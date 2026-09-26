@@ -1,6 +1,10 @@
-use super::{demote_step, ArenaOffload, DemoteOutcome, HostChainIndex, HostOffloadPolicy};
-use crate::backends::kv::{arena_page_bytes, CpuKvArena, KvArena};
+use super::{
+    ArenaOffload, DemoteOutcome, HostChainIndex, HostOffloadPolicy, demote_step,
+    lookup_longest_with_host, promote_tail,
+};
 use crate::backends::BackendKind;
+use crate::backends::kv::{CpuKvArena, KvArena, arena_page_bytes};
+use crate::engine::EngineCoreConfig;
 use crate::engine::cache::coordinator::KvSnapshot;
 use crate::engine::cache::coordinator::{
     KvBlockIntent, KvCacheCoordinator, KvGroupReservation, KvReserveRequest,
@@ -9,7 +13,6 @@ use crate::engine::cache::prefix::{
     CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
 };
 use crate::engine::execution::PlanId;
-use crate::engine::EngineCoreConfig;
 use crate::engine::{ModelInstanceId, SessionKey};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId, KvPlanFingerprint};
 
@@ -293,4 +296,243 @@ fn offload_policy_resolves_engagement_and_watermark_sanity() {
     config.kv_offload_high_watermark = 0.5;
     config.kv_offload_low_watermark = 0.7;
     assert!(HostOffloadPolicy::resolve(&config).is_err());
+}
+
+/// Demotes a seeded two-page prefix and releases its table, leaving the pages
+/// reachable only through the host chain.
+fn demoted_prefix() -> (
+    CpuKvArena,
+    KvCacheCoordinator,
+    CoordinatedPrefixIndex,
+    ArenaOffload,
+    Vec<KvPrefixPageKey>,
+    Vec<Vec<u8>>,
+) {
+    let physical = arena();
+    let mut coordinator = KvCacheCoordinator::new(arena_id(), 4);
+    let mut index = CoordinatedPrefixIndex::new(8);
+    let (keys, _, seeds, _) = publish_seeded_prefix(&mut coordinator, &mut index, &physical);
+    coordinator
+        .release_table(
+            &SessionKey::new("session-a".to_string(), 0),
+            CacheDomainId::new(0),
+        )
+        .unwrap();
+    let mut offload = ArenaOffload::new(arena_page_bytes(physical.config()), 4096).unwrap();
+    assert_eq!(
+        demote_step(
+            &mut coordinator,
+            &mut index,
+            &physical,
+            &mut offload,
+            &Default::default(),
+        )
+        .unwrap(),
+        DemoteOutcome::Demoted { pages: 2 }
+    );
+    (physical, coordinator, index, offload, keys, seeds)
+}
+
+#[test]
+fn lookup_continues_from_the_device_index_into_the_host_chain() {
+    let (_, _coordinator, mut index, mut offload, keys, _) = demoted_prefix();
+
+    let tokens = vec![1, 2, 3, 4, 5];
+    let device_only = index.lookup_longest(&namespace(), &tokens, 2).unwrap();
+    assert!(device_only.blocks.is_empty());
+    assert!(device_only.host_tail.is_none());
+
+    let matched =
+        lookup_longest_with_host(&mut index, &mut offload.chain, &namespace(), &tokens, 2, 64)
+            .unwrap();
+    assert_eq!(matched.reused_tokens, 4);
+    assert!(matched.blocks.is_empty(), "device head is empty here");
+    let tail = matched.host_tail.expect("host tail extends the match");
+    assert_eq!(tail.device_end_tokens, 0);
+    assert_eq!(tail.digests, vec![keys[0].digest(), keys[1].digest()]);
+    assert_eq!(tail.slots.len(), 2);
+}
+
+#[test]
+fn host_continuation_truncates_at_the_promotion_ceiling() {
+    let (_, _, mut index, mut offload, keys, _) = demoted_prefix();
+
+    let matched = lookup_longest_with_host(
+        &mut index,
+        &mut offload.chain,
+        &namespace(),
+        &[1, 2, 3, 4],
+        2,
+        1,
+    )
+    .unwrap();
+    assert_eq!(matched.reused_tokens, 2);
+    let tail = matched.host_tail.expect("one host page fits the ceiling");
+    assert_eq!(tail.digests, vec![keys[0].digest()]);
+    assert_eq!(tail.device_end_tokens, 0);
+
+    let capped_out = lookup_longest_with_host(
+        &mut index,
+        &mut offload.chain,
+        &namespace(),
+        &[1, 2, 3, 4],
+        2,
+        0,
+    )
+    .unwrap();
+    assert_eq!(capped_out.reused_tokens, 0);
+    assert!(
+        capped_out.host_tail.is_none(),
+        "zero ceiling disables the tail"
+    );
+}
+
+#[test]
+fn promotion_restores_host_bytes_into_fresh_device_pages() {
+    let (physical, mut coordinator, mut index, mut offload, keys, seeds) = demoted_prefix();
+
+    // A preparing transaction reserves fresh pages for the whole span, the
+    // way prepare_inner does before restoring the tail into them.
+    let snapshot = coordinator
+        .register_table(
+            SessionKey::new("session-b".to_string(), 0),
+            CacheDomainId::new(0),
+        )
+        .unwrap();
+    coordinator
+        .reserve(KvReserveRequest {
+            txn_id: 2,
+            expected: snapshot,
+            target_committed_tokens: 6,
+            target_window_start: 0,
+            groups: vec![KvGroupReservation {
+                group: KvGroupId::new(0),
+                blocks: vec![
+                    KvBlockIntent::Fresh,
+                    KvBlockIntent::Fresh,
+                    KvBlockIntent::Fresh,
+                ],
+            }],
+        })
+        .unwrap();
+    let prepared = coordinator.prepare(2).unwrap();
+    let blocks = prepared.provisional_groups[0].blocks.clone();
+    assert_eq!(blocks.len(), 3);
+
+    let mut tail = lookup_longest_with_host(
+        &mut index,
+        &mut offload.chain,
+        &namespace(),
+        &[1, 2, 3, 4],
+        2,
+        64,
+    )
+    .unwrap()
+    .host_tail
+    .expect("matched tail");
+    let copy = promote_tail(
+        &physical,
+        &mut offload,
+        &blocks[..tail.slots.len()],
+        &tail.digests,
+        &tail.slots,
+    );
+    assert_eq!(copy.restored_pages, 2);
+
+    // The device pages now carry the exact bytes the host slots held.
+    let page_bytes = arena_page_bytes(physical.config()) as usize;
+    let mut readback = vec![0_u8; page_bytes];
+    for (index, block) in blocks.iter().take(2).enumerate() {
+        physical.capture_page(*block, &mut readback).unwrap();
+        assert_eq!(readback, seeds[index]);
+    }
+
+    // Commit publishes the restored pages into the device index and reclaims
+    // the host entries, leaving the chain empty and the pool released.
+    coordinator
+        .complete_write(crate::engine::cache::coordinator::KvWriteReceipt {
+            txn_id: 2,
+            committed_tokens: 6,
+            written_blocks: blocks.clone(),
+        })
+        .unwrap();
+    index
+        .commit_transaction(
+            &mut coordinator,
+            2,
+            2,
+            &[
+                KvPrefixPublication {
+                    key: keys[0].clone(),
+                    block: blocks[0],
+                },
+                KvPrefixPublication {
+                    key: keys[1].clone(),
+                    block: blocks[1],
+                },
+            ],
+        )
+        .unwrap();
+    for digest in &tail.digests {
+        if let Some(slot) = offload.chain.remove(digest) {
+            offload.pool.release_slot(slot).unwrap();
+        }
+    }
+    assert_eq!(offload.chain.len(), 0);
+    assert_eq!(offload.pool.resident_pages(), 0);
+
+    let device_match = index
+        .lookup_longest(&namespace(), &[1, 2, 3, 4], 2)
+        .unwrap();
+    assert_eq!(device_match.blocks, vec![blocks[0], blocks[1]]);
+    assert!(device_match.host_tail.is_none());
+}
+
+#[test]
+fn a_failed_promotion_copy_purges_the_tail_from_the_host_chain() {
+    let (physical, mut coordinator, _index, mut offload, keys, _) = demoted_prefix();
+
+    // One real fresh page so the first copy succeeds; an out-of-range block
+    // makes the second copy fail mid-tail.
+    let snapshot = coordinator
+        .register_table(
+            SessionKey::new("session-b".to_string(), 0),
+            CacheDomainId::new(0),
+        )
+        .unwrap();
+    coordinator
+        .reserve(KvReserveRequest {
+            txn_id: 2,
+            expected: snapshot,
+            target_committed_tokens: 2,
+            target_window_start: 0,
+            groups: vec![KvGroupReservation {
+                group: KvGroupId::new(0),
+                blocks: vec![KvBlockIntent::Fresh],
+            }],
+        })
+        .unwrap();
+    let prepared = coordinator.prepare(2).unwrap();
+    let valid = prepared.provisional_groups[0].blocks[0];
+
+    let slots = keys
+        .iter()
+        .map(|key| offload.chain.lookup(key).expect("host entry"))
+        .collect::<Vec<_>>();
+    let copy = promote_tail(
+        &physical,
+        &mut offload,
+        &[valid, block(99)],
+        &keys.iter().map(|key| key.digest()).collect::<Vec<_>>(),
+        &slots,
+    );
+    assert_eq!(copy.restored_pages, 1);
+    assert_eq!(
+        offload.chain.len(),
+        1,
+        "failing page and descendants purged"
+    );
+    assert!(offload.chain.lookup(&keys[0]).is_some());
+    assert!(offload.chain.lookup(&keys[1]).is_none());
+    assert_eq!(offload.pool.resident_pages(), 1);
 }

@@ -289,11 +289,28 @@ pub struct KvPrefixPublication {
     pub block: CacheBlockRef,
 }
 
+/// DS4: the host-resident continuation of a matched prefix chain. The device
+/// index holds the head (`KvPrefixMatch::blocks`); these pages live in the
+/// arena's host pool until a preparing transaction restores them into the
+/// fresh pages it reserved for the span they cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvHostTailMatch {
+    /// Token boundary where the device-resident head ends (page-aligned).
+    pub device_end_tokens: u32,
+    /// Host page digests in chain order.
+    pub digests: Vec<[u8; 32]>,
+    /// Host pool slot holding each page's bytes, in chain order.
+    pub slots: Vec<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KvPrefixMatch {
     pub blocks: Vec<CacheBlockRef>,
     pub page_digests: Vec<[u8; 32]>,
     pub reused_tokens: u32,
+    /// Host-resident pages that continue the matched chain beyond `blocks`.
+    /// `None` when the match is fully device-resident.
+    pub host_tail: Option<KvHostTailMatch>,
 }
 
 /// Non-removing view of one LRU subtree, returned by
@@ -673,14 +690,18 @@ mod tests {
         let third =
             KvPrefixPageKey::new(&namespace(1), Some(second.digest()), 4, vec![5, 6]).unwrap();
 
-        assert!(index
-            .publish(first.clone(), 2, block(0))
-            .unwrap()
-            .is_empty());
-        assert!(index
-            .publish(second.clone(), 2, block(1))
-            .unwrap()
-            .is_empty());
+        assert!(
+            index
+                .publish(first.clone(), 2, block(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .publish(second.clone(), 2, block(1))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(index.lookup(&first).unwrap().unwrap().block, block(0));
         assert_eq!(
             index.publish(third, 2, block(2)).unwrap(),
@@ -716,11 +737,13 @@ mod tests {
         let key = KvPrefixPageKey::new(&namespace(1), None, 0, vec![1, 2]).unwrap();
         let mut index = CoordinatedPrefixIndex::new(2);
 
-        assert!(index
-            .lookup_longest(&namespace(1), &[1, 2], 2)
-            .unwrap()
-            .blocks
-            .is_empty());
+        assert!(
+            index
+                .lookup_longest(&namespace(1), &[1, 2], 2)
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
         index
             .commit_transaction(
                 &mut coordinator,
@@ -778,11 +801,13 @@ mod tests {
         );
         assert!(index.is_empty());
         assert!(coordinator.abort(12).unwrap());
-        assert!(index
-            .lookup_longest(&namespace(1), &[7, 8], 2)
-            .unwrap()
-            .blocks
-            .is_empty());
+        assert!(
+            index
+                .lookup_longest(&namespace(1), &[7, 8], 2)
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
         assert_eq!(coordinator.stats().prefix_refs, 0);
         coordinator.check_invariants().unwrap();
     }

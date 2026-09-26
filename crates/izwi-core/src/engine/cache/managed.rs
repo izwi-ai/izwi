@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use candle_core::{DType, Device, DeviceLocation};
 use serde::Serialize;
@@ -16,28 +16,28 @@ use super::coordinator::{
 };
 use super::offload::{self, DemoteOutcome, HostOffloadPolicy};
 use super::prefix::{
-    CoordinatedPrefixIndex, KvPrefixMatch, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
-    StagedPrefixCommit,
+    CoordinatedPrefixIndex, KvHostTailMatch, KvPrefixMatch, KvPrefixNamespace, KvPrefixPageKey,
+    KvPrefixPublication, StagedPrefixCommit,
 };
 use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
 use super::tensor_snapshots::{
-    tensor_snapshot_byte_size, tensor_snapshot_prefix_policy, TensorSnapshotPrefixPolicy,
-    TensorStateSnapshotIndex,
+    TensorSnapshotPrefixPolicy, TensorStateSnapshotIndex, tensor_snapshot_byte_size,
+    tensor_snapshot_prefix_policy,
 };
+use crate::backends::BackendKind;
 #[cfg(feature = "cuda")]
 use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
 use crate::backends::kv::MetalKvBackendRuntime;
 use crate::backends::kv::{
-    cuda_paged_growth_geometry, CpuKvBackendRuntime, KvArena, KvArenaConfig, KvArenaGrowthConfig,
-    KvBackendRuntime, KvLayerConfig,
+    CpuKvBackendRuntime, KvArena, KvArenaConfig, KvArenaGrowthConfig, KvBackendRuntime,
+    KvLayerConfig, cuda_paged_growth_geometry,
 };
 use crate::backends::state::{
-    negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
-    StateBackendPlanRequest, StateBackendRegistry, StateComponentValue, TensorStateArena,
-    TensorStateCapacity, TensorStateSelection,
+    PhysicalStateSequenceId, PhysicalStateTransactionId, StateBackendPlanRequest,
+    StateBackendRegistry, StateComponentValue, TensorStateArena, TensorStateCapacity,
+    TensorStateSelection, negotiate_state_plan,
 };
-use crate::backends::BackendKind;
 use crate::engine::{
     EngineCoreRequest, ManagedCacheDomainReservation, ManagedCacheReceipt, ManagedCacheReservation,
     ManagedClockedStateReservation, ManagedSessionGeneration, ModelInstanceId, PlanId,
@@ -45,14 +45,14 @@ use crate::engine::{
     ResourceVector, SessionKey, WorkUnit,
 };
 use crate::error::{Error, Result};
+#[cfg(test)]
+use crate::kv::CacheDomainId;
 use crate::kv::v2::{
     AllocationReceipt, AttentionPattern, CapacityStrategy, GroupCapacityRequest,
     InferenceStateContract, PrefixPolicy, ResidencyMeasurement, ResolvedStatePlan,
     StateAllocationLedger, StateDomainId, StateDomainSpec, StateResourceVector,
     StateRuntimeAllocationPlan, WorkspaceContract, WorkspacePlacement,
 };
-#[cfg(test)]
-use crate::kv::CacheDomainId;
 use crate::kv::{InferenceStateCapability, KvArenaId, KvGroupId, KvStorageDType, ResolvedKvPlan};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -364,6 +364,8 @@ struct ManagedKvModelState {
     coordinators: HashMap<KvArenaId, KvCacheCoordinator>,
     prefix_indexes: HashMap<KvArenaId, CoordinatedPrefixIndex>,
     pending_prefixes: HashMap<PlanId, Vec<PendingPrefixCommit>>,
+    /// DS4.3: promotions awaiting their transaction's commit, keyed by txn.
+    pending_promotions: HashMap<PlanId, Vec<PendingPrefixPromotion>>,
     /// Transactions whose accepted prefix must equal their reserved target.
     exact_target_transactions: HashSet<PlanId>,
     registered_sessions: HashSet<SessionKey>,
@@ -385,6 +387,23 @@ struct PendingPrefixCommit {
     arena: KvArenaId,
     page_tokens: u32,
     publications: Vec<KvPrefixPublication>,
+}
+
+/// DS4.3: host-resident pages a prepare restored into its transaction's fresh
+/// device pages. At commit the device pages publish into the prefix index and
+/// the host entries are reclaimed; on abort the record drops and the host
+/// entries stay valid. `blocks` are the device pages the bytes were restored
+/// into, `digests`/`slots` the host identities they came from, all in chain
+/// order starting at the device match boundary.
+#[derive(Clone)]
+struct PendingPrefixPromotion {
+    arena: KvArenaId,
+    page_tokens: u32,
+    device_end_tokens: u32,
+    blocks: Vec<crate::kv::CacheBlockRef>,
+    digests: Vec<[u8; 32]>,
+    slots: Vec<usize>,
+    latency_ns: u64,
 }
 
 /// DS1.2b: cross-request sharing of committed tensor snapshots for one hybrid
@@ -1302,6 +1321,7 @@ impl ManagedKvCacheManager {
                 coordinators,
                 prefix_indexes,
                 pending_prefixes: HashMap::new(),
+                pending_promotions: HashMap::new(),
                 exact_target_transactions: HashSet::new(),
                 registered_sessions: HashSet::new(),
                 session_generations: HashMap::new(),
@@ -1398,18 +1418,50 @@ impl ManagedKvCacheManager {
             return Ok(None);
         }
         let reusable = prompt_tokens.len() - 1;
+        let max_host_pages = self
+            .host_offload_policy
+            .map(|policy| policy.max_promotion_pages)
+            .unwrap_or(0);
         for group in runtime.plan.groups.iter() {
             if !prefix_enabled_for_domain(&state.contract, group.domain) {
                 continue;
             }
+            // DS4: snapshot-sharing arenas keep device-only semantics — their
+            // attach reconciliation walks the matched digests as a complete
+            // page chain, which a host tail (restored only at prepare) would
+            // not satisfy.
+            let host_continuation = !state.tensor_snapshots.as_ref().is_some_and(|sharing| {
+                sharing.paged_arena == group.arena && sharing.policy.paged_domain == group.domain
+            });
+            let chain = if host_continuation {
+                state.host_offload.as_mut().and_then(|offload| {
+                    offload
+                        .arenas
+                        .get_mut(&group.arena)
+                        .map(|arena| &mut arena.chain)
+                })
+            } else {
+                None
+            };
             let prefix_index = state.prefix_indexes.get_mut(&group.arena).ok_or_else(|| {
                 Error::InferenceError(
                     "resolved arena has no prefix index for the prefix probe".into(),
                 )
             })?;
-            let mut matched = prefix_index
-                .lookup_longest(&namespace, &prompt_tokens[..reusable], group.page_tokens)
-                .map_err(prefix_error)?;
+            let mut matched = match chain {
+                Some(chain) => offload::lookup_longest_with_host(
+                    &mut *prefix_index,
+                    chain,
+                    &namespace,
+                    &prompt_tokens[..reusable],
+                    group.page_tokens,
+                    max_host_pages,
+                )
+                .map_err(prefix_error)?,
+                None => prefix_index
+                    .lookup_longest(&namespace, &prompt_tokens[..reusable], group.page_tokens)
+                    .map_err(prefix_error)?,
+            };
             if matched.reused_tokens == 0 {
                 continue;
             }
@@ -1549,8 +1601,14 @@ impl ManagedKvCacheManager {
                     telemetry,
                 ) {
                     Ok(DemoteOutcome::Demoted { .. }) => steps -= 1,
-                    Ok(_) => break,
-                    Err(_) => break,
+                    Ok(other) => {
+                        eprintln!("DS4DBG step outcome {:?}", other);
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("DS4DBG step error {error}");
+                        break;
+                    }
                 }
             }
         }
@@ -1705,6 +1763,9 @@ impl ManagedKvCacheManager {
         // host tier are visible to this very reservation.
         let host_offload_policy = self.host_offload_policy;
         Self::run_host_offload_tick(host_offload_policy, state, &self.telemetry);
+        let host_page_ceiling = host_offload_policy
+            .map(|policy| policy.max_promotion_pages)
+            .unwrap_or(0);
         let installed_claim = if let Some(request) = request {
             if incremental && sequence_input.is_some() {
                 ensure_incremental_capacity_claim(state, session, request, work)?
@@ -1731,6 +1792,8 @@ impl ManagedKvCacheManager {
 
         let mut domains = Vec::with_capacity(runtime.plan.groups.len());
         let mut pending_prefixes = Vec::new();
+        // DS4.3: host tails restored this transaction, committed at finalize.
+        let mut pending_promotions = Vec::new();
         // DS1.2b: snapshot-sharing facts copied out of `state` so the paged
         // group loop can consult them while mutating coordinators. Clocked
         // (selected) transactions have no fork path and never share.
@@ -1820,48 +1883,85 @@ impl ManagedKvCacheManager {
                         && domain_sequence_input
                             .is_some_and(|input| input.start == *cursor as usize)
                 });
-            let mut prefix_match =
-                if prefix_eligible && session_generation == ManagedSessionGeneration::INITIAL {
-                    if let Some(namespace) = namespace.as_ref() {
-                        let reusable_tokens =
-                            usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
-                        state
-                            .prefix_indexes
-                            .get_mut(&group.arena)
-                            .expect("resolved arena has a prefix index")
-                            .lookup_longest(
-                                namespace,
-                                &request
-                                    .expect("prefix namespace requires a request")
-                                    .prompt_tokens[..reusable_tokens],
-                                group.page_tokens,
-                            )
-                            .map_err(prefix_error)?
+            let mut prefix_match = if prefix_eligible
+                && session_generation == ManagedSessionGeneration::INITIAL
+            {
+                if let Some(namespace) = namespace.as_ref() {
+                    let reusable_tokens =
+                        usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
+                    let snapshot_shared_arena =
+                        snapshot_sharing
+                            .as_ref()
+                            .is_some_and(|(policy, paged_arena, _)| {
+                                *paged_arena == group.arena && policy.paged_domain == group.domain
+                            });
+                    let host_chain = if snapshot_shared_arena {
+                        None
                     } else {
-                        self.telemetry.record_prefix_rejection();
-                        Default::default()
-                    }
-                } else if let Some(cursor) = expected_attach_cursor {
-                    if let Some(namespace) = namespace.as_ref() {
-                        let reusable_tokens = cursor as usize;
-                        state
-                            .prefix_indexes
-                            .get_mut(&group.arena)
-                            .expect("resolved arena has a prefix index")
-                            .lookup_longest(
-                                namespace,
-                                &request
-                                    .expect("prefix namespace requires a request")
-                                    .prompt_tokens[..reusable_tokens],
-                                group.page_tokens,
-                            )
-                            .map_err(prefix_error)?
+                        state.host_offload.as_mut().and_then(|offload| {
+                            offload
+                                .arenas
+                                .get_mut(&group.arena)
+                                .map(|arena| &mut arena.chain)
+                        })
+                    };
+                    let prefix_index = state
+                        .prefix_indexes
+                        .get_mut(&group.arena)
+                        .expect("resolved arena has a prefix index");
+                    managed_prefix_lookup(
+                        prefix_index,
+                        host_chain,
+                        group.page_tokens,
+                        namespace,
+                        &request
+                            .expect("prefix namespace requires a request")
+                            .prompt_tokens[..reusable_tokens],
+                        host_page_ceiling,
+                    )?
+                } else {
+                    self.telemetry.record_prefix_rejection();
+                    Default::default()
+                }
+            } else if let Some(cursor) = expected_attach_cursor {
+                if let Some(namespace) = namespace.as_ref() {
+                    let reusable_tokens = cursor as usize;
+                    let snapshot_shared_arena =
+                        snapshot_sharing
+                            .as_ref()
+                            .is_some_and(|(policy, paged_arena, _)| {
+                                *paged_arena == group.arena && policy.paged_domain == group.domain
+                            });
+                    let host_chain = if snapshot_shared_arena {
+                        None
                     } else {
-                        Default::default()
-                    }
+                        state.host_offload.as_mut().and_then(|offload| {
+                            offload
+                                .arenas
+                                .get_mut(&group.arena)
+                                .map(|arena| &mut arena.chain)
+                        })
+                    };
+                    let prefix_index = state
+                        .prefix_indexes
+                        .get_mut(&group.arena)
+                        .expect("resolved arena has a prefix index");
+                    managed_prefix_lookup(
+                        prefix_index,
+                        host_chain,
+                        group.page_tokens,
+                        namespace,
+                        &request
+                            .expect("prefix namespace requires a request")
+                            .prompt_tokens[..reusable_tokens],
+                        host_page_ceiling,
+                    )?
                 } else {
                     Default::default()
-                };
+                }
+            } else {
+                Default::default()
+            };
             if let Some(cursor) = expected_attach_cursor {
                 // The attach must reconcile the same snapshot boundary the
                 // probe verified; a shorter realized cursor means the shared
@@ -1966,8 +2066,15 @@ impl ManagedKvCacheManager {
             } else {
                 publication_start_tokens = prefix_match.reused_tokens;
             }
-            let execution_start_tokens = snapshot.committed_tokens.max(prefix_match.reused_tokens);
-            publication_start_tokens = publication_start_tokens.max(execution_start_tokens);
+            // DS4: a host tail means pages from the device boundary onward
+            // bind into the device index at this transaction's commit — the
+            // restored ones and any recomputed ones alike — so publication
+            // starts at the device-resident boundary instead of the execution
+            // cursor (finalized after the restore below).
+            let host_tail_boundary = prefix_match
+                .host_tail
+                .as_ref()
+                .map(|tail| tail.device_end_tokens);
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
             let target_window_start = sliding_window
                 .map(|window| {
@@ -2169,6 +2276,66 @@ impl ManagedKvCacheManager {
                         .record_prefix_copy_on_write(prepared.page_copies.len());
                 }
             }
+            // DS4.3: restore the host-resident tail of the matched prefix into
+            // the fresh pages this transaction reserved for their span. A page
+            // that fails to restore truncates the promotion (the failing entry
+            // and its host descendants are purged); with an admission cursor
+            // the shortened match degrades to the cursor-lost re-plan, without
+            // one the executor simply recomputes the truncated span.
+            if let Some(tail) = prefix_match.host_tail.take() {
+                let promoted = {
+                    let arena = runtime
+                        .arena(group.arena)
+                        .expect("resolved arena allocated");
+                    match state
+                        .host_offload
+                        .as_mut()
+                        .and_then(|offload| offload.arenas.get_mut(&group.arena))
+                    {
+                        Some(arena_offload) => {
+                            let table = prepared
+                                .provisional_groups
+                                .iter()
+                                .find(|table| table.group == group.id);
+                            promote_host_tail(
+                                arena.as_ref(),
+                                arena_offload,
+                                group.arena,
+                                group.page_tokens,
+                                table,
+                                tail,
+                            )
+                        }
+                        // The host tier vanished mid-prepare: nothing was
+                        // restored, so the match falls back to its device head.
+                        None => PromotedTail {
+                            restored_tokens: tail.device_end_tokens,
+                            record: None,
+                        },
+                    }
+                };
+                if promoted.restored_tokens < prefix_match.reused_tokens {
+                    if expected_attach_cursor
+                        .is_some_and(|cursor| promoted.restored_tokens != cursor)
+                    {
+                        let _ = coordinator.abort(txn_id);
+                        abort_domains(state, txn_id, &domains);
+                        return Err(Error::Backpressure(format!(
+                            "{MANAGED_PREFIX_CURSOR_LOST}: promotion restored cursor {} but admission probed {}",
+                            promoted.restored_tokens, prefix_match.reused_tokens
+                        )));
+                    }
+                    prefix_match.reused_tokens = promoted.restored_tokens;
+                }
+                if let Some(record) = promoted.record {
+                    pending_promotions.push(record);
+                }
+            }
+            let execution_start_tokens = snapshot.committed_tokens.max(prefix_match.reused_tokens);
+            publication_start_tokens = match host_tail_boundary {
+                Some(device_end_tokens) => publication_start_tokens.min(device_end_tokens),
+                None => publication_start_tokens.max(execution_start_tokens),
+            };
             domains.push(ManagedCacheDomainReservation {
                 arena: group.arena,
                 domain: group.domain,
@@ -2218,6 +2385,9 @@ impl ManagedKvCacheManager {
                 "managed KV transaction duplicated pending prefix publication".into(),
             ));
         }
+        if !pending_promotions.is_empty() {
+            state.pending_promotions.insert(txn_id, pending_promotions);
+        }
         let clocked_state = if needs_tensor_transaction {
             let arena = runtime
                 .tensor_state()
@@ -2231,6 +2401,7 @@ impl ManagedKvCacheManager {
                     if let Err(error) = arena.register(sequence) {
                         abort_domains(state, txn_id, &domains);
                         state.pending_prefixes.remove(&txn_id);
+                        state.pending_promotions.remove(&txn_id);
                         return Err(error);
                     }
                     state.tensor_sequences.insert(session.clone(), sequence);
@@ -2245,6 +2416,7 @@ impl ManagedKvCacheManager {
                 if !newly_registered {
                     abort_domains(state, txn_id, &domains);
                     state.pending_prefixes.remove(&txn_id);
+                    state.pending_promotions.remove(&txn_id);
                     return Err(Error::InferenceError(
                         "managed tensor snapshot attach requires a fresh sequence".into(),
                     ));
@@ -2279,6 +2451,7 @@ impl ManagedKvCacheManager {
                 if let Err(error) = fork_result {
                     abort_domains(state, txn_id, &domains);
                     state.pending_prefixes.remove(&txn_id);
+                    state.pending_promotions.remove(&txn_id);
                     state.tensor_sequences.remove(session);
                     arena.release(sequence).map_err(|release_error| {
                         Error::InferenceError(format!(
@@ -2306,6 +2479,7 @@ impl ManagedKvCacheManager {
                 Err(error) => {
                     abort_domains(state, txn_id, &domains);
                     state.pending_prefixes.remove(&txn_id);
+                    state.pending_promotions.remove(&txn_id);
                     if newly_registered {
                         state.tensor_sequences.remove(session);
                         arena.release(sequence)?;
@@ -2321,6 +2495,7 @@ impl ManagedKvCacheManager {
             if let Err(error) = begin {
                 abort_domains(state, txn_id, &domains);
                 state.pending_prefixes.remove(&txn_id);
+                state.pending_promotions.remove(&txn_id);
                 if newly_registered {
                     state.tensor_sequences.remove(session);
                     arena.release(sequence).map_err(|release_error| {
@@ -2437,6 +2612,12 @@ impl ManagedKvCacheManager {
                 "managed KV exact-target reservation rejected a partial prefix".into(),
             ));
         }
+        // DS4.3: host tails restored at prepare, reclaimed at this commit.
+        let promotions = state
+            .pending_promotions
+            .get(&reservation.txn_id)
+            .cloned()
+            .unwrap_or_default();
         let mut resolved_domains = Vec::with_capacity(reservation.domains.len());
         for domain in &reservation.domains {
             let Some(written) = receipt
@@ -2490,9 +2671,27 @@ impl ManagedKvCacheManager {
             } else {
                 domain.target_window_start
             };
+            // DS4.3: pages restored from the host tier were filled by the
+            // promotion copy rather than the executor's backend writes; the
+            // committed write receipt covers both. Restored pages the accepted
+            // cursor truncates away are left out — their host entries stay
+            // authoritative and only the surviving span is reclaimed.
+            let mut written_blocks = written.written_blocks.clone();
+            if let Some(promotion) = promotions
+                .iter()
+                .find(|promotion| promotion.arena == domain.arena)
+            {
+                for (index, block) in promotion.blocks.iter().enumerate() {
+                    let page_end = u64::from(promotion.device_end_tokens)
+                        + u64::from(promotion.page_tokens).saturating_mul(index as u64 + 1);
+                    if page_end <= u64::from(committed_tokens) && !written_blocks.contains(block) {
+                        written_blocks.push(*block);
+                    }
+                }
+            }
             resolved_domains.push((
                 domain,
-                written.written_blocks.clone(),
+                written_blocks,
                 committed_tokens,
                 target_window_start,
                 group.page_tokens,
@@ -2679,6 +2878,29 @@ impl ManagedKvCacheManager {
                     .expect("staged arena has a prefix index")
                     .apply_staged(prefix);
             }
+        }
+        // DS4.3: the transaction committed, so its restored pages are
+        // device-resident and published into the prefix index; reclaim the
+        // host entries they replace. An entry already evicted from the host
+        // tier is simply gone.
+        for promotion in state
+            .pending_promotions
+            .remove(&reservation.txn_id)
+            .unwrap_or_default()
+        {
+            if let Some(arena_offload) = state
+                .host_offload
+                .as_mut()
+                .and_then(|offload| offload.arenas.get_mut(&promotion.arena))
+            {
+                for digest in &promotion.digests {
+                    if let Some(slot) = arena_offload.chain.remove(digest) {
+                        let _ = arena_offload.pool.release_slot(slot);
+                    }
+                }
+            }
+            self.telemetry
+                .record_promotion(promotion.digests.len(), promotion.latency_ns);
         }
         state.pending_prefixes.remove(&reservation.txn_id);
         state.exact_target_transactions.remove(&reservation.txn_id);
@@ -3697,7 +3919,9 @@ fn ensure_incremental_capacity_claim(
             .sum::<u64>();
         if others.saturating_add(pages) > capacity {
             return Err(Error::Backpressure(format!(
-                "managed KV incremental admission is waiting: request {} needs {pages} pages, {others} are claimed by other requests, capacity is {capacity}", request.id)));
+                "managed KV incremental admission is waiting: request {} needs {pages} pages, {others} are claimed by other requests, capacity is {capacity}",
+                request.id
+            )));
         }
         claims.push((
             group.arena,
@@ -3879,6 +4103,90 @@ fn validate_sliding_contract(
         }
     }
     Ok(())
+}
+
+/// DS4: the longest committed prefix for one arena, continuing past the
+/// device index into the host chain when the arena carries a host tail.
+/// Snapshot-sharing paged arenas are excluded by the caller: their attach
+/// reconciliation requires the matched digests to be a fully device-resident
+/// chain, and host pages only become device-resident at prepare.
+fn managed_prefix_lookup(
+    prefix_index: &mut CoordinatedPrefixIndex,
+    host_chain: Option<&mut offload::HostChainIndex>,
+    page_tokens: u32,
+    namespace: &KvPrefixNamespace,
+    tokens: &[u32],
+    host_page_ceiling: usize,
+) -> Result<KvPrefixMatch> {
+    Ok(match host_chain {
+        Some(chain) => offload::lookup_longest_with_host(
+            prefix_index,
+            chain,
+            namespace,
+            tokens,
+            page_tokens,
+            host_page_ceiling,
+        )
+        .map_err(prefix_error)?,
+        None => prefix_index
+            .lookup_longest(namespace, tokens, page_tokens)
+            .map_err(prefix_error)?,
+    })
+}
+
+/// DS4.3: outcome of restoring a matched host tail during prepare. The
+/// restored boundary may sit below the matched end when a page failed to
+/// copy; `record` carries the successfully restored span to the transaction's
+/// commit.
+struct PromotedTail {
+    restored_tokens: u32,
+    record: Option<PendingPrefixPromotion>,
+}
+
+/// Restores a matched host tail into the fresh device pages the current
+/// transaction reserved for its span. The provisional table supplies one
+/// block per tail page; a shorter table truncates the promotion exactly like
+/// a failed copy does.
+fn promote_host_tail(
+    arena: &dyn KvArena,
+    offload: &mut offload::ArenaOffload,
+    arena_id: KvArenaId,
+    page_tokens: u32,
+    table: Option<&super::coordinator::GroupBlockTable>,
+    tail: KvHostTailMatch,
+) -> PromotedTail {
+    let page = usize::try_from(page_tokens).unwrap_or(usize::MAX).max(1);
+    let first_page = usize::try_from(tail.device_end_tokens).unwrap_or(usize::MAX) / page;
+    let mut blocks = Vec::with_capacity(tail.digests.len());
+    for index in first_page..first_page + tail.digests.len() {
+        match table.and_then(|table| table.blocks.get(index)).copied() {
+            Some(block) => blocks.push(block),
+            None => break,
+        }
+    }
+    let copy = offload::promote_tail(
+        arena,
+        offload,
+        &blocks,
+        &tail.digests[..blocks.len()],
+        &tail.slots[..blocks.len()],
+    );
+    let restored_tokens = tail.device_end_tokens.saturating_add(
+        u32::try_from(copy.restored_pages.saturating_mul(page)).unwrap_or(u32::MAX),
+    );
+    let record = (copy.restored_pages > 0).then(|| PendingPrefixPromotion {
+        arena: arena_id,
+        page_tokens,
+        device_end_tokens: tail.device_end_tokens,
+        blocks: blocks[..copy.restored_pages].to_vec(),
+        digests: tail.digests[..copy.restored_pages].to_vec(),
+        slots: tail.slots[..copy.restored_pages].to_vec(),
+        latency_ns: copy.latency_ns,
+    });
+    PromotedTail {
+        restored_tokens,
+        record,
+    }
 }
 
 fn prefix_publications(
@@ -4079,6 +4387,9 @@ fn abort_domains(
 
 fn abort_reservation(state: &mut ManagedKvModelState, reservation: &ManagedCacheReservation) {
     state.pending_prefixes.remove(&reservation.txn_id);
+    // DS4.3: an aborted transaction never publishes its restored pages, so
+    // the host entries stay authoritative and keep their slots.
+    state.pending_promotions.remove(&reservation.txn_id);
     state.exact_target_transactions.remove(&reservation.txn_id);
     abort_domains(state, reservation.txn_id, &reservation.domains);
     if reservation.clocked_state.is_some() {
@@ -4188,7 +4499,7 @@ mod tests {
         StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
     };
     use crate::kv::{
-        test_contract, CacheBlockRef, InferenceStateCapability as CacheCapability, KvSlotRef,
+        CacheBlockRef, InferenceStateCapability as CacheCapability, KvSlotRef, test_contract,
     };
     use crate::model::ModelVariant;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
@@ -4308,15 +4619,17 @@ mod tests {
             input: InputRange { start, end },
             max_output_steps: end.saturating_sub(start).max(1),
             auxiliary_state: Some(
-                vec![ClockedStateSpan::new(
-                    group,
-                    clock,
-                    InputRange {
-                        start: state_start,
-                        end: state_end,
-                    },
-                )
-                .unwrap()]
+                vec![
+                    ClockedStateSpan::new(
+                        group,
+                        clock,
+                        InputRange {
+                            start: state_start,
+                            end: state_end,
+                        },
+                    )
+                    .unwrap(),
+                ]
                 .into(),
             ),
         }
@@ -4358,16 +4671,18 @@ mod tests {
         );
         assert!(prefix_enabled_for_domain(&contract, CacheDomainId::new(1)));
         let mut manager = ManagedKvCacheManager::default();
-        assert!(manager
-            .bind_request(
-                ModelInstanceId::new(702),
-                BackendKind::Cpu,
-                4,
-                16,
-                &CacheCapability::Managed(contract),
-            )
-            .unwrap()
-            .is_some());
+        assert!(
+            manager
+                .bind_request(
+                    ModelInstanceId::new(702),
+                    BackendKind::Cpu,
+                    4,
+                    16,
+                    &CacheCapability::Managed(contract),
+                )
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -4390,9 +4705,11 @@ mod tests {
 
         let error = validate_sliding_contract(&contract, BackendKind::Cuda)
             .expect_err("an empty paged-attention domain must remain invalid");
-        assert!(error
-            .to_string()
-            .contains("managed paged-attention domain has no layers"));
+        assert!(
+            error
+                .to_string()
+                .contains("managed paged-attention domain has no layers")
+        );
     }
 
     #[test]
@@ -4411,14 +4728,18 @@ mod tests {
             .expect("managed runtime");
 
         let state = manager.models.get(&model).expect("registered model");
-        assert!(state
-            .prefix_indexes
-            .values()
-            .all(|index| index.capacity_pages() == 2));
-        assert!(state
-            .coordinators
-            .values()
-            .all(|coordinator| coordinator.stats().capacity_pages == 8));
+        assert!(
+            state
+                .prefix_indexes
+                .values()
+                .all(|index| index.capacity_pages() == 2)
+        );
+        assert!(
+            state
+                .coordinators
+                .values()
+                .all(|coordinator| coordinator.stats().capacity_pages == 8)
+        );
     }
 
     fn composite_tensor_contract() -> InferenceStateContract {
@@ -4745,17 +5066,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(plan_managed_state_capacity(
-            &state_plan,
-            ModelInstanceId::new(801),
-            ManagedStateCapacityRequest {
-                total_paged_pages: 1,
-                logical_token_reach: None,
-                retained_sequence_rows: 1,
-                staged_transaction_rows: 1,
-            },
-        )
-        .is_err());
+        assert!(
+            plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(801),
+                ManagedStateCapacityRequest {
+                    total_paged_pages: 1,
+                    logical_token_reach: None,
+                    retained_sequence_rows: 1,
+                    staged_transaction_rows: 1,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5065,9 +5388,11 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("transaction rows cannot exceed retained sequence rows"));
+        assert!(
+            error
+                .to_string()
+                .contains("transaction rows cannot exceed retained sequence rows")
+        );
     }
 
     #[test]
@@ -5377,24 +5702,28 @@ mod tests {
     #[test]
     fn multi_domain_cuda_context_fitter_rejects_invalid_geometry() {
         assert!(cuda_contiguous_replacement_required_bytes(64, &[], 0).is_err());
-        assert!(cuda_contiguous_replacement_required_bytes(
-            64,
-            &[CudaContiguousPagedGeometry {
-                page_tokens: 0,
-                bytes_per_page: 1,
-            }],
-            0,
-        )
-        .is_err());
-        assert!(cuda_contiguous_replacement_required_bytes(
-            64,
-            &[CudaContiguousPagedGeometry {
-                page_tokens: 1,
-                bytes_per_page: u64::MAX,
-            }],
-            0,
-        )
-        .is_err());
+        assert!(
+            cuda_contiguous_replacement_required_bytes(
+                64,
+                &[CudaContiguousPagedGeometry {
+                    page_tokens: 0,
+                    bytes_per_page: 1,
+                }],
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            cuda_contiguous_replacement_required_bytes(
+                64,
+                &[CudaContiguousPagedGeometry {
+                    page_tokens: 1,
+                    bytes_per_page: u64::MAX,
+                }],
+                0,
+            )
+            .is_err()
+        );
     }
 
     fn prefix_request(model: ModelInstanceId, tokens: Vec<u32>) -> EngineCoreRequest {
@@ -5547,15 +5876,17 @@ mod tests {
         // target must reject prepare and restore the earlier claim.
         let mut expanded_request = request.clone();
         expanded_request.prompt_tokens = vec![1; 20];
-        assert!(manager
-            .prepare_incremental(
-                &runtime,
-                8421,
-                &session,
-                &sequence_work(0, 2),
-                Some(&expanded_request)
-            )
-            .is_err());
+        assert!(
+            manager
+                .prepare_incremental(
+                    &runtime,
+                    8421,
+                    &session,
+                    &sequence_work(0, 2),
+                    Some(&expanded_request)
+                )
+                .is_err()
+        );
         assert_eq!(manager.models[&model].capacity_claims[&session], before);
         for coordinator in manager.models[&model].coordinators.values() {
             assert_eq!(coordinator.stats().active_transactions, 0);
@@ -5925,9 +6256,11 @@ mod tests {
             .unwrap();
         let version = manager.snapshot(model, &session, domain).unwrap().version;
 
-        assert!(manager
-            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL,)
-            .is_err());
+        assert!(
+            manager
+                .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL,)
+                .is_err()
+        );
         assert_eq!(
             manager.snapshot(model, &session, domain).unwrap().version,
             version
@@ -6012,10 +6345,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restarted.session_generation, next);
-        assert!(restarted
-            .domains
-            .iter()
-            .all(|domain| domain.execution_start_tokens == 0));
+        assert!(
+            restarted
+                .domains
+                .iter()
+                .all(|domain| domain.execution_start_tokens == 0)
+        );
         assert_eq!(manager.telemetry_snapshot().prefix_hits, hits_before);
         manager.finalize(&restarted, None, false).unwrap();
     }
@@ -6093,9 +6428,11 @@ mod tests {
         }
         let runtime_before = manager.runtime_snapshot();
 
-        assert!(manager
-            .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
-            .is_err());
+        assert!(
+            manager
+                .reset_session_generation(&runtime, &session, ManagedSessionGeneration::INITIAL)
+                .is_err()
+        );
         assert_eq!(
             manager
                 .snapshot(model, &session, first_group.domain)
@@ -6303,16 +6640,20 @@ mod tests {
             .unwrap();
 
         assert!(manager.release_session(&session).is_err());
-        assert!(manager.models[&model]
-            .registered_sessions
-            .contains(&session));
+        assert!(
+            manager.models[&model]
+                .registered_sessions
+                .contains(&session)
+        );
         assert!(manager.snapshot(model, &session, domain).is_some());
 
         manager.finalize(&reservation, None, false).unwrap();
         manager.release_session(&session).unwrap();
-        assert!(!manager.models[&model]
-            .registered_sessions
-            .contains(&session));
+        assert!(
+            !manager.models[&model]
+                .registered_sessions
+                .contains(&session)
+        );
         assert!(manager.snapshot(model, &session, domain).is_none());
     }
 
@@ -6445,6 +6786,146 @@ mod tests {
         assert_eq!(snapshot.committed_tokens, 256);
         assert_eq!(snapshot.window_start, 224);
         assert!(snapshot.groups[0].blocks.len() <= 3);
+    }
+
+    #[test]
+    fn demoted_prefix_pages_promote_back_into_a_preparing_transaction() {
+        let model = ModelInstanceId::new(49);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([12; 32]));
+        manager.set_host_offload_policy(Some(HostOffloadPolicy {
+            budget_bytes: 4 << 20,
+            high_watermark: 0.85,
+            low_watermark: 0.70,
+            max_in_flight_pages: 8,
+            max_promotion_pages: 64,
+        }));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        // 353 tokens: eleven complete published pages plus one private tail
+        // token, and prompt+output fits the twelve-page arena's admission.
+        let tokens = (0..353).collect::<Vec<u32>>();
+
+        // Commit and release an eleven-page prefix: every published page keeps
+        // only its durable prefix reference, pushing the arena over the
+        // watermark (11/12 = 0.92).
+        let source_session = SessionKey::new("ds4-source".into(), 1);
+        let source = manager
+            .prepare(
+                &runtime,
+                41,
+                &source_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("source prepare")
+            .expect("source reservation");
+        manager
+            .finalize(
+                &source,
+                Some(&source.completed_write_receipt_for_test()),
+                true,
+            )
+            .expect("source commit");
+        manager.release_session(&source_session).expect("release");
+
+        // The next prepare's offload tick crosses the high watermark and
+        // demotes the whole chain; its own lookup then continues into the
+        // host tier and restores the tail into its fresh pages.
+        let resumed_session = SessionKey::new("ds4-resumed".into(), 1);
+        let resumed = manager
+            .prepare(
+                &runtime,
+                42,
+                &resumed_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("resumed prepare")
+            .expect("resumed reservation");
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.demotions_total, 11, "whole chain demoted");
+        assert_eq!(
+            manager.runtime_snapshot().counters.kv_host_pages,
+            11,
+            "host pool holds the demoted chain"
+        );
+        // Device-index telemetry only ever saw the device portion: the source
+        // prepare's cold lookup and this one (the chain is fully host-resident
+        // here). The host continuation is proven by the restored execution
+        // cursor below.
+        assert_eq!(telemetry.prefix_misses, 2);
+        assert_eq!(telemetry.reused_tokens, 0);
+        assert_eq!(
+            resumed.domains[0].execution_start_tokens, 352,
+            "execution resumes above the restored host tail"
+        );
+        assert_eq!(resumed.domains[0].writable_blocks.len(), 12);
+
+        // Commit: the restored pages publish into the device index and every
+        // host entry they replace is reclaimed (the reusable window covers
+        // all eleven pages). The executor-visible write range starts at the
+        // restored cursor, so the receipt carries the prefix-accepted shape.
+        manager
+            .finalize(
+                &resumed,
+                Some(
+                    &resumed
+                        .completed_write_receipt_for_prefix_for_test(tokens.len() as u32, 32)
+                        .expect("prefix receipt"),
+                ),
+                true,
+            )
+            .expect("resumed commit");
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.promotions_total, 11);
+        assert!(
+            telemetry.promotion_latency_ns_total > 0,
+            "promotion latency recorded"
+        );
+        assert_eq!(
+            manager.runtime_snapshot().counters.kv_host_pages,
+            0,
+            "host tier fully reclaimed at commit"
+        );
+        manager.release_session(&resumed_session).expect("release");
+
+        // Releasing the committed session leaves its published pages
+        // unreferenced over the watermark again: the cycle repeats and the
+        // next request re-promotes them. An aborted reservation leaves the
+        // host entries valid.
+        let cycle_session = SessionKey::new("ds4-cycle".into(), 1);
+        let cycle = manager
+            .prepare(
+                &runtime,
+                43,
+                &cycle_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("cycle prepare")
+            .expect("cycle reservation");
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.demotions_total, 22, "chain re-demoted");
+        assert_eq!(
+            manager.runtime_snapshot().counters.kv_host_pages,
+            11,
+            "re-demoted chain is host-resident again"
+        );
+        assert_eq!(cycle.domains[0].execution_start_tokens, 352);
+        manager.finalize(&cycle, None, false).expect("abort");
+        assert_eq!(
+            manager.runtime_snapshot().counters.kv_host_pages,
+            11,
+            "abort keeps the host entries authoritative"
+        );
     }
 
     #[test]
@@ -6671,15 +7152,17 @@ mod tests {
         if let StateDomainSpec::PagedAttention(domain) = &mut changed.domains[0] {
             domain.layers[0].kv_heads = 2;
         }
-        assert!(manager
-            .bind_request(
-                model,
-                BackendKind::Cpu,
-                2,
-                16,
-                &CacheCapability::Managed(changed),
-            )
-            .is_err());
+        assert!(
+            manager
+                .bind_request(
+                    model,
+                    BackendKind::Cpu,
+                    2,
+                    16,
+                    &CacheCapability::Managed(changed),
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -6768,20 +7251,24 @@ mod tests {
         assert!(!pending[1].publications.is_empty());
         pending[1].publications[0].block = reservation.domains[0].writable_blocks[0];
 
-        assert!(manager
-            .finalize(&reservation, Some(&receipt), true)
-            .is_err());
+        assert!(
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .is_err()
+        );
         for domain in [CacheDomainId::new(1), CacheDomainId::new(2)] {
             let snapshot = manager.snapshot(model, &session, domain).expect("snapshot");
             assert_eq!(snapshot.version, 0);
             assert_eq!(snapshot.committed_tokens, 0);
         }
-        assert!(manager
-            .runtime_snapshot()
-            .models
-            .iter()
-            .flat_map(|model| &model.arenas)
-            .all(|arena| arena.coordinator.active_transactions == 0));
+        assert!(
+            manager
+                .runtime_snapshot()
+                .models
+                .iter()
+                .flat_map(|model| &model.arenas)
+                .all(|arena| arena.coordinator.active_transactions == 0)
+        );
     }
 
     #[test]
@@ -7017,23 +7504,29 @@ mod tests {
             )
             .unwrap();
         let receipt = reservation.completed_write_receipt_for_test();
-        assert!(manager
-            .finalize(&reservation, Some(&receipt), true)
-            .is_err());
+        assert!(
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .is_err()
+        );
         assert_eq!(arena.occupancy().unwrap().active_transactions, 0);
         let sequence =
             PhysicalStateSequenceId::new(reservation.clocked_state.as_ref().unwrap().sequence())
                 .unwrap();
-        assert!(arena
-            .read(sequence, StateDomainId::new(2))
-            .unwrap()
-            .is_none());
-        assert!(manager
-            .runtime_snapshot()
-            .models
-            .iter()
-            .flat_map(|model| &model.arenas)
-            .all(|arena| arena.coordinator.active_transactions == 0));
+        assert!(
+            arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            manager
+                .runtime_snapshot()
+                .models
+                .iter()
+                .flat_map(|model| &model.arenas)
+                .all(|arena| arena.coordinator.active_transactions == 0)
+        );
     }
 
     #[test]
@@ -7093,10 +7586,12 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert!(reservation
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
+        assert!(
+            reservation
+                .domains
+                .iter()
+                .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens })
+        );
         let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
         arena
             .stage_replace(
@@ -7165,10 +7660,12 @@ mod tests {
             .prepare(&runtime, 5243, &session, &work, None)
             .unwrap()
             .unwrap();
-        assert!(reservation
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
+        assert!(
+            reservation
+                .domains
+                .iter()
+                .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens })
+        );
         let transaction = PhysicalStateTransactionId::new(reservation.txn_id).unwrap();
         arena
             .stage_replace(
@@ -7221,11 +7718,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let page_tokens = runtime.plan().groups[0].page_tokens;
-            assert!(runtime
-                .plan()
-                .groups
-                .iter()
-                .all(|group| group.page_tokens == page_tokens));
+            assert!(
+                runtime
+                    .plan()
+                    .groups
+                    .iter()
+                    .all(|group| group.page_tokens == page_tokens)
+            );
             let tensor_arena = runtime.tensor_state().unwrap().clone();
             let reservation = manager
                 .prepare(
@@ -7808,10 +8307,12 @@ mod tests {
             assert_eq!(snapshot.committed_tokens, 0);
             assert_eq!(snapshot.version, 1);
         }
-        assert!(manager.models[&model]
-            .coordinators
-            .values()
-            .all(|coordinator| coordinator.stats().active_transactions == 0));
+        assert!(
+            manager.models[&model]
+                .coordinators
+                .values()
+                .all(|coordinator| coordinator.stats().active_transactions == 0)
+        );
     }
 
     #[test]
@@ -7851,10 +8352,11 @@ mod tests {
                 .unwrap()
                 .expect("unchanged-prefix reservation");
             assert!(reservation.allow_unchanged_prefix);
-            assert!(reservation
-                .domains
-                .iter()
-                .all(|domain| { domain.target_committed_tokens == domain.execution_start_tokens }));
+            assert!(
+                reservation.domains.iter().all(|domain| {
+                    domain.target_committed_tokens == domain.execution_start_tokens
+                })
+            );
             let receipt = reservation
                 .completed_write_receipt_for_prefix(
                     &[],
@@ -7881,10 +8383,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!prompt.allow_unchanged_prefix);
-        assert!(prompt
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens - domain.execution_start_tokens == 3 }));
+        assert!(
+            prompt.domains.iter().all(|domain| {
+                domain.target_committed_tokens - domain.execution_start_tokens == 3
+            })
+        );
         let partial = prompt
             .completed_write_receipt_for_prefix_for_test(1, 8)
             .expect("partial prompt receipt");
@@ -7926,30 +8429,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!decode.allow_unchanged_prefix);
-        assert!(decode
-            .domains
-            .iter()
-            .all(|domain| { domain.target_committed_tokens - domain.execution_start_tokens == 1 }));
+        assert!(
+            decode.domains.iter().all(|domain| {
+                domain.target_committed_tokens - domain.execution_start_tokens == 1
+            })
+        );
         let decode_receipt = decode.completed_write_receipt_for_test();
         manager
             .finalize(&decode, Some(&decode_receipt), true)
             .expect("exact decode commit");
 
-        assert!(manager
-            .prepare(
-                &runtime,
-                7786,
-                &session,
-                &WorkUnit::RealtimeDecodeContinuation {
-                    operation_id,
-                    max_output_steps: 1,
-                    max_cache_append: 2,
-                    retained_state_input: crate::engine::InputRange::new(1, 2).unwrap(),
-                    auxiliary_state: None,
-                },
-                None,
-            )
-            .is_err());
+        assert!(
+            manager
+                .prepare(
+                    &runtime,
+                    7786,
+                    &session,
+                    &WorkUnit::RealtimeDecodeContinuation {
+                        operation_id,
+                        max_output_steps: 1,
+                        max_cache_append: 2,
+                        retained_state_input: crate::engine::InputRange::new(1, 2).unwrap(),
+                        auxiliary_state: None,
+                    },
+                    None,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -7994,10 +8500,12 @@ mod tests {
             assert_eq!(snapshot.committed_tokens, 0);
             assert_eq!(snapshot.version, 0);
         }
-        assert!(tensor_arena
-            .read(sequence, StateDomainId::new(2))
-            .unwrap()
-            .is_none());
+        assert!(
+            tensor_arena
+                .read(sequence, StateDomainId::new(2))
+                .unwrap()
+                .is_none()
+        );
         let state = manager.models.get(&model).unwrap();
         for coordinator in state.coordinators.values() {
             assert_eq!(coordinator.stats().active_transactions, 0);
@@ -8038,9 +8546,11 @@ mod tests {
 
         // The independently active tensor transaction forces begin() to fail
         // only after the managed session has registered its new sequence.
-        assert!(manager
-            .prepare(&runtime, 41, &session, &sequence_work(0, 1), None)
-            .is_err());
+        assert!(
+            manager
+                .prepare(&runtime, 41, &session, &sequence_work(0, 1), None)
+                .is_err()
+        );
         assert_eq!(
             arena.occupancy().unwrap(),
             crate::backends::state::TensorStateOccupancy {
@@ -8048,9 +8558,11 @@ mod tests {
                 active_transactions: 1,
             }
         );
-        assert!(!manager.models[&model]
-            .tensor_sequences
-            .contains_key(&session));
+        assert!(
+            !manager.models[&model]
+                .tensor_sequences
+                .contains_key(&session)
+        );
 
         arena.abort(conflicting_transaction).unwrap();
         arena.release(existing_sequence).unwrap();
@@ -8163,11 +8675,13 @@ mod tests {
             },
             offset: 0,
         };
-        assert!(replacement
-            .arena(replacement_group.arena)
-            .expect("replacement arena")
-            .lower_slots(&[stale])
-            .is_err());
+        assert!(
+            replacement
+                .arena(replacement_group.arena)
+                .expect("replacement arena")
+                .lower_slots(&[stale])
+                .is_err()
+        );
     }
 
     #[test]
@@ -8189,20 +8703,22 @@ mod tests {
         }
 
         let authority = authority_with_capacity(1);
-        assert!(reserve_managed_arena(
-            &authority,
-            ModelInstanceId::new(47),
-            BackendKind::Cuda,
-            managed_state_resources(
+        assert!(
+            reserve_managed_arena(
+                &authority,
+                ModelInstanceId::new(47),
                 BackendKind::Cuda,
-                StateResourceVector {
-                    device_bytes: 2,
-                    ..StateResourceVector::default()
-                },
+                managed_state_resources(
+                    BackendKind::Cuda,
+                    StateResourceVector {
+                        device_bytes: 2,
+                        ..StateResourceVector::default()
+                    },
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        )
-        .is_err());
+            .is_err()
+        );
     }
 }
 
