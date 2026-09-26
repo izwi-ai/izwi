@@ -19393,3 +19393,434 @@ Design decisions:
   703 lib + 2 process tests green. One transient pre-existing batch-runtime
   cancellation-timing flake was observed once in an unrelated module and
   passed on rerun.
+
+# Plan — DS3 Realtime voice over the worker boundary — 2026-09-25
+
+Scope (docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md DS3): versioned WebSocket
+subprotocol `izwi-realtime-v1` on the worker; realtime stage execution in
+workers reusing the atomic admission gate; gateway-side session ownership
+records; gateway relay route; mock + contract tests (T32/T33); route-migration
+ledger + support matrix; real CPU + Metal streaming-ASR evidence slices.
+
+Design decisions:
+
+- One stage per worker WS session. A realtime session binds exactly one stage
+  (ASR-stream today; TTS-stream protocol-ready) to exactly one worker. The
+  plan's "bind" event folds into admit: the admit names the expected
+  deployment + model generation, which IS the bind. Multi-stage voice = the
+  gateway composing one stage session per deployment pool plus the existing
+  remote chat dispatch.
+- Realtime sessions register in the SAME worker attempt table with the same
+  AttemptState machine. The admit carries gateway-minted request_id/attempt_id
+  (same as HTTP), so `query_attempt`/`cancel_attempt` over HTTP work
+  identically for realtime sessions, cancellation semantics are literally the
+  HTTP-path ladder (CancellationRequested -> ExecutionStopping -> terminal
+  after confirmed teardown), and one-terminal-outcome carries over.
+- Control frames: minimal new types + maximal reuse. Client->worker text
+  frames: `admit(RealtimeSessionAdmit)` (first frame, mandatory), `cancel`,
+  `ping`. Worker->client text frames: `admitted(RealtimeAdmitted)` (identity
+  echo + negotiated audio spec + session bounds), then raw `InvocationEvent`
+  JSON for the event stream (TextDelta = partial transcript, Usage,
+  Completed/Error/Cancelled terminal vocabulary unchanged).
+- Audio framing declared in the admit (`RealtimeAudioSpec`: codec, sample
+  rate, channels); binary frames carry a small header (magic, version, flags
+  with is_final, sequence) + payload. Frame-size caps, in-flight frame count,
+  and total byte budgets are enforced at the socket boundary; WS ordering
+  guarantees ordering, no reordering logic exists anywhere.
+- Worker task generalization: `IZWI_WORKER_TASK` (chat | speech_to_text |
+  text_to_speech), default chat = unchanged. Realtime-ASR workers load
+  NemotronAsr/Voxtral variants (the families with realtime stream decode);
+  warm-up becomes task-aware (chat warm-up; bounded synthetic-utterance ASR
+  warm-up). HTTP invocations on non-chat workers are rejected by the existing
+  task/capability eligibility gate before the executor is reached.
+- Descriptor advertisement: `WorkerFeature::RealtimeSocket` (additive) +
+  `capability.realtime = true` for realtime-stage workers; registry selection
+  requires the feature when the request asks for realtime.
+- Gateway preview (DS3.6 wording): gateway mode gains a realtime
+  transcription relay route behind `IZWI_GATEWAY_REALTIME=on|off` (default
+  off = byte-identical today), speaking the same public client protocol as
+  the local `/v1/speech-to-text/realtime/ws` route so clients point at a
+  gateway transparently. Bounded session registry maps session -> (worker,
+  incarnation, deployment generation, stage lease); owner loss emits an
+  explicit interruption event; reconnect = new session, no resume.
+- Stage accounting: each stage session takes its own registry reservation +
+  permit; the relay never holds one stage's permit while awaiting another
+  stage's admission (no two-stage permit deadlock, plan section 10.4).
+- ASR-stream first: DS3.7's real-evidence core is streaming ASR through the
+  subprotocol on CPU and Metal. TTS-stream worker execution follows once the
+  ASR surface is green end-to-end; the protocol types fit TTS from the start.
+
+Items:
+
+- [ ] Protocol: `realtime.rs` wire contract (admit/admitted/cancel/ping
+      frames, audio codec, bounds constants, encode/decode with cap
+      enforcement); `WorkerFeature::RealtimeSocket`; `InputFormat::Text`
+- [ ] Worker: task-aware `WorkerProcessConfig` + deployment construction +
+      task-aware warm-up
+- [ ] Worker: `/internal/v1/realtime` WS route — auth, subprotocol
+      negotiation, admission through the atomic gate + attempt table, ASR
+      stage runtime (start/push/finish, deltas as InvocationEvents),
+      cancellation ladder, teardown-fenced permit, session bounds
+- [ ] Client: bounded realtime WS session transport (loopback/TLS rules,
+      deadlines, one-terminal-outcome enforcement)
+- [ ] Mock: realtime endpoint with fault knobs (cadenced audio, disconnect
+      mid-stream, stale incarnation, cancel races)
+- [ ] Contract tests (T32/T33): ordering, bounds, one terminal outcome,
+      owner-loss interruption, stale incarnation
+- [ ] Gateway: bounded session registry + realtime relay route + ASR pool
+      selection + flag; process-test leg through the real gateway binary
+- [ ] Evidence: real CPU worker and real Metal worker executing streaming
+      ASR through the subprotocol with a small fixture; route-migration
+      ledger + support matrix updates; plan checkbox + review section
+
+## DS3 session — result (2026-09-25)
+
+All 7 items executed. Commits: b1d8bd95 (protocol contract), d7769f3b
+(worker task-aware + realtime WS route), ca436599 (client session
+transport), 54451a90 (mock realtime + T32/T33 contract tests), e238bd4a
+(gateway relay + registry + flag), 89ba42a5 (Nemotron direct-path fix +
+evidence test), ca133a41 (docs/evidence records).
+
+- [x] 1. Protocol: `izwi-realtime-v1` wire contract (admit/admitted/
+      cancel/ping, PCM i16 LE audio spec, 16-byte binary frame codec with
+      hard caps, 4xxx close codes), `WorkerFeature::RealtimeSocket`,
+      `InputFormat::PcmAudio`, protocol minor 2.
+- [x] 2. Worker task dimension: `IZWI_WORKER_TASK` (chat default unchanged,
+      text_to_speech rejected), Nemotron/Voxtral-family gating for ASR
+      workers, task-aware warm-up (chat warm-up; bounded synthetic-utterance
+      ASR warm-up fails boot closed), task-aware deployment advertisement.
+- [x] 3. Worker `/internal/v1/realtime`: auth/subprotocol/drain fencing
+      before upgrade, admission through the atomic gate + shared attempt
+      table (HTTP query/cancel parity), Accepted-first sequenced event
+      stream, cancellation ladder, teardown-fenced permit, session bounds
+      enforced at the socket boundary and configurable via
+      `WorkerConfig.realtime_session_limits`. `RealtimeStageRunner`/
+      `RealtimeAsrStageStream` traits keep the session layer engine-
+      independent (boxed opaque stream handles; fakes in tests).
+- [x] 4. Client transport (`izwi_serving_client::realtime`): shared endpoint
+      rules (extracted `validated_session_endpoint`), subprotocol +
+      credential headers, admitted-echo validation, monotonic client-
+      sequenced audio with admitted-bounds enforcement, one-terminal-outcome
+      validation, all awaits deadline-bounded.
+- [x] 5. Mock: `MockRealtimeKnobs` (cadence, disconnect_after_frames owner
+      loss), same fencing codes as the real worker, shared attempt table.
+- [x] 6. Contract tests T32/T33: 12 worker session tests + 8 client-mock
+      tests over real sockets (ordering, bounds, one terminal, owner loss,
+      stale incarnation, duplicate, capacity, drain, HTTP-cancel parity).
+- [x] 7. Gateway: `/v1/realtime/ws` behind `IZWI_GATEWAY_REALTIME=on|off`
+      (default off; pinned mode rejects), bounded `RealtimeSessionRegistry`
+      (dup/full/TTL), realtime worker selection (fails boot closed without
+      an approved speech_to_text deployment), gateway-minted attested caller
+      (client caller claims ignored), client ids passed through, one tenant
+      lease + one dispatch slot per stage session (no two-stage deadlock),
+      verbatim frame relay, owner-loss interruption event, process test leg
+      through the real gateway binary with two approved mock workers.
+- [x] 8. Evidence: CPU + Metal lanes through the real worker binary with the
+      real Nemotron artifact (36 fox.wav frames each → "The quick brown fox
+      jumps.", one terminal, clean close, HTTP-resolvable attempt). Docs:
+      plan DS3.1-3.7 checked, ledger row, runbook preview section, support
+      matrix Nemotron row. tasks/ stays untracked.
+
+Key finding: the DS3.7 evidence run exposed a real regression from 7215003a —
+Nemotron ASR was routed through Engine realtime admission that requires paged
+state, while Nemotron publishes retained tensor state; the single-node server
+had silently degraded to chunked fallback since then. Fixed by restoring the
+direct native streaming path for the family (worker fail-closed warm-up is
+what surfaced it — the fail-closed design did its job).
+
+Verification: protocol 33/33, worker lib 14/14 + bin 5/5 + realtime_ws 12/12
++ process suites, client lib 7/7 + http_contract 23/23 + realtime_contract
+8/8, izwi-core lib 2647/2647, izwi-server lib 705/705 + gateway process 3/3
+(incl. the realtime relay leg), clippy clean on touched code, rustfmt clean.
+
+Next: DS3 follow-ups (TTS-stream stage execution, public transcription-
+realtime envelope translation for transparent client repointing), then DS4.
+
+## TTS-stream stage session — plan (2026-09-26)
+
+Continuing the DS3 review's follow-ups: realtime **TTS-stream stage execution**
+on workers (the DS3.2 "rejected until implemented" arm), before the public
+transcription-realtime envelope translation and DS4.
+
+Contract decisions (recorded before implementation):
+
+- **No protocol change.** Protocol minor 2 is already stage-symmetric:
+  `RealtimeStageInput::TextStream` (task `text_to_speech`), client
+  `Input { text }` frames (worker reader already bounds them at
+  `MAX_REALTIME_INPUT_TEXT_BYTES`), `Admitted.output_audio` announcing the
+  synthesized stream spec, symmetric IRTA binary codec, 4xxx close codes.
+- **Stage semantics:** the client accumulates the utterance with `Input`
+  frames (cumulative bytes charged against the same session byte budget ASR
+  uses for audio); `Finish` commits synthesis. Empty text finish mirrors
+  ASR's empty-transcript finish: success with zero audio. Audio streams out
+  as binary IRTA frames (worker-side monotonic sequence from 1, final flag on
+  the last frame) while the model synthesizes — genuinely incremental for
+  Fish S2 (intra-utterance) and Kokoro (per sentence chunk), one final chunk
+  for final-only families; execution representation is recorded honestly per
+  family. One terminal outcome (`Completed`, usage omitted — no TTS token
+  metering exists), then a clean 1000 close. Cancellation ladder identical to
+  ASR (client Cancel, HTTP cancel_attempt through the shared attempt table,
+  deadline, outbound-closed → ExecutionStopping → Cancelled). Input after
+  Finish and double Finish are InvalidInput failures.
+- **Worker execution:** new `RealtimeTtsStageStream` trait (synthesize →
+  bounded chunk receiver) + `RuntimeRealtimeTtsExecutor`/runner wrapping
+  `RuntimeService::generate_streaming` (f32 → i16 LE via the AudioEncoder
+  RawI16 rule). `IZWI_WORKER_TASK=text_to_speech` un-banned: config validate,
+  descriptor features (`RealtimeSocket`, input Text / output PcmAudio),
+  task-aware TTS warm-up (bounded short-text synthesis, fails boot closed),
+  route gate accepts TTS sessions, `Admitted.output_audio` resolved from the
+  loaded model's rate.
+- **Client transport:** `send_text`, `next_audio` (decode IRTA, monotonic
+  sequences, per-frame + session byte bounds), `output_audio` surfaced on the
+  admission; bounded demux queues so events and audio interleave; binary
+  frames remain a protocol error for AudioStream admits. Mock worker gains a
+  deterministic TTS script (`realtime_tts` knobs) and can advertise a
+  text_to_speech realtime deployment.
+- **Gateway relay:** the relay learns a second, optional stage — boot selects
+  the `text_to_speech` pool by the same public model (absent pool keeps boot
+  green; a TTS admit then closes PolicyDenied instead of the current silent
+  drop), the pump forwards `Input` frames downstream and worker binary frames
+  upstream verbatim, selection requests are per-stage
+  (Text/PcmAudio/streaming/realtime). Stage leases stay per-session (no
+  two-stage permit held — plan §10.4 unchanged).
+- **Evidence:** real CPU + Metal workers running the real Kokoro-82M artifact
+  (staged symlinks + generated manifest, same pattern as the ASR evidence)
+  through the subprotocol: audio frames arrive, final flag lands, one
+  terminal, clean close, attempt resolvable over HTTP. Fish S2
+  intra-utterance streaming stays covered by izwi-core's own ignored GPU
+  smoke test and is not claimed by this evidence.
+- **Verification:** fmt + clippy -D warnings on touched crates; protocol,
+  worker (lib/bin/realtime_ws), client (lib/http_contract/realtime_contract
+  under mock-worker), izwi-server lib + gateway process suites; boundary gate
+  if any Cargo.toml changes. tasks/ stays untracked (DS3 practice).
+
+Items:
+
+- [ ] Worker: TTS stage traits + runtime executor/runner/stream + session
+      loop + parse/config/descriptor/warm-up gating + realtime_ws tests
+- [ ] Client: send_text/next_audio/output_audio + mock TTS knobs +
+      realtime_contract tests
+- [ ] Gateway: optional TTS stage pool, per-stage selection, pump paths,
+      close-instead-of-drop, process test leg
+- [ ] Evidence: ignored real-artifact TTS test, CPU + Metal runs recorded
+- [ ] Docs: plan checkboxes, ledger row, support matrix, runbook; session
+      review below
+
+## TTS-stream stage session — result (2026-09-26)
+
+All 5 items executed. Commits: 383c9b50 (worker stage execution), 572db937
+(client transport + mock TTS), 49fb6281 (gateway relay TTS pool + process
+test), 4a3490e2 (real CPU+Metal evidence + warm-up hardening), plus docs.
+
+- [x] Worker: `RealtimeTtsStageStream` (synthesize → bounded chunk receiver,
+      drop = teardown confirmation) + `RuntimeRealtimeTtsExecutor`/runner over
+      `RuntimeService::generate_streaming` (max_tokens 0 mirrors the
+      single-node voice route); session loop accumulates `Input` frames
+      (session byte budget), commits on `Finish`, streams IRTA frames
+      (chunk splitting at the frame cap, final flag on the terminal frame,
+      full outbound queue = lost peer); parse/config/descriptor/warm-up
+      gating un-banned `text_to_speech` with a fail-closed TTS-family gate.
+- [x] Client: `send_text` (per-frame + session text budget enforced
+      pre-write), `next_audio` (IRTA decode, per-frame bounds, monotonic
+      receive sequences), `output_audio` surfaced on the admission (required
+      for text-stream admits), bounded demux queues between
+      `next_event`/`next_audio`; mock `realtime_tts` knobs + 8 new
+      contract tests (16 total in realtime_contract).
+- [x] Gateway: relay resolves the admit's task to the optional
+      text_to_speech pool, forwards Input frames downstream and worker
+      binary frames upstream verbatim, missing stage → explicit PolicyDenied
+      close (was: silent drop), boot fails closed only when NO realtime
+      stage has a pool; process test leg through the real binary.
+- [x] Evidence: `real_cpu_realtime_tts.rs` (ignored, env-gated) — CPU lane
+      133,200 bytes (2.77 s @ 24 kHz) in 41 s; Metal lane identical output
+      in 8 s; non-silence asserted; attempt Completed over HTTP both lanes.
+      New ignored izwi-core Kokoro streaming smoke documents the
+      direct-streaming chunk shape.
+- [x] Docs: plan DS3.8 checked, ledger "Realtime TTS" row, support matrix
+      Kokoro row (other TTS families honestly marked no real-artifact
+      evidence), runbook preview section (per-stage pools, per-stage
+      fail-closed boot semantics). tasks/ stays untracked.
+
+Key findings:
+
+- **Direct-streaming TTS families break the "empty terminal chunk"
+  assumption**: `RuntimeService::generate_streaming` for Kokoro delivers the
+  whole utterance as ONE chunk carrying `is_final: true` (the engine path's
+  separate empty terminal-stats chunk does not exist there). The first
+  evidence run's zero-audio failure was my test accounting, not synthesis.
+  Consumers must treat payload-bearing final frames as normal. The TTS
+  warm-up was hardened accordingly (requires actual PCM, not just a terminal
+  marker — a marker alone would have let a silently-dead synthesis path
+  boot a "ready" worker).
+- **reader.abort() with buffered inbound frames turned the orderly WS close
+  into a TCP reset** that could cost the client its terminal event (exposed
+  by the TTS HTTP-cancel test; the same latent wart existed for ASR).
+  Sessions now drain the reader through the close handshake; abort is only
+  a backstop.
+- The relay's per-stage boot rule changed: `IZWI_GATEWAY_REALTIME=on` now
+  requires an approved speech_to_text OR text_to_speech deployment (both
+  optional individually; a missing stage refuses its admits at session
+  time). The gateway_process test for TTS caught the old hard ASR
+  requirement immediately.
+- Kokoro CPU synthesis is slow (RTF ≈ 15-18: a 2.8 s utterance takes ~40-50
+  s); Metal is ~5× faster end to end. Session budgets must account for this
+  per family; evidence used a 5-minute budget.
+- Verification: protocol 33/33; worker lib 14 + bin 5 + realtime_ws 24 +
+  process suites; client lib 7 + http_contract 23 + realtime_contract 16;
+  izwi-server lib 705/705 + gateway process 4/4; clippy clean on all new
+  code (pre-existing denies verified unchanged via stash comparison); fmt
+  clean; boundary gate passed. One mid-verification failure of the
+  documented pre-existing batch_runtime cancellation-timing flake
+  (cancellation_retains_capacity_until_non_cooperative_executor_teardown,
+  worker.rs:2269) under full-suite parallel load: 3/3 green in isolation,
+  untouched code path, full suite green on rerun — same flake the DS0.5
+  session recorded.
+
+Next: public transcription-realtime envelope translation (transparent
+client repointing), then DS4 (hierarchical KV offload).
+
+## Public transcription-realtime envelope translation (DS3.4 deferred item) — plan (2026-09-26)
+
+Goal: a client of the single-node `/v1/speech-to-text/realtime/ws` surface can
+repoint at the gateway `/v1/realtime/ws` unchanged: the gateway translates the
+public transcription-realtime envelope (legacy `transcription_realtime_v2` and
+typed `transcription_realtime` v3) onto the internal `izwi-realtime-v1` worker
+subprotocol. Clients offering `izwi-realtime-v1` keep the byte-identical
+passthrough relay. Scope is the transcription (ASR) surface only; a public
+TTS/voice-envelope translation stays deferred with the voice surface.
+
+- [x] Shared plumbing: extract `pub(crate)` helpers from realtime_relay.rs
+      (selection request, attested caller, worker dial, session guard, client
+      close) so the translator reuses them; passthrough behavior unchanged.
+- [x] Translator module `app/realtime_translate.rs`: route dispatch on
+      subprotocol offer; v2/v3 negotiation (resume rejected); admission
+      deferred to the first audio frame (public envelope carries sample_rate
+      per ITRW frame; the admit needs a concrete spec); ITRW → IRTA re-encode
+      with client frame_seq; incremental-delta accumulation with
+      replace-on-terminal final (worker contract: last pre-terminal delta is
+      the full final text); v2 transcript_partial/session_done and v3
+      TranscriptPartial/TranscriptFinal/Closing/Closed envelopes; local ping
+      answers; owner-loss and error mapping; registry entry + session budget
+      identical to v1 mode.
+- [x] Unit tests: ITRW parse/spec lock/seq regression; accumulate vs
+      replace-on-terminal; v2 golden shapes; v3 envelope golden shape +
+      finality order; negotiation accept/reject; audio-gap detection.
+- [x] Process test through the real gateway binary: public v2 client leg
+      (no subprotocol: session_start → ITRW frames → ping → session_stop)
+      and v3 leg (envelope order + finality), mirroring the v1 relay test.
+- [x] Docs: plan DS3.4 note, ledger row, support matrix / runbook mentions.
+- [x] Verification: izwi-server lib + gateway process suites, clippy/fmt on
+      new code; session review appended below.
+
+### Review (2026-09-26)
+
+Delivered in commit 4e121999. State on resume was exactly as the prior
+session's memory recorded: plumbing diff verified visibility-only
+(`pub(crate)` on RelayStage/SessionGuard/WorkerSide/WorkerDialError, the
+shared helpers, ITRW consts/ClientEvent/BinaryMessageKind/
+TranscriptionWireProtocol/negotiate/parse_binary_message, plus the new
+`registry()` accessor and `SessionGuard::new`); no translator existed.
+
+Implementation notes and deviations worth remembering:
+
+- The registry's `insert`/`remove` and `reject_client` needed `pub(crate)`
+  on top of the prior session's plumbing list (translator calls both);
+  `RealtimeSessionRegistry::insert/remove` were module-private.
+- Two-phase pump: phase one (no worker) handles negotiation/local lifecycle
+  and dials on the first accepted audio frame, then breaks into the
+  relay-style select loop. The relay's disjoint-field-borrow pattern
+  (`worker.sink.send` in the action arm vs `worker.source.next()` in the
+  select) only works with a non-Option `WorkerSide`, which is why the dial
+  happens in phase one and phase two owns a plain `WorkerSide`.
+- Delta translation uses one-delta hold-back (`TranscriptAccumulator`): the
+  newest delta is provisional until the next delta folds it into the
+  accumulated partial or the terminal resolves it as the full final text.
+  This avoids emitting a garbage partial that concatenates the accumulated
+  fragments with the authoritative final.
+- v2 sessions whose worker never sent audio get plain `session_done` (no
+  empty final partial), mirroring the single-node legacy surface; v3 always
+  emits the final/closing/closed ladder (mirrors `send_session_finished`).
+- `session_stop` after the worker is dialed forwards `Finish` and the pump
+  waits for the worker terminal (session_done/final arrive after it);
+  client audio after stop is ignored (the single-node surface stops
+  reading, and the worker's Finish contract ends its input stage).
+- Duplicate `session_start` errors instead of restarting the session (the
+  single-node surface silently restarts; restarting a dialed worker session
+  is out of scope and UIs send it once).
+- Unconfigured ASR stage closes PolicyDenied at `session_start` (mirrors
+  the v1 relay refusing admits for an unconfigured stage); the client's
+  `model_id` hint is dropped — the gateway routes by approved deployment.
+- The 400-on-missing-subprotocol response in `relay_socket` is gone
+  (replaced by the translator dispatch); no test pinned it, confirmed.
+- The support matrix was deliberately left unchanged: it records per-lane
+  model evidence, and the translator adds none — same precedent as DS3.6
+  (ledger + runbook carry the gateway feature).
+
+Evidence: 9 unit tests in `realtime_translate` (accumulator hold-back and
+replace-on-terminal, ITRW→IRTA re-encode + malformed rejection, sample-rate
+lock, gap detection, v3 golden shape + finality order, v2 partial JSON
+shape, negotiation, error-code mapping) and two process tests through the
+real gateway binary — public v2 client at the alias path (session_ready →
+session_started → accumulating partials → local pong → final partial with
+`is_final` + session_done → close 1000) and public v3 client (legacy
+announcement, SessionReady/SessionStarted, AudioAccepted echoing client
+sequences, AudioGap (3→4) on a skipped frame, accumulating partials,
+TranscriptFinal → Closing → Closed with strict sequence/event-id
+continuity, close 1000). Suites: izwi-server lib 714/714, gateway process
+6/6, clippy clean on touched files, fmt clean.
+
+Next: DS4 (hierarchical KV offload), or the public realtime-voice envelope
+translation (stays deferred with the voice surface).
+
+---
+
+## DS4 — Hierarchical KV offload (GPU→host) — session 2026-09-26
+
+Plan approved (plan mode). Explicit opt-in engagement (user decision).
+Scaffolding: `kv/residency.rs` state machine (unused, reserved), `PlacementPolicy::BackendLocalWithHostOffload`
+validates Host placement (`kv/v2/resolved.rs:541`), coordinator `pin_transfer`/`unpin_transfer`
++ `BlockSlot.transfer_pins`, prefix eviction truncates chains from LRU position (`prefix.rs:242,266`).
+
+- [x] DS4.1 Design note: ADR 0004 + `docs/dev/DS4_KV_OFFLOAD_DESIGN.md` (commit 39c62ca9)
+- [x] Substrate (commit b955f69f): supervisor key + env + EngineConfig knobs + KvHostPool + telemetry
+- [x] Physical capture/restore (commit 319c3235): KvArena::capture_page/restore_page + page_transfer codec
+- [x] DS4.2 Demotion (commit 3cf8278a): offload.rs demote_step, manager tick, budget charge, 5 tests
+- [x] DS4.3 counters end-to-end (commit 08386cd6): Prometheus + LoadedDeployment + mock knobs + protocol tests
+- [x] DS4.3 Promotion core (commit ebc8597a): host-aware lookup (`lookup_longest_with_host`,
+      digest chain complete across the tier boundary, promotion ceiling inside the shared
+      helper so probe and prepare truncate identically); prepare restore hook after
+      zero/copy with pending promotion records; publication starts at the device-resident
+      boundary so restored pages bind at commit; finalize unions restored pages into the
+      write receipt and reclaims host entries at commit while aborts leave them valid;
+      failure truncates (cursor-lost re-plan with an admission cursor, silent cold tail
+      without); managed-layer cycle test (demote→restore→commit→reclaim→re-demote→abort)
+- [x] DS4.4 Acceptance (commit 8fe04ada): engine-level `ds4_host_offload.rs` (concurrent
+      shared-prefix sessions, undersized arena, greedy replay byte-identical to cold,
+      demotion/promotion/budget counters); two DS4.2 gaps surfaced and fixed: pool budget
+      now inside the model's load-time resource authorization, and host continuation now
+      covers snapshot-sharing arenas (page_digests extended; DS1.5 regression still green)
+- [x] DS4.5 Evidence (commits bench rig + 5a2a7544 docs): `run-ds4-offload-benchmark.sh`
+      (DS2 rig shape, off/on legs, sequential trailer because concurrency keeps the chain
+      referenced); worker Prometheus gained the DS4 counters (were missing entirely);
+      CPU on-leg demotions=10 promotions=8 host_pages=2, Metal 7/3/4, budget respected;
+      reuse degrades on-legs (fixture watermarks churn — documented); plan flips, runbook
+      section, support-matrix offload cells, delivery-report rows, design-note deviations
+
+Env: DEVELOPER_DIR=/Library/Developer/CommandLineTools + CXXFLAGS per memory; rustfmt on leaf
+files only (rustfmt on managed.rs recursed into managed_stress.rs — revert); one server +
+one loaded model at a time; metal benchmark build overwrites target/debug worker (bare
+cargo test rebuilds without metal).
+
+### Review
+
+DS4 is complete. Verified at HEAD: izwi-core lib 2664 green (incl. 9 offload unit tests
++ the managed cycle test), worker suites green (lib/bin/backend_parity/ds4_host_offload/
+prefix_attach_repro/real_cpu_process/realtime_ws), mock-worker contract 23 green. The
+benchmark rig passes both lanes with hard gates; CUDA recorded not run. Deviations are
+recorded in the design note §9. Engine-test gotchas: LFM2 declares PrefixPolicy::Disabled
+(so the hybrid fixture is the DS4 engine-test vehicle); test futures must be heap-collected
+(join_all over an inline array::map overflowed the test stack); fixture-scale watermarks
+are the calibration lever for the tiny arena.
+
+Next: DS0.7 packaging evidence / remaining DS0 items, or DS5 multi-gateway durability.
+CUDA offload stays not run until hardware.
