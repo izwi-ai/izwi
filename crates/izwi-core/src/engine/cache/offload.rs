@@ -386,6 +386,9 @@ pub(crate) fn lookup_longest_with_host(
     if digests.is_empty() {
         return Ok(matched);
     }
+    // The digest chain stays complete across the tier boundary so snapshot
+    // reconciliation can walk the match back through host-resident pages.
+    matched.page_digests.extend(digests.iter().copied());
     let tail_tokens = u32::try_from(digests.len() * page)
         .ok()
         .and_then(|tokens| matched.reused_tokens.checked_add(tokens))

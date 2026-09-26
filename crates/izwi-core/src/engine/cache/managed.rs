@@ -1154,11 +1154,33 @@ impl ManagedKvCacheManager {
         // one-time observation. Reserve the worst contiguous-replacement peak
         // before Ready publication so later request/workspace allocations
         // cannot consume memory required by lazy KV growth.
-        let authorization = if backend == BackendKind::Cuda {
+        //
+        // DS4: the host pool's byte ceiling is part of the model's durable
+        // envelope, so the lease authorizes it up front (same charge shape as
+        // the materialization below) and the load-time charge cannot exceed
+        // the reservation. The supervisor has already validated the budget
+        // against the assignment's host/shared limit.
+        let mut authorization = if backend == BackendKind::Cuda {
             cuda_managed_state_peak_authorization(resources, &plan.groups)?
         } else {
             resources
         };
+        if let Some(policy) = self
+            .host_offload_policy
+            .filter(|_| self.max_prefix_cache_pages > 0)
+        {
+            let charge = match backend {
+                BackendKind::Metal => ResourceVector {
+                    unified_bytes: ResourceAmount::Known(policy.budget_bytes),
+                    ..ResourceVector::zero()
+                },
+                _ => ResourceVector {
+                    host_bytes: ResourceAmount::Known(policy.budget_bytes),
+                    ..ResourceVector::zero()
+                },
+            };
+            authorization = authorization.checked_add(charge)?;
+        }
         let resource_lease = self
             .resource_authority
             .as_ref()
@@ -1426,23 +1448,12 @@ impl ManagedKvCacheManager {
             if !prefix_enabled_for_domain(&state.contract, group.domain) {
                 continue;
             }
-            // DS4: snapshot-sharing arenas keep device-only semantics — their
-            // attach reconciliation walks the matched digests as a complete
-            // page chain, which a host tail (restored only at prepare) would
-            // not satisfy.
-            let host_continuation = !state.tensor_snapshots.as_ref().is_some_and(|sharing| {
-                sharing.paged_arena == group.arena && sharing.policy.paged_domain == group.domain
+            let chain = state.host_offload.as_mut().and_then(|offload| {
+                offload
+                    .arenas
+                    .get_mut(&group.arena)
+                    .map(|arena| &mut arena.chain)
             });
-            let chain = if host_continuation {
-                state.host_offload.as_mut().and_then(|offload| {
-                    offload
-                        .arenas
-                        .get_mut(&group.arena)
-                        .map(|arena| &mut arena.chain)
-                })
-            } else {
-                None
-            };
             let prefix_index = state.prefix_indexes.get_mut(&group.arena).ok_or_else(|| {
                 Error::InferenceError(
                     "resolved arena has no prefix index for the prefix probe".into(),
@@ -1601,14 +1612,8 @@ impl ManagedKvCacheManager {
                     telemetry,
                 ) {
                     Ok(DemoteOutcome::Demoted { .. }) => steps -= 1,
-                    Ok(other) => {
-                        eprintln!("DS4DBG step outcome {:?}", other);
-                        break;
-                    }
-                    Err(error) => {
-                        eprintln!("DS4DBG step error {error}");
-                        break;
-                    }
+                    Ok(_) => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -1883,85 +1888,64 @@ impl ManagedKvCacheManager {
                         && domain_sequence_input
                             .is_some_and(|input| input.start == *cursor as usize)
                 });
-            let mut prefix_match = if prefix_eligible
-                && session_generation == ManagedSessionGeneration::INITIAL
-            {
-                if let Some(namespace) = namespace.as_ref() {
-                    let reusable_tokens =
-                        usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
-                    let snapshot_shared_arena =
-                        snapshot_sharing
-                            .as_ref()
-                            .is_some_and(|(policy, paged_arena, _)| {
-                                *paged_arena == group.arena && policy.paged_domain == group.domain
-                            });
-                    let host_chain = if snapshot_shared_arena {
-                        None
-                    } else {
-                        state.host_offload.as_mut().and_then(|offload| {
+            let mut prefix_match =
+                if prefix_eligible && session_generation == ManagedSessionGeneration::INITIAL {
+                    if let Some(namespace) = namespace.as_ref() {
+                        let reusable_tokens =
+                            usize::try_from(target_committed_tokens - 1).unwrap_or(usize::MAX);
+                        let host_chain = state.host_offload.as_mut().and_then(|offload| {
                             offload
                                 .arenas
                                 .get_mut(&group.arena)
                                 .map(|arena| &mut arena.chain)
-                        })
-                    };
-                    let prefix_index = state
-                        .prefix_indexes
-                        .get_mut(&group.arena)
-                        .expect("resolved arena has a prefix index");
-                    managed_prefix_lookup(
-                        prefix_index,
-                        host_chain,
-                        group.page_tokens,
-                        namespace,
-                        &request
-                            .expect("prefix namespace requires a request")
-                            .prompt_tokens[..reusable_tokens],
-                        host_page_ceiling,
-                    )?
-                } else {
-                    self.telemetry.record_prefix_rejection();
-                    Default::default()
-                }
-            } else if let Some(cursor) = expected_attach_cursor {
-                if let Some(namespace) = namespace.as_ref() {
-                    let reusable_tokens = cursor as usize;
-                    let snapshot_shared_arena =
-                        snapshot_sharing
-                            .as_ref()
-                            .is_some_and(|(policy, paged_arena, _)| {
-                                *paged_arena == group.arena && policy.paged_domain == group.domain
-                            });
-                    let host_chain = if snapshot_shared_arena {
-                        None
+                        });
+                        let prefix_index = state
+                            .prefix_indexes
+                            .get_mut(&group.arena)
+                            .expect("resolved arena has a prefix index");
+                        managed_prefix_lookup(
+                            prefix_index,
+                            host_chain,
+                            group.page_tokens,
+                            namespace,
+                            &request
+                                .expect("prefix namespace requires a request")
+                                .prompt_tokens[..reusable_tokens],
+                            host_page_ceiling,
+                        )?
                     } else {
-                        state.host_offload.as_mut().and_then(|offload| {
+                        self.telemetry.record_prefix_rejection();
+                        Default::default()
+                    }
+                } else if let Some(cursor) = expected_attach_cursor {
+                    if let Some(namespace) = namespace.as_ref() {
+                        let reusable_tokens = cursor as usize;
+                        let host_chain = state.host_offload.as_mut().and_then(|offload| {
                             offload
                                 .arenas
                                 .get_mut(&group.arena)
                                 .map(|arena| &mut arena.chain)
-                        })
-                    };
-                    let prefix_index = state
-                        .prefix_indexes
-                        .get_mut(&group.arena)
-                        .expect("resolved arena has a prefix index");
-                    managed_prefix_lookup(
-                        prefix_index,
-                        host_chain,
-                        group.page_tokens,
-                        namespace,
-                        &request
-                            .expect("prefix namespace requires a request")
-                            .prompt_tokens[..reusable_tokens],
-                        host_page_ceiling,
-                    )?
+                        });
+                        let prefix_index = state
+                            .prefix_indexes
+                            .get_mut(&group.arena)
+                            .expect("resolved arena has a prefix index");
+                        managed_prefix_lookup(
+                            prefix_index,
+                            host_chain,
+                            group.page_tokens,
+                            namespace,
+                            &request
+                                .expect("prefix namespace requires a request")
+                                .prompt_tokens[..reusable_tokens],
+                            host_page_ceiling,
+                        )?
+                    } else {
+                        Default::default()
+                    }
                 } else {
                     Default::default()
-                }
-            } else {
-                Default::default()
-            };
+                };
             if let Some(cursor) = expected_attach_cursor {
                 // The attach must reconcile the same snapshot boundary the
                 // probe verified; a shorter realized cursor means the shared
@@ -4106,10 +4090,9 @@ fn validate_sliding_contract(
 }
 
 /// DS4: the longest committed prefix for one arena, continuing past the
-/// device index into the host chain when the arena carries a host tail.
-/// Snapshot-sharing paged arenas are excluded by the caller: their attach
-/// reconciliation requires the matched digests to be a fully device-resident
-/// chain, and host pages only become device-resident at prepare.
+/// device index into the host chain when the arena carries a host tail. The
+/// digest chain stays complete across the tier boundary, so snapshot
+/// reconciliation can walk a match back through host-resident pages.
 fn managed_prefix_lookup(
     prefix_index: &mut CoordinatedPrefixIndex,
     host_chain: Option<&mut offload::HostChainIndex>,

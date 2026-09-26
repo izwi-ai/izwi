@@ -351,6 +351,11 @@ fn lookup_continues_from_the_device_index_into_the_host_chain() {
     assert_eq!(tail.device_end_tokens, 0);
     assert_eq!(tail.digests, vec![keys[0].digest(), keys[1].digest()]);
     assert_eq!(tail.slots.len(), 2);
+    assert_eq!(
+        matched.page_digests,
+        vec![keys[0].digest(), keys[1].digest()],
+        "the digest chain stays complete across the tier boundary"
+    );
 }
 
 #[test]
