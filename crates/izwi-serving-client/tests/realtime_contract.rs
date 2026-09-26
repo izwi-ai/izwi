@@ -7,7 +7,7 @@
 use futures::StreamExt;
 use izwi_serving_client::realtime::{connect, RealtimeClientConfig, RealtimeClientError};
 use izwi_serving_client::{
-    mock::{MockRealtimeKnobs, MockWorker, MockWorkerConfig},
+    mock::{MockRealtimeKnobs, MockTtsRealtimeKnobs, MockWorker, MockWorkerConfig},
     WorkerClient, WorkerClientConfig,
 };
 use izwi_serving_protocol::*;
@@ -34,6 +34,15 @@ fn realtime_config(knobs: MockRealtimeKnobs) -> MockWorkerConfig {
         deployment_id: id("mock-asr-v1"),
         public_model: id("mock-asr"),
         realtime: Some(knobs),
+        ..MockWorkerConfig::default()
+    }
+}
+
+fn tts_config(knobs: MockTtsRealtimeKnobs) -> MockWorkerConfig {
+    MockWorkerConfig {
+        deployment_id: id("mock-tts-v1"),
+        public_model: id("mock-tts"),
+        realtime_tts: Some(knobs),
         ..MockWorkerConfig::default()
     }
 }
@@ -379,4 +388,295 @@ async fn realtime_endpoint_rejects_missing_subprotocol_and_denies_policy() {
 
     // Keep the used worker alive until the end of the test.
     let _ = futures::stream::iter(vec![worker]).next().await;
+}
+
+// ---------------------------------------------------------------------------
+// TTS-stream stage: text in, synthesized audio out (protocol minor 2).
+// ---------------------------------------------------------------------------
+
+fn tts_admission(session: &'static str, attempt: &'static str) -> RealtimeSessionAdmit {
+    RealtimeSessionAdmit {
+        schema_version: PROTOCOL_V1,
+        session_id: id(session),
+        request_id: id("request-1"),
+        attempt_id: id(attempt),
+        expected_worker_incarnation: id("mock-incarnation-1"),
+        deployment_id: id("mock-tts-v1"),
+        expected_model_generation: ModelGeneration::new(1).unwrap(),
+        caller: GatewayAttestedCallerContext {
+            tenant_id: id("tenant-1"),
+            caller_id: id("caller-1"),
+            policy_revision: id("policy-1"),
+            permitted_actions: BTreeSet::from([PermittedAction::Invoke]),
+            allowed_data_regions: vec!["local".into()],
+        },
+        task: TaskKind::TextToSpeech,
+        service_class: ServiceClass::Realtime,
+        remaining_time_ms: 10_000,
+        input: RealtimeStageInput::TextStream,
+    }
+}
+
+#[tokio::test]
+async fn tts_session_streams_audio_frames_and_ends_with_one_terminal() {
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+        chunk_bytes: 16,
+        chunk_count: 3,
+        ..MockTtsRealtimeKnobs::default()
+    }))
+    .await
+    .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+
+    // The admission announces the synthesized audio spec.
+    let admission = session.admission().clone();
+    let spec = admission
+        .output_audio
+        .expect("TTS admissions announce output_audio");
+    assert_eq!(spec.codec, RealtimeAudioCodec::PcmI16Le);
+    assert_eq!(spec.sample_rate, 24_000);
+    assert_eq!(spec.channels, 1);
+
+    let accepted = session.next_event().await.unwrap().expect("accepted");
+    assert!(matches!(
+        accepted.event,
+        InvocationEventKind::Accepted { .. }
+    ));
+    assert_eq!(accepted.sequence, 0);
+
+    session.send_text("Hello ").await.unwrap();
+    session.send_text("world").await.unwrap();
+    session.finish().await.unwrap();
+
+    // Audio frames arrive in order; the terminal frame is zero-payload with
+    // the final flag; the Completed event is buffered behind the audio.
+    let mut seen_final = false;
+    let mut payloads = Vec::new();
+    while let Some(chunk) = session.next_audio().await.unwrap() {
+        assert!(!seen_final, "no audio follows the final frame");
+        seen_final = chunk.is_final;
+        payloads.push((chunk.sequence, chunk.payload));
+    }
+    assert!(seen_final, "the final frame arrived");
+    assert_eq!(payloads.len(), 4, "three payload frames plus the final");
+    assert_eq!(payloads[3].0, 4);
+    assert!(payloads[3].1.is_empty());
+    for (index, (sequence, payload)) in payloads.iter().take(3).enumerate() {
+        assert_eq!(*sequence, u32::try_from(index + 1).unwrap());
+        let expected: Vec<u8> = (0..16)
+            .map(|position| ((index * 31 + position * 7) % 251 + 1) as u8)
+            .collect();
+        assert_eq!(*payload, expected, "payload frame {index} content");
+    }
+
+    let completed = session.next_event().await.unwrap().expect("completed");
+    assert!(matches!(
+        completed.event,
+        InvocationEventKind::Completed { .. }
+    ));
+    assert!(session.is_terminal());
+    assert!(session.next_event().await.unwrap().is_none());
+    assert!(session.next_audio().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn tts_session_client_rejects_text_bound_violations_locally() {
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+        .await
+        .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+
+    let oversized = "x".repeat(MAX_REALTIME_INPUT_TEXT_BYTES + 1);
+    let error = session.send_text(&oversized).await.unwrap_err();
+    assert!(matches!(error, RealtimeClientError::Protocol(_)));
+    // Nothing left the process: a valid piece still flows and the session
+    // completes normally.
+    session.send_text("ok").await.unwrap();
+    session.finish().await.unwrap();
+    while session.next_audio().await.unwrap().is_some() {}
+    assert!(session.is_terminal());
+}
+
+#[tokio::test]
+async fn tts_session_in_session_cancel_ends_with_one_cancelled_terminal() {
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+        .await
+        .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+    session.send_text("hi").await.unwrap();
+
+    // Cancelling before the finish-commit reaches the stage's select loop,
+    // which answers with exactly one Cancelled terminal.
+    session.cancel().await.unwrap();
+    loop {
+        match session
+            .next_event()
+            .await
+            .unwrap()
+            .expect("terminal event")
+            .event
+        {
+            InvocationEventKind::Cancelled { .. } => break,
+            _ => continue,
+        }
+    }
+    assert!(session.is_terminal());
+    assert!(session.next_event().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn tts_owner_loss_interrupts_without_any_terminal_event() {
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+        disconnect_after_frames: Some(2),
+        ..MockTtsRealtimeKnobs::default()
+    }))
+    .await
+    .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+
+    session.send_text("hi").await.unwrap();
+    session.finish().await.unwrap();
+    // Payload frames flow until the disconnect threshold fires before the
+    // final frame; then the transport simply ends.
+    loop {
+        match session.next_audio().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("session ended cleanly without a terminal outcome"),
+            Err(error) => {
+                assert!(
+                    matches!(error, RealtimeClientError::Protocol(_)),
+                    "unexpected error: {error}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(!session.is_terminal());
+
+    // The attempt remains owned in the worker's table; HTTP still resolves it.
+    let client = http_client(&worker).await;
+    let query = client
+        .query_attempt(&AttemptIdentity {
+            request_id: id("request-1"),
+            attempt_id: id("attempt-1"),
+            tenant_id: id("tenant-1"),
+            caller_id: id("caller-1"),
+            incarnation_id: id("mock-incarnation-1"),
+            deployment_id: id("mock-tts-v1"),
+            model_generation: ModelGeneration::new(1).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(!query.state.is_terminal());
+}
+
+#[tokio::test]
+async fn tts_admit_on_an_asr_worker_is_incompatible() {
+    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+        .await
+        .unwrap();
+    // The admit targets the ASR worker's deployment with the TTS task, so the
+    // fencing ladder reaches the task check and answers IncompatibleTask.
+    let admit = RealtimeSessionAdmit {
+        deployment_id: id("mock-asr-v1"),
+        ..tts_admission("session-1", "attempt-1")
+    };
+    let error = connect(
+        &worker.endpoint(),
+        &credentials(),
+        admit,
+        RealtimeClientConfig::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, RealtimeClientError::ClosedBeforeAdmit(4413)),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn tts_http_cancel_reaches_the_ws_session_through_the_shared_table() {
+    // A long emission window guarantees the HTTP cancel lands mid-stream.
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+        chunk_count: 10,
+        push_cadence: Duration::from_millis(20),
+        ..MockTtsRealtimeKnobs::default()
+    }))
+    .await
+    .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+    session.send_text("hi").await.unwrap();
+    session.finish().await.unwrap();
+
+    let client = http_client(&worker).await;
+    let response = client
+        .cancel_attempt(&AttemptIdentity {
+            request_id: id("request-1"),
+            attempt_id: id("attempt-1"),
+            tenant_id: id("tenant-1"),
+            caller_id: id("caller-1"),
+            incarnation_id: id("mock-incarnation-1"),
+            deployment_id: id("mock-tts-v1"),
+            model_generation: ModelGeneration::new(1).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.disposition, CancelDisposition::Requested);
+
+    loop {
+        match session
+            .next_event()
+            .await
+            .unwrap()
+            .expect("terminal event")
+            .event
+        {
+            InvocationEventKind::Cancelled { .. } => break,
+            _ => continue,
+        }
+    }
+    assert!(session.is_terminal());
+    assert!(session.next_event().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn tts_session_empty_finish_completes_without_audio() {
+    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+        .await
+        .unwrap();
+    let mut session =
+        established(&worker.endpoint(), tts_admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+    session.finish().await.unwrap();
+    let completed = session.next_event().await.unwrap().expect("completed");
+    assert!(matches!(
+        completed.event,
+        InvocationEventKind::Completed { .. }
+    ));
+    assert!(session.is_terminal());
+    assert!(session.next_audio().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn text_input_is_rejected_on_audio_stream_sessions_before_writing() {
+    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+        .await
+        .unwrap();
+    let mut session = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some());
+    let error = session.send_text("hi").await.unwrap_err();
+    assert!(matches!(error, RealtimeClientError::Protocol(_)));
+    // The ASR session is unaffected: audio still flows.
+    session.send_audio(&[0, 0]).await.unwrap();
+    assert!(session.next_event().await.unwrap().is_some());
 }

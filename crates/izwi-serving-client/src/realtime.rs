@@ -8,6 +8,15 @@
 //! enforced before any frame leaves the process, and one-terminal-outcome
 //! validation over the `InvocationEvent` vocabulary.
 //!
+//! Both protocol stages are served from one session type: the ASR-stream
+//! stage pushes audio with [`RealtimeSession::send_audio`] and reads
+//! transcript events with [`RealtimeSession::next_event`]; the TTS-stream
+//! stage pushes utterance text with [`RealtimeSession::send_text`] and reads
+//! synthesized audio with [`RealtimeSession::next_audio`]. Events and audio
+//! interleave on the wire, so each read method buffers the other kind in a
+//! bounded pending queue; a caller that never drains one kind fails closed
+//! once that queue is full.
+//!
 //! Dropping a session without a terminal outcome leaves the worker session
 //! running until its own deadline; the owner is responsible for an explicit
 //! HTTP `cancel_attempt` in that case, exactly as for an uncertain HTTP
@@ -15,16 +24,23 @@
 
 use futures::{SinkExt, StreamExt};
 use izwi_serving_protocol::{
-    encode_realtime_audio_frame, InvocationEvent, InvocationEventKind, RealtimeClientFrame,
-    RealtimeServerFrame, RealtimeSessionAdmit, RealtimeSessionBounds, ServiceCredentials,
+    decode_realtime_audio_frame, encode_realtime_audio_frame, InvocationEvent, InvocationEventKind,
+    RealtimeAudioSpec, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
+    RealtimeSessionBounds, RealtimeStageInput, ServiceCredentials, MAX_REALTIME_INPUT_TEXT_BYTES,
     PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH, SERVICE_AUTHORIZATION_HEADER,
     SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
 };
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, http::HeaderValue, Error as WsError, Message,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// Bound on events buffered while a caller drains audio instead. Events are
+/// tiny and rare (accepted, terminal); overflowing means the caller is
+/// misusing the session and must fail closed.
+const MAX_PENDING_EVENTS: usize = 16;
 
 /// Bounded deadlines for one realtime session client.
 #[derive(Debug, Clone)]
@@ -74,6 +90,8 @@ pub enum RealtimeClientError {
     AudioFrameTooLarge { actual: usize, limit: usize },
     #[error("session audio budget of {limit} bytes exhausted at {actual}")]
     AudioBudgetExhausted { actual: u64, limit: u64 },
+    #[error("session text budget of {limit} bytes exhausted at {actual}")]
+    TextBudgetExhausted { actual: u64, limit: u64 },
     #[error("{0}")]
     Protocol(String),
 }
@@ -103,6 +121,20 @@ pub struct RealtimeAdmission {
     pub incarnation_id: String,
     pub deployment_id: String,
     pub bounds: RealtimeSessionBounds,
+    /// The synthesized audio spec for stages that emit audio (TTS-stream);
+    /// `None` for input-only stages.
+    pub output_audio: Option<RealtimeAudioSpec>,
+}
+
+/// One synthesized audio frame delivered by the worker (TTS-stream stage).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealtimeAudioChunk {
+    /// Worker-assigned monotonic sequence starting at 1.
+    pub sequence: u32,
+    /// True only on the terminal frame; payload may be empty there.
+    pub is_final: bool,
+    /// Raw PCM i16 LE payload at the admission's output audio sample rate.
+    pub payload: Vec<u8>,
 }
 
 /// One admitted realtime session over a worker WebSocket.
@@ -111,12 +143,18 @@ pub struct RealtimeSession {
     admission: RealtimeAdmission,
     expected_request_id: String,
     config: RealtimeClientConfig,
+    /// The admitted stage emits audio to this client (TTS-stream).
+    stage_emits_audio: bool,
     accepted_seen: bool,
     terminal_seen: bool,
     closed: bool,
     last_event_sequence: Option<u64>,
     next_audio_sequence: u32,
     audio_bytes: u64,
+    text_bytes: u64,
+    last_received_audio_sequence: Option<u32>,
+    pending_events: VecDeque<InvocationEvent>,
+    pending_audio: VecDeque<RealtimeAudioChunk>,
 }
 
 impl std::fmt::Debug for RealtimeSession {
@@ -229,8 +267,9 @@ pub async fn connect(
                     node_id,
                     incarnation_id,
                     deployment_id,
+                    model_generation: _,
+                    output_audio,
                     bounds,
-                    ..
                 }) => {
                     if session_id.as_str() != admit.session_id.as_str()
                         || attempt_id.as_str() != admit.attempt_id.as_str()
@@ -244,6 +283,12 @@ pub async fn connect(
                             "admitted bounds exceed the protocol caps".into(),
                         )
                     })?;
+                    let stage_emits_audio = matches!(admit.input, RealtimeStageInput::TextStream);
+                    if stage_emits_audio && output_audio.is_none() {
+                        return Err(RealtimeClientError::Protocol(
+                            "text-stream sessions must announce an output audio spec".into(),
+                        ));
+                    }
                     break RealtimeAdmission {
                         session_id: session_id.to_string(),
                         attempt_id: attempt_id.to_string(),
@@ -252,6 +297,7 @@ pub async fn connect(
                         incarnation_id: incarnation_id.to_string(),
                         deployment_id: deployment_id.to_string(),
                         bounds,
+                        output_audio,
                     };
                 }
                 Ok(RealtimeServerFrame::Event { .. } | RealtimeServerFrame::Pong) => {
@@ -280,6 +326,7 @@ pub async fn connect(
     };
 
     Ok(RealtimeSession {
+        stage_emits_audio: matches!(admit.input, RealtimeStageInput::TextStream),
         stream,
         admission,
         expected_request_id: admit.request_id.to_string(),
@@ -290,6 +337,10 @@ pub async fn connect(
         last_event_sequence: None,
         next_audio_sequence: 1,
         audio_bytes: 0,
+        text_bytes: 0,
+        last_received_audio_sequence: None,
+        pending_events: VecDeque::new(),
+        pending_audio: VecDeque::new(),
     })
 }
 
@@ -352,6 +403,38 @@ impl RealtimeSession {
         Ok(())
     }
 
+    /// Sends one bounded piece of the utterance text (TTS-stream stage).
+    /// The worker accumulates pieces until [`RealtimeSession::finish`]; the
+    /// per-frame protocol cap and the session text budget are enforced here
+    /// before anything is written.
+    pub async fn send_text(&mut self, text: &str) -> Result<(), RealtimeClientError> {
+        self.guard_open()?;
+        if !self.stage_emits_audio {
+            return Err(RealtimeClientError::Protocol(
+                "text input is not valid for audio-stream sessions".into(),
+            ));
+        }
+        if text.len() > MAX_REALTIME_INPUT_TEXT_BYTES {
+            return Err(RealtimeClientError::Protocol(format!(
+                "input text of {} bytes exceeds the protocol bound {MAX_REALTIME_INPUT_TEXT_BYTES}",
+                text.len()
+            )));
+        }
+        let new_total = self.text_bytes.saturating_add(text.len() as u64);
+        if new_total > self.admission.bounds.max_session_audio_bytes {
+            return Err(RealtimeClientError::TextBudgetExhausted {
+                actual: new_total,
+                limit: self.admission.bounds.max_session_audio_bytes,
+            });
+        }
+        self.send_control(&RealtimeClientFrame::Input {
+            text: text.to_string(),
+        })
+        .await?;
+        self.text_bytes = new_total;
+        Ok(())
+    }
+
     /// Signals end of input; the worker finalizes the stage and emits its
     /// final outputs followed by exactly one terminal event.
     pub async fn finish(&mut self) -> Result<(), RealtimeClientError> {
@@ -372,8 +455,13 @@ impl RealtimeSession {
 
     /// Reads the next session event. Returns `Ok(None)` only after the
     /// terminal outcome has been observed and the worker closed the socket
-    /// cleanly; every other end is an error.
+    /// cleanly; every other end is an error. On stages that emit audio,
+    /// interleaved audio frames are buffered (bounded) for
+    /// [`RealtimeSession::next_audio`].
     pub async fn next_event(&mut self) -> Result<Option<InvocationEvent>, RealtimeClientError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
         loop {
             if self.closed {
                 return Ok(None);
@@ -408,10 +496,19 @@ impl RealtimeSession {
                         }
                     }
                 }
-                Message::Binary(_) => {
-                    return Err(RealtimeClientError::Protocol(
-                        "worker sent an unexpected audio frame".into(),
-                    ));
+                Message::Binary(data) => {
+                    if !self.stage_emits_audio {
+                        return Err(RealtimeClientError::Protocol(
+                            "worker sent an unexpected audio frame".into(),
+                        ));
+                    }
+                    let chunk = self.decode_audio_frame(&data)?;
+                    if self.pending_audio.len() >= self.admission.bounds.max_in_flight_frames {
+                        return Err(RealtimeClientError::Protocol(
+                            "too many audio frames buffered; drain them with next_audio".into(),
+                        ));
+                    }
+                    self.pending_audio.push_back(chunk);
                 }
                 Message::Close(frame) => {
                     self.closed = true;
@@ -429,6 +526,111 @@ impl RealtimeSession {
                 }
             }
         }
+    }
+
+    /// Reads the next synthesized audio frame (TTS-stream stage). Events that
+    /// arrive meanwhile are buffered (bounded) for
+    /// [`RealtimeSession::next_event`]. Returns `Ok(None)` only after a clean
+    /// close following the terminal outcome, mirroring [`Self::next_event`].
+    pub async fn next_audio(&mut self) -> Result<Option<RealtimeAudioChunk>, RealtimeClientError> {
+        if let Some(chunk) = self.pending_audio.pop_front() {
+            return Ok(Some(chunk));
+        }
+        loop {
+            if self.closed {
+                return Ok(None);
+            }
+            let message = tokio::time::timeout(self.config.event_timeout, self.stream.next())
+                .await
+                .map_err(|_| RealtimeClientError::EventTimeout)?
+                .ok_or_else(|| {
+                    RealtimeClientError::Protocol("worker socket ended without a close".into())
+                })?
+                .map_err(|error| {
+                    RealtimeClientError::Protocol(format!("session transport error: {error}"))
+                })?;
+            match message {
+                Message::Binary(data) => {
+                    if !self.stage_emits_audio {
+                        return Err(RealtimeClientError::Protocol(
+                            "worker sent an unexpected audio frame".into(),
+                        ));
+                    }
+                    let chunk = self.decode_audio_frame(&data)?;
+                    return Ok(Some(chunk));
+                }
+                Message::Text(text) => {
+                    let frame: RealtimeServerFrame =
+                        serde_json::from_str(&text).map_err(|error| {
+                            RealtimeClientError::Protocol(format!(
+                                "server frame did not decode: {error}"
+                            ))
+                        })?;
+                    match frame {
+                        RealtimeServerFrame::Event { event } => {
+                            let event = self.validate_event(event)?;
+                            if self.pending_events.len() >= MAX_PENDING_EVENTS {
+                                return Err(RealtimeClientError::Protocol(
+                                    "too many events buffered; drain them with next_event".into(),
+                                ));
+                            }
+                            self.pending_events.push_back(event);
+                        }
+                        RealtimeServerFrame::Pong => continue,
+                        RealtimeServerFrame::Admitted { .. } => {
+                            return Err(RealtimeClientError::Protocol(
+                                "duplicate admitted frame".into(),
+                            ));
+                        }
+                    }
+                }
+                Message::Close(frame) => {
+                    self.closed = true;
+                    let code = frame.map(|frame| u16::from(frame.code)).unwrap_or(1000);
+                    if !self.terminal_seen || code != 1000 {
+                        return Err(RealtimeClientError::Closed(code));
+                    }
+                    return Ok(None);
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Frame(_) => {
+                    return Err(RealtimeClientError::Protocol(
+                        "worker sent an unexpected raw frame".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Decodes one worker-pushed IRTA frame against the announced bounds and
+    /// the monotonic receive sequence.
+    fn decode_audio_frame(
+        &mut self,
+        data: &[u8],
+    ) -> Result<RealtimeAudioChunk, RealtimeClientError> {
+        let (header, payload) = decode_realtime_audio_frame(data)
+            .map_err(|error| RealtimeClientError::Protocol(format!("audio frame: {error}")))?;
+        if payload.len() > self.admission.bounds.max_frame_bytes {
+            return Err(RealtimeClientError::AudioFrameTooLarge {
+                actual: payload.len(),
+                limit: self.admission.bounds.max_frame_bytes,
+            });
+        }
+        if self
+            .last_received_audio_sequence
+            .is_some_and(|last| header.sequence <= last)
+        {
+            return Err(RealtimeClientError::Protocol(format!(
+                "audio frame sequence {} did not advance",
+                header.sequence
+            )));
+        }
+        self.last_received_audio_sequence = Some(header.sequence);
+        Ok(RealtimeAudioChunk {
+            sequence: header.sequence,
+            is_final: header.is_final,
+            payload: payload.to_vec(),
+        })
     }
 
     async fn send_control(

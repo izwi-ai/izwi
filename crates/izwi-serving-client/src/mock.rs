@@ -72,6 +72,36 @@ impl Default for MockRealtimeKnobs {
     }
 }
 
+/// Scripted realtime TTS stage behavior for the mock's `izwi-realtime-v1`
+/// endpoint: the client accumulates `Input` frames, and one finish-commit
+/// emits deterministic audio frames followed by the zero-payload final frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockTtsRealtimeKnobs {
+    /// Payload bytes per emitted audio frame (deterministic pattern).
+    pub chunk_bytes: usize,
+    /// Payload frames emitted for one finish.
+    pub chunk_count: usize,
+    /// Silence before each emitted frame.
+    pub push_cadence: Duration,
+    /// Output sample rate announced in the `Admitted.output_audio` spec.
+    pub output_sample_rate: u32,
+    /// When set, the socket is dropped abruptly after this many emitted
+    /// audio frames, simulating owner loss with no terminal event.
+    pub disconnect_after_frames: Option<usize>,
+}
+
+impl Default for MockTtsRealtimeKnobs {
+    fn default() -> Self {
+        Self {
+            chunk_bytes: 64,
+            chunk_count: 3,
+            push_cadence: Duration::from_millis(5),
+            output_sample_rate: 24_000,
+            disconnect_after_frames: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockWorkerConfig {
     pub worker_id: WorkerId,
@@ -97,6 +127,9 @@ pub struct MockWorkerConfig {
     /// realtime surface; `Some` turns it into a realtime speech_to_text
     /// worker that rejects HTTP invocations and serves the WebSocket route.
     pub realtime: Option<MockRealtimeKnobs>,
+    /// Realtime TTS-stage knobs. Mutually exclusive with `realtime`; `Some`
+    /// turns the mock into a realtime text_to_speech worker.
+    pub realtime_tts: Option<MockTtsRealtimeKnobs>,
 }
 
 /// Configurable engine-signal values a mock worker advertises so gateway
@@ -142,6 +175,7 @@ impl Default for MockWorkerConfig {
             ready: true,
             routing_signals: None,
             realtime: None,
+            realtime_tts: None,
         }
     }
 }
@@ -156,6 +190,9 @@ impl MockWorkerConfig {
         }
         if self.max_retained_attempts < self.max_active_invocations {
             return Err("attempt retention must cover every active invocation");
+        }
+        if self.realtime.is_some() && self.realtime_tts.is_some() {
+            return Err("realtime and realtime_tts stages are mutually exclusive");
         }
         Ok(())
     }
@@ -275,7 +312,7 @@ impl MockWorker {
     pub async fn spawn(config: MockWorkerConfig) -> Result<Self, std::io::Error> {
         config.validate().map_err(std::io::Error::other)?;
         let max_request_bytes = config.max_request_bytes;
-        let realtime_enabled = config.realtime.is_some();
+        let realtime_enabled = config.realtime.is_some() || config.realtime_tts.is_some();
         let state = Arc::new(MockState {
             capacity: Arc::new(Semaphore::new(config.max_active_invocations)),
             attempts: Mutex::new(AttemptTable::default()),
@@ -357,7 +394,7 @@ async fn descriptor(State(state): State<Arc<MockState>>, headers: HeaderMap) -> 
             affinity: Vec::new(),
             host_memory_limit_bytes: 64 * 1024 * 1024,
         },
-        features: if state.config.realtime.is_some() {
+        features: if realtime_enabled(&state.config) {
             BTreeSet::from([
                 WorkerFeature::Streaming,
                 WorkerFeature::Cancellation,
@@ -402,18 +439,41 @@ async fn status(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Resp
     .into_response()
 }
 
+/// True when the mock serves either realtime stage; realtime workers reject
+/// HTTP invocations and advertise the socket feature.
+fn realtime_enabled(config: &MockWorkerConfig) -> bool {
+    config.realtime.is_some() || config.realtime_tts.is_some()
+}
+
 fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
     let task = if config.realtime.is_some() {
         TaskKind::SpeechToText
+    } else if config.realtime_tts.is_some() {
+        TaskKind::TextToSpeech
     } else {
         TaskKind::Chat
     };
-    let (accepted_input_formats, max_context_tokens, max_output_tokens, realtime) =
+    let (accepted_input_formats, output_formats, max_context_tokens, max_output_tokens, realtime) =
         if config.realtime.is_some() {
-            (BTreeSet::from([InputFormat::PcmAudio]), None, None, true)
+            (
+                BTreeSet::from([InputFormat::PcmAudio]),
+                BTreeSet::from([OutputFormat::Text]),
+                None,
+                None,
+                true,
+            )
+        } else if config.realtime_tts.is_some() {
+            (
+                BTreeSet::from([InputFormat::Text]),
+                BTreeSet::from([OutputFormat::PcmAudio]),
+                None,
+                None,
+                true,
+            )
         } else {
             (
                 BTreeSet::from([InputFormat::ChatMessages]),
+                BTreeSet::from([OutputFormat::Text]),
                 Some(4096),
                 Some(config.max_output_tokens),
                 false,
@@ -427,7 +487,7 @@ fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
         task,
         backend: BackendKind::Cpu,
         precision: "mock".into(),
-        execution_representation: if config.realtime.is_some() {
+        execution_representation: if realtime {
             "deterministic-realtime".into()
         } else {
             "deterministic-text".into()
@@ -444,7 +504,7 @@ fn deployment(config: &MockWorkerConfig) -> LoadedDeployment {
             realtime,
             cancellation: CancellationBehavior::Cooperative,
             accepted_input_formats,
-            output_formats: BTreeSet::from([OutputFormat::Text]),
+            output_formats,
             max_input_bytes: config.max_request_bytes as u64,
             max_context_tokens,
             max_output_tokens,
@@ -506,7 +566,7 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
             "model generation changed",
         );
     }
-    if state.config.realtime.is_some() || request.task != TaskKind::Chat {
+    if realtime_enabled(&state.config) || request.task != TaskKind::Chat {
         return rejection(
             &request,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1041,13 +1101,41 @@ fn mock_event(
     (sequence, message)
 }
 
+/// One scripted realtime stage for the mock's `izwi-realtime-v1` endpoint.
+#[derive(Debug, Clone)]
+enum MockRealtimeStage {
+    Asr(MockRealtimeKnobs),
+    Tts(MockTtsRealtimeKnobs),
+}
+
+impl MockRealtimeStage {
+    fn task(&self) -> TaskKind {
+        match self {
+            Self::Asr(_) => TaskKind::SpeechToText,
+            Self::Tts(_) => TaskKind::TextToSpeech,
+        }
+    }
+
+    fn output_audio_spec(&self) -> Option<RealtimeAudioSpec> {
+        match self {
+            Self::Asr(_) => None,
+            Self::Tts(knobs) => Some(RealtimeAudioSpec {
+                codec: RealtimeAudioCodec::PcmI16Le,
+                sample_rate: knobs.output_sample_rate,
+                channels: 1,
+            }),
+        }
+    }
+}
+
 /// The mock's realtime session: the same fencing checks and shared attempt
-/// table as the HTTP path, a scripted ASR stage, and abrupt owner loss when
-/// `disconnect_after_frames` fires.
+/// table as the HTTP path, a scripted stage, and abrupt owner loss when the
+/// disconnect knob fires.
 async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket) {
-    let knobs = match &state.config.realtime {
-        Some(knobs) => knobs.clone(),
-        None => return,
+    let stage = match (&state.config.realtime, &state.config.realtime_tts) {
+        (Some(knobs), None) => MockRealtimeStage::Asr(knobs.clone()),
+        (None, Some(knobs)) => MockRealtimeStage::Tts(knobs.clone()),
+        _ => return,
     };
 
     // First frame must be the admit, within the session timeout.
@@ -1110,7 +1198,7 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
         reject_close(&mut socket, RealtimeSessionCloseCode::WrongModelGeneration).await;
         return;
     }
-    if admit.task != TaskKind::SpeechToText {
+    if admit.task != stage.task() {
         reject_close(&mut socket, RealtimeSessionCloseCode::IncompatibleTask).await;
         return;
     }
@@ -1146,7 +1234,7 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
             return;
         }
     };
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let identity = AttemptIdentity {
         request_id: admit.request_id.clone(),
         attempt_id: admit.attempt_id.clone(),
@@ -1180,7 +1268,7 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
         incarnation_id: state.config.incarnation_id.clone(),
         deployment_id: state.config.deployment_id.clone(),
         model_generation: state.config.model_generation,
-        output_audio: None,
+        output_audio: stage.output_audio_spec(),
         bounds: MOCK_REALTIME_BOUNDS,
     };
     if socket
@@ -1211,9 +1299,43 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
         Some(accepted_sequence),
     );
 
-    // Scripted stage loop. The socket is dropped on owner loss (no terminal
+    // Scripted stage loops. The socket is dropped on owner loss (no terminal
     // event, no close frame); every other path ends with one terminal event
-    // followed by a clean close.
+    // followed by a clean close. A `None` terminal means the transport ended
+    // without a terminal outcome.
+    let terminal = match stage {
+        MockRealtimeStage::Asr(knobs) => {
+            run_mock_asr_stage(&state, &admit, &mut socket, knobs, cancel_rx).await
+        }
+        MockRealtimeStage::Tts(knobs) => {
+            run_mock_tts_stage(&state, &admit, &mut socket, knobs, cancel_rx).await
+        }
+    };
+
+    if let Some((attempt_state, event)) = terminal {
+        let (sequence, message) = mock_event(&state, &admit, event);
+        let _ = socket.send(message).await;
+        state.update_attempt(&admit.attempt_id, attempt_state, Some(sequence));
+        let _ = socket
+            .send(WsMessage::Close(Some(CloseFrame {
+                code: 1000,
+                reason: Utf8Bytes::from_static("session complete"),
+            })))
+            .await;
+    }
+    drop(permit);
+}
+
+/// Scripted ASR stage: one transcript delta per pushed audio frame, one final
+/// transcript on finish, and abrupt owner loss when `disconnect_after_frames`
+/// fires.
+async fn run_mock_asr_stage(
+    state: &MockState,
+    admit: &RealtimeSessionAdmit,
+    socket: &mut WebSocket,
+    knobs: MockRealtimeKnobs,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Option<(AttemptState, InvocationEventKind)> {
     let mut last_audio_sequence: Option<u32> = None;
     let mut frames_pushed: usize = 0;
     let mut terminal: Option<(AttemptState, InvocationEventKind)> = None;
@@ -1246,7 +1368,7 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
                     let final_delta = InvocationEventKind::TextDelta {
                         text: knobs.final_text.clone(),
                     };
-                    let (sequence, message) = mock_event(&state, &admit, final_delta);
+                    let (sequence, message) = mock_event(state, admit, final_delta);
                     if socket.send(message).await.is_err() {
                         break;
                     }
@@ -1333,13 +1455,13 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
                     .is_some_and(|limit| frames_pushed >= limit)
                 {
                     // Owner loss: drop everything without a terminal event.
-                    return;
+                    return None;
                 }
                 tokio::time::sleep(knobs.push_cadence).await;
                 let delta = InvocationEventKind::TextDelta {
                     text: knobs.delta_per_frame.clone(),
                 };
-                let (sequence, message) = mock_event(&state, &admit, delta);
+                let (sequence, message) = mock_event(state, admit, delta);
                 if socket.send(message).await.is_err() {
                     break;
                 }
@@ -1349,17 +1471,200 @@ async fn run_mock_realtime_session(state: Arc<MockState>, mut socket: WebSocket)
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
         }
     }
+    terminal
+}
 
-    if let Some((attempt_state, event)) = terminal {
-        let (sequence, message) = mock_event(&state, &admit, event);
-        let _ = socket.send(message).await;
-        state.update_attempt(&admit.attempt_id, attempt_state, Some(sequence));
-        let _ = socket
-            .send(WsMessage::Close(Some(CloseFrame {
-                code: 1000,
-                reason: Utf8Bytes::from_static("session complete"),
-            })))
-            .await;
+/// Scripted TTS stage: `Input` frames accumulate the utterance, finish-commit
+/// emits `chunk_count` deterministic payload frames plus the zero-payload
+/// final frame, and the disconnect knob fires on emitted audio frames.
+async fn run_mock_tts_stage(
+    state: &MockState,
+    admit: &RealtimeSessionAdmit,
+    socket: &mut WebSocket,
+    knobs: MockTtsRealtimeKnobs,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> Option<(AttemptState, InvocationEventKind)> {
+    let mut text = String::new();
+    let mut text_bytes = 0u64;
+    let mut finish_submitted = false;
+    let mut audio_sequence = 0u32;
+    let mut frames_emitted = 0usize;
+    let mut terminal: Option<(AttemptState, InvocationEventKind)> = None;
+    while terminal.is_none() {
+        let message = tokio::select! {
+            message = socket.recv() => message,
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    state.update_attempt(
+                        &admit.attempt_id,
+                        AttemptState::ExecutionStopping,
+                        None,
+                    );
+                    tokio::time::sleep(state.config.cancellation_delay).await;
+                    let cancelled = InvocationEventKind::Cancelled {
+                        reason: Some("requested".into()),
+                    };
+                    terminal = Some((AttemptState::Cancelled, cancelled));
+                }
+                continue;
+            }
+        };
+        let message = match message {
+            Some(Ok(message)) => message,
+            Some(Err(_)) | None => break, // transport error or client gone
+        };
+        match message {
+            WsMessage::Text(text_frame) => {
+                match serde_json::from_str::<RealtimeClientFrame>(&text_frame) {
+                    Ok(RealtimeClientFrame::Finish) => {
+                        if finish_submitted {
+                            terminal = Some(mock_failure("finish was already submitted"));
+                            continue;
+                        }
+                        finish_submitted = true;
+                        let utterance = std::mem::take(&mut text);
+                        if utterance.is_empty() {
+                            // Mirror the worker: finishing without input is a
+                            // successful empty result with no audio.
+                            terminal = Some(mock_completed());
+                            continue;
+                        }
+                        'emit: {
+                            for index in 0..knobs.chunk_count {
+                                if knobs
+                                    .disconnect_after_frames
+                                    .is_some_and(|limit| frames_emitted >= limit)
+                                {
+                                    // Owner loss: drop everything.
+                                    return None;
+                                }
+                                // Emission runs inline, so cancellation is
+                                // observed between frames here rather than
+                                // through the stage select.
+                                if *cancel_rx.borrow_and_update() {
+                                    state.update_attempt(
+                                        &admit.attempt_id,
+                                        AttemptState::ExecutionStopping,
+                                        None,
+                                    );
+                                    tokio::time::sleep(state.config.cancellation_delay).await;
+                                    return Some((
+                                        AttemptState::Cancelled,
+                                        InvocationEventKind::Cancelled {
+                                            reason: Some("requested".into()),
+                                        },
+                                    ));
+                                }
+                                tokio::time::sleep(knobs.push_cadence).await;
+                                audio_sequence = audio_sequence.saturating_add(1);
+                                frames_emitted = frames_emitted.saturating_add(1);
+                                let payload = mock_tts_payload(index, knobs.chunk_bytes);
+                                let frame =
+                                    encode_realtime_audio_frame(audio_sequence, false, &payload)
+                                        .expect("mock frame within caps");
+                                if socket.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                    break 'emit;
+                                }
+                                state.update_attempt(
+                                    &admit.attempt_id,
+                                    AttemptState::Running,
+                                    None,
+                                );
+                            }
+                            if knobs
+                                .disconnect_after_frames
+                                .is_some_and(|limit| frames_emitted >= limit)
+                            {
+                                return None;
+                            }
+                            audio_sequence = audio_sequence.saturating_add(1);
+                            let frame = encode_realtime_audio_frame(audio_sequence, true, &[])
+                                .expect("final frame within caps");
+                            if socket.send(WsMessage::Binary(frame.into())).await.is_err() {
+                                break 'emit;
+                            }
+                            terminal = Some(mock_completed());
+                        }
+                    }
+                    Ok(RealtimeClientFrame::Cancel) => {
+                        state.update_attempt(
+                            &admit.attempt_id,
+                            AttemptState::ExecutionStopping,
+                            None,
+                        );
+                        tokio::time::sleep(state.config.cancellation_delay).await;
+                        terminal = Some((
+                            AttemptState::Cancelled,
+                            InvocationEventKind::Cancelled {
+                                reason: Some("requested".into()),
+                            },
+                        ));
+                    }
+                    Ok(RealtimeClientFrame::Ping) => {
+                        let pong = WsMessage::Text(
+                            serde_json::to_string(&RealtimeServerFrame::Pong)
+                                .expect("pong encodes")
+                                .into(),
+                        );
+                        let _ = socket.send(pong).await;
+                    }
+                    Ok(RealtimeClientFrame::Admit { .. }) => {
+                        terminal = Some(mock_failure("duplicate admit"));
+                    }
+                    Ok(RealtimeClientFrame::Input { text: incoming }) => {
+                        if finish_submitted {
+                            terminal = Some(mock_failure("input after finish"));
+                        } else if incoming.len() > MAX_REALTIME_INPUT_TEXT_BYTES {
+                            terminal = Some(mock_failure("input text exceeds bound"));
+                        } else {
+                            text_bytes = text_bytes.saturating_add(incoming.len() as u64);
+                            if text_bytes > MOCK_REALTIME_BOUNDS.max_session_audio_bytes {
+                                terminal = Some(mock_failure("session text budget exhausted"));
+                            } else {
+                                text.push_str(&incoming);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        terminal = Some(mock_failure("unparseable control frame"));
+                    }
+                }
+            }
+            WsMessage::Binary(_) => {
+                terminal = Some(mock_failure(
+                    "audio input is not valid for text_to_speech sessions",
+                ));
+            }
+            WsMessage::Close(_) => break,
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+        }
     }
-    drop(permit);
+    terminal
+}
+
+fn mock_failure(message: &str) -> (AttemptState, InvocationEventKind) {
+    (
+        AttemptState::Failed,
+        InvocationEventKind::Error {
+            code: InvocationErrorCode::InvalidInput,
+            message: message.to_string(),
+        },
+    )
+}
+
+fn mock_completed() -> (AttemptState, InvocationEventKind) {
+    (
+        AttemptState::Completed,
+        InvocationEventKind::Completed {
+            finish_reason: FinishReason::Stop,
+            usage: None,
+        },
+    )
+}
+
+/// Deterministic non-silent payload so tests can assert content.
+fn mock_tts_payload(index: usize, chunk_bytes: usize) -> Vec<u8> {
+    (0..chunk_bytes)
+        .map(|position| ((index * 31 + position * 7) % 251 + 1) as u8)
+        .collect()
 }
