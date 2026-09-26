@@ -910,10 +910,21 @@ async fn gateway_state(
             let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
                 store_database,
             );
-            store
-                .connection()
-                .await
-                .context("Failed to open fleet coordination database")?;
+            // Two fleet gateways booting simultaneously race the SQLite
+            // journal-mode setup before the busy timeout is in play, so the
+            // first open retries briefly before failing closed.
+            let mut opened = Err(anyhow::anyhow!("fleet coordination database never opened"));
+            for _ in 0..10 {
+                match store.connection().await {
+                    Ok(_) => {
+                        opened = Ok(());
+                        break;
+                    }
+                    Err(error) => opened = Err(error),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            opened.context("Failed to open fleet coordination database")?;
             let coordinator = Arc::new(
                 app::fleet_coordinator::FleetCoordinator::new(
                     store,

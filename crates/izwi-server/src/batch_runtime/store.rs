@@ -701,6 +701,19 @@ impl BatchRuntimeStore {
         }
     }
 
+    /// Address the coordination store through a SQLite file path. The public
+    /// form of [`Self::initialize_with_database`] for fleet tooling and
+    /// process rigs that inspect a fleet coordination database directly.
+    pub fn initialize_with_database_path(db_path: std::path::PathBuf) -> Self {
+        Self::initialize_with_database(StoreDatabase::new(db_path))
+    }
+
+    /// Address the coordination store through a bounded database URL
+    /// (PostgreSQL/MySQL fleet profile, DS5).
+    pub fn initialize_with_database_url(url: String) -> Self {
+        Self::initialize_with_database(StoreDatabase::from_url(url))
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
         self.test_clock = Some(clock);

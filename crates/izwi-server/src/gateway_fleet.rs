@@ -217,9 +217,11 @@ fn parse_bounded_u32(os_value: &std::ffi::OsStr, _name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
 
     #[test]
     fn no_env_returns_none() {
+        let _guard = env_lock();
         std::env::remove_var(FLEET_PARTITION_ENV);
         std::env::remove_var(FLEET_SIZE_ENV);
         assert!(FleetPartition::from_env().unwrap().is_none());
@@ -227,6 +229,7 @@ mod tests {
 
     #[test]
     fn valid_partition_parses() {
+        let _guard = env_lock();
         std::env::set_var(FLEET_SIZE_ENV, "2");
         std::env::set_var(FLEET_PARTITION_ENV, "1");
         let p = FleetPartition::from_env().unwrap().unwrap();
@@ -238,6 +241,7 @@ mod tests {
 
     #[test]
     fn partition_without_size_is_error() {
+        let _guard = env_lock();
         std::env::remove_var(FLEET_SIZE_ENV);
         std::env::set_var(FLEET_PARTITION_ENV, "0");
         assert_eq!(
@@ -249,6 +253,7 @@ mod tests {
 
     #[test]
     fn size_without_partition_is_error() {
+        let _guard = env_lock();
         std::env::set_var(FLEET_SIZE_ENV, "2");
         std::env::remove_var(FLEET_PARTITION_ENV);
         assert_eq!(
@@ -287,6 +292,7 @@ mod tests {
 
     #[test]
     fn fleet_db_requires_absolute_bounded_paths_or_database_urls() {
+        let _guard = env_lock();
         std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
         assert!(fleet_database_from_env().unwrap().is_none());
         std::env::set_var("IZWI_GATEWAY_FLEET_DB_PATH", "relative/fleet.sqlite3");
@@ -304,6 +310,7 @@ mod tests {
 
     #[test]
     fn fleet_db_accepts_bounded_database_urls_and_rejects_unknown_schemes() {
+        let _guard = env_lock();
         std::env::set_var(
             "IZWI_GATEWAY_FLEET_DB_PATH",
             "postgres://fleet:fleet@db.internal:5432/izwi_fleet",
@@ -335,6 +342,7 @@ mod tests {
 
     #[test]
     fn gateway_identity_prefers_bounded_operator_value() {
+        let _guard = env_lock();
         std::env::set_var("IZWI_GATEWAY_ID", "gateway-east-1");
         assert_eq!(gateway_identity(), "gateway-east-1");
         std::env::set_var("IZWI_GATEWAY_ID", "not valid!!");
@@ -344,6 +352,7 @@ mod tests {
 
     #[test]
     fn fleet_claim_ttl_defaults_and_bounds() {
+        let _guard = env_lock();
         std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS");
         assert_eq!(
             fleet_claim_ttl_from_env().unwrap(),
