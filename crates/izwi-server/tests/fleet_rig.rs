@@ -169,10 +169,12 @@ async fn spawn_gateway_once(
         let buffer = std::sync::Arc::clone(&stderr_buffer);
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            let mut collected = buffer.lock().expect("stderr lock");
+            // Lock per line: holding the guard across the blocking read
+            // would deadlock every stderr_tail() reader.
             for line in BufReader::new(stderr).lines() {
                 match line {
                     Ok(line) => {
+                        let mut collected = buffer.lock().expect("stderr lock");
                         collected.push_str(&line);
                         collected.push('\n');
                     }

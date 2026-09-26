@@ -223,6 +223,7 @@ struct MockState {
     capacity: Arc<Semaphore>,
     attempts: Mutex<AttemptTable>,
     status_sequence: AtomicU64,
+    served_invocations: AtomicU64,
 }
 
 impl MockState {
@@ -321,6 +322,7 @@ impl MockWorker {
             capacity: Arc::new(Semaphore::new(config.max_active_invocations)),
             attempts: Mutex::new(AttemptTable::default()),
             status_sequence: AtomicU64::new(0),
+            served_invocations: AtomicU64::new(0),
             config,
         });
         let mut router = Router::new()
@@ -359,6 +361,12 @@ impl MockWorker {
 
     pub fn config(&self) -> &MockWorkerConfig {
         &self.state.config
+    }
+
+    /// Total invocation requests admitted by this worker since spawn.
+    /// Routing-level test evidence: which worker actually served traffic.
+    pub fn served_invocations(&self) -> u64 {
+        self.state.served_invocations.load(Ordering::SeqCst)
     }
 
     pub fn active_invocations(&self) -> usize {
@@ -532,6 +540,7 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
     if !state.authenticate(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    state.served_invocations.fetch_add(1, Ordering::SeqCst);
     let request: InvocationRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
