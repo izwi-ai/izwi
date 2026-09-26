@@ -367,6 +367,13 @@ pub enum WorkerRegistryError {
     UnknownLocalDispatch,
 }
 
+/// Optional selection gate consulted for every candidate: when it reports
+/// the rollout-eligible generation for a (task, model) pool, only workers of
+/// that generation are selectable. `None` (or an absent gate) keeps every
+/// approved generation selectable — the single-generation behavior.
+pub type EligibleGenerationGate =
+    Arc<dyn Fn(TaskKind, &ModelAlias) -> Option<ModelGeneration> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -390,6 +397,7 @@ struct RegistryInner {
     active_incarnations: BTreeMap<WorkerId, IncarnationId>,
     dispatches: BTreeMap<u64, LocalDispatchRecord>,
     next_dispatch_id: u64,
+    generation_gate: Option<EligibleGenerationGate>,
 }
 
 struct WorkerRecord {
@@ -440,8 +448,17 @@ impl WorkerRegistry {
                 active_incarnations: BTreeMap::new(),
                 dispatches: BTreeMap::new(),
                 next_dispatch_id: 1,
+                generation_gate: None,
             })),
         })
+    }
+
+    /// Installs the rollout-eligible-generation gate (DS6). Selection skips
+    /// workers whose deployment generation is not currently eligible for new
+    /// admissions; the deployment table is the authority.
+    pub fn set_generation_gate(&self, gate: EligibleGenerationGate) {
+        let mut inner = lock_recover(&self.inner);
+        inner.generation_gate = Some(gate);
     }
 
     /// Adds an explicitly approved worker incarnation. Re-registering a logical
@@ -788,6 +805,13 @@ impl WorkerRegistry {
             let Some(deployment) = eligible_deployment(record, observation, request) else {
                 continue;
             };
+            if let Some(gate) = &inner.generation_gate {
+                if let Some(eligible) = gate(request.task, &request.public_model) {
+                    if deployment.model_generation != eligible {
+                        continue;
+                    }
+                }
+            }
             let cluster_claims = fleet.cluster_claims(key);
             if !observed_credit_available(&inner, key, &observation.status.capacity, cluster_claims)
             {
@@ -1527,6 +1551,73 @@ mod tests {
                 .unwrap_err(),
             WorkerRegistryError::WorkerLimitReached
         );
+    }
+
+    #[test]
+    fn generation_gate_restricts_selection_to_the_eligible_generation() {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        let old = registration("worker-old", "inc-old", BackendKind::Cpu, 9101, 4);
+        let old_descriptor = old.descriptor.clone();
+        registry.approve(old).unwrap();
+
+        let mut successor = registration("worker-new", "inc-new", BackendKind::Cpu, 9102, 4);
+        let successor_descriptor = successor.descriptor.clone();
+        let mut successor_deployment = deployment("chat-prod", "lfm2", BackendKind::Cpu);
+        successor_deployment.model_generation = ModelGeneration::new(2).unwrap();
+        successor.approved_deployments = BTreeMap::from([(
+            successor_deployment.deployment_id.clone(),
+            ApprovedDeployment::from_loaded(&successor_deployment),
+        )]);
+        registry.approve(successor).unwrap();
+
+        let observed = Instant::now();
+        registry
+            .observe_status_at(
+                status(
+                    &old_descriptor,
+                    1,
+                    vec![deployment("chat-prod", "lfm2", BackendKind::Cpu)],
+                    capacity(4, 0, 4),
+                ),
+                observed,
+            )
+            .unwrap();
+        registry
+            .observe_status_at(
+                status(
+                    &successor_descriptor,
+                    1,
+                    vec![successor_deployment],
+                    capacity(4, 0, 4),
+                ),
+                observed,
+            )
+            .unwrap();
+
+        // Without the gate both generations are selectable; the deterministic
+        // tie-break prefers the lexicographically smaller worker id.
+        let selected = registry
+            .select_and_reserve_at(&selection(), observed)
+            .unwrap();
+        assert_eq!(selected.key.worker_id, id::<WorkerId>("worker-new"));
+
+        // With the rollout gate only the eligible generation is selectable;
+        // the window's current generation serves until cutover completes.
+        registry.set_generation_gate(Arc::new(|_, _| Some(ModelGeneration::new(1).unwrap())));
+        let selected = registry
+            .select_and_reserve_at(&selection(), observed)
+            .unwrap();
+        assert_eq!(selected.key.worker_id, id::<WorkerId>("worker-old"));
+        assert_eq!(selected.model_generation, ModelGeneration::new(1).unwrap());
+
+        // After the cutover swap the successor is the only eligible
+        // generation and the drained predecessor is skipped.
+        registry.set_generation_gate(Arc::new(|_, _| Some(ModelGeneration::new(2).unwrap())));
+        let selected = registry
+            .select_and_reserve_at(&selection(), observed)
+            .unwrap();
+        assert_eq!(selected.key.worker_id, id::<WorkerId>("worker-new"));
+        assert_eq!(selected.model_generation, ModelGeneration::new(2).unwrap());
     }
 
     #[test]
