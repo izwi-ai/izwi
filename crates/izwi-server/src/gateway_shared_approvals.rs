@@ -24,14 +24,11 @@
 //! cached view is retained and the error is surfaced without admission going
 //! down.
 
-use std::str::FromStr;
-
 use super::gateway_deployments::GatewayWorkerApproval;
 
 const SHARED_APPROVALS_PATH_ENV: &str = "IZWI_GATEWAY_SHARED_APPROVALS_PATH";
 const SHARED_APPROVALS_TTL_MS_ENV: &str = "IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS";
 const MAX_SHARED_APPROVALS_FILE_BYTES: u64 = 64 * 1024;
-const MAX_SHARED_APPROVAL_ENTRIES: usize = 256;
 const DEFAULT_SHARED_APPROVALS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const MIN_SHARED_APPROVALS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_SHARED_APPROVALS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -153,26 +150,24 @@ fn read_approvals_file(
         return Err(SharedApprovalsError::FileTooLarge);
     }
     let text = std::fs::read_to_string(path).map_err(|_| SharedApprovalsError::Unreadable)?;
-    let mut approvals = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let entry = line.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
+    parse_shared_approvals_text(&text)
+}
+
+fn parse_shared_approvals_text(
+    text: &str,
+) -> Result<Vec<GatewayWorkerApproval>, SharedApprovalsError> {
+    match izwi_serving_protocol::parse_approvals_text(text) {
+        Ok(approvals) => Ok(approvals),
+        Err(izwi_serving_protocol::ApprovalsFileError::TextTooLarge) => {
+            Err(SharedApprovalsError::FileTooLarge)
         }
-        if approvals.len() >= MAX_SHARED_APPROVAL_ENTRIES {
-            return Err(SharedApprovalsError::TooManyEntries);
+        Err(izwi_serving_protocol::ApprovalsFileError::TooManyEntries { .. }) => {
+            Err(SharedApprovalsError::TooManyEntries)
         }
-        match GatewayWorkerApproval::from_str(entry) {
-            Ok(approval) => approvals.push(approval),
-            Err(error) => {
-                return Err(SharedApprovalsError::InvalidEntry {
-                    line: index + 1,
-                    detail: error.to_string(),
-                })
-            }
+        Err(izwi_serving_protocol::ApprovalsFileError::InvalidEntry { line, detail }) => {
+            Err(SharedApprovalsError::InvalidEntry { line, detail })
         }
     }
-    Ok(approvals)
 }
 
 #[cfg(test)]
@@ -240,7 +235,7 @@ mod tests {
     #[test]
     fn too_many_entries_are_rejected() {
         let mut content = String::new();
-        for index in 0..=MAX_SHARED_APPROVAL_ENTRIES {
+        for index in 0..=izwi_serving_protocol::MAX_APPROVALS_FILE_ENTRIES {
             content.push_str(&format!(
                 "http://127.0.0.1:{}/|chat|tiny-model|deploy-a|1\n",
                 9000 + (index % 1000)

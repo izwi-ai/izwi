@@ -5,11 +5,13 @@
 //! boundary, and the versioned realtime WebSocket subprotocol. Public API compatibility remains
 //! the gateway's responsibility.
 
+mod approvals;
 mod identity;
 mod ndjson;
 mod realtime;
 mod types;
 
+pub use approvals::*;
 pub use identity::*;
 pub use ndjson::*;
 pub use realtime::*;
