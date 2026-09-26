@@ -9,6 +9,7 @@ mod config;
 mod launch;
 mod lifecycle;
 mod locks;
+pub mod rollout;
 
 pub use config::*;
 pub use launch::*;

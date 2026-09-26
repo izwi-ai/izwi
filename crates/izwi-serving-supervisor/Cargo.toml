@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 fs2 = "0.4.3"
+serde_json = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 serde = { workspace = true }
