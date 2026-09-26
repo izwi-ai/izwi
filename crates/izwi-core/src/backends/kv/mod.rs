@@ -633,6 +633,10 @@ impl KvWriteCompletionCollector {
     }
 }
 
+mod page_transfer;
+
+pub use page_transfer::arena_page_bytes;
+
 /// Physical arena mutation ABI shared by CPU and accelerator backends.
 pub trait KvArena: Send + Sync {
     fn id(&self) -> KvArenaId;
@@ -693,6 +697,26 @@ pub trait KvArena: Send + Sync {
 
     fn zero_pages(&self, pages: &[CacheBlockRef]) -> Result<DeviceFence>;
     fn copy_pages(&self, copies: &[KvPageCopy]) -> Result<DeviceFence>;
+
+    /// Copy one whole page's bytes into a host buffer for host-tier storage
+    /// (DS4 demotion). The buffer must be exactly `arena_page_bytes(config)`
+    /// long; the read is consistent across layers. Offload-capable arenas
+    /// override this; the default rejects the operation.
+    fn capture_page(&self, _page: CacheBlockRef, _destination: &mut [u8]) -> Result<()> {
+        Err(Error::InferenceError(
+            "this KV arena does not support host page capture".to_string(),
+        ))
+    }
+
+    /// Write one whole page's bytes from a host buffer into the arena
+    /// (DS4 promotion). Symmetric with `capture_page`; the default rejects
+    /// the operation.
+    fn restore_page(&self, _page: CacheBlockRef, _source: &[u8]) -> Result<()> {
+        Err(Error::InferenceError(
+            "this KV arena does not support host page restore".to_string(),
+        ))
+    }
+
     /// Operations submitted through this arena after the write observe it in
     /// device submission order. The completion fence proves host visibility
     /// and safe reuse; callers may defer its wait until batch seal.

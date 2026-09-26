@@ -17,9 +17,9 @@ use super::cuda_tuning::{
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
 use super::{
-    DeviceFence, KvArena, KvArenaConfig, KvArenaGrowthPlan, KvArenaOperationStats,
-    KvAttentionProvider, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion,
-    PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    arena_page_bytes, page_transfer, DeviceFence, KvArena, KvArenaConfig, KvArenaGrowthPlan,
+    KvArenaOperationStats, KvAttentionProvider, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs,
+    KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -1813,6 +1813,83 @@ impl KvArena for CandleAcceleratorKvArena {
         }
         self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
         self.mutation_fence()
+    }
+
+    fn capture_page(&self, page: CacheBlockRef, destination: &mut [u8]) -> Result<()> {
+        let page = self.validate_block(page)?;
+        let expected = arena_page_bytes(&self.config) as usize;
+        if destination.len() != expected {
+            return Err(Error::InferenceError(format!(
+                "KV host page buffer must be {expected} bytes, got {}",
+                destination.len()
+            )));
+        }
+        // Writers cannot touch demotion candidates (prefix-shared pages are
+        // COW-protected by the coordinator), but the mutation lock still
+        // gives one consistent cross-layer snapshot.
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let mut offset = 0usize;
+        for layer in &self.config.layers {
+            let storage = self.layer_from(&layers, layer.binding)?;
+            offset += page_transfer::capture_block(
+                &storage.keys.narrow(0, page, 1)?.to_device(&Device::Cpu)?,
+                0,
+                &mut destination[offset..],
+            )?;
+            offset += page_transfer::capture_block(
+                &storage.values.narrow(0, page, 1)?.to_device(&Device::Cpu)?,
+                0,
+                &mut destination[offset..],
+            )?;
+        }
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(offset, expected);
+        Ok(())
+    }
+
+    fn restore_page(&self, page: CacheBlockRef, source: &[u8]) -> Result<()> {
+        let page = self.validate_block(page)?;
+        let expected = arena_page_bytes(&self.config) as usize;
+        if source.len() != expected {
+            return Err(Error::InferenceError(format!(
+                "KV host page buffer must be {expected} bytes, got {}",
+                source.len()
+            )));
+        }
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let layers = self
+            .layers
+            .read()
+            .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
+        let indices = accelerator_indices(&[0], &self.device)?;
+        let mut offset = 0usize;
+        for layer in &self.config.layers {
+            let storage = self.layer_from(&layers, layer.binding)?;
+            for tensor in [&storage.keys, &storage.values] {
+                let dims = tensor.dims();
+                let page_tensor = page_transfer::decoded_page(tensor, &source[offset..])?
+                    .reshape((1, dims[1], dims[2], dims[3]))?
+                    .to_device(&self.device)?;
+                scatter_rows(&tensor.narrow(0, page, 1)?, &indices, &page_tensor)?;
+                offset += page_tensor.elem_count() * self.config.dtype.size_in_bytes();
+            }
+        }
+        let mut clean = self
+            .clean_pages
+            .lock()
+            .map_err(|_| Error::InferenceError("accelerator KV cleanliness was poisoned".into()))?;
+        clean[page] = AcceleratorPageCleanliness::Dirty;
+        self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(offset, expected);
+        Ok(())
     }
 
     fn write_slots(
