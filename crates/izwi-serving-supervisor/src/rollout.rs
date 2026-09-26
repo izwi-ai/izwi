@@ -41,6 +41,8 @@ use crate::config::{ValidatedNodeConfig, WorkerConfig};
 pub const MAX_ROLLOUT_PLAN_BYTES: usize = 64 * 1024;
 /// Hard ceiling on the soak window.
 pub const MAX_ROLLOUT_WINDOW_SECS: u64 = 3600;
+/// Hard ceiling on the post-abort routing grace.
+pub const MAX_ROLLOUT_ABORT_GRACE_SECS: u64 = 300;
 /// Rollout state file name inside the supervisor's runtime directory.
 pub const ROLLOUT_STATE_FILE: &str = "rollout-state.json";
 /// Pre-rollout approvals backup file name inside the runtime directory.
@@ -82,9 +84,17 @@ pub struct RolloutPlan {
     /// generation. Zero skips the wait.
     #[serde(default = "default_window_secs")]
     window_secs: u64,
+    /// Grace between restoring the approvals on abort and stopping the
+    /// replacement workers, so the gateway stops routing to them first.
+    #[serde(default = "default_abort_grace_secs")]
+    abort_grace_secs: u64,
 }
 
 fn default_window_secs() -> u64 {
+    30
+}
+
+fn default_abort_grace_secs() -> u64 {
     30
 }
 
@@ -106,6 +116,10 @@ pub struct RolloutSpec {
     pub rolling: Vec<RollingDeployment>,
     pub canary_worker_id: String,
     pub window: Duration,
+    /// After abort restores the previous approval view, the coordinator
+    /// waits this long before stopping the replacement workers so the
+    /// gateway's approvals refresh stops routing to them first.
+    pub abort_grace: Duration,
 }
 
 impl RolloutSpec {
@@ -137,6 +151,16 @@ impl RolloutPlan {
             toml::from_str(text).map_err(|error| RolloutError::InvalidToml(error.to_string()))?;
         plan.validate_shape()?;
         Ok(plan)
+    }
+
+    /// The target node config path.
+    pub fn target_node_config(&self) -> &Path {
+        &self.target_node_config
+    }
+
+    /// The shared approvals file path the coordinator rewrites.
+    pub fn shared_approvals_path(&self) -> &Path {
+        &self.shared_approvals_path
     }
 
     fn validate_shape(&self) -> Result<(), RolloutError> {
@@ -176,6 +200,11 @@ impl RolloutPlan {
                 "window_secs must be at most {MAX_ROLLOUT_WINDOW_SECS}"
             )));
         }
+        if self.abort_grace_secs > MAX_ROLLOUT_ABORT_GRACE_SECS {
+            return Err(RolloutError::InvalidPlan(format!(
+                "abort_grace_secs must be at most {MAX_ROLLOUT_ABORT_GRACE_SECS}"
+            )));
+        }
         Ok(())
     }
 
@@ -190,6 +219,8 @@ impl RolloutPlan {
         hasher.update(self.canary_worker_id.as_bytes());
         hasher.update([0]);
         hasher.update(self.window_secs.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(self.abort_grace_secs.to_le_bytes());
         hasher.update([0]);
         hasher.update(target_config_bytes);
         format!("sha256:{:x}", hasher.finalize())
@@ -342,6 +373,7 @@ impl RolloutPlan {
             rolling,
             canary_worker_id: self.canary_worker_id.clone(),
             window: Duration::from_secs(self.window_secs),
+            abort_grace: Duration::from_secs(self.abort_grace_secs),
         })
     }
 }
@@ -396,7 +428,6 @@ impl RolloutPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RolloutWorkerRecord {
     pub worker_id: String,
-    pub incarnation_id: String,
     pub pid: u32,
 }
 
@@ -529,9 +560,11 @@ fn replacement_lines(
     Ok(lines)
 }
 
-/// Builds the window view: every current line stays (the old generation
-/// remains approved and admission-eligible until the gateway observes the
-/// successor Ready), plus one pinned line per replacement worker.
+/// Builds the window view: the old generation's operator lines stay
+/// verbatim (it remains approved and admission-eligible until the gateway
+/// observes the successor Ready), and one pinned line per replacement
+/// worker is appended. Regenerating this view from an already-written
+/// window file yields identical content, so resume rewrites are safe.
 pub fn build_window_view(
     classified: &[ClassifiedApproval],
     spec: &RolloutSpec,
@@ -539,31 +572,7 @@ pub fn build_window_view(
 ) -> Result<String, RolloutError> {
     let mut text = String::new();
     for entry in classified {
-        text.push_str(&entry.raw);
-        text.push('\n');
-    }
-    for approval in replacement_lines(spec, target)? {
-        text.push_str(&approval.render_line());
-        text.push('\n');
-    }
-    Ok(text)
-}
-
-/// Builds the commit view: the old generation's lines are removed and the
-/// replacement lines stay. Adopting this view makes the new generation the
-/// only approved one.
-pub fn build_commit_view(
-    classified: &[ClassifiedApproval],
-    spec: &RolloutSpec,
-    target: &ValidatedNodeConfig,
-) -> Result<String, RolloutError> {
-    let mut text = String::new();
-    for entry in classified {
-        let rolling_old = spec.rolling.iter().any(|deployment| {
-            entry.approval.deployment_id.as_str() == deployment.deployment_id
-                && entry.approval.model_generation == deployment.old_generation
-        });
-        if rolling_old {
+        if is_rolling_new_line(entry, spec) {
             continue;
         }
         text.push_str(&entry.raw);
@@ -574,6 +583,48 @@ pub fn build_commit_view(
         text.push('\n');
     }
     Ok(text)
+}
+
+/// Builds the commit view: every line of the rolling deployments' old
+/// generation is removed and the replacement lines stay. Adopting this view
+/// makes the new generation the only approved one.
+pub fn build_commit_view(
+    classified: &[ClassifiedApproval],
+    spec: &RolloutSpec,
+    target: &ValidatedNodeConfig,
+) -> Result<String, RolloutError> {
+    let mut text = String::new();
+    for entry in classified {
+        if is_rolling_line(entry, spec) {
+            continue;
+        }
+        text.push_str(&entry.raw);
+        text.push('\n');
+    }
+    for approval in replacement_lines(spec, target)? {
+        text.push_str(&approval.render_line());
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// Whether one classified line is a replacement line of a rolling
+/// deployment (regenerated by the views, never passed through).
+fn is_rolling_new_line(entry: &ClassifiedApproval, spec: &RolloutSpec) -> bool {
+    spec.rolling.iter().any(|deployment| {
+        entry.approval.deployment_id.as_str() == deployment.deployment_id
+            && entry.approval.model_generation == deployment.new_generation
+    })
+}
+
+/// Whether one classified line belongs to a rolling deployment at either
+/// generation (the commit view drops both and regenerates replacements).
+fn is_rolling_line(entry: &ClassifiedApproval, spec: &RolloutSpec) -> bool {
+    spec.rolling.iter().any(|deployment| {
+        entry.approval.deployment_id.as_str() == deployment.deployment_id
+            && (entry.approval.model_generation == deployment.old_generation
+                || entry.approval.model_generation == deployment.new_generation)
+    })
 }
 
 /// Reads a bounded approvals file.
@@ -904,6 +955,7 @@ mod tests {
             }],
             canary_worker_id: "worker-b".to_string(),
             window: Duration::from_secs(10),
+            abort_grace: Duration::from_secs(5),
         }
     }
 
@@ -934,6 +986,32 @@ mod tests {
             replacement.model_generation,
             ModelGeneration::new(2).unwrap()
         );
+    }
+
+    #[test]
+    fn views_are_idempotent_over_an_already_written_window_file() {
+        let spec = sample_spec();
+        let window_once = build_window_view(&sample_classified(), &spec, &sample_target()).unwrap();
+        let window_twice = build_window_view(
+            &classify_approvals(&window_once).unwrap(),
+            &spec,
+            &sample_target(),
+        )
+        .unwrap();
+        assert_eq!(window_once, window_twice);
+        let commit = build_commit_view(
+            &classify_approvals(&window_once).unwrap(),
+            &spec,
+            &sample_target(),
+        )
+        .unwrap();
+        let commit_twice = build_commit_view(
+            &classify_approvals(&commit).unwrap(),
+            &spec,
+            &sample_target(),
+        )
+        .unwrap();
+        assert_eq!(commit, commit_twice);
     }
 
     #[test]
@@ -978,7 +1056,6 @@ mod tests {
             window_deadline_ms: Some(3),
             replacement_workers: vec![RolloutWorkerRecord {
                 worker_id: "worker-b".to_string(),
-                incarnation_id: "inc-1".to_string(),
                 pid: 42,
             }],
             shared_approvals_path: "/tmp/approvals".to_string(),

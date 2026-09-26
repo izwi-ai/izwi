@@ -2,11 +2,12 @@ use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
     BackendKind, DeviceId, IncarnationId, ServiceBearerToken, ServiceCredentials, WorkerId,
 };
+use izwi_serving_supervisor::rollout::{self, RolloutPhase};
 use izwi_serving_supervisor::{
     build_child_launch_spec, BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory,
     LockNamespace, MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, RestartController,
-    RestartDecision, SupervisedWorker, ValidatedNodeConfig, WorkerBinaryFlavor, WorkerLockPaths,
-    MAX_NODE_CONFIG_BYTES,
+    RestartDecision, ShutdownPolicy, SupervisedWorker, ValidatedNodeConfig, WorkerBinaryFlavor,
+    WorkerLockPaths, MAX_NODE_CONFIG_BYTES,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,7 +16,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{mpsc, watch},
@@ -46,10 +47,17 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     let validate_only = options.validate_only;
     let config_bytes = read_bounded(&options.config, MAX_NODE_CONFIG_BYTES)?;
     let config = NodeConfig::parse_bounded(&config_bytes)?;
+
+    // --rollout-status only reports persisted state; no validation, locks,
+    // or launch. The abort command runs after full node validation below.
+    if options.rollout_status {
+        return print_rollout_status(&config);
+    }
+
     ensure_flavor_binaries(&config, &options)?;
 
     let inventory = HostInventory {
-        effective_cpu_ids: options.cpu_ids,
+        effective_cpu_ids: options.cpu_ids.clone(),
         allocatable_host_memory_bytes: options.allocatable_host_memory_bytes,
         metal_devices: options
             .metal_devices
@@ -110,6 +118,13 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         return Ok(());
     }
 
+    // --rollout-abort restores the pre-rollout approval view without
+    // launching anything. Acquiring the node lease and generation barrier
+    // proves no supervisor is live and no orphaned worker holds a fence.
+    if options.rollout_abort {
+        return rollout_abort_command(&node);
+    }
+
     let inherited_environment = inherited_environment();
 
     let locks = LockNamespace::open(&node.config().runtime_directory)?;
@@ -121,6 +136,22 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     let generation_barrier = locks.try_generation_barrier(lock_metadata.as_bytes())?;
     drop(generation_barrier);
 
+    // DS6: rollout preparation runs under the supervisor lease so state
+    // staging cannot race another supervisor. A fresh start without a plan
+    // must reconcile any persisted rollout state fail-closed.
+    let mut rollout = match options.rollout_plan.as_ref() {
+        Some(plan_path) => Some(prepare_rollout(
+            plan_path, &node, &inventory, &binaries, &options,
+        )?),
+        None => {
+            reconcile_fresh_start_state(&node, &config_bytes)?;
+            None
+        }
+    };
+    let resume_draining_old = rollout
+        .as_ref()
+        .is_some_and(|prepared| prepared.state.phase == RolloutPhase::DrainingOld);
+
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         wait_for_shutdown_request().await;
@@ -128,6 +159,17 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     });
     let (diagnostic_tx, mut diagnostic_rx) = mpsc::channel(1);
     spawn_diagnostic_signal_listener(diagnostic_tx);
+    // DS6: SIGUSR2 requests an in-process rollout abort while the rollout is
+    // still reversible (launch or window phases).
+    let (abort_tx, mut abort_rx) = watch::channel(false);
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let mut signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+                .expect("install SIGUSR2 listener");
+        signal.recv().await;
+        let _ = abort_tx.send(true);
+    });
 
     let started_at = Instant::now();
     let mut metrics = SupervisorMetrics::default();
@@ -179,6 +221,16 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         {
             continue;
         }
+        // On resume into DrainingOld the old generation is retired and its
+        // workers exited before the generation barrier released; never
+        // relaunch them.
+        if resume_draining_old
+            && rollout
+                .as_ref()
+                .is_some_and(|prepared| prepared.spec.is_old_worker(slot.worker_id.as_str()))
+        {
+            continue;
+        }
         launch_slot(
             &node,
             &locks,
@@ -189,6 +241,35 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             &mut metrics,
         )
         .await;
+    }
+
+    // DS6: run the rollout state machine to commit or abort. After a commit
+    // the replacement slots join supervision under the target node config.
+    let mut replacement_slots: Vec<WorkerSlot> = Vec::new();
+    let mut target_node: Option<ValidatedNodeConfig> = None;
+    if rollout.is_some() {
+        match execute_rollout(
+            rollout.as_mut().expect("rollout is present"),
+            &node,
+            &locks,
+            &inherited_environment,
+            &mut slots,
+            &mut shutdown_rx,
+            &mut abort_rx,
+            started_at,
+            &mut metrics,
+        )
+        .await
+        {
+            RolloutOutcome::Committed | RolloutOutcome::DegradedAbort => {
+                let prepared = rollout.take().expect("rollout is present");
+                replacement_slots = prepared.replacements;
+                target_node = Some(prepared.target);
+            }
+            RolloutOutcome::Aborted => {
+                rollout.take();
+            }
+        }
     }
 
     let mut poll = tokio::time::interval(SUPERVISION_POLL_INTERVAL);
@@ -202,9 +283,18 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             }
             Some(()) = diagnostic_rx.recv() => {
                 eprint!("{}", runtime_diagnostic(&node, &slots, &metrics, started_at));
+                if !replacement_slots.is_empty() {
+                    if let Some(target) = target_node.as_ref() {
+                        eprint!(
+                            "{}",
+                            runtime_diagnostic(target, &replacement_slots, &metrics, started_at)
+                        );
+                    }
+                }
             }
             _ = poll.tick() => {
                 observe_exits(&mut slots, started_at, &mut metrics);
+                observe_exits(&mut replacement_slots, started_at, &mut metrics);
                 if let Some(slot) = next_restart_slot(&mut slots) {
                     launch_slot(
                         &node,
@@ -216,12 +306,605 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                         &mut metrics,
                     ).await;
                 }
+                if !replacement_slots.is_empty() {
+                    if let Some(target) = target_node.as_ref() {
+                        if let Some(slot) = next_restart_slot(&mut replacement_slots) {
+                            launch_slot(
+                                target,
+                                &locks,
+                                &inherited_environment,
+                                slot,
+                                &mut shutdown_rx,
+                                started_at,
+                                &mut metrics,
+                            ).await;
+                        }
+                    }
+                }
             }
         }
     }
 
     drain_all(slots, node.config().shutdown.clone(), &mut metrics).await;
+    let replacement_policy = target_node
+        .as_ref()
+        .map(|target| target.config().shutdown.clone())
+        .unwrap_or_else(|| node.config().shutdown.clone());
+    drain_all(replacement_slots, replacement_policy, &mut metrics).await;
     Ok(())
+}
+
+/// A prepared DS6 rollout: validated spec, staged state, target config, and
+/// resolved replacement slots awaiting launch.
+struct PreparedRollout {
+    spec: rollout::RolloutSpec,
+    state: rollout::RolloutState,
+    target: ValidatedNodeConfig,
+    approvals_path: PathBuf,
+    classified: Vec<rollout::ClassifiedApproval>,
+    replacements: Vec<WorkerSlot>,
+}
+
+enum RolloutOutcome {
+    /// The new generation is admission-eligible and the old generation
+    /// drained; replacements join supervision under the target config.
+    Committed,
+    /// The rollout aborted cleanly; the previous generation never stopped
+    /// serving and the replacement workers were stopped.
+    Aborted,
+    /// Abort could not restore the approvals; everything keeps running and
+    /// the state stays non-terminal for a manual `--rollout-abort` retry.
+    DegradedAbort,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn prepare_rollout(
+    plan_path: &Path,
+    current: &ValidatedNodeConfig,
+    inventory: &HostInventory,
+    binaries: &BinaryCatalog,
+    options: &CliOptions,
+) -> Result<PreparedRollout, SupervisorError> {
+    let plan_bytes = read_bounded(plan_path, rollout::MAX_ROLLOUT_PLAN_BYTES)?;
+    let plan = rollout::RolloutPlan::parse_bounded(&plan_bytes)?;
+    let target_bytes = read_bounded(plan.target_node_config(), MAX_NODE_CONFIG_BYTES)?;
+    let target_config = NodeConfig::parse_bounded(&target_bytes)?;
+    ensure_flavor_binaries(&target_config, options)?;
+    let target = target_config.validate(inventory, binaries)?;
+    let spec = plan.validate(current, &target)?;
+
+    let runtime_directory = &current.config().runtime_directory;
+    let plan_digest = plan.digest(&target_bytes);
+    let existing = rollout::load_state(runtime_directory)?;
+    let state = match existing {
+        Some(state) if !state.phase.is_terminal() => {
+            if state.plan_digest != plan_digest {
+                return Err(SupervisorError::RolloutStateDigestMismatch);
+            }
+            eprintln!(
+                "resuming rollout in state {} (plan digest matches)",
+                state.phase.as_str()
+            );
+            Some(state)
+        }
+        Some(state) => {
+            rollout::clear_state(runtime_directory)?;
+            rollout::clear_approvals_backup(runtime_directory)?;
+            eprintln!(
+                "cleared terminal rollout state ({}) before staging the new rollout",
+                state.phase.as_str()
+            );
+            None
+        }
+        None => None,
+    };
+
+    let approvals_text = rollout::read_approvals_file(plan.shared_approvals_path())?;
+    let classified = rollout::classify_approvals(&approvals_text)?;
+    rollout::verify_approvals_precondition(&classified, &spec)?;
+    let replacements = resolve_replacement_slots(&target, &spec)?;
+
+    let state = match state {
+        Some(state) => state,
+        None => {
+            let now = now_ms();
+            let approvals_backup_digest =
+                rollout::backup_approvals(runtime_directory, &approvals_text)?;
+            rollout::RolloutState {
+                schema_version: 1,
+                plan_digest,
+                phase: rollout::RolloutPhase::LaunchingReplacement,
+                started_at_ms: now,
+                updated_at_ms: now,
+                window_deadline_ms: None,
+                replacement_workers: Vec::new(),
+                shared_approvals_path: plan.shared_approvals_path().to_string_lossy().into_owned(),
+                target_node_config: plan.target_node_config().to_string_lossy().into_owned(),
+                target_config_digest: rollout::digest_bytes(&target_bytes),
+                approvals_backup_digest,
+            }
+        }
+    };
+    rollout::persist_state(runtime_directory, &state)?;
+    eprintln!(
+        "rollout prepared: {} rolling deployment(s), canary {}, window {}s, abort grace {}s",
+        spec.rolling.len(),
+        spec.canary_worker_id,
+        spec.window.as_secs(),
+        spec.abort_grace.as_secs()
+    );
+    Ok(PreparedRollout {
+        spec,
+        state,
+        target,
+        approvals_path: plan.shared_approvals_path().to_path_buf(),
+        classified,
+        replacements,
+    })
+}
+
+/// A fresh supervisor start without a plan must not silently relaunch the
+/// old generation mid-rollout: non-terminal state fails closed, committed
+/// state requires the committed target config, aborted state clears.
+fn reconcile_fresh_start_state(
+    node: &ValidatedNodeConfig,
+    config_bytes: &[u8],
+) -> Result<(), SupervisorError> {
+    let runtime_directory = &node.config().runtime_directory;
+    let Some(state) = rollout::load_state(runtime_directory)? else {
+        return Ok(());
+    };
+    if !state.phase.is_terminal() {
+        return Err(rollout::RolloutError::RolloutAlreadyInProgress {
+            phase: state.phase.as_str().to_string(),
+        }
+        .into());
+    }
+    let supplied_digest = rollout::digest_bytes(config_bytes);
+    if state.phase == RolloutPhase::Committed && state.target_config_digest != supplied_digest {
+        return Err(SupervisorError::RolloutCommittedConfigMismatch {
+            recorded: state.target_config_digest,
+            actual: supplied_digest,
+        });
+    }
+    rollout::clear_state(runtime_directory)?;
+    rollout::clear_approvals_backup(runtime_directory)?;
+    eprintln!("cleared terminal rollout state ({})", state.phase.as_str());
+    Ok(())
+}
+
+async fn execute_rollout(
+    prepared: &mut PreparedRollout,
+    node: &ValidatedNodeConfig,
+    locks: &LockNamespace,
+    inherited_environment: &BTreeMap<OsString, OsString>,
+    current_slots: &mut Vec<WorkerSlot>,
+    shutdown: &mut watch::Receiver<bool>,
+    abort_requested: &mut watch::Receiver<bool>,
+    started_at: Instant,
+    metrics: &mut SupervisorMetrics,
+) -> RolloutOutcome {
+    let runtime_directory = node.config().runtime_directory.clone();
+    let shutdown_policy = node.config().shutdown.clone();
+    let resuming_window = prepared.state.phase == RolloutPhase::WindowOpen;
+
+    // Launch the replacements canary-first. On window resume the crashed
+    // supervisor's replacements self-drained, so they relaunch here too.
+    if prepared.state.phase == RolloutPhase::LaunchingReplacement || resuming_window {
+        let canary = prepared.spec.canary_worker_id.clone();
+        prepared
+            .replacements
+            .sort_by_key(|slot| slot.worker_id.as_str() != canary.as_str());
+        prepared.state.replacement_workers.clear();
+        for slot in prepared.replacements.iter_mut() {
+            if *shutdown.borrow() {
+                break;
+            }
+            launch_slot(
+                &prepared.target,
+                locks,
+                inherited_environment,
+                slot,
+                shutdown,
+                started_at,
+                metrics,
+            )
+            .await;
+            if slot.process.is_none() {
+                eprintln!(
+                    "replacement worker {} failed to reach readiness; aborting rollout",
+                    slot.worker_id
+                );
+                let restored = abort_rollout(
+                    prepared,
+                    &runtime_directory,
+                    metrics,
+                    false,
+                    &shutdown_policy,
+                    "replacement readiness failed",
+                )
+                .await;
+                return if restored {
+                    RolloutOutcome::Aborted
+                } else {
+                    RolloutOutcome::DegradedAbort
+                };
+            }
+            let pid = slot
+                .process
+                .as_ref()
+                .and_then(SupervisedWorker::process_id)
+                .unwrap_or(0);
+            prepared
+                .state
+                .replacement_workers
+                .push(rollout::RolloutWorkerRecord {
+                    worker_id: slot.worker_id.to_string(),
+                    pid,
+                });
+            prepared.state.updated_at_ms = now_ms();
+            if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
+                eprintln!("rollout state persist failed: {error}");
+            }
+        }
+        if *shutdown.borrow() {
+            let restored = abort_rollout(
+                prepared,
+                &runtime_directory,
+                metrics,
+                false,
+                &shutdown_policy,
+                "shutdown requested",
+            )
+            .await;
+            return if restored {
+                RolloutOutcome::Aborted
+            } else {
+                RolloutOutcome::DegradedAbort
+            };
+        }
+    }
+
+    // Open (or re-open on resume) the window: both generations are approved,
+    // the gateway cuts over atomically when the successor first observes
+    // Ready. The old generation never stops serving during the window.
+    let window_view =
+        match rollout::build_window_view(&prepared.classified, &prepared.spec, &prepared.target)
+            .and_then(|view| {
+                rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
+                Ok(view)
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("rollout window view failed to write: {error}; nothing changed");
+                return RolloutOutcome::DegradedAbort;
+            }
+        };
+    let _ = window_view;
+    let deadline_ms = prepared
+        .state
+        .window_deadline_ms
+        .unwrap_or_else(|| now_ms().saturating_add(prepared.spec.window.as_millis() as u64));
+    prepared.state.phase = RolloutPhase::WindowOpen;
+    prepared.state.window_deadline_ms = Some(deadline_ms);
+    prepared.state.updated_at_ms = now_ms();
+    if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
+        eprintln!("rollout state persist failed: {error}");
+    }
+    eprintln!(
+        "rollout window open: both generations approved; cutover fires when the successor generation is observed Ready; drain starts in {}s",
+        deadline_ms.saturating_sub(now_ms()) / 1000
+    );
+    let mut window_watch = tokio::time::interval(Duration::from_millis(500));
+    window_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    while now_ms() < deadline_ms {
+        tokio::select! {
+            _ = window_watch.tick() => {
+                let operator_abort = *abort_requested.borrow();
+                if *shutdown.borrow() || operator_abort {
+                    let reason = if *shutdown.borrow() {
+                        "shutdown requested"
+                    } else {
+                        "operator abort (SIGUSR2)"
+                    };
+                    let restored = abort_rollout(
+                        prepared,
+                        &runtime_directory,
+                        metrics,
+                        true,
+                        &shutdown_policy,
+                        reason,
+                    )
+                    .await;
+                    return if restored {
+                        RolloutOutcome::Aborted
+                    } else {
+                        RolloutOutcome::DegradedAbort
+                    };
+                }
+                for slot in prepared.replacements.iter_mut() {
+                    let Some(process) = slot.process.as_mut() else {
+                        continue;
+                    };
+                    if matches!(process.try_wait(), Ok(Some(_))) {
+                        eprintln!(
+                            "replacement worker {} exited during the rollout window; aborting rollout",
+                            slot.worker_id
+                        );
+                        let restored = abort_rollout(
+                            prepared,
+                            &runtime_directory,
+                            metrics,
+                            true,
+                            &shutdown_policy,
+                            "replacement exited during the window",
+                        )
+                        .await;
+                        return if restored {
+                            RolloutOutcome::Aborted
+                        } else {
+                            RolloutOutcome::DegradedAbort
+                        };
+                    }
+                }
+            }
+            _ = abort_requested.changed() => {}
+        }
+    }
+
+    // DrainingOld is the point of no return: the commit view is written and
+    // the old generation's workers stop admitting. On resume into this
+    // phase the old workers already exited (the generation barrier proved
+    // it), so the drain finds nothing to stop.
+    prepared.state.phase = RolloutPhase::DrainingOld;
+    prepared.state.window_deadline_ms = None;
+    prepared.state.updated_at_ms = now_ms();
+    if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
+        eprintln!("rollout state persist failed: {error}");
+    }
+    eprintln!(
+        "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
+    );
+    let commit_view =
+        match rollout::build_commit_view(&prepared.classified, &prepared.spec, &prepared.target)
+            .and_then(|view| {
+                rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
+                Ok(view)
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "rollout commit view failed to write: {error}; the window view stays in place"
+                );
+                return RolloutOutcome::DegradedAbort;
+            }
+        };
+    let _ = commit_view;
+    drain_selected(
+        current_slots,
+        |slot| prepared.spec.is_old_worker(slot.worker_id.as_str()),
+        &shutdown_policy,
+        metrics,
+    )
+    .await;
+    prepared.state.phase = RolloutPhase::Committed;
+    prepared.state.updated_at_ms = now_ms();
+    if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
+        eprintln!("rollout state persist failed: {error}");
+    }
+    eprintln!(
+        "rollout committed: the target config's generations are admission-eligible; repoint the service definition at the target node config"
+    );
+    RolloutOutcome::Committed
+}
+
+/// Aborts a reversible rollout: restore the pre-rollout approvals first so
+/// the gateway stops routing to the replacements within one refresh TTL,
+/// wait the abort grace, then drain the replacement workers. The previous
+/// generation never stopped serving. Returns whether the approvals were
+/// restored.
+async fn abort_rollout(
+    prepared: &mut PreparedRollout,
+    runtime_directory: &Path,
+    metrics: &mut SupervisorMetrics,
+    honor_grace: bool,
+    policy: &ShutdownPolicy,
+    reason: &str,
+) -> bool {
+    eprintln!("rollout aborted ({reason}): restoring the previous approval view");
+    if let Err(error) = rollout::restore_approvals(
+        runtime_directory,
+        &prepared.approvals_path,
+        &prepared.state.approvals_backup_digest,
+    ) {
+        eprintln!(
+            "rollout abort could not restore approvals: {error}; workers keep running and the state stays resumable"
+        );
+        return false;
+    }
+    if honor_grace && !prepared.spec.abort_grace.is_zero() {
+        eprintln!(
+            "waiting {}s for gateway approval refresh before stopping replacement workers",
+            prepared.spec.abort_grace.as_secs()
+        );
+        tokio::time::sleep(prepared.spec.abort_grace).await;
+    }
+    let mut drains = JoinSet::new();
+    for slot in prepared.replacements.iter_mut() {
+        if let Some(process) = slot.process.take() {
+            let worker_id = slot.worker_id.clone();
+            let policy = policy.clone();
+            drains.spawn(async move { (worker_id, process.drain_and_stop(&policy).await) });
+        }
+    }
+    while let Some(result) = drains.join_next().await {
+        match result {
+            Ok((worker_id, Ok(report))) => eprintln!(
+                "replacement worker {worker_id} stopped with {:?} ({})",
+                report.outcome, report.exit_status
+            ),
+            Ok((worker_id, Err(error))) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("replacement worker {worker_id} stop failed: {error}");
+            }
+            Err(error) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("replacement worker stop task failed: {error}");
+            }
+        }
+    }
+    prepared.state.phase = RolloutPhase::Aborted;
+    prepared.state.updated_at_ms = now_ms();
+    if let Err(error) = rollout::persist_state(runtime_directory, &prepared.state) {
+        eprintln!("rollout state persist failed: {error}");
+    }
+    let _ = rollout::clear_state(runtime_directory);
+    let _ = rollout::clear_approvals_backup(runtime_directory);
+    eprintln!(
+        "rollout abort complete: the previous approval view is restored and the replacement workers are stopped"
+    );
+    true
+}
+
+/// Drains a selected subset of slots and removes them from supervision.
+async fn drain_selected(
+    slots: &mut Vec<WorkerSlot>,
+    select: impl Fn(&WorkerSlot) -> bool,
+    policy: &ShutdownPolicy,
+    metrics: &mut SupervisorMetrics,
+) {
+    let mut drains = JoinSet::new();
+    let mut selected = Vec::new();
+    for (index, slot) in slots.iter_mut().enumerate() {
+        if select(slot) {
+            if let Some(process) = slot.process.take() {
+                let worker_id = slot.worker_id.clone();
+                let policy = policy.clone();
+                drains.spawn(async move { (worker_id, process.drain_and_stop(&policy).await) });
+            }
+            selected.push(index);
+        }
+    }
+    while let Some(result) = drains.join_next().await {
+        match result {
+            Ok((worker_id, Ok(report))) => eprintln!(
+                "worker {worker_id} drained with {:?} ({})",
+                report.outcome, report.exit_status
+            ),
+            Ok((worker_id, Err(error))) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("worker {worker_id} drain failed: {error}");
+            }
+            Err(error) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("worker drain task failed: {error}");
+            }
+        }
+    }
+    let mut cursor = 0;
+    slots.retain(|_| {
+        let keep = !selected.contains(&cursor);
+        cursor += 1;
+        keep
+    });
+}
+
+fn rollout_abort_command(node: &ValidatedNodeConfig) -> Result<(), SupervisorError> {
+    let runtime_directory = &node.config().runtime_directory;
+    let Some(state) = rollout::load_state(runtime_directory)? else {
+        eprintln!(
+            "no rollout state found in {}; nothing to abort",
+            runtime_directory.display()
+        );
+        return Err(SupervisorError::RolloutNothingToAbort);
+    };
+    if state.phase.is_terminal() {
+        rollout::clear_state(runtime_directory)?;
+        rollout::clear_approvals_backup(runtime_directory)?;
+        eprintln!("cleared terminal rollout state ({})", state.phase.as_str());
+        return Ok(());
+    }
+    let locks = LockNamespace::open(runtime_directory)?;
+    let lease_metadata = format!("rollout-abort pid={}", std::process::id());
+    if locks
+        .try_node_supervisor(lease_metadata.as_bytes())
+        .is_err()
+    {
+        return Err(SupervisorError::RolloutSupervisorBusy);
+    }
+    if locks
+        .try_generation_barrier(lease_metadata.as_bytes())
+        .is_err()
+    {
+        return Err(SupervisorError::RolloutFenceContended);
+    }
+    rollout::restore_approvals(
+        runtime_directory,
+        Path::new(&state.shared_approvals_path),
+        &state.approvals_backup_digest,
+    )?;
+    rollout::clear_approvals_backup(runtime_directory)?;
+    rollout::clear_state(runtime_directory)?;
+    eprintln!(
+        "rollout aborted: the previous approval view is restored byte-identically; the previous generation never stopped serving"
+    );
+    Ok(())
+}
+
+fn print_rollout_status(config: &NodeConfig) -> Result<(), SupervisorError> {
+    let runtime_directory = &config.runtime_directory;
+    match rollout::load_state(runtime_directory)? {
+        Some(state) => {
+            eprintln!(
+                "rollout_state={} node={}",
+                state.phase.as_str(),
+                config.node_id
+            );
+            eprintln!(
+                "plan_digest={} target_node_config={}",
+                state.plan_digest, state.target_node_config
+            );
+            eprintln!("shared_approvals_path={}", state.shared_approvals_path);
+            if let Some(deadline) = state.window_deadline_ms {
+                eprintln!(
+                    "window_deadline_ms={deadline} (remaining {}s)",
+                    deadline.saturating_sub(now_ms()) / 1000
+                );
+            }
+            for worker in &state.replacement_workers {
+                eprintln!("replacement_worker={} pid={}", worker.worker_id, worker.pid);
+            }
+            if state.phase.is_terminal() {
+                eprintln!(
+                    "note: terminal rollout state clears automatically on the next supervisor start or via --rollout-abort"
+                );
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!("no rollout state in {}", runtime_directory.display());
+            Ok(())
+        }
+    }
+}
+
+fn resolve_replacement_slots(
+    target: &ValidatedNodeConfig,
+    spec: &rollout::RolloutSpec,
+) -> Result<Vec<WorkerSlot>, SupervisorError> {
+    target
+        .config()
+        .workers
+        .iter()
+        .filter(|worker| spec.rolling_for(worker.worker_id.as_str()).is_some())
+        .map(|worker| resolve_slot(target, worker))
+        .collect()
 }
 
 struct WorkerSlot {
@@ -294,33 +977,37 @@ fn resolve_slots(node: &ValidatedNodeConfig) -> Result<Vec<WorkerSlot>, Supervis
     node.config()
         .workers
         .iter()
-        .map(|worker| {
-            let value =
-                env::var(&worker.bearer_token_env).map_err(|_| SupervisorError::MissingSecret {
-                    worker: worker.worker_id.clone(),
-                    environment: worker.bearer_token_env.clone(),
-                })?;
-            let secret = ResolvedWorkerSecret {
-                bearer_token: ServiceBearerToken::new(value).map_err(|source| {
-                    SupervisorError::InvalidSecret {
-                        worker: worker.worker_id.clone(),
-                        environment: worker.bearer_token_env.clone(),
-                        source,
-                    }
-                })?,
-            };
-            Ok(WorkerSlot {
-                worker_id: worker.worker_id.clone(),
-                secret_environment_name: worker.bearer_token_env.clone(),
-                secret,
-                restart: RestartController::for_worker(node, &worker.worker_id)?,
-                process: None,
-                process_started_at: None,
-                restart_at: Some(Instant::now()),
-                exit_observation_failed: false,
-            })
-        })
+        .map(|worker| resolve_slot(node, worker))
         .collect()
+}
+
+fn resolve_slot(
+    node: &ValidatedNodeConfig,
+    worker: &izwi_serving_supervisor::WorkerConfig,
+) -> Result<WorkerSlot, SupervisorError> {
+    let value = env::var(&worker.bearer_token_env).map_err(|_| SupervisorError::MissingSecret {
+        worker: worker.worker_id.clone(),
+        environment: worker.bearer_token_env.clone(),
+    })?;
+    let secret = ResolvedWorkerSecret {
+        bearer_token: ServiceBearerToken::new(value).map_err(|source| {
+            SupervisorError::InvalidSecret {
+                worker: worker.worker_id.clone(),
+                environment: worker.bearer_token_env.clone(),
+                source,
+            }
+        })?,
+    };
+    Ok(WorkerSlot {
+        worker_id: worker.worker_id.clone(),
+        secret_environment_name: worker.bearer_token_env.clone(),
+        secret,
+        restart: RestartController::for_worker(node, &worker.worker_id)?,
+        process: None,
+        process_started_at: None,
+        restart_at: Some(Instant::now()),
+        exit_observation_failed: false,
+    })
 }
 
 fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
@@ -761,6 +1448,9 @@ struct CliOptions {
     allocatable_host_memory_bytes: u64,
     validate_only: bool,
     canary_worker_id: Option<WorkerId>,
+    rollout_plan: Option<PathBuf>,
+    rollout_abort: bool,
+    rollout_status: bool,
 }
 
 enum ParseOutcome {
@@ -789,6 +1479,9 @@ impl CliOptions {
         let mut allocatable_host_memory_bytes = None;
         let mut validate_only = false;
         let mut canary_worker_id = None;
+        let mut rollout_plan = None;
+        let mut rollout_abort = false;
+        let mut rollout_status = false;
         let mut index = 0;
         while index < arguments.len() {
             let name = arguments[index]
@@ -799,6 +1492,22 @@ impl CliOptions {
                     return Err(SupervisorError::DuplicateOption(name.to_string()));
                 }
                 validate_only = true;
+                index += 1;
+                continue;
+            }
+            if name == "--rollout-abort" {
+                if rollout_abort {
+                    return Err(SupervisorError::DuplicateOption(name.to_string()));
+                }
+                rollout_abort = true;
+                index += 1;
+                continue;
+            }
+            if name == "--rollout-status" {
+                if rollout_status {
+                    return Err(SupervisorError::DuplicateOption(name.to_string()));
+                }
+                rollout_status = true;
                 index += 1;
                 continue;
             }
@@ -853,9 +1562,32 @@ impl CliOptions {
                         .map_err(|_| SupervisorError::InvalidOption(name.to_string()))?;
                     set_once(&mut canary_worker_id, id, name)?;
                 }
+                "--rollout-plan" => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
+                    set_once(&mut rollout_plan, PathBuf::from(value), name)?;
+                }
                 _ => return Err(SupervisorError::UnknownOption(name.to_string())),
             }
             index += 2;
+        }
+        let rollout_modes = usize::from(rollout_abort)
+            + usize::from(rollout_status)
+            + usize::from(rollout_plan.is_some());
+        if rollout_modes > 1 {
+            return Err(SupervisorError::InvalidOption(
+                "--rollout-plan, --rollout-abort, and --rollout-status are mutually exclusive"
+                    .to_string(),
+            ));
+        }
+        if (rollout_abort || rollout_status || rollout_plan.is_some())
+            && (validate_only || canary_worker_id.is_some())
+        {
+            return Err(SupervisorError::InvalidOption(
+                "--rollout-* modes cannot be combined with --validate-only or --canary-worker-id"
+                    .to_string(),
+            ));
         }
         Ok(ParseOutcome::Run(Box::new(Self {
             config: config.ok_or(SupervisorError::MissingOption("--config"))?,
@@ -870,6 +1602,9 @@ impl CliOptions {
             )?,
             validate_only,
             canary_worker_id,
+            rollout_plan,
+            rollout_abort,
+            rollout_status,
         })))
     }
 }
@@ -983,9 +1718,14 @@ the supervisor admits nothing before that worker reports readiness."
     eprintln!(
         "Optional: --validate-only resolves configuration and service credentials, prints bounded redacted diagnostics, and exits without acquiring locks or launching workers."
     );
+    eprintln!(
+        "Rollout (DS6): --rollout-plan PATH starts or resumes a blue-green rollout declared by the plan;\n\
+  --rollout-abort restores the pre-rollout approvals and clears state; --rollout-status reports persisted rollout state.\n\
+  All three require --config."
+    );
     #[cfg(unix)]
     eprintln!(
-        "Send SIGUSR1 to a running supervisor for one bounded, redacted status snapshot on stderr."
+        "Send SIGUSR1 to a running supervisor for one bounded, redacted status snapshot on stderr; SIGUSR2 aborts a running rollout while it is still reversible."
     );
 }
 
@@ -1048,6 +1788,18 @@ enum SupervisorError {
     CanaryWorkerNotFound { worker_id: WorkerId },
     #[error("canary worker {worker_id} failed to reach readiness; rollout aborted")]
     CanaryReadinessFailed { worker_id: WorkerId },
+    #[error(transparent)]
+    Rollout(#[from] rollout::RolloutError),
+    #[error("persisted rollout state belongs to a different plan; resume with its original plan or abort with --rollout-abort")]
+    RolloutStateDigestMismatch,
+    #[error("a committed rollout recorded target config digest {recorded}; the supplied config digest is {actual}. Start with the committed target config or clear the state with --rollout-abort")]
+    RolloutCommittedConfigMismatch { recorded: String, actual: String },
+    #[error("cannot abort: a live supervisor holds the node lease (send SIGUSR2 for in-process abort, or stop the supervisor first)")]
+    RolloutSupervisorBusy,
+    #[error("cannot abort: orphaned rollout workers still hold their generation fence; they self-drain after the supervisor exited, retry shortly")]
+    RolloutFenceContended,
+    #[error("no rollout state found to abort")]
+    RolloutNothingToAbort,
 }
 
 #[cfg(test)]
@@ -1277,6 +2029,9 @@ mod tests {
             allocatable_host_memory_bytes: 4294967296,
             validate_only: false,
             canary_worker_id: None,
+            rollout_plan: None,
+            rollout_abort: false,
+            rollout_status: false,
         };
         assert!(matches!(
             ensure_flavor_binaries(&config(metal.clone(), WorkerBinaryFlavor::Metal), &options),
