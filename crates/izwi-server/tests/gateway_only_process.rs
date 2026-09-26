@@ -626,3 +626,279 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     let _ = gateway.kill();
     let _ = gateway.wait();
 }
+
+/// Process-level TTS-stream leg: with IZWI_GATEWAY_REALTIME=on and an
+/// approved text_to_speech worker, the gateway resolves the admit's task to
+/// the TTS pool, forwards Input text frames downstream, and passes worker
+/// audio frames back to the client verbatim.
+#[tokio::test]
+async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binary() {
+    use futures::{SinkExt, StreamExt};
+    use izwi_serving_protocol::{
+        decode_realtime_audio_frame, AttemptId, CallerId, GatewayAttestedCallerContext,
+        InvocationEventKind, ModelGeneration, PermittedAction, PolicyRevision, RealtimeAudioCodec,
+        RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeStageInput,
+        RequestId, ServiceClass, SessionId, TaskKind, TenantId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
+    };
+    use std::collections::BTreeSet;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    let model = ModelVariant::Qwen34BGguf;
+    let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
+    let chat_worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+        public_model: model_alias.clone(),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock chat worker binds");
+    let tts_worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-tts-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-tts-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-tts-v1")
+            .expect("static identity"),
+        public_model: model_alias,
+        realtime_tts: Some(izwi_serving_client::mock::MockTtsRealtimeKnobs {
+            chunk_bytes: 32,
+            chunk_count: 2,
+            push_cadence: Duration::from_millis(1),
+            output_sample_rate: 24_000,
+            disconnect_after_frames: None,
+        }),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock tts worker binds");
+
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe listener binds");
+        probe.local_addr().expect("probe addr").port()
+    };
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .args([
+            "--role",
+            "gateway",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--public-model",
+            model.dir_name(),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|chat|{}|mock-chat-v1|1",
+                chat_worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|text_to_speech|{}|mock-tts-v1|1",
+                tts_worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-realtime",
+            "on",
+        ])
+        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("gateway binary spawns");
+    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_store = std::sync::Arc::clone(&stderr_capture);
+    if let Some(stderr) = gateway.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stderr).lines().flatten() {
+                if let Ok(mut collected) = stderr_store.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+            }
+        });
+    }
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match client.get(format!("{base}/readyz")).send().await {
+            Ok(response) if response.status().is_success() => {
+                ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !ready {
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        panic!(
+            "gateway never became ready; stderr:\n{}",
+            stderr_capture
+                .lock()
+                .map(|buf| buf.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
+        .into_client_request()
+        .expect("websocket request");
+    let headers = request.headers_mut();
+    headers.insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static(REALTIME_SUBPROTOCOL),
+    );
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {GATEWAY_API_KEY}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway upgrades the realtime session");
+
+    let admit = RealtimeSessionAdmit {
+        schema_version: PROTOCOL_V1,
+        session_id: SessionId::try_from("gateway-tts-session-1").expect("identity"),
+        request_id: RequestId::try_from("gateway-tts-request-1").expect("identity"),
+        attempt_id: AttemptId::try_from("gateway-tts-attempt-1").expect("identity"),
+        expected_worker_incarnation: izwi_serving_protocol::IncarnationId::try_from("ignored")
+            .expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-tts-v1")
+            .expect("identity"),
+        expected_model_generation: ModelGeneration::new(1).unwrap(),
+        caller: GatewayAttestedCallerContext {
+            tenant_id: TenantId::try_from("spoofed-tenant").expect("identity"),
+            caller_id: CallerId::try_from("spoofed-caller").expect("identity"),
+            policy_revision: PolicyRevision::try_from("spoofed-policy").expect("identity"),
+            permitted_actions: BTreeSet::from([PermittedAction::Invoke]),
+            allowed_data_regions: vec![],
+        },
+        task: TaskKind::TextToSpeech,
+        service_class: ServiceClass::Realtime,
+        remaining_time_ms: 60_000,
+        input: RealtimeStageInput::TextStream,
+    };
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Admit {
+            admit: Box::new(admit),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    async fn next_tts_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Result<RealtimeServerFrame, (u32, bool, Vec<u8>)> {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                .await
+                .expect("frame arrives")
+                .expect("stream open")
+                .expect("no transport error");
+            match message {
+                Message::Text(text) => {
+                    return Ok(serde_json::from_str::<RealtimeServerFrame>(&text)
+                        .unwrap_or_else(|error| panic!("server frame decodes: {error}: {text}")))
+                }
+                Message::Binary(data) => {
+                    let (header, payload) =
+                        decode_realtime_audio_frame(&data).expect("worker audio frame decodes");
+                    return Err((header.sequence, header.is_final, payload.to_vec()));
+                }
+                Message::Close(frame) => panic!("unexpected close: {frame:?}"),
+                _ => continue,
+            }
+        }
+    }
+
+    let admitted = next_tts_frame(&mut ws).await.unwrap();
+    let RealtimeServerFrame::Admitted { output_audio, .. } = &admitted else {
+        panic!("expected admitted frame, got {admitted:?}");
+    };
+    let spec = output_audio.expect("TTS admission announces the output spec");
+    assert_eq!(spec.sample_rate, 24_000);
+
+    let accepted = next_tts_frame(&mut ws).await.unwrap();
+    let RealtimeServerFrame::Event { event } = &accepted else {
+        panic!("expected accepted event");
+    };
+    assert!(matches!(event.event, InvocationEventKind::Accepted { .. }));
+
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Input {
+            text: "Hello ".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Input {
+            text: "world".into(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(Message::Text(
+        serde_json::to_string(&RealtimeClientFrame::Finish)
+            .unwrap()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    // Two payload frames then the zero-payload final frame, forwarded
+    // verbatim by the relay, then the Completed terminal.
+    let mut audio = Vec::new();
+    loop {
+        match next_tts_frame(&mut ws).await {
+            Err((sequence, is_final, payload)) => audio.push((sequence, is_final, payload)),
+            Ok(RealtimeServerFrame::Event { event }) => match event.event {
+                InvocationEventKind::Completed { .. } => break,
+                other => panic!("expected completed, got {other:?}"),
+            },
+            Ok(frame) => panic!("unexpected frame: {frame:?}"),
+        }
+    }
+    assert_eq!(audio.len(), 3, "two payload frames plus the final frame");
+    assert_eq!(audio[0].0, 1);
+    assert!(!audio[0].1);
+    assert_eq!(audio[0].2.len(), 32);
+    assert_eq!(audio[1].0, 2);
+    assert!(!audio[1].1);
+    assert_eq!(audio[2].0, 3);
+    assert!(audio[2].1);
+    assert!(audio[2].2.is_empty());
+
+    let close = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Close(frame) = message {
+            break frame.expect("close frame");
+        }
+    };
+    assert_eq!(u16::from(close.code), 1000);
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}

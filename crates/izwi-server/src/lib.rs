@@ -1003,19 +1003,26 @@ async fn gateway_state(
         args.gateway_max_in_flight,
     );
     let state = if args.gateway_realtime == "on" {
-        // The relay targets the approved speech_to_text deployment; boot
-        // fails closed when no approved worker advertises one.
-        let realtime_deployment = deployment_table
+        // Stage pools resolve per approved task for the public model; boot
+        // fails closed only when no realtime stage can be served at all. A
+        // missing individual stage refuses its admits with a policy close at
+        // session time.
+        let asr_deployment_id = deployment_table
             .select(TaskKind::SpeechToText, &public_model)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--gateway-realtime is on but no approved worker advertises speech_to_text model {public_model}"
-                )
-            })?;
+            .map(|deployment| deployment.deployment_id().clone());
+        let tts_deployment_id = deployment_table
+            .select(TaskKind::TextToSpeech, &public_model)
+            .map(|deployment| deployment.deployment_id().clone());
+        if asr_deployment_id.is_none() && tts_deployment_id.is_none() {
+            return Err(anyhow::anyhow!(
+                "--gateway-realtime is on but no approved worker advertises a realtime speech_to_text or text_to_speech model {public_model}"
+            ));
+        }
         let relay = app::realtime_relay::GatewayRealtimeRelay::new(
             registry,
             app::realtime_relay::RealtimeRelayConfig {
-                deployment_id: realtime_deployment.deployment_id().clone(),
+                deployment_id: asr_deployment_id,
+                tts_deployment_id,
                 public_model: public_model.clone(),
                 policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
                 backend_policy: gateway_backend_policy(args.backend.as_ref()),
@@ -1028,7 +1035,8 @@ async fn gateway_state(
         info!(
             service = SERVICE_NAME,
             version = SERVICE_VERSION,
-            deployment = %realtime_deployment.deployment_id(),
+            asr_stage = relay.config().deployment_id.is_some(),
+            tts_stage = relay.config().tts_deployment_id.is_some(),
             max_sessions = args.gateway_realtime_max_sessions,
             "Gateway realtime relay enabled for izwi-realtime-v1 sessions"
         );

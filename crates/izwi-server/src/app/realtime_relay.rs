@@ -1,6 +1,7 @@
 //! Gateway realtime relay (DS3.6): a bounded, authenticated WebSocket relay
-//! that forwards public `izwi-realtime-v1` sessions to an eligible realtime
-//! speech_to_text worker.
+//! that forwards public `izwi-realtime-v1` sessions to eligible realtime
+//! workers, resolved per stage — the admit's task selects the
+//! speech_to_text pool or the optional text_to_speech pool.
 //!
 //! The gateway is a transparent relay on the worker subprotocol: it
 //! authenticates the client principal, selects a worker from the registry,
@@ -61,16 +62,32 @@ const RELAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 /// Upper bound for the relay's configured session capacity.
 pub(crate) const MAX_RELAY_SESSIONS: usize = 4_096;
 
-/// Bounded configuration for the relay, resolved once at gateway boot.
+/// Bounded configuration for the relay, resolved once at gateway boot. Each
+/// stage pool is optional; boot fails closed only when both are absent.
 #[derive(Clone)]
 pub(crate) struct RealtimeRelayConfig {
-    pub deployment_id: DeploymentId,
+    /// Approved speech_to_text deployment for ASR-stream sessions.
+    pub deployment_id: Option<DeploymentId>,
+    /// Optional second stage: the approved text_to_speech deployment serving
+    /// TTS-stream sessions. A missing stage refuses its admits with
+    /// PolicyDenied.
+    pub tts_deployment_id: Option<DeploymentId>,
     pub public_model: ModelAlias,
     pub policy_revision: PolicyRevision,
     pub backend_policy: BackendPolicy,
     pub max_sessions: usize,
     /// End-to-end session budget minted into every worker admit.
     pub session_budget: Duration,
+}
+
+/// The resolved worker pool for one relayed session, keyed by the admit's
+/// task.
+#[derive(Debug, Clone)]
+struct RelayStage {
+    deployment_id: DeploymentId,
+    task: TaskKind,
+    input_format: InputFormat,
+    output_format: OutputFormat,
 }
 
 /// One live relayed session as observed by the gateway. Read through
@@ -272,6 +289,8 @@ enum ClientAction {
     /// Raw binary audio frame, forwarded to the worker verbatim so the
     /// client's sequence numbers reach the worker unchanged.
     Audio(Vec<u8>),
+    /// Bounded text input (TTS-stream stage), forwarded verbatim.
+    Text(String),
     Finish,
     Cancel,
     Ping,
@@ -306,9 +325,59 @@ async fn run_relay_session(
         }
         _ => return,
     };
-    if requested.validate().is_err() || requested.task != TaskKind::SpeechToText {
+    if requested.validate().is_err() {
+        close_client(
+            &mut client_sink,
+            Some(RealtimeSessionCloseCode::ProtocolViolation),
+        )
+        .await;
         return;
     }
+    // Stage resolution: the admit's task picks the pool. An unconfigured
+    // stage is refused explicitly rather than silently dropping the socket.
+    let stage = match requested.task {
+        TaskKind::SpeechToText => match &relay.config().deployment_id {
+            Some(deployment_id) => RelayStage {
+                deployment_id: deployment_id.clone(),
+                task: TaskKind::SpeechToText,
+                input_format: InputFormat::PcmAudio,
+                output_format: OutputFormat::Text,
+            },
+            None => {
+                close_client(
+                    &mut client_sink,
+                    Some(RealtimeSessionCloseCode::PolicyDenied),
+                )
+                .await;
+                return;
+            }
+        },
+        TaskKind::TextToSpeech => match &relay.config().tts_deployment_id {
+            Some(tts_deployment_id) => RelayStage {
+                deployment_id: tts_deployment_id.clone(),
+                task: TaskKind::TextToSpeech,
+                input_format: InputFormat::Text,
+                output_format: OutputFormat::PcmAudio,
+            },
+            None => {
+                close_client(
+                    &mut client_sink,
+                    Some(RealtimeSessionCloseCode::PolicyDenied),
+                )
+                .await;
+                return;
+            }
+        },
+        // Protocol validate rejects chat admits before this point.
+        TaskKind::Chat => {
+            close_client(
+                &mut client_sink,
+                Some(RealtimeSessionCloseCode::ProtocolViolation),
+            )
+            .await;
+            return;
+        }
+    };
 
     // Session accounting: one bounded registry entry per live session gates
     // capacity and duplicate sessions before any worker work happens.
@@ -317,7 +386,7 @@ async fn run_relay_session(
             attempt_id: requested.attempt_id.clone(),
             worker_id,
             incarnation_id,
-            deployment_id: relay.config().deployment_id.clone(),
+            deployment_id: stage.deployment_id.clone(),
             model_generation: generation,
             principal_namespace: principal_namespace(&context.principal),
             created_at: Instant::now(),
@@ -356,7 +425,7 @@ async fn run_relay_session(
 
     let mut selected = match relay
         .registry
-        .select_and_reserve(&realtime_selection_request(relay.config()))
+        .select_and_reserve(&realtime_selection_request(relay.config(), &stage))
     {
         Ok(selected) => selected,
         Err(_) => {
@@ -379,7 +448,7 @@ async fn run_relay_session(
         deployment_id: selected.deployment_id.clone(),
         expected_model_generation: selected.model_generation,
         caller: attested_caller(&relay, &context),
-        task: TaskKind::SpeechToText,
+        task: stage.task,
         service_class: ServiceClass::Realtime,
         remaining_time_ms: relay.config().session_budget.as_millis() as u64,
         input: requested.input.clone(),
@@ -459,6 +528,16 @@ async fn run_relay_session(
                         // monotonicity enforcement sees exactly what a
                         // direct client would send.
                         if worker.sink.send(WireMessage::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ClientAction::Text(text)) => {
+                        if worker
+                            .sink
+                            .send(control_wire(&RealtimeClientFrame::Input { text }))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -546,6 +625,13 @@ async fn run_relay_session(
                             .await;
                         break;
                     }
+                    Some(Ok(WireMessage::Binary(data))) => {
+                        // Passthrough (TTS-stream audio): the worker's framed
+                        // sequence numbers reach the client unchanged.
+                        if client_sink.send(Message::Binary(data)).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(Ok(_)) | Some(Err(_)) | None => {
                         // Owner loss: no terminal event, no close frame. The
                         // client gets an explicit interruption event and a
@@ -582,14 +668,17 @@ impl Drop for SessionGuard {
     }
 }
 
-fn realtime_selection_request(config: &RealtimeRelayConfig) -> WorkerSelectionRequest {
+fn realtime_selection_request(
+    config: &RealtimeRelayConfig,
+    stage: &RelayStage,
+) -> WorkerSelectionRequest {
     WorkerSelectionRequest {
         protocol_version: PROTOCOL_V1,
-        deployment_id: config.deployment_id.clone(),
+        deployment_id: stage.deployment_id.clone(),
         public_model: config.public_model.clone(),
-        task: TaskKind::SpeechToText,
-        input_format: InputFormat::PcmAudio,
-        output_format: OutputFormat::Text,
+        task: stage.task,
+        input_format: stage.input_format,
+        output_format: stage.output_format,
         streaming: true,
         realtime: true,
         cancellation: Some(CancellationBehavior::Cooperative),
@@ -649,9 +738,7 @@ async fn read_client_actions(
                         Ok(RealtimeClientFrame::Admit { .. }) => {
                             Some(ClientAction::Violation("duplicate admit"))
                         }
-                        Ok(RealtimeClientFrame::Input { .. }) => Some(ClientAction::Violation(
-                            "text input is not valid for speech_to_text sessions",
-                        )),
+                        Ok(RealtimeClientFrame::Input { text }) => Some(ClientAction::Text(text)),
                         Err(_) => Some(ClientAction::Violation("unparseable control frame")),
                     }
                 }
