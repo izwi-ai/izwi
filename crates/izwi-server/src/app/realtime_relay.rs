@@ -56,7 +56,7 @@ const CLIENT_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the relay waits for the worker's admitted echo.
 const WORKER_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an unused registration slot is held before TTL eviction.
-const REGISTRATION_TTL: Duration = Duration::from_secs(3600);
+pub(crate) const REGISTRATION_TTL: Duration = Duration::from_secs(3600);
 /// Client control frames are tiny; anything larger is refused before parse.
 const RELAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 /// Upper bound for the relay's configured session capacity.
@@ -83,11 +83,11 @@ pub(crate) struct RealtimeRelayConfig {
 /// The resolved worker pool for one relayed session, keyed by the admit's
 /// task.
 #[derive(Debug, Clone)]
-struct RelayStage {
-    deployment_id: DeploymentId,
-    task: TaskKind,
-    input_format: InputFormat,
-    output_format: OutputFormat,
+pub(crate) struct RelayStage {
+    pub deployment_id: DeploymentId,
+    pub task: TaskKind,
+    pub input_format: InputFormat,
+    pub output_format: OutputFormat,
 }
 
 /// One live relayed session as observed by the gateway. Read through
@@ -143,7 +143,7 @@ impl RealtimeSessionRegistry {
             .len()
     }
 
-    fn insert(
+    pub(crate) fn insert(
         &self,
         session_id: SessionId,
         registration: SessionRegistration,
@@ -175,7 +175,7 @@ impl RealtimeSessionRegistry {
         Ok(())
     }
 
-    fn remove(&self, session_id: &SessionId) -> bool {
+    pub(crate) fn remove(&self, session_id: &SessionId) -> bool {
         let mut state = self.entries.lock().expect("registry poisoned");
         if state.by_session.remove(session_id).is_some() {
             state.order.retain(|id| id != session_id);
@@ -244,7 +244,11 @@ impl GatewayRealtimeRelay {
         &self.config
     }
 
-    fn worker_credentials(&self) -> &ServiceCredentials {
+    pub(crate) fn registry(&self) -> &WorkerRegistry {
+        &self.registry
+    }
+
+    pub(crate) fn worker_credentials(&self) -> &ServiceCredentials {
         &self.worker_credentials
     }
 }
@@ -262,7 +266,9 @@ fn offers_realtime_subprotocol(headers: &HeaderMap) -> bool {
 
 /// Public `/v1/realtime/ws` upgrade handler. Authentication, admission
 /// accounting, and the request context arrive through the v1 middleware
-/// stack; this handler only negotiates the subprotocol.
+/// stack. Clients offering the worker subprotocol get the byte-identical
+/// passthrough relay; everyone else gets the public transcription-realtime
+/// translator, so a single-node client can repoint at the gateway unchanged.
 pub(crate) async fn relay_socket(
     State(state): State<GatewayState>,
     Extension(context): Extension<RequestContext>,
@@ -272,16 +278,14 @@ pub(crate) async fn relay_socket(
     let Some(relay) = state.realtime_relay.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !offers_realtime_subprotocol(&headers) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "the izwi-realtime-v1 subprotocol must be offered",
-        )
-            .into_response();
+    if offers_realtime_subprotocol(&headers) {
+        return upgrade
+            .protocols([REALTIME_SUBPROTOCOL])
+            .on_upgrade(move |socket| run_relay_session(state, relay, socket, context));
     }
-    upgrade
-        .protocols([REALTIME_SUBPROTOCOL])
-        .on_upgrade(move |socket| run_relay_session(state, relay, socket, context))
+    upgrade.on_upgrade(move |socket| {
+        crate::app::realtime_translate::run_translate_session(state, relay, socket, context)
+    })
 }
 
 /// A client frame shaped into a relay action by the reader task.
@@ -657,9 +661,15 @@ async fn run_relay_session(
 }
 
 /// Holds the registry entry until the session ends on any path.
-struct SessionGuard {
+pub(crate) struct SessionGuard {
     relay: Arc<GatewayRealtimeRelay>,
     session_id: SessionId,
+}
+
+impl SessionGuard {
+    pub(crate) fn new(relay: Arc<GatewayRealtimeRelay>, session_id: SessionId) -> Self {
+        Self { relay, session_id }
+    }
 }
 
 impl Drop for SessionGuard {
@@ -668,7 +678,7 @@ impl Drop for SessionGuard {
     }
 }
 
-fn realtime_selection_request(
+pub(crate) fn realtime_selection_request(
     config: &RealtimeRelayConfig,
     stage: &RelayStage,
 ) -> WorkerSelectionRequest {
@@ -689,7 +699,7 @@ fn realtime_selection_request(
     }
 }
 
-fn attested_caller(
+pub(crate) fn attested_caller(
     relay: &GatewayRealtimeRelay,
     context: &RequestContext,
 ) -> GatewayAttestedCallerContext {
@@ -793,7 +803,7 @@ fn error_message(
     serde_json::to_string(&RealtimeServerFrame::Event { event }).expect("error event encodes")
 }
 
-async fn close_client(
+pub(crate) async fn close_client(
     client_sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     code: Option<RealtimeSessionCloseCode>,
 ) {
@@ -809,7 +819,7 @@ async fn close_client(
     let _ = client_sink.send(Message::Close(Some(frame))).await;
 }
 
-async fn reject_client(
+pub(crate) async fn reject_client(
     client_sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     status: StatusCode,
     message: &str,
@@ -829,16 +839,16 @@ async fn reject_client(
 }
 
 /// Worker-side session transport with the admitted echo already consumed.
-struct WorkerSide {
-    sink: futures::stream::SplitSink<WorkerWire, WireMessage>,
-    source: futures::stream::SplitStream<WorkerWire>,
-    admitted_message: Message,
+pub(crate) struct WorkerSide {
+    pub sink: futures::stream::SplitSink<WorkerWire, WireMessage>,
+    pub source: futures::stream::SplitStream<WorkerWire>,
+    pub admitted_message: Message,
 }
 
 /// Dial failures keep their own vocabulary: the client only learns the
 /// gateway could not establish the worker session.
 #[derive(Debug, thiserror::Error)]
-enum WorkerDialError {
+pub(crate) enum WorkerDialError {
     #[error("worker endpoint is not a supported websocket origin")]
     UnsupportedOrigin,
     #[error(transparent)]
@@ -847,7 +857,7 @@ enum WorkerDialError {
     Protocol(&'static str),
 }
 
-async fn dial_worker_session(
+pub(crate) async fn dial_worker_session(
     endpoint: &str,
     credentials: &ServiceCredentials,
     admit: &RealtimeSessionAdmit,

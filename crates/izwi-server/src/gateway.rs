@@ -836,10 +836,18 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         post(crate::api::openai::chat::completions::gateway_completions),
     );
     if state.realtime_relay.is_some() {
-        v1_routes = v1_routes.route(
-            "/realtime/ws",
-            get(crate::app::realtime_relay::relay_socket),
-        );
+        v1_routes = v1_routes
+            .route(
+                "/realtime/ws",
+                get(crate::app::realtime_relay::relay_socket),
+            )
+            // Alias of the single-node transcription socket path so a public
+            // realtime client can repoint at the gateway without changing its
+            // URL; dispatch still keys off the subprotocol offer.
+            .route(
+                "/speech-to-text/realtime/ws",
+                get(crate::app::realtime_relay::relay_socket),
+            );
     }
     let v1_routes = v1_routes
         .fallback(api_not_found)

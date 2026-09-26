@@ -506,7 +506,8 @@ publication rather than being stored under `.wav` and later misreported as
 
 Gateway mode currently exposes text-only
 `POST /v1/chat/completions` plus, behind an explicit preview flag, the
-realtime transcription relay `GET /v1/realtime/ws` (see below). The following
+realtime transcription relay `GET /v1/realtime/ws` and its public-client
+alias `/v1/speech-to-text/realtime/ws` (see below). The following
 representative routes return 404 in gateway mode and remain available only
 through their existing local/desktop profile where applicable:
 
@@ -563,6 +564,34 @@ worker-subprotocol client library works against the gateway unchanged. Owner
 loss (worker stream lost without a terminal) surfaces as an explicit
 internal-error event followed by a close; reconnecting is always a new
 session with no resume.
+
+### Public transcription-realtime clients (DS3.4, same flag)
+
+At the same route the gateway dispatches on the subprotocol offer. Clients
+offering `izwi-realtime-v1` get the byte-identical passthrough relay above;
+clients offering no worker subprotocol get the public transcription-realtime
+surface translated onto the worker session, so a client of the single-node
+`/v1/speech-to-text/realtime/ws` socket can repoint at the gateway unchanged
+— either keeping the single-node path (an alias of it is mounted at the
+gateway) or switching to `/v1/realtime/ws`. Both public wire modes are
+served: the legacy `transcription_realtime_v2` JSON lifecycle
+(`session_start`/`session_stop`/`ping`, ITRW binary audio frames,
+`transcript_partial`/`session_done`) and the typed `transcription_realtime`
+v3 envelopes (`session_ready`/`session_started`, per-frame ingress events
+with audio-gap detection, `transcript_final`/`closing`/`closed`); typed v3
+resume requests are rejected exactly as on the single-node surface. Audio is
+re-encoded from the public ITRW framing onto the worker's IRTA framing with
+the client's sequence numbers preserved; admission (worker selection and
+dialing) defers to the first audio frame because the public envelope declares
+the sample rate per frame, and a session that never streams audio finishes
+locally without touching a worker. Worker deltas accumulate into the public
+replaceable partial hypothesis; the worker's terminal delta carries the full
+final text and replaces the accumulation. Pings are answered locally; owner
+loss and worker errors map onto the public error vocabulary with the same
+close semantics as the passthrough mode. Unlike the passthrough relay, the
+public surface carries no client session ids, so the gateway mints them —
+operator-visible registry entries use gateway-minted ids. Session capacity,
+tenant leases, and the session budget are shared with the passthrough mode.
 
 ## Drain, shutdown, and restart
 

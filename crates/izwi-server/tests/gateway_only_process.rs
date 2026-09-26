@@ -902,3 +902,572 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     let _ = gateway.kill();
     let _ = gateway.wait();
 }
+
+/// Builds one public transcription-realtime client audio frame (ITRW:
+/// magic, version 1, kind 1 client PCM16, sample rate at 8..12, frame
+/// sequence at 12..16, payload).
+fn itrw_public_frame(frame_seq: u32, sample_rate: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(16 + payload.len());
+    frame.extend_from_slice(b"ITRW");
+    frame.push(1);
+    frame.push(1);
+    frame.extend_from_slice(&0_u16.to_le_bytes());
+    frame.extend_from_slice(&sample_rate.to_le_bytes());
+    frame.extend_from_slice(&frame_seq.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+type PublicWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Next text frame from the public socket, or None on close.
+async fn next_public_text(ws: &mut PublicWsStream) -> Option<String> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("frame arrives")
+            .expect("stream open")
+            .expect("no transport error");
+        match message {
+            Message::Text(text) => return Some(text.to_string()),
+            Message::Close(_) => return None,
+            _ => continue,
+        }
+    }
+}
+
+/// Process-level DS3.4 leg (public legacy v2 client): a client of the
+/// single-node `/v1/speech-to-text/realtime/ws` surface repoints at the
+/// gateway alias unchanged — no subprotocol, legacy JSON session lifecycle,
+/// ITRW audio frames. The gateway translates onto the worker subprotocol and
+/// maps the worker transcript back onto the public vocabulary.
+#[tokio::test]
+async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    let model = ModelVariant::Qwen34BGguf;
+    let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
+    let chat_worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+        public_model: model_alias.clone(),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock chat worker binds");
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+            .expect("static identity"),
+        public_model: model_alias,
+        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+            delta_per_frame: "partial ".into(),
+            final_text: "gateway translated transcript".into(),
+            push_cadence: Duration::from_millis(1),
+            disconnect_after_frames: None,
+        }),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock realtime worker binds");
+
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe listener binds");
+        probe.local_addr().expect("probe addr").port()
+    };
+
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .args([
+            "--role",
+            "gateway",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--public-model",
+            model.dir_name(),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|chat|{}|mock-chat-v1|1",
+                chat_worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|speech_to_text|{}|mock-asr-v1|1",
+                worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-realtime",
+            "on",
+        ])
+        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("gateway binary spawns");
+    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_store = std::sync::Arc::clone(&stderr_capture);
+    if let Some(stderr) = gateway.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stderr).lines().flatten() {
+                if let Ok(mut collected) = stderr_store.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+            }
+        });
+    }
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match client.get(format!("{base}/readyz")).send().await {
+            Ok(response) if response.status().is_success() => {
+                ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !ready {
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        panic!(
+            "gateway never became ready; stderr:\n{}",
+            stderr_capture
+                .lock()
+                .map(|buf| buf.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    // Public legacy client: the alias path, the perimeter API key, no
+    // subprotocol offer — byte-identical to how it addresses the single-node
+    // surface.
+    let mut request = format!("ws://127.0.0.1:{port}/v1/speech-to-text/realtime/ws")
+        .into_client_request()
+        .expect("websocket request");
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {GATEWAY_API_KEY}")).unwrap(),
+    );
+    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway upgrades the translated session");
+    assert!(
+        response.headers().get("sec-websocket-protocol").is_none(),
+        "the public surface selects no subprotocol"
+    );
+
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "session_start" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("session_start sends");
+
+    let ready_message = next_public_text(&mut ws)
+        .await
+        .expect("session_ready arrives");
+    let ready: serde_json::Value = serde_json::from_str(&ready_message).expect("JSON ready");
+    assert_eq!(ready["type"], "session_ready");
+    assert_eq!(ready["protocol"], "transcription_realtime_v2");
+    let started = next_public_text(&mut ws).await.expect("session_started");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&started).expect("JSON started")["type"],
+        "session_started"
+    );
+
+    // Two audio frames; the worker answers one incremental delta per frame.
+    let payload = [0i16.to_le_bytes(); 8].concat();
+    for sequence in 1..=2u32 {
+        ws.send(Message::Binary(
+            itrw_public_frame(sequence, 16_000, &payload).into(),
+        ))
+        .await
+        .expect("audio frame sends");
+    }
+
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "ping", "timestamp_ms": 7 })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("ping sends");
+
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "session_stop" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("session_stop sends");
+
+    // The pump answers pings locally, emits the accumulating partials, then
+    // the final transcript and session_done when the worker completes.
+    let mut partials: Vec<String> = Vec::new();
+    let mut pong_timestamp: Option<i64> = None;
+    let mut final_text: Option<String> = None;
+    loop {
+        let Some(text) = next_public_text(&mut ws).await else {
+            panic!("socket closed before session_done");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("JSON event");
+        match value["type"].as_str() {
+            Some("transcript_partial") => {
+                if value["is_final"] == serde_json::json!(true) {
+                    final_text = Some(value["text"].as_str().expect("final text").to_string());
+                } else {
+                    partials.push(value["text"].as_str().expect("partial text").to_string());
+                }
+            }
+            Some("pong") => {
+                pong_timestamp = value["timestamp_ms"].as_i64();
+            }
+            Some("session_done") => break,
+            Some("session_ready" | "session_started") => {}
+            other => panic!("unexpected public event: {other:?}: {value}"),
+        }
+    }
+    assert_eq!(
+        partials,
+        vec!["partial ", "partial partial "],
+        "deltas accumulate into the replaceable partial hypothesis"
+    );
+    assert_eq!(
+        final_text.as_deref(),
+        Some("gateway translated transcript"),
+        "the terminal delta carries the full final text"
+    );
+    assert_eq!(pong_timestamp, Some(7), "pings are answered locally");
+
+    let close = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Close(frame) = message {
+            break frame.expect("close frame");
+        }
+    };
+    assert_eq!(u16::from(close.code), 1000);
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}
+
+/// Process-level DS3.4 leg (public typed v3 client): the typed
+/// `transcription_realtime` envelope mode at `/v1/realtime/ws` without the
+/// worker subprotocol. The gateway emits the legacy announcement, the typed
+/// session ladder, per-frame ingress events with audio-gap detection, and
+/// the final/closing/closed ladder with strict envelope continuity.
+#[tokio::test]
+async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    let model = ModelVariant::Qwen34BGguf;
+    let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
+    let chat_worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+        public_model: model_alias.clone(),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock chat worker binds");
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+            .expect("static identity"),
+        public_model: model_alias,
+        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+            delta_per_frame: "partial ".into(),
+            final_text: "gateway translated transcript".into(),
+            push_cadence: Duration::from_millis(1),
+            disconnect_after_frames: None,
+        }),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .expect("mock realtime worker binds");
+
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe listener binds");
+        probe.local_addr().expect("probe addr").port()
+    };
+
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .args([
+            "--role",
+            "gateway",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--public-model",
+            model.dir_name(),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|chat|{}|mock-chat-v1|1",
+                chat_worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-worker-approval",
+            &format!(
+                "{}|speech_to_text|{}|mock-asr-v1|1",
+                worker.endpoint(),
+                model.dir_name()
+            ),
+            "--gateway-realtime",
+            "on",
+        ])
+        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("gateway binary spawns");
+    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_store = std::sync::Arc::clone(&stderr_capture);
+    if let Some(stderr) = gateway.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stderr).lines().flatten() {
+                if let Ok(mut collected) = stderr_store.lock() {
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+            }
+        });
+    }
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match client.get(format!("{base}/readyz")).send().await {
+            Ok(response) if response.status().is_success() => {
+                ready = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !ready {
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        panic!(
+            "gateway never became ready; stderr:\n{}",
+            stderr_capture
+                .lock()
+                .map(|buf| buf.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
+        .into_client_request()
+        .expect("websocket request");
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {GATEWAY_API_KEY}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("gateway upgrades the translated session");
+
+    // The legacy announcement still precedes negotiation, then the typed
+    // session_start upgrades the session to v3 envelopes.
+    ws.send(Message::Text(
+        serde_json::json!({
+            "type": "session_start",
+            "protocol": "transcription_realtime",
+            "version": 3
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("session_start sends");
+
+    let ready_message = next_public_text(&mut ws)
+        .await
+        .expect("legacy announcement arrives");
+    let ready: serde_json::Value = serde_json::from_str(&ready_message).expect("JSON ready");
+    assert_eq!(ready["type"], "session_ready");
+
+    // Three audio frames (1, 2, 4): each accepted, and the skip surfaces as
+    // an AudioGap with the missing span. Then the stop drains the final
+    // transcript and the closing ladder.
+    let payload = [0i16.to_le_bytes(); 8].concat();
+    for sequence in [1u32, 2, 4] {
+        ws.send(Message::Binary(
+            itrw_public_frame(sequence, 16_000, &payload).into(),
+        ))
+        .await
+        .expect("audio frame sends");
+    }
+
+    ws.send(Message::Text(
+        serde_json::json!({ "type": "session_stop" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("session_stop sends");
+
+    let mut envelopes: Vec<serde_json::Value> = Vec::new();
+    loop {
+        let Some(text) = next_public_text(&mut ws).await else {
+            panic!("socket closed before the typed close ladder");
+        };
+        let envelope: serde_json::Value = serde_json::from_str(&text).expect("typed envelope");
+        assert_eq!(envelope["protocol"], "transcription_realtime");
+        assert_eq!(envelope["version"], 3);
+        envelopes.push(envelope);
+        if envelopes.last().expect("envelope")["type"] == "closed" {
+            break;
+        }
+    }
+
+    // Strict continuity: sequences count 0,1,2.. within epoch 0 and event
+    // ids strictly increase from 1.
+    let mut previous_sequence: Option<u64> = None;
+    let mut previous_event_id: Option<u64> = None;
+    for envelope in &envelopes {
+        let sequence = envelope["sequence"].as_u64().expect("sequence");
+        let event_id = envelope["event_id"].as_u64().expect("event id");
+        assert_eq!(envelope["connection_epoch"], 0);
+        match previous_sequence {
+            None => assert_eq!(sequence, 0, "epoch starts at sequence zero"),
+            Some(previous) => assert_eq!(sequence, previous + 1, "sequences are contiguous"),
+        }
+        if let Some(previous) = previous_event_id {
+            assert!(event_id > previous, "event ids increase");
+        }
+        previous_sequence = Some(sequence);
+        previous_event_id = Some(event_id);
+    }
+
+    let event_type =
+        |envelope: &serde_json::Value| envelope["type"].as_str().expect("event type").to_string();
+    let types: Vec<String> = envelopes.iter().map(event_type).collect();
+    assert_eq!(
+        types.first().map(String::as_str),
+        Some("session_ready"),
+        "the typed session opens with SessionReady"
+    );
+    assert_eq!(types.get(1).map(String::as_str), Some("session_started"));
+    assert_eq!(
+        envelopes[0]["data"]["accepted_version"], 3,
+        "admission announces the accepted version"
+    );
+
+    let mut accepted_sequences: Vec<u64> = Vec::new();
+    let mut gaps: Vec<(u64, u64, u64)> = Vec::new();
+    let mut partials: Vec<String> = Vec::new();
+    let mut final_text: Option<String> = None;
+    let mut saw_closing = false;
+    let mut saw_closed = false;
+    for envelope in &envelopes {
+        match event_type(envelope).as_str() {
+            "audio_accepted" => accepted_sequences.push(
+                envelope["data"]["frame_sequence"]
+                    .as_u64()
+                    .expect("frame sequence"),
+            ),
+            "audio_gap" => gaps.push((
+                envelope["data"]["expected_frame_sequence"]
+                    .as_u64()
+                    .expect("expected"),
+                envelope["data"]["received_frame_sequence"]
+                    .as_u64()
+                    .expect("received"),
+                envelope["data"]["missing_frames"]
+                    .as_u64()
+                    .expect("missing"),
+            )),
+            "transcript_partial" => partials.push(
+                envelope["data"]["text"]
+                    .as_str()
+                    .expect("partial text")
+                    .to_string(),
+            ),
+            "transcript_final" => {
+                final_text = Some(
+                    envelope["data"]["text"]
+                        .as_str()
+                        .expect("final text")
+                        .to_string(),
+                )
+            }
+            "closing" => saw_closing = true,
+            "closed" => saw_closed = true,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        accepted_sequences,
+        vec![1, 2, 4],
+        "every accepted frame echoes the client sequence"
+    );
+    assert_eq!(
+        gaps,
+        vec![(3, 4, 1)],
+        "the skipped frame 3 is reported as one missing frame"
+    );
+    assert_eq!(
+        partials,
+        vec!["partial ", "partial partial ", "partial partial partial "],
+        "deltas accumulate into replaceable partial hypotheses"
+    );
+    assert_eq!(
+        final_text.as_deref(),
+        Some("gateway translated transcript"),
+        "the terminal delta carries the full final text"
+    );
+    assert!(saw_closing, "Closing precedes Closed");
+    assert!(saw_closed, "Closed terminates the session");
+
+    let close = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Close(frame) = message {
+            break frame.expect("close frame");
+        }
+    };
+    assert_eq!(u16::from(close.code), 1000);
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}
