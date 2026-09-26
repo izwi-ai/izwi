@@ -518,6 +518,7 @@ pub async fn warm_up_tts_runtime(
     tokio::pin!(deadline);
     let mut chunks = 0usize;
     let mut saw_final = false;
+    let mut saw_samples = false;
     let outcome = loop {
         tokio::select! {
             () = &mut deadline => break Err(CoreError::Timeout("worker startup warm-up".into())),
@@ -525,6 +526,7 @@ pub async fn warm_up_tts_runtime(
                 Some(chunk) => {
                     chunks = chunks.saturating_add(1);
                     saw_final = saw_final || chunk.is_final;
+                    saw_samples = saw_samples || !chunk.samples.is_empty();
                     if chunks > TTS_WARMUP_MAX_CHUNKS {
                         break Err(CoreError::InferenceError(
                             "worker startup warm-up exceeded its output bounds".into(),
@@ -532,11 +534,18 @@ pub async fn warm_up_tts_runtime(
                     }
                 }
                 None => {
-                    break if saw_final {
+                    // A terminal marker alone proves nothing: the engine
+                    // streaming path always emits one, so completion requires
+                    // actual PCM as well.
+                    break if saw_final && saw_samples {
                         Ok(chunks)
-                    } else {
+                    } else if !saw_final {
                         Err(CoreError::InferenceError(
                             "worker startup warm-up ended without completion".into(),
+                        ))
+                    } else {
+                        Err(CoreError::InferenceError(
+                            "worker startup warm-up completed without any synthesized audio".into(),
                         ))
                     }
                 }
@@ -545,13 +554,7 @@ pub async fn warm_up_tts_runtime(
     };
     drop(chunk_rx);
     let _ = generation.await;
-    let chunks = outcome?;
-    if chunks == 0 {
-        return Err(CoreError::InferenceError(
-            "worker startup warm-up ended without any synthesized audio".into(),
-        ));
-    }
-    Ok(())
+    outcome.map(|_| ())
 }
 
 /// Serve realtime TTS sessions for one already loaded TTS model variant.
