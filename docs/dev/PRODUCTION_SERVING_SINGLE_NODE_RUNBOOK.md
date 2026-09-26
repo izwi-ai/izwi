@@ -593,6 +593,36 @@ public surface carries no client session ids, so the gateway mints them —
 operator-visible registry entries use gateway-minted ids. Session capacity,
 tenant leases, and the session budget are shared with the passthrough mode.
 
+### Hierarchical KV offload (DS4, explicit opt-in)
+
+DS4 demotes cold committed prefix pages from the device KV arenas into a
+bounded host pool and promotes them back when a later request's prefix
+lookup continues into the host tier. It is off unless the supervisor
+assignment carries `host_kv_pool_budget_bytes` (validated against the
+assignment's own host/shared limit) or the worker gets
+`IZWI_KV_HOST_POOL_BUDGET_BYTES`; the budget is part of the model's
+load-time resource authorization, so an over-large budget fails at load,
+not under pressure. Kill switch: `IZWI_KV_HOST_OFFLOAD=0`. Tuning knobs:
+`IZWI_KV_OFFLOAD_HIGH_WATERMARK`/`IZWI_KV_OFFLOAD_LOW_WATERMARK` (defaults
+0.85/0.70 of arena capacity), `IZWI_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES` (8),
+`IZWI_KV_OFFLOAD_MAX_PROMOTION_PAGES` (64).
+
+Operationally: pages move only between tiers of the same worker process
+(ADR 0004); demotion runs synchronously at manager safe points, so a
+referenced page is never a victim and active work keeps resolving through
+the existing preemption ladder; a promotion that cannot restore truncates
+and the scheduler re-plans cold, so reuse degrades before correctness does.
+On CUDA the pool is additional capacity across PCIe; on Metal and CPU it is
+charged to the shared host/unified ledger (DINV-05) and the win is prefix
+retention plus admission headroom, never extra memory. Watch
+`izwi_engine_kv_cache_host_pages` (gauge, must stay inside the budget),
+`izwi_engine_kv_cache_demotions_total`/`izwi_engine_kv_cache_promotions_total`
+(counters; on a healthy shared-prefix workload both advance and the gauge
+returns toward zero after promotion), and the per-deployment additive
+status fields of the same names. Evidence rig:
+`scripts/bench/run-ds4-offload-benchmark.sh` (off/on legs; hard gates on
+completion, demotion, promotion, and budget containment).
+
 ## Drain, shutdown, and restart
 
 For planned maintenance, drain the gateway before stopping the supervisor:

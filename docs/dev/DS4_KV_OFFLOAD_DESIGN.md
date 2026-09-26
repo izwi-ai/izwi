@@ -164,11 +164,41 @@ prefix pages into free slots for active work.
 from pool occupancy), `demotions_total` (pages), `promotions_total` (pages),
 and `promotion_latency` (total nanoseconds + count, rendered as an average).
 They flow the DS2.1 route: engine snapshot → Prometheus
-(`izwi_engine_kv_host_pages`, `izwi_engine_kv_demotions_total`,
-`izwi_engine_kv_promotions_total`, `izwi_engine_kv_promotion_latency_seconds`)
-→ additive `Option` fields on `LoadedDeployment` → mock-worker routing-signal
-knobs for contract tests. Absence of the fields on older workers means
-"offload not compiled/not enabled", matching the additive-field contract.
+(`izwi_engine_kv_cache_host_pages`, `izwi_engine_kv_cache_demotions_total`,
+`izwi_engine_kv_cache_promotions_total`,
+`izwi_engine_kv_cache_promotion_latency_avg_seconds`; the standard
+`engine.` → `izwi_engine_` dot-to-underscore rendering) → additive `Option`
+fields on `LoadedDeployment` → mock-worker routing-signal knobs for contract
+tests. The worker's own Prometheus endpoint renders the host-pages gauge and
+the demotion/promotion counters beside the other managed-KV counters.
+Absence of the fields on older workers means "offload not compiled/not
+enabled", matching the additive-field contract.
+
+## 9. As-built deviations (recorded at DS4.5)
+
+- **Demotion is synchronous, not async.** Steps run inside the manager's
+  own critical section at safe points (prepare ticks), bounded per tick by
+  the in-flight page budget. The two-phase transfer records and the
+  residency machine keep the structure an async copy worker needs if a later
+  backend makes deferred application worthwhile; the plan's "async" wording
+  was an implementation choice, not a contract.
+- **Host continuation covers snapshot-sharing arenas.** The matched digest
+  chain stays complete across the tier boundary (host digests extend
+  `page_digests`), so DS1.2b snapshot reconciliation walks matches back
+  through host-resident pages unchanged; prepare restores the full tail
+  before execution, so an attach cursor inside the tail is sound.
+- **The pool budget is part of the model's load-time resource
+  authorization** (same charge shape as the materialization: unified ledger
+  on Metal, host domain on CPU/CUDA). Charging only the materialized usage
+  without extending the authorization fails the lease check on any real
+  engagement.
+- **Promotion truncation degrades through the cursor-lost re-plan**: a page
+  that fails to restore truncates the promotion there and purges its
+  unreachable host descendants; with an admission cursor the shortened match
+  raises the managed-prefix cursor-lost signal and the scheduler re-plans.
+- The promotion ceiling applies inside the shared lookup helper, so
+  admission probes and prepare truncate identically (a probe-only ceiling
+  would cursor-lost-loop against a prepare that truncates further).
 
 ## 7. Test plan (DS4.4)
 
@@ -192,8 +222,24 @@ standard baseline suites.
 
 `scripts/bench/run-ds4-offload-benchmark.sh` clones the DS2 rig shape: one
 worker + gateway, `shared` workload at high concurrency, offload off then on,
-per-leg worker counter deltas. Manifests
+per-leg worker counter deltas, plus a sequential trailer after the workload
+(at concurrency some client always holds a table reference on the shared
+chain, so the trailer's prepare is the safe point where the released chain
+demotes and the next lookup promotes it back). Manifests
 `benchmarks/manifests/ds4-{cpu,metal}-offload-{off,on}.json` plus per-lane
 summaries; CUDA recorded `not run` until hardware. On Metal, success means
 better retention/admission headroom under the shared budget — not more total
 memory.
+
+Recorded (2026-09-26, commit range 39c62ca9..DS4.5, fixture-scale watermarks
+0.10/0.05 on the tiny synthetic arena):
+
+- CPU on-leg: demotions=10, promotions=8, host_pages=2 inside the 8 MiB
+  budget; Metal on-leg: demotions=7, promotions=3, host_pages=4.
+- Reused tokens drop on the on-legs (CPU 2496 off vs 1536 on; Metal 1408 vs
+  576): the fixture-scale watermarks deliberately churn chains that the
+  production defaults (0.85/0.70) would keep resident, trading reuse for
+  headroom — the documented degradation, not a regression.
+- Engine-level acceptance (`ds4_host_offload.rs`): concurrent shared-prefix
+  sessions on an undersized arena, greedy replay byte-identical to the cold
+  run.

@@ -31,7 +31,11 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
 | P7 Secure one-gateway fleet | Done (code) | TLS/mTLS, topology policy, remote artifact transport; separate-machine handshake evidence open |
 | P8 Multi-gateway correctness | Done (code, SQLite) | Partitioned quotas, claims, outage degradation; PG/MySQL execution + shared-atomic default open (DS5) |
 | P9 Operational release | Partial | Validate-only, drain, canary, packaging, benchmark harness done; soak/benchmark runs open |
-| DS0 Foundations | 5 of 9 done | DS0.1/0.3/0.4/0.6 closed; DS0.2 (this report), DS0.5, DS0.7, DS0.8 open |
+| DS0 Foundations | 6 of 9 done | DS0.1/0.3/0.4/0.6 closed; DS0.5 scoped per-principal keys closed (manifest bootstrap + salted-HMAC store + role-gated perimeter); DS0.2 (this report), DS0.7, DS0.8 open |
+| DS1 Committed prefix reuse | Done | DS1.1–DS1.6 closed: paged reuse, tensor-snapshot forks, admission probe + cursor-lost re-plan, catalog-auto default-on with per-family evidence cells |
+| DS2 Cache-aware routing | Done | Protocol minor-1 routing signals, worker exposure, cache affinity + conversation pinning (default OFF), CPU+Metal 2-worker evidence |
+| DS3 Realtime voice over the worker boundary | Done | `izwi-realtime-v1` end to end (worker route, client transport, gateway relay behind flag), TTS-stream stage, DS3.4 public envelope translation |
+| DS4 Hierarchical KV offload | Done | DS4.1–DS4.5 closed: design note + ADR 0004, host pool substrate, demotion, promotion, counters, engine-level acceptance, CPU+Metal benchmark evidence (CUDA `not run`) |
 
 ## Supported deployment profiles
 
@@ -78,6 +82,26 @@ server 678 (one unrelated pre-existing cancellation-race flake reproduced
 once and passed on retry and on the clean tree); clippy/fmt clean on touched
 code.
 
+DS2/DS3 additions (verified 2026-09-25/26): routing-signal protocol tests,
+2-worker CPU+Metal rig manifests, realtime worker-route/client/gateway
+suites, gateway TTS-pool tests, envelope-translation tests; the DS3.4
+translation commit is `4e121999`.
+
+DS4 additions (verified 2026-09-26, commits `39c62ca9`…DS4.5): izwi-core lib
+2664 green including the new offload unit suite (pool budget, residency
+transitions, chain purge, promotion round-trip with seeded bytes) and the
+managed-layer demote→promote→re-demote cycle test; worker suites green
+including the new engine-level acceptance test `ds4_host_offload.rs`
+(concurrent shared-prefix sessions on an undersized arena, greedy replay
+byte-identical to the cold run) and the DS1.5 attach regression with host
+continuation extended over snapshot-sharing arenas; mock-worker contract
+suite 23 green; benchmark rig `run-ds4-offload-benchmark.sh` passes both
+lanes with hard gates (CPU on-leg demotions=10/promotions=8/host_pages=2;
+Metal on-leg demotions=7/promotions=3/host_pages=4; 8 MiB budget respected).
+Two DS4.2 gaps surfaced and fixed by the DS4.4 work: the host pool budget is
+now part of the model's load-time resource authorization, and the worker
+Prometheus endpoint renders the DS4 counters.
+
 ## Tests not executed and why
 
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
@@ -112,7 +136,12 @@ prefix-caching evidence (`benchmarks/manifests/ds15-{cpu,metal}-{shared,cold}.js
 committed prefixes (36 attaches, 4736 avoided-prefill tokens per lane) while
 cold workloads reuse nothing (0 attaches); TTFT delta ≈ 0 at fixture scale —
 prefill of ~130 tiny tokens is microseconds, so reuse is counter-proven, not
-wall-clock-proven. Real-model TTFT/throughput claims remain future work.
+wall-clock-proven. DS2 routing evidence (`ds2-{cpu,metal}-summary.json`) and
+DS4 offload evidence (`ds4-{cpu,metal}-summary.json`, 2026-09-26) are the
+same class of counter-proven fixture evidence: DS4's on-legs show demotion,
+promotion, and budget containment with prefix reuse preserved, and the
+engine-level test pins byte-identical greedy output against the cold run.
+Real-model TTFT/throughput claims remain future work.
 
 ## Security / deployment assumptions
 
@@ -131,8 +160,9 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS2 cache-aware routing (the registry currently routes by load only), then
-DS0.5 scoped per-principal API keys as a standalone security slice. DS1 is
-complete including DS1.6: committed prefix reuse is default-on through the
-evidence-gated catalog-auto mode (see the support matrix's per-family table
-and the DS1 analysis decision record).
+DS0.7 packaging evidence and the remaining DS0 items, then the DS5
+multi-gateway durability lanes (PG/MySQL execution). DS4 is complete
+including its benchmark evidence: hierarchical offload is explicit opt-in
+and counter-proven on the CPU and Metal fixture lanes (see the support
+matrix's offload table and the DS4 design note's as-built deviations).
+CUDA offload stays `not run` until hardware evidence exists.

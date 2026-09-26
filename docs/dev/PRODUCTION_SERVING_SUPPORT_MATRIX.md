@@ -43,6 +43,24 @@ This is an evidence statement, not a performance certificate: reuse on the
 fixture lanes is counter-proven (counters + output equivalence), not
 wall-clock-proven.
 
+## Hierarchical KV offload by lane (DS4)
+
+Offload is explicit opt-in (`host_kv_pool_budget_bytes` on the assignment or
+`IZWI_KV_HOST_POOL_BUDGET_BYTES`; `IZWI_KV_HOST_OFFLOAD=0` is the kill
+switch) and moves pages only between tiers of one worker process. Evidence
+rig: `scripts/bench/run-ds4-offload-benchmark.sh` (shared workload, off/on
+legs, sequential trailer, hard gates on completion, demotion, promotion, and
+budget containment); acceptance test `ds4_host_offload.rs` (concurrent
+shared-prefix sessions on an undersized arena, greedy replay byte-identical
+to the cold run). Design and as-built deviations:
+[DS4_KV_OFFLOAD_DESIGN.md](DS4_KV_OFFLOAD_DESIGN.md).
+
+| Lane | Status | Evidence |
+|---|---|---|
+| CPU | Supported on the fixture lane — counter-proven (`benchmarks/manifests/ds4-cpu-summary.json`: on-leg demotions=10, promotions=8, host_pages=2 inside the 8 MiB budget; reuse preserved) | Not a production model, capacity, soak, or performance certificate |
+| Metal | Supported on the fixture lane — counter-proven (`benchmarks/manifests/ds4-metal-summary.json`: on-leg demotions=7, promotions=3, host_pages=4; charged to the shared unified ledger, so the win is retention/admission headroom, never more memory) | Not a production model, capacity, soak, or performance certificate |
+| CUDA | Not run — no hardware in this work session; the pool is designed as additional capacity across PCIe there | Recorded `not run`, never `passed` |
+
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent as recorded in
