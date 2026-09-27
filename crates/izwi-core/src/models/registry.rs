@@ -4299,6 +4299,19 @@ pub enum NativeChatDecodeState {
     Lfm2(Lfm2ChatDecodeState),
 }
 
+impl NativeChatDecodeState {
+    /// DS9.3: take the logprob entries produced by the last decode step.
+    pub(crate) fn drain_pending_logprobs(&mut self) -> Vec<crate::engine::TokenLogprob> {
+        match self {
+            Self::Qwen3(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Qwen35(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Qwen38(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Gemma3(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Lfm2(state) => std::mem::take(&mut state.pending_logprobs),
+        }
+    }
+}
+
 pub(crate) enum NativeChatDecodeCheckpoint {
     Qwen3(Qwen3ChatDecodeCheckpoint),
     Qwen35(Qwen35SharedStepCheckpoint),
@@ -4571,6 +4584,9 @@ pub struct NativeChatDecodeStep {
     pub tokens_generated: usize,
     pub input_tokens_committed: usize,
     pub finished: bool,
+    /// DS9.3: per-token logprob entries produced by this step. Empty unless
+    /// the request asked for logprobs.
+    pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 impl NativeChatModel {
@@ -5113,52 +5129,62 @@ impl NativeChatModel {
         match (self, state) {
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: 1,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: 1,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             _ => Err(Error::InvalidInput(
@@ -5174,12 +5200,14 @@ impl NativeChatModel {
     ) -> Result<NativeChatDecodeStep> {
         if let (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) = (self, &mut *state) {
             let step = model.decode_quantum(state, input_budget.max(1))?;
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
             return Ok(NativeChatDecodeStep {
                 delta: step.delta,
                 text: step.text,
                 tokens_generated: step.tokens_generated,
                 input_tokens_committed: step.input_tokens_committed,
                 finished: step.finished,
+                logprobs,
             });
         }
         let mut delta = String::new();
@@ -5187,6 +5215,7 @@ impl NativeChatModel {
         let mut tokens_generated = 0usize;
         let mut input_tokens_committed = 0usize;
         let mut finished = false;
+        let mut logprobs = Vec::new();
         for _ in 0..input_budget.max(1) {
             let step = self.decode_step(state)?;
             delta.push_str(&step.delta);
@@ -5195,6 +5224,7 @@ impl NativeChatModel {
             input_tokens_committed =
                 input_tokens_committed.saturating_add(step.input_tokens_committed);
             finished = step.finished;
+            logprobs.extend(step.logprobs);
             if finished {
                 break;
             }
@@ -5205,6 +5235,7 @@ impl NativeChatModel {
             tokens_generated,
             input_tokens_committed,
             finished,
+            logprobs,
         })
     }
 
@@ -5212,18 +5243,6 @@ impl NativeChatModel {
         &self,
         states: &mut [&mut NativeChatDecodeState],
     ) -> Result<Vec<NativeChatDecodeStep>> {
-        let convert = |steps: Vec<crate::models::architectures::qwen3::chat::ChatDecodeStep>| {
-            steps
-                .into_iter()
-                .map(|step| NativeChatDecodeStep {
-                    delta: step.delta,
-                    text: step.text,
-                    tokens_generated: step.tokens_generated,
-                    input_tokens_committed: 1,
-                    finished: step.finished,
-                })
-                .collect()
-        };
         match self {
             Self::Qwen3(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5237,7 +5256,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(convert)
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Gemma3(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5251,18 +5283,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: 1,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Qwen38(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5276,18 +5310,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: 1,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Qwen35(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5301,18 +5337,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: step.input_tokens_committed,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Lfm2(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5326,18 +5364,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: step.input_tokens_committed,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
         }
     }

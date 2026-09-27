@@ -55,6 +55,9 @@ pub struct ChatDecodeState {
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each step entry.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -458,6 +461,7 @@ impl Qwen3ChatModel {
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            pending_logprobs: Vec::new(),
         })
     }
 
@@ -525,6 +529,36 @@ impl Qwen3ChatModel {
         Ok(complete)
     }
 
+    /// DS9.3: sample one token, resolving raw logprobs into the public
+    /// payload when the request asked for them. The caller records the
+    /// entry only when the token is actually emitted.
+    fn sample_token(
+        &self,
+        state: &mut ChatDecodeState,
+        logits: &Tensor,
+    ) -> Result<(u32, Option<crate::engine::TokenLogprob>)> {
+        state.pending_logprobs.clear();
+        if !state.sampler.wants_logprobs() {
+            let token = state.sampler.sample(logits, self.tokenizer.vocab_size)?;
+            return Ok((token, None));
+        }
+        let (token, raw) = state
+            .sampler
+            .sample_with_logprobs(logits, self.tokenizer.vocab_size)?;
+        let entry = raw
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        Ok((token, entry))
+    }
+
+    fn record_logprob(state: &mut ChatDecodeState, entry: Option<crate::engine::TokenLogprob>) {
+        if let Some(entry) = entry {
+            state.pending_logprobs.push(entry);
+        }
+    }
+
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         let text_model = &self.text_model;
 
@@ -548,7 +582,7 @@ impl Qwen3ChatModel {
         let output = state.unconsumed_output.take().ok_or_else(|| {
             Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
         })?;
-        let next = state.sampler.sample(&output, self.tokenizer.vocab_size)?;
+        let (next, logprob_entry) = self.sample_token(state, &output)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
@@ -564,6 +598,7 @@ impl Qwen3ChatModel {
             });
         }
 
+        Self::record_logprob(state, logprob_entry);
         state.generated_ids.push(next);
         state.pending_token = Some(next);
         let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
@@ -631,9 +666,7 @@ impl Qwen3ChatModel {
             }
 
             let row_output = next_logits.i(row)?.unsqueeze(0)?;
-            let next = state
-                .sampler
-                .sample(&row_output, self.tokenizer.vocab_size)?;
+            let (next, logprob_entry) = self.sample_token(state, &row_output)?;
             if next == self.tokenizer.specials.im_end
                 || next == self.tokenizer.specials.eos
                 || self.tokenizer.specials.eos_alt == Some(next)
@@ -649,6 +682,7 @@ impl Qwen3ChatModel {
                 continue;
             }
 
+            Self::record_logprob(state, logprob_entry);
             state.generated_ids.push(next);
             state.pending_token = Some(next);
             let decoded = self.tokenizer.decode_text(&state.generated_ids)?;

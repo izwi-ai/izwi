@@ -180,7 +180,7 @@ pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, LatencyBreakdown, Priority,
-    RequestId, SequenceId, TaskType, TokenId,
+    RequestId, SequenceId, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
 };
 
 use crate::error::{Error, Result};
@@ -3394,6 +3394,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                 })
@@ -3480,6 +3481,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                     .with_dispatch(dispatch)
@@ -3605,6 +3607,7 @@ mod tests {
                             text: Some("fast-progress".to_string()),
                             stats: None,
                             asr_progress: None,
+                            logprobs: Vec::new(),
                         },
                         request.stream_policy,
                     )
@@ -3688,6 +3691,7 @@ mod tests {
                     text: Some("first delta".to_string()),
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 },
                 request.stream_policy,
             )?;
@@ -3720,6 +3724,7 @@ mod tests {
                     text: None,
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 },
                 request.stream_policy,
             )?;
@@ -3736,6 +3741,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 },
             );
             result.staged_stream_outputs = request.take_staged_stream_outputs()?;
@@ -3819,6 +3825,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                 })
@@ -3918,6 +3925,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
         context.enqueue_audio_delivery(
@@ -3945,6 +3953,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -4007,6 +4016,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         context.enqueue_audio_delivery(
             session.clone(),
@@ -4032,6 +4042,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -4094,6 +4105,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
         context.enqueue_audio_delivery(
@@ -4120,6 +4132,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -4220,6 +4233,7 @@ mod tests {
             text: Some("committed".into()),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         })
         .await
         .unwrap();
@@ -4232,6 +4246,7 @@ mod tests {
             text: Some(" tail".into()),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         })
         .await
         .expect("concurrent drain must free the bounded channel");

@@ -2979,8 +2979,10 @@ impl EngineCore {
             phase_timing_override,
             asr_diagnostics,
             error,
+            logprobs,
         } = current;
 
+        merged.logprobs.extend(logprobs);
         merged.audio = Self::merge_audio_output(merged.audio.take(), audio);
         if text.is_some() {
             merged.text = text;
@@ -5912,6 +5914,7 @@ mod tests {
             text: Some(format!("delta-{sequence}")),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         }
     }
 
@@ -5954,6 +5957,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect()
         }
@@ -6056,6 +6060,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     );
                     result.dispatch = dispatch;
@@ -6221,6 +6226,7 @@ mod tests {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     },
                 ));
             }
@@ -6310,6 +6316,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -6412,6 +6419,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -6463,6 +6471,7 @@ mod tests {
                     }),
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -7192,6 +7201,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         };
         let second = ExecutorOutput {
             request_id: "req-a".to_string(),
@@ -7204,6 +7214,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         };
 
         let merged = EngineCore::merge_executor_output(Some(first), second);
@@ -8287,6 +8298,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         invalid.disposition = ExecutionDisposition::Progress;
@@ -8326,6 +8338,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: Some("transient backend failure".to_string()),
+                    logprobs: Vec::new(),
                 },
                 disposition: ExecutionDisposition::Failed(ExecutionFailure {
                     kind: super::super::execution::FailureKind::Backend,
@@ -8646,6 +8659,7 @@ mod tests {
                     text: None,
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 });
             let committed = core.commit_executor_result(result, 1.0).await.unwrap();
             assert_eq!(committed.staged_stream_outputs.len(), 1);
@@ -8866,6 +8880,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         let output = core
@@ -8926,6 +8941,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         )
         .with_observed_resources(observed);
@@ -9013,6 +9029,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         let output = core

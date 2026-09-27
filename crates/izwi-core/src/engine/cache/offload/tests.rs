@@ -1,10 +1,9 @@
 use super::{
-    ArenaOffload, DemoteOutcome, HostChainIndex, HostOffloadPolicy, demote_step,
-    lookup_longest_with_host, promote_tail,
+    demote_step, lookup_longest_with_host, promote_tail, ArenaOffload, DemoteOutcome,
+    HostChainIndex, HostOffloadPolicy,
 };
+use crate::backends::kv::{arena_page_bytes, CpuKvArena, KvArena};
 use crate::backends::BackendKind;
-use crate::backends::kv::{CpuKvArena, KvArena, arena_page_bytes};
-use crate::engine::EngineCoreConfig;
 use crate::engine::cache::coordinator::KvSnapshot;
 use crate::engine::cache::coordinator::{
     KvBlockIntent, KvCacheCoordinator, KvGroupReservation, KvReserveRequest,
@@ -13,6 +12,7 @@ use crate::engine::cache::prefix::{
     CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
 };
 use crate::engine::execution::PlanId;
+use crate::engine::EngineCoreConfig;
 use crate::engine::{ModelInstanceId, SessionKey};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId, KvPlanFingerprint};
 

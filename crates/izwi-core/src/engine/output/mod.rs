@@ -64,6 +64,9 @@ pub struct StreamingOutput {
     pub stats: Option<StreamingStats>,
     /// Optional ASR progress metadata.
     pub asr_progress: Option<AsrProgress>,
+    /// DS9.3: logprob entries for the tokens this chunk carries. Empty
+    /// unless the request asked for logprobs.
+    pub logprobs: Vec<crate::engine::types::TokenLogprob>,
 }
 
 impl StreamingOutput {
@@ -83,6 +86,7 @@ impl StreamingOutput {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         }
     }
 
@@ -102,6 +106,7 @@ impl StreamingOutput {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         }
     }
 
@@ -271,6 +276,7 @@ impl OutputProcessor {
             token_stats,
             latency_breakdown: None,
             asr_diagnostics: executor_output.asr_diagnostics,
+            logprobs: executor_output.logprobs,
             error: executor_output.error,
             provenance: super::OutcomeProvenance::produced_output(),
         }
@@ -335,6 +341,7 @@ impl OutputProcessor {
                 text: None,
                 stats: Some(stats),
                 asr_progress: None,
+                logprobs: Vec::new(),
             };
 
             session.total_samples_sent += chunk_samples.len();
@@ -383,6 +390,7 @@ impl OutputProcessor {
             text,
             stats: Some(stats.clone()),
             asr_progress: None,
+            logprobs: Vec::new(),
         };
 
         let _ = session.tx.send(output).await;

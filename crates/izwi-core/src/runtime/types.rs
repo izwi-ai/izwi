@@ -173,6 +173,9 @@ pub struct ChatGeneration {
     /// subset of `prompt_tokens`; `None` when the executing runtime did not
     /// measure prefix reuse (unavailable, not a zero measurement).
     pub cached_prompt_tokens: Option<u64>,
+    /// DS9.3: per-token logprob entries for the generated text. Empty
+    /// unless the request asked for logprobs.
+    pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 #[derive(Debug, Clone)]

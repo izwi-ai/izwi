@@ -990,6 +990,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_staged_stream_outputs(staged[index].clone())
                 .with_clocked_state_completion(completions[index].clone())
@@ -1323,6 +1324,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_clocked_state_completion(completion)
@@ -1742,6 +1744,7 @@ impl NativeExecutor {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_staged_stream_outputs(staged)
                     .with_managed_cache_completions(completions)
@@ -2077,6 +2080,7 @@ impl NativeExecutor {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_staged_stream_outputs(staged)
                     .with_managed_cache_completions(completions)
@@ -2464,6 +2468,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_managed_cache_completions(completions)
@@ -2882,6 +2887,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_managed_cache_completions(completions)
@@ -3197,6 +3203,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -3573,6 +3580,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -3868,6 +3876,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -4300,6 +4309,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions);
         Ok(match clocked_state_completion {
@@ -4766,6 +4776,7 @@ impl NativeExecutor {
                 .map(ExecutorPhaseTiming::with_media_decode_ms),
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(managed_cache_completions))
     }
@@ -5313,6 +5324,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(completions),
             );
@@ -5644,6 +5656,7 @@ impl NativeExecutor {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
             continuing[index] = !step.finished;
         }
@@ -5838,6 +5851,7 @@ impl NativeExecutor {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
         }
         let host_cancelled = host
@@ -6053,6 +6067,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: diagnostics,
                     error: None,
+                    logprobs: Vec::new(),
                 }));
                 let _ = sample_count;
             }
@@ -6499,6 +6514,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(managed_cache_completions),
             );
@@ -6758,6 +6774,7 @@ impl NativeExecutor {
                                 ),
                                 asr_diagnostics: diagnostics,
                                 error: None,
+                                logprobs: Vec::new(),
                             }));
                         }
 
@@ -6918,6 +6935,7 @@ impl NativeExecutor {
                             .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_managed_cache_completions(managed_cache_completions));
                 }
@@ -7394,6 +7412,7 @@ impl NativeExecutor {
             phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
             asr_diagnostics,
             error: None,
+            logprobs: Vec::new(),
         }))
     }
 

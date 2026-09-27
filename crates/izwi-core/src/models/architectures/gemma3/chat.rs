@@ -49,6 +49,9 @@ pub struct ChatDecodeState {
     stagnant_steps: usize,
     max_new_tokens: usize,
     finished: bool,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -670,6 +673,7 @@ impl Gemma3ChatModel {
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            pending_logprobs: Vec::new(),
         })
     }
 
@@ -744,8 +748,32 @@ impl Gemma3ChatModel {
         let logits = state.unconsumed_logits.take().ok_or_else(|| {
             Error::InferenceError("Gemma decode quantum has no unconsumed logits".into())
         })?;
-        let next = state.sampler.sample(&logits, self.tokenizer.vocab_size)?;
-        self.apply_sample(state, next)
+        let (next, entry) = self.sample_token(state, &logits)?;
+        self.apply_sample(state, next, entry)
+    }
+
+    /// DS9.3: sample one token, resolving raw logprobs into the public
+    /// payload when the request asked for them. The entry is recorded by
+    /// `apply_sample` only when the token is actually emitted.
+    fn sample_token(
+        &self,
+        state: &mut ChatDecodeState,
+        logits: &Tensor,
+    ) -> Result<(u32, Option<crate::engine::TokenLogprob>)> {
+        state.pending_logprobs.clear();
+        if !state.sampler.wants_logprobs() {
+            let token = state.sampler.sample(logits, self.tokenizer.vocab_size)?;
+            return Ok((token, None));
+        }
+        let (token, raw) = state
+            .sampler
+            .sample_with_logprobs(logits, self.tokenizer.vocab_size)?;
+        let entry = raw
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        Ok((token, entry))
     }
 
     pub fn decode_step_batch(
@@ -791,15 +819,19 @@ impl Gemma3ChatModel {
         }
         let mut steps = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let next = state
-                .sampler
-                .sample(&logits.i(row)?, self.tokenizer.vocab_size)?;
-            steps.push(self.apply_sample(state, next)?);
+            let row_logits = logits.i(row)?;
+            let (next, entry) = self.sample_token(state, &row_logits)?;
+            steps.push(self.apply_sample(state, next, entry)?);
         }
         Ok(steps)
     }
 
-    fn apply_sample(&self, state: &mut ChatDecodeState, next: u32) -> Result<ChatDecodeStep> {
+    fn apply_sample(
+        &self,
+        state: &mut ChatDecodeState,
+        next: u32,
+        logprob_entry: Option<crate::engine::TokenLogprob>,
+    ) -> Result<ChatDecodeStep> {
         if next == self.tokenizer.specials.end_of_turn
             || next == self.tokenizer.specials.eos
             || next == self.tokenizer.specials.start_of_turn
@@ -808,6 +840,9 @@ impl Gemma3ChatModel {
         {
             state.finished = true;
             return Ok(state.step(String::new()));
+        }
+        if let Some(entry) = logprob_entry {
+            state.pending_logprobs.push(entry);
         }
         state.generated_ids.push(next);
         state.pending_token = Some(next);

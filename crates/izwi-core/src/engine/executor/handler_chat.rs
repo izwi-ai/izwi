@@ -52,6 +52,7 @@ fn finish_resumable_prefill_step(
         tokens_generated: last_tokens_generated,
         input_tokens_committed: 0,
         finished: false,
+        logprobs: Vec::new(),
     })
 }
 
@@ -238,6 +239,7 @@ impl NativeExecutor {
                 last_tokens_generated: state.last_tokens_generated,
                 stream_sequence: state.stream_sequence,
                 streamed_text: state.streamed_text.clone(),
+                logprobs: state.logprobs.clone(),
             },
         );
         // All CPU continuation state is installed before dropping GPU owners.
@@ -420,6 +422,7 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
         }
 
@@ -477,6 +480,7 @@ impl NativeExecutor {
                     last_tokens_generated: saved.last_tokens_generated,
                     stream_sequence: saved.stream_sequence,
                     streamed_text: saved.streamed_text.clone(),
+                    logprobs: saved.logprobs.clone(),
                 })?;
                 suspended.remove(&session);
                 started_replay = true;
@@ -625,6 +629,7 @@ impl NativeExecutor {
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 streamed_text: String::new(),
+                logprobs: Vec::new(),
             })?;
         }
 
@@ -655,7 +660,7 @@ impl NativeExecutor {
             })
             .transpose()?;
         state_lease.mark_dirty();
-        let (step, final_text, finished, managed_cache_completions) = {
+        let (step, final_text, finished, managed_cache_completions, terminal_logprobs) = {
             let active_state = state_lease.require_state_mut()?;
             if matches!(active_state.state, NativeChatDecodeState::Lfm2(_))
                 && crate::models::architectures::lfm2::diagnostics::enabled()
@@ -680,6 +685,7 @@ impl NativeExecutor {
                     tokens_generated: active_state.last_tokens_generated,
                     input_tokens_committed: 0,
                     finished: false,
+                    logprobs: Vec::new(),
                 }
             } else if let Some((scheduled_start, span_end)) = resumable_span {
                 // A managed prefix attach leaves the state's logical prefill
@@ -736,14 +742,16 @@ impl NativeExecutor {
                     .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
             }
 
+            active_state.logprobs.extend(step.logprobs.clone());
             if let Some(tx) = stream_tx.as_ref() {
                 if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
+                    Self::stream_chat_text_with_policy(
                         tx,
                         stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
+                        step.logprobs.clone(),
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }
@@ -759,7 +767,18 @@ impl NativeExecutor {
                 }
             }
             let managed_cache_completions = active_state.state.take_managed_write_completions();
-            (step, final_text, finished, managed_cache_completions)
+            let terminal_logprobs = if finished {
+                std::mem::take(&mut active_state.logprobs)
+            } else {
+                Vec::new()
+            };
+            (
+                step,
+                final_text,
+                finished,
+                managed_cache_completions,
+                terminal_logprobs,
+            )
         };
 
         let tokens_processed = if let Some(span_tokens) = resumable_span_tokens {
@@ -786,6 +805,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: terminal_logprobs,
         })
         .with_managed_cache_completions(managed_cache_completions))
     }
@@ -1033,13 +1053,15 @@ impl NativeExecutor {
                 let Some(tx) = Self::stream_sender(request) else {
                     return Ok(());
                 };
+                active_state.logprobs.extend(step.logprobs.clone());
                 if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
+                    Self::stream_chat_text_with_policy(
                         &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
+                        step.logprobs.clone(),
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }
@@ -1078,6 +1100,11 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: if step.finished {
+                        std::mem::take(&mut active_state.logprobs)
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .with_managed_cache_completions(managed_cache_completions),
             );
@@ -1172,6 +1199,7 @@ mod tests {
                 tokens_generated: 1,
                 input_tokens_committed: 0,
                 finished: false,
+                logprobs: Vec::new(),
             })
         })
         .unwrap();

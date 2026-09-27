@@ -50,6 +50,9 @@ pub struct ChatDecodeState {
     finished: bool,
     position: usize,
     prefill_progress: usize,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(crate) struct Lfm2ChatDecodeCheckpoint {
@@ -676,6 +679,7 @@ impl Lfm2ChatModel {
             finished: false,
             position: 0,
             prefill_progress: 0,
+            pending_logprobs: Vec::new(),
         })
     }
 
@@ -758,8 +762,32 @@ impl Lfm2ChatModel {
             Error::InferenceError("LFM2 decode state has no sampleable output".into())
         })?;
         self.tokenizer.validate_logits(&logits)?;
-        let next = state.sampler.sample(&logits, self.tokenizer.vocab_size)?;
-        self.accept_token(state, next, committed)
+        let (next, entry) = self.sample_token(state, &logits)?;
+        self.accept_token(state, next, committed, entry)
+    }
+
+    /// DS9.3: sample one token, resolving raw logprobs into the public
+    /// payload when the request asked for them. `accept_token` records the
+    /// entry only when the token is actually emitted.
+    fn sample_token(
+        &self,
+        state: &mut ChatDecodeState,
+        logits: &Tensor,
+    ) -> Result<(u32, Option<crate::engine::TokenLogprob>)> {
+        state.pending_logprobs.clear();
+        if !state.sampler.wants_logprobs() {
+            let token = state.sampler.sample(logits, self.tokenizer.vocab_size)?;
+            return Ok((token, None));
+        }
+        let (token, raw) = state
+            .sampler
+            .sample_with_logprobs(logits, self.tokenizer.vocab_size)?;
+        let entry = raw
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        Ok((token, entry))
     }
 
     fn accept_token(
@@ -767,6 +795,7 @@ impl Lfm2ChatModel {
         state: &mut ChatDecodeState,
         next: u32,
         committed: usize,
+        logprob_entry: Option<crate::engine::TokenLogprob>,
     ) -> Result<ChatDecodeStep> {
         if diagnostics::enabled() && state.generated_ids.len() < 64 {
             tracing::info!(
@@ -800,6 +829,9 @@ impl Lfm2ChatModel {
                 .decode_incrementally(&mut state.decoder, next)?;
             state.generated_ids.push(next);
             state.assembled.push_str(&delta);
+            if let Some(entry) = logprob_entry {
+                state.pending_logprobs.push(entry);
+            }
         }
         state.stop_reason = reason.or_else(|| {
             if should_check_repetition_loop(state.generated_ids.len())
@@ -876,23 +908,26 @@ impl Lfm2ChatModel {
         drop(shortconv);
         drop(caches);
         self.tokenizer.validate_logits(&logits)?;
-        let next_tokens = if states.iter().all(|state| state.greedy) {
+        // DS9.3: rows collecting logprobs must sample through the resolving
+        // path, which forfeits the batched argmax for the whole envelope.
+        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
+        let next_tokens = if states.iter().all(|state| state.greedy) && !wants_logprobs {
             argmax_batch(&logits.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?)?
+                .into_iter()
+                .map(|token| (token, None))
+                .collect::<Vec<_>>()
         } else {
-            states
-                .iter_mut()
-                .enumerate()
-                .map(|(row, state)| {
-                    state
-                        .sampler
-                        .sample(&logits.i(row)?, self.tokenizer.vocab_size)
-                })
-                .collect::<Result<Vec<_>>>()?
+            let mut sampled = Vec::with_capacity(states.len());
+            for (row, state) in states.iter_mut().enumerate() {
+                let row_logits = logits.i(row)?;
+                sampled.push(self.sample_token(state, &row_logits)?);
+            }
+            sampled
         };
         let mut steps = Vec::with_capacity(states.len());
-        for (state, next) in states.iter_mut().zip(next_tokens) {
+        for (state, (next, logprob_entry)) in states.iter_mut().zip(next_tokens) {
             state.position = state.position.saturating_add(1);
-            steps.push(self.accept_token(state, next, 1)?);
+            steps.push(self.accept_token(state, next, 1, logprob_entry)?);
         }
         Ok(steps)
     }

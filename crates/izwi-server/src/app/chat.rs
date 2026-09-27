@@ -678,6 +678,7 @@ fn worker_chat_generation(
             .map_err(|_| bad_gateway_error("Worker reported an invalid output token count"))?,
         generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
         cached_prompt_tokens: usage.cached_tokens,
+        logprobs: Vec::new(),
     })
 }
 
@@ -1469,6 +1470,7 @@ mod tests {
                     latency_breakdown: None,
                     finish_reason: None,
                     cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             });
 
@@ -1513,6 +1515,7 @@ mod tests {
                     latency_breakdown: None,
                     finish_reason: None,
                     cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             });
 
@@ -1552,6 +1555,7 @@ mod tests {
                     latency_breakdown: None,
                     finish_reason: None,
                     cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             },
         );

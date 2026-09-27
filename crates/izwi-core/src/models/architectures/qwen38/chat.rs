@@ -350,6 +350,12 @@ pub struct ChatDecodeState {
     draft_rng: SimpleRng,
     adaptive_mtp: AdaptiveMtp,
     mtp_timings: Vec<timing::PendingRound>,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+    /// DS9.3: resolved logprob entry for the prefill-seeded anchor token,
+    /// flushed by the decode quantum that publishes it.
+    bootstrap_logprob: Option<crate::engine::TokenLogprob>,
 }
 
 impl ChatDecodeState {
@@ -993,19 +999,38 @@ impl Qwen38ChatModel {
         history: &[u32],
         rng: &mut SimpleRng,
     ) -> Result<u32> {
-        if self.device_sampling_enabled() {
+        let (token, _) =
+            self.sample_next_token_with_logprobs(logits, vocab_size, config, history, rng)?;
+        Ok(token)
+    }
+
+    /// DS9.3: sample a token and, when the request asked for logprobs,
+    /// route through the host sampler: the CUDA kernels path returns only
+    /// token ids, so raw-distribution stats need the host route.
+    fn sample_next_token_with_logprobs(
+        &self,
+        logits: &Tensor,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: &[u32],
+        rng: &mut SimpleRng,
+    ) -> Result<(
+        u32,
+        Option<crate::models::shared::sampling::RawTokenLogprobs>,
+    )> {
+        if self.device_sampling_enabled() && !config.logprobs {
             let token = device_sampling::sample(logits, vocab_size, config, history, rng)?;
             record_sampling_bounded_cuda(true);
-            return Ok(token);
+            return Ok((token, None));
         }
-        // Explicit CUDA opt-out uses the compatibility host sampler. CPU and
-        // Metal retain their established sampling routes.
+        // Logprob requests and explicit CUDA opt-outs use the host sampler;
+        // CPU and Metal retain their established sampling routes.
         let logits = if logits.device().is_cuda() {
             logits.to_device(&candle_core::Device::Cpu)?
         } else {
             logits.clone()
         };
-        sample_next_token(&logits, vocab_size, config, history, rng)
+        sample_next_token_with_logprobs(&logits, vocab_size, config, history, rng)
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -1348,6 +1373,8 @@ impl Qwen38ChatModel {
             rng,
             draft_rng,
             mtp_timings: Vec::new(),
+            pending_logprobs: Vec::new(),
+            bootstrap_logprob: None,
             adaptive_mtp: AdaptiveMtp::new(
                 self.device_kind == BackendKind::Cuda
                     && self.performance.cuda.enabled()
@@ -1401,6 +1428,8 @@ impl Qwen38ChatModel {
             draft_rng: saved.draft_rng.clone(),
             adaptive_mtp: saved.adaptive_mtp.clone(),
             mtp_timings: Vec::new(),
+            pending_logprobs: Vec::new(),
+            bootstrap_logprob: None,
         })
     }
 
@@ -1573,6 +1602,8 @@ impl Qwen38ChatModel {
             rng,
             draft_rng,
             mtp_timings: Vec::new(),
+            pending_logprobs: Vec::new(),
+            bootstrap_logprob: None,
             adaptive_mtp: AdaptiveMtp::new(
                 self.device_kind == BackendKind::Cuda
                     && self.performance.cuda.enabled()
@@ -1676,7 +1707,8 @@ impl Qwen38ChatModel {
                 } else {
                     &[]
                 };
-                let anchor = self.sample_next_token(
+                state.pending_logprobs.clear();
+                let (anchor, anchor_logprob) = self.sample_next_token_with_logprobs(
                     &logits,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -1686,6 +1718,15 @@ impl Qwen38ChatModel {
                 if state.track_history {
                     state.history_ids.push(anchor);
                 }
+                state.bootstrap_logprob = anchor_logprob
+                    .filter(|_| !self.is_stop_token(anchor, &state.config))
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
                 let anchor_embedding = self.text_model.embed_token_ids(&[anchor])?;
                 let pairs = Qwen38MtpPairBatch::single(
                     anchor_embedding,
@@ -1773,20 +1814,31 @@ impl Qwen38ChatModel {
         } else {
             Vec::with_capacity(state_count)
         };
+        let mut logprob_entries = vec![None; state_count];
         if !batch_greedy {
             for (row, state) in states.iter_mut().enumerate() {
+                state.pending_logprobs.clear();
                 let history: &[u32] = if state.track_history {
                     &state.history_ids
                 } else {
                     &[]
                 };
-                sampled.push(self.sample_next_token(
-                    &target.logits.i((row, 0))?,
+                let row_logits = target.logits.i((row, 0))?;
+                let (token, logprob_entry) = self.sample_next_token_with_logprobs(
+                    &row_logits,
                     self.tokenizer.vocab_size,
                     &state.config,
                     history,
                     &mut state.rng,
-                )?);
+                )?;
+                if let Some(raw) = logprob_entry {
+                    logprob_entries[row] =
+                        Some(crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )?);
+                }
+                sampled.push(token);
             }
         }
         let terminal_rows = states
@@ -1832,6 +1884,11 @@ impl Qwen38ChatModel {
             if state.track_history {
                 state.history_ids.push(next);
             }
+            if let Some(entry) = logprob_entries[row].take() {
+                if !terminal_rows[row] {
+                    state.pending_logprobs.push(entry);
+                }
+            }
             if !terminal_rows[row] {
                 if let Some(hidden) = mtp_hidden.as_ref() {
                     state.mtp_anchor_hidden = Some(hidden.i(row)?.unsqueeze(0)?);
@@ -1875,6 +1932,11 @@ impl Qwen38ChatModel {
         }
 
         if let Some(anchor) = state.bootstrap_token.take() {
+            if let Some(entry) = state.bootstrap_logprob.take() {
+                if !self.is_stop_token(anchor, &state.config) {
+                    state.pending_logprobs.push(entry);
+                }
+            }
             let delta = self.publish_token(state, anchor)?;
             return Ok(self.decode_step_result(state, delta, 0));
         }
@@ -1904,7 +1966,8 @@ impl Qwen38ChatModel {
             .unconsumed_output
             .take()
             .ok_or_else(|| Error::InferenceError("missing Qwen3.8 output".into()))?;
-        let next = self.sample_next_token(
+        state.pending_logprobs.clear();
+        let (next, logprob_entry) = self.sample_next_token_with_logprobs(
             &output,
             self.tokenizer.vocab_size,
             &state.config,
@@ -1913,6 +1976,16 @@ impl Qwen38ChatModel {
         )?;
         if state.track_history {
             state.history_ids.push(next);
+        }
+        let resolved = logprob_entry
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        if let Some(entry) = resolved {
+            if !self.is_stop_token(next, &state.config) {
+                state.pending_logprobs.push(entry);
+            }
         }
         state.pending_token = Some(next);
         let delta = self.publish_token(state, next)?;
@@ -2009,7 +2082,14 @@ impl Qwen38ChatModel {
             } else {
                 None
             };
-            let selected_depth = state.adaptive_mtp.depth(remaining);
+            // DS9.3: speculative rounds commit drafted tokens whose raw
+            // logits the scalar sampler never observed, so logprob requests
+            // force depth 0 (the MTP domain still advances each round).
+            let selected_depth = if state.config.logprobs {
+                0
+            } else {
+                state.adaptive_mtp.depth(remaining)
+            };
             if selected_depth == 0 {
                 record_mtp_scalar_target_token();
                 let pending = state.pending_token.ok_or_else(|| {
@@ -2030,7 +2110,8 @@ impl Qwen38ChatModel {
                 } else {
                     &[]
                 };
-                let next = self.sample_next_token(
+                state.pending_logprobs.clear();
+                let (next, logprob_entry) = self.sample_next_token_with_logprobs(
                     &logits,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -2039,6 +2120,19 @@ impl Qwen38ChatModel {
                 )?;
                 if state.track_history {
                     state.history_ids.push(next);
+                }
+                let resolved = logprob_entry
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(entry) = resolved {
+                    if !self.is_stop_token(next, &state.config) {
+                        state.pending_logprobs.push(entry);
+                    }
                 }
                 let mtp = state.mtp_physical_kv.as_mut().ok_or_else(|| {
                     Error::InferenceError("Qwen3.8 MTP scalar tail lost its cache".into())
@@ -2747,6 +2841,57 @@ fn take_quantum_sample(
         Error::InferenceError("Qwen3.8 decode quantum has no unconsumed model output".to_string())
     })?;
     sample_next_token(&output, vocab_size, config, history, rng)
+}
+
+/// DS9.3: sample a token and, when the request asked for logprobs, resolve
+/// the raw-distribution stats on host. Sampling math is unchanged.
+fn sample_next_token_with_logprobs(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<(
+    u32,
+    Option<crate::models::shared::sampling::RawTokenLogprobs>,
+)> {
+    if !config.logprobs {
+        let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+        return Ok((token, None));
+    }
+    let host = if logits.device().is_cuda() {
+        logits.to_device(&candle_core::Device::Cpu)?
+    } else {
+        logits.clone()
+    };
+    let raw_values = logits_to_vec(&host)?;
+    let mut values = raw_values.clone();
+    truncate_logits_to_vocab(&mut values, vocab_size);
+    if values.is_empty() {
+        return Err(Error::InvalidInput(
+            "Qwen3.8 sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    let (logsumexp, top) =
+        crate::models::shared::sampling::raw_logprobs_stats(&values, config.top_logprobs)?;
+    let token = sample_next_token(&host, vocab_size, config, history, rng)?;
+    let chosen_raw = raw_values
+        .get(token as usize)
+        .copied()
+        .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
+    if !chosen_raw.is_finite() {
+        return Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ));
+    }
+    Ok((
+        token,
+        Some(crate::models::shared::sampling::RawTokenLogprobs {
+            token,
+            logprob: chosen_raw - logsumexp,
+            top,
+        }),
+    ))
 }
 
 fn sample_next_token(

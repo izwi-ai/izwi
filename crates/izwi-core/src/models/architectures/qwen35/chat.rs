@@ -137,6 +137,9 @@ pub struct ChatDecodeState {
     prefill_vision_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 impl ChatDecodeState {
@@ -737,6 +740,7 @@ impl Qwen35ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: 0,
+            pending_logprobs: Vec::new(),
             prefill_vision_progress: 0,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
@@ -866,13 +870,31 @@ impl Qwen35ChatModel {
         } else {
             &[]
         };
-        let next = take_quantum_sample(
-            &mut state.unconsumed_output,
-            self.tokenizer.vocab_size,
-            &state.config,
-            history,
-            &mut state.rng,
-        )?;
+        state.pending_logprobs.clear();
+        let next = {
+            let output = state.unconsumed_output.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
+                )
+            })?;
+            let (token, raw_logprobs) = sample_next_token_with_logprobs(
+                &output,
+                self.tokenizer.vocab_size,
+                &state.config,
+                history,
+                &mut state.rng,
+            )?;
+            if let Some(raw) = raw_logprobs {
+                let entry = crate::models::shared::sampling::resolve_token_logprob(
+                    &self.tokenizer.inner,
+                    &raw,
+                )?;
+                if !self.is_stop_token(token, &state.config) {
+                    state.pending_logprobs.push(entry);
+                }
+            }
+            token
+        };
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -963,18 +985,34 @@ impl Qwen35ChatModel {
             } else {
                 &[]
             };
-            sampled.push(sample_next_token(
-                &logits.i((row, 0))?,
+            state.pending_logprobs.clear();
+            let row_logits = logits.i((row, 0))?;
+            let (token, raw_logprobs) = sample_next_token_with_logprobs(
+                &row_logits,
                 self.tokenizer.vocab_size,
                 &state.config,
                 history,
                 &mut state.rng,
-            )?);
+            )?;
+            let entry = raw_logprobs
+                .map(|raw| {
+                    crate::models::shared::sampling::resolve_token_logprob(
+                        &self.tokenizer.inner,
+                        &raw,
+                    )
+                })
+                .transpose()?;
+            sampled.push((token, entry));
             state.next_text_position = state.next_text_position.saturating_add(1);
         }
         let mut steps = Vec::with_capacity(states.len());
-        for (state, next) in states.iter_mut().zip(sampled) {
+        for (state, (next, logprob_entry)) in states.iter_mut().zip(sampled) {
             let is_stop = self.is_stop_token(next, &state.config);
+            if let Some(entry) = logprob_entry {
+                if !is_stop {
+                    state.pending_logprobs.push(entry);
+                }
+            }
             if state.track_history && !is_stop {
                 state.history_ids.push(next);
             }
@@ -1586,6 +1624,52 @@ fn take_quantum_sample(
         Error::InferenceError("Qwen3.5 decode quantum has no unconsumed model output".to_string())
     })?;
     sample_next_token(&output, vocab_size, config, history, rng)
+}
+
+/// DS9.3: sample a token and, when the request asked for logprobs, resolve
+/// the raw-distribution stats on host. Sampling math is unchanged.
+fn sample_next_token_with_logprobs(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<(
+    u32,
+    Option<crate::models::shared::sampling::RawTokenLogprobs>,
+)> {
+    if !config.logprobs {
+        let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+        return Ok((token, None));
+    }
+    let raw_values = logits_to_vec(logits)?;
+    let mut values = raw_values.clone();
+    truncate_logits_to_vocab(&mut values, vocab_size);
+    if values.is_empty() {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    let (logsumexp, top) =
+        crate::models::shared::sampling::raw_logprobs_stats(&values, config.top_logprobs)?;
+    let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+    let chosen_raw = raw_values
+        .get(token as usize)
+        .copied()
+        .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
+    if !chosen_raw.is_finite() {
+        return Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ));
+    }
+    Ok((
+        token,
+        Some(crate::models::shared::sampling::RawTokenLogprobs {
+            token,
+            logprob: chosen_raw - logsumexp,
+            top,
+        }),
+    ))
 }
 
 fn sample_next_token(
@@ -2340,6 +2424,8 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
         };
         let mut rng = SimpleRng::new(7);
         let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
@@ -2363,6 +2449,8 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 17,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
         };
         let history = [1u32];
         let mut direct_rng = SimpleRng::new(17);
@@ -2393,6 +2481,8 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
         };
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
@@ -2418,6 +2508,8 @@ mod tests {
                 stop_token_ids: Vec::new(),
                 seed: 7,
                 request: ChatRequestConfig::default(),
+                logprobs: false,
+                top_logprobs: 0,
             };
             let mut rng = SimpleRng::new(7);
             let error = sample_next_token(&logits, 3, &config, &[], &mut rng)

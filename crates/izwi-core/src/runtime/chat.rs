@@ -146,6 +146,8 @@ impl RuntimeService {
             stop_token_ids: params.stop_token_ids.clone(),
             seed: 0,
             request: chat_config.clone(),
+            logprobs: params.logprobs || params.top_logprobs > 0,
+            top_logprobs: params.top_logprobs,
         }
     }
 
@@ -377,6 +379,7 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
             cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 
@@ -455,6 +458,7 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
             cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 
@@ -549,6 +553,7 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
             cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 
@@ -661,6 +666,7 @@ impl RuntimeService {
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
             cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 }

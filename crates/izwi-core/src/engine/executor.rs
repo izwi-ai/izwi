@@ -1130,6 +1130,10 @@ pub struct ExecutorOutput {
     pub asr_diagnostics: Option<serde_json::Value>,
     /// Error if any
     pub error: Option<String>,
+    /// DS9.3: per-token logprob entries carried by terminal chat outputs.
+    /// Empty unless the request asked for logprobs and this output is the
+    /// request's terminal quantum.
+    pub logprobs: Vec<crate::engine::types::TokenLogprob>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1178,6 +1182,7 @@ impl ExecutorOutput {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: Some(error.into()),
+            logprobs: Vec::new(),
         }
     }
 
@@ -1199,6 +1204,7 @@ impl ExecutorOutput {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         }
     }
 }
@@ -1296,6 +1302,7 @@ impl ModelSessionResult {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             disposition: ExecutionDisposition::RestartSequence(reason),
             safe_point: true,
@@ -6346,6 +6353,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         });
         assert_eq!(
             sequence.disposition,
@@ -6364,6 +6372,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         });
         assert!(matches!(
             atomic.disposition,

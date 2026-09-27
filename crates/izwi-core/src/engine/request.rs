@@ -4428,6 +4428,8 @@ impl EngineCoreRequest {
             stop_token_ids: self.params.stop_token_ids.clone(),
             seed: Self::chat_request_seed(&self.id),
             request: self.chat_config.clone(),
+            logprobs: self.params.logprobs || self.params.top_logprobs > 0,
+            top_logprobs: self.params.top_logprobs,
         }
     }
 

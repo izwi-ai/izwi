@@ -68,6 +68,16 @@ pub struct GenerationParams {
     /// Stop token IDs
     #[serde(default)]
     pub stop_token_ids: Vec<TokenId>,
+
+    /// DS9.3: collect per-token logprobs of the raw model distribution
+    /// (log_softmax of the raw logits, before penalties and temperature).
+    #[serde(default)]
+    pub logprobs: bool,
+
+    /// DS9.3: number of top alternatives reported per token when `logprobs`
+    /// is on (validated 0..=20 at the public boundary).
+    #[serde(default)]
+    pub top_logprobs: usize,
 }
 
 fn default_temperature() -> f32 {
@@ -102,6 +112,8 @@ impl Default for GenerationParams {
             speed: default_speed(),
             stop_sequences: Vec::new(),
             stop_token_ids: Vec::new(),
+            logprobs: false,
+            top_logprobs: 0,
         }
     }
 }
@@ -200,6 +212,9 @@ pub struct EngineOutput {
     pub error: Option<String>,
     /// Bounded provenance for dispatch, failure, and deadline observability.
     pub provenance: OutcomeProvenance,
+    /// DS9.3: full per-token logprob list on terminal chat outputs. Empty
+    /// unless the request asked for logprobs.
+    pub logprobs: Vec<TokenLogprob>,
 }
 
 impl EngineOutput {
@@ -247,6 +262,32 @@ pub struct TokenStats {
     /// never probed a managed prefix (unavailable, not a zero measurement).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_prefix_tokens: Option<u32>,
+}
+
+/// DS9.3: one top alternative in a token's logprob entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopTokenLogprob {
+    /// Decoded surface text of this token (single-token decode).
+    pub token: String,
+    /// log_softmax of the raw logit, before penalties and temperature.
+    pub logprob: f32,
+    /// UTF-8 bytes of `token`.
+    pub bytes: Vec<u8>,
+}
+
+/// DS9.3: per-token logprob entry for one sampled output token.
+///
+/// Logprobs are computed from the raw model distribution (log_softmax of the
+/// raw logits) so they stay independent of sampling parameters, matching the
+/// raw-logprob semantics of serving engines. Token strings use single-token
+/// decoding: byte-level pieces that split a multi-byte UTF-8 sequence decode
+/// lossily, and `bytes` carries those lossy bytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<TopTokenLogprob>,
 }
 
 /// Request latency phases captured by the scheduler/engine loop.
