@@ -670,6 +670,79 @@ rollback:
 If startup fails, stop the partial rollout, restore the known-good artifact and
 configuration with another fresh generation, and repeat the same sequence.
 
+For a pure model-generation cutover on one node, prefer the coordinated
+rollout below: it replaces the manual approval-edit step (step 6) with an
+atomic, supervisor-computed approvals view and adds an automatic abort path.
+The manual sequence remains the fallback for changes a rollout plan cannot
+express (node identity, capacity, non-rolling workers).
+
+### Coordinated blue-green rollout (DS6)
+
+One supervisor invocation performs the cutover with automatic abort
+(ADR 0006). Write a rollout plan that names the already-validated target node
+config (new nonzero generations), the gateway's shared approvals file, the
+canary replacement, and the soak/abort windows:
+
+```toml
+schema_version = 1
+target_node_config = "/etc/izwi/node-v2.toml"   # absolute path; validated in full before anything changes
+shared_approvals_path = "/etc/izwi/shared-approvals.toml"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
+canary_worker_id = "chat-worker-2"              # replacement launched first; its readiness failure aborts
+window_secs = 30                                # soak window between cutover and draining the old generation (0–3600)
+abort_grace_secs = 30                           # wait after an abort restore before stopping replacements (0–300)
+```
+
+The target config's non-rolling workers and node identity must match the
+running config exactly; only the rolling deployments' generations advance.
+
+Start (or restart) the supervisor with the plan — `--config` stays the current
+(old) config; the plan carries the target:
+
+```
+izwi-serving-supervisor --config /etc/izwi/node-v1.toml \
+  --cpu-worker-binary <path> --cpu-ids <ids> --allocatable-host-memory-bytes <bytes> \
+  --rollout-plan /etc/izwi/rollout.toml
+```
+
+The supervisor then:
+
+1. launches the current generation's workers, then the replacements
+   canary-first (canary readiness failure aborts immediately);
+2. writes the window view — both generations approved, one atomic file
+   write — and persists `window_open` state; the gateway adopts the view at
+   runtime and moves admission to the new generation the moment it observes
+   it Ready (never two eligible generations, never zero);
+3. after the soak window writes the commit view (new generation only) and
+   drains the old workers — the point of no return — then records
+   `committed` and keeps supervising the replacements; repoint the service
+   definition at the target config for the next supervisor restart.
+
+Monitor and intervene without guessing:
+
+- `--rollout-status` reports the persisted phase (`launching_replacement`,
+  `window_open`, `draining_old`, `committed`, `aborted`) and window deadline.
+- Abort while reversible: send SIGUSR2 to the supervisor, or stop it —
+  shutdown during launch/window aborts and restores automatically. A
+  replacement that exits during the window aborts too. The abort restores
+  the pre-rollout approvals byte-identically first, waits
+  `abort_grace_secs` so the gateway stops routing to the replacements, then
+  drains them; the old generation never stopped serving.
+- If the supervisor dies mid-rollout, managed workers self-drain and a fresh
+  start fails closed until you rerun `--rollout-plan` (resume with the same
+  plan: the old generation relaunches only in pre-drain states, replacements
+  relaunch alongside it; in `draining_old` the old generation is never
+  relaunched) or `--rollout-abort` (restore without launching anything).
+  Terminal states clear automatically; a `committed` state requires the
+  committed target config's digest.
+- Rollback after `committed` is a new rollout plan back to the previous
+  configuration with a fresh generation — never a generation reuse.
+
+Limit the blast radius honestly: `draining_old` is irreversible (worker
+control-pipe EOF cannot be un-sent), the coordinator covers one supervisor
+and one gateway over one shared approvals file, and hand-editing the shared
+approvals file is still possible — it now has runtime effect, so leave the
+file to the rollout command.
+
 ## Troubleshooting
 
 | Symptom | Check | Safe response |
@@ -767,12 +840,13 @@ stays explicitly unsupported.
 marks the gateway draining (same path as SIGTERM). The endpoint returns 404
 when no admin key is configured and 401 for the inference key.
 
-**Canary rollout.** Start the supervisor with
-`--canary-worker-id <worker-id>` to launch that worker first. Remaining
-workers start only after the canary reaches readiness; if it fails, the
-supervisor exits without launching the rest. Pair this with a fresh model
-generation on the canary worker and a known-good generation elsewhere for a
-safe rollout with implicit rollback.
+**Canary launch ordering.** `--canary-worker-id <worker-id>` launches that
+worker first within a single plain boot; remaining workers start only after
+the canary reaches readiness, and the supervisor exits if it fails. It orders
+launches only — it never moves gateway routing between generations and
+cannot be combined with `--rollout-*`. For a generation cutover use the
+coordinated blue-green rollout (see "Drain, shutdown, and restart"), which
+adds the dual-generation approval window, automatic abort, and resume.
 
 **Worker TLS.** The worker terminates TLS when both
 `IZWI_WORKER_TLS_CERT_REF` and `IZWI_WORKER_TLS_KEY_REF` name bounded

@@ -30,13 +30,14 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
 | P6 Durable jobs, artifacts | Done for the single-node text profile | Voice route migration remains gated per ledger |
 | P7 Secure one-gateway fleet | Done (code) | TLS/mTLS, topology policy, remote artifact transport; separate-machine handshake evidence open |
 | P8 Multi-gateway correctness | Done | Partitioned quotas, claims, outage degradation; DS5 validated the shared stores and posture with real processes |
-| P9 Operational release | Partial | Validate-only, drain, canary, packaging, benchmark harness done; soak/benchmark runs open |
+| P9 Operational release | Partial | Validate-only, drain, packaging, benchmark harness done; DS6 replaced the manual canary with the coordinated blue-green rollout; soak/benchmark runs open |
 | DS0 Foundations | Done (9 of 9) | DS0.1 process gateway proof, DS0.2 this report, DS0.3 poll jitter, DS0.4 model-load slots, DS0.5 scoped per-principal keys, DS0.6 multi-lane supervision, DS0.7 CPU/Metal baselines, DS0.8 backend parity harness |
 | DS1 Committed prefix reuse | Done | DS1.1–DS1.6 closed: paged reuse, tensor-snapshot forks, admission probe + cursor-lost re-plan, catalog-auto default-on with per-family evidence cells |
 | DS2 Cache-aware routing | Done | Protocol minor-1 routing signals, worker exposure, cache affinity + conversation pinning (default OFF), CPU+Metal 2-worker evidence |
 | DS3 Realtime voice over the worker boundary | Done | `izwi-realtime-v1` end to end (worker route, client transport, gateway relay behind flag), TTS-stream stage, DS3.4 public envelope translation |
 | DS4 Hierarchical KV offload | Done | DS4.1–DS4.5 closed: design note + ADR 0004, host pool substrate, demotion, promotion, counters, engine-level acceptance, CPU+Metal benchmark evidence (CUDA `not run`) |
 | DS5 Fleet authority | Done | DS5.1 PostgreSQL validated (URL connect path, dialect-aware migrator, execution suites in CI; the PG claim race needed a worker-keyed advisory lock), DS5.2 two-gateway/two-worker fleet rig (SQLite + PG lanes: T07/T20/P8.1/steering/crash+TTL/DINV-06 outage), DS5.3 explicit fleet posture + claim-TTL env + maintenance sweep, DS5.4 T25 generation-fence process evidence, DS5.5 ADR 0005 + docs; MySQL recorded unvalidated (error 1170 TEXT-key burden) |
+| DS6 Coordinated blue-green rollout | Done | Declarative rollout plan + supervisor state machine (`43d2e7bb`/`3ec044e3`), shared approval format as a protocol contract (`bf30273a`), gateway per-pool DINV-07 eligibility rule (`c539e914`) with runtime approvals-view adoption (`0ec7b5c5`), supervisor process tests + T37 gateway zero-dropped-requests rig (`7fd649eb`/`d9e5abe0`), ADR 0006 + runbook/support-matrix/delivery docs |
 
 ## Supported deployment profiles
 
@@ -107,6 +108,18 @@ Two DS4.2 gaps surfaced and fixed by the DS4.4 work: the host pool budget is
 now part of the model's load-time resource authorization, and the worker
 Prometheus endpoint renders the DS4 counters.
 
+DS6 additions (verified 2026-09-26/27, commits `bf30273a`…`d9e5abe0`):
+supervisor rollout module 10 unit tests + 5 process tests (`tests/rollout.rs`
+with python fake workers serving the real readiness contract: canary-failure
+abort with byte-identical approvals restore, promote through window → drain →
+commit, replacement-exit abort, SIGKILL resume + fail-closed fresh start,
+status/abort command semantics); gateway cutover rig (real gateway process,
+two mock workers on real TCP, continuous traffic across window → abort-restore
+and window → commit view transitions with zero failed requests, served-count
+proofs that the draining predecessor receives nothing after cutover);
+protocol round-trip tests for the shared approval format; izwi-server lib +
+supervisor suites green, clippy/fmt clean on touched code.
+
 ## Tests not executed and why
 
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
@@ -164,16 +177,21 @@ operator-declared and verified by worker-side assigned-device selection.
 
 Roll back by redeploying the previous binaries and manifest; worker
 configurations and fleet tables are additive (schema v2, additive protocol
-fields tolerated absent). Never run two supervisor generations against one
+fields tolerated absent). Model-generation rollback on one node uses the
+coordinated rollout (a new rollout plan targeting the previous configuration
+with a fresh generation — never a generation reuse, ADR 0006). Never run two
+supervisor generations against one
 device: the generation fence blocks startup until the old generation exits.
 No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS5 is complete: the multi-gateway fleet profile is validated on SQLite and
-PostgreSQL coordination stores with real two-gateway process evidence
-(ADR 0005), the supervisor generation fence is process-proven, and MySQL
-stays honestly unvalidated. Next per the plan: the remaining DS0 remnant is
-none (DS0.1–DS0.8 closed), so the next phase is DS6 (declarative rollout
-with canary promotion), with CUDA lanes staying `not run` until hardware
-evidence exists.
+DS6 is complete: one operator command (`--rollout-plan`) performs a
+deployment-generation cutover with automatic abort — the supervisor computes
+atomic marker-free approvals views, the gateway adopts them at runtime under
+a structural DINV-07 rule (never two eligible generations, never zero), the
+state machine persists resume-after-crash state, and both promote and abort
+paths are proven with real processes (ADR 0006). Next per the plan: DS7
+(signal-driven worker autoscaling), with CUDA lanes staying `not run` until
+hardware evidence exists and the public realtime-voice envelope translation
+still deferred with the voice surface.

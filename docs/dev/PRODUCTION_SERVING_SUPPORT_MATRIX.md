@@ -61,6 +61,28 @@ to the cold run). Design and as-built deviations:
 | Metal | Supported on the fixture lane — counter-proven (`benchmarks/manifests/ds4-metal-summary.json`: on-leg demotions=7, promotions=3, host_pages=4; charged to the shared unified ledger, so the win is retention/admission headroom, never more memory) | Not a production model, capacity, soak, or performance certificate |
 | CUDA | Not run — no hardware in this work session; the pool is designed as additional capacity across PCIe there | Recorded `not run`, never `passed` |
 
+## Coordinated blue-green rollout by scope (DS6)
+
+One supervisor command (`--rollout-plan`) performs a deployment-generation
+cutover: canary-first replacement launch, an atomic approvals view that
+approves both generations for the soak window, a structurally
+never-two-eligible / never-zero-eligible gateway cutover (DINV-07), then
+drain of the old generation. Automatic aborts (canary/replacement readiness
+failure, replacement exit during the window, SIGUSR2, shutdown) restore the
+pre-rollout approvals byte-identically and leave the old generation serving
+(ADR 0006). Design and evidence:
+[ADR 0006](adr/0006-coordinated-blue-green-rollout.md); runbook section
+"Coordinated blue-green rollout".
+
+| Scope | Status | Evidence |
+|---|---|---|
+| One supervisor + one gateway over one shared approvals file (single node) | Supported on the process-evidenced lane | Supervisor process tests (`tests/rollout.rs`): canary-failure abort with byte-identical approvals restore, promotion through window → drain → commit with on-disk view assertions, replacement-exit abort, SIGKILL resume with fail-closed fresh start, status/abort command semantics; gateway rig (real gateway process, mock workers on real TCP, T37 pattern): continuous traffic across window → abort-restore and window → commit with zero failed requests, and the draining predecessor receives nothing after cutover |
+| Fleet-wide (multi-gateway) cutover | Not implemented — the coordinator writes one shared approvals file; each additional gateway adopts the same views, but no multi-gateway rollout rig or fleet-wide abort evidence exists | Recorded `not implemented`, never `supported` |
+
+`draining_old` is the point of no return (worker control-pipe EOF cannot be
+un-sent); rollback after `committed` is a new rollout plan with a fresh
+generation. Not a production soak or hardware-capacity certificate.
+
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent as recorded in
