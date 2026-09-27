@@ -24,6 +24,12 @@ pub const MAX_RETAINED_ATTEMPTS_PER_WORKER: usize = 65_536;
 pub const MAX_EXECUTION_PROFILE_LABEL_BYTES: usize = 128;
 pub const DEFAULT_MODEL_LOAD_SLOTS: u32 = 1;
 pub const MAX_MODEL_LOAD_SLOTS: u32 = 64;
+pub const MIN_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 100;
+pub const MAX_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 60_000;
+pub const DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 1_000;
+pub const MAX_SCALE_UP_QUEUE_DEPTH: u64 = 100_000;
+pub const MAX_SCALE_UP_SUSTAINED_POLLS: u32 = 3_600;
+pub const MIN_SCALE_DOWN_STABILIZATION_WINDOW_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +52,11 @@ pub struct NodeConfig {
     /// they begin serving.
     #[serde(default = "default_max_parallel_model_loads")]
     pub max_parallel_model_loads: u32,
+    /// DS7 signal-driven worker autoscaling. Absent (the default) keeps the
+    /// static supervisor behavior: every declared worker launches at startup
+    /// and no capacity decisions are made.
+    #[serde(default)]
+    pub autoscaling: Option<AutoscalingConfig>,
 }
 
 fn default_max_parallel_model_loads() -> u32 {
@@ -97,6 +108,9 @@ impl NodeConfig {
         self.readiness.validate()?;
         self.restart.validate()?;
         self.shutdown.validate()?;
+        if let Some(autoscaling) = self.autoscaling.as_ref() {
+            autoscaling.validate(&self.workers)?;
+        }
         validate_inventory(inventory)?;
 
         let effective_cpus = inventory
@@ -673,6 +687,146 @@ impl ShutdownPolicy {
     }
 }
 
+/// DS7 signal-driven worker autoscaling policy: the shared approvals file the
+/// supervisor manages for its autoscaled deployments, the evaluation cadence,
+/// and one policy per autoscaled deployment. Absent means autoscaling is off.
+///
+/// Every worker of an autoscaled deployment must be declared in the node
+/// config (own id, bind, assignment, budgets); `max_workers` names the full
+/// declared replica count and `min_workers` the subset launched at startup.
+/// The remaining declared workers are standby replicas that only scale-up
+/// launches, so the config-time aggregate budget check already proves that
+/// any reachable scale-out state fits the node ledger.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoscalingConfig {
+    /// Shared worker-approvals file whose lines for this node's autoscaled
+    /// deployments are owned by the supervisor (fleet profile: the gateway
+    /// adopts changed views at runtime).
+    pub shared_approvals_path: PathBuf,
+    #[serde(default = "default_autoscaling_evaluation_interval_ms")]
+    pub evaluation_interval_ms: u64,
+    pub deployments: BTreeMap<String, DeploymentAutoscalingPolicy>,
+}
+
+impl AutoscalingConfig {
+    fn validate(&self, workers: &[WorkerConfig]) -> Result<(), ConfigError> {
+        validate_path_length(
+            "autoscaling.shared_approvals_path",
+            &self.shared_approvals_path,
+        )?;
+        if self.evaluation_interval_ms < MIN_AUTOSCALING_EVALUATION_INTERVAL_MS
+            || self.evaluation_interval_ms > MAX_AUTOSCALING_EVALUATION_INTERVAL_MS
+        {
+            return Err(ConfigError::InvalidAutoscalingInterval(
+                self.evaluation_interval_ms,
+            ));
+        }
+        if self.deployments.is_empty() {
+            return Err(ConfigError::EmptyAutoscalingDeployments);
+        }
+        for (deployment_id, policy) in &self.deployments {
+            let declared = workers
+                .iter()
+                .filter(|worker| worker.deployment.deployment_id.as_str() == deployment_id)
+                .count();
+            if declared == 0 {
+                return Err(ConfigError::UnknownAutoscalingDeployment(
+                    deployment_id.clone(),
+                ));
+            }
+            policy.validate(deployment_id, declared)?;
+        }
+        Ok(())
+    }
+
+    pub fn policy(&self, deployment_id: &str) -> Option<&DeploymentAutoscalingPolicy> {
+        self.deployments.get(deployment_id)
+    }
+}
+
+/// One deployment's autoscaling policy. `min=max` is the explicit static
+/// posture: all declared workers launch and no scale events ever fire.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentAutoscalingPolicy {
+    pub min_workers: usize,
+    pub max_workers: usize,
+    /// Sustained queue depth that drives a scale-up: at least one running
+    /// worker of the deployment must report `queued_invocations` at or above
+    /// this depth for `scale_up_sustained_polls` consecutive evaluations.
+    pub scale_up_queue_depth: u64,
+    pub scale_up_sustained_polls: u32,
+    /// Hysteresis window: no scale event (either direction) may start within
+    /// this window after a previous scale event, and a scale-down candidate
+    /// must stay fully idle for the whole window.
+    pub scale_down_stabilization_window_ms: u64,
+}
+
+impl DeploymentAutoscalingPolicy {
+    fn validate(&self, deployment: &str, declared: usize) -> Result<(), ConfigError> {
+        if self.min_workers == 0 {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "min_workers must be at least one",
+            });
+        }
+        if self.min_workers > MAX_WORKERS_PER_NODE {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "min_workers exceeds the per-node worker ceiling",
+            });
+        }
+        if self.min_workers > self.max_workers {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "min_workers exceeds max_workers",
+            });
+        }
+        if self.max_workers != declared {
+            return Err(ConfigError::AutoscalingWorkerCountMismatch {
+                deployment: deployment.to_string(),
+                max_workers: self.max_workers,
+                declared,
+            });
+        }
+        if self.scale_up_queue_depth == 0 || self.scale_up_queue_depth > MAX_SCALE_UP_QUEUE_DEPTH {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_queue_depth is outside 1..=100000",
+            });
+        }
+        if self.scale_up_sustained_polls == 0
+            || self.scale_up_sustained_polls > MAX_SCALE_UP_SUSTAINED_POLLS
+        {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_sustained_polls is outside 1..=3600",
+            });
+        }
+        if self.scale_down_stabilization_window_ms < MIN_SCALE_DOWN_STABILIZATION_WINDOW_MS
+            || self.scale_down_stabilization_window_ms > MAX_POLICY_DURATION_MS
+        {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_down_stabilization_window_ms is outside 1000..=86400000",
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether a scale event may start at `now_ms` given the last one.
+    pub fn hysteresis_elapsed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
+        last_scale_event_ms.is_none_or(|last| {
+            now_ms.saturating_sub(last) >= self.scale_down_stabilization_window_ms
+        })
+    }
+}
+
+fn default_autoscaling_evaluation_interval_ms() -> u64 {
+    DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedNodeConfig {
     config: NodeConfig,
@@ -844,6 +998,27 @@ pub enum ConfigError {
     InvalidEnvironmentName(String),
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
+    #[error(
+        "autoscaling.evaluation_interval_ms must be between {MIN_AUTOSCALING_EVALUATION_INTERVAL_MS} and {MAX_AUTOSCALING_EVALUATION_INTERVAL_MS}; got {0}"
+    )]
+    InvalidAutoscalingInterval(u64),
+    #[error("the autoscaling block must configure at least one deployment policy")]
+    EmptyAutoscalingDeployments,
+    #[error("autoscaling policy names unknown deployment {0}")]
+    UnknownAutoscalingDeployment(String),
+    #[error(
+        "autoscaling deployment {deployment} declares max_workers {max_workers} but the node config declares {declared} workers for it"
+    )]
+    AutoscalingWorkerCountMismatch {
+        deployment: String,
+        max_workers: usize,
+        declared: usize,
+    },
+    #[error("autoscaling deployment {deployment}: {reason}")]
+    InvalidAutoscalingPolicy {
+        deployment: String,
+        reason: &'static str,
+    },
     #[error("integer overflow while calculating {0}")]
     BudgetOverflow(&'static str),
 }
@@ -1148,7 +1323,174 @@ mod tests {
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,
+            autoscaling: None,
         }
+    }
+
+    #[test]
+    fn autoscaling_policy_bounds_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+        let mut config = cpu_config(directory.path());
+        config.autoscaling = Some(autoscaling_config("deployment-1", 1, 1));
+        config
+            .validate(&inventory(), &binaries)
+            .expect("a static min=max policy is valid");
+
+        let mut over = cpu_config(directory.path());
+        over.autoscaling = Some(autoscaling_config("deployment-1", 1, 2));
+        assert!(matches!(
+            over.validate(&inventory(), &binaries),
+            Err(ConfigError::AutoscalingWorkerCountMismatch { .. })
+        ));
+
+        let mut unknown = cpu_config(directory.path());
+        unknown.autoscaling = Some(autoscaling_config("other-deployment", 1, 1));
+        assert!(matches!(
+            unknown.validate(&inventory(), &binaries),
+            Err(ConfigError::UnknownAutoscalingDeployment(_))
+        ));
+
+        let mut inverted = cpu_config(directory.path());
+        inverted.autoscaling = Some(autoscaling_config("deployment-1", 2, 2));
+        // min=max=2 exceeds the one declared worker through the count check.
+        assert!(matches!(
+            inverted.validate(&inventory(), &binaries),
+            Err(ConfigError::AutoscalingWorkerCountMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn autoscaling_field_ranges_and_defaults_are_enforced() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+
+        let mut interval = cpu_config(directory.path());
+        let mut autoscaling = autoscaling_config("deployment-1", 1, 1);
+        autoscaling.evaluation_interval_ms = MIN_AUTOSCALING_EVALUATION_INTERVAL_MS - 1;
+        interval.autoscaling = Some(autoscaling);
+        assert!(matches!(
+            interval.validate(&inventory(), &binaries),
+            Err(ConfigError::InvalidAutoscalingInterval(_))
+        ));
+
+        for (field, mutate) in [
+            (
+                "scale_up_queue_depth",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_queue_depth = MAX_SCALE_UP_QUEUE_DEPTH + 1
+                }) as Box<dyn Fn(&mut DeploymentAutoscalingPolicy)>,
+            ),
+            (
+                "scale_up_sustained_polls",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_sustained_polls = 0
+                }),
+            ),
+            (
+                "stabilization window",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_down_stabilization_window_ms =
+                        MIN_SCALE_DOWN_STABILIZATION_WINDOW_MS - 1
+                }),
+            ),
+            (
+                "min_workers",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| policy.min_workers = 0),
+            ),
+        ] {
+            let mut config = cpu_config(directory.path());
+            let mut autoscaling = autoscaling_config("deployment-1", 1, 1);
+            mutate(&mut autoscaling.deployments.get_mut("deployment-1").unwrap());
+            config.autoscaling = Some(autoscaling);
+            assert!(
+                matches!(
+                    config.validate(&inventory(), &binaries),
+                    Err(ConfigError::InvalidAutoscalingPolicy { .. })
+                ),
+                "{field} bound must be enforced"
+            );
+        }
+    }
+
+    #[test]
+    fn autoscaling_toml_parses_with_defaults_and_rejects_unknown_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = format!("{:?}", directory.path().to_string_lossy());
+        let toml = format!(
+            r#"
+schema_version = 2
+node_id = "node-a"
+working_directory = {path}
+runtime_directory = {path}
+host_memory_budget_bytes = 1024
+
+[[workers]]
+worker_id = "cpu-1"
+bind = "127.0.0.1:9470"
+binary = "cpu"
+credential_id = "credential-1"
+bearer_token_env = "IZWI_SUPERVISOR_SECRET_CPU_1"
+
+[workers.assignment]
+backend = "cpu"
+thread_budget = 1
+host_memory_limit_bytes = 512
+
+[workers.deployment]
+deployment_id = "deployment-1"
+public_model = "model-1"
+artifact_revision = "revision-1"
+model_generation = 1
+task = "chat"
+backend = "cpu"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
+models_directory = {path}
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 1048576
+max_context_tokens = 32
+max_output_tokens = 32
+
+[autoscaling]
+shared_approvals_path = "/tmp/shared-approvals"
+
+[autoscaling.deployments.deployment-1]
+min_workers = 1
+max_workers = 1
+scale_up_queue_depth = 4
+scale_up_sustained_polls = 3
+scale_down_stabilization_window_ms = 60000
+"#
+        );
+        let parsed = NodeConfig::parse_bounded(toml.as_bytes()).unwrap();
+        let autoscaling = parsed.autoscaling.expect("autoscaling block parses");
+        assert_eq!(
+            autoscaling.evaluation_interval_ms,
+            DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS
+        );
+        assert_eq!(
+            autoscaling.shared_approvals_path,
+            PathBuf::from("/tmp/shared-approvals")
+        );
+        let policy = autoscaling.policy("deployment-1").unwrap();
+        assert_eq!(policy.min_workers, 1);
+        assert_eq!(policy.scale_up_queue_depth, 4);
+
+        let unknown_field = toml.replace(
+            "scale_down_stabilization_window_ms = 60000",
+            "scale_down_stabilization_window_ms = 60000\nunknown_policy_field = true",
+        );
+        assert!(matches!(
+            NodeConfig::parse_bounded(unknown_field.as_bytes()),
+            Err(ConfigError::Toml(_))
+        ));
     }
 
     #[test]
@@ -1190,6 +1532,27 @@ mod tests {
                 supported_backends: vec![BackendKind::Cpu],
             },
         )])
+    }
+
+    fn autoscaling_config(
+        deployment: &str,
+        min_workers: usize,
+        max_workers: usize,
+    ) -> AutoscalingConfig {
+        AutoscalingConfig {
+            shared_approvals_path: PathBuf::from("/tmp/shared-approvals"),
+            evaluation_interval_ms: DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS,
+            deployments: BTreeMap::from([(
+                deployment.to_string(),
+                DeploymentAutoscalingPolicy {
+                    min_workers,
+                    max_workers,
+                    scale_up_queue_depth: 4,
+                    scale_up_sustained_polls: 2,
+                    scale_down_stabilization_window_ms: 60_000,
+                },
+            )]),
+        }
     }
 
     #[test]

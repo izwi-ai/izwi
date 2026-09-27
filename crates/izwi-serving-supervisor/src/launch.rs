@@ -535,6 +535,7 @@ mod tests {
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
+            autoscaling: None,
         }
     }
 

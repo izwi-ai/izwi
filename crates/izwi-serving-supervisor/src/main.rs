@@ -1,13 +1,17 @@
 use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
-    BackendKind, DeviceId, IncarnationId, ServiceBearerToken, ServiceCredentials, WorkerId,
+    BackendKind, DeploymentId, DeviceId, IncarnationId, ServiceBearerToken, ServiceCredentials,
+    WorkerId,
+};
+use izwi_serving_supervisor::autoscale::{
+    self, Autoscaler, DeploymentObservation, ResourceLedger, ScaleDecision, WorkerSignals,
 };
 use izwi_serving_supervisor::rollout::{self, RolloutPhase};
 use izwi_serving_supervisor::{
     build_child_launch_spec, BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory,
     LockNamespace, MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, RestartController,
     RestartDecision, ShutdownPolicy, SupervisedWorker, ValidatedNodeConfig, WorkerBinaryFlavor,
-    WorkerLockPaths, MAX_NODE_CONFIG_BYTES,
+    WorkerConfig, WorkerLockPaths, MAX_NODE_CONFIG_BYTES,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -139,6 +143,12 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     // DS6: rollout preparation runs under the supervisor lease so state
     // staging cannot race another supervisor. A fresh start without a plan
     // must reconcile any persisted rollout state fail-closed.
+    // DS7: autoscaling and coordinated rollout are mutually exclusive in one
+    // supervisor run — both own the shared approvals view. The check must
+    // precede rollout preparation so a conflicting plan never stages state.
+    if options.rollout_plan.is_some() && node.config().autoscaling.is_some() {
+        return Err(SupervisorError::RolloutAutoscalingConflict);
+    }
     let mut rollout = match options.rollout_plan.as_ref() {
         Some(plan_path) => Some(prepare_rollout(
             plan_path, &node, &inventory, &binaries, &options,
@@ -151,6 +161,62 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     let resume_draining_old = rollout
         .as_ref()
         .is_some_and(|prepared| prepared.state.phase == RolloutPhase::DrainingOld);
+
+    let mut autoscaler = Autoscaler::from_config(&node);
+    let mut ledger = ResourceLedger::new(&inventory, &node);
+    if let Some(scaler) = autoscaler.as_mut() {
+        // Partition slots: the min set keeps the static posture
+        // (`autoscale: None`); every other declared worker of an autoscaled
+        // deployment becomes a standby that only a scale-up decision starts.
+        for slot in slots.iter_mut() {
+            let Some(state) = scaler.deployment_of(&slot.worker_id) else {
+                continue;
+            };
+            if state.core_set().contains(&slot.worker_id) {
+                continue;
+            }
+            slot.autoscale = Some(AutoscaleSlotState {
+                deployment: state.deployment_id().clone(),
+                phase: AutoscalePhase::Standby,
+            });
+        }
+        // Reconcile the shared view to the min set before any launch: lines
+        // for this node's non-running autoscaled workers must not stay
+        // approved, or the gateway would route to endpoints that do not exist.
+        let approvals_path = node
+            .config()
+            .autoscaling
+            .as_ref()
+            .expect("the autoscaler exists only with the autoscaling block")
+            .shared_approvals_path
+            .clone();
+        let desired: Vec<&WorkerConfig> = scaler
+            .deployments()
+            .values()
+            .flat_map(|state| state.core_set().iter())
+            .filter_map(|worker_id| node.worker(worker_id))
+            .collect();
+        autoscale::reconcile_min_set(&approvals_path, &node, &desired)
+            .map_err(|error| SupervisorError::Autoscale(error.to_string()))?;
+        eprintln!(
+            "autoscaling: reconciled {} to the min set of {} autoscaled deployment(s)",
+            approvals_path.display(),
+            scaler.deployments().len()
+        );
+    }
+    if let Some(canary_id) = options.canary_worker_id.as_ref() {
+        if slots.iter().any(|slot| {
+            &slot.worker_id == canary_id
+                && slot
+                    .autoscale
+                    .as_ref()
+                    .is_some_and(|state| state.phase == AutoscalePhase::Standby)
+        }) {
+            return Err(SupervisorError::Autoscale(format!(
+                "canary worker {canary_id} is an autoscaling standby; canaries must belong to the startup min set"
+            )));
+        }
+    }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -195,6 +261,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             &mut metrics,
         )
         .await;
+        note_slot_launched(&mut autoscaler, &slots[canary_index]);
         if slots[canary_index].process.is_none() {
             eprintln!(
                 "canary worker {} failed to reach readiness; aborting rollout",
@@ -231,6 +298,14 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         {
             continue;
         }
+        // DS7: autoscaling standbys wait for a scale-up decision.
+        if slot
+            .autoscale
+            .as_ref()
+            .is_some_and(|state| state.phase == AutoscalePhase::Standby)
+        {
+            continue;
+        }
         launch_slot(
             &node,
             &locks,
@@ -241,6 +316,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             &mut metrics,
         )
         .await;
+        note_slot_launched(&mut autoscaler, slot);
     }
 
     // DS6: run the rollout state machine to commit or abort. After a commit
@@ -274,6 +350,10 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
 
     let mut poll = tokio::time::interval(SUPERVISION_POLL_INTERVAL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_autoscale_eval = Instant::now()
+        + autoscaler
+            .as_ref()
+            .map_or(Duration::ZERO, |scaler| scaler.evaluation_interval());
     while !*shutdown_rx.borrow() {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -293,8 +373,14 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                 }
             }
             _ = poll.tick() => {
-                observe_exits(&mut slots, started_at, &mut metrics);
-                observe_exits(&mut replacement_slots, started_at, &mut metrics);
+                observe_exits(
+                    &mut slots,
+                    autoscaler.as_mut(),
+                    &mut ledger,
+                    started_at,
+                    &mut metrics,
+                );
+                observe_exits(&mut replacement_slots, None, &mut ledger, started_at, &mut metrics);
                 if let Some(slot) = next_restart_slot(&mut slots) {
                     launch_slot(
                         &node,
@@ -305,6 +391,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                         started_at,
                         &mut metrics,
                     ).await;
+                    note_slot_launched(&mut autoscaler, slot);
                 }
                 if !replacement_slots.is_empty() {
                     if let Some(target) = target_node.as_ref() {
@@ -319,6 +406,24 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                                 &mut metrics,
                             ).await;
                         }
+                    }
+                }
+                // DS7: one autoscaling evaluation pass per configured interval.
+                if Instant::now() >= next_autoscale_eval {
+                    if let Some(scaler) = autoscaler.as_mut() {
+                        next_autoscale_eval = Instant::now() + scaler.evaluation_interval();
+                        run_autoscale_tick(
+                            scaler,
+                            &node,
+                            &mut ledger,
+                            &mut slots,
+                            &locks,
+                            &inherited_environment,
+                            &mut shutdown_rx,
+                            started_at,
+                            &mut metrics,
+                        )
+                        .await;
                     }
                 }
             }
@@ -907,6 +1012,27 @@ fn resolve_replacement_slots(
         .collect()
 }
 
+/// Lifecycle phase of an autoscaling slot (DS7). Core (min-set) workers keep
+/// `autoscale: None` and behave exactly like static workers; only standby
+/// replicas and scale-event transitions carry state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoscalePhase {
+    /// Declared standby: not launched; only a scale-up decision starts it.
+    Standby,
+    /// Scale-up launched the process; the approvals line is not yet published.
+    Admitting,
+    /// Running and approved in the shared approvals view.
+    Active,
+    /// Scale-down in progress: unapproved, admission stopped, draining.
+    Draining,
+}
+
+#[derive(Debug, Clone)]
+struct AutoscaleSlotState {
+    deployment: DeploymentId,
+    phase: AutoscalePhase,
+}
+
 struct WorkerSlot {
     worker_id: WorkerId,
     secret_environment_name: String,
@@ -916,6 +1042,7 @@ struct WorkerSlot {
     process_started_at: Option<Instant>,
     restart_at: Option<Instant>,
     exit_observation_failed: bool,
+    autoscale: Option<AutoscaleSlotState>,
 }
 
 #[derive(Debug, Default)]
@@ -928,10 +1055,21 @@ struct SupervisorMetrics {
     unexpected_exits: u64,
     exit_observation_failures: u64,
     stop_failures: u64,
+    autoscale_ups: u64,
+    autoscale_downs: u64,
 }
 
 impl WorkerSlot {
     fn restart_due(&self) -> bool {
+        if self
+            .autoscale
+            .as_ref()
+            .is_some_and(|state| state.phase != AutoscalePhase::Active)
+        {
+            // Standbys launch only via scale-up decisions; admitting and
+            // draining slots are mid-transition and never auto-restart.
+            return false;
+        }
         self.process.is_none()
             && !self.restart.is_quarantined()
             && self
@@ -1007,6 +1145,7 @@ fn resolve_slot(
         process_started_at: None,
         restart_at: Some(Instant::now()),
         exit_observation_failed: false,
+        autoscale: None,
     })
 }
 
@@ -1032,6 +1171,24 @@ fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
             worker.max_active_invocations,
         ));
     }
+    if let Some(autoscaling) = node.config().autoscaling.as_ref() {
+        output.push_line(&format!(
+            "autoscaling enabled deployments={} evaluation_interval_ms={} shared_approvals={}",
+            autoscaling.deployments.len(),
+            autoscaling.evaluation_interval_ms,
+            autoscaling.shared_approvals_path.display(),
+        ));
+        for (deployment, policy) in &autoscaling.deployments {
+            output.push_line(&format!(
+                "autoscale deployment={deployment} min_workers={} max_workers={} scale_up_queue_depth={} scale_up_sustained_polls={} scale_down_stabilization_window_ms={}",
+                policy.min_workers,
+                policy.max_workers,
+                policy.scale_up_queue_depth,
+                policy.scale_up_sustained_polls,
+                policy.scale_down_stabilization_window_ms,
+            ));
+        }
+    }
     output.finish()
 }
 
@@ -1052,7 +1209,7 @@ fn runtime_diagnostic(
         .filter(|slot| slot.process.is_none() && slot.restart_at.is_some())
         .count();
     output.push_line(&format!(
-        "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} stop_failures_total={}",
+        "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} stop_failures_total={} autoscale_ups_total={} autoscale_downs_total={}",
         env!("CARGO_PKG_VERSION"),
         node.config().node_id,
         started_at.elapsed().as_millis(),
@@ -1068,19 +1225,48 @@ fn runtime_diagnostic(
         metrics.unexpected_exits,
         metrics.exit_observation_failures,
         metrics.stop_failures,
+        metrics.autoscale_ups,
+        metrics.autoscale_downs,
     ));
+    let mut autoscale_summary: BTreeMap<String, [usize; 3]> = BTreeMap::new();
+    for slot in slots {
+        if let Some(state) = slot.autoscale.as_ref() {
+            let entry = autoscale_summary
+                .entry(state.deployment.to_string())
+                .or_default();
+            match state.phase {
+                AutoscalePhase::Standby => entry[1] += 1,
+                AutoscalePhase::Admitting | AutoscalePhase::Active => entry[0] += 1,
+                AutoscalePhase::Draining => entry[2] += 1,
+            }
+        }
+    }
+    for (deployment, [running_capacity, standby, draining]) in autoscale_summary {
+        output.push_line(&format!(
+            "autoscale deployment={deployment} running={running_capacity} standby={standby} draining={draining}"
+        ));
+    }
     for slot in slots {
         let configured = node
             .worker(&slot.worker_id)
             .expect("worker slots are derived from validated configuration");
         let (state, process_id, incarnation, assignment_source) =
             if let Some(process) = &slot.process {
+                let transition_state = || {
+                    slot.autoscale
+                        .as_ref()
+                        .and_then(|autoscale| match autoscale.phase {
+                            AutoscalePhase::Admitting => Some("admitting"),
+                            AutoscalePhase::Draining => Some("draining"),
+                            _ => None,
+                        })
+                };
                 (
-                    if slot.exit_observation_failed {
+                    transition_state().unwrap_or(if slot.exit_observation_failed {
                         "observation-uncertain"
                     } else {
                         "ready"
-                    },
+                    }),
                     process
                         .process_id()
                         .map_or_else(|| "unavailable".to_string(), |id| id.to_string()),
@@ -1090,6 +1276,17 @@ fn runtime_diagnostic(
             } else if slot.restart.is_quarantined() {
                 (
                     "quarantined",
+                    "none".to_string(),
+                    "none".to_string(),
+                    "configured",
+                )
+            } else if slot
+                .autoscale
+                .as_ref()
+                .is_some_and(|state| state.phase == AutoscalePhase::Standby)
+            {
+                (
+                    "standby",
                     "none".to_string(),
                     "none".to_string(),
                     "configured",
@@ -1294,6 +1491,8 @@ async fn launch_slot(
 
 fn observe_exits(
     slots: &mut [WorkerSlot],
+    mut autoscaler: Option<&mut Autoscaler>,
+    ledger: &mut ResourceLedger,
     supervisor_started_at: Instant,
     metrics: &mut SupervisorMetrics,
 ) {
@@ -1303,12 +1502,45 @@ fn observe_exits(
         };
         match process.try_wait() {
             Ok(Some(status)) => {
+                if slot
+                    .autoscale
+                    .as_ref()
+                    .is_some_and(|state| state.phase == AutoscalePhase::Draining)
+                {
+                    // Expected completion of a scale-down: admission had
+                    // stopped, the worker finished its bounded shutdown on
+                    // its own, and the slot returns to the standby pool.
+                    slot.process = None;
+                    slot.process_started_at = None;
+                    slot.exit_observation_failed = false;
+                    if let Some(state) = slot.autoscale.as_mut() {
+                        state.phase = AutoscalePhase::Standby;
+                    }
+                    ledger.release(&slot.worker_id);
+                    if let Some(state) = autoscaler
+                        .as_mut()
+                        .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
+                    {
+                        state.note_stopped();
+                    }
+                    eprintln!(
+                        "autoscaling: draining worker {} exited cleanly ({status}); slot returned to standby",
+                        slot.worker_id
+                    );
+                    continue;
+                }
                 metrics.unexpected_exits = metrics.unexpected_exits.saturating_add(1);
                 eprintln!("worker {} exited with {status}", slot.worker_id);
                 let uptime = slot
                     .process_started_at
                     .map_or(Duration::ZERO, |started| started.elapsed());
                 slot.record_failure(supervisor_started_at, uptime, metrics);
+                if let Some(state) = autoscaler
+                    .as_mut()
+                    .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
+                {
+                    state.note_worker_lost(&slot.worker_id);
+                }
             }
             Ok(None) => slot.exit_observation_failed = false,
             Err(error) => {
@@ -1323,6 +1555,339 @@ fn observe_exits(
             }
         }
     }
+}
+
+/// Driver confirmation after any successful launch of a slot that belongs to
+/// an autoscaled deployment (startup min set, canary ordering, or crash
+/// restart): the state machine counts it toward running capacity.
+fn note_slot_launched(autoscaler: &mut Option<Autoscaler>, slot: &WorkerSlot) {
+    if slot.process.is_none() {
+        return;
+    }
+    if let Some(state) = autoscaler
+        .as_mut()
+        .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
+    {
+        state.note_launched(&slot.worker_id);
+    }
+}
+
+/// One DS7 autoscaling evaluation pass: complete pending admissions, poll
+/// the running workers of each deployment, then act on at most one scale
+/// decision per deployment. Every step is conservative — a failed approvals
+/// write, a failed status poll, or a launch in flight freezes that
+/// deployment's decisions until the state is consistent again.
+#[allow(clippy::too_many_arguments)]
+async fn run_autoscale_tick(
+    autoscaler: &mut Autoscaler,
+    node: &ValidatedNodeConfig,
+    ledger: &mut ResourceLedger,
+    slots: &mut [WorkerSlot],
+    locks: &LockNamespace,
+    inherited_environment: &BTreeMap<OsString, OsString>,
+    shutdown: &mut watch::Receiver<bool>,
+    supervisor_started_at: Instant,
+    metrics: &mut SupervisorMetrics,
+) {
+    let now_ms = now_ms();
+    let Some(autoscaling) = node.config().autoscaling.as_ref() else {
+        return;
+    };
+    let approvals_path = autoscaling.shared_approvals_path.clone();
+    let deployment_ids: Vec<DeploymentId> = autoscaler.deployments().keys().cloned().collect();
+    for deployment_id in deployment_ids {
+        if !admit_pending_workers(
+            autoscaler,
+            &approvals_path,
+            node,
+            &deployment_id,
+            slots,
+            now_ms,
+            metrics,
+        ) {
+            continue;
+        }
+        let Some(observation) = poll_deployment(
+            autoscaler,
+            slots,
+            &deployment_id,
+            autoscaler.evaluation_interval(),
+        )
+        .await
+        else {
+            continue;
+        };
+        let decision = autoscaler
+            .deployment_mut(&deployment_id)
+            .expect("deployment ids come from the autoscaler")
+            .evaluate(now_ms, &observation);
+        match decision {
+            ScaleDecision::NoAction => {}
+            ScaleDecision::ScaleUp { worker } => {
+                scale_up(
+                    node,
+                    &deployment_id,
+                    ledger,
+                    slots,
+                    locks,
+                    inherited_environment,
+                    shutdown,
+                    supervisor_started_at,
+                    metrics,
+                    worker,
+                )
+                .await;
+            }
+            ScaleDecision::MarkDraining { worker } => {
+                mark_draining(
+                    autoscaler,
+                    node,
+                    &deployment_id,
+                    &approvals_path,
+                    slots,
+                    now_ms,
+                    metrics,
+                    worker,
+                )
+                .await;
+            }
+            ScaleDecision::StopDrained { worker } => {
+                stop_drained(
+                    autoscaler,
+                    node,
+                    &deployment_id,
+                    ledger,
+                    slots,
+                    metrics,
+                    worker,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Publishes approvals lines for slots that finished scale-up readiness but
+/// are not yet admitted. Returns false while any publication is outstanding
+/// so the deployment defers further decisions.
+fn admit_pending_workers(
+    autoscaler: &mut Autoscaler,
+    approvals_path: &Path,
+    node: &ValidatedNodeConfig,
+    deployment_id: &DeploymentId,
+    slots: &mut [WorkerSlot],
+    now_ms: u64,
+    metrics: &mut SupervisorMetrics,
+) -> bool {
+    let pending: Vec<WorkerId> = slots
+        .iter()
+        .filter(|slot| {
+            slot.autoscale.as_ref().is_some_and(|state| {
+                &state.deployment == deployment_id && state.phase == AutoscalePhase::Admitting
+            })
+        })
+        .map(|slot| slot.worker_id.clone())
+        .collect();
+    let mut all_admitted = true;
+    for worker in pending {
+        match autoscale::add_worker(approvals_path, node, &worker) {
+            Ok(()) => {
+                if let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) {
+                    if let Some(state) = slot.autoscale.as_mut() {
+                        state.phase = AutoscalePhase::Active;
+                    }
+                }
+                if let Some(state) = autoscaler.deployment_mut(deployment_id) {
+                    state.note_scaled_up(now_ms, &worker);
+                }
+                metrics.autoscale_ups = metrics.autoscale_ups.saturating_add(1);
+                eprintln!("autoscaling: worker {worker} is ready and approved; scale-up complete");
+            }
+            Err(error) => {
+                eprintln!(
+                    "autoscaling: approvals publish for worker {worker} failed: {error}; retrying next evaluation"
+                );
+                all_admitted = false;
+            }
+        }
+    }
+    all_admitted
+}
+
+/// Polls the status of every running worker of a deployment. `None` means
+/// the deployment is not fully observable this tick (a launch in flight, a
+/// restart pending, a failed or timed-out poll) and must make no decisions.
+async fn poll_deployment(
+    autoscaler: &Autoscaler,
+    slots: &[WorkerSlot],
+    deployment_id: &DeploymentId,
+    poll_budget: Duration,
+) -> Option<DeploymentObservation> {
+    let state = autoscaler.deployment(deployment_id)?;
+    let mut observation = DeploymentObservation::default();
+    for worker in state.active() {
+        let slot = slots.iter().find(|slot| &slot.worker_id == worker)?;
+        let process = slot.process.as_ref()?;
+        let status = match tokio::time::timeout(poll_budget, process.client().status()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                eprintln!("autoscaling: worker {worker} status poll failed: {error}");
+                return None;
+            }
+            Err(_) => {
+                eprintln!("autoscaling: worker {worker} status poll timed out");
+                return None;
+            }
+        };
+        observation.signals.insert(
+            worker.clone(),
+            WorkerSignals {
+                queued_invocations: u64::from(status.capacity.queued_invocations),
+                active_invocations: status.capacity.active_invocations,
+                reserved_sessions: status.capacity.reserved_sessions,
+            },
+        );
+    }
+    Some(observation)
+}
+
+/// Scale-up: reserve the candidate's budgets, then launch it through the
+/// existing launch/readiness path. Readiness is awaited inline (as the
+/// startup and canary paths do); the approvals line is published on the
+/// next evaluation pass (Admitting phase).
+#[allow(clippy::too_many_arguments)]
+async fn scale_up(
+    node: &ValidatedNodeConfig,
+    deployment_id: &DeploymentId,
+    ledger: &mut ResourceLedger,
+    slots: &mut [WorkerSlot],
+    locks: &LockNamespace,
+    inherited_environment: &BTreeMap<OsString, OsString>,
+    shutdown: &mut watch::Receiver<bool>,
+    supervisor_started_at: Instant,
+    metrics: &mut SupervisorMetrics,
+    worker: WorkerId,
+) {
+    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
+        eprintln!("autoscaling: scale-up candidate {worker} has no slot; abandoned");
+        return;
+    };
+    if let Err(rejection) = ledger.reserve(&worker) {
+        eprintln!("autoscaling: {rejection}");
+        return;
+    }
+    slot.restart_at = None;
+    slot.autoscale = Some(AutoscaleSlotState {
+        deployment: deployment_id.clone(),
+        phase: AutoscalePhase::Admitting,
+    });
+    eprintln!("autoscaling: deployment {deployment_id} scaled up; launching standby {worker}");
+    launch_slot(
+        node,
+        locks,
+        inherited_environment,
+        slot,
+        shutdown,
+        supervisor_started_at,
+        metrics,
+    )
+    .await;
+    if slot.process.is_none() {
+        ledger.release(&worker);
+        slot.autoscale = Some(AutoscaleSlotState {
+            deployment: deployment_id.clone(),
+            phase: AutoscalePhase::Standby,
+        });
+        eprintln!("autoscaling: standby {worker} failed its launch; it remains standby");
+    }
+}
+
+/// Scale-down step 1: remove the worker's approvals line (the gateway stops
+/// routing new work after its view refresh) and close the ownership pipe so
+/// the worker stops admission immediately, covering the gateway's refresh
+/// TTL gap.
+#[allow(clippy::too_many_arguments)]
+async fn mark_draining(
+    autoscaler: &mut Autoscaler,
+    node: &ValidatedNodeConfig,
+    deployment_id: &DeploymentId,
+    approvals_path: &Path,
+    slots: &mut [WorkerSlot],
+    now_ms: u64,
+    metrics: &mut SupervisorMetrics,
+    worker: WorkerId,
+) {
+    if let Err(error) = autoscale::remove_worker(approvals_path, node, &worker) {
+        eprintln!(
+            "autoscaling: could not unapprove worker {worker}: {error}; retrying next evaluation"
+        );
+        return;
+    }
+    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
+        return;
+    };
+    if let Some(process) = slot.process.as_mut() {
+        if let Err(error) = process.begin_drain().await {
+            eprintln!("autoscaling: worker {worker} admission stop failed: {error}");
+        }
+    }
+    slot.autoscale = Some(AutoscaleSlotState {
+        deployment: deployment_id.clone(),
+        phase: AutoscalePhase::Draining,
+    });
+    autoscaler
+        .deployment_mut(deployment_id)
+        .expect("deployment ids come from the autoscaler")
+        .note_draining(now_ms, &worker);
+    metrics.autoscale_downs = metrics.autoscale_downs.saturating_add(1);
+    eprintln!(
+        "autoscaling: worker {worker} marked draining; waiting for zero active work before stopping it"
+    );
+}
+
+/// Scale-down step 2: the worker is fully quiet — stop it via the existing
+/// drain_and_stop path (mostly-immediate cooperative stop) and return the
+/// slot to the standby pool.
+async fn stop_drained(
+    autoscaler: &mut Autoscaler,
+    node: &ValidatedNodeConfig,
+    deployment_id: &DeploymentId,
+    ledger: &mut ResourceLedger,
+    slots: &mut [WorkerSlot],
+    metrics: &mut SupervisorMetrics,
+    worker: WorkerId,
+) {
+    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
+        return;
+    };
+    if let Some(process) = slot.process.take() {
+        match process
+            .drain_and_stop(&node.config().shutdown.clone())
+            .await
+        {
+            Ok(report) => eprintln!(
+                "autoscaling: worker {worker} stopped with {:?} ({})",
+                report.outcome, report.exit_status
+            ),
+            Err(error) => {
+                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
+                eprintln!("autoscaling: worker {worker} stop failed: {error}");
+            }
+        }
+    }
+    slot.process_started_at = None;
+    slot.autoscale = Some(AutoscaleSlotState {
+        deployment: deployment_id.clone(),
+        phase: AutoscalePhase::Standby,
+    });
+    ledger.release(&worker);
+    autoscaler
+        .deployment_mut(deployment_id)
+        .expect("deployment ids come from the autoscaler")
+        .note_stopped();
+    eprintln!(
+        "autoscaling: worker {worker} drained and stopped; the slot returned to the standby pool"
+    );
 }
 
 fn next_restart_slot(slots: &mut [WorkerSlot]) -> Option<&mut WorkerSlot> {
@@ -1800,6 +2365,12 @@ enum SupervisorError {
     RolloutFenceContended,
     #[error("no rollout state found to abort")]
     RolloutNothingToAbort,
+    #[error(
+        "autoscaling and coordinated rollout are mutually exclusive in one supervisor run; disable one before using the other"
+    )]
+    RolloutAutoscalingConflict,
+    #[error("autoscaling: {0}")]
+    Autoscale(String),
 }
 
 #[cfg(test)]
@@ -1870,6 +2441,7 @@ mod tests {
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
+            autoscaling: None,
         }
     }
 
@@ -1989,6 +2561,7 @@ mod tests {
             process_started_at: None,
             restart_at: Some(Instant::now()),
             exit_observation_failed: false,
+            autoscale: None,
         };
         let metrics = SupervisorMetrics {
             launch_attempts: 2,
