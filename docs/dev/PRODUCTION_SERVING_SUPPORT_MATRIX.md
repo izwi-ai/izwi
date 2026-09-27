@@ -83,6 +83,30 @@ pre-rollout approvals byte-identically and leave the old generation serving
 un-sent); rollback after `committed` is a new rollout plan with a fresh
 generation. Not a production soak or hardware-capacity certificate.
 
+## Signal-driven worker autoscaling (DS7)
+
+The supervisor can scale one deployment's worker count within explicit
+declared bounds: out on sustained queue depth, in after a stabilized idle
+window with drain (ADR 0007). It is supervisor-managed — no Kubernetes, no
+external scaler — and fleet-profile only: the supervisor owns the v1 pinned
+approval lines of its autoscaled deployments in the gateway's shared
+approvals file, and the gateway adopts the add/remove at runtime with no
+gateway-side change. Scale decisions respect the node resource ledger
+(declared host memory, CPU threads, device exclusivity; overcommitting
+scale-ups are rejected with diagnostics, never launched), per-deployment
+hysteresis, and drain-before-stop (never below the declared min set). Design
+and evidence: [ADR 0007](adr/0007-signal-driven-worker-autoscaling.md);
+runbook section "Signal-driven worker autoscaling (DS7)".
+
+| Scope | Status | Evidence |
+|---|---|---|
+| One supervisor, one autoscaled deployment, CPU lane | Supported on the process-evidenced lane (T38) | Policy unit tests (signals → decisions, hysteresis, bounds, ledger overcommit, view add/remove/reconciliation) in `crates/izwi-serving-supervisor/src/autoscale.rs`; process rig `tests/autoscale.rs` — sustained queue depth scales 1→2 with the approvals line published only after readiness, the idle window scales 2→1 with unapprove → admission stop → drain observed and the core set untouched, the disabled configuration launches every declared worker and never touches the shared view, `--validate-only` reports the policy, and `--rollout-plan` is refused while autoscaling is on |
+| One supervisor, multiple autoscaled deployments | Not run — the policy supports a map of deployments and the state machine is per-deployment, but the process rig exercises one deployment | Recorded `not run`, never `passed` |
+| Metal / CUDA autoscaled lanes | Not run — scale-out on exclusive-device lanes requires distinct declared devices (config validation already enforces exclusivity); no multi-device autoscale rig exists | Recorded `not run`, never `passed` |
+
+Not a production soak or hardware-capacity certificate; scale state is
+in-memory by design (a supervisor restart returns to the declared min set).
+
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent as recorded in

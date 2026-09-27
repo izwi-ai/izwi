@@ -38,6 +38,7 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
 | DS4 Hierarchical KV offload | Done | DS4.1–DS4.5 closed: design note + ADR 0004, host pool substrate, demotion, promotion, counters, engine-level acceptance, CPU+Metal benchmark evidence (CUDA `not run`) |
 | DS5 Fleet authority | Done | DS5.1 PostgreSQL validated (URL connect path, dialect-aware migrator, execution suites in CI; the PG claim race needed a worker-keyed advisory lock), DS5.2 two-gateway/two-worker fleet rig (SQLite + PG lanes: T07/T20/P8.1/steering/crash+TTL/DINV-06 outage), DS5.3 explicit fleet posture + claim-TTL env + maintenance sweep, DS5.4 T25 generation-fence process evidence, DS5.5 ADR 0005 + docs; MySQL recorded unvalidated (error 1170 TEXT-key burden) |
 | DS6 Coordinated blue-green rollout | Done | Declarative rollout plan + supervisor state machine (`43d2e7bb`/`3ec044e3`), shared approval format as a protocol contract (`bf30273a`), gateway per-pool DINV-07 eligibility rule (`c539e914`) with runtime approvals-view adoption (`0ec7b5c5`), supervisor process tests + T37 gateway zero-dropped-requests rig (`7fd649eb`/`d9e5abe0`), ADR 0006 + runbook/support-matrix/delivery docs |
+| DS7 Signal-driven worker autoscaling | Done | Validated per-deployment policy config + pre-declared standby replicas (`111fcfb4`), supervisor scale up/down wiring with ResourceLedger + approvals view editor (same commit), supervisor-only process rig T38: 1→2 on sustained queue depth, 2→1 on the idle window with drain, disabled-config static, rollout conflict refused (`4702d08a`), ADR 0007 + runbook/support-matrix/delivery docs |
 
 ## Supported deployment profiles
 
@@ -120,6 +121,27 @@ proofs that the draining predecessor receives nothing after cutover);
 protocol round-trip tests for the shared approval format; izwi-server lib +
 supervisor suites green, clippy/fmt clean on touched code.
 
+DS7 additions (verified 2026-09-27, commits `111fcfb4`…`4702d08a`): a new
+supervisor `autoscale` module holds the process-free primitives — per-
+deployment scale state machine (signals → decisions under bounds and shared
+hysteresis), `ResourceLedger` (reserved declared budgets of supervised
+slots; host-memory, CPU-thread, and device-exclusivity rejections with
+actionable diagnostics), and the shared approvals view editor (v1 pinned
+identity add/remove, atomic writes under a sidecar lock, verbatim
+preservation of unrelated lines, fail-closed standalone-line collision) —
+with unit tests for signals→decisions, hysteresis, bounds, ledger
+overcommit, and view idempotence/reconciliation. Process evidence (T38,
+`tests/autoscale.rs`): the real supervisor binary supervises fake CPU
+workers whose status documents the test rewrites per request — sustained
+queue depth scales 1→2 (standby launched through the readiness path, v1
+line published only after readiness), the idle window scales 2→1
+(unapprove → admission stop → drain → clean exit, core set untouched, no
+scale-down inside the stabilization window), the disabled configuration
+launches every declared worker and never touches the view, `--validate-only`
+reports the parsed policy, and `--rollout-plan` is refused while autoscaling
+is on. Full supervisor suite green (86 tests incl. all DS6 rigs), clippy
+clean on new code, fmt clean.
+
 ## Tests not executed and why
 
 - CUDA/Metal *inference*, multi-GPU, multi-machine, soak, overload matrices:
@@ -186,12 +208,11 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS6 is complete: one operator command (`--rollout-plan`) performs a
-deployment-generation cutover with automatic abort — the supervisor computes
-atomic marker-free approvals views, the gateway adopts them at runtime under
-a structural DINV-07 rule (never two eligible generations, never zero), the
-state machine persists resume-after-crash state, and both promote and abort
-paths are proven with real processes (ADR 0006). Next per the plan: DS7
-(signal-driven worker autoscaling), with CUDA lanes staying `not run` until
-hardware evidence exists and the public realtime-voice envelope translation
-still deferred with the voice surface.
+DS7 is complete: the supervisor is a capacity manager within explicit bounds
+— pre-declared standby replicas, sustained-queue-depth scale-up, stabilized
+idle-window scale-down with drain, ledger-respecting decisions, and shared
+hysteresis — off by default and proven with real processes (ADR 0007, T38).
+Next per the plan: DS9 (API completeness: `usage.cached_tokens`, grammar-
+constrained `response_format`, logprobs, MTP generalization), with DS8
+(vLLM engine lane) still behind its decision-gate ADR. CUDA lanes stay
+`not run` until hardware evidence exists.

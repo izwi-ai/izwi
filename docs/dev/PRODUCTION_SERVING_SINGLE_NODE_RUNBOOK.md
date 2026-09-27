@@ -743,6 +743,84 @@ and one gateway over one shared approvals file, and hand-editing the shared
 approvals file is still possible — it now has runtime effect, so leave the
 file to the rollout command.
 
+### Signal-driven worker autoscaling (DS7)
+
+The supervisor can act as a capacity manager for one deployment on its node:
+scale out on sustained queue depth, scale in after a stabilized idle window
+(ADR 0007). It is supervisor-managed — no Kubernetes, no external scaler —
+and fleet-profile only: the supervisor owns the v1 pinned approval lines of
+its autoscaled deployments in the gateway's shared approvals file.
+
+Autoscaling is off unless the node config carries an `[autoscaling]` block.
+All workers of an autoscaled deployment are declared in the node config as
+usual (own id, bind, assignment, budgets); `max_workers` names the full
+declared replica set and `min_workers` the subset launched at startup. The
+rest are standbys that only a scale-up decision starts:
+
+```toml
+[autoscaling]
+shared_approvals_path = "/etc/izwi/shared-approvals"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
+# evaluation_interval_ms = 1000                       # 100–60000, default 1000
+
+[autoscaling.deployments.chat-prod]
+min_workers = 1                              # launched at startup, never scaled down
+max_workers = 3                              # must equal the declared worker count for the deployment
+scale_up_queue_depth = 4                     # a running worker reporting queued >= this depth...
+scale_up_sustained_polls = 3                 # ...for this many consecutive evaluations
+scale_down_stabilization_window_ms = 60000   # 1000–86400000; hysteresis + idle window
+```
+
+Startup behavior with the block present: the supervisor reconciles the shared
+approvals view to the min set (standby lines are removed so the gateway never
+routes to a not-running endpoint; unrelated and foreign-node lines pass
+through untouched), launches exactly the min set, and evaluates every
+`evaluation_interval_ms` thereafter.
+
+Scale semantics:
+
+- **Scale-up** requires the deployment below `max_workers`, a standby
+  available, hysteresis clear, and a running worker at or above
+  `scale_up_queue_depth` for `scale_up_sustained_polls` consecutive
+  evaluations. The standby launches through the standard launch/readiness
+  path (readiness is awaited inline, like the canary path) and gains its
+  approvals line only after readiness.
+- **Scale-down** requires the deployment above `min_workers`, hysteresis
+  clear, and a non-core worker fully idle (zero queued, zero active, zero
+  reserved sessions) for the whole stabilization window. The worker's line
+  is removed first (the gateway stops routing new work after its view
+  refresh), its control pipe closes immediately (it stops admission without
+  waiting for the gateway TTL), the supervisor waits for zero active work,
+  and only then runs the standard drain/stop. The slot returns to the
+  standby pool; scale-down never touches the startup min set.
+- **Hysteresis** is shared by both directions: no scale event may start
+  within `scale_down_stabilization_window_ms` of the previous scale event.
+- **Budgets** (DS7.3): every scale-up reserves the candidate's declared
+  budgets in the node resource ledger first — host memory, CPU threads,
+  device exclusivity — and a reservation that would overcommit is rejected
+  with a diagnostic instead of launched. Config validation already proves
+  the full declared replica set fits the node, so a rejection means ledger
+  misuse, not reachable config state.
+
+Operate it like the rest of the supervisor:
+
+- `--validate-only` prints the parsed policy; SIGUSR1 diagnostics include an
+  `autoscale deployment=... running=N standby=N draining=N` line per
+  autoscaled deployment plus `autoscale_ups_total`/`autoscale_downs_total`.
+- Decisions freeze (never guess) while a worker is restart-pending, a status
+  poll fails, or an approvals write fails; the affected deployment resumes
+  deciding once observability is whole again.
+- Standbys are ordinary declared workers: they resolve secrets at startup
+  and are covered by the restart controller once activated. A quarantined
+  standby stays standby until an operator clears it.
+- Autoscaling and `--rollout-plan` are mutually exclusive in one supervisor
+  run (both own the shared view). Stop autoscaling by removing the block
+  before rolling; scale state is in-memory by design — a supervisor restart
+  returns to the declared min set and reconciles the view to it.
+- Hand-editing lines for autoscaled deployments of this node is futile (the
+  next reconciliation overwrites them) and a standalone-form line colliding
+  with an autoscaled endpoint fails the view write closed; the fleet
+  profile's v1 pinned form is required.
+
 ## Troubleshooting
 
 | Symptom | Check | Safe response |
