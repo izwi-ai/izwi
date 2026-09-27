@@ -512,10 +512,17 @@ pub enum FinishReason {
     Length,
 }
 
+/// Bounded per-invocation token accounting.
+///
+/// `cached_tokens` (minor 3) reports how many input tokens were served from
+/// the worker's managed prefix cache. It is always a subset of
+/// `input_tokens`; absent means the worker did not measure prefix reuse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -667,6 +674,7 @@ pub struct CancelAttemptResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PROTOCOL_MINOR_VERSION;
     use serde_json::json;
 
     fn id<T: TryFrom<&'static str>>(value: &'static str) -> T
@@ -716,10 +724,11 @@ mod tests {
 
     #[test]
     fn current_version_is_compatible_with_additive_minor_only() {
+        let next_minor = SchemaVersion::new(1, PROTOCOL_MINOR_VERSION + 1);
         assert!(PROTOCOL_V1.is_supported_by(PROTOCOL_V1));
-        assert!(PROTOCOL_V1.is_supported_by(SchemaVersion::new(1, 3)));
+        assert!(PROTOCOL_V1.is_supported_by(next_minor));
         assert!(SchemaVersion::new(1, 0).is_supported_by(PROTOCOL_V1));
-        assert!(!SchemaVersion::new(1, 3).is_supported_by(PROTOCOL_V1));
+        assert!(!next_minor.is_supported_by(PROTOCOL_V1));
         assert!(!PROTOCOL_V1.is_supported_by(SchemaVersion::new(2, 0)));
         // Additive-minor tolerance: within one major, any minor interoperates.
         assert!(SchemaVersion::new(1, 0).shares_major_with(PROTOCOL_V1));
@@ -919,6 +928,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 2,
                     output_tokens: 4,
+                    cached_tokens: None,
                 }),
             },
         };
@@ -930,6 +940,33 @@ mod tests {
             serde_json::from_value::<InvocationEvent>(value).unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn cached_tokens_is_additive_and_absent_when_unmeasured() {
+        let without = Usage {
+            input_tokens: 2,
+            output_tokens: 4,
+            cached_tokens: None,
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(
+            value.get("cached_tokens").is_none(),
+            "absent measurement must omit the field, got {value}"
+        );
+
+        let with = Usage {
+            input_tokens: 2,
+            output_tokens: 4,
+            cached_tokens: Some(3),
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["cached_tokens"], 3);
+        assert_eq!(serde_json::from_value::<Usage>(value).unwrap(), with);
+
+        // Minor-2 workers (and older gateways) never send the field.
+        let legacy = serde_json::json!({"input_tokens": 2, "output_tokens": 4});
+        assert_eq!(serde_json::from_value::<Usage>(legacy).unwrap(), without);
     }
 
     #[test]

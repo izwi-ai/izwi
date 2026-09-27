@@ -249,6 +249,7 @@ impl AdmittedExecution for RuntimeAdmittedExecution {
                     finish_reason: map_finish_reason(generation.finish_reason),
                     input_tokens: generation.prompt_tokens as u64,
                     output_tokens: generation.tokens_generated as u64,
+                    cached_input_tokens: generation.cached_prompt_tokens,
                 };
                 if self.streaming || generation.text.is_empty() {
                     Some(completed)

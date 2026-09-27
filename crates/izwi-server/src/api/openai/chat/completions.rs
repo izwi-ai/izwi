@@ -175,6 +175,15 @@ struct OpenAiUsage {
     prompt_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
+    /// DS9.1: OpenAI-shape prompt token details. Always present with usage;
+    /// `cached_tokens` is 0 when the serving runtime did not measure prefix
+    /// reuse.
+    prompt_tokens_details: OpenAiPromptTokensDetails,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -853,6 +862,9 @@ fn render_completion_response(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: OpenAiPromptTokensDetails {
+                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
+            },
         },
         izwi_generation_time_ms: compat_profile
             .is_relaxed()
@@ -964,6 +976,11 @@ fn render_chat_stream(
                                 completion_tokens: generation.tokens_generated,
                                 total_tokens: generation.prompt_tokens
                                     + generation.tokens_generated,
+                                prompt_tokens_details: OpenAiPromptTokensDetails {
+                                    cached_tokens: generation
+                                        .cached_prompt_tokens
+                                        .unwrap_or(0),
+                                },
                             }),
                             izwi_generation_time_ms: compat_profile
                                 .is_relaxed()
@@ -1817,6 +1834,7 @@ mod timing_contract_tests {
                 prompt_tokens: 5,
                 completion_tokens: 4,
                 total_tokens: 9,
+                prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 0 },
             },
             izwi_generation_time_ms: Some(90.0),
             izwi_timing: Some(timing.clone()),
@@ -1842,5 +1860,30 @@ mod timing_contract_tests {
         let strict = serde_json::to_value(sse).unwrap();
         assert!(strict.get("izwi_timing").is_none());
         assert!(strict.get("izwi_generation_time_ms").is_none());
+    }
+
+    #[test]
+    fn usage_reports_openai_shaped_cached_tokens() {
+        let measured = serde_json::to_value(OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 7 },
+        })
+        .unwrap();
+        assert_eq!(measured["prompt_tokens"], 10);
+        assert_eq!(measured["prompt_tokens_details"]["cached_tokens"], 7);
+
+        let unmeasured = serde_json::to_value(OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 0 },
+        })
+        .unwrap();
+        assert_eq!(
+            unmeasured["prompt_tokens_details"]["cached_tokens"], 0,
+            "unmeasured cache must render as an explicit zero, OpenAI parity"
+        );
     }
 }

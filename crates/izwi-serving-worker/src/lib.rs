@@ -233,6 +233,10 @@ pub enum ExecutionEvent {
         finish_reason: FinishReason,
         input_tokens: u64,
         output_tokens: u64,
+        /// DS9.1: input tokens served from the managed prefix cache. Always
+        /// a subset of `input_tokens`; `None` when the runtime did not
+        /// measure prefix reuse.
+        cached_input_tokens: Option<u64>,
     },
     Failed(ExecutionFailure),
 }
@@ -1702,6 +1706,7 @@ async fn run_invocation<E: InvocationExecutor>(
                         finish_reason,
                         input_tokens,
                         output_tokens,
+                        cached_input_tokens,
                     }) => {
                         if let Some(text) = text.filter(|text| !text.is_empty()) {
                             output_bytes = output_bytes.saturating_add(text.len());
@@ -1756,6 +1761,7 @@ async fn run_invocation<E: InvocationExecutor>(
                             usage: Usage {
                                 input_tokens,
                                 output_tokens,
+                                cached_tokens: cached_input_tokens,
                             },
                         });
                     }
@@ -2394,6 +2400,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     input_tokens: 2,
                     output_tokens: 2,
+                    cached_input_tokens: None,
                 },
             ]))),
             teardown: ExecutionTeardown::Completed,
@@ -2440,6 +2447,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 input_tokens: 2,
                 output_tokens: 2,
+                cached_input_tokens: None,
             }]))),
             teardown: ExecutionTeardown::Completed,
             cancel_calls: Arc::new(AtomicUsize::new(0)),
@@ -2524,6 +2532,7 @@ mod tests {
             finish_reason: FinishReason::Stop,
             input_tokens: 1,
             output_tokens: 8,
+            cached_input_tokens: None,
         });
         let executor = ScriptExecutor {
             events: Mutex::new(Some(events)),

@@ -873,6 +873,7 @@ mod tests {
                     usage: Some(Usage {
                         input_tokens: 1,
                         output_tokens: u64::try_from(count).unwrap_or(u64::MAX),
+                        cached_tokens: None,
                     }),
                 });
                 accepted_response(&request, following)
@@ -886,6 +887,7 @@ mod tests {
                         usage: Some(Usage {
                             input_tokens: 1,
                             output_tokens: 1,
+                            cached_tokens: None,
                         }),
                     },
                 ],

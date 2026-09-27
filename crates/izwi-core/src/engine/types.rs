@@ -242,6 +242,11 @@ pub struct TokenStats {
     pub decode_time_ms: f32,
     /// Tokens per second during decode
     pub tokens_per_second: f32,
+    /// DS9.1: prompt tokens already resident in the managed prefix cache at
+    /// admission. Always a subset of `prompt_tokens`; `None` when the request
+    /// never probed a managed prefix (unavailable, not a zero measurement).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prefix_tokens: Option<u32>,
 }
 
 /// Request latency phases captured by the scheduler/engine loop.

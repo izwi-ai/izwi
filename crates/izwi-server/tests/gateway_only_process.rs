@@ -25,6 +25,10 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
         // The CLI dispatcher requires capacity for its 4096-token output
         // budget; the mock's 1024-token default would fail eligibility.
         max_output_tokens: 8_192,
+        // DS9.1: the worker reports managed-prefix cached tokens through
+        // protocol minor 3 and the gateway must surface them in the public
+        // OpenAI usage shape.
+        usage_cached_input_tokens: Some(64),
         ..MockWorkerConfig::default()
     };
     let worker = MockWorker::spawn(worker_config)
@@ -139,6 +143,15 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
     assert!(
         content.contains("gateway-process-t01"),
         "output must come from the approved worker, got {content:?}"
+    );
+    assert_eq!(
+        body["usage"]["prompt_tokens_details"]["cached_tokens"], 64,
+        "worker cached-token measurement must reach the public OpenAI usage shape"
+    );
+    assert_eq!(
+        body["usage"]["prompt_tokens"].as_u64(),
+        Some(1),
+        "cached tokens are a subset of prompt tokens"
     );
 
     // Unauthenticated callers are rejected at the perimeter.

@@ -130,6 +130,9 @@ pub struct MockWorkerConfig {
     /// Realtime TTS-stage knobs. Mutually exclusive with `realtime`; `Some`
     /// turns the mock into a realtime text_to_speech worker.
     pub realtime_tts: Option<MockTtsRealtimeKnobs>,
+    /// DS9.1: cached input tokens the mock reports in every terminal usage.
+    /// `None` keeps `Usage::cached_tokens` absent on the wire.
+    pub usage_cached_input_tokens: Option<u64>,
 }
 
 /// Configurable engine-signal values a mock worker advertises so gateway
@@ -180,6 +183,7 @@ impl Default for MockWorkerConfig {
             routing_signals: None,
             realtime: None,
             realtime_tts: None,
+            usage_cached_input_tokens: None,
         }
     }
 }
@@ -744,6 +748,7 @@ async fn run_invocation(
                             usage: Usage {
                                 input_tokens: 1,
                                 output_tokens: 0,
+                                cached_tokens: state_for_work.config.usage_cached_input_tokens,
                             },
                         },
                     };
@@ -833,6 +838,7 @@ async fn run_invocation(
                         usage: Some(Usage {
                             input_tokens: 1,
                             output_tokens: u64::try_from(count).unwrap_or(u64::MAX),
+                            cached_tokens: state_for_work.config.usage_cached_input_tokens,
                         }),
                     },
                 };
@@ -906,6 +912,7 @@ async fn run_invocation(
                         usage: Some(Usage {
                             input_tokens: 1,
                             output_tokens: 3,
+                            cached_tokens: state_for_work.config.usage_cached_input_tokens,
                         }),
                     },
                 };

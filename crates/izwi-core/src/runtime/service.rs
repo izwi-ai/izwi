@@ -2825,6 +2825,7 @@ fn invocation_chat_generation(
         prompt_tokens: output.token_stats.prompt_tokens,
         tokens_generated: output.num_tokens,
         generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+        cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
     })
 }
 

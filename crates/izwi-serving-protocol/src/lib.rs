@@ -23,10 +23,12 @@ pub const PROTOCOL_MAJOR_VERSION: u16 = 1;
 ///
 /// Minor 1 adds optional per-deployment routing signals on `LoadedDeployment`.
 /// Minor 2 adds the realtime WebSocket subprotocol (`realtime` module), the
-/// `WorkerFeature::RealtimeSocket` and `InputFormat::Text` variants. All
-/// version gates tolerate any minor within major 1: older workers omit the
-/// fields and newer workers only add optional ones.
-pub const PROTOCOL_MINOR_VERSION: u16 = 2;
+/// `WorkerFeature::RealtimeSocket` and `InputFormat::Text` variants. Minor 3
+/// adds optional per-request cache accounting: `Usage::cached_tokens` (DS9.1)
+/// and, later in minor 3, optional per-token logprobs on `TextDelta` (DS9.3).
+/// All version gates tolerate any minor within major 1: older workers omit
+/// the fields and newer workers only add optional ones.
+pub const PROTOCOL_MINOR_VERSION: u16 = 3;
 pub const PROTOCOL_V1: SchemaVersion =
     SchemaVersion::new(PROTOCOL_MAJOR_VERSION, PROTOCOL_MINOR_VERSION);
 

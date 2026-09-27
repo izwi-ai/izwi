@@ -24,10 +24,10 @@ use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole,
 
 use super::dto::{
     ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
-    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList, ResponseObject,
-    ResponseOutputContent, ResponseOutputItem, ResponseStreamCompletedPayload,
-    ResponseStreamCreatedPayload, ResponseStreamDeltaPayload, ResponseStreamEnvelope,
-    ResponseUsage, ResponsesCreateRequest,
+    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList,
+    ResponseInputTokensDetails, ResponseObject, ResponseOutputContent, ResponseOutputItem,
+    ResponseStreamCompletedPayload, ResponseStreamCreatedPayload, ResponseStreamDeltaPayload,
+    ResponseStreamEnvelope, ResponseUsage, ResponsesCreateRequest,
 };
 
 const RESPONSE_STREAM_INTERRUPTED_ERROR: &str = "Response stream ended before a terminal event";
@@ -105,6 +105,9 @@ pub async fn create_response(
         input_tokens: output.prompt_tokens,
         output_tokens: output.tokens_generated,
         total_tokens: output.prompt_tokens + output.tokens_generated,
+        input_tokens_details: ResponseInputTokensDetails {
+            cached_tokens: output.cached_prompt_tokens.unwrap_or(0),
+        },
     };
 
     let response = ResponseObject {
@@ -130,6 +133,7 @@ pub async fn create_response(
             output_text: Some(output.text),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            input_cached_tokens: usage.input_tokens_details.cached_tokens,
             error: None,
             metadata: req.metadata,
         },
@@ -250,6 +254,9 @@ async fn create_streaming_response(
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
+                input_tokens_details: ResponseInputTokensDetails {
+                    cached_tokens: 0,
+                },
             },
             error: None,
             metadata: metadata.clone(),
@@ -342,6 +349,9 @@ async fn create_streaming_response(
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
                             total_tokens: generation.prompt_tokens + generation.tokens_generated,
+                            input_tokens_details: ResponseInputTokensDetails {
+                                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
+                            },
                         },
                         error: None,
                         metadata: metadata.clone(),
@@ -358,6 +368,9 @@ async fn create_streaming_response(
                             output_text: Some(output_text.clone()),
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
+                            input_cached_tokens: generation
+                                .cached_prompt_tokens
+                                .unwrap_or(0),
                             error: None,
                             metadata: metadata.clone(),
                         },
@@ -433,6 +446,7 @@ async fn create_streaming_response(
                             output_text: None,
                             input_tokens: 0,
                             output_tokens: 0,
+                            input_cached_tokens: 0,
                             error: Some("Response generation failed".to_string()),
                             metadata: metadata.clone(),
                         },
@@ -457,6 +471,7 @@ async fn create_streaming_response(
                             output_text: None,
                             input_tokens: 0,
                             output_tokens: 0,
+                            input_cached_tokens: 0,
                             error: Some("Server is shutting down".to_string()),
                             metadata: metadata.clone(),
                         },
@@ -493,6 +508,7 @@ async fn create_streaming_response(
                     output_text: None,
                     input_tokens: 0,
                     output_tokens: 0,
+                    input_cached_tokens: 0,
                     error: Some(RESPONSE_STREAM_INTERRUPTED_ERROR.to_string()),
                     metadata: metadata.clone(),
                 },
@@ -833,6 +849,9 @@ fn record_to_response(record: StoredResponseRecord) -> ResponseObject {
             input_tokens: record.input_tokens,
             output_tokens: record.output_tokens,
             total_tokens: record.input_tokens + record.output_tokens,
+            input_tokens_details: ResponseInputTokensDetails {
+                cached_tokens: record.input_cached_tokens,
+            },
         },
         error: record.error.map(|message| ResponseError {
             message,
@@ -890,6 +909,26 @@ mod tests {
             Some(RESPONSE_STREAM_INTERRUPTED_ERROR)
         );
         assert!(response_stream_interruption_payload("resp_test", true).is_none());
+    }
+
+    #[test]
+    fn stored_record_usage_reports_openai_shaped_cached_tokens() {
+        let record = StoredResponseRecord {
+            id: "resp_cached".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "test".to_string(),
+            input_items: Vec::new(),
+            output_text: Some("done".to_string()),
+            input_tokens: 12,
+            output_tokens: 3,
+            input_cached_tokens: 7,
+            error: None,
+            metadata: None,
+        };
+        let response = record_to_response(record);
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.input_tokens_details.cached_tokens, 7);
     }
 
     #[test]
@@ -1131,6 +1170,7 @@ mod tests {
             output_text: Some("ok".to_string()),
             input_tokens: 1,
             output_tokens: 1,
+            input_cached_tokens: 0,
             error: None,
             metadata: None,
         }

@@ -253,6 +253,9 @@ impl OutputProcessor {
             } else {
                 0.0
             },
+            // Stamped by the engine core from the request's admission-time
+            // managed prefix cursor; the processor never sees the request.
+            cached_prefix_tokens: None,
         };
 
         EngineOutput {

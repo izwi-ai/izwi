@@ -276,6 +276,10 @@ pub struct StoredResponseRecord {
     #[serde(default)]
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// DS9.1: cached subset of `input_tokens` measured by the serving
+    /// runtime; 0 when prefix reuse was unavailable or not measured.
+    #[serde(default)]
+    pub input_cached_tokens: u64,
     pub error: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -785,6 +789,7 @@ mod tests {
                 output_text: Some("old".to_string()),
                 input_tokens: 1,
                 output_tokens: 1,
+                input_cached_tokens: 1,
                 error: None,
                 metadata: None,
             },
@@ -800,6 +805,7 @@ mod tests {
                 output_text: Some("new".to_string()),
                 input_tokens: 1,
                 output_tokens: 1,
+                input_cached_tokens: 1,
                 error: None,
                 metadata: None,
             },
@@ -1054,6 +1060,7 @@ mod tests {
             output_text: Some(id.to_string()),
             input_tokens: 1,
             output_tokens: 1,
+            input_cached_tokens: 1,
             error: None,
             metadata: None,
         }

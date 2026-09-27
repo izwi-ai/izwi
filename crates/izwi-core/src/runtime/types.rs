@@ -169,6 +169,10 @@ pub struct ChatGeneration {
     pub prompt_tokens: usize,
     pub tokens_generated: usize,
     pub generation_time_ms: f64,
+    /// DS9.1: prompt tokens served from the managed prefix cache. Always a
+    /// subset of `prompt_tokens`; `None` when the executing runtime did not
+    /// measure prefix reuse (unavailable, not a zero measurement).
+    pub cached_prompt_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -240,6 +240,55 @@ async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
 }
 
 #[tokio::test]
+async fn cached_usage_reports_in_completed_usage_when_configured() {
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        usage_cached_input_tokens: Some(7),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .unwrap();
+    let client = client(&worker);
+
+    let invocation = request(worker.config(), "cached");
+    let events = client.invoke_collect(invocation).await.unwrap();
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.event {
+            InvocationEventKind::Completed { usage, .. } => Some(usage.clone()),
+            _ => None,
+        })
+        .expect("completed event present");
+    let usage = completed.expect("completed usage present");
+    assert_eq!(usage.input_tokens, 1);
+    assert_eq!(usage.cached_tokens, Some(7));
+}
+
+#[tokio::test]
+async fn cached_usage_is_absent_on_the_wire_when_not_configured() {
+    let worker = MockWorker::spawn(MockWorkerConfig::default())
+        .await
+        .unwrap();
+    let client = client(&worker);
+
+    let invocation = request(worker.config(), "uncached");
+    let events = client.invoke_collect(invocation).await.unwrap();
+    let completed = events
+        .iter()
+        .find_map(|event| match &event.event {
+            InvocationEventKind::Completed { usage, .. } => Some(usage.clone()),
+            _ => None,
+        })
+        .expect("completed event present");
+    let usage = completed.expect("completed usage present");
+    assert_eq!(usage.cached_tokens, None);
+    let raw = serde_json::to_value(&usage).unwrap();
+    assert!(
+        raw.get("cached_tokens").is_none(),
+        "unmeasured cache must omit the field, got {raw}"
+    );
+}
+
+#[tokio::test]
 async fn authentication_failure_does_not_expose_worker_control_data() {
     let worker = MockWorker::spawn(MockWorkerConfig::default())
         .await

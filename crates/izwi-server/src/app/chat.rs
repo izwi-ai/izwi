@@ -663,6 +663,7 @@ fn worker_chat_generation(
     let usage = usage.unwrap_or(Usage {
         input_tokens: 0,
         output_tokens: 0,
+        cached_tokens: None,
     });
     Ok(ChatGeneration {
         latency_breakdown: None,
@@ -676,6 +677,7 @@ fn worker_chat_generation(
         tokens_generated: usize::try_from(usage.output_tokens)
             .map_err(|_| bad_gateway_error("Worker reported an invalid output token count"))?,
         generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
+        cached_prompt_tokens: usage.cached_tokens,
     })
 }
 
@@ -1266,6 +1268,37 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
+    fn worker_usage_maps_cached_tokens_into_the_generation() {
+        let measured = worker_chat_generation(
+            "text".to_string(),
+            WorkerFinishReason::Stop,
+            Some(Usage {
+                input_tokens: 12,
+                output_tokens: 3,
+                cached_tokens: Some(7),
+            }),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(measured.prompt_tokens, 12);
+        assert_eq!(measured.tokens_generated, 3);
+        assert_eq!(measured.cached_prompt_tokens, Some(7));
+
+        let unmeasured = worker_chat_generation(
+            "text".to_string(),
+            WorkerFinishReason::Stop,
+            None,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(unmeasured.prompt_tokens, 0);
+        assert_eq!(
+            unmeasured.cached_prompt_tokens, None,
+            "unmeasured cache stays absent so the public surface renders zero"
+        );
+    }
+
+    #[test]
     fn explicit_overrides_win_over_default_generation_params() {
         let request = ChatExecutionRequest {
             variant: ModelVariant::Qwen34BGguf,
@@ -1435,6 +1468,7 @@ mod tests {
                     generation_time_ms: 25.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
                 })
             });
 
@@ -1478,6 +1512,7 @@ mod tests {
                     generation_time_ms: 1.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
                 })
             });
 
@@ -1516,6 +1551,7 @@ mod tests {
                     generation_time_ms: 1.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
                 })
             },
         );

@@ -2303,6 +2303,16 @@ impl Scheduler {
         true
     }
 
+    /// DS9.1: the managed prefix depth this request is executing with.
+    /// `None` when no prefix was probed, the probe was lost before prepare,
+    /// or the request is no longer tracked — callers must treat absence as
+    /// "no cached-prefix measurement", never as a zero measurement.
+    pub(crate) fn managed_prefix_cursor(&self, request_id: &RequestId) -> Option<u32> {
+        self.requests
+            .get(request_id)
+            .and_then(|metadata| metadata.managed_prefix_cursor)
+    }
+
     /// DS1.5: a probed managed prefix cursor could not be honored (pages or
     /// the tensor snapshot were evicted between admission and prepare).
     /// Clear the cursor and reset prefill progress so the request replans as

@@ -4760,6 +4760,11 @@ impl EngineCore {
                 .get(&request_id)
                 .map(|request| request.num_prompt_tokens())
                 .unwrap_or(engine_output.token_stats.prompt_tokens);
+            // DS9.1: the managed prefix depth this request actually ran with.
+            // The scheduler's cursor copy is authoritative — it is cleared
+            // when the probed prefix is lost and the row replans from zero.
+            engine_output.token_stats.cached_prefix_tokens =
+                self.scheduler.managed_prefix_cursor(&request_id);
             if exec_output.finished {
                 if let Some((_, total_generated)) = self.scheduler.get_running_info(&request_id) {
                     let resolved_total = total_generated.max(engine_output.num_tokens);

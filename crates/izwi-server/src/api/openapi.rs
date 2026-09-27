@@ -2097,6 +2097,13 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u64,
 }
 
 #[allow(dead_code)]
@@ -2251,6 +2258,13 @@ pub struct ResponseUsage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub total_tokens: usize,
+    pub input_tokens_details: InputTokensDetails,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InputTokensDetails {
+    pub cached_tokens: u64,
 }
 
 #[allow(dead_code)]

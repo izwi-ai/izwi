@@ -126,6 +126,15 @@ pub struct ResponseUsage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub total_tokens: usize,
+    /// DS9.1: OpenAI-shape input token details. Always present with usage;
+    /// `cached_tokens` is 0 when the serving runtime did not measure prefix
+    /// reuse.
+    pub input_tokens_details: ResponseInputTokensDetails,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseInputTokensDetails {
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
