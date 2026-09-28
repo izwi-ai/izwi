@@ -124,6 +124,22 @@ class WorkloadMessageTests(unittest.TestCase):
         self.assertEqual(len(first[0]["content"].split()), 30)
         self.assertEqual(len(second[0]["content"].split()), 30)
 
+    def test_long_prompt_messages_are_unique_long_single_user_turns(self):
+        first = benchmark.build_messages("long_prompt", 2048, 64, 1)
+        second = benchmark.build_messages("long_prompt", 2048, 64, 2)
+        self.assertEqual([m["role"] for m in first], ["user"])
+        self.assertNotEqual(first[0]["content"], second[0]["content"])
+        self.assertEqual(len(first[0]["content"].split()), 2112)
+        self.assertEqual(len(second[0]["content"].split()), 2112)
+        # Same regime as cold: per-request uniqueness through the positional
+        # marker, so no cross-request prefix reuse is expected.
+        common_prefix = 0
+        for a, b in zip(first[0]["content"].split(), second[0]["content"].split()):
+            if a != b:
+                break
+            common_prefix += 1
+        self.assertLess(common_prefix, 16)
+
     def test_build_messages_rejects_unknown_workload(self):
         with self.assertRaises(ValueError):
             benchmark.build_messages("bursty", 4, 4, 1)
@@ -175,7 +191,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_json_success(self):
         MockGatewayHandler.mode = "json"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32, False, 1
         )
         self.assertTrue(ok)
@@ -186,7 +202,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_stream_success(self):
         MockGatewayHandler.mode = "stream"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32, True, 1
         )
         self.assertTrue(ok)
@@ -197,7 +213,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_rejection(self):
         MockGatewayHandler.mode = "reject"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32, False, 1
         )
         self.assertFalse(ok)
@@ -206,7 +222,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_error(self):
         MockGatewayHandler.mode = "error"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32, False, 1
         )
         self.assertFalse(ok)
@@ -215,7 +231,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_shared_workload_sends_system_and_unique_user(self):
         MockGatewayHandler.mode = "json"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32,
             False, 3, workload="shared", prefix_tokens=8, suffix_tokens=6,
         )
@@ -232,7 +248,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
     def test_run_one_retries_rejection_then_succeeds(self):
         MockGatewayHandler.mode = "flaky"
         MockGatewayHandler.attempts = 0
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32,
             False, 1, max_retries=3,
         )
@@ -242,7 +258,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_rejection_exhausts_retries(self):
         MockGatewayHandler.mode = "reject"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32,
             False, 1, max_retries=2,
         )
@@ -252,7 +268,7 @@ class GatewayBenchmarkTests(unittest.TestCase):
 
     def test_run_one_passes_vocab_through(self):
         MockGatewayHandler.mode = "json"
-        ok, rejected, ttft_ms, latency_ms, detail = benchmark.run_one(
+        ok, rejected, ttft_ms, latency_ms, detail, _ = benchmark.run_one(
             f"http://127.0.0.1:{self.port}", "test-api-key", "test-model", 32,
             False, 1, workload="cold", prefix_tokens=12, suffix_tokens=4,
             vocab=["a", "b", "c"],

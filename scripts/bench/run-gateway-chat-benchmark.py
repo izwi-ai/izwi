@@ -115,11 +115,11 @@ def build_messages(workload, prefix_tokens, suffix_tokens, index, vocab=None,
             {"role": "system", "content": prefix},
             {"role": "user", "content": " ".join(suffix_words)},
         ]
-    if workload == "cold":
+    if workload in ("cold", "long_prompt"):
         total = prefix_tokens + suffix_tokens
         if total < marker_len + 1:
             raise ValueError(
-                f"workload cold needs --prefix-tokens + --suffix-tokens >= "
+                f"workload {workload} needs --prefix-tokens + --suffix-tokens >= "
                 f"{marker_len + 1} for a {len(words)}-word vocabulary "
                 f"(marker uniqueness)"
             )
@@ -327,13 +327,16 @@ def main():
     parser.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--workload",
-        choices=["default", "shared", "cold", "multi_turn"],
+        choices=["default", "shared", "cold", "multi_turn", "long_prompt"],
         default="default",
         help="default: fixed prompt; shared: constant system prefix + per-request "
         "unique user suffix (prefix-cache reuse expected); cold: unique "
         "per-request prompts of the same total length (no reuse expected); "
         "multi_turn: one growing conversation per request with real assistant "
-        "replies replayed into the history (routing/locality evidence)",
+        "replies replayed into the history (routing/locality evidence); "
+        "long_prompt: one very long unique user prompt per request (DS10 PD "
+        "entry-criteria workload — run with --prefix-tokens >= 2048 and a "
+        "raised --max-tokens to expose ITL tail under saturation)",
     )
     parser.add_argument(
         "--turns",
@@ -394,6 +397,18 @@ def main():
             parser.error("--suffix-tokens must be between 1 and 4096 for shared/cold")
         if args.prefix_tokens + args.suffix_tokens > 4096:
             parser.error("--prefix-tokens + --suffix-tokens must not exceed 4096")
+    if args.workload == "long_prompt":
+        if args.prefix_tokens < 2048 or args.prefix_tokens > 8192:
+            parser.error(
+                "--prefix-tokens must be between 2048 and 8192 for long_prompt: "
+                "the DS10 PD entry-criteria regime is multi-thousand-token "
+                "prompts, below that the disaggregation case is structurally "
+                "absent"
+            )
+        if args.suffix_tokens <= 0 or args.suffix_tokens > 4096:
+            parser.error("--suffix-tokens must be between 1 and 4096 for long_prompt")
+        if args.prefix_tokens + args.suffix_tokens > 8192:
+            parser.error("--prefix-tokens + --suffix-tokens must not exceed 8192 for long_prompt")
     if args.workload == "multi_turn":
         if args.prefix_tokens <= 0 or args.prefix_tokens > 4096:
             parser.error("--prefix-tokens must be between 1 and 4096 for multi_turn")
@@ -415,7 +430,7 @@ def main():
             parser.error(
                 f"multi_turn supports at most {MARKER_UNIQUE_REQUESTS // 16} conversations"
             )
-    if args.workload in ("shared", "cold"):
+    if args.workload in ("shared", "cold", "long_prompt"):
         try:
             build_messages(args.workload, args.prefix_tokens, args.suffix_tokens, 0, vocab)
         except ValueError as error:
