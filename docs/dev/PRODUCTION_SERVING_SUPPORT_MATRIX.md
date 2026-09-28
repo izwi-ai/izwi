@@ -107,6 +107,24 @@ runbook section "Signal-driven worker autoscaling (DS7)".
 Not a production soak or hardware-capacity certificate; scale state is
 in-memory by design (a supervisor restart returns to the declared min set).
 
+## API completeness surface (DS9)
+
+OpenAI-shape API-completeness additions on the chat surface. All protocol
+changes are additive (protocol minor 3): absent fields keep their previous
+semantics, and older workers tolerate the new fields.
+
+| Scope | Status | Evidence |
+|---|---|---|
+| `usage.cached_tokens` (DS9.1) | Supported | Scheduler-authoritative managed-prefix cursor through `ChatGeneration` into public `usage.prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (responses); mock knob for tests; process test proves 64 cached tokens flow worker→public (`b2fb8415`) |
+| `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming `choices[].logprobs`, streaming `delta.logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
+| `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`); design note `docs/dev/CONSTRAINED_DECODING_DESIGN.md` |
+| `response_format: json_object` on own-sampler families; `json_schema` everywhere | Documented 400, never silently ignored | Rejection is the recorded spike decision pending the schema→FSM follow-up (`c1f4b1af`) |
+| Shared speculative MTP envelopes in continuous batches (DS9.4) | Supported on the CUDA+MTP lane; perf claim hardware-gated | CPU fixture tests prove the two-row envelope commits exactly the solo sequence per row (greedy and sampled) with ragged exits and the opt-in gate both ways (`b6211f24`); the tokens/s-improvement / no-ITL-regression acceptance runs on CUDA via the qwen38 continuous-batching manifest's `IZWI_CUDA_MTP_IN_CONTINUOUS=off` vs default comparison using `summary.itl_ms` — recorded `not run` until hardware evidence exists |
+
+The constrained-decoding spike deliberately ships the grammar machine per
+state/key masking rather than a compressed-FSM grammar compiler; the design
+note records the survey and the follow-up path for `json_schema`.
+
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent as recorded in

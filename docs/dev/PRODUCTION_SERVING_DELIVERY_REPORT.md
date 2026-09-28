@@ -39,6 +39,7 @@ template in `PRODUCTION_SERVING_RELEASE_CHECKLIST.md`.
 | DS5 Fleet authority | Done | DS5.1 PostgreSQL validated (URL connect path, dialect-aware migrator, execution suites in CI; the PG claim race needed a worker-keyed advisory lock), DS5.2 two-gateway/two-worker fleet rig (SQLite + PG lanes: T07/T20/P8.1/steering/crash+TTL/DINV-06 outage), DS5.3 explicit fleet posture + claim-TTL env + maintenance sweep, DS5.4 T25 generation-fence process evidence, DS5.5 ADR 0005 + docs; MySQL recorded unvalidated (error 1170 TEXT-key burden) |
 | DS6 Coordinated blue-green rollout | Done | Declarative rollout plan + supervisor state machine (`43d2e7bb`/`3ec044e3`), shared approval format as a protocol contract (`bf30273a`), gateway per-pool DINV-07 eligibility rule (`c539e914`) with runtime approvals-view adoption (`0ec7b5c5`), supervisor process tests + T37 gateway zero-dropped-requests rig (`7fd649eb`/`d9e5abe0`), ADR 0006 + runbook/support-matrix/delivery docs |
 | DS7 Signal-driven worker autoscaling | Done | Validated per-deployment policy config + pre-declared standby replicas (`111fcfb4`), supervisor scale up/down wiring with ResourceLedger + approvals view editor (same commit), supervisor-only process rig T38: 1→2 on sustained queue depth, 2→1 on the idle window with drain, disabled-config static, rollout conflict refused (`4702d08a`), ADR 0007 + runbook/support-matrix/delivery docs |
+| DS9 API completeness | Done | `usage.cached_tokens` end-to-end with protocol minor 3 (`b2fb8415`), per-token logprobs through all five families/public/worker + gateway collector with same-tokens and T40 process evidence (`0f060c00`/`a3d34d83`/`77a07a1c`), grammar-constrained `response_format: json_object` spike with design note and documented 400s (`c1f4b1af`), shared speculative MTP envelopes in continuous batches with per-row-depth CPU parity evidence (`b6211f24`) and the hardware-gated CUDA perf posture + chat ITL metric (`3e3096bb`) |
 
 ## Supported deployment profiles
 
@@ -165,6 +166,18 @@ status-poll jitter (validation now reserves 10% TTL headroom). The gateway
 exposes only `POST /v1/chat/completions` + probes/admin; all other route
 families remain local-only per the ledger.
 
+DS9 additions (protocol minor 3, all additive): `Usage.cached_tokens` with
+public `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`;
+optional `logprobs`/`top_logprobs` request fields with OpenAI-shape
+`choices[].logprobs` and `delta.logprobs` responses; `response_format` —
+`json_object` is grammar-enforced on shared-sampler families (qwen3, gemma3,
+lfm2) and rejected with a documented 400 on own-sampler families, `json_schema`
+is rejected with a documented 400 pending the schema→FSM follow-up. New
+operator knob `cuda.mtp_in_continuous` (env `IZWI_CUDA_MTP_IN_CONTINUOUS`,
+default Auto, Off kill switch) governing shared speculative MTP envelopes in
+continuous batches; it only ever widens a grant the exact-solo path already
+gave and the fairness gates still collapse it under queue pressure.
+
 ## Known limitations and failure behavior
 
 Documented in `PRODUCTION_SERVING_SUPPORT_MATRIX.md` §failure semantics:
@@ -186,7 +199,14 @@ DS4 offload evidence (`ds4-{cpu,metal}-summary.json`, 2026-09-26) are the
 same class of counter-proven fixture evidence: DS4's on-legs show demotion,
 promotion, and budget containment with prefix reuse preserved, and the
 engine-level test pins byte-identical greedy output against the cold run.
-Real-model TTFT/throughput claims remain future work.
+DS9 correctness evidence is fixture-scale by the same standard: cached-token
+and logprob payloads are asserted end-to-end worker→public, and the DS9.4
+speculative-envelope test pins that a two-row shared envelope commits exactly
+the solo sequence per row (greedy and sampled, ragged exits included). DS9.4's
+throughput claim (tokens/s improvement, no ITL regression) is deliberately
+deferred to CUDA hardware: the qwen38 continuous-batching manifest records the
+off/on comparison and chat reports carry `summary.itl_ms` for it. Real-model
+TTFT/throughput claims remain future work.
 
 ## Security / deployment assumptions
 
@@ -208,11 +228,13 @@ No destructive migrations shipped.
 
 ## Next highest-priority task
 
-DS7 is complete: the supervisor is a capacity manager within explicit bounds
-— pre-declared standby replicas, sustained-queue-depth scale-up, stabilized
-idle-window scale-down with drain, ledger-respecting decisions, and shared
-hysteresis — off by default and proven with real processes (ADR 0007, T38).
-Next per the plan: DS9 (API completeness: `usage.cached_tokens`, grammar-
-constrained `response_format`, logprobs, MTP generalization), with DS8
-(vLLM engine lane) still behind its decision-gate ADR. CUDA lanes stay
-`not run` until hardware evidence exists.
+DS9 is complete: the public chat surface reaches OpenAI-shape parity on
+`usage.cached_tokens`, per-token logprobs (streaming and not), and
+`response_format` (grammar-constrained `json_object` where the sampler can
+enforce it, documented 400s where it cannot), and Qwen3.8's MTP speculation
+now runs shared per-row-depth envelopes inside continuous batches behind an
+opt-in kill switch. Remaining open items per the plan: the DS9.2 schema→FSM
+follow-up (full `json_schema` support), the hardware-gated CUDA evidence set
+(prefix-reuse + offload lane, DS9.4 perf/ITL comparison), and DS8 (vLLM engine
+lane), which stays behind its decision-gate ADR — write it only if the
+engine-lane entry criteria are still met after the parity work above.
