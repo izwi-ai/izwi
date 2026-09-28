@@ -668,7 +668,16 @@ impl Gemma3ChatModel {
             pending_token: None,
             prefill_progress: position,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids).with_json_object_constraint(
+                std::sync::Arc::new(self.tokenizer.inner.clone()),
+                vec![
+                    Some(self.tokenizer.specials.end_of_turn),
+                    Some(self.tokenizer.specials.eos),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             assembled: String::new(),
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),

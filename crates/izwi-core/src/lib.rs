@@ -132,7 +132,7 @@ pub use catalog::{
     resolve_asr_model_variant, resolve_diarization_model_variant, ChatModelCapabilities,
     CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind,
     CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
-    CudaSupportLevel, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    CudaSupportLevel, ModelFamily, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,

@@ -32,7 +32,7 @@ use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
     ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
-    ModelVariant,
+    ModelFamily, ModelVariant,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -84,6 +84,10 @@ pub struct ChatCompletionRequest {
     /// DS9.3: number of top alternatives per token (0-20).
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+    /// DS9.2: structured output request. `json_object` constrains generation
+    /// to one valid JSON value on models whose sampler enforces it.
+    #[serde(default)]
+    pub response_format: Option<OpenAiResponseFormat>,
     #[serde(default)]
     pub stop: Option<serde_json::Value>,
     #[serde(default)]
@@ -100,6 +104,16 @@ pub struct ChatCompletionRequest {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
+/// `json_schema` is rejected with a documented error for now.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, rename = "json_schema")]
+    pub json_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -686,6 +700,22 @@ fn validate_chat_request_compatibility(
         }
     }
 
+    if let Some(response_format) = &req.response_format {
+        match response_format.kind.as_str() {
+            "json_object" => {}
+            "json_schema" => {
+                return Err(ApiError::bad_request(
+                    "`response_format` type `json_schema` is not supported; use `json_object`",
+                ));
+            }
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown `response_format` type `{other}`; supported: `json_object`"
+                )));
+            }
+        }
+    }
+
     if profile.is_strict()
         && req
             .frequency_penalty
@@ -861,11 +891,33 @@ pub async fn gateway_completions(
     ))
 }
 
+/// DS9.2: models whose sampler enforces the JSON grammar. Others reject
+/// `json_object` rather than silently ignoring the request.
+fn ensure_response_format_supported(
+    variant: ModelVariant,
+    response_format: &OpenAiResponseFormat,
+) -> Result<(), ApiError> {
+    if response_format.kind == "json_object"
+        && !matches!(
+            variant.family(),
+            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat | ModelFamily::Lfm2Chat
+        )
+    {
+        return Err(ApiError::bad_request(format!(
+            "constrained decoding (`response_format: json_object`) is not supported for model {variant}; it requires a grammar-aware sampler"
+        )));
+    }
+    Ok(())
+}
+
 fn prepare_execution_request(
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
 ) -> Result<(ModelVariant, ChatExecutionRequest), ApiError> {
     let variant = parse_chat_model(&req.model)?;
+    if let Some(response_format) = &req.response_format {
+        ensure_response_format_supported(variant, response_format)?;
+    }
     let (messages, media_inputs) = to_core_messages_with_media(
         variant,
         req.messages.clone(),
@@ -901,6 +953,10 @@ fn prepare_execution_request(
             presence_penalty: req.presence_penalty,
             logprobs: req.logprobs,
             top_logprobs: req.top_logprobs,
+            response_format_json_object: req
+                .response_format
+                .as_ref()
+                .is_some_and(|format| format.kind == "json_object"),
             chat_config,
             correlation_id: Some(ctx.correlation_id.clone()),
         },
@@ -1737,6 +1793,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format: None,
             stop: None,
             user: None,
             tools: None,
@@ -1774,6 +1831,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1811,6 +1869,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1965,6 +2024,7 @@ mod timing_contract_tests {
             presence_penalty: None,
             logprobs,
             top_logprobs,
+            response_format: None,
             stop: None,
             user: None,
             tools: None,
@@ -1987,6 +2047,61 @@ mod timing_contract_tests {
 
     fn profile() -> OpenAiCompatibilityProfile {
         OpenAiCompatibilityProfile::Relaxed
+    }
+
+    #[test]
+    fn response_format_types_are_validated() {
+        let req = |kind: &str| ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format: Some(OpenAiResponseFormat {
+                kind: kind.into(),
+                json_schema: None,
+            }),
+            stop: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
+        };
+        assert!(validate_chat_request_compatibility(&req("json_object"), profile()).is_ok());
+        assert!(
+            validate_chat_request_compatibility(&req("json_schema"), profile()).is_err(),
+            "json_schema must be rejected with a documented error"
+        );
+        assert!(
+            validate_chat_request_compatibility(&req("yaml"), profile()).is_err(),
+            "unknown types must be rejected"
+        );
+    }
+
+    #[test]
+    fn json_object_is_rejected_on_models_without_a_grammar_aware_sampler() {
+        let format = OpenAiResponseFormat {
+            kind: "json_object".into(),
+            json_schema: None,
+        };
+        assert!(ensure_response_format_supported(ModelVariant::Qwen34BGguf, &format).is_ok());
+        assert!(
+            ensure_response_format_supported(ModelVariant::Qwen3827BFp8, &format).is_err(),
+            "qwen3.8 has its own sampler without the grammar seam"
+        );
     }
 
     #[test]

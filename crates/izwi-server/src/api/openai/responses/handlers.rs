@@ -90,6 +90,7 @@ pub async fn create_response(
         presence_penalty: req.presence_penalty,
         logprobs: None,
         top_logprobs: None,
+        response_format_json_object: false,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };

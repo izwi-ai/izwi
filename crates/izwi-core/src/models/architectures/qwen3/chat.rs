@@ -457,7 +457,17 @@ impl Qwen3ChatModel {
             pending_token: None,
             prefill_progress: pos,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids).with_json_object_constraint(
+                std::sync::Arc::new(self.tokenizer.inner.clone()),
+                vec![
+                    Some(self.tokenizer.specials.im_end),
+                    Some(self.tokenizer.specials.eos),
+                    self.tokenizer.specials.eos_alt,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,

@@ -1073,6 +1073,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         }
@@ -1541,6 +1542,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         }

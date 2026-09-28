@@ -78,6 +78,11 @@ pub struct GenerationParams {
     /// is on (validated 0..=20 at the public boundary).
     #[serde(default)]
     pub top_logprobs: usize,
+
+    /// DS9.2: constrain generation to one valid JSON value
+    /// (`response_format: json_object`).
+    #[serde(default)]
+    pub constrain_json_object: bool,
 }
 
 fn default_temperature() -> f32 {
@@ -114,6 +119,7 @@ impl Default for GenerationParams {
             stop_token_ids: Vec::new(),
             logprobs: false,
             top_logprobs: 0,
+            constrain_json_object: false,
         }
     }
 }

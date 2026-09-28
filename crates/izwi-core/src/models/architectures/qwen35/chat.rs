@@ -2426,6 +2426,7 @@ mod tests {
             request: ChatRequestConfig::default(),
             logprobs: false,
             top_logprobs: 0,
+            constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
         let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
@@ -2451,6 +2452,7 @@ mod tests {
             request: ChatRequestConfig::default(),
             logprobs: false,
             top_logprobs: 0,
+            constrain_json_object: false,
         };
         let history = [1u32];
         let mut direct_rng = SimpleRng::new(17);
@@ -2483,6 +2485,7 @@ mod tests {
             request: ChatRequestConfig::default(),
             logprobs: false,
             top_logprobs: 0,
+            constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
@@ -2510,6 +2513,7 @@ mod tests {
                 request: ChatRequestConfig::default(),
                 logprobs: false,
                 top_logprobs: 0,
+                constrain_json_object: false,
             };
             let mut rng = SimpleRng::new(7);
             let error = sample_next_token(&logits, 3, &config, &[], &mut rng)

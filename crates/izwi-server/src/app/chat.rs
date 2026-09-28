@@ -43,6 +43,8 @@ pub struct ChatExecutionRequest {
     /// DS9.3: OpenAI `logprobs` flag and `top_logprobs` count (0-20).
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<u8>,
+    /// DS9.2: the request carried `response_format: json_object`.
+    pub response_format_json_object: bool,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
 }
@@ -92,6 +94,9 @@ impl ChatExecutionRequest {
         }
         if let Some(top_logprobs) = self.top_logprobs {
             params.top_logprobs = top_logprobs as usize;
+        }
+        if self.response_format_json_object {
+            params.constrain_json_object = true;
         }
         params
     }
@@ -1406,6 +1411,7 @@ mod tests {
             presence_penalty: Some(0.25),
             logprobs: None,
             top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         };
@@ -1434,6 +1440,7 @@ mod tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig {
                 enable_thinking,
                 ..Default::default()

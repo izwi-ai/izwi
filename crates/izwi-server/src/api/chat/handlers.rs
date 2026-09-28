@@ -339,6 +339,7 @@ pub async fn create_thread_message(
         presence_penalty: req.presence_penalty,
         logprobs: None,
         top_logprobs: None,
+        response_format_json_object: false,
         chat_config,
         correlation_id: Some(ctx.correlation_id),
     };

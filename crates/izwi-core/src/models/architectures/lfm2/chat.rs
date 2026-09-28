@@ -670,7 +670,17 @@ impl Lfm2ChatModel {
             unconsumed_output: None,
             pending_token: None,
             generated_ids: Vec::with_capacity(max_new_tokens.max(1)),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids).with_json_object_constraint(
+                std::sync::Arc::new(self.tokenizer.inner.clone()),
+                vec![
+                    Some(self.tokenizer.specials.im_end),
+                    Some(self.tokenizer.specials.eos),
+                    self.tokenizer.specials.eos_alt,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             greedy: is_plain_greedy(config),
             decoder: IncrementalDecoder::new(true),
             stop_reason: None,

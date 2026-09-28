@@ -24,6 +24,139 @@ pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
 /// CUDA-only entry point.
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = DEVICE_SAMPLING_CANDIDATE_LIMIT;
 
+/// DS9.2: per-request constrained-decoding runtime. The mask cache is shared
+/// across sampler clones; the machine advances per committed token.
+pub struct GrammarRuntime {
+    tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+    /// Token ids that must remain sampleable regardless of the grammar
+    /// (the family's end-of-sequence tokens and configured stops).
+    always_allowed: Vec<u32>,
+    surfaces: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
+    masks: super::grammar::JsonGrammarMasks,
+    machine: super::grammar::JsonGrammarMachine,
+}
+
+impl Clone for GrammarRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.clone(),
+            always_allowed: self.always_allowed.clone(),
+            surfaces: self.surfaces.clone(),
+            masks: self.masks.clone(),
+            machine: self.machine.clone(),
+        }
+    }
+}
+
+impl GrammarRuntime {
+    fn new(
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        always_allowed: Vec<u32>,
+    ) -> Self {
+        Self {
+            tokenizer,
+            always_allowed,
+            surfaces: std::sync::Arc::new(std::sync::OnceLock::new()),
+            masks: super::grammar::JsonGrammarMasks::new(),
+            machine: super::grammar::JsonGrammarMachine::new(),
+        }
+    }
+
+    fn surfaces(&self, vocab_size: usize) -> Result<&[String]> {
+        if let Some(surfaces) = self.surfaces.get() {
+            if surfaces.len() >= vocab_size {
+                return Ok(&surfaces[..vocab_size]);
+            }
+        }
+        let surfaces = (0..vocab_size)
+            .map(|id| self.tokenizer.decode(&[id as u32]).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let _ = self.surfaces.set(surfaces);
+        Ok(self
+            .surfaces
+            .get()
+            .expect("surfaces just inserted")
+            .as_slice())
+    }
+
+    /// Sample one token under the grammar's current mask, then advance the
+    /// machine with the token's surface text.
+    fn sample_token(
+        &mut self,
+        logits: &Tensor,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: &[u32],
+        rng: &mut SimpleRng,
+    ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        let surfaces = self.surfaces(vocab_size)?;
+        let mask = self.masks.mask_for(&self.machine, surfaces);
+        let row = chat_logits_row(logits)?;
+        let mut values = read_f32_values_to_host(&row)?;
+        values.truncate(vocab_size.min(values.len()));
+        if values.is_empty() {
+            return Err(Error::InvalidInput(
+                "chat sampler received no in-vocabulary logits".to_string(),
+            ));
+        }
+        // Raw stats (for logprobs) come from the unmasked row.
+        let raw_logprobs = if config.logprobs {
+            let (logsumexp, top) = raw_logprobs_stats(&values, config.top_logprobs)?;
+            Some((logsumexp, top))
+        } else {
+            None
+        };
+        for (index, value) in values.iter_mut().enumerate() {
+            let allowed = mask.get(index).copied().unwrap_or(false)
+                || self.always_allowed.iter().any(|id| *id as usize == index);
+            if !allowed {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+        let token = sample_from_host_values(values, config, history, rng)?;
+        if config.stop_token_ids.contains(&token) || self.always_allowed.contains(&token) {
+            // A stop token ends generation; the machine state stays put.
+        } else {
+            let surface = surfaces
+                .get(token as usize)
+                .ok_or_else(|| {
+                    Error::InferenceError("sampled token outside the grammar vocab".into())
+                })?
+                .clone();
+            self.machine.feed(&surface).map_err(|_| {
+                Error::InferenceError("grammar machine rejected a masked-in token".into())
+            })?;
+        }
+        let logprobs = match raw_logprobs {
+            Some((logsumexp, top)) => {
+                let chosen_raw = read_chosen_raw(&row, vocab_size, token)?;
+                Some(RawTokenLogprobs {
+                    token,
+                    logprob: chosen_raw - logsumexp,
+                    top,
+                })
+            }
+            None => None,
+        };
+        Ok((token, logprobs))
+    }
+}
+
+fn read_chosen_raw(row: &Tensor, vocab_size: usize, token: u32) -> Result<f32> {
+    let value = row
+        .i(token as usize)?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    let _ = vocab_size;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ))
+    }
+}
+
 /// Request-owned chat sampler used after a shared tensor forward. Continuous
 /// batching shares logits computation, never sampling policy or RNG state.
 #[derive(Clone)]
@@ -32,6 +165,7 @@ pub struct ChatSampler {
     history: Vec<u32>,
     track_history: bool,
     rng: SimpleRng,
+    grammar: Option<GrammarRuntime>,
 }
 
 impl ChatSampler {
@@ -47,7 +181,22 @@ impl ChatSampler {
             },
             config,
             track_history,
+            grammar: None,
         }
+    }
+
+    /// DS9.2: constrain this request to emit one valid JSON value
+    /// (`response_format: json_object`). `always_allowed` lists token ids
+    /// (typically end-of-sequence) that must stay sampleable in every state.
+    pub fn with_json_object_constraint(
+        mut self,
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        always_allowed: Vec<u32>,
+    ) -> Self {
+        if self.config.constrain_json_object {
+            self.grammar = Some(GrammarRuntime::new(tokenizer, always_allowed));
+        }
+        self
     }
 
     pub fn sample(&mut self, logits: &Tensor, vocab_size: usize) -> Result<u32> {
@@ -62,6 +211,19 @@ impl ChatSampler {
         logits: &Tensor,
         vocab_size: usize,
     ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        if let Some(grammar) = self.grammar.as_mut() {
+            let (token, logprobs) = grammar.sample_token(
+                logits,
+                vocab_size,
+                &self.config,
+                &self.history,
+                &mut self.rng,
+            )?;
+            if self.track_history {
+                self.history.push(token);
+            }
+            return Ok((token, logprobs));
+        }
         let (token, logprobs) = sample_chat_token_and_logprobs(
             logits,
             vocab_size,

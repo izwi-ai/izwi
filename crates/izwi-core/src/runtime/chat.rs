@@ -148,6 +148,7 @@ impl RuntimeService {
             request: chat_config.clone(),
             logprobs: params.logprobs || params.top_logprobs > 0,
             top_logprobs: params.top_logprobs,
+            constrain_json_object: params.constrain_json_object,
         }
     }
 
