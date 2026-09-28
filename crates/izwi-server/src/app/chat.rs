@@ -40,6 +40,9 @@ pub struct ChatExecutionRequest {
     pub top_k: Option<usize>,
     pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// DS9.3: OpenAI `logprobs` flag and `top_logprobs` count (0-20).
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<u8>,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
 }
@@ -83,6 +86,12 @@ impl ChatExecutionRequest {
         }
         if let Some(presence_penalty) = self.presence_penalty {
             params.presence_penalty = presence_penalty;
+        }
+        if self.logprobs.unwrap_or(false) {
+            params.logprobs = true;
+        }
+        if let Some(top_logprobs) = self.top_logprobs {
+            params.top_logprobs = top_logprobs as usize;
         }
         params
     }
@@ -228,7 +237,12 @@ pub fn resolve_chat_request_config(
 #[derive(Debug, Clone)]
 pub enum ChatStreamEvent {
     Started,
-    Delta(String),
+    /// DS9.3: a text delta with its per-token logprob entries (empty unless
+    /// the request asked for logprobs).
+    Delta {
+        text: String,
+        logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    },
     Completed(Box<ChatGeneration>),
     Failed(String),
     ShuttingDown,
@@ -286,8 +300,12 @@ fn try_send_chat_delta(
     event_tx: &mpsc::Sender<ChatStreamEvent>,
     backpressure: &ChatStreamBackpressure,
     delta: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
 ) {
-    match event_tx.try_send(ChatStreamEvent::Delta(delta)) {
+    match event_tx.try_send(ChatStreamEvent::Delta {
+        text: delta,
+        logprobs,
+    }) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => backpressure.trip(),
         // The receiver has gone away, so there is nobody to notify with a
@@ -794,11 +812,11 @@ where
                         return;
                     }
                 }
-                InvocationEventKind::TextDelta { text: delta } => {
+                InvocationEventKind::TextDelta { text: delta, .. } => {
                     if let Err(error) = append_remote_text(&mut text, &delta, max_output_bytes) {
                         break ChatStreamEvent::Failed(error.message);
                     }
-                    try_send_chat_delta(&event_tx, &backpressure, delta);
+                    try_send_chat_delta(&event_tx, &backpressure, delta, Vec::new());
                     if event_tx.is_closed() {
                         return;
                     }
@@ -1149,7 +1167,7 @@ where
                 return;
             }
 
-            let generation = runtime.chat_generate_streaming_with_runtime_context(
+            let generation = runtime.chat_generate_streaming_tokens_with_runtime_context(
                 variant,
                 messages,
                 params,
@@ -1159,8 +1177,8 @@ where
                 {
                     let event_tx = event_tx.clone();
                     let backpressure = backpressure.clone();
-                    move |delta| {
-                        try_send_chat_delta(&event_tx, &backpressure, delta);
+                    move |delta: String, logprobs: Vec<izwi_core::engine::TokenLogprob>| {
+                        try_send_chat_delta(&event_tx, &backpressure, delta, logprobs);
                     }
                 },
             );
@@ -1314,6 +1332,8 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: Some(0.25),
+            logprobs: None,
+            top_logprobs: None,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         };
@@ -1340,6 +1360,8 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             chat_config: ChatRequestConfig {
                 enable_thinking,
                 ..Default::default()
@@ -1459,9 +1481,9 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let mut event_rx =
             spawn_chat_stream_with_task(semaphore, 4, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string(), Vec::new());
                 tokio::time::sleep(Duration::from_millis(25)).await;
-                try_send_chat_delta(&event_tx, &backpressure, " world".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, " world".to_string(), Vec::new());
                 Ok(ChatGeneration {
                     text: "Hello world".to_string(),
                     prompt_tokens: 12,
@@ -1480,12 +1502,12 @@ mod tests {
         }
 
         match event_rx.recv().await {
-            Some(ChatStreamEvent::Delta(delta)) => assert_eq!(delta, "Hello"),
+            Some(ChatStreamEvent::Delta { text, .. }) => assert_eq!(text, "Hello"),
             other => panic!("expected first delta event, got {other:?}"),
         }
 
         match event_rx.recv().await {
-            Some(ChatStreamEvent::Delta(delta)) => assert_eq!(delta, " world"),
+            Some(ChatStreamEvent::Delta { text, .. }) => assert_eq!(text, " world"),
             other => panic!("expected second delta event, got {other:?}"),
         }
 
@@ -1503,8 +1525,8 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let mut event_rx =
             spawn_chat_stream_with_task(semaphore, 2, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "first".to_string());
-                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, "first".to_string(), Vec::new());
+                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string(), Vec::new());
                 // Completion in the same poll as the overflow must not win the
                 // race and turn a truncated stream into apparent success.
                 Ok(ChatGeneration {
@@ -1525,7 +1547,7 @@ mod tests {
         ));
         assert!(matches!(
             event_rx.recv().await,
-            Some(ChatStreamEvent::Delta(delta)) if delta == "first"
+            Some(ChatStreamEvent::Delta { text, .. }) if text == "first"
         ));
         assert!(matches!(
             event_rx.recv().await,

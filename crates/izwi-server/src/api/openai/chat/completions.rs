@@ -78,6 +78,12 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// DS9.3: include per-token logprobs in the response.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// DS9.3: number of top alternatives per token (0-20).
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
     #[serde(default)]
     pub stop: Option<serde_json::Value>,
     #[serde(default)]
@@ -159,6 +165,9 @@ struct OpenAiChoice {
     index: usize,
     message: OpenAiAssistantMessage,
     finish_reason: &'static str,
+    /// DS9.3: per-token logprobs; absent unless the request asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +193,54 @@ struct OpenAiUsage {
 #[derive(Debug, Clone, Serialize)]
 struct OpenAiPromptTokensDetails {
     cached_tokens: u64,
+}
+
+/// DS9.3: OpenAI-shape per-choice logprobs wrapper.
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiChoiceLogprobs {
+    content: Vec<OpenAiTokenLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiTokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+    top_logprobs: Vec<OpenAiTopTokenLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiTopTokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+}
+
+/// DS9.3: map core logprob entries into the OpenAI response shape. `None`
+/// when the request did not collect logprobs.
+fn openai_logprobs(entries: &[izwi_core::engine::TokenLogprob]) -> Option<OpenAiChoiceLogprobs> {
+    if entries.is_empty() {
+        return None;
+    }
+    Some(OpenAiChoiceLogprobs {
+        content: entries
+            .iter()
+            .map(|entry| OpenAiTokenLogprob {
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                bytes: entry.bytes.clone(),
+                top_logprobs: entry
+                    .top_logprobs
+                    .iter()
+                    .map(|top| OpenAiTopTokenLogprob {
+                        token: top.token.clone(),
+                        logprob: top.logprob,
+                        bytes: top.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +273,9 @@ struct OpenAiDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiDeltaToolCall>>,
+    /// DS9.3: per-token logprobs for this chunk; absent unless requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,6 +673,19 @@ fn validate_chat_request_compatibility(
         ));
     }
 
+    if let Some(top_logprobs) = req.top_logprobs {
+        if top_logprobs > 20 {
+            return Err(ApiError::bad_request(
+                "`top_logprobs` must be between 0 and 20",
+            ));
+        }
+        if !req.logprobs.unwrap_or(false) {
+            return Err(ApiError::bad_request(
+                "`top_logprobs` requires `logprobs` to be true",
+            ));
+        }
+    }
+
     if profile.is_strict()
         && req
             .frequency_penalty
@@ -826,6 +899,8 @@ fn prepare_execution_request(
             top_k: req.top_k,
             repetition_penalty: req.repetition_penalty,
             presence_penalty: req.presence_penalty,
+            logprobs: req.logprobs,
+            top_logprobs: req.top_logprobs,
             chat_config,
             correlation_id: Some(ctx.correlation_id.clone()),
         },
@@ -857,6 +932,7 @@ fn render_completion_response(
                 tool_calls: assistant_tool_calls,
             },
             finish_reason: measured_finish_reason(finish_reason, generation.finish_reason),
+            logprobs: openai_logprobs(&generation.logprobs),
         }],
         usage: OpenAiUsage {
             prompt_tokens,
@@ -912,6 +988,7 @@ fn render_chat_stream(
                                 role: Some("assistant"),
                                 content: None,
                                 tool_calls: None,
+                                logprobs: None,
                             },
                             finish_reason: None,
                         }],
@@ -922,7 +999,7 @@ fn render_chat_stream(
                     .unwrap_or_default(),
                     false,
                 ),
-                ChatStreamEvent::Delta(delta) => (
+                ChatStreamEvent::Delta { text, logprobs } => (
                     serde_json::to_string(&OpenAiChatChunk {
                         id: completion_id.clone(),
                         object: "chat.completion.chunk",
@@ -932,8 +1009,9 @@ fn render_chat_stream(
                             index: 0,
                             delta: OpenAiDelta {
                                 role: None,
-                                content: Some(delta),
+                                content: Some(text),
                                 tool_calls: None,
+                                logprobs: openai_logprobs(&logprobs),
                             },
                             finish_reason: None,
                         }],
@@ -964,6 +1042,7 @@ fn render_chat_stream(
                                     role: None,
                                     content: None,
                                     tool_calls: delta_tool_calls,
+                                    logprobs: None,
                                 },
                                 finish_reason: Some(if tool_calls.is_some() {
                                     "tool_calls"
@@ -1656,6 +1735,8 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(0.5),
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             stop: None,
             user: None,
             tools: None,
@@ -1691,6 +1772,8 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1726,6 +1809,8 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(1.0),
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1860,6 +1945,80 @@ mod timing_contract_tests {
         let strict = serde_json::to_value(sse).unwrap();
         assert!(strict.get("izwi_timing").is_none());
         assert!(strict.get("izwi_generation_time_ms").is_none());
+    }
+
+    #[test]
+    fn logprob_requests_validate_openai_bounds() {
+        let req = |logprobs: Option<bool>, top_logprobs: Option<u8>| ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logprobs,
+            top_logprobs,
+            stop: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
+        };
+        assert!(validate_chat_request_compatibility(&req(Some(true), Some(20)), profile()).is_ok());
+        assert!(validate_chat_request_compatibility(&req(Some(true), None), profile()).is_ok());
+        let too_many = validate_chat_request_compatibility(&req(Some(true), Some(21)), profile());
+        assert!(too_many.is_err(), "top_logprobs above 20 must be rejected");
+        let missing_flag = validate_chat_request_compatibility(&req(None, Some(3)), profile());
+        assert!(
+            missing_flag.is_err(),
+            "top_logprobs without logprobs must be rejected"
+        );
+    }
+
+    fn profile() -> OpenAiCompatibilityProfile {
+        OpenAiCompatibilityProfile::Relaxed
+    }
+
+    #[test]
+    fn logprob_entries_render_openai_shape() {
+        let entries = vec![izwi_core::engine::TokenLogprob {
+            token: " hello".to_string(),
+            logprob: -0.25,
+            bytes: b" hello".to_vec(),
+            top_logprobs: vec![
+                izwi_core::engine::TopTokenLogprob {
+                    token: " hello".to_string(),
+                    logprob: -0.25,
+                    bytes: b" hello".to_vec(),
+                },
+                izwi_core::engine::TopTokenLogprob {
+                    token: " hi".to_string(),
+                    logprob: -1.5,
+                    bytes: b" hi".to_vec(),
+                },
+            ],
+        }];
+        let rendered = serde_json::to_value(openai_logprobs(&entries).unwrap()).unwrap();
+        let first = &rendered["content"][0];
+        assert_eq!(first["token"], " hello");
+        assert_eq!(first["logprob"], -0.25);
+        assert_eq!(
+            first["bytes"],
+            serde_json::json!([32, 104, 101, 108, 108, 111])
+        );
+        assert_eq!(first["top_logprobs"].as_array().unwrap().len(), 2);
+        assert_eq!(first["top_logprobs"][1]["token"], " hi");
+        assert!(openai_logprobs(&[]).is_none());
     }
 
     #[test]

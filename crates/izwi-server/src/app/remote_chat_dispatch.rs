@@ -1066,6 +1066,8 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         }
@@ -1223,7 +1225,7 @@ mod tests {
         ));
         assert!(matches!(
             events.recv().await,
-            Some(ChatStreamEvent::Delta(ref text)) if text == "from-b"
+            Some(ChatStreamEvent::Delta { text, .. }) if text == "from-b"
         ));
         assert!(matches!(
             events.recv().await,
@@ -1532,6 +1534,8 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         }

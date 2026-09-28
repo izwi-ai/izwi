@@ -88,6 +88,8 @@ pub async fn create_response(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        logprobs: None,
+        top_logprobs: None,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
@@ -315,14 +317,14 @@ async fn create_streaming_response(
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => continue,
-                ChatStreamEvent::Delta(delta) => {
-                    full_text.push_str(&delta);
+                ChatStreamEvent::Delta { text, .. } => {
+                    full_text.push_str(&text);
                     (
                         serde_json::to_string(&ResponseStreamEnvelope {
                             event_type: "response.output_text.delta",
                             payload: ResponseStreamDeltaPayload {
                                 response_id: response_id_for_task.clone(),
-                                delta,
+                                delta: text,
                             },
                         })
                         .unwrap_or_default(),
