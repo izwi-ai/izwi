@@ -1,3 +1,66 @@
+# Plan — DS10 best-effort groundwork (planning only) — 2026-09-28
+
+Scope: the DS10 deferred register, split into a groundwork tier (buildable
+now, best effort) and an activation tier (entry criteria unchanged). Full
+plan: docs/dev/DS10_BEST_EFFORT_GROUNDWORK_PLAN.md. Research-only session —
+no code written; four surveys (model layer, serving runtime, distributed
+layer, industry practice) are condensed in §2 of the plan doc.
+
+Implementation session same day (ADR 0008 accepted first). Design
+deviations from the plan, all deliberate: the dispatch seam is an
+`ExpertSet` trait + `SparseMoeDispatcher` (vLLM MoELayer/FusedMoE shape)
+rather than a full family; the first MoE support rides the qwen3 family's
+FFN-agnostic chat driver as ModelFamily::Qwen3MoeChat (engine machinery
+unchanged, family-level capability honesty preserved) instead of a
+duplicated family module; expert histograms are engine-side only
+(protocol fields deferred to EP activation per ADR 0008 §3).
+
+- [x] ADR 0008 DS10 groundwork posture. DONE `3881aa1a`.
+- [x] A1 admission scratch fix: TensorStorageInventory (total, largest
+  bytes/elements, count); load scratch = max(size-class, source+F32
+  conversion bound, 32 KiB/tensor whole-checkpoint term). Dense stays
+  within a small correct bump. DONE `0c7f1ea2`.
+- [x] D2 KV codec round-trip tests: bit-preserving across F32/F16/BF16,
+  pages, seeds, CPU+Metal arenas incl. NaN/±inf/−0.0; error paths pinned.
+  DONE `fa018479`.
+- [x] Sparse expert dispatch seam `models/shared/moe.rs`: ExpertSet trait,
+  dispatcher (softmax→top-k→norm→gather/apply/weighted-scatter),
+  ExpertActivationCounters; reference-parity tests. DONE `7fba7985`.
+- [x] Qwen3 family sparse FFN: optional MoE config (fail-closed),
+  per-expert projections reusing dense machinery, GGUF fused-expert
+  byte-range split into per-expert QMatMuls (quantized residency kept),
+  qwen3moe metadata prefix, HF per-expert safetensors naming.
+  Dense-equivalence test (identical experts + normalized top-k = dense
+  function). DONE `cee1f596`.
+- [x] Activation sweep: ModelVariant::Qwen3Moe30bA3bGguf →
+  ModelFamily::Qwen3MoeChat; registration table, loader registry,
+  downloader manifest, prefix_reuse cell (fail-closed),
+  cuda_support cells, conformance, frozen counts 52/76; catalog-disabled.
+  DONE `0c12f366`.
+- [x] Real-process MoE proof: tiny fused-expert GGUF through a real worker
+  over HTTP + public gateway streaming/non-streaming; opened the three
+  runtime gates (chat_sequence_execution, continuous-chat adapter
+  predicate, KV route validation). DONE `6880899d`.
+- [x] A6 expert histograms wired engine-side (count invariant test).
+  DONE `a58eacf0`.
+- [x] B4 long_prompt bench workload (2048–8192 unique-token regime) +
+  repaired stale bench smoke suite (run_one arity). DONE `bb11c7c4`.
+- [x] B1/B2/D1/D3 PD design + page-transfer framing spec
+  (docs/dev/PD_DISAGGREGATION_DESIGN.md). DONE `cf421c57`.
+- [x] B3 loopback KV transfer rig: IZKV1 framing, digest chain, re-keying,
+  bit-identity, tamper rejection. DONE `961d5734`.
+- [x] Plan-doc ledger close. DONE `944aff17`.
+
+Review: verification = izwi-core lib 2687 green, worker all targets green
+(incl. qwen3_moe_process real-process test, kv_transfer_rig),
+http_contract 26 green (mock-worker feature), izwi-server lib 738 green,
+supervisor all targets green (one transient process-test flake green on
+rerun), izwi-cli 72 green, bench python 19 green, clippy clean on
+izwi-core. Honest limits: no real MoE checkpoint validated (activation
+tier); EP/protocol fields deferred; TP and cross-node KV remain
+no-build; fixture GGUF is F32-quantized — real Q4_K expert layouts
+still need activation evidence. See docs/dev/DS10_BEST_EFFORT_GROUNDWORK_PLAN.md.
+
 # Plan — DS9 API completeness for production parity — 2026-09-27
 
 Scope: docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md DS9.1–DS9.4, T40.
