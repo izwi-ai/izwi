@@ -233,7 +233,7 @@ DS10 (register only — no build without entry criteria)
 **Best-effort groundwork plan (2026-09-28):** `docs/dev/DS10_BEST_EFFORT_GROUNDWORK_PLAN.md` —
 proposes a two-tier amendment (groundwork buildable now: MoE runtime core + synthetic fixtures,
 PD design/mock-rig/measurement, KV-transfer framing spec; activation criteria unchanged).
-ADR 0008 recommended before groundwork begins.
+ADR 0008 (accepted) fixes the two-tier posture before groundwork begins.
 
 Maintained as decisions, not tasks:
 
