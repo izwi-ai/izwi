@@ -335,7 +335,7 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Qwen3.8 DeltaNet blocks require independently verified Izwi CUDA causal-convolution coverage with a Candle fallback; Qwen3.5 evidence is not inherited",
             ),
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3MoeChat | ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
                 CudaOperatorCapability::source_reviewed(
                     Operator::Convolution,
                     Provider::NotApplicable,
@@ -352,7 +352,8 @@ impl ModelVariant {
             _ => Provider::CandleFlashAttentionEligible,
         };
         let paged_provider = match family {
-            ModelFamily::Qwen3Chat
+            ModelFamily::Qwen3MoeChat
+            | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
@@ -488,6 +489,7 @@ impl ModelVariant {
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat

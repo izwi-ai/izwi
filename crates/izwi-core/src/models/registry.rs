@@ -295,6 +295,22 @@ fn load_qwen_chat_model(
     )?))
 }
 
+fn load_qwen3_moe_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
+) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
+    )?))
+}
+
 fn load_gemma_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -475,6 +491,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen_chat",
         family: ModelFamily::Qwen3Chat,
         loader: load_qwen_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "qwen3_moe_chat",
+        family: ModelFamily::Qwen3MoeChat,
+        loader: load_qwen3_moe_chat_model,
     },
     ChatLoaderRegistration {
         name: "qwen35_chat",
@@ -5552,6 +5573,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::GraniteSpeechAsr => "granite_speech_asr",
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
+        ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",
         ModelFamily::Qwen35Chat => "qwen35_chat",
         ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",

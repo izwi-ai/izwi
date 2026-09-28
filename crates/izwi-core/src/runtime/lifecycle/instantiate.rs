@@ -48,6 +48,7 @@ impl ModelLifecycleController {
                 InstantiatedPayload::None
             }
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat

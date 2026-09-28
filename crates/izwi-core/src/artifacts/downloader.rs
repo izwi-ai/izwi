@@ -47,6 +47,7 @@ fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
         ModelVariant::Qwen34BGguf => Some("Qwen3-4B-Q4_K_M.gguf"),
         ModelVariant::Qwen38BGguf => Some("Qwen3-8B-Q4_K_M.gguf"),
         ModelVariant::Qwen314BGguf => Some("Qwen3-14B-Q4_K_M.gguf"),
+        ModelVariant::Qwen3Moe30bA3bGguf => Some("Qwen3-30B-A3B-Q4_K_M.gguf"),
         _ => None,
     }
 }
@@ -823,6 +824,7 @@ impl ModelDownloader {
                 .join("diar_streaming_sortformer_4spk-v2.1.nemo")
                 .exists(),
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
@@ -1435,6 +1437,7 @@ impl ModelDownloader {
                 "safety.md".to_string(),
             ],
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat

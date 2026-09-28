@@ -179,6 +179,16 @@ pub enum ModelVariant {
     /// Qwen3 14B text model (GGUF Q4_K_M)
     #[serde(rename = "Qwen3-14B-GGUF")]
     Qwen314BGguf,
+    /// Qwen3 MoE 30B-A3B text model (GGUF; sparse experts, ~3B active params).
+    /// Catalog-disabled until real-checkpoint activation evidence exists
+    /// (DS10 groundwork posture, ADR 0008).
+    #[serde(
+        rename = "Qwen3-30B-A3B-GGUF",
+        alias = "Qwen3-30B-A3B",
+        alias = "unsloth/Qwen3-30B-A3B-GGUF",
+        alias = "Qwen3-30B-A3B-Q4_K_M.gguf"
+    )]
+    Qwen3Moe30bA3bGguf,
     /// Qwen3.5 0.8B multimodal chat model (GGUF Q4_K_M only)
     #[serde(
         rename = "Qwen3.5-0.8B",
@@ -367,6 +377,7 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen/Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen/Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen/Qwen3-14B-GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen/Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "unsloth/Qwen3.5-0.8B-GGUF",
             Self::Qwen352BGguf => "unsloth/Qwen3.5-2B-GGUF",
             Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
@@ -424,6 +435,7 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3 4B GGUF",
             Self::Qwen38BGguf => "Qwen3 8B GGUF",
             Self::Qwen314BGguf => "Qwen3 14B GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen3 MoE 30B-A3B GGUF",
             Self::Qwen3508BGguf => "Qwen3.5 0.8B GGUF",
             Self::Qwen352BGguf => "Qwen3.5 2B GGUF",
             Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
@@ -481,6 +493,7 @@ impl ModelVariant {
             Self::Qwen34BGguf => "Qwen3-4B-GGUF",
             Self::Qwen38BGguf => "Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen3-14B-GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "Qwen3.5-0.8B",
             Self::Qwen352BGguf => "Qwen3.5-2B",
             Self::Qwen354BGguf => "Qwen3.5-4B",
@@ -538,6 +551,7 @@ impl ModelVariant {
             Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
             Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
+            Self::Qwen3Moe30bA3bGguf => 18_600_000_000, // ~17.3 GB Q4_K_M estimate (128 routed experts, ~3B active)
             Self::Qwen3508BGguf => 737_504_352, // local GGUF + mmproj + tokenizer assets
             Self::Qwen352BGguf => 1_949_063_104, // local GGUF + mmproj + tokenizer assets
             Self::Qwen354BGguf => 3_413_361_504, // local GGUF + mmproj + tokenizer assets
@@ -594,6 +608,7 @@ impl ModelVariant {
             Self::Qwen34BGguf => 6.0,
             Self::Qwen38BGguf => 10.0,
             Self::Qwen314BGguf => 16.0,
+            Self::Qwen3Moe30bA3bGguf => 32.0,
             Self::Qwen3508BGguf => 3.5,
             Self::Qwen352BGguf => 5.5,
             Self::Qwen354BGguf => 9.0,
@@ -666,6 +681,7 @@ impl ModelVariant {
         matches!(
             self.family(),
             crate::catalog::ModelFamily::Qwen3Chat
+                | crate::catalog::ModelFamily::Qwen3MoeChat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
@@ -914,6 +930,7 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
@@ -932,6 +949,7 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
@@ -944,7 +962,7 @@ impl ModelVariant {
         )
     }
 
-    /// Whether this is a Qwen3 chat GGUF variant.
+    /// Whether this is a Qwen3 chat GGUF variant (dense or sparse/MoE).
     pub fn is_qwen_chat_gguf(&self) -> bool {
         matches!(
             self,
@@ -953,7 +971,13 @@ impl ModelVariant {
                 | Self::Qwen34BGguf
                 | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
         )
+    }
+
+    /// Whether this is the sparse-expert (MoE) Qwen3 chat GGUF variant.
+    pub fn is_qwen3_moe_chat_gguf(&self) -> bool {
+        matches!(self, Self::Qwen3Moe30bA3bGguf)
     }
 
     /// Whether this is a Qwen3 ASR GGUF variant.
@@ -994,7 +1018,10 @@ impl ModelVariant {
             | Self::Qwen306B4Bit
             | Self::Qwen317B
             | Self::Qwen317B4Bit
-            | Self::Qwen314BGguf => false,
+            | Self::Qwen314BGguf
+            // DS10 groundwork posture (ADR 0008): catalog-disabled until a
+            // real MoE checkpoint is validated on every buildable lane.
+            | Self::Qwen3Moe30bA3bGguf => false,
             Self::Qwen306BGguf
             | Self::Qwen317BGguf
             | Self::Qwen34BGguf
@@ -1070,6 +1097,7 @@ impl ModelVariant {
             Self::Qwen34BGguf,
             Self::Qwen38BGguf,
             Self::Qwen314BGguf,
+            Self::Qwen3Moe30bA3bGguf,
             Self::Qwen3508BGguf,
             Self::Qwen352BGguf,
             Self::Qwen354BGguf,

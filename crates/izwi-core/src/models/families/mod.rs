@@ -64,6 +64,7 @@ const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen38BGguf,
     ModelVariant::Qwen314BGguf,
 ];
+const QWEN3_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3Moe30bA3bGguf];
 const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3508BGguf,
     ModelVariant::Qwen352BGguf,
@@ -206,6 +207,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::Qwen3Chat,
         module_path: "crate::models::architectures::qwen3::chat",
         variants: QWEN3_CHAT_VARIANTS,
+        capabilities: CHAT_CAPABILITIES,
+        fixture_ids: CHAT_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Qwen3MoeChat,
+        module_path: "crate::models::architectures::qwen3::chat",
+        variants: QWEN3_MOE_CHAT_VARIANTS,
         capabilities: CHAT_CAPABILITIES,
         fixture_ids: CHAT_FIXTURES,
     },

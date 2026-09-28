@@ -58,6 +58,7 @@ impl ModelLifecycleController {
                 self.model_registry.unload_diarization(variant).await;
             }
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat

@@ -19,6 +19,7 @@ pub enum ModelFamily {
     GraniteSpeechAsr,
     SortformerDiarization,
     Qwen3Chat,
+    Qwen3MoeChat,
     Qwen35Chat,
     Qwen38Chat,
     Lfm2Chat,
@@ -119,6 +120,7 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
+            Qwen3Moe30bA3bGguf => ModelFamily::Qwen3MoeChat,
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
@@ -144,6 +146,7 @@ impl ModelVariant {
             | ModelFamily::GraniteSpeechAsr => ModelTask::Asr,
             ModelFamily::SortformerDiarization => ModelTask::Diarization,
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat

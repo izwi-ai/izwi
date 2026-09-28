@@ -158,6 +158,20 @@ impl ModelFamily {
                     "no CUDA lane evidence for dense prefix reuse",
                 ),
             },
+            // DS10 groundwork (ADR 0008): the sparse-MoE family shares the
+            // dense qwen3 committed-pages machinery, but per-family evidence
+            // is not collected yet — the cell stays fail-closed until the MoE
+            // fixture correctness suite runs.
+            Self::Qwen3MoeChat => match backend {
+                BackendKind::Cpu | BackendKind::Metal => not_enabled(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "contract declares committed pages; MoE fixture correctness suite pending",
+                ),
+                BackendKind::Cuda => not_enabled(
+                    PrefixReuseEvidenceLevel::NotRun,
+                    "no CUDA lane evidence for sparse-MoE prefix reuse",
+                ),
+            },
             Self::Voxtral => not_enabled(
                 PrefixReuseEvidenceLevel::ContractDeclared,
                 "LM contract declares committed pages; no lane parity evidence yet",
