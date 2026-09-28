@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum JsonState {
+pub(crate) enum JsonState {
     /// Expecting any JSON value (or insignificant whitespace).
     ValueStart,
     /// Directly after `{`: a key string or the closing brace.
@@ -64,7 +64,7 @@ enum JsonState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum JsonContainer {
+pub(crate) enum JsonContainer {
     Object,
     Array,
 }
@@ -75,7 +75,7 @@ enum JsonContainer {
 pub(crate) type JsonStateKey = (JsonState, Option<JsonContainer>);
 
 #[derive(Debug, Clone)]
-pub struct JsonGrammarMachine {
+pub(crate) struct JsonGrammarMachine {
     state: JsonState,
     stack: Vec<JsonContainer>,
     root_seen_value: bool,
@@ -88,7 +88,7 @@ impl Default for JsonGrammarMachine {
 }
 
 impl JsonGrammarMachine {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: JsonState::ValueStart,
             stack: Vec::new(),
@@ -98,13 +98,13 @@ impl JsonGrammarMachine {
 
     /// Whether the document is complete; callers usually restrict the mask to
     /// whitespace and stop tokens in this state.
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.state == JsonState::Complete
     }
 
     /// Whether the machine may stand at the END of the input: complete, or
     /// inside a number (numbers end implicitly without a delimiter).
-    pub fn is_document_terminal(&self) -> bool {
+    pub(crate) fn is_document_terminal(&self) -> bool {
         matches!(
             self.state,
             JsonState::Complete
@@ -116,13 +116,13 @@ impl JsonGrammarMachine {
     }
 
     /// The mask-cache key for the current machine position.
-    pub fn state_key(&self) -> JsonStateKey {
+    pub(crate) fn state_key(&self) -> JsonStateKey {
         (self.state, self.stack.last().copied())
     }
 
     /// Feed one token's surface text. Fails when the text is not a legal
     /// continuation; the machine is left untouched on failure.
-    pub fn feed(&mut self, text: &str) -> Result<(), GrammarError> {
+    pub(crate) fn feed(&mut self, text: &str) -> Result<(), GrammarError> {
         let mut probe = self.clone();
         for ch in text.chars() {
             probe.step(ch)?;
@@ -247,7 +247,7 @@ impl JsonGrammarMachine {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GrammarError;
+pub(crate) struct GrammarError;
 
 fn unicode_digit(ch: char, remaining: u8, back: JsonState) -> Result<JsonState, GrammarError> {
     if !ch.is_ascii_hexdigit() {
@@ -385,7 +385,7 @@ fn end_container(
 /// DS9.2: per-state vocabulary masks, built lazily from token surfaces and
 /// cached per (state, container-top) key. Cheap to clone; the cache is shared
 /// across a sampler's clones.
-pub struct JsonGrammarMasks {
+pub(crate) struct JsonGrammarMasks {
     cache: Mutex<HashMap<JsonStateKey, Arc<Vec<bool>>>>,
 }
 
@@ -406,14 +406,14 @@ impl Clone for JsonGrammarMasks {
 }
 
 impl JsonGrammarMasks {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Build (or fetch) the allowed-token mask for the machine's state.
     /// `surfaces` maps token id → decoded surface text and must cover every
     /// masked position.
-    pub fn mask_for(&self, machine: &JsonGrammarMachine, surfaces: &[String]) -> Arc<Vec<bool>> {
+    pub(crate) fn mask_for(&self, machine: &JsonGrammarMachine, surfaces: &[String]) -> Arc<Vec<bool>> {
         let key = machine.state_key();
         let mut cache = self.cache.lock().expect("grammar mask cache");
         cache
