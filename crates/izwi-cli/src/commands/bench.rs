@@ -611,6 +611,7 @@ struct BenchmarkSummary {
     first_transcript_ms: Option<Stats>,
     inter_transcript_ms: Option<Stats>,
     end_to_end_ms: Option<Stats>,
+    itl_ms: Option<Stats>,
     completion_tps: Option<Stats>,
     server_request_tps: Option<Stats>,
     decode_wall_tps: Option<Stats>,
@@ -1908,6 +1909,16 @@ async fn bench_chat(
             }
         })
         .collect();
+    // DS9.4: mean inter-token latency per streamed request — the decode span
+    // after the first token divided by the tokens that follow it.
+    let itl_ms: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| {
+            let intervals = sample.completion_tokens.saturating_sub(1).max(1) as f64;
+            let decode_ms = sample.total_ms - sample.ttft_ms;
+            (decode_ms.is_finite() && decode_ms > 0.0).then_some(decode_ms / intervals)
+        })
+        .collect();
     let prompt_tokens_avg = samples
         .iter()
         .map(|sample| sample.prompt_tokens as f64)
@@ -1961,6 +1972,14 @@ async fn bench_chat(
             percentile(&total_ms, 0.5),
             percentile(&total_ms, 0.95)
         );
+        if !itl_ms.is_empty() {
+            println!(
+                "  ITL (avg/p50/p95):        {:.2} / {:.2} / {:.2} ms",
+                itl_ms.iter().sum::<f64>() / itl_ms.len() as f64,
+                percentile(&itl_ms, 0.5),
+                percentile(&itl_ms, 0.95)
+            );
+        }
         println!(
             "  Completion TPS (avg/p50/p95): {:.2} / {:.2} / {:.2} tok/s",
             completion_tps.iter().sum::<f64>() / completion_tps.len() as f64,
@@ -2057,6 +2076,7 @@ async fn bench_chat(
             first_transcript_ms: None,
             inter_transcript_ms: None,
             end_to_end_ms: stats(&total_ms),
+            itl_ms: stats(&itl_ms),
             completion_tps: stats(&completion_tps),
             server_request_tps: stats(
                 &samples
@@ -2389,6 +2409,7 @@ async fn bench_tts(
             first_transcript_ms: None,
             inter_transcript_ms: None,
             end_to_end_ms: stats(&times),
+            itl_ms: None,
             completion_tps: None,
             server_request_tps: None,
             decode_wall_tps: None,
@@ -2713,6 +2734,7 @@ async fn bench_asr(
             first_transcript_ms: stats(&first_transcript_ms),
             inter_transcript_ms: stats(&inter_transcript_ms),
             end_to_end_ms: stats(&times),
+            itl_ms: None,
             completion_tps: None,
             server_request_tps: None,
             decode_wall_tps: None,
@@ -2844,6 +2866,7 @@ async fn bench_throughput(
             first_transcript_ms: None,
             inter_transcript_ms: None,
             end_to_end_ms: None,
+            itl_ms: None,
             completion_tps: None,
             server_request_tps: None,
             decode_wall_tps: None,
