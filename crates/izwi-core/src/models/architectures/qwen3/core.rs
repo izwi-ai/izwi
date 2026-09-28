@@ -40,7 +40,9 @@ use crate::models::shared::attention::batched::{
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
-use crate::models::shared::moe::{ExpertSet, SparseMoeConfig, SparseMoeDispatcher};
+use crate::models::shared::moe::{
+    ExpertSet, ExpertActivationCounters, SparseMoeConfig, SparseMoeDispatcher,
+};
 #[cfg(test)]
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
@@ -2381,13 +2383,20 @@ struct Qwen3SparseMlp {
     dispatcher: SparseMoeDispatcher,
     router: Qwen3Projection,
     experts: Vec<Qwen3SparseExpert>,
+    /// Per-step routing histogram (EPLB-style balancer input; DS10 A6).
+    activation_counters: Arc<ExpertActivationCounters>,
 }
 
 impl Qwen3SparseMlp {
+    fn counters(&self) -> Arc<ExpertActivationCounters> {
+        self.activation_counters.clone()
+    }
+
     fn load(cfg: &Qwen3Config, moe: SparseMoeConfig, vb: VarBuilder) -> Result<Self> {
         let moe_intermediate_size = cfg
             .moe_intermediate_size()
             .ok_or_else(|| Error::ModelLoadError("sparse MoE intermediate size missing".into()))?;
+        let counters = Arc::new(ExpertActivationCounters::new(moe.num_experts));
         let router = Qwen3Projection::dense(cfg.hidden_size, moe.num_experts, vb.pp("gate"))?;
         let vb_experts = vb.pp("experts");
         let experts = (0..moe.num_experts)
@@ -2419,9 +2428,11 @@ impl Qwen3SparseMlp {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            dispatcher: SparseMoeDispatcher::new(moe)?,
+            dispatcher: SparseMoeDispatcher::new(moe)?
+                .with_counters(counters.clone()),
             router,
             experts,
+            activation_counters: counters,
         })
     }
 
@@ -2435,6 +2446,7 @@ impl Qwen3SparseMlp {
         let moe_intermediate_size = cfg
             .moe_intermediate_size()
             .ok_or_else(|| Error::ModelLoadError("sparse MoE intermediate size missing".into()))?;
+        let counters = Arc::new(ExpertActivationCounters::new(moe.num_experts));
         let router = Qwen3Projection::quantized(loader, device, &format!("{prefix}.gate.weight"))?;
         let gate_experts = fused_expert_qtensors(
             loader,
@@ -2475,9 +2487,11 @@ impl Qwen3SparseMlp {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            dispatcher: SparseMoeDispatcher::new(moe)?,
+            dispatcher: SparseMoeDispatcher::new(moe)?
+                .with_counters(counters.clone()),
             router,
             experts,
+            activation_counters: counters,
         })
     }
 
@@ -2982,6 +2996,19 @@ impl Qwen3Model {
             .fold(self.lm_head.diagnostics(), |acc, layer| {
                 acc.add(layer.projection_diagnostics())
             })
+    }
+
+    /// Per-layer expert-activation counters of the sparse layers (empty when
+    /// the model is dense). Engine-side telemetry only: protocol exposure is
+    /// deferred to expert-parallel activation (DS10 A6, ADR 0008).
+    pub fn expert_activation_counters(&self) -> Vec<Arc<ExpertActivationCounters>> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.mlp {
+                Qwen3FeedForward::Sparse(sparse) => Some(sparse.counters()),
+                Qwen3FeedForward::Dense(_) => None,
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -3986,13 +4013,16 @@ mod tests {
                 down_proj: test_projection(4, 8, 7, device),
             })
             .collect::<Vec<_>>();
+        let activation_counters = Arc::new(ExpertActivationCounters::new(num_experts));
         let sparse = Qwen3SparseMlp {
             dispatcher: SparseMoeDispatcher::new(
                 cfg.sparse_moe().unwrap().expect("MoE geometry configured"),
             )
-            .unwrap(),
+            .unwrap()
+            .with_counters(activation_counters.clone()),
             router: test_projection(num_experts, 4, 9, device),
             experts,
+            activation_counters,
         };
         let layer = Qwen3Layer {
             input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
@@ -4212,6 +4242,38 @@ mod tests {
             assert_tensor_close(&dense_step, &sparse_step);
             owned_position += 1;
         }
+    }
+
+    #[test]
+    fn managed_qwen3_moe_records_expert_activation_histograms() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_moe_model(&device, 4);
+        let counters = model.expert_activation_counters();
+        assert_eq!(counters.len(), 1, "one sparse layer exposes one counter set");
+        assert_eq!(counters[0].num_experts(), 4);
+        assert_eq!(counters[0].total_selections(), 0);
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        // 4 prompt tokens + 2 decode steps, top-2 routing: 12 selections.
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 5], (1, 4), &device).unwrap();
+        model.forward_managed(&prompt, 0, &mut managed).unwrap();
+        for token in [3u32, 6] {
+            model
+                .forward_managed(
+                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
+                    managed.context_len(),
+                    &mut managed,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            counters[0].total_selections(),
+            12,
+            "every routed token selects exactly experts_per_tok entries"
+        );
+        let snapshot = counters[0].snapshot();
+        assert_eq!(snapshot.iter().sum::<u64>(), 12);
     }
 
     #[test]
