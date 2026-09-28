@@ -8,6 +8,7 @@ pub mod chat;
 pub mod config;
 pub mod grammar;
 pub mod memory;
+pub mod moe;
 pub mod sampling;
 pub mod speculative_sampling;
 pub(crate) mod state;
