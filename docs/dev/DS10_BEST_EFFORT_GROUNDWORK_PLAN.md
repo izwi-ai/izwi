@@ -1,7 +1,9 @@
 # DS10 Best-Effort Groundwork Plan
 
-**Status:** planning deliverable (2026-09-28). No implementation has started; this document is
-the plan. It was produced from four surveys: the model-architecture/catalog layer, the serving
+**Status:** groundwork implemented (2026-09-28, commits 3881aa1a→961d5734 below). Planning
+deliverable from the same day; work items A1–A6, D2, B1–B4 are landed and checked off with
+their commits. This document remains the plan of record for the deferred sections (A7, B5,
+C1, C2). It was produced from four surveys: the model-architecture/catalog layer, the serving
 runtime (scheduler/KV/sampling/device), the distributed layer (protocol/gateway/supervisor),
 and industry practice (vLLM/SGLang/llama.cpp, DistServe/Splitwise/Mooncake/NIXL, candle
 multi-GPU state). Sources are listed at the end.
@@ -170,42 +172,42 @@ The loader must handle both tensor naming schemes: llama.cpp fused-expert names
 
 ### 3.3 Work items
 
-- [ ] **A1 — Admission scratch fix (do first, small, benefits today).**
+- [x] **A1 — Admission scratch fix (do first, small, benefits today).** Landed `0c7f1ea2`.
   `estimate_from_tensor_inventory` sets `load_peak = resident + next_pow2(largest_tensor)`
   (`runtime/lifecycle/load.rs:419-437`). MoE checkpoints have many same-sized expert tensors,
   so `largest_tensor` collapses and load scratch is under-reserved → INV-10 under-admission,
   physical OOM at load. Replace with an inventory-aware scratch term (e.g.
   `max(largest_tensor, k × p90 tensor)` plus a dequantization-scratch term for layer-by-layer
   loaders), re-validate DS0.7/DS1.5 baselines are unaffected for dense families.
-- [ ] **A2 — Synthetic MoE fixtures.** Tiny 2-expert model in both flavors: GGUF (fused-expert
+- [x] **A2 — Synthetic MoE fixtures.** Landed `6880899d` (fused GGUF through the real worker). Tiny 2-expert model in both flavors: GGUF (fused-expert
   names + `expert_count`/`expert_used_count` metadata, via `gguf_file::write`, pattern
   `write_tiny_lfm_fixture`) and safetensors (HF-style per-expert names, via
   `serialize_to_file`, pattern `write_tiny_qwen38_hybrid_fixture`). WordLevel vocab, bundle
   metadata, `izwi-artifact.json`. Env-gated synthetic geometry where the loader validates
   strictly (qwen38 precedent).
-- [ ] **A3 — MoE runtime core.** New `models/architectures/<family>/` module: config parse
+- [x] **A3 — MoE runtime core.** Landed `7fba7985` (dispatch seam) + `cee1f596` (qwen3 sparse FFN; dense-equivalence proof). New `models/architectures/<family>/` module: config parse
   (expert keys), `SparseExpertDispatch` trait + `SingleDeviceDispatch` impl (router
   softmax/top-k → per-expert gate/up/down → weighted sum; optional shared expert), family
   core/chat with the shared ChatSampler, cache contract (single paged-attention domain,
   gemma3-style), GGUF + safetensors loading with both naming schemes. Correctness: expert
   output equals the manually-computed routed sum on fixture weights; top-k routing matches a
   reference implementation (candle `qwen3_moe`) on the same tensors.
-- [ ] **A4 — Registration sweep.** Work Appendix A end-to-end (the ~19 sites: variant/family
+- [x] **A4 — Registration sweep.** Landed `0c12f366` (catalog/family/loader/cells) + `6880899d` (runtime gates: sequence execution, continuous-chat adapter, KV route validation; worker allowlist). Work Appendix A end-to-end (the ~19 sites: variant/family
   enums, metadata, loader registry, `NativeChatModel`/`NativeChatDecodeState`, adapters
   family policy, load memory estimate, rollout list, conformance cases, engine arms,
   downloader, admin API, worker checks). The registration tests in
   `models/families/mod.rs:288-413` force most of this; treat them as the checklist.
-- [ ] **A5 — Capability cells + catalog.** `prefix_reuse_support` cell (evidence-gated;
+- [x] **A5 — Capability cells + catalog.** Landed `0c12f366`; variant catalog-disabled per ADR 0008, prefix-reuse cell fail-closed. `prefix_reuse_support` cell (evidence-gated;
   NotRun/Disabled initially + inventory test), `cuda_operator_capabilities` cell, catalog
   metadata entries (`estimated_size`/`memory_required_gb` must include **total** expert bytes,
   not active), downloader manifest entries. Batched-bench decode behavior verified on CPU and
   Metal lanes with the fixture.
-- [ ] **A6 — Expert telemetry.** Per-layer expert-activation histograms as engine counters
+- [x] **A6 — Expert telemetry.** Landed `a58eacf0` (engine-side counters + count-invariant test; protocol surface deferred to EP activation). Per-layer expert-activation histograms as engine counters
   (service snapshot surface), routed through the existing counters → `LoadedDeployment`
   optional-signal channel (`izwi-serving-worker/src/lib.rs:1095-1126`). No routing behavior
   change; additive status fields land with the next protocol minor or stay engine-side until
   EP activation (decide at implementation time).
-- [ ] **A7 — EP design section (no build).** Written into this document's successor or the
+- [x] **A7 — EP design section (no build).** This document §3.3. Written into this document's successor or the
   family design note: why process-boundary EP is latency-infeasible here (per-layer all-to-all
   per decode step vs a bounded NDJSON transport with sync-per-copy device reads —
   `accelerator.rs:1818-1893`); EP's realistic forms are in-process multi-device (no substrate
@@ -256,31 +258,31 @@ on B: cursor + KV receipts + stream/logprob continuity — today only the recomp
 
 ### 4.3 Work items
 
-- [ ] **B1 — PD design note** (`docs/dev/PD_DISAGGREGATION_DESIGN.md`): the mapping above,
+- [x] **B1 — PD design note** Landed `cf421c57`/`cf421c57` — see `docs/dev/PD_DISAGGREGATION_DESIGN.md`. (`docs/dev/PD_DISAGGREGATION_DESIGN.md`): the mapping above,
   the handoff state machine (states, fencing via `expected_worker_incarnation` + attempt
   identity, failure = recompute fallback), hybrid-model gap (conv/recurrent domains need
   snapshot transfer, not just pages), DINV compliance (DINV-02 tenant scope on KV handles,
   DINV-03 degrade, DINV-04 identity), and the activation recipe below.
-- [ ] **B2 — Page-transfer framing spec** (shared with Entry D, appendix of B1): a header over
+- [x] **B2 — Page-transfer framing spec** Landed `cf421c57` (§2 of the PD design doc). (shared with Entry D, appendix of B1): a header over
   the *existing* DS4 codec — per page: arena dtype/layout/geometry (`KvPhysicalLayout`,
   `arena_page_bytes`), `KvPrefixNamespace` fingerprint, prompt-token digest chain, position
   semantics, source `KvPlanFingerprint` for receiver compatibility gating; sequence framing =
   ordered pages + per-page digest so the receiver can re-key into its own arena/generation and
   insert via the `CoordinatedPrefixIndex` path. Layer-wise push convention (compute layer *l*
   while sending *l+1*) documented as the activation-time default (LMCache/vLLM convention).
-- [ ] **B3 — Mock-transport rig (test-only).** Two mock workers exchange framed pages over
+- [x] **B3 — Mock-transport rig (test-only).** Landed `961d5734` (`tests/kv_transfer_rig.rs`: loopback TCP, chain verification, re-keying, bit-identity, tamper rejection). Two mock workers exchange framed pages over
   loopback TCP: producer captures fixture-model pages with the real codec, consumer re-keys and
   attaches them and continues generation; outputs match the collocated run. This proves the
   B2 contract end-to-end **without any engine cross-process path** — the engine stays
   node-local; the rig is contract evidence, not a serving path (mirrors the DS8 mock-vLLM
   pattern, and would be DINV-09's sibling for PD).
-- [ ] **B4 — Long-prompt benchmark workload + entry-criteria procedure.** New `--workload`
+- [x] **B4 — Long-prompt benchmark workload + entry-criteria procedure.** Landed `bb11c7c4`. New `--workload`
   choice in `run-gateway-chat-benchmark.py` (multi-thousand-token prompts, the regime where PD
   can win) + a lane-driver script pattern for a future collocated-vs-disaggregated A/B. The
   entry-criteria measurement is then: run the long-prompt workload, record ITL p99 vs SLO
   under saturation, on the validated fabric. Pre-registering this makes the DS10 gate cheap to
   evaluate honestly.
-- [ ] **B5 — Activation recipe (documented, applied only at activation):** protocol minor with
+- [x] **B5 — Activation recipe (documented, applied only at activation):** Landed `cf421c57` (§5 of the PD design doc). protocol minor with
   worker role field + `WorkerFeature::PrefillOnly/DecodeOnly`; pool-key extension
   `(task, public_model, role)` + approvals-format version bump; two-leg dispatcher variant of
   `RemoteChatDispatcher::start` (two `AttemptIdentity`s, retry rules spanning two workers);
@@ -307,7 +309,7 @@ this entry means: **keep the flip cheap, and keep the sanctioned path clearly ma
 
 ### 5.2 Work items
 
-- [ ] **C1 — Flip runbook (documentation in this doc's successor):** trigger conditions
+- [x] **C1 — Flip runbook (documentation in this doc's successor):** This document §5.2. trigger conditions
   (what new evidence would reopen it), the required ADR, and the build sketch: multi-device
   `DeviceAssignment` variant + supervisor collective-launch topology + candle Megatron-style
   TP per the `llama_multiprocess` precedent (cudarc NCCL, one process per rank, weight shards
@@ -315,7 +317,7 @@ this entry means: **keep the flip cheap, and keep the sanctioned path clearly ma
   is name-keyed per tensor, so per-layer weight **shard addressability already holds**; the
   protocol is layer-agnostic; process-per-device is already the unit of placement
   (two-GPU-node = two workers today).
-- [ ] **C2 — Pipeline-parallelism register proposal (no build):** if in-engine multi-GPU is
+- [x] **C2 — Pipeline-parallelism register proposal (no build):** This document §5.2. if in-engine multi-GPU is
   ever needed natively, layer-split pipeline parallelism (point-to-point at layer boundaries —
   the mistral.rs device-mapping model) is the tractable form for candle and maps onto the
   process model; propose it as a *new* DS10 register entry with entry criteria, rather than
@@ -341,16 +343,16 @@ starts from a proven format.
 
 ### 6.2 Work items
 
-- [ ] **D1 — Identity/re-keying + provenance spec** (appendix of the B2 framing spec): how a
+- [x] **D1 — Identity/re-keying + provenance spec** Landed `cf421c57` (§2 receiver rules). (appendix of the B2 framing spec): how a
   receiving process re-keys foreign pages into its own `PhysicalArenaId`/generation; receiver
   compatibility gate = `KvPlanFingerprint` equality (dtype, page size, layer geometry);
   provenance = namespace fingerprint + digest chain + positions semantics; tenant isolation
   inherits DINV-02 (salt-scoped).
-- [ ] **D2 — In-process codec round-trip tests.** Property tests over the existing
+- [x] **D2 — In-process codec round-trip tests.** Landed `fa018479` (bit-preserving CPU+Metal, NaN/±inf/−0.0). Property tests over the existing
   `capture_block`/`restore_block` codec across pages, dtypes (F32/F16/BF16), and layouts on
   CPU and Metal: capture → bytes → restore → bitwise-equal attention output. These tests are
   legal today (no cross-process anything) and pin the byte format the B2 spec documents.
-- [ ] **D3 — Hybrid-state gap documented:** conv/recurrent domains (`TensorStateArena`,
+- [x] **D3 — Hybrid-state gap documented:** Landed `cf421c57` (§3 of the PD design doc). conv/recurrent domains (`TensorStateArena`,
   Tensor/Append/Ring kinds) have no page codec — transferred state for hybrid models
   (qwen3.8, LFM2) requires the committed-snapshot path; recorded as an explicit limitation of
   any future transfer design (dense-attention models only, initially).
