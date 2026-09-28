@@ -3363,19 +3363,22 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
-            let (preferred_decode_tokens, sustained_decode_quantum) = request
-                .prepared_chat_model_for_executor()
-                .ok()
-                .and_then(|model| match model.as_ref() {
-                    NativeChatModel::Qwen38(model) => Some((
-                        model.preferred_decode_tokens(),
-                        model.sustained_cuda_mtp_quantum(),
-                    )),
-                    _ => None,
-                })
-                .unwrap_or((1, false));
+            let (preferred_decode_tokens, sustained_decode_quantum, speculative_decode_batch) =
+                request
+                    .prepared_chat_model_for_executor()
+                    .ok()
+                    .and_then(|model| match model.as_ref() {
+                        NativeChatModel::Qwen38(model) => Some((
+                            model.preferred_decode_tokens(),
+                            model.sustained_cuda_mtp_quantum(),
+                            model.mtp_in_continuous_enabled(),
+                        )),
+                        _ => None,
+                    })
+                    .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
+            profile.speculative_decode_batch = speculative_decode_batch;
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the

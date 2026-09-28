@@ -212,6 +212,15 @@ fn cache(model_layer: u32) -> PhysicalPagedKvCache {
 }
 
 fn start(model: &Qwen38ChatModel, temperature: f32) -> ChatDecodeState {
+    start_with_caches(model, temperature, cache(0), Some(cache(1)))
+}
+
+fn start_with_caches(
+    model: &Qwen38ChatModel,
+    temperature: f32,
+    text: PhysicalPagedKvCache,
+    mtp: Option<PhysicalPagedKvCache>,
+) -> ChatDecodeState {
     let config = ChatGenerationConfig {
         temperature,
         top_p: 0.9,
@@ -227,8 +236,57 @@ fn start(model: &Qwen38ChatModel, temperature: f32) -> ChatDecodeState {
         next_text_position: 2,
     };
     model
-        .start_decode_state_physical(&[], 12, &config, Some(&prepared), cache(0), Some(cache(1)))
+        .start_decode_state_physical(&[], 12, &config, Some(&prepared), text, mtp)
         .unwrap()
+}
+
+/// DS9.4: two MTP caches carved from one arena with disjoint page halves,
+/// mirroring the managed pool layout the executor hands to continuous rows.
+/// `forward_steps_batch` lowers one slot map across all rows' caches, which
+/// only exists when the rows share the arena (and its free-slot allocation).
+fn shared_mtp_caches() -> [PhysicalPagedKvCache; 2] {
+    let id = KvArenaId {
+        model_instance: ModelInstanceId::new(91),
+        backend: BackendKind::Cpu,
+        device_ordinal: None,
+        generation: 1,
+    };
+    let group = KvGroupId::new(1);
+    let binding = KvLayerBinding {
+        model_layer: 1,
+        physical_layer: 0,
+    };
+    let arena = Arc::new(
+        CpuKvArena::new(KvArenaConfig {
+            id,
+            group,
+            page_tokens: 4,
+            capacity_pages: 8,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding,
+                num_kv_heads: 1,
+                key_head_dim: 2,
+                value_head_dim: 2,
+            }],
+        })
+        .unwrap(),
+    );
+    let blocks = |start: u32| -> Vec<CacheBlockRef> {
+        (start..start + 4)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect()
+    };
+    [
+        PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks(0), 0).unwrap(),
+        PhysicalPagedKvCache::new(arena, vec![binding], blocks(4), 0).unwrap(),
+    ]
 }
 
 fn reservation(cache: &PhysicalPagedKvCache) -> PhysicalPagedKvCache {
@@ -267,6 +325,48 @@ fn poison_mtp_cache(state: &ChatDecodeState) {
         .unwrap()
         .wait()
         .unwrap();
+}
+
+#[test]
+fn speculative_batch_commits_the_solo_mtp_sequence_per_row() {
+    // DS9.4: a shared speculative envelope must commit exactly the tokens the
+    // solo rounds commit for the same request, for every row in the envelope,
+    // including ragged exits when one row finishes before the other.
+    let model = model_fixture(false);
+    for temperature in [0.0, 0.8] {
+        let mut solo_a = start(&model, temperature);
+        let mut solo_b = start(&model, temperature);
+        let [mtp_a, mtp_b] = shared_mtp_caches();
+        let mut batch_a = start_with_caches(&model, temperature, cache(0), Some(mtp_a));
+        let mut batch_b = start_with_caches(&model, temperature, cache(0), Some(mtp_b));
+        // A short output cap makes row B exit raggedly mid-envelope, before
+        // row A reaches its own (much longer) limit. Both sides carry it so
+        // the parity comparison sees the same request.
+        solo_b.max_new_tokens = 3;
+        batch_b.max_new_tokens = 3;
+        for _ in 0..4 {
+            model.decode_quantum(&mut solo_a, 3).unwrap();
+            model.decode_quantum(&mut solo_b, 3).unwrap();
+            let batch_b_finished = batch_b.finished;
+            let mut envelope = vec![&mut batch_a, &mut batch_b];
+            let steps = model.decode_speculative_batch(&mut envelope, 3).unwrap();
+            assert_eq!(steps.len(), 2);
+            assert_eq!(steps[0].tokens_generated, batch_a.tokens_generated);
+            assert_eq!(steps[1].tokens_generated, batch_b.tokens_generated);
+            if batch_b_finished {
+                assert!(steps[1].finished);
+            }
+        }
+        assert_eq!(batch_a.generated_ids, solo_a.generated_ids, "greedy/sampled row A must match solo");
+        assert_eq!(batch_a.physical_kv.context_len(), solo_a.physical_kv.context_len());
+        assert_eq!(
+            batch_a.mtp_physical_kv.as_ref().unwrap().context_len(),
+            solo_a.mtp_physical_kv.as_ref().unwrap().context_len()
+        );
+        assert_eq!(batch_b.generated_ids, solo_b.generated_ids, "row B must match solo");
+        assert_eq!(batch_b.tokens_generated, solo_b.tokens_generated);
+        assert!(batch_b.finished, "row B must exit raggedly");
+    }
 }
 
 #[test]

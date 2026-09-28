@@ -831,12 +831,28 @@ impl NativeExecutor {
         if scheduled.is_empty()
             || scheduled
                 .iter()
-                .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+                .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens < 1)
         {
             return Err(Error::InvalidInput(
-                "continuous chat execution requires one decode token per row".to_string(),
+                "continuous chat execution requires a positive decode token count per row".to_string(),
             ));
         }
+        // DS9.4: a speculative envelope is homogeneous — every row carries the
+        // same multi-token quantum. Mixed widths cannot arise because the
+        // quantum gates are per-model and per-step global.
+        let speculative_width = {
+            let width = scheduled[0].num_tokens;
+            if width > 1
+                && scheduled
+                    .iter()
+                    .any(|scheduled| scheduled.num_tokens != width)
+            {
+                return Err(Error::InvalidInput(
+                    "continuous chat execution requires homogeneous speculative quanta".to_string(),
+                ));
+            }
+            (width > 1).then_some(width)
+        };
         if managed_caches.len() != scheduled.len() {
             return Err(Error::InvalidInput(
                 "continuous chat managed-cache rows do not match batch width".to_string(),
@@ -1008,7 +1024,19 @@ impl NativeExecutor {
             .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
             .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
-        let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
+        let steps = match speculative_width {
+            Some(budget) => {
+                if !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+                    return Err(Error::InvalidInput(
+                        "speculative envelopes require the Qwen3.8 MTP model".to_string(),
+                    ));
+                }
+                Self::run_blocking(|| {
+                    model.decode_speculative_batch(&mut state_refs, budget)
+                })?
+            }
+            None => Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?,
+        };
         drop(state_refs);
         if steps.len() != active_states.rows.len() {
             return Err(Error::InferenceError(

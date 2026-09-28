@@ -566,6 +566,10 @@ struct RequestCachePolicy {
     cache_release_safe: bool,
     preferred_decode_tokens: usize,
     sustained_decode_quantum: bool,
+    /// DS9.4: the loaded model can run shared speculative envelopes, so
+    /// multi-token quanta are granted inside continuous batches (not only
+    /// solo) subject to the fairness gates.
+    speculative_decode_batch: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -580,6 +584,7 @@ impl Default for RequestCachePolicy {
             cache_release_safe: false,
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
+            speculative_decode_batch: false,
         }
     }
 }
@@ -953,6 +958,7 @@ impl Scheduler {
             cache_release_safe: profile.cache_release_safe,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
+            speculative_decode_batch: profile.speculative_decode_batch,
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -1276,6 +1282,7 @@ impl Scheduler {
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
                     metadata.cache_policy.preferred_decode_tokens,
                     metadata.cache_policy.sustained_decode_quantum,
+                    metadata.cache_policy.speculative_decode_batch,
                 ))
             })
             .collect();
@@ -1363,6 +1370,7 @@ impl Scheduler {
             continuous_decode,
             preferred_decode_tokens,
             sustained_decode_quantum,
+            speculative_decode_batch,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1392,6 +1400,7 @@ impl Scheduler {
                 preferred_decode_tokens,
                 continuous_decode,
                 sustained_decode_quantum,
+                speculative_decode_batch,
             );
             if num_tokens == 0 {
                 continue;
@@ -3153,21 +3162,30 @@ impl Scheduler {
         preferred_decode_tokens: usize,
         continuous_decode: bool,
         sustained_decode_quantum: bool,
+        speculative_decode_batch: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         let preferred_decode_tokens = preferred_decode_tokens.max(1);
         if continuous_decode {
-            let exact_solo = self.running.len() == 1
-                && self
-                    .running
-                    .values()
-                    .filter(|request| request.prefill_complete)
-                    .count()
-                    == 1
-                && !has_waiting_work
-                && (overdue_ms <= 0.0 || sustained_decode_quantum);
-            if exact_solo && preferred_decode_tokens > 1 {
-                return preferred_decode_tokens.min(base).max(1);
+            if preferred_decode_tokens > 1 {
+                // DS9.4: MTP-eligible rows keep their speculative quanta in
+                // continuous batches only when the loaded model opted in; the
+                // fairness gates still collapse them to one token while work
+                // is waiting or the row is overdue. Without the opt-in the
+                // quanta remain exact-solo.
+                let fairness_clear =
+                    !has_waiting_work && (overdue_ms <= 0.0 || sustained_decode_quantum);
+                let exact_solo = self.running.len() == 1
+                    && self
+                        .running
+                        .values()
+                        .filter(|request| request.prefill_complete)
+                        .count()
+                        == 1;
+                if fairness_clear && (speculative_decode_batch || exact_solo) {
+                    return preferred_decode_tokens.min(base).max(1);
+                }
+                return 1.min(base);
             }
             return 1.min(base);
         }
@@ -3493,6 +3511,7 @@ mod tests {
                 cache_release_safe: false,
                 preferred_decode_tokens: 1,
                 sustained_decode_quantum: false,
+                speculative_decode_batch: false,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
@@ -5381,6 +5400,56 @@ mod tests {
         let decode = scheduler.schedule();
         assert_eq!(decode.decode_requests.len(), 1);
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
+    }
+
+    #[test]
+    fn speculative_quanta_survive_continuous_batches_only_when_opted_in() {
+        // DS9.4: two concurrent decodable rows that cannot claim exact-solo
+        // keep their MTP quanta in a continuous batch only when the loaded
+        // model opted in via its execution profile; otherwise the fairness
+        // gates collapse every shared row to one token.
+        for (speculative_decode_batch, expected) in [(true, 4usize), (false, 1usize)] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 2,
+                max_tokens_per_step: 8,
+                min_tokens_per_step: 1,
+                enable_adaptive_batching: false,
+                enable_decode_quanta: false,
+                ..Default::default()
+            });
+            for name in ["spec-quanta-a", "spec-quanta-b"] {
+                let request_id = name.to_string();
+                let mut request = EngineCoreRequest::tts("hello");
+                request.id = request_id.clone();
+                request.prompt_tokens = vec![1];
+                assert!(scheduler.add_request(&request));
+                allow_incremental_prefill(&mut scheduler, &request_id);
+                let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+                let mut profile =
+                    ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.preferred_decode_tokens = 4;
+                profile.speculative_decode_batch = speculative_decode_batch;
+                assert!(scheduler
+                    .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+            }
+
+            let first = scheduler.schedule();
+            assert_eq!(first.prefill_requests.len(), 2);
+            for name in ["spec-quanta-a", "spec-quanta-b"] {
+                scheduler.update_after_step(&name.to_string(), 1, 1, 1.0);
+            }
+
+            let decode = scheduler.schedule();
+            assert_eq!(decode.decode_requests.len(), 2);
+            assert!(
+                decode
+                    .decode_requests
+                    .iter()
+                    .all(|request| request.num_tokens == expected),
+                "opted-in={speculative_decode_batch}: expected every shared row to be granted {expected} tokens"
+            );
+        }
     }
 
     #[test]

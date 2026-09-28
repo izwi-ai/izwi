@@ -5239,6 +5239,45 @@ impl NativeChatModel {
         })
     }
 
+    /// DS9.4: one shared speculative envelope over continuous rows. Only the
+    /// Qwen3.8 MTP model supports it; other families reject the route.
+    pub(crate) fn decode_speculative_batch(
+        &self,
+        states: &mut [&mut NativeChatDecodeState],
+        input_budget: usize,
+    ) -> Result<Vec<NativeChatDecodeStep>> {
+        let Self::Qwen38(model) = self else {
+            return Err(Error::InvalidInput(
+                "speculative envelopes require the Qwen3.8 MTP model".into(),
+            ));
+        };
+        let mut typed = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            match &mut **state {
+                NativeChatDecodeState::Qwen38(state) => typed.push(state),
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 speculative envelope received another model's state".into(),
+                    ))
+                }
+            }
+        }
+        let steps = model.decode_speculative_batch(&mut typed, input_budget)?;
+        let mut out = Vec::with_capacity(steps.len());
+        for (step, state) in steps.into_iter().zip(typed.iter_mut()) {
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
+            out.push(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+                logprobs,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn decode_step_batch(
         &self,
         states: &mut [&mut NativeChatDecodeState],
