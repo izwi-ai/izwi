@@ -256,6 +256,10 @@ impl From<MistralConfig> for Qwen3Config {
             use_sliding_window: cfg.use_sliding_window,
             ada_rms_norm_t_cond: cfg.ada_rms_norm_t_cond,
             ada_rms_norm_t_cond_dim: cfg.ada_rms_norm_t_cond_dim,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
         }
     }
 }

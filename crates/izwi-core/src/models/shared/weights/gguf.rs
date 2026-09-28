@@ -8,7 +8,7 @@
 //! to be loaded from either safetensors or GGUF formats with minimal code changes.
 
 use candle_core::quantized::gguf_file::{Content as GgufContent, Value as GgufValue};
-use candle_core::quantized::QTensor;
+use candle_core::quantized::{QStorage, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
@@ -462,15 +462,58 @@ where
 
 /// Check if a file is in GGUF format by examining the magic bytes.
 pub fn is_gguf_file(path: &Path) -> bool {
-    if let Ok(mut file) = std::fs::File::open(path) {
-        use std::io::Read;
-        let mut magic = [0u8; 4];
-        if file.read_exact(&mut magic).is_ok() {
-            // GGUF magic: 'GGUF' in little-endian
-            return magic == [0x47, 0x47, 0x55, 0x46]; // "GGUF"
-        }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_ok() {
+        // GGUF magic: 'GGUF' in little-endian
+        return magic == [0x47, 0x47, 0x55, 0x46]; // "GGUF"
     }
     false
+}
+
+/// Split one fused GGUF expert tensor into per-expert 2D `QTensor`s without
+/// dequantizing. Fused llama.cpp expert tensors (`ffn_{gate,up,down}_exps`)
+/// store each expert's quantized blocks contiguously along the leading
+/// dimension, so a per-expert view is a byte-range re-wrap at full quantized
+/// fidelity — residency stays quantized and the dispatcher can apply experts
+/// one at a time with plain per-expert matmuls.
+pub fn split_fused_expert_qtensor(
+    fused: &QTensor,
+    num_experts: usize,
+    expert_rows: usize,
+    expert_cols: usize,
+) -> Result<Vec<QTensor>> {
+    let expected = [num_experts, expert_rows, expert_cols];
+    if fused.shape().dims() != expected {
+        return Err(Error::ModelLoadError(format!(
+            "fused GGUF expert tensor shape {:?} does not match the MoE geometry {expected:?}",
+            fused.shape().dims()
+        )));
+    }
+    let dtype = fused.dtype();
+    let device = fused.device();
+    let data = fused.data()?;
+    if num_experts == 0 || data.len() % num_experts != 0 {
+        return Err(Error::ModelLoadError(format!(
+            "fused GGUF expert tensor of {} bytes does not divide evenly across {num_experts} experts",
+            data.len()
+        )));
+    }
+    let expert_bytes = data.len() / num_experts;
+    (0..num_experts)
+        .map(|expert| {
+            let range = expert * expert_bytes..(expert + 1) * expert_bytes;
+            let storage = QStorage::from_data(
+                std::borrow::Cow::Borrowed(&data[range]),
+                &device,
+                dtype,
+            )?;
+            QTensor::new(storage, (expert_rows, expert_cols)).map_err(Error::from)
+        })
+        .collect()
 }
 
 /// Helper function to format GGUF metadata values for display.

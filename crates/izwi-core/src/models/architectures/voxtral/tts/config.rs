@@ -238,6 +238,10 @@ impl VoxtralTtsConfig {
             use_sliding_window: self.sliding_window.unwrap_or(0) > 0,
             ada_rms_norm_t_cond: false,
             ada_rms_norm_t_cond_dim: 0,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
         }
     }
 

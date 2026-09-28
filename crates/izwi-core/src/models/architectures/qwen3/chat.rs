@@ -821,18 +821,34 @@ fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
 }
 
 fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
+    // Qwen3-MoE checkpoints carry the "qwen3moe" architecture id with MoE
+    // expert keys; dense checkpoints use "qwen3". Accept both prefixes so one
+    // parser serves the family.
+    let arch = ["qwen3moe", "qwen3"]
+        .into_iter()
+        .find(|arch| loader.get_metadata_u64(&format!("{arch}.block_count")).is_some())
+        .ok_or_else(|| {
+            Error::ModelLoadError("Missing or invalid GGUF metadata: qwen3.block_count".to_string())
+        })?;
     let required_usize = |key: &str| {
         loader
-            .get_metadata_u64(key)
+            .get_metadata_u64(&format!("{arch}.{key}"))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| {
-                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
+                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {arch}.{key}"))
             })
     };
+    let optional_usize = |key: &str| {
+        loader
+            .get_metadata_u64(&format!("{arch}.{key}"))
+            .and_then(|value| usize::try_from(value).ok())
+    };
     let required_f64 = |key: &str| {
-        loader.get_metadata_f64(key).ok_or_else(|| {
-            Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
-        })
+        loader
+            .get_metadata_f64(&format!("{arch}.{key}"))
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {arch}.{key}"))
+            })
     };
     let vocab_size = loader
         .get_metadata_array_len("tokenizer.ggml.tokens")
@@ -842,18 +858,25 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
             )
         })?;
 
+    let num_experts = optional_usize("expert_count");
+    let num_experts_per_tok = optional_usize("expert_used_count");
+    let moe_intermediate_size = optional_usize("expert_feed_forward_length");
+    let norm_topk_prob = loader
+        .get_metadata_f64(&format!("{arch}.norm_topk_prob"))
+        .map(|value| value != 0.0);
+
     Ok(Qwen3Config {
-        hidden_size: required_usize("qwen3.embedding_length")?,
-        intermediate_size: required_usize("qwen3.feed_forward_length")?,
-        num_attention_heads: required_usize("qwen3.attention.head_count")?,
-        num_hidden_layers: required_usize("qwen3.block_count")?,
-        num_key_value_heads: required_usize("qwen3.attention.head_count_kv")?,
-        max_position_embeddings: Some(required_usize("qwen3.context_length")?),
+        hidden_size: required_usize("embedding_length")?,
+        intermediate_size: required_usize("feed_forward_length")?,
+        num_attention_heads: required_usize("attention.head_count")?,
+        num_hidden_layers: required_usize("block_count")?,
+        num_key_value_heads: required_usize("attention.head_count_kv")?,
+        max_position_embeddings: Some(required_usize("context_length")?),
         head_dim: loader
-            .get_metadata_u64("qwen3.attention.key_length")
+            .get_metadata_u64(&format!("{arch}.attention.key_length"))
             .and_then(|value| usize::try_from(value).ok()),
-        rms_norm_eps: required_f64("qwen3.attention.layer_norm_rms_epsilon")?,
-        rope_theta: required_f64("qwen3.rope.freq_base")?,
+        rms_norm_eps: required_f64("attention.layer_norm_rms_epsilon")?,
+        rope_theta: required_f64("rope.freq_base")?,
         vocab_size,
         lm_head_size: None,
         tie_word_embeddings: !loader.has_tensor("output.weight"),
@@ -862,6 +885,10 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
         use_sliding_window: false,
         ada_rms_norm_t_cond: false,
         ada_rms_norm_t_cond_dim: 0,
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        norm_topk_prob,
     })
 }
 

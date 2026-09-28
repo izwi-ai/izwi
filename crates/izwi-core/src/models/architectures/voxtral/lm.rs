@@ -1034,6 +1034,10 @@ mod tests {
             use_sliding_window: false,
             ada_rms_norm_t_cond: false,
             ada_rms_norm_t_cond_dim: 0,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
         }
     }
 
