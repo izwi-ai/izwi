@@ -876,7 +876,8 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
     metadata.capability == CapabilityKind::Chat
         && matches!(
             metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3Chat
+            crate::catalog::ModelFamily::Qwen3MoeChat
+                | crate::catalog::ModelFamily::Qwen3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Qwen38Chat

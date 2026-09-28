@@ -569,8 +569,11 @@ impl WorkerProcessConfig {
                     .with_context(|| format!("parse IZWI_WORKER_MODEL={model}"))?;
                 if variant != ModelVariant::Lfm2512BInstructGguf
                     && variant != ModelVariant::Qwen3827BFp8
+                    && variant != ModelVariant::Qwen3Moe30bA3bGguf
                 {
-                    bail!("serving worker supports only LFM2.5-1.2B-Instruct-GGUF and Qwen3.8-27B-FP8 for chat");
+                    bail!(
+                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, Qwen3.8-27B-FP8, and Qwen3-30B-A3B-GGUF for chat"
+                    );
                 }
                 variant
             }

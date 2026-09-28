@@ -77,7 +77,8 @@ pub(crate) fn validate_managed_state_plan_eligibility(
     let route_validated = matches!(
         (variant.family(), capability),
         (
-            ModelFamily::Qwen3Chat
+            ModelFamily::Qwen3MoeChat
+                | ModelFamily::Qwen3Chat
                 | ModelFamily::Qwen35Chat
                 | ModelFamily::Qwen38Chat
                 | ModelFamily::Gemma3Chat

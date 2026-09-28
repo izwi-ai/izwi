@@ -134,6 +134,154 @@ pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
     model_dir
 }
 
+/// Tiny genuine Qwen3-MoE GGUF: one decoder layer whose FFN is a 2-expert
+/// sparse block with llama.cpp fused expert tensors (`ffn_gate_inp` router,
+/// `ffn_{gate,up,down}_exps` fused `[n_expert, n_ff, hidden]`), the
+/// `qwen3moe.*` metadata prefix, and the im_start/im_end chat tokenizer. This
+/// exercises the real sparse-expert load and dispatch path (DS10 groundwork)
+/// without downloading the 30.5B artifact.
+pub fn write_tiny_qwen3_moe_fixture(models_dir: &Path) -> PathBuf {
+    let model_dir = models_dir.join("Qwen3-30B-A3B-GGUF");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let tokenizer = tokenizers::Tokenizer::new(
+        tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                [
+                    ("<|pad|>".to_string(), 0),
+                    ("<|im_start|>".to_string(), 1),
+                    ("<|im_end|>".to_string(), 2),
+                    ("a".to_string(), 3),
+                    ("b".to_string(), 4),
+                    ("Ã".to_string(), 5),
+                    ("©".to_string(), 6),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("<|pad|>".to_string())
+            .build()
+            .unwrap(),
+    );
+    tokenizer
+        .save(model_dir.join("tokenizer.json"), false)
+        .unwrap();
+    std::fs::write(
+        model_dir.join("tokenizer_config.json"),
+        r#"{"added_tokens_decoder":{"0":{"content":"<|pad|>","special":true},"1":{"content":"<|im_start|>","special":true},"2":{"content":"<|im_end|>","special":true}}}"#,
+    )
+    .unwrap();
+
+    use gguf_file::Value;
+    let hidden = 4_usize;
+    let n_experts = 2_usize;
+    let n_ff = 4_usize;
+    let fixture_vocab = ["<|pad|>", "<|im_start|>", "<|im_end|>", "a", "b", "Ã", "©"];
+    let mut metadata = vec![
+        ("general.architecture", Value::String("qwen3moe".into())),
+        ("qwen3moe.block_count", Value::U32(1)),
+        ("qwen3moe.context_length", Value::U32(32)),
+        ("qwen3moe.embedding_length", Value::U32(hidden as u32)),
+        ("qwen3moe.feed_forward_length", Value::U32(4)),
+        ("qwen3moe.attention.head_count", Value::U32(2)),
+        ("qwen3moe.attention.head_count_kv", Value::U32(1)),
+        ("qwen3moe.attention.key_length", Value::U32(2)),
+        (
+            "qwen3moe.attention.layer_norm_rms_epsilon",
+            Value::F32(1e-5),
+        ),
+        ("qwen3moe.rope.freq_base", Value::F32(10_000.0)),
+        ("qwen3moe.expert_count", Value::U32(n_experts as u32)),
+        ("qwen3moe.expert_used_count", Value::U32(2)),
+        (
+            "qwen3moe.expert_feed_forward_length",
+            Value::U32(n_ff as u32),
+        ),
+        ("qwen3moe.norm_topk_prob", Value::F32(1.0)),
+        // Embedded tokenizer metadata: the qwen3 GGUF config parser derives
+        // vocab_size from the token array (real Qwen3 GGUFs embed it).
+        (
+            "tokenizer.ggml.tokens",
+            Value::Array(
+                fixture_vocab
+                    .iter()
+                    .map(|token| Value::String((*token).into()))
+                    .collect(),
+            ),
+        ),
+        (
+            "tokenizer.ggml.scores",
+            Value::Array(vec![Value::F32(0.0); fixture_vocab.len()]),
+        ),
+    ];
+    let mut weights = Vec::new();
+    let embeddings = vec![0.25f32; 7 * hidden];
+    weights.push((
+        "token_embd.weight".into(),
+        QTensor::quantize(
+            &Tensor::from_vec(embeddings, (7, hidden), &Device::Cpu).unwrap(),
+            GgmlDType::F32,
+        )
+        .unwrap(),
+    ));
+    let mut add = |name: String, shape: &[usize]| {
+        let tensor = Tensor::from_vec(
+            (0..shape.iter().product::<usize>())
+                .map(|idx| ((idx * 7 % 13) as f32 - 6.0) / 16.0)
+                .collect::<Vec<_>>(),
+            shape,
+            &Device::Cpu,
+        )
+        .unwrap();
+        weights.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
+    };
+    add("output_norm.weight".into(), &[hidden]);
+    add("blk.0.attn_norm.weight".into(), &[hidden]);
+    add("blk.0.ffn_norm.weight".into(), &[hidden]);
+    // q projects 2 heads x head_dim 2 = 4; k/v project 1 kv-head x 2 = 2.
+    add("blk.0.attn_q.weight".into(), &[hidden, hidden]);
+    add("blk.0.attn_k.weight".into(), &[2, hidden]);
+    add("blk.0.attn_v.weight".into(), &[2, hidden]);
+    add("blk.0.attn_output.weight".into(), &[hidden, hidden]);
+    // Router: [num_experts, hidden]; distinct logits so top-2 of 2 is stable.
+    add("blk.0.ffn_gate_inp.weight".into(), &[n_experts, hidden]);
+    // Fused experts: [num_experts, n_ff, hidden] for gate/up, [num_experts,
+    // hidden, n_ff] for down — the llama.cpp MoE tensor convention.
+    add("blk.0.ffn_gate_exps.weight".into(), &[n_experts, n_ff, hidden]);
+    add("blk.0.ffn_up_exps.weight".into(), &[n_experts, n_ff, hidden]);
+    add("blk.0.ffn_down_exps.weight".into(), &[n_experts, hidden, n_ff]);
+    let mut file =
+        std::fs::File::create(model_dir.join("Qwen3-30B-A3B-Q4_K_M.gguf")).unwrap();
+    gguf_file::write(
+        &mut file,
+        &metadata
+            .iter()
+            .map(|(name, value)| (*name, value))
+            .collect::<Vec<_>>(),
+        &weights
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let manifest = ArtifactManifest {
+        schema_version: 1,
+        variant: ModelVariant::Qwen3Moe30bA3bGguf,
+        repo_id: ModelVariant::Qwen3Moe30bA3bGguf.repo_id().into(),
+        revision: "tiny-qwen3-moe-fixture-v1".into(),
+        files: vec![
+            "Qwen3-30B-A3B-Q4_K_M.gguf".into(),
+            "tokenizer.json".into(),
+            "tokenizer_config.json".into(),
+        ],
+    };
+    std::fs::write(
+        model_dir.join("izwi-artifact.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    model_dir
+}
+
 /// Explicit fixture generation for benchmark runs (DS0.7): run with
 /// `IZWI_BENCH_FIXTURE_DIR=<models root> cargo test -p izwi-serving-worker \
 ///  --test backend_parity generate_benchmark_fixture -- --ignored`
