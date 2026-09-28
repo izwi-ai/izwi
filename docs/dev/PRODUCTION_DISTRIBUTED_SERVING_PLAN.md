@@ -230,6 +230,11 @@ DS10 (register only — no build without entry criteria)
 
 ### Phase DS10 — Deferred register (no build without entry criteria)
 
+**Best-effort groundwork plan (2026-09-28):** `docs/dev/DS10_BEST_EFFORT_GROUNDWORK_PLAN.md` —
+proposes a two-tier amendment (groundwork buildable now: MoE runtime core + synthetic fixtures,
+PD design/mock-rig/measurement, KV-transfer framing spec; activation criteria unchanged).
+ADR 0008 recommended before groundwork begins.
+
 Maintained as decisions, not tasks:
 
 - **MoE architectures + expert parallelism:** entry criteria — a MoE chat model in the supported catalog AND the DS5 fleet profile validated on real hardware. (Today: no MoE chat families in `models/architectures/` — qwen3/35/38, lfm2, gemma3 are dense.)
