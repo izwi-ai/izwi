@@ -33,6 +33,59 @@ pub struct GgufModelInfo {
 }
 
 /// GGUF model loader that provides a unified interface for loading quantized models.
+/// Aggregate tensor payload facts taken from a checkpoint's metadata without
+/// materializing any tensor data. `largest_tensor_elements` belongs to the
+/// tensor reported by `largest_tensor_bytes`, so load-scratch bounds can be
+/// derived from both storage and destination-dtype expansion. `tensor_count`
+/// carries the allocation-count dimension that MoE-shaped checkpoints make
+/// material (many same-sized expert tensors).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TensorStorageInventory {
+    pub total_bytes: u64,
+    pub largest_tensor_bytes: u64,
+    pub largest_tensor_elements: u64,
+    pub tensor_count: u64,
+}
+
+impl TensorStorageInventory {
+    pub(crate) fn push(self, tensor_bytes: u64, tensor_elements: u64) -> Self {
+        let total_bytes = self.total_bytes.saturating_add(tensor_bytes);
+        let tensor_count = self.tensor_count.saturating_add(1);
+        if tensor_bytes > self.largest_tensor_bytes {
+            Self {
+                total_bytes,
+                largest_tensor_bytes: tensor_bytes,
+                largest_tensor_elements: tensor_elements,
+                tensor_count,
+            }
+        } else {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..self
+            }
+        }
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        let total_bytes = self.total_bytes.saturating_add(other.total_bytes);
+        let tensor_count = self.tensor_count.saturating_add(other.tensor_count);
+        if other.largest_tensor_bytes > self.largest_tensor_bytes {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..other
+            }
+        } else {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..self
+            }
+        }
+    }
+}
+
 pub struct GgufLoader {
     path: PathBuf,
     content: GgufContent,
@@ -154,31 +207,29 @@ impl GgufLoader {
 
     /// Return exact stored tensor payload bytes and the largest individual
     /// tensor without materializing checkpoint data.
-    pub fn tensor_storage_inventory(&self) -> Result<(u64, u64)> {
+    pub fn tensor_storage_inventory(&self) -> Result<TensorStorageInventory> {
         self.content
             .tensor_infos
             .values()
-            .try_fold((0_u64, 0_u64), |(total, largest), info| {
-                let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
-                })?;
-                let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
-                })?;
-                let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
-                })?;
-                let bytes = elements
-                    .checked_div(block)
-                    .and_then(|blocks| blocks.checked_mul(type_bytes))
-                    .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
-                Ok((
-                    total.checked_add(bytes).ok_or_else(|| {
-                        Error::ModelLoadError("GGUF tensor inventory overflow".into())
-                    })?,
-                    largest.max(bytes),
-                ))
-            })
+            .try_fold(
+                TensorStorageInventory::default(),
+                |inv, info| {
+                    let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
+                    })?;
+                    let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
+                    })?;
+                    let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
+                    })?;
+                    let bytes = elements
+                        .checked_div(block)
+                        .and_then(|blocks| blocks.checked_mul(type_bytes))
+                        .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
+                    Ok(inv.push(bytes, elements))
+                },
+            )
     }
 
     /// Get a raw metadata value.

@@ -25,6 +25,7 @@ use crate::kv::v2::{
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
+use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::models::registry::NativeAsrModel;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedExecutionContract, LoadedModelBundleDraft, LoadedStatePublication,
@@ -344,13 +345,12 @@ fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>)
     Ok(())
 }
 
-fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
+fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
     let mut files = Vec::new();
     collect_checkpoint_files(path, 3, &mut files)?;
-    let mut total = 0_u64;
-    let mut largest = 0_u64;
     let mut found = false;
     let mut container_fallback = 0_u64;
+    let mut aggregate = TensorStorageInventory::default();
     for file in files {
         let extension = file.extension().and_then(|value| value.to_str());
         let inventory = match extension {
@@ -363,17 +363,24 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
                 // the parsed tensor views returned below.
                 let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(&file) }?;
                 Some(tensors.tensors().into_iter().try_fold(
-                    (0_u64, 0_u64),
-                    |(sum, max), (_, tensor)| {
+                    TensorStorageInventory::default(),
+                    |inv, (_, tensor)| {
                         let bytes = u64::try_from(tensor.data().len()).map_err(|_| {
                             Error::ModelLoadError("safetensors tensor size exceeds u64".into())
                         })?;
-                        Ok::<_, Error>((
-                            sum.checked_add(bytes).ok_or_else(|| {
-                                Error::ModelLoadError("safetensors inventory overflow".into())
-                            })?,
-                            max.max(bytes),
-                        ))
+                        let elements = u64::try_from(
+                            tensor
+                                .shape()
+                                .iter()
+                                .try_fold(1_usize, |acc: usize, &dim| acc.checked_mul(dim))
+                                .unwrap_or(usize::MAX),
+                        )
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "safetensors tensor element count exceeds u64".into(),
+                            )
+                        })?;
+                        Ok::<_, Error>(inv.push(bytes, elements))
                     },
                 )?)
             }
@@ -381,11 +388,11 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
                 let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
                     .ok()
                     .map(|infos| {
-                        infos.into_iter().fold((0_u64, 0_u64), |(sum, max), info| {
-                            let bytes = u64::try_from(info.layout.shape().elem_count())
-                                .unwrap_or(u64::MAX)
-                                .saturating_mul(info.dtype.size_in_bytes() as u64);
-                            (sum.saturating_add(bytes), max.max(bytes))
+                        infos.into_iter().fold(TensorStorageInventory::default(), |inv, info| {
+                            let elements = u64::try_from(info.layout.shape().elem_count())
+                                .unwrap_or(u64::MAX);
+                            let bytes = elements.saturating_mul(info.dtype.size_in_bytes() as u64);
+                            inv.push(bytes, elements)
                         })
                     });
                 if parsed.is_none() {
@@ -402,37 +409,71 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
             }
             _ => None,
         };
-        if let Some((file_total, file_largest)) = inventory {
+        if let Some(file_inventory) = inventory {
             found = true;
-            total = total.checked_add(file_total).ok_or_else(|| {
-                Error::ModelLoadError("checkpoint tensor inventory overflow".into())
-            })?;
-            largest = largest.max(file_largest);
+            aggregate = aggregate.merge(file_inventory);
         }
     }
     if !found && container_fallback > 0 {
-        return Ok(Some((container_fallback, container_fallback)));
+        return Ok(Some(TensorStorageInventory {
+            total_bytes: container_fallback,
+            largest_tensor_bytes: container_fallback,
+            largest_tensor_elements: 0,
+            tensor_count: 1,
+        }));
     }
-    Ok(found.then_some((total, largest)))
+    Ok(found.then_some(aggregate))
 }
+
+/// Per-tensor instantiation slack: device buffer page rounding, storage
+/// headers, and allocator slack for every materialized weight tensor. Only
+/// becomes material at MoE scale (thousands of same-sized expert tensors);
+/// negligible for the few hundred tensors of a dense checkpoint.
+const PER_TENSOR_INSTANTIATION_SLACK_BYTES: u64 = 32 * 1024;
+/// Worst-case load-time destination expansion of one tensor: a quantized
+/// source dequantizes to F32 (4 bytes/element) and the source bytes stay
+/// alive while the destination is built.
+const SINGLE_TENSOR_F32_DESTINATION_BYTES_PER_ELEMENT: u64 = 4;
 
 fn estimate_from_tensor_inventory(
     catalog: ModelMemoryEstimate,
-    inventory: Option<(u64, u64)>,
+    inventory: Option<TensorStorageInventory>,
 ) -> Result<ModelMemoryEstimate> {
-    let Some((resident_bytes, largest_tensor_bytes)) = inventory else {
+    let Some(inventory) = inventory else {
         return Ok(catalog);
     };
-    let load_peak_bytes = resident_bytes
-        .checked_add(
-            largest_tensor_bytes
-                .checked_next_power_of_two()
-                .unwrap_or(largest_tensor_bytes),
-        )
+    if inventory.total_bytes == 0 {
+        return Ok(catalog);
+    }
+    // Size-class bound for one tensor's working copy (the historic term).
+    let single_tensor_working_copy = inventory
+        .largest_tensor_bytes
+        .checked_next_power_of_two()
+        .unwrap_or(inventory.largest_tensor_bytes);
+    // Conversion bound for a dequantizing loader: source bytes plus the F32
+    // destination of the largest tensor. Dominates the size-class bound only
+    // when the source is sub-F32 (quantized or half-precision checkpoints).
+    let single_tensor_conversion_bound = inventory.largest_tensor_bytes.saturating_add(
+        inventory
+            .largest_tensor_elements
+            .saturating_mul(SINGLE_TENSOR_F32_DESTINATION_BYTES_PER_ELEMENT),
+    );
+    // Allocation-count bound: instantiation overhead of the whole checkpoint.
+    // A MoE-shaped checkpoint (many same-sized expert tensors) collapses the
+    // largest-tensor terms; this term keeps its load scratch reserved.
+    let whole_checkpoint_instantiation = inventory
+        .tensor_count
+        .saturating_mul(PER_TENSOR_INSTANTIATION_SLACK_BYTES);
+    let load_scratch_bytes = single_tensor_working_copy
+        .max(single_tensor_conversion_bound)
+        .max(whole_checkpoint_instantiation);
+    let load_peak_bytes = inventory
+        .total_bytes
+        .checked_add(load_scratch_bytes)
         .ok_or_else(|| Error::ModelLoadError("portable model load estimate overflow".into()))?;
     Ok(ModelMemoryEstimate {
         load_peak_bytes,
-        resident_bytes,
+        resident_bytes: inventory.total_bytes,
     })
 }
 
@@ -506,7 +547,7 @@ fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
 /// reserving the same portable conversion scratch the pinned estimate carries.
 fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEstimate> {
     let overflow = || Error::ModelLoadError("Qwen3.8 fixture memory estimate overflow".into());
-    let Some((file_bytes, largest_tensor_bytes)) = checkpoint_tensor_inventory(model_path)? else {
+    let Some(inventory) = checkpoint_tensor_inventory(model_path)? else {
         return Err(Error::ModelLoadError(
             "Synthetic Qwen3.8 fixture has no readable tensor inventory".into(),
         ));
@@ -515,10 +556,10 @@ fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEst
     // FP8/BF16 source bytes; a 4x envelope covers the resident expansion and
     // the portable conversion scratch bounds the load peak like the pinned
     // estimate does.
-    let resident_bytes = file_bytes.checked_mul(4).ok_or_else(overflow)?;
+    let resident_bytes = inventory.total_bytes.checked_mul(4).ok_or_else(overflow)?;
     let load_peak_bytes = resident_bytes
         .checked_add(QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
-        .and_then(|bytes| bytes.checked_add(largest_tensor_bytes.next_power_of_two()))
+        .and_then(|bytes| bytes.checked_add(inventory.largest_tensor_bytes.next_power_of_two()))
         .ok_or_else(overflow)?;
     Ok(ModelMemoryEstimate {
         load_peak_bytes,
@@ -2828,6 +2869,7 @@ mod tests {
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
+    use crate::models::shared::weights::gguf::TensorStorageInventory;
     use crate::config::{ContextLengthPreference, EngineConfig};
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, CapacitySource, ConcurrencyClass, ExecutionGroupId,
@@ -3012,14 +3054,87 @@ mod tests {
             load_peak_bytes: 12 * 1024 * 1024 * 1024,
             resident_bytes: 12 * 1024 * 1024 * 1024,
         };
-        let estimate =
-            estimate_from_tensor_inventory(catalog, Some((2_400_000_000, 160_000_000))).unwrap();
+        // F32-shaped largest tensor: 160 MB storage over 40M elements.
+        let estimate = estimate_from_tensor_inventory(
+            catalog,
+            Some(TensorStorageInventory {
+                total_bytes: 2_400_000_000,
+                largest_tensor_bytes: 160_000_000,
+                largest_tensor_elements: 40_000_000,
+                tensor_count: 400,
+            }),
+        )
+        .unwrap();
         assert_eq!(estimate.resident_bytes, 2_400_000_000);
-        assert_eq!(estimate.load_peak_bytes, 2_668_435_456);
+        // Scratch = max(next_pow2(160M) = 268,435,456; 160M + 40M*4 = 320M;
+        // 400 * 32 KiB = 13,107,200) = 320,000,000: the F32 conversion bound
+        // of the largest tensor exceeds the historic size-class proxy.
+        assert_eq!(estimate.load_peak_bytes, 2_720_000_000);
         assert_eq!(
             estimate_from_tensor_inventory(catalog, None).unwrap(),
             catalog
         );
+        assert_eq!(
+            estimate_from_tensor_inventory(
+                catalog,
+                Some(TensorStorageInventory::default()),
+            )
+            .unwrap(),
+            catalog
+        );
+    }
+
+    #[test]
+    fn moe_shaped_inventory_reserves_whole_checkpoint_instantiation_scratch() {
+        let catalog = ModelMemoryEstimate {
+            load_peak_bytes: 40 * 1024 * 1024 * 1024,
+            resident_bytes: 40 * 1024 * 1024 * 1024,
+        };
+        // MoE shape: tens of thousands of same-sized expert tensors collapse
+        // the largest-tensor terms; only the allocation-count term keeps the
+        // instantiation scratch reserved.
+        let inventory = TensorStorageInventory {
+            total_bytes: 30_000_000_000,
+            largest_tensor_bytes: 20_971_520,
+            largest_tensor_elements: 5_242_880,
+            tensor_count: 18_432,
+        };
+        let estimate =
+            estimate_from_tensor_inventory(catalog, Some(inventory)).unwrap();
+        assert_eq!(estimate.resident_bytes, 30_000_000_000);
+        assert_eq!(estimate.load_peak_bytes, 30_603_979_776);
+        // The historic formula would have reserved only the size-class proxy
+        // of one expert tensor (30,033,554,432) — under-reserving by the
+        // whole-checkpoint instantiation term the fix exists for.
+        let historic_load_peak = inventory.total_bytes
+            + inventory
+                .largest_tensor_bytes
+                .checked_next_power_of_two()
+                .unwrap();
+        assert_eq!(historic_load_peak, 30_033_554_432);
+        assert!(estimate.load_peak_bytes > historic_load_peak);
+    }
+
+    #[test]
+    fn quantized_largest_tensor_reserves_f32_conversion_scratch() {
+        let catalog = ModelMemoryEstimate {
+            load_peak_bytes: 1024 * 1024 * 1024,
+            resident_bytes: 1024 * 1024 * 1024,
+        };
+        // Q4_0-shaped largest tensor: 1M elements over 562.5 KB of storage.
+        // A dequantizing loader holds the source while building the F32
+        // destination (4 MB), which the size-class proxy under-covers.
+        let estimate = estimate_from_tensor_inventory(
+            catalog,
+            Some(TensorStorageInventory {
+                total_bytes: 5_000_000,
+                largest_tensor_bytes: 562_500,
+                largest_tensor_elements: 1_000_000,
+                tensor_count: 10,
+            }),
+        )
+        .unwrap();
+        assert_eq!(estimate.load_peak_bytes, 9_562_500);
     }
 
     #[test]
