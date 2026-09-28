@@ -150,3 +150,244 @@ pub fn restore_block(tensor: &Tensor, page: usize, source: &[u8]) -> Result<usiz
     destination.scatter_set(&indices, &page_tensor, 0)?;
     Ok(elements * tensor.dtype().size_in_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::kv::{KvArenaId, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{KvGroupId, KvLayerBinding};
+
+    const ARENA: KvArenaId = KvArenaId {
+        model_instance: ModelInstanceId::new(41),
+        backend: BackendKind::Cpu,
+        device_ordinal: None,
+        generation: 3,
+    };
+    const GROUP: KvGroupId = KvGroupId::new(5);
+
+    /// Deterministic xorshift-derived values in [-4, 4) with special bit
+    /// patterns (±inf, NaN, -0.0) injected at fixed strides so the round trip
+    /// must be bit-preserving, not approximately preserving.
+    fn seeded_values(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if index % 89 == 0 {
+                    -0.0_f32
+                } else if index % 97 == 0 {
+                    f32::INFINITY
+                } else if index % 101 == 0 {
+                    f32::NEG_INFINITY
+                } else if index % 103 == 0 {
+                    f32::NAN
+                } else {
+                    let unit = (state >> 40) as f32 / (1 << 24) as f32;
+                    (unit * 8.0) - 4.0
+                }
+            })
+            .collect()
+    }
+
+    /// A `[capacity_pages, page_tokens, heads, head_dim]` tensor of seeded
+    /// values converted to the arena dtype, mirroring a real arena layer's
+    /// per-page slice shape.
+    fn layer_tensor(
+        dtype: DType,
+        device: &Device,
+        capacity_pages: usize,
+        page_tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        seed: u64,
+    ) -> Result<Tensor> {
+        let values = seeded_values(seed, capacity_pages * page_tokens * heads * head_dim);
+        let tensor = Tensor::from_vec(values, (capacity_pages, page_tokens, heads, head_dim), device)?;
+        if dtype == DType::F32 {
+            Ok(tensor)
+        } else {
+            Ok(tensor.to_dtype(dtype)?)
+        }
+    }
+
+    /// Two layers with asymmetric head dims, so the page layout (per layer:
+    /// key block then value block) is exercised non-uniformly.
+    fn arena_config(dtype: DType) -> KvArenaConfig {
+        KvArenaConfig {
+            id: ARENA,
+            group: GROUP,
+            page_tokens: 8,
+            capacity_pages: 3,
+            growth: None,
+            dtype,
+            layers: vec![
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 0,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: 2,
+                    key_head_dim: 4,
+                    value_head_dim: 6,
+                },
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 1,
+                        physical_layer: 1,
+                    },
+                    num_kv_heads: 3,
+                    key_head_dim: 2,
+                    value_head_dim: 1,
+                },
+            ],
+        }
+    }
+
+    fn layer_dims(config: &KvArenaConfig) -> Vec<(usize, usize, usize)> {
+        config
+            .layers
+            .iter()
+            .map(|layer| {
+                (
+                    layer.num_kv_heads as usize,
+                    layer.key_head_dim as usize,
+                    layer.value_head_dim as usize,
+                )
+            })
+            .collect()
+    }
+
+    /// Full page round trip on one device: capture every layer block into one
+    /// page buffer, restore into fresh zero arenas, then recapture and demand
+    /// bitwise-identical bytes (NaN and -0.0 included).
+    fn round_trip_page(device: &Device, dtype: DType, seed: u64, page: usize) -> Result<()> {
+        let config = arena_config(dtype);
+        let capacity = config.capacity_pages as usize;
+        let page_tokens = config.page_tokens as usize;
+        let dims = layer_dims(&config);
+
+        let mut sources = Vec::new();
+        for (layer, (heads, key_dim, value_dim)) in dims.iter().enumerate() {
+            sources.push(layer_tensor(
+                dtype,
+                device,
+                capacity,
+                page_tokens,
+                *heads,
+                *key_dim,
+                seed + layer as u64,
+            )?);
+            sources.push(layer_tensor(
+                dtype,
+                device,
+                capacity,
+                page_tokens,
+                *heads,
+                *value_dim,
+                seed + 100 + layer as u64,
+            )?);
+        }
+
+        let page_bytes = arena_page_bytes(&config) as usize;
+        let mut captured = vec![0_u8; page_bytes];
+        let mut offset = 0usize;
+        for tensor in &sources {
+            offset += capture_block(tensor, page, &mut captured[offset..])?;
+        }
+        assert_eq!(offset, page_bytes, "captured bytes must match the arena page size");
+
+        let mut restored = Vec::new();
+        for tensor in &sources {
+            let dims = tensor.dims();
+            restored.push(Tensor::zeros(
+                (dims[0], dims[1], dims[2], dims[3]),
+                tensor.dtype(),
+                device,
+            )?);
+        }
+        offset = 0usize;
+        for tensor in &restored {
+            offset += restore_block(tensor, page, &captured[offset..])?;
+        }
+        assert_eq!(offset, page_bytes, "restored bytes must consume the whole page buffer");
+
+        // Bitwise proof: recapturing the restored pages must reproduce the
+        // original capture byte-for-byte, so the codec is lossless including
+        // NaN payloads, infinities, and negative zero.
+        let mut recaptured = vec![0_u8; page_bytes];
+        offset = 0usize;
+        for tensor in &restored {
+            offset += capture_block(tensor, page, &mut recaptured[offset..])?;
+        }
+        assert_eq!(recaptured, captured, "page round trip must be bit-preserving");
+
+        // The decoded page is a host (CPU) tensor shaped [tokens, heads, dim].
+        let decoded = decoded_page(&sources[0], &captured)?;
+        assert_eq!(decoded.device().location(), candle_core::DeviceLocation::Cpu);
+        assert_eq!(decoded.dims(), &[page_tokens, dims[0].0, dims[0].1]);
+        Ok(())
+    }
+
+    #[test]
+    fn page_round_trip_is_bit_preserving_across_dtypes_and_pages() -> Result<()> {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for seed in 0..4_u64 {
+                for page in 0..3_usize {
+                    round_trip_page(&Device::Cpu, dtype, seed, page)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn page_round_trip_is_bit_preserving_through_metal_arenas() -> Result<()> {
+        let Ok(device) = Device::new_metal(0) else {
+            eprintln!("skipping Metal page-transfer round trip: no Metal device");
+            return Ok(());
+        };
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for seed in 0..2_u64 {
+                for page in 0..3_usize {
+                    round_trip_page(&device, dtype, seed, page)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capture_rejects_undersized_destination() -> Result<()> {
+        let tensor = layer_tensor(DType::F32, &Device::Cpu, 2, 4, 2, 3, 7)?;
+        let mut destination = vec![0_u8; 4 * 4 * 2 * 3 - 1];
+        let error = capture_block(&tensor, 0, &mut destination).unwrap_err();
+        assert!(format!("{error}").contains("too small"));
+        Ok(())
+    }
+
+    #[test]
+    fn decode_and_restore_reject_truncated_and_out_of_range_input() -> Result<()> {
+        let tensor = layer_tensor(DType::F16, &Device::Cpu, 2, 4, 2, 3, 9)?;
+        let truncated = vec![0_u8; 4 * 2 * 3 * 2 - 1];
+        let error = decoded_page(&tensor, &truncated).unwrap_err();
+        assert!(format!("{error}").contains("truncated"));
+
+        let mut full = vec![0_u8; 4 * 2 * 3 * 2];
+        let error = restore_block(&tensor, 2, &full).unwrap_err();
+        assert!(format!("{error}").contains("expects a [capacity_pages"));
+
+        let flat = Tensor::zeros((4, 2, 3), DType::F32, &Device::Cpu)?;
+        let error = decoded_page(&flat, &full).unwrap_err();
+        assert!(format!("{error}").contains("expects a [capacity_pages, tokens, heads, dim]"));
+
+        let quantized = Tensor::zeros((2, 4, 2, 3), DType::I64, &Device::Cpu)?;
+        let error = capture_block(&quantized, 0, &mut full).unwrap_err();
+        assert!(format!("{error}").contains("does not support"));
+        Ok(())
+    }
+}
