@@ -1,3 +1,145 @@
+# Plan — DS9 API completeness for production parity — 2026-09-27
+
+Scope: docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md DS9.1–DS9.4, T40.
+Order: 9.1 cached_tokens (lands protocol minor 3) → 9.3 logprobs (rides
+minor 3 + sampler value plumbing) → 9.2 response_format (research-first,
+time-boxed, rides sampler mask seam) → 9.4 MTP into continuous batches
+(largest, last). Each item = independently verified commits.
+
+- [x] DS9.1 `usage.cached_tokens`: admission cursor (`managed_prefix_cursor`)
+  → EngineOutput → ChatGeneration; protocol `Usage.cached_tokens: Option<u64>`
+  + minor 3 bump; worker seam map + gateway rebuild; public
+  `usage.prompt_tokens_details.cached_tokens` (chat) +
+  `input_tokens_details.cached_tokens` (responses); mock worker knob; tests.
+  DONE `b2fb8415`.
+- [x] DS9.3 `logprobs`/`top_logprobs`: raw-logit log_softmax semantics;
+  ChatSampler sample surface returns logprob + top-k (greedy via bounded
+  candidates, RNG untouched); qwen35/qwen38 host samplers; per-token payload
+  (token/logprob/bytes/top) through ChatGeneration (non-stream) +
+  StreamingOutput/ChatStreamEvent::Delta (stream) + OpenAiDelta/choices[];
+  protocol TextDelta optional logprobs; mock knob; same-tokens property test;
+  qwen38 CUDA kernels path scoped during impl (no custom kernels).
+  DONE `0f060c00`/`a3d34d83`/`77a07a1c`.
+- [x] DS9.2 `response_format`: parse/validate json_object+json_schema and
+  thread to ChatGenerationConfig; design note docs/dev/CONSTRAINED_DECODING_DESIGN.md;
+  valid-JSON FSM spike (per-state vocab masks, lazy+cached, allowed_mask seam,
+  host fallback −inf, masked greedy, pre-mask before qwen38 kernels);
+  time-box decision gate — record outcome either way; json_schema strict out
+  of scope. DONE — spike outcome = feasible, `c1f4b1af`; json_schema = documented
+  400 pending schema→FSM follow-up.
+- [x] DS9.4 MTP in continuous batches: relax exact_solo for MTP-eligible rows
+  (mtp_in_continuous mode, kill switch); batched speculative route in
+  executor/handler (lift 1-token invariant for MTP rows); batched draft via
+  forward_steps_batch + per-row verify forwards + model-neutral acceptance +
+  per-row checkpoints/truncate commit + ragged exit; workspace re-verify;
+  bench manifest concurrent MTP cases + ITL metric; CPU/Metal correctness
+  tests, CUDA perf evidence hardware-gated. DONE `b6211f24` + `3e3096bb`
+  (per-row depths, not a homogeneous minimum — see review; CUDA perf evidence
+  `not run`, posture recorded).
+- [x] Closeout: plan doc checkboxes, support matrix, delivery report,
+  hygiene command, memory update. DONE `0f42ec4b` + ledger/memory commits.
+
+## Review
+
+DS9 closed 2026-09-28. Commits `b2fb8415` (9.1), `0f060c00`/`a3d34d83`/
+`77a07a1c` (9.3), `c1f4b1af` + `57aff7bc`/`ac179dff` hygiene (9.2),
+`b6211f24` + `3e3096bb` (9.4), `0f42ec4b` (docs).
+
+DS9.4 completion notes:
+- The draft round uses **per-row depths**, not the homogeneous minimum the
+  first implementation sketched. A minimum couples each row's proposal count
+  (and with it its sampled token stream and acceptance rng draws) to whatever
+  co-batched rows have smaller remaining budgets; per-row depths keep every
+  row's round sequence identical to its solo quantum, so batch composition
+  never changes a row's output. Depth-0 rows inside mixed rounds run a
+  solo-equivalent scalar tail instead of the shared batched path.
+- Rows entering their first envelope carry the prefill bootstrap token; it is
+  published as its own step and the row sits out the call (mirrors the solo
+  quantum's bootstrap step and its committed-0 accounting). Without this, any
+  scalar round inside the envelope hits decode_step_batch's non-decodable
+  check.
+- Batch controller observations are gated by `can_train(remaining)` with the
+  round's own remaining slice — the solo path's RoundTimer contract that
+  scheduler-limited tails do not train the controller; the first sketch
+  observed unconditionally with the output cap as budget, which desyncs the
+  adaptive policies from solo (and changes sampled streams).
+- Fixture lesson: `forward_steps_batch` lowers ONE slot map across all rows'
+  MTP caches, which only exists when rows share one arena with disjoint page
+  halves (the managed-pool shape). The recovery fixture gained
+  `shared_mtp_caches()` for that; per-row private arenas are the shape that
+  produced "KV slot map contains duplicate physical slot" and cannot
+  represent a batched MTP write.
+- Hygiene: `cuda.mtp_in_continuous` initially shipped without the overrides
+  layer (CudaPerformanceConfigOverrides field, is_empty, apply_overrides,
+  set_value, From<&PerformanceConfig>) — the CLI serve child-env test caught
+  it as "unsupported performance key".
+- Verification: izwi-core lib 2674 green, izwi-cli 72 green, izwi-server
+  green, mock-worker http_contract 26 green, both bench-script smoke suites
+  green, clippy clean on izwi-core/izwi-cli. CUDA perf evidence stays
+  `not run` (hardware-gated) with the manifest posture recorded.
+
+Next per plan: DS8 (vLLM engine lane) behind its decision-gate ADR; DS9.2
+schema→FSM follow-up; hardware-gated CUDA evidence set.
+
+# Plan — DS7 Signal-driven worker autoscaling — 2026-09-27
+
+Scope: the serving supervisor becomes a capacity manager within explicit
+bounds (docs/dev/PRODUCTION_DISTRIBUTED_SERVING_PLAN.md DS7.1–DS7.5, T38).
+Scale up on sustained queue depth, scale down after a stabilized idle window
+with drain; every decision respects bounds, the node resource ledger, and
+hysteresis; off by default (`min=max=static` behavior is unchanged).
+
+Design decisions: pre-declared standby replicas (all max_workers workers
+declared in node TOML, only min_workers launch at startup); node-level
+`[autoscaling]` TOML block with per-deployment policies; signals and
+zero-work observation from the supervisor's own status polls
+(`capacity.queued_invocations`, `active_invocations`/`reserved_sessions`);
+scale-up adds the worker's v1 line to the shared approvals file after
+readiness, scale-down removes the line then `begin_drain` then waits for
+zero work then `drain_and_stop`; per-deployment hysteresis window shared by
+both directions; scale-down never touches the startup min-set (longest-idle
+scaled-up worker first); `ResourceLedger` reserves supervised slot budgets
+and rejects overcommitting scale-ups with diagnostics; mutual exclusion with
+`--rollout-plan`.
+
+- [x] DS7.1 Policy config: `[autoscaling]` block with validated ranges, off
+  by default, schema v2 unchanged.
+- [x] DS7.2 Supervisor implementation: scale-up via existing
+  launch/readiness path; scale-down remove-line → begin_drain → zero-work
+  observation → `drain_and_stop`; hysteresis.
+- [x] DS7.3 Budget integration: `ResourceLedger` over supervised slots;
+  impossible scale-ups rejected with diagnostics.
+- [x] DS7.4 Tests: policy unit tests (signals → decisions, hysteresis,
+  bounds, ledger overcommit); process rig — sustained queue depth scales
+  1→2, idle window scales 2→1 with drain observed, disabled config static.
+- [x] DS7.5 Docs: ADR 0007, runbook section, support matrix, plan
+  checkboxes, delivery report row.
+
+## Review
+
+- Design landed as planned: pre-declared standby replicas (config-order min
+  set = core, rest standbys), node-level `[autoscaling]` block, supervisor
+  status polls as the signal source, approvals-file channel for
+  scale up/down, per-deployment shared hysteresis (recorded at drain
+  initiation), longest-idle-in-config-order scale-down candidate, mutual
+  exclusion with `--rollout-plan` checked before rollout state staging,
+  in-memory scale state (restart returns to the min set).
+- Deviation from the DS6 commit granularity: implementation is one commit
+  (`111fcfb4`) instead of config/primitives/wiring splits, because the
+  binary's `NodeConfig` test fixture must carry the new field for the bin
+  to compile — config, module, and wiring are not independently
+  compilable. No gateway-side changes existed, so no gateway commit.
+- Tests: 60 lib unit tests (incl. 15 new across config + autoscale), 8 bin
+  tests, 4 process tests in `tests/autoscale.rs` (T38), all pre-existing
+  rigs green (rollout 5, multi-lane, fence collision, recovery, etc. — 86
+  total in the crate). Env quirks applied (DEVELOPER_DIR/CXXFLAGS);
+  rustfmt run directly on touched leaf files only; clippy clean on new
+  code (5 pre-existing DS6 warnings untouched).
+- Commits: `111fcfb4` (feat DS7.1–7.3), `4702d08a` (test DS7.4/T38), docs
+  commit closes DS7.5 (ADR 0007, runbook, support matrix, plan, delivery
+  report).
+- Next: DS9 (API completeness), DS8 still ADR-gated.
+
 # Plan — Google Cloud GLM 5.2 in OpenCode — 2026-09-16
 
 Scope: make the project-local OpenCode configuration call Google Cloud's GLM
@@ -19916,3 +20058,105 @@ deadline 60s). Disk hit 100% mid-session — removed target/debug/incremental
 
 Next: DS6 (declarative rollout, canary promotion) per the plan's dependency
 order. CUDA lanes remain `not run` until hardware.
+
+---
+
+## DS6 — Coordinated blue-green rollout — plan (2026-09-26)
+
+Goal: one operator command performs a generation cutover with automatic abort (DINV-07).
+Coordinator in the supervisor; the shared approvals file stays the only supervisor↔gateway
+coupling; the gateway adopts changed approvals views at runtime and owns the atomic
+generation cutover.
+
+Design decisions (recorded in ADR 0006):
+- Rollout plan = declarative TOML (target node config path, shared approvals path, canary
+  worker id, soak window, abort-on-readiness-loss). Accepted by the supervisor CLI only
+  (plan's "and/or gateway CLI" resolved to supervisor; gateway gets runtime adoption).
+- Approvals views are marker-free; eligibility is a pure function of the view:
+  one generation ⇒ Eligible; two generations ⇒ lower = current (Eligible until the first
+  higher-generation worker observes Ready, then DrainingPrevious in the same table
+  mutation that makes higher Eligible), higher = PendingCutover. DINV-07 becomes
+  structural (never two Eligible generations of one deployment); no zero-eligible gap,
+  because the swap is triggered BY a Ready observation of the new generation.
+- State machine: Validating → LaunchingReplacement (canary first) → VerifyingReadiness →
+  WindowOpen(soak) → DrainingOld → Committed; abort legal in the first three reversible
+  states (restore saved approvals bytes, stop replacements, old generation immediately
+  eligible again — old workers were never drained). DrainingOld is the point of no return
+  (stdin EOF is irreversible); documented honestly.
+- State persisted in runtime_directory/rollout-state.json (atomic, bounded, carries plan
+  digest, replacement pids/incarnations, window deadline, pre-rollout approvals bytes for
+  byte-identical abort restore). Fresh supervisor start with a non-terminal state file
+  fails closed (must resume via --rollout-plan or --rollout-abort); terminal states
+  auto-clear. Resume relaunches per state (old slots in pre-drain states, replacements
+  only in DrainingOld); managed workers self-drain on supervisor death, so post-crash
+  fences clear as orphans exit.
+- Automatic abort (readiness failure / readiness loss during window) continues supervising
+  the old config — exiting would EOF-drain the old workers and cause an outage.
+
+- [x] DS6.1 protocol (commit bf30273a): move `GatewayWorkerApproval` + file parse/serialize into
+      `izwi-serving-protocol::approvals` (single format definition; supervisor generates
+      views, gateway parses — no drift); izwi-server delegates; round-trip + bounds tests.
+- [x] DS6.2a gateway table (commit c539e914): per-pool generations with eligibility rule + `apply_view` +
+      ready-swap; DINV-07 invariant + selection unit tests.
+- [x] DS6.2b gateway runtime (commit 0ec7b5c5): shared-approvals refresh adopts changed views (content-hash
+      dedupe); chat selection + realtime stage pools filter to the Eligible generation.
+- [x] DS6.3 supervisor rollout module (commit 43d2e7bb): plan parse/validate (reuses NodeConfig::validate on
+      the target), state file, state machine core, approvals view generation, guarded
+      atomic write (temp+flock+rename); unit tests.
+- [x] DS6.3b supervisor CLI (commit 3ec044e3): --rollout-plan/--rollout-abort/--rollout-status wiring,
+      resume semantics, fail-closed fresh start on non-terminal state.
+- [x] DS6.4a process tests (commit 7fd649eb): python fake worker that serves the readiness
+      contract; canary-fails-readiness → abort with approvals restored byte-identical;
+      promote path through window→drain→commit with on-disk view assertions; resume after
+      SIGKILL; fail-closed fresh start.
+- [x] DS6.4b T37 gateway test (commit d9e5abe0): G1+G2 MockWorkers on real TCP, traffic
+      across window→commit and window→abort-restore — zero failed requests, DINV-07 held.
+- [x] DS6.5 docs (2026-09-27): ADR 0006 written (decision/consequences with honest
+      point-of-no-return and single-node scope); runbook "Coordinated blue-green
+      rollout (DS6)" section replaces the manual canary guidance (plan format, command,
+      phases, monitoring/abort/resume/rollback) + `--canary-worker-id` demoted to launch
+      ordering with a cross-reference + pointer from the manual model-update sequence;
+      support-matrix "Coordinated blue-green rollout by scope (DS6)" table (single-node
+      supported on process evidence, fleet-wide cutover recorded not implemented);
+      plan DS6.1–DS6.5 checkboxes closed with commit hashes + config-surface line;
+      delivery report DS6 row + DS6 evidence paragraph + P9 row + rollback note +
+      next-task section (DS7 next).
+- [x] Verification (2026-09-27, docs-only close-out at HEAD = d9e5abe0 code): supervisor
+      suite fully green (lib + bin + all process tests incl. rollout 5/5);
+      izwi-server --test rollout_gateway 1/1 (T37 zero dropped requests); protocol lib
+      40/40; izwi-server lib approvals-filtered 5/5; mock-worker http_contract 23/23
+      (--features mock-worker per memory); full izwi-server lib 731/731 green on rerun
+      (first run hit the known worker.rs:2269 cancellation flake under parallel load —
+      same recorded DS0.5/DS3.4 flake, green in isolation, full suite green on rerun;
+      untouched path). Docs-only diff, so fmt/clippy unchanged from d9e5abe0's clean pass.
+
+### Review (2026-09-27)
+
+DS6 is complete. This session closed the last item (DS6.5 docs) and ran the
+close-out verification. Doc/code consistency was checked against source, not
+memory: plan TOML fields and bounds (`schema_version = 1`, absolute paths,
+`window_secs` ≤ 3600, `abort_grace_secs` ≤ 300), CLI flag set and mutual
+exclusions (`--rollout-plan`/`--rollout-abort`/`--rollout-status` exclusive of
+each other and of `--validate-only`/`--canary-worker-id`), phase names
+(`launching_replacement`/`window_open`/`draining_old`/`committed`/`aborted`),
+state/backup file names, and the resume semantics (old slots relaunch only in
+pre-drain states; replacements relaunch in launching/window — the earlier
+session note saying "replacements only in DrainingOld" was wrong and the
+runbook states the code's actual behavior).
+
+Evidence: supervisor suite green (rollout process tests 5/5 in 5.05s),
+rollout_gateway 1/1 (7.66s), protocol 40/40, http_contract 23/23, izwi-server
+lib 731/731 on rerun. Killed 3 orphaned test-supervisor processes from the
+prior session before running the suites (temp-dir fake workers, idle CPU
+burn). Disk at 51% used (13Gi available) — no cleanup needed.
+
+Deviation worth remembering: the todo's design bullet said the plan declares
+"abort-on-readiness-loss"; no such plan field exists in the code and none is
+needed — canary/replacement readiness failure and replacement exit during the
+window abort automatically, and there is no readiness-probe latch on the old
+generation during the window (the gateway's eligibility flip on the successor's
+Ready observation is what protects it). Docs describe the implemented set.
+
+Next: DS7 (signal-driven worker autoscaling) per the plan's dependency order;
+CUDA lanes remain `not run` until hardware.
+
