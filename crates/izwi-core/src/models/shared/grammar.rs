@@ -306,7 +306,7 @@ fn push_array(stack: &mut Vec<JsonContainer>) -> Result<(), GrammarError> {
 
 /// Resolve after a VALUE finishes (string close, literal end): the container
 /// it sits in dictates the next state.
-fn end_value(stack: &mut Vec<JsonContainer>, root_seen_value: &mut bool) -> JsonState {
+fn end_value(stack: &mut [JsonContainer], root_seen_value: &mut bool) -> JsonState {
     *root_seen_value = true;
     match stack.last() {
         Some(JsonContainer::Object) => JsonState::ObjectCommaOrEnd,
@@ -344,7 +344,7 @@ fn literal_step(
     ch: char,
     literal: &str,
     missing: u8,
-    stack: &mut Vec<JsonContainer>,
+    stack: &mut [JsonContainer],
     root_seen_value: &mut bool,
 ) -> Result<JsonState, GrammarError> {
     let expected = literal
