@@ -525,7 +525,27 @@ pub struct Usage {
     pub cached_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// DS9.3 (minor 3): one top alternative in a token's logprob entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    /// UTF-8 bytes of `token`.
+    pub bytes: Vec<u8>,
+}
+
+/// DS9.3 (minor 3): per-token logprob entry for one sampled output token.
+/// Logprobs are computed from the raw model distribution (log_softmax of the
+/// raw logits, before penalties and temperature).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<TopTokenLogprob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InvocationEventKind {
     Accepted {
@@ -537,6 +557,10 @@ pub enum InvocationEventKind {
     },
     TextDelta {
         text: String,
+        /// DS9.3: logprob entries for the tokens this delta carries. Absent
+        /// when the worker did not collect logprobs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logprobs: Option<Vec<TokenLogprob>>,
     },
     Usage {
         usage: Usage,
@@ -563,7 +587,7 @@ impl InvocationEventKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvocationEvent {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
@@ -939,6 +963,48 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<InvocationEvent>(value).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn text_delta_logprobs_are_additive_and_absent_when_unmeasured() {
+        let plain = InvocationEventKind::TextDelta {
+            text: "hi".into(),
+            logprobs: None,
+        };
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(
+            value.get("logprobs").is_none(),
+            "absent logprobs must omit the field, got {value}"
+        );
+
+        let measured = InvocationEventKind::TextDelta {
+            text: "hi".into(),
+            logprobs: Some(vec![TokenLogprob {
+                token: "hi".into(),
+                logprob: -0.5,
+                bytes: b"hi".to_vec(),
+                top_logprobs: vec![TopTokenLogprob {
+                    token: "hi".into(),
+                    logprob: -0.5,
+                    bytes: b"hi".to_vec(),
+                }],
+            }]),
+        };
+        let value = serde_json::to_value(&measured).unwrap();
+        assert_eq!(value["logprobs"][0]["token"], "hi");
+        assert_eq!(value["logprobs"][0]["bytes"], serde_json::json!([104, 105]));
+        assert_eq!(value["logprobs"][0]["top_logprobs"][0]["logprob"], -0.5);
+        assert_eq!(
+            serde_json::from_value::<InvocationEventKind>(value).unwrap(),
+            measured
+        );
+
+        // Minor-2 peers never send the field.
+        let legacy = serde_json::json!({"type": "text_delta", "text": "hi"});
+        assert_eq!(
+            serde_json::from_value::<InvocationEventKind>(legacy).unwrap(),
+            plain
         );
     }
 

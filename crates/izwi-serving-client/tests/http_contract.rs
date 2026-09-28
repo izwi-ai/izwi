@@ -264,6 +264,43 @@ async fn cached_usage_reports_in_completed_usage_when_configured() {
 }
 
 #[tokio::test]
+async fn configured_delta_logprobs_report_on_text_delta_events() {
+    let worker = MockWorker::spawn(MockWorkerConfig {
+        delta_logprobs: Some(vec![TokenLogprob {
+            token: "x".into(),
+            logprob: -1.25,
+            bytes: b"x".to_vec(),
+            top_logprobs: vec![TopTokenLogprob {
+                token: "x".into(),
+                logprob: -1.25,
+                bytes: b"x".to_vec(),
+            }],
+        }]),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .unwrap();
+    let client = client(&worker);
+
+    let invocation = request(worker.config(), "logprobs");
+    let events = client.invoke_collect(invocation).await.unwrap();
+    let deltas = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            InvocationEventKind::TextDelta { logprobs, .. } => Some(logprobs.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!deltas.is_empty(), "expected at least one text delta");
+    for logprobs in deltas {
+        let entries = logprobs.expect("configured entries present");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].token, "x");
+        assert_eq!(entries[0].logprob, -1.25);
+    }
+}
+
+#[tokio::test]
 async fn cached_usage_is_absent_on_the_wire_when_not_configured() {
     let worker = MockWorker::spawn(MockWorkerConfig::default())
         .await
@@ -816,7 +853,7 @@ async fn gateway_sized_line_budget_allows_a_near_512_kib_text_delta() {
     let events = client.invoke_collect(invocation).await.unwrap();
     assert!(matches!(
         events.get(1).map(|event| &event.event),
-        Some(InvocationEventKind::TextDelta { text }) if text.len() == output_bytes
+        Some(InvocationEventKind::TextDelta { text, .. }) if text.len() == output_bytes
     ));
 }
 

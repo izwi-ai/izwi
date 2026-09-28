@@ -500,6 +500,7 @@ where
 {
     let mut text = String::new();
     let mut latest_usage = None;
+    let mut logprob_entries = RemoteLogprobCollector::default();
 
     loop {
         let event = match stream.next_event().await {
@@ -512,8 +513,12 @@ where
         };
         match event.event {
             InvocationEventKind::Accepted { .. } => {}
-            InvocationEventKind::TextDelta { text: delta } => {
+            InvocationEventKind::TextDelta {
+                text: delta,
+                logprobs,
+            } => {
                 append_remote_text(&mut text, &delta, remote.config.max_output_bytes)?;
+                logprob_entries.extend(logprobs);
             }
             InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
             InvocationEventKind::Completed {
@@ -528,6 +533,7 @@ where
                     finish_reason,
                     usage.or(latest_usage),
                     started,
+                    logprob_entries.finish(),
                 );
             }
             InvocationEventKind::Error { code, message } => {
@@ -672,11 +678,69 @@ fn append_remote_text(text: &mut String, delta: &str, max_bytes: u64) -> Result<
     Ok(())
 }
 
+/** DS9.3: bound on accumulated worker logprob entries per response. */
+const REMOTE_CHAT_LOGPROB_ENTRY_LIMIT: usize = 65_536;
+
+/// DS9.3: map protocol logprob entries onto the core payload shape.
+fn remote_logprobs(
+    entries: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
+) -> Vec<izwi_core::engine::TokenLogprob> {
+    entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| izwi_core::engine::TokenLogprob {
+            token: entry.token,
+            logprob: entry.logprob,
+            bytes: entry.bytes,
+            top_logprobs: entry
+                .top_logprobs
+                .into_iter()
+                .map(|top| izwi_core::engine::TopTokenLogprob {
+                    token: top.token,
+                    logprob: top.logprob,
+                    bytes: top.bytes,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// DS9.3: bounded accumulator for entries collected across worker deltas.
+#[derive(Default)]
+struct RemoteLogprobCollector {
+    entries: Vec<izwi_core::engine::TokenLogprob>,
+    overflow: bool,
+}
+
+impl RemoteLogprobCollector {
+    fn extend(
+        &mut self,
+        entries: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
+    ) -> Vec<izwi_core::engine::TokenLogprob> {
+        let mapped = remote_logprobs(entries);
+        if !self.overflow {
+            let room = REMOTE_CHAT_LOGPROB_ENTRY_LIMIT.saturating_sub(self.entries.len());
+            if mapped.len() <= room {
+                self.entries.extend(mapped.iter().cloned());
+            } else {
+                self.entries.extend(mapped.into_iter().take(room));
+                self.overflow = true;
+            }
+        }
+        self.entries.clone()
+    }
+
+    fn finish(self) -> Vec<izwi_core::engine::TokenLogprob> {
+        self.entries
+    }
+}
+
 fn worker_chat_generation(
     text: String,
     finish_reason: WorkerFinishReason,
     usage: Option<Usage>,
     started: Instant,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
 ) -> Result<ChatGeneration, ApiError> {
     let usage = usage.unwrap_or(Usage {
         input_tokens: 0,
@@ -696,7 +760,7 @@ fn worker_chat_generation(
             .map_err(|_| bad_gateway_error("Worker reported an invalid output token count"))?,
         generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
         cached_prompt_tokens: usage.cached_tokens,
-        logprobs: Vec::new(),
+        logprobs,
     })
 }
 
@@ -786,6 +850,7 @@ where
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     tokio::spawn(async move {
         let started = Instant::now();
+        let mut logprob_entries = RemoteLogprobCollector::default();
         let backpressure = Arc::new(ChatStreamBackpressure::default());
         let mut text = String::new();
         let mut latest_usage = None;
@@ -812,11 +877,15 @@ where
                         return;
                     }
                 }
-                InvocationEventKind::TextDelta { text: delta, .. } => {
+                InvocationEventKind::TextDelta {
+                    text: delta,
+                    logprobs,
+                } => {
                     if let Err(error) = append_remote_text(&mut text, &delta, max_output_bytes) {
                         break ChatStreamEvent::Failed(error.message);
                     }
-                    try_send_chat_delta(&event_tx, &backpressure, delta, Vec::new());
+                    let entries = logprob_entries.extend(logprobs);
+                    try_send_chat_delta(&event_tx, &backpressure, delta, entries);
                     if event_tx.is_closed() {
                         return;
                     }
@@ -837,6 +906,7 @@ where
                         finish_reason,
                         usage.or(latest_usage),
                         started,
+                        logprob_entries.finish(),
                     ) {
                         Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
                         Err(error) => break ChatStreamEvent::Failed(error.message),
@@ -1297,6 +1367,7 @@ mod tests {
                 cached_tokens: Some(7),
             }),
             std::time::Instant::now(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(measured.prompt_tokens, 12);
@@ -1308,6 +1379,7 @@ mod tests {
             WorkerFinishReason::Stop,
             None,
             std::time::Instant::now(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(unmeasured.prompt_tokens, 0);

@@ -2017,7 +2017,12 @@ pub struct RuntimeChatInvocationRequest {
 /// Ordered output emitted by an admitted chat invocation.
 #[derive(Debug, Clone)]
 pub enum RuntimeChatInvocationEvent {
-    TextDelta(String),
+    /// DS9.3: a text delta with its per-token logprob entries (empty unless
+    /// the request asked for logprobs).
+    TextDelta {
+        text: String,
+        logprobs: Vec<crate::engine::TokenLogprob>,
+    },
     Completed(ChatGeneration),
 }
 
@@ -2783,7 +2788,10 @@ impl RuntimeChatInvocationDriver {
                             if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
                                 self.streamed_text.push_str(&delta);
                                 if !self.try_send_event(Ok(
-                                    RuntimeChatInvocationEvent::TextDelta(delta),
+                                    RuntimeChatInvocationEvent::TextDelta {
+                                        text: delta,
+                                        logprobs: chunk.logprobs.clone(),
+                                    },
                                 )) {
                                     return self.cancel_and_confirm().await;
                                 }

@@ -29,6 +29,18 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
         // protocol minor 3 and the gateway must surface them in the public
         // OpenAI usage shape.
         usage_cached_input_tokens: Some(64),
+        // DS9.3: the worker reports per-token logprobs through protocol
+        // minor 3; the gateway must map them into the public choice shape.
+        delta_logprobs: Some(vec![izwi_serving_protocol::TokenLogprob {
+            token: "gateway".into(),
+            logprob: -0.75,
+            bytes: b"gateway".to_vec(),
+            top_logprobs: vec![izwi_serving_protocol::TopTokenLogprob {
+                token: "gateway".into(),
+                logprob: -0.75,
+                bytes: b"gateway".to_vec(),
+            }],
+        }]),
         ..MockWorkerConfig::default()
     };
     let worker = MockWorker::spawn(worker_config)
@@ -153,6 +165,17 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
         Some(1),
         "cached tokens are a subset of prompt tokens"
     );
+    let logprobs = &body["choices"][0]["logprobs"]["content"];
+    assert_eq!(
+        logprobs[0]["token"], "gateway",
+        "worker logprobs must reach the public OpenAI choice shape: {body}"
+    );
+    assert_eq!(logprobs[0]["logprob"], -0.75);
+    assert_eq!(
+        logprobs[0]["bytes"],
+        serde_json::json!([103, 97, 116, 101, 119, 97, 121])
+    );
+    assert_eq!(logprobs[0]["top_logprobs"][0]["token"], "gateway");
 
     // Unauthenticated callers are rejected at the perimeter.
     let rejected = client
@@ -607,7 +630,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     let RealtimeServerFrame::Event { event } = final_delta else {
         panic!("expected final delta");
     };
-    let InvocationEventKind::TextDelta { text } = event.event else {
+    let InvocationEventKind::TextDelta { text, .. } = event.event else {
         panic!("expected final transcript delta, got {:?}", event.event);
     };
     assert_eq!(text, "gateway relayed transcript");

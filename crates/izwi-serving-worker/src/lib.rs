@@ -223,9 +223,14 @@ pub struct ExecutionFailure {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionEvent {
-    TextDelta(String),
+    /// DS9.3: a text delta with its per-token logprob entries (empty unless
+    /// the request asked for logprobs).
+    TextDelta {
+        text: String,
+        logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    },
     Completed {
         /// Non-streaming runtimes return their one bounded text value here.
         /// Streaming adapters leave this empty after forwarding deltas.
@@ -1651,7 +1656,9 @@ async fn run_invocation<E: InvocationExecutor>(
             }
             event = execution.next_event() => {
                 match event {
-                    Some(ExecutionEvent::TextDelta(text)) if !cancellation_requested => {
+                    Some(ExecutionEvent::TextDelta { text, logprobs })
+                        if !cancellation_requested =>
+                    {
                         output_bytes = output_bytes.saturating_add(text.len());
                         if output_bytes as u64 > request.output_limits.max_bytes {
                             terminal = Some(TerminalEvent::Failed(ExecutionFailure {
@@ -1673,7 +1680,10 @@ async fn run_invocation<E: InvocationExecutor>(
                             request_id: request.request_id.clone(),
                             attempt_id: request.attempt_id.clone(),
                             sequence,
-                            event: InvocationEventKind::TextDelta { text },
+                            event: InvocationEventKind::TextDelta {
+                                text,
+                                logprobs: protocol_logprobs(&logprobs),
+                            },
                         };
                         match try_send_event(&state.config, &state.metrics, &tx, event) {
                             EventSendResult::Sent => {
@@ -1700,7 +1710,7 @@ async fn run_invocation<E: InvocationExecutor>(
                             }
                         }
                     }
-                    Some(ExecutionEvent::TextDelta(_)) => {}
+                    Some(ExecutionEvent::TextDelta { .. }) => {}
                     Some(ExecutionEvent::Completed {
                         text,
                         finish_reason,
@@ -1724,7 +1734,10 @@ async fn run_invocation<E: InvocationExecutor>(
                                 request_id: request.request_id.clone(),
                                 attempt_id: request.attempt_id.clone(),
                                 sequence,
-                                event: InvocationEventKind::TextDelta { text },
+                                event: InvocationEventKind::TextDelta {
+                                text,
+                                logprobs: None,
+                            },
                             };
                             match try_send_event(&state.config, &state.metrics, &tx, delta) {
                                 EventSendResult::Sent => {
@@ -1890,6 +1903,34 @@ fn mark_execution_cancellation(metrics: &WorkerMetrics, started_at: &mut Option<
         *started_at = Some(Instant::now());
         metrics.record_cancellation_started();
     }
+}
+
+/// DS9.3: map core logprob entries onto the protocol wire shape.
+fn protocol_logprobs(
+    entries: &[izwi_core::engine::TokenLogprob],
+) -> Option<Vec<izwi_serving_protocol::TokenLogprob>> {
+    if entries.is_empty() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .map(|entry| izwi_serving_protocol::TokenLogprob {
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                bytes: entry.bytes.clone(),
+                top_logprobs: entry
+                    .top_logprobs
+                    .iter()
+                    .map(|top| izwi_serving_protocol::TopTokenLogprob {
+                        token: top.token.clone(),
+                        logprob: top.logprob,
+                        bytes: top.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 enum TerminalEvent {
@@ -2394,7 +2435,10 @@ mod tests {
     async fn accepted_stream_is_ordered_and_terminal_after_teardown() {
         let executor = ScriptExecutor {
             events: Mutex::new(Some(VecDeque::from([
-                ExecutionEvent::TextDelta("tiny response".into()),
+                ExecutionEvent::TextDelta {
+                    text: "tiny response".into(),
+                    logprobs: Vec::new(),
+                },
                 ExecutionEvent::Completed {
                     text: None,
                     finish_reason: FinishReason::Stop,
@@ -2525,7 +2569,10 @@ mod tests {
     async fn bounded_output_backpressure_requests_cancel_without_holding_more_events() {
         let cancel_calls = Arc::new(AtomicUsize::new(0));
         let mut events = (0..8)
-            .map(|index| ExecutionEvent::TextDelta(format!("delta-{index}")))
+            .map(|index| ExecutionEvent::TextDelta {
+                text: format!("delta-{index}"),
+                logprobs: Vec::new(),
+            })
             .collect::<VecDeque<_>>();
         events.push_back(ExecutionEvent::Completed {
             text: None,

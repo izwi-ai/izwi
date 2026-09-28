@@ -254,7 +254,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
     loop {
         match session.next_event().await {
             Ok(Some(event)) => match event.event {
-                InvocationEventKind::TextDelta { text } => {
+                InvocationEventKind::TextDelta { text, .. } => {
                     transcript.push_str(&text);
                     deltas += 1;
                 }

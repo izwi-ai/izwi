@@ -68,7 +68,7 @@ async fn run_chat(
                 panic!("chat {id} timed out");
             }
             event = invocation.next_event() => match event {
-                Ok(Some(izwi_core::RuntimeChatInvocationEvent::TextDelta(delta))) => {
+                Ok(Some(izwi_core::RuntimeChatInvocationEvent::TextDelta { text: delta, .. })) => {
                     text.push_str(&delta);
                 }
                 Ok(Some(izwi_core::RuntimeChatInvocationEvent::Completed(generation))) => {

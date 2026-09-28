@@ -71,7 +71,7 @@ pub async fn warm_up_chat_runtime(
             }
             event = invocation.next_event() => {
                 match event {
-                    Ok(Some(RuntimeChatInvocationEvent::TextDelta(text))) => {
+                    Ok(Some(RuntimeChatInvocationEvent::TextDelta { text, .. })) => {
                         event_count = event_count.saturating_add(1);
                         text_bytes = text_bytes.saturating_add(text.len());
                     }
@@ -240,8 +240,8 @@ impl AdmittedExecution for RuntimeAdmittedExecution {
             .as_mut()
             .expect("runtime invocation exists until teardown");
         match invocation.next_event().await {
-            Ok(Some(RuntimeChatInvocationEvent::TextDelta(text))) => {
-                Some(ExecutionEvent::TextDelta(text))
+            Ok(Some(RuntimeChatInvocationEvent::TextDelta { text, logprobs })) => {
+                Some(ExecutionEvent::TextDelta { text, logprobs })
             }
             Ok(Some(RuntimeChatInvocationEvent::Completed(generation))) => {
                 let completed = ExecutionEvent::Completed {
@@ -255,7 +255,10 @@ impl AdmittedExecution for RuntimeAdmittedExecution {
                     Some(completed)
                 } else {
                     self.pending.push_back(completed);
-                    Some(ExecutionEvent::TextDelta(generation.text))
+                    Some(ExecutionEvent::TextDelta {
+                        text: generation.text,
+                        logprobs: generation.logprobs,
+                    })
                 }
             }
             Ok(None) => None,

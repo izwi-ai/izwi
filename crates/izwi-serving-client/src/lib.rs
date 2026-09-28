@@ -1059,7 +1059,7 @@ impl InvocationStream {
                     self.client.inner.config.first_output_timeout,
                 );
             }
-            InvocationEventKind::TextDelta { text } if !text.is_empty() => {
+            InvocationEventKind::TextDelta { text, .. } if !text.is_empty() => {
                 self.reset_phase_deadline(
                     DeadlinePhase::StreamProgress,
                     self.client.inner.config.progress_timeout,

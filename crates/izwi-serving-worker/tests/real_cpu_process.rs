@@ -130,7 +130,7 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
         Some(InvocationEventKind::Completed { .. })
     ));
     assert!(events.iter().any(|event| {
-        matches!(&event.event, InvocationEventKind::TextDelta { text } if !text.is_empty())
+        matches!(&event.event, InvocationEventKind::TextDelta { text, .. } if !text.is_empty())
     }));
 
     // The engine-backed worker must advertise routing signals once it has

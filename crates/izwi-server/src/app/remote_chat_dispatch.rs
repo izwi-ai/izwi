@@ -861,13 +861,15 @@ mod tests {
                 &request,
                 vec![InvocationEventKind::TextDelta {
                     text: "partial".into(),
+                    logprobs: None,
                 }],
             ),
             ScriptedResponse::ManyDeltas(count) => {
                 let mut following = Vec::with_capacity(count.saturating_add(1));
-                following.extend(
-                    (0..count).map(|_| InvocationEventKind::TextDelta { text: "x".into() }),
-                );
+                following.extend((0..count).map(|_| InvocationEventKind::TextDelta {
+                    text: "x".into(),
+                    logprobs: None,
+                }));
                 following.push(InvocationEventKind::Completed {
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
@@ -881,7 +883,10 @@ mod tests {
             ScriptedResponse::Success(text) => accepted_response(
                 &request,
                 vec![
-                    InvocationEventKind::TextDelta { text },
+                    InvocationEventKind::TextDelta {
+                        text,
+                        logprobs: None,
+                    },
                     InvocationEventKind::Completed {
                         finish_reason: FinishReason::Stop,
                         usage: Some(Usage {

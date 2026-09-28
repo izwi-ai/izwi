@@ -511,6 +511,7 @@ mod tests {
             sequence: 1,
             event: InvocationEventKind::TextDelta {
                 text: "partial".into(),
+                logprobs: None,
             },
         };
         let frames = [

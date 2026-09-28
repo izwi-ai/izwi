@@ -138,7 +138,7 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
 
     session.finish().await.unwrap();
     let final_delta = session.next_event().await.unwrap().expect("final delta");
-    let InvocationEventKind::TextDelta { text } = final_delta.event else {
+    let InvocationEventKind::TextDelta { text, .. } = final_delta.event else {
         panic!("expected final transcript delta");
     };
     assert_eq!(text, "mock realtime transcript");

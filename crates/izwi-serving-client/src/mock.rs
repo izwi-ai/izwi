@@ -133,6 +133,9 @@ pub struct MockWorkerConfig {
     /// DS9.1: cached input tokens the mock reports in every terminal usage.
     /// `None` keeps `Usage::cached_tokens` absent on the wire.
     pub usage_cached_input_tokens: Option<u64>,
+    /// DS9.3: logprob entries the mock attaches to every text delta. `None`
+    /// keeps `TextDelta::logprobs` absent on the wire.
+    pub delta_logprobs: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
 }
 
 /// Configurable engine-signal values a mock worker advertises so gateway
@@ -184,6 +187,7 @@ impl Default for MockWorkerConfig {
             realtime: None,
             realtime_tts: None,
             usage_cached_input_tokens: None,
+            delta_logprobs: None,
         }
     }
 }
@@ -778,6 +782,7 @@ async fn run_invocation(
                         sequence,
                         event: InvocationEventKind::TextDelta {
                             text: String::new(),
+                            logprobs: state_for_work.config.delta_logprobs.clone(),
                         },
                     };
                     let _ = tx_for_work.send(encode_event(&event)).await;
@@ -797,6 +802,7 @@ async fn run_invocation(
                     sequence: 1,
                     event: InvocationEventKind::TextDelta {
                         text: state_for_work.config.output_text.clone(),
+                        logprobs: state_for_work.config.delta_logprobs.clone(),
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&event)).await;
@@ -816,7 +822,10 @@ async fn run_invocation(
                         request_id: request_for_work.request_id.clone(),
                         attempt_id: request_for_work.attempt_id.clone(),
                         sequence,
-                        event: InvocationEventKind::TextDelta { text: text.clone() },
+                        event: InvocationEventKind::TextDelta {
+                            text: text.clone(),
+                            logprobs: state_for_work.config.delta_logprobs.clone(),
+                        },
                     };
                     if tx_for_work.send(encode_event(&event)).await.is_err() {
                         return (AttemptState::Failed, Some(sequence.saturating_sub(1)));
@@ -858,6 +867,7 @@ async fn run_invocation(
                     sequence: 1,
                     event: InvocationEventKind::TextDelta {
                         text: state_for_work.config.output_text.clone(),
+                        logprobs: state_for_work.config.delta_logprobs.clone(),
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&event)).await;
@@ -880,6 +890,7 @@ async fn run_invocation(
                     sequence: 1,
                     event: InvocationEventKind::TextDelta {
                         text: "x".repeat(text_bytes),
+                        logprobs: state_for_work.config.delta_logprobs.clone(),
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&event)).await;
@@ -893,6 +904,7 @@ async fn run_invocation(
                     sequence: 1,
                     event: InvocationEventKind::TextDelta {
                         text: state_for_work.config.output_text.clone(),
+                        logprobs: state_for_work.config.delta_logprobs.clone(),
                     },
                 };
                 let _ = tx_for_work.send(encode_event(&delta)).await;
@@ -1393,6 +1405,7 @@ async fn run_mock_asr_stage(
                 Ok(RealtimeClientFrame::Finish) => {
                     let final_delta = InvocationEventKind::TextDelta {
                         text: knobs.final_text.clone(),
+                        logprobs: state.config.delta_logprobs.clone(),
                     };
                     let (sequence, message) = mock_event(state, admit, final_delta);
                     if socket.send(message).await.is_err() {
@@ -1486,6 +1499,7 @@ async fn run_mock_asr_stage(
                 tokio::time::sleep(knobs.push_cadence).await;
                 let delta = InvocationEventKind::TextDelta {
                     text: knobs.delta_per_frame.clone(),
+                    logprobs: state.config.delta_logprobs.clone(),
                 };
                 let (sequence, message) = mock_event(state, admit, delta);
                 if socket.send(message).await.is_err() {

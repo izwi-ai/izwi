@@ -145,7 +145,7 @@ async fn collect_lane_outputs(
         let text: String = events
             .iter()
             .filter_map(|event| match &event.event {
-                InvocationEventKind::TextDelta { text } => Some(text.as_str()),
+                InvocationEventKind::TextDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -454,7 +454,7 @@ async fn collect_prefix_lane_with_env(
         let text: String = events
             .iter()
             .filter_map(|event| match &event.event {
-                InvocationEventKind::TextDelta { text } => Some(text.as_str()),
+                InvocationEventKind::TextDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

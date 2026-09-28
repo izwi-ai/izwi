@@ -792,7 +792,7 @@ async fn handle_invocation_event(
 ) -> bool {
     match event.event {
         InvocationEventKind::Accepted { .. } | InvocationEventKind::Usage { .. } => {}
-        InvocationEventKind::TextDelta { text } => {
+        InvocationEventKind::TextDelta { text, .. } => {
             if let Some(partial) = session.transcript.push(text) {
                 match session.wire {
                     TranscriptionWireProtocol::LegacyV2 => {

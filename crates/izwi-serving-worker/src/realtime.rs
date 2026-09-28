@@ -578,7 +578,10 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         match terminal.expect("loop exit carries a terminal outcome") {
             StageTerminal::Completed { text } => {
                 if let Some(text) = text.filter(|text| !text.is_empty()) {
-                    match self.emit_event(InvocationEventKind::TextDelta { text }) {
+                    match self.emit_event(InvocationEventKind::TextDelta {
+                        text,
+                        logprobs: None,
+                    }) {
                         EventSendResult::Sent => {}
                         EventSendResult::Oversized => {
                             self.terminate_failed(
@@ -673,7 +676,10 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
             if event.delta.is_empty() {
                 continue;
             }
-            match self.emit_event(InvocationEventKind::TextDelta { text: event.delta }) {
+            match self.emit_event(InvocationEventKind::TextDelta {
+                text: event.delta,
+                logprobs: None,
+            }) {
                 EventSendResult::Sent => {
                     self.state.update_attempt(
                         &self.admit.attempt_id,
@@ -716,7 +722,10 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
             if event.is_final {
                 final_text = Some(event.text);
             } else if !event.delta.is_empty() {
-                match self.emit_event(InvocationEventKind::TextDelta { text: event.delta }) {
+                match self.emit_event(InvocationEventKind::TextDelta {
+                    text: event.delta,
+                    logprobs: None,
+                }) {
                     EventSendResult::Sent => {
                         self.state.update_attempt(
                             &self.admit.attempt_id,

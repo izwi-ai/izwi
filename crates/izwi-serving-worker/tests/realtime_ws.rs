@@ -445,7 +445,7 @@ async fn realtime_session_streams_deltas_and_completes_through_shared_attempt_ta
         NextFrame::Event(event) => event,
         other => panic!("expected final delta, got {other:?}"),
     };
-    let InvocationEventKind::TextDelta { text } = final_delta.event else {
+    let InvocationEventKind::TextDelta { text, .. } = final_delta.event else {
         panic!("expected final transcript delta");
     };
     assert_eq!(text, "final transcript");
