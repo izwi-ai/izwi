@@ -635,7 +635,7 @@ impl KvWriteCompletionCollector {
 
 mod page_transfer;
 
-pub use page_transfer::arena_page_bytes;
+pub use page_transfer::{arena_page_bytes, capture_block, decoded_page, restore_block};
 
 /// Physical arena mutation ABI shared by CPU and accelerator backends.
 pub trait KvArena: Send + Sync {

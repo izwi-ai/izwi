@@ -37,6 +37,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 candle-core = { workspace = true }
 half = { workspace = true }
+sha2 = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-server = { path = "../izwi-server" }
