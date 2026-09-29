@@ -286,6 +286,10 @@ impl ModelVariant {
     /// Revision used for the first supported Qwen3.8-27B-FP8 artifact contract.
     pub const QWEN38_27B_FP8_ARTIFACT_REVISION: &'static str =
         "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
+    /// Revision used for the first supported Qwen3.5-35B-A3B-FP8 artifact
+    /// contract (HF repo state 2026-04-24).
+    pub const QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION: &'static str =
+        "9d1823d2dee688a6b25e77009dc727688c44936e";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -329,6 +333,7 @@ impl ModelVariant {
     pub fn artifact_revision(self) -> Option<&'static str> {
         match self {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
+            Self::Qwen35Moe35BA3BFp8 => Some(Self::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             _ => None,
         }
@@ -1389,6 +1394,10 @@ mod tests {
         assert_eq!(variant.dir_name(), "Qwen3.5-35B-A3B-FP8");
         assert_eq!(variant.display_name(), "Qwen3.5 35B-A3B FP8");
         assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION)
+        );
         let caps = variant
             .chat_capabilities()
             .expect("qwen3.5 moe chat capabilities");

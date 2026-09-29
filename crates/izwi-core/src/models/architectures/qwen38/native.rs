@@ -22,8 +22,11 @@ use crate::error::{Error, Result};
 use crate::performance::LoadingPerformanceConfig;
 
 mod cache;
-mod loading;
-mod q8;
+// Crate-internal so sibling native families (qwen35moe) can reuse the narrow
+// stable ingestion primitives on `IndexedSafetensors`; execution graphs stay
+// family-owned.
+pub(crate) mod loading;
+pub(crate) mod q8;
 #[cfg(feature = "cuda")]
 mod upload;
 pub use loading::RawBlockFp8Projection;

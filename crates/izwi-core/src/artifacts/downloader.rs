@@ -263,6 +263,61 @@ fn qwen38_selected_files(index_bytes: &[u8]) -> Result<Vec<String>> {
     Ok(files)
 }
 
+const QWEN35_MOE_REQUIRED_METADATA_FILES: &[&str] = &[
+    "config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "model.safetensors.index.json",
+];
+
+fn qwen35_moe_selected_files(index_bytes: &[u8]) -> Result<Vec<String>> {
+    let mut files = QWEN35_MOE_REQUIRED_METADATA_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect::<Vec<_>>();
+    files.extend(indexed_safetensor_shards(index_bytes)?);
+    Ok(files)
+}
+
+fn qwen35_moe_bundle_is_complete(model_dir: &Path) -> bool {
+    let index_bytes = match std::fs::read(model_dir.join("model.safetensors.index.json")) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let mut selected_files = match qwen35_moe_selected_files(&index_bytes) {
+        Ok(files) => files,
+        Err(_) => return false,
+    };
+    if !selected_files
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+    {
+        return false;
+    }
+
+    let manifest = match read_artifact_manifest(model_dir) {
+        Ok(Some(manifest)) => manifest,
+        _ => return false,
+    };
+    let mut recorded_files = manifest.files.clone();
+    recorded_files.sort();
+    recorded_files.dedup();
+    selected_files.sort();
+    selected_files.dedup();
+
+    manifest.schema_version == 1
+        && manifest.variant == ModelVariant::Qwen35Moe35BA3BFp8
+        && manifest.repo_id == ModelVariant::Qwen35Moe35BA3BFp8.repo_id()
+        && manifest.revision == ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION
+        && recorded_files == selected_files
+}
+
 fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
     let index_bytes = match std::fs::read(model_dir.join("model.safetensors.index.json")) {
         Ok(bytes) => bytes,
@@ -740,6 +795,9 @@ impl ModelDownloader {
         }
         if variant.is_qwen38_fp8() {
             return qwen38_bundle_is_complete(&path);
+        }
+        if variant.is_qwen35_moe_fp8() {
+            return qwen35_moe_bundle_is_complete(&path);
         }
 
         let has_any_safetensors = || {
@@ -1449,6 +1507,11 @@ impl ModelDownloader {
                         .iter()
                         .map(|file| (*file).to_string())
                         .collect();
+                } else if variant.is_qwen35_moe_fp8() {
+                    return QWEN35_MOE_REQUIRED_METADATA_FILES
+                        .iter()
+                        .map(|file| (*file).to_string())
+                        .collect();
                 } else if variant.is_qwen_chat_gguf() {
                     let gguf_file =
                         qwen_chat_gguf_filename(variant).expect("checked by is_qwen_chat_gguf");
@@ -1754,6 +1817,37 @@ impl ModelDownloader {
         })
     }
 
+    /// Index-closure file plan for the Qwen3.5-35B-A3B-FP8 bundle: every
+    /// safetensors shard named by the index plus the required metadata files.
+    async fn get_qwen35_moe_indexed_file_specs(&self) -> Result<Vec<ModelFileSpec>> {
+        let variant = ModelVariant::Qwen35Moe35BA3BFp8;
+        let repo_id = variant.repo_id();
+        let revision = variant
+            .artifact_revision()
+            .expect("Qwen3.5 MoE artifact revision is catalog-pinned");
+        let local_index = self
+            .model_path(variant)
+            .join("model.safetensors.index.json");
+        let index_bytes = if local_index.is_file() {
+            tokio::fs::read(&local_index).await?
+        } else {
+            self.get_file_bytes(repo_id, revision, "model.safetensors.index.json")
+                .await?
+        };
+
+        qwen35_moe_selected_files(&index_bytes).map(|files| {
+            files
+                .into_iter()
+                .map(|file| ModelFileSpec {
+                    source_repo: repo_id.to_string(),
+                    source_revision: revision.to_string(),
+                    source_file: file.clone(),
+                    local_file: file,
+                })
+                .collect()
+        })
+    }
+
     /// Get actual file size from HTTP HEAD request
     async fn get_actual_file_size(
         &self,
@@ -1799,11 +1893,13 @@ impl ModelDownloader {
     ) -> Result<Vec<FileDownloadPlan>> {
         let file_specs = if variant.is_qwen38_fp8() {
             self.get_qwen38_indexed_file_specs().await?
+        } else if variant.is_qwen35_moe_fp8() {
+            self.get_qwen35_moe_indexed_file_specs().await?
         } else {
             self.get_model_file_specs(variant)
         };
         let local_dir = self.model_path(variant);
-        let require_exact_bundle = variant.is_qwen38_fp8();
+        let require_exact_bundle = variant.is_qwen38_fp8() || variant.is_qwen35_moe_fp8();
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         let mut repo_tree_planning_available = true;
