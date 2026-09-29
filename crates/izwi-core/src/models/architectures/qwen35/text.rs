@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
-use candle_transformers::models::with_tracing::QMatMul;
+use candle_core::quantized::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::kv::{
@@ -30,6 +30,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
+use crate::models::architectures::qwen35moe::sparse::Qwen35MoeSparseMlp;
 
 pub struct Qwen35TextModel {
     device: Device,
@@ -278,7 +279,7 @@ struct Qwen35Layer {
     attn_norm: RmsNorm,
     mixer: Qwen35Mixer,
     post_attention_norm: RmsNorm,
-    mlp: Qwen35Mlp,
+    ffn: Qwen35FeedForward,
 }
 
 enum Qwen35Mixer {
@@ -335,8 +336,125 @@ struct Qwen35GatedRmsNorm {
     eps: f64,
 }
 
+/// Sparse-expert feed-forward geometry shared by every layer of a
+/// sparse-MoE variant of the Qwen3.5 hybrid trunk (Qwen3.5-35B-A3B: 256
+/// routed experts, 8 active, plus one always-on shared expert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen35MoeFfnGeometry {
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub expert_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+}
+
+/// Checkpoint-format seam for the shared Qwen3.5 hybrid trunk. The dense
+/// GGUF family and the qwen35moe loaders (native block-FP8 safetensors and
+/// the synthetic GGUF fixture) build the identical model through this
+/// interface; only tensor naming, residency, and MoE weight layout differ.
+///
+/// Names handed to the source are the logical GGUF-style names
+/// (`token_embd.weight`, `blk.{i}.attn_q.weight`, ...); implementations
+/// translate to their own checkpoint layout internally.
+pub(crate) trait Qwen35WeightSource {
+    fn has(&self, name: &str) -> bool;
+
+    fn qmatmul(&self, name: &str, device: &Device) -> Result<QMatMul>;
+
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm>;
+
+    /// Dense tensor, coerced to `dtype` when requested (always F32 when
+    /// `Some(F32)`).
+    fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor>;
+
+    /// Sparse-expert feed-forward weights for one decoder layer.
+    fn moe_ffn(
+        &self,
+        layer: usize,
+        geometry: &Qwen35MoeFfnGeometry,
+        device: &Device,
+    ) -> Result<Qwen35MoeSparseMlp>;
+
+    /// Token embedding matrix `[vocab, hidden]`.
+    fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
+}
+
+/// GGUF-backed source for the dense Qwen3.5 family and the qwen35moe
+/// synthetic fixture checkpoints (fused `ffn_*_exps` expert tensors).
+pub(crate) struct GgufSource<'a> {
+    loader: &'a GgufLoader,
+}
+
+impl<'a> GgufSource<'a> {
+    pub(crate) fn new(loader: &'a GgufLoader) -> Self {
+        Self { loader }
+    }
+}
+
+impl Qwen35WeightSource for GgufSource<'_> {
+    fn has(&self, name: &str) -> bool {
+        self.loader.has_tensor(name)
+    }
+
+    fn qmatmul(&self, name: &str, device: &Device) -> Result<QMatMul> {
+        load_qmatmul(self.loader, device, name)
+    }
+
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
+        load_rms_norm(self.loader, device, name, eps)
+    }
+
+    fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {
+        load_dense(self.loader, device, name, dtype)
+    }
+
+    fn moe_ffn(
+        &self,
+        layer: usize,
+        geometry: &Qwen35MoeFfnGeometry,
+        device: &Device,
+    ) -> Result<Qwen35MoeSparseMlp> {
+        crate::models::architectures::qwen35moe::sparse::load_gguf_sparse_mlp(
+            self.loader,
+            layer,
+            geometry,
+            device,
+        )
+    }
+
+    fn token_embeddings(&self, device: &Device) -> Result<Tensor> {
+        self.loader
+            .load_qtensor("token_embd.weight", device)?
+            .dequantize(device)
+            .map_err(Error::from)
+    }
+}
+
+/// Feed-forward branch of a trunk layer: dense SwiGLU MLP or the sparse
+/// expert block. Mirrors `Qwen3FeedForward` on the qwen3 family.
+enum Qwen35FeedForward {
+    Dense(Qwen35Mlp),
+    Sparse(Qwen35MoeSparseMlp),
+}
+
+impl Qwen35FeedForward {
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(hidden_states),
+            Self::Sparse(moe) => moe.forward(hidden_states),
+        }
+    }
+}
+
 impl Qwen35TextModel {
     pub fn load(loader: &GgufLoader, cfg: &Qwen35TextConfig, device: &Device) -> Result<Self> {
+        Self::load_with_source(&GgufSource::new(loader), cfg, device)
+    }
+
+    pub(crate) fn load_with_source(
+        source: &dyn Qwen35WeightSource,
+        cfg: &Qwen35TextConfig,
+        device: &Device,
+    ) -> Result<Self> {
         if cfg.attention_key_length != cfg.attention_value_length {
             return Err(Error::ModelLoadError(format!(
                 "Qwen3.5 full attention currently requires key/value head dims to match, found {} and {}",
@@ -351,51 +469,55 @@ impl Qwen35TextModel {
             )));
         }
 
-        let embedding_weights = loader
-            .load_qtensor("token_embd.weight", device)?
-            .dequantize(device)
-            .map_err(Error::from)?;
+        let embedding_weights = source.token_embeddings(device)?;
         let (vocab_size, hidden_size) = embedding_weights.dims2()?;
         if hidden_size != cfg.embedding_length {
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5 token embedding width mismatch: GGUF has {hidden_size}, metadata says {}",
+                "Qwen3.5 token embedding width mismatch: checkpoint has {hidden_size}, metadata says {}",
                 cfg.embedding_length
             )));
         }
         let _ = vocab_size;
 
         let token_embeddings = Embedding::new(embedding_weights, hidden_size);
-        let output_norm = load_rms_norm(loader, device, "output_norm.weight", cfg)?;
-        let output = if loader.has_tensor("output.weight") {
-            load_qmatmul(loader, device, "output.weight")?
+        let output_norm = source.rms_norm("output_norm.weight", cfg.attention_layer_norm_rms_epsilon, device)?;
+        let output = if source.has("output.weight") {
+            source.qmatmul("output.weight", device)?
         } else {
-            load_qmatmul(loader, device, "token_embd.weight")?
+            source.qmatmul("token_embd.weight", device)?
         };
         let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
             let prefix = format!("blk.{layer_idx}");
-            let attn_norm =
-                load_rms_norm(loader, device, &format!("{prefix}.attn_norm.weight"), cfg)?;
-            let post_attention_norm = load_rms_norm(
-                loader,
+            let attn_norm = source.rms_norm(
+                &format!("{prefix}.attn_norm.weight"),
+                cfg.attention_layer_norm_rms_epsilon,
                 device,
-                &format!("{prefix}.post_attention_norm.weight"),
-                cfg,
             )?;
-            let mlp = Qwen35Mlp::load(loader, device, &prefix)?;
+            let post_attention_norm = source.rms_norm(
+                &format!("{prefix}.post_attention_norm.weight"),
+                cfg.attention_layer_norm_rms_epsilon,
+                device,
+            )?;
+            let ffn = match &cfg.moe_ffn {
+                Some(geometry) => {
+                    Qwen35FeedForward::Sparse(source.moe_ffn(layer_idx, geometry, device)?)
+                }
+                None => Qwen35FeedForward::Dense(Qwen35Mlp::load_via(source, device, &prefix)?),
+            };
             let mixer = if is_full_attention_layer(layer_idx, cfg.full_attention_interval) {
-                Qwen35Mixer::Full(Qwen35FullAttention::load(loader, device, &prefix, cfg)?)
+                Qwen35Mixer::Full(Qwen35FullAttention::load_via(source, device, &prefix, cfg)?)
             } else {
-                Qwen35Mixer::Linear(Qwen35LinearAttention::load(loader, device, &prefix, cfg)?)
+                Qwen35Mixer::Linear(Qwen35LinearAttention::load_via(source, device, &prefix, cfg)?)
             };
 
             layers.push(Qwen35Layer {
                 attn_norm,
                 mixer,
                 post_attention_norm,
-                mlp,
+                ffn,
             });
         }
         Ok(Self {
@@ -416,6 +538,20 @@ impl Qwen35TextModel {
 
     pub fn hidden_size(&self) -> usize {
         self.token_embeddings.hidden_size()
+    }
+
+    /// Per-sparse-layer expert activation histograms (DS10 A6); empty for
+    /// dense checkpoints.
+    pub(crate) fn expert_activation_counters(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::models::shared::moe::ExpertActivationCounters>> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.ffn {
+                Qwen35FeedForward::Sparse(moe) => Some(moe.counters()),
+                Qwen35FeedForward::Dense(_) => None,
+            })
+            .collect()
     }
 
     pub(crate) fn forward_token_id_at_physical(
@@ -831,7 +967,7 @@ impl Qwen35Layer {
         let hidden_states = (&residual + &mixed)?;
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.ffn.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
 
@@ -880,17 +1016,21 @@ impl Qwen35Layer {
         let hidden_states = (&residual + &mixed)?;
         let residual = hidden_states.clone();
         let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.ffn.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
 }
 
 impl Qwen35Mlp {
-    fn load(loader: &GgufLoader, device: &Device, prefix: &str) -> Result<Self> {
+    fn load_via(
+        source: &dyn Qwen35WeightSource,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
         Ok(Self {
-            gate: load_qmatmul(loader, device, &format!("{prefix}.ffn_gate.weight"))?,
-            up: load_qmatmul(loader, device, &format!("{prefix}.ffn_up.weight"))?,
-            down: load_qmatmul(loader, device, &format!("{prefix}.ffn_down.weight"))?,
+            gate: source.qmatmul(&format!("{prefix}.ffn_gate.weight"), device)?,
+            up: source.qmatmul(&format!("{prefix}.ffn_up.weight"), device)?,
+            down: source.qmatmul(&format!("{prefix}.ffn_down.weight"), device)?,
         })
     }
 
@@ -911,19 +1051,27 @@ impl Qwen35Mlp {
 }
 
 impl Qwen35FullAttention {
-    fn load(
-        loader: &GgufLoader,
+    fn load_via(
+        source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
         cfg: &Qwen35TextConfig,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_q.weight"))?,
-            k_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_k.weight"))?,
-            v_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_v.weight"))?,
-            o_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_output.weight"))?,
-            q_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_q_norm.weight"), cfg)?,
-            k_norm: load_rms_norm(loader, device, &format!("{prefix}.attn_k_norm.weight"), cfg)?,
+            q_proj: source.qmatmul(&format!("{prefix}.attn_q.weight"), device)?,
+            k_proj: source.qmatmul(&format!("{prefix}.attn_k.weight"), device)?,
+            v_proj: source.qmatmul(&format!("{prefix}.attn_v.weight"), device)?,
+            o_proj: source.qmatmul(&format!("{prefix}.attn_output.weight"), device)?,
+            q_norm: source.rms_norm(
+                &format!("{prefix}.attn_q_norm.weight"),
+                cfg.attention_layer_norm_rms_epsilon,
+                device,
+            )?,
+            k_norm: source.rms_norm(
+                &format!("{prefix}.attn_k_norm.weight"),
+                cfg.attention_layer_norm_rms_epsilon,
+                device,
+            )?,
             num_heads: cfg.attention_head_count,
             num_kv_heads: cfg.attention_head_count_kv,
             head_dim: cfg.attention_key_length,
@@ -1286,8 +1434,8 @@ impl Qwen35FullAttention {
 }
 
 impl Qwen35LinearAttention {
-    fn load(
-        loader: &GgufLoader,
+    fn load_via(
+        source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
         cfg: &Qwen35TextConfig,
@@ -1298,53 +1446,68 @@ impl Qwen35LinearAttention {
         let head_v_dim = cfg.ssm_inner_size / cfg.ssm_time_step_rank;
         let conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-        let dt_bias_name = if loader.has_tensor(&format!("{prefix}.ssm_dt.bias")) {
+        let dt_bias_name = if source.has(&format!("{prefix}.ssm_dt.bias")) {
             format!("{prefix}.ssm_dt.bias")
         } else {
             format!("{prefix}.ssm_dt")
         };
-        let dt_bias = load_vector(loader, device, &dt_bias_name, num_v_heads)?.reshape((
-            1,
-            1,
-            num_v_heads,
-        ))?;
-        let a = load_vector(loader, device, &format!("{prefix}.ssm_a"), num_v_heads)?.reshape((
-            1,
-            1,
-            num_v_heads,
-        ))?;
+        let dt_bias = source
+            .dense(&dt_bias_name, Some(DType::F32), device)?
+            .reshape((num_v_heads,))?
+            .reshape((1, 1, num_v_heads))?;
+        if dt_bias.elem_count() != num_v_heads {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected tensor size for {dt_bias_name}: expected {num_v_heads} elements, found {}",
+                dt_bias.elem_count()
+            )));
+        }
+        let a_name = format!("{prefix}.ssm_a");
+        let a = source
+            .dense(&a_name, Some(DType::F32), device)?
+            .reshape((num_v_heads,))?
+            .reshape((1, 1, num_v_heads))?;
+        if a.elem_count() != num_v_heads {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected tensor size for {a_name}: expected {num_v_heads} elements, found {}",
+                a.elem_count()
+            )));
+        }
         let conv_kernel = normalize_conv_kernel(
-            load_dense(
-                loader,
-                device,
+            source.dense(
                 &format!("{prefix}.ssm_conv1d.weight"),
                 Some(DType::F32),
+                device,
             )?,
             conv_dim,
             cfg.ssm_conv_kernel,
         )?;
         let conv_kernel_slices = pre_slice_conv_kernel(&conv_kernel, cfg.ssm_conv_kernel)?;
+        let norm_weight_name = format!("{prefix}.ssm_norm.weight");
+        let norm_weight = source
+            .dense(&norm_weight_name, Some(DType::F32), device)?
+            .reshape((head_v_dim,))?;
+        if norm_weight.elem_count() != head_v_dim {
+            return Err(Error::ModelLoadError(format!(
+                "Unexpected tensor size for {norm_weight_name}: expected {head_v_dim} elements, found {}",
+                norm_weight.elem_count()
+            )));
+        }
         let norm = Qwen35GatedRmsNorm {
-            weight: load_vector(
-                loader,
-                device,
-                &format!("{prefix}.ssm_norm.weight"),
-                head_v_dim,
-            )?,
+            weight: norm_weight,
             eps: cfg.attention_layer_norm_rms_epsilon,
         };
 
         Ok(Self {
-            qkv_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_qkv.weight"))?,
-            gate_proj: load_qmatmul(loader, device, &format!("{prefix}.attn_gate.weight"))?,
-            beta_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_beta.weight"))?,
-            alpha_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_alpha.weight"))?,
+            qkv_proj: source.qmatmul(&format!("{prefix}.attn_qkv.weight"), device)?,
+            gate_proj: source.qmatmul(&format!("{prefix}.attn_gate.weight"), device)?,
+            beta_proj: source.qmatmul(&format!("{prefix}.ssm_beta.weight"), device)?,
+            alpha_proj: source.qmatmul(&format!("{prefix}.ssm_alpha.weight"), device)?,
             dt_bias,
             a,
             conv_kernel,
             conv_kernel_slices,
             norm,
-            out_proj: load_qmatmul(loader, device, &format!("{prefix}.ssm_out.weight"))?,
+            out_proj: source.qmatmul(&format!("{prefix}.ssm_out.weight"), device)?,
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -1789,20 +1952,16 @@ fn is_full_attention_layer(layer_idx: usize, full_attention_interval: usize) -> 
 
 fn load_qmatmul(loader: &GgufLoader, device: &Device, name: &str) -> Result<QMatMul> {
     let weights = Arc::new(loader.load_qtensor(name, device)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
+    QMatMul::from_arc(weights).map_err(Error::from)
 }
 
 fn load_rms_norm(
     loader: &GgufLoader,
     device: &Device,
     name: &str,
-    cfg: &Qwen35TextConfig,
+    eps: f64,
 ) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(
-        loader.load_qtensor(name, device)?,
-        cfg.attention_layer_norm_rms_epsilon,
-    )
-    .map_err(Error::from)
+    RmsNorm::from_qtensor(loader.load_qtensor(name, device)?, eps).map_err(Error::from)
 }
 
 fn load_dense(
@@ -1821,22 +1980,6 @@ fn load_dense(
         }
     }
     Ok(tensor)
-}
-
-fn load_vector(
-    loader: &GgufLoader,
-    device: &Device,
-    name: &str,
-    expected_len: usize,
-) -> Result<Tensor> {
-    let tensor = load_dense(loader, device, name, Some(DType::F32))?;
-    let actual_len = tensor.elem_count();
-    if actual_len != expected_len {
-        return Err(Error::ModelLoadError(format!(
-            "Unexpected tensor size for {name}: expected {expected_len} elements, found {actual_len}"
-        )));
-    }
-    tensor.reshape((expected_len,)).map_err(Error::from)
 }
 
 fn normalize_conv_kernel(
@@ -2257,10 +2400,9 @@ mod tests {
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
-    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
-    use candle_transformers::models::with_tracing::QMatMul;
     use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
 
@@ -2288,7 +2430,7 @@ mod tests {
             )
             .unwrap();
             let weights = QTensor::quantize(&weights, GgmlDType::F32).unwrap();
-            QMatMul::from_weights(Arc::new(weights)).unwrap()
+            QMatMul::from_arc(Arc::new(weights)).unwrap()
         };
         let conv_kernel = Tensor::from_vec(
             (0..24)

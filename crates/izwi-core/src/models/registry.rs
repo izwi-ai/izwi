@@ -83,6 +83,7 @@ use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
     Qwen35SharedStepCheckpoint,
 };
+use crate::models::architectures::qwen35moe::chat::Qwen35MoeChatModel;
 use crate::models::architectures::qwen38::chat::{
     ChatDecodeState as Qwen38ChatDecodeState, Qwen38ChatModel, Qwen38PreparedPrompt,
     Qwen38SharedStepCheckpoint,
@@ -381,20 +382,17 @@ fn load_qwen38_chat_model(
 }
 
 fn load_qwen35_moe_chat_model(
-    _model_dir: &Path,
+    model_dir: &Path,
     variant: ModelVariant,
-    _device: DeviceProfile,
+    device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
     _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    // Registration-sweep posture: the variant is catalog-disabled and its
-    // native block-scaled FP8 ingestion lands with the qwen35moe
-    // architecture module. Fail loudly if anything reaches this loader
-    // before that module exists.
-    Err(Error::ModelLoadError(format!(
-        "{} requires the qwen35moe native FP8 ingestion module, which is not part of this build",
-        variant.dir_name()
-    )))
+    // Hybrid-recurrent prefix reuse is unproven for this family (the DS1
+    // catalog cell is excluded), so the mode is deliberately not engaged.
+    Ok(NativeChatModel::Qwen35Moe(Qwen35MoeChatModel::load(
+        model_dir, variant, device,
+    )?))
 }
 
 fn load_lfm25_audio_model(
@@ -3684,6 +3682,7 @@ impl NativeDiarizationModel {
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
     Qwen35(Qwen35ChatModel),
+    Qwen35Moe(Qwen35MoeChatModel),
     Qwen38(Qwen38ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
@@ -3697,6 +3696,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.max_context_tokens(),
             Self::Qwen35(model) => model.max_context_tokens(),
+            Self::Qwen35Moe(model) => model.max_context_tokens(),
             Self::Qwen38(model) => model.max_context_tokens(),
             Self::Gemma3(model) => model.max_context_tokens(),
             Self::Lfm2(model) => model.max_context_tokens(),
@@ -3709,6 +3709,7 @@ impl InferenceStateContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.inference_state_contract(),
             Self::Qwen35(model) => model.inference_state_contract(),
+            Self::Qwen35Moe(model) => model.inference_state_contract(),
             Self::Qwen38(model) => model.inference_state_contract(),
             Self::Gemma3(model) => model.inference_state_contract(),
             Self::Lfm2(model) => model.inference_state_contract(),
@@ -4366,6 +4367,7 @@ pub(crate) enum NativeChatDecodeCheckpoint {
 #[derive(Debug, Clone)]
 pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
+    Qwen35Moe(Qwen35PreparedPrompt),
     Qwen38(Qwen38PreparedPrompt),
 }
 
@@ -4373,6 +4375,7 @@ impl NativeChatPreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         match self {
             Self::Qwen35(prepared) => prepared.prompt_ids(),
+            Self::Qwen35Moe(prepared) => prepared.prompt_ids(),
             Self::Qwen38(prepared) => prepared.prompt_ids(),
         }
     }
@@ -4380,6 +4383,7 @@ impl NativeChatPreparedPrompt {
     pub fn family(&self) -> ModelFamily {
         match self {
             Self::Qwen35(_) => ModelFamily::Qwen35Chat,
+            Self::Qwen35Moe(_) => ModelFamily::Qwen35MoeChat,
             Self::Qwen38(_) => ModelFamily::Qwen38Chat,
         }
     }
@@ -4387,14 +4391,21 @@ impl NativeChatPreparedPrompt {
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),
-            Self::Qwen38(_) => None,
+            Self::Qwen35Moe(_) | Self::Qwen38(_) => None,
+        }
+    }
+
+    pub(crate) fn as_qwen35_moe(&self) -> Option<&Qwen35PreparedPrompt> {
+        match self {
+            Self::Qwen35Moe(prepared) => Some(prepared),
+            Self::Qwen35(_) | Self::Qwen38(_) => None,
         }
     }
 
     pub(crate) fn as_qwen38(&self) -> Option<&Qwen38PreparedPrompt> {
         match self {
             Self::Qwen38(prepared) => Some(prepared),
-            Self::Qwen35(_) => None,
+            Self::Qwen35(_) | Self::Qwen35Moe(_) => None,
         }
     }
 }
@@ -4648,6 +4659,13 @@ impl NativeChatModel {
                     Some(NativeChatPreparedPrompt::Qwen35(prepared)),
                 ))
             }
+            Self::Qwen35Moe(model) => {
+                let prepared = model.prepare_prompt_for_execution(messages, config)?;
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Qwen35Moe(prepared)),
+                ))
+            }
             Self::Qwen38(model) => {
                 let prepared = model.prepare_prompt_for_execution(messages, config)?;
                 Ok((
@@ -4671,6 +4689,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.prompt_token_ids(messages),
             Self::Qwen35(model) => model.prompt_token_ids_with_config(messages, config),
+            Self::Qwen35Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids(messages),
@@ -4696,6 +4715,9 @@ impl NativeChatModel {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "Qwen3.5-MoE chat requires scheduler-owned physical state".to_string(),
             )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
@@ -4735,6 +4757,9 @@ impl NativeChatModel {
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
             )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "Qwen3.5-MoE chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
             )),
@@ -4755,6 +4780,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
             Self::Qwen35(model) => model.supports_incremental_decode(),
+            Self::Qwen35Moe(model) => model.supports_incremental_decode(),
             Self::Qwen38(model) => model.supports_incremental_decode(),
             Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
@@ -4765,6 +4791,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen35(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen35Moe(model) => model.supports_continuous_decode_batch(),
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen38(model) => model.supports_continuous_decode_batch(),
             Self::Lfm2(model) => model.supports_continuous_decode_batch(),
@@ -4777,7 +4804,12 @@ impl NativeChatModel {
     pub fn supports_resumable_prefill(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen38(_) | Self::Gemma3(_) | Self::Lfm2(_)
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen35Moe(_)
+            | Self::Qwen38(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_)
         )
     }
 
@@ -4787,7 +4819,12 @@ impl NativeChatModel {
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Qwen38(_) | Self::Lfm2(_)
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen35Moe(_)
+            | Self::Gemma3(_)
+            | Self::Qwen38(_)
+            | Self::Lfm2(_)
         )
     }
 
@@ -4795,6 +4832,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen35(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen35Moe(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen38(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Lfm2(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
@@ -4853,6 +4891,24 @@ impl NativeChatModel {
             )),
             _ => Err(Error::InvalidInput(
                 "managed Qwen3.5 state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_qwen35_moe_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen35Moe(model) => Ok(NativeChatDecodeState::Qwen35(
+                model.start_decode_state_physical(messages, max_new_tokens, config, prepared, cache)?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.5-MoE state was routed to another model family".into(),
             )),
         }
     }
@@ -4959,6 +5015,29 @@ impl NativeChatModel {
                     )?,
                 ))
             }
+            Self::Qwen35Moe(model) if mtp_cache.is_none() => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5-MoE resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5-MoE prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_resumable_prefill_state_physical(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        target_cache,
+                    )?,
+                ))
+            }
             Self::Qwen38(model) => {
                 let prepared = match prepared {
                     Some(prepared) => Some(prepared.as_qwen38().ok_or_else(|| {
@@ -5043,6 +5122,24 @@ impl NativeChatModel {
                 if prepared.prompt_ids() != prompt_ids {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                let complete = model
+                    .continue_resumable_prefill_physical(state, prepared, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5-MoE resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5-MoE prepared artifact disagrees with sealed prompt tokens".into(),
                     ));
                 }
                 let complete = model
@@ -5156,6 +5253,9 @@ impl NativeChatModel {
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "incremental Qwen3.5 chat requires scheduler-owned physical state".into(),
             )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "incremental Qwen3.5-MoE chat requires scheduler-owned physical state".into(),
+            )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "incremental Qwen3.8 chat requires scheduler-owned physical state".into(),
             )),
@@ -5183,6 +5283,18 @@ impl NativeChatModel {
                 })
             }
             (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
+                let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
+                    finished: step.finished,
+                    logprobs,
+                })
+            }
+            (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) => {
                 let step = model.decode_step(state)?;
                 let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
@@ -5415,6 +5527,33 @@ impl NativeChatModel {
                         _ => {
                             return Err(Error::InvalidInput(
                                 "Qwen3.5 continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
+            }
+            Self::Qwen35Moe(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen35(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.5-MoE continuous batch received another model's state".into(),
                             ))
                         }
                     }
@@ -5670,6 +5809,7 @@ fn native_chat_model_kind(model: &NativeChatModel) -> &'static str {
     match model {
         NativeChatModel::Qwen3(_) => "qwen3_chat",
         NativeChatModel::Qwen35(_) => "qwen35_chat",
+        NativeChatModel::Qwen35Moe(_) => "qwen35_moe_chat",
         NativeChatModel::Qwen38(_) => "qwen38_chat",
         NativeChatModel::Gemma3(_) => "gemma3_chat",
         NativeChatModel::Lfm2(_) => "lfm2_chat",

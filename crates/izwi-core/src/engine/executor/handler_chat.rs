@@ -564,6 +564,17 @@ impl NativeExecutor {
                         )
                     })?
                 }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35Moe(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen35_moe_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35_moe()),
+                            cache,
+                        )
+                    })?
+                }
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
                     Self::run_blocking(|| {
                         model.start_qwen38_decode_state_managed(

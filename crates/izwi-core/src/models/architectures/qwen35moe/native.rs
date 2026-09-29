@@ -962,10 +962,16 @@ pub fn expected_text_tensor_plan(
         );
 
         if text.is_full_attention_layer(layer) {
+            // The gated full attention fuses the per-head sigmoid output
+            // gate into q_proj: the published checkpoint's q_proj carries
+            // `num_heads * head_dim * 2` rows (transformers qwen3_5_moe
+            // `Qwen3_5MoeAttention` chunks the q_proj output into query
+            // and gate halves; llama.cpp encodes the same fusion, which is
+            // what the shared trunk consumes).
             insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.self_attn.q_proj.weight"),
-                text.attention_query_width(),
+                text.attention_query_width() * 2,
                 hidden,
                 block_shape,
             );
@@ -1047,10 +1053,13 @@ pub fn expected_text_tensor_plan(
                 vec![text.ssm_conv_channels(), 1, text.ssm_conv_kernel],
                 ExpectedTensorKind::Dense,
             );
+            // The gated RMS norm applies per value head: its weight is
+            // `linear_value_head_dim` wide (the trunk reshapes V into
+            // heads × head_dim before norming), not the full value width.
             insert(
                 &mut plan,
                 format!("{prefix}.linear_attn.norm.weight"),
-                vec![text.ssm_v_width()],
+                vec![text.ssm_value_head_dim],
                 ExpectedTensorKind::Dense,
             );
             insert_fp8_projection(
@@ -1434,6 +1443,165 @@ mod tests {
         .unwrap()
     }
 
+    /// Forward-capable variant of [`tiny_config`]: the published contract
+    /// pins linear key width to hidden (2 heads × 16 = 32) and value width
+    /// to 2 × hidden (4 heads × 16 = 64); the shared trunk's GDN
+    /// V-head-repeat path requires value heads to be a multiple of key
+    /// heads, and CPU Q8_0 requant needs every packed inner dimension
+    /// divisible by 32 (hidden 32, query width 2×16=32, MoE width 32).
+    fn forward_config() -> Qwen35MoeNativeConfig {
+        Qwen35MoeNativeConfig::from_json_with_policy(
+            r#"{
+                "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                "text_config": {
+                    "num_hidden_layers": 4,
+                    "full_attention_interval": 4,
+                    "hidden_size": 32,
+                    "vocab_size": 32,
+                    "max_position_embeddings": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "num_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_intermediate_size": 32,
+                    "shared_expert_intermediate_size": 32,
+                    "linear_num_value_heads": 4,
+                    "linear_num_key_heads": 2,
+                    "linear_key_head_dim": 16,
+                    "linear_value_head_dim": 16,
+                    "linear_conv_kernel_dim": 2,
+                    "rms_norm_eps": 1e-6,
+                    "mamba_ssm_dtype": "float32",
+                    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                    "rope_parameters": {
+                        "rope_type": "mrope",
+                        "mrope_interleaved": true,
+                        "mrope_section": [2, 2, 0],
+                        "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 0.5
+                    }
+                },
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "activation_scheme": "dynamic",
+                    "weight_block_size": [4, 4]
+                }
+            }"#
+            .as_bytes(),
+            Qwen35MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn native_checkpoint_builds_hybrid_trunk_and_forwards_finitely() {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35moe::native_model::load_text_model_native;
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use std::sync::Arc;
+
+        let config = forward_config();
+        let dir = TestDir::new("trunk-forward");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen35MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen35MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        let device_profile = DeviceProfile::cpu();
+        let (text_config, model) = load_text_model_native(
+            &checkpoint,
+            &device_profile,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(text_config.block_count, 4);
+        let moe = text_config.moe_ffn.expect("sparse geometry from native config");
+        assert_eq!(moe.num_experts, 2);
+        assert_eq!(moe.shared_expert_intermediate_size, 32);
+        // One counter array per sparse layer.
+        assert_eq!(model.expert_activation_counters().len(), 4);
+
+        // Single full-attention layer (model layer 3 → physical 0).
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4243),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 8,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 3,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: 1,
+                    key_head_dim: 16,
+                    value_head_dim: 16,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let mut cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+        let mut state = model.new_state();
+
+        // Prefill three tokens, then decode one: every hybrid domain
+        // (paged KV, recurrent F32 state, conv ring) plus the sparse-expert
+        // FFNs execute, and the logits stay finite.
+        let logits = model
+            .prefill_token_ids_physical(
+                &[1, 2, 3],
+                &[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap()
+            .expect("prefill logits");
+        let values = logits.to_dtype(candle_core::DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(values.len(), config.text.vocab_size);
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "prefill logits must be finite"
+        );
+
+        let logits = model
+            .forward_token_id_at_physical(4, [3, 3, 3], &mut state, &mut cache)
+            .unwrap();
+        let values = logits.to_dtype(candle_core::DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|v| v.is_finite()));
+    }
+
     #[test]
     fn parses_the_pinned_qwen35_moe_config() {
         let config = pinned_config();
@@ -1615,7 +1783,8 @@ mod tests {
             .get("model.layers.3.self_attn.q_proj.weight")
             .expect("full-attention layer in plan");
         assert_eq!(q_proj.kind, ExpectedTensorKind::BlockFp8);
-        assert_eq!(q_proj.shape, vec![4_096, 2_048]);
+        // Fused query + sigmoid gate: 16 heads × 256 dim × 2 halves.
+        assert_eq!(q_proj.shape, vec![8_192, 2_048]);
     }
 
     #[test]
@@ -1844,7 +2013,7 @@ mod tests {
                     &mut tensors,
                     config,
                     format!("{prefix}.self_attn.q_proj.weight"),
-                    text.attention_query_width(),
+                    text.attention_query_width() * 2,
                     hidden,
                 );
                 push_fp8_proj(
@@ -1917,7 +2086,7 @@ mod tests {
                 push_dense(
                     &mut tensors,
                     format!("{prefix}.linear_attn.norm.weight"),
-                    vec![text.ssm_v_width()],
+                    vec![text.ssm_value_head_dim],
                 );
                 push_fp8_proj(
                     &mut tensors,
