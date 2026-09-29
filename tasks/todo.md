@@ -20313,28 +20313,55 @@ Full plan: docs/dev/QWEN35_35B_A3B_FP8_SUPPORT_PLAN.md. New family `Qwen35MoeCha
   per-backend materialization (CPU packed Q8_0) → 40-layer-pattern trunk with 2
   routed + 1 shared expert → prefill + decode, finite logits, per-layer histograms.
 
-## Phase 3 — runtime gates
-- [ ] chat_sequence_execution (adapters.rs:435), is_continuous_physical_chat (loaded.rs:874), family_inference_state_policy arm, continuous-batch leg
-- [ ] Evidence via PUBLIC dispatch entry points (not resolver-only)
+## Phase 3 — runtime gates — DONE (commit bb455280)
+- [x] chat_sequence_execution + is_continuous_physical_chat + rollout managed-KV provider route admit Qwen35MoeChat (family_inference_state_policy already had it from Phase 2)
+- [x] Metadata / continuous-factory / rollout-cell tests extended; evidence via a real worker process over HTTP: synthetic native FP8 bundle (4-layer hybrid trunk, 2 experts top-1 + shared, real pinned revision, IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY) drives load, warm-up, worker lane, managed-KV status, public gateway streaming + non-streaming
 
-## Phase 4 — chat surface
-- [ ] Thinking render (default-on <think>, enable_thinking=False empty block, preserve_thinking history re-render), EOS set im_end+endoftext
-- [ ] json_object: sampler grammar wiring + ensure_response_format_supported allowlist in the SAME slice
-- [ ] logprobs via shared sampler; evidence: API-level tests on fixture
+## Phase 4 — chat surface — DONE (commit 24fec63f)
+- [x] Thinking render rides the shared qwen35 machinery; fixture test pins the MoE contract (default on; explicit off closes the block; history reasoning stripped to visible reply — assistant turns before the last query render content only)
+- [x] json_object: GrammarRuntime wired into qwen35 ChatDecodeState (single + batched steps) via a new GrammarRng trait (drives qwen35's local xorshift RNG); API allowlist extended in the SAME slice
+- [x] logprobs: DS9.3 entries drained per non-stop step (decode-state enum arms shared with Qwen35); fixture tests: constrained decode stays grammar-legal, logprob shape validated; gateway json_object request reaches the model in the process proof
 
-## Phase 5 — memory/admission + distributed posture
-- [ ] qwen35moe_memory resource plan (representation math, ~37k-tensor slack, staging reserves) wired into model_resource_plan; catalog byte pin matches
-- [ ] DS1 prefix_reuse cell NotEnabled (all backends); DS4 offload dormant documented; DS10 page-transfer out-of-scope documented
-- [ ] DS5/6/7 deployment examples with truthful host_memory_limit_bytes
+## Phase 5 — memory/admission + distributed posture — DONE (commit 999a146c)
+- [x] qwen35moe_memory plan derives element counts from the loader's pinned tensor plan (fp8 32,862,371,840 / dense 1,798,238,848 / 62,243 tensors, exact-pinned by test): CPU Q8_0+F32-dense 39.2 GiB resident, Metal F16 / CUDA BF16 64.6 GiB, load peaks carry 1.9 GiB per-tensor slack + scratch, CUDA 8 GiB host staging; source bytes within 3% of the catalog estimated_size pin; fixture path prices real inventory
+- [x] DS1 prefix_reuse cell NotEnabled (was already landed in Phase 0); DS4 dormant / DS10 PD out-of-scope documented in the plan doc
+- [x] DS5/6/7 truthful host_memory_limit_bytes examples recorded in the plan doc §7
 
-## Phase 6 — MTP speculative (optional, after core)
-- [ ] Port qwen38 mtp.rs pattern to qwen35moe (checkpoint ships 1-layer BF16 MTP); DS9 per-row-depth wiring; opt-in + kill switch
+## Phase 6 — MTP speculative — DEFERRED to hardware handoff (deliberate)
+- The 35B MTP tensor manifest cannot be pinned without the checkpoint: the loader skips mtp.* tensors without name validation and the config parser has no MTP fields. Implementing the head now would guess the contract (dense-vs-MoE MTP FFN, attention type, names/counts).
+- Scoped unblock order recorded in docs/dev/QWEN35_35B_A3B_FP8_HARDWARE_HANDOFF.md §5: pin real manifest -> port qwen38 mtp.rs pattern -> executor MTP domain + DS9 per-row-depth wiring (opt-in + kill switch) -> fixture contract tests; speedup claims only from hardware evidence.
 
-## Phase 7 — evidence + hardware handoff
-- [ ] Portable gate: CPU matrix, CUDA compile no-run, failure injection, synthetic FP8 runner
-- [ ] Handoff doc: download + SHA pin, activation checklist per backend, ADR 0008 gate, post-activation flip order
+## Phase 7 — evidence + hardware handoff — DONE (this commit)
+- [x] Portable gate: full izwi-core lib 2714 green, izwi-server lib 738 green, three worker process tests green, failure-injection suites in the native/qwen35moe test modules. CUDA compile no-run stays at the driverless CI tier (no nvcc on this host, per evidence-tier policy).
+- [x] Handoff doc: docs/dev/QWEN35_35B_A3B_FP8_HARDWARE_HANDOFF.md (download + revision pin 9d1823d2dee688a6b25e77009dc727688c44936e, tensor-scope confirmation, per-backend activation checklists, ADR 0008 gate + flip order, MTP scoping, watchlist status)
 
-## Open decisions
-- [ ] D1 CPU residency: Q8_0 requant (recommended) vs F32 expand (~140 GB, impractical)
-- [ ] D4 routing mode: pin softmax/renorm vs sigmoid from transformers qwen3_5_moe before parity work
+## Open decisions — CLOSED
+- [x] D1 CPU residency: RESOLVED as Q8_0 projections + F32 dense (PackedQ8_0 residency, ~39.2 GiB); 140 GB stays only as the conservative catalog hint
+- [x] D4 routing mode: RESOLVED in Phase 2 (F32 softmax -> top-k -> in-top-k renorm, pinned from transformers qwen3_5_moe)
 - D2 GGUF = fixture path only; D3 vision out of scope; D5 YaRN out of scope (agreed defaults in plan doc)
+
+### Phase 3-7 review notes (2026-09-29)
+- Three runtime gates, not two: the DS10 A4 lesson repeated — chat_sequence_execution,
+  is_continuous_physical_chat, AND rollout validate_managed_state_plan_eligibility all
+  needed the family. The worker process proof is what surfaced the download-state gate:
+  qwen35_moe_bundle_is_complete requires the full native bundle (10 metadata files +
+  index-closed shards + manifest at the real pinned revision), so the process fixture had
+  to be a complete synthetic native FP8 checkpoint (mirroring write_tiny_checkpoint),
+  not the GGUF fixture the loader would otherwise prefer.
+- The json_object seam: qwen35 owns its sampler (not ChatSampler), so the GrammarRuntime
+  was wired into ChatDecodeState with a new pub(crate) GrammarRng trait bridging the
+  family-local xorshift RNG. GrammarRuntime::new/sample_token became pub(crate).
+- Thinking contract discovery: assistant turns BEFORE the last user query render content
+  only (reasoning stripped) — history <think> spans are dropped, not preserved; only
+  trailing pre-fill assistant turns re-render with reasoning. The fixture test pins this
+  as prompt-id equality across differing history reasoning spans.
+- Memory plan honesty: the plan doc §7 projections (CUDA Q8_0 ~36.6 GB) were superseded
+  by the implemented policy (CUDA expands BF16, 64.6 GiB) — a 48 GB card tier claim is
+  gone from the record; admission now derives from the loader's own tensor plan so it
+  cannot drift.
+- MTP deferral is a scoping decision, not an omission: guessing the MTP tensor manifest
+  without the checkpoint would repeat the Phase 1 -> Phase 2 tensor-plan correction loop
+  at speculative-scheduler scale.
+- Evidence totals at close: izwi-core lib 2714, izwi-server lib 738, qwen35moe fixture
+  module 21 (incl. thinking/json/logprobs), qwen35 module 45, worker process proof
+  (qwen35_moe_process) green with a complete synthetic native FP8 bundle.
