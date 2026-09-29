@@ -879,6 +879,7 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
             crate::catalog::ModelFamily::Qwen3MoeChat
                 | crate::catalog::ModelFamily::Qwen3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Qwen35MoeChat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
@@ -5077,6 +5078,7 @@ mod tests {
         for variant in [
             ModelVariant::Qwen3827BFp8,
             ModelVariant::Qwen3508BGguf,
+            ModelVariant::Qwen35Moe35BA3BFp8,
             ModelVariant::Lfm2512BInstructGguf,
         ] {
             let metadata = chat_adapter_metadata(variant);

@@ -246,11 +246,19 @@ pub fn write_tiny_qwen3_moe_fixture(models_dir: &Path) -> PathBuf {
     add("blk.0.ffn_gate_inp.weight".into(), &[n_experts, hidden]);
     // Fused experts: [num_experts, n_ff, hidden] for gate/up, [num_experts,
     // hidden, n_ff] for down — the llama.cpp MoE tensor convention.
-    add("blk.0.ffn_gate_exps.weight".into(), &[n_experts, n_ff, hidden]);
-    add("blk.0.ffn_up_exps.weight".into(), &[n_experts, n_ff, hidden]);
-    add("blk.0.ffn_down_exps.weight".into(), &[n_experts, hidden, n_ff]);
-    let mut file =
-        std::fs::File::create(model_dir.join("Qwen3-30B-A3B-Q4_K_M.gguf")).unwrap();
+    add(
+        "blk.0.ffn_gate_exps.weight".into(),
+        &[n_experts, n_ff, hidden],
+    );
+    add(
+        "blk.0.ffn_up_exps.weight".into(),
+        &[n_experts, n_ff, hidden],
+    );
+    add(
+        "blk.0.ffn_down_exps.weight".into(),
+        &[n_experts, hidden, n_ff],
+    );
+    let mut file = std::fs::File::create(model_dir.join("Qwen3-30B-A3B-Q4_K_M.gguf")).unwrap();
     gguf_file::write(
         &mut file,
         &metadata
@@ -673,4 +681,401 @@ fn generate_qwen38_benchmark_fixture() {
     let root = std::env::var("IZWI_BENCH_FIXTURE_DIR").expect("set IZWI_BENCH_FIXTURE_DIR");
     let dir = write_tiny_qwen38_hybrid_fixture(std::path::Path::new(&root));
     println!("fixture model dir: {}", dir.display());
+}
+/// Tiny synthetic native block-FP8 Qwen3.5-MoE checkpoint: a forward-capable
+/// 4-layer hybrid trunk (3 DeltaNet + 1 gated full attention, interval 4) with
+/// 2 routed experts (top-1) plus a shared expert. Values mirror the in-process
+/// `qwen35moe::native` recovery fixtures exactly: all-ones weights, 0x38
+/// E4M3 bytes (= 1.0), unit block scales, and an lm_head row bias so greedy
+/// decode emits a plain-letter token deterministically. The geometry requires
+/// `IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY=1` in the loading process; the
+/// downloader bundle gate requires the real pinned artifact revision.
+pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
+    let model_dir = models_dir.join("Qwen3.5-35B-A3B-FP8");
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    const HIDDEN: usize = 32;
+    const VOCAB: usize = 32;
+    const QUERY_WIDTH: usize = 2 * 16; // 2 attention heads × head_dim 16
+    const KV_WIDTH: usize = 1 * 16; // 1 kv head × head_dim 16
+    const MOE_INTERMEDIATE: usize = 32;
+    const SHARED_INTERMEDIATE: usize = 32;
+    const NUM_EXPERTS: usize = 2;
+    const SSM_TIME_STEP_RANK: usize = 4; // linear_num_value_heads
+    const SSM_QK_WIDTH: usize = 2 * 16; // linear_num_key_heads × linear_key_head_dim
+    const SSM_V_WIDTH: usize = 4 * 16; // linear_num_value_heads × linear_value_head_dim
+    const SSM_CONV_CHANNELS: usize = 2 * SSM_QK_WIDTH + SSM_V_WIDTH;
+    const CONV_KERNEL: usize = 2;
+    const BLOCK: [usize; 2] = [4, 4];
+
+    let config = serde_json::json!({
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "num_hidden_layers": 4,
+            "full_attention_interval": 4,
+            "hidden_size": HIDDEN,
+            "vocab_size": VOCAB,
+            "max_position_embeddings": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "num_experts": NUM_EXPERTS,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": MOE_INTERMEDIATE,
+            "shared_expert_intermediate_size": SHARED_INTERMEDIATE,
+            "linear_num_value_heads": SSM_TIME_STEP_RANK,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": CONV_KERNEL,
+            "rms_norm_eps": 1e-6,
+            "mamba_ssm_dtype": "float32",
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention"
+            ],
+            "rope_parameters": {
+                "rope_type": "mrope",
+                "mrope_interleaved": true,
+                "mrope_section": [2, 2, 0],
+                "rope_theta": 1_000_000.0,
+                "partial_rotary_factor": 0.5
+            }
+        },
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": BLOCK
+        }
+    });
+    std::fs::write(model_dir.join("config.json"), config.to_string()).unwrap();
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    struct Qwen35MoeFixtureTensor {
+        name: String,
+        dtype: safetensors::Dtype,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    let dense = |name: String, shape: &[usize], value: f32| Qwen35MoeFixtureTensor {
+        name: name.into(),
+        dtype: safetensors::Dtype::BF16,
+        shape: shape.to_vec(),
+        data: bf16_bytes(&vec![value; shape.iter().product::<usize>()]),
+    };
+
+    // Block-FP8 projection: an all-ones (0x38 = 1.0 in E4M3) weight with a
+    // unit `weight_scale_inv` companion at [ceil(rows/block), ceil(cols/block)].
+    let fp8_projection = |name: String, rows: usize, cols: usize| {
+        let name: String = name.into();
+        let (scale_rows, scale_cols) = (rows.div_ceil(BLOCK[0]), cols.div_ceil(BLOCK[1]));
+        vec![
+            Qwen35MoeFixtureTensor {
+                name: name.clone(),
+                dtype: safetensors::Dtype::F8_E4M3,
+                shape: vec![rows, cols],
+                data: vec![0x38; rows * cols],
+            },
+            Qwen35MoeFixtureTensor {
+                name: format!("{}.weight_scale_inv", name.strip_suffix(".weight").unwrap()),
+                dtype: safetensors::Dtype::BF16,
+                shape: vec![scale_rows, scale_cols],
+                data: bf16_bytes(&vec![1.0; scale_rows * scale_cols]),
+            },
+        ]
+    };
+
+    let mut tensors: Vec<Qwen35MoeFixtureTensor> = Vec::new();
+    // Embeddings and lm_head are FP8-excluded dense tensors. lm_head row 7
+    // ("c" in the fixture tokenizer) carries a larger value so greedy decode
+    // deterministically emits a plain-letter token instead of a special.
+    let mut lm_head = vec![0.5f32; VOCAB * HIDDEN];
+    for column in 0..HIDDEN {
+        lm_head[7 * HIDDEN + column] = 4.0;
+    }
+    tensors.push(Qwen35MoeFixtureTensor {
+        name: "model.language_model.embed_tokens.weight".into(),
+        dtype: safetensors::Dtype::BF16,
+        shape: vec![VOCAB, HIDDEN],
+        data: bf16_bytes(&vec![1.0; VOCAB * HIDDEN]),
+    });
+    tensors.push(Qwen35MoeFixtureTensor {
+        name: "lm_head.weight".into(),
+        dtype: safetensors::Dtype::BF16,
+        shape: vec![VOCAB, HIDDEN],
+        data: bf16_bytes(&lm_head),
+    });
+    tensors.push(dense(
+        "model.language_model.norm.weight".to_string(),
+        &[HIDDEN],
+        1.0,
+    ));
+
+    for layer in 0..4usize {
+        let prefix = format!("model.language_model.layers.{layer}");
+        tensors.push(dense(
+            format!("{prefix}.input_layernorm.weight"),
+            &[HIDDEN],
+            1.0,
+        ));
+        tensors.push(dense(
+            format!("{prefix}.post_attention_layernorm.weight"),
+            &[HIDDEN],
+            1.0,
+        ));
+        // Router: dense FP8-excluded [num_experts, hidden].
+        tensors.push(dense(
+            format!("{prefix}.mlp.gate.weight"),
+            &[NUM_EXPERTS, HIDDEN],
+            1.0,
+        ));
+        for expert in 0..NUM_EXPERTS {
+            tensors.extend(fp8_projection(
+                format!("{prefix}.mlp.experts.{expert}.gate_proj.weight"),
+                MOE_INTERMEDIATE,
+                HIDDEN,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.mlp.experts.{expert}.up_proj.weight"),
+                MOE_INTERMEDIATE,
+                HIDDEN,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.mlp.experts.{expert}.down_proj.weight"),
+                HIDDEN,
+                MOE_INTERMEDIATE,
+            ));
+        }
+        tensors.extend(fp8_projection(
+            format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+            SHARED_INTERMEDIATE,
+            HIDDEN,
+        ));
+        tensors.extend(fp8_projection(
+            format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+            SHARED_INTERMEDIATE,
+            HIDDEN,
+        ));
+        tensors.extend(fp8_projection(
+            format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+            HIDDEN,
+            SHARED_INTERMEDIATE,
+        ));
+        tensors.push(dense(
+            format!("{prefix}.mlp.shared_expert_gate.weight"),
+            &[1, HIDDEN],
+            1.0,
+        ));
+        if layer == 3 {
+            // Gated full attention: q_proj fuses the per-head output gate.
+            tensors.extend(fp8_projection(
+                format!("{prefix}.self_attn.q_proj.weight"),
+                QUERY_WIDTH * 2,
+                HIDDEN,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.self_attn.k_proj.weight"),
+                KV_WIDTH,
+                HIDDEN,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.self_attn.v_proj.weight"),
+                KV_WIDTH,
+                HIDDEN,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.self_attn.o_proj.weight"),
+                HIDDEN,
+                QUERY_WIDTH,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.self_attn.q_norm.weight"),
+                &[16],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.self_attn.k_norm.weight"),
+                &[16],
+                1.0,
+            ));
+        } else {
+            // Gated DeltaNet: fused input projections are dense, out_proj is
+            // a block-FP8 pair — the checkpoint contract.
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                &[SSM_CONV_CHANNELS, HIDDEN],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.in_proj_z.weight"),
+                &[SSM_V_WIDTH, HIDDEN],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.b_proj.weight"),
+                &[SSM_TIME_STEP_RANK, HIDDEN],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.a_proj.weight"),
+                &[SSM_TIME_STEP_RANK, HIDDEN],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.A_log"),
+                &[SSM_TIME_STEP_RANK],
+                -1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.dt_bias"),
+                &[SSM_TIME_STEP_RANK],
+                0.1,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.conv1d.weight"),
+                &[SSM_CONV_CHANNELS, 1, CONV_KERNEL],
+                1.0,
+            ));
+            tensors.push(dense(
+                format!("{prefix}.linear_attn.norm.weight"),
+                &[16],
+                1.0,
+            ));
+            tensors.extend(fp8_projection(
+                format!("{prefix}.linear_attn.out_proj.weight"),
+                HIDDEN,
+                SSM_V_WIDTH,
+            ));
+        }
+    }
+    // Auxiliary scopes the loader must skip (vision tower + MTP leftovers).
+    tensors.push(dense(
+        "model.visual.blocks.0.attn.qkv.weight".to_string(),
+        &[4, 4],
+        1.0,
+    ));
+    tensors.push(dense("mtp.norm.weight".to_string(), &[HIDDEN], 1.0));
+
+    let write_shard = |path: &Path, tensors: &[Qwen35MoeFixtureTensor]| {
+        let views = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    safetensors::tensor::TensorView::new(
+                        tensor.dtype,
+                        tensor.shape.clone(),
+                        &tensor.data,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        safetensors::serialize_to_file(&views, &None, path).unwrap();
+    };
+    write_shard(&model_dir.join("layers.safetensors"), &tensors);
+
+    let mut weight_map = serde_json::Map::new();
+    for tensor in &tensors {
+        weight_map.insert(tensor.name.clone(), serde_json::json!("layers.safetensors"));
+    }
+    std::fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        serde_json::json!({ "weight_map": weight_map }).to_string(),
+    )
+    .unwrap();
+
+    // WordLevel tokenizer over the 32-id model vocabulary; ids 5-7 are plain
+    // letters so prompt/decode text stays inside the model output space.
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "WordLevel",
+            "vocab": {
+                "<|im_start|>": 0,
+                "<|im_end|>": 1,
+                "<|image_pad|>": 2,
+                "<|video_pad|>": 3,
+                "<|endoftext|>": 4,
+                "a": 5,
+                "b": 6,
+                "c": 7
+            },
+            "unk_token": "a"
+        }
+    });
+    std::fs::write(model_dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+    let tokenizer_config = serde_json::json!({
+        "added_tokens_decoder": {
+            "0": { "content": "<|im_start|>", "special": true },
+            "1": { "content": "<|im_end|>", "special": true },
+            "2": { "content": "<|image_pad|>", "special": true },
+            "3": { "content": "<|video_pad|>", "special": true },
+            "4": { "content": "<|endoftext|>", "special": true }
+        },
+        "eos_token": "<|endoftext|>",
+        "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    });
+    std::fs::write(
+        model_dir.join("tokenizer_config.json"),
+        tokenizer_config.to_string(),
+    )
+    .unwrap();
+
+    // The downloader bundle-completeness gate requires every metadata file of
+    // the published bundle to exist, even when unused by the loader.
+    std::fs::write(model_dir.join("generation_config.json"), "{}").unwrap();
+    std::fs::write(
+        model_dir.join("chat_template.jinja"),
+        "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+    )
+    .unwrap();
+    std::fs::write(model_dir.join("vocab.json"), "{}").unwrap();
+    std::fs::write(model_dir.join("merges.txt"), "").unwrap();
+    std::fs::write(model_dir.join("preprocessor_config.json"), "{}").unwrap();
+    std::fs::write(model_dir.join("video_preprocessor_config.json"), "{}").unwrap();
+
+    let manifest = ArtifactManifest {
+        schema_version: 1,
+        variant: ModelVariant::Qwen35Moe35BA3BFp8,
+        repo_id: ModelVariant::Qwen35Moe35BA3BFp8.repo_id().into(),
+        revision: ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION.into(),
+        files: vec![
+            "chat_template.jinja".into(),
+            "config.json".into(),
+            "generation_config.json".into(),
+            "layers.safetensors".into(),
+            "merges.txt".into(),
+            "model.safetensors.index.json".into(),
+            "preprocessor_config.json".into(),
+            "tokenizer.json".into(),
+            "tokenizer_config.json".into(),
+            "video_preprocessor_config.json".into(),
+            "vocab.json".into(),
+        ],
+    };
+    std::fs::write(
+        model_dir.join("izwi-artifact.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    model_dir
 }

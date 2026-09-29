@@ -437,6 +437,7 @@ fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode
         ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Lfm2Chat
@@ -782,6 +783,9 @@ mod tests {
         let qwen_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
             .unwrap();
+        let qwen35_moe_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Qwen35Moe35BA3BFp8)
+            .unwrap();
         let gemma_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
             .unwrap();
@@ -799,6 +803,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            qwen35_moe_chat.sequence_execution,
+            SequenceExecutionMode::Always
+        );
+        assert_eq!(
+            qwen35_moe_chat.state_requirement,
+            InferenceStateRequirement::Retained
+        );
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             gemma_chat.state_requirement,
