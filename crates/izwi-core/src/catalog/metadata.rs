@@ -822,7 +822,9 @@ impl ModelVariant {
 
     /// Machine-readable chat controls that the selected runtime actually
     /// consumes. Keep reasoning effort narrower than generic thinking support:
-    /// today only Qwen3.8 implements the three-level effort contract.
+    /// today only Qwen3.8 implements the three-level effort contract. The
+    /// LFM2.5 Thinking checkpoint always reasons (the upstream template never
+    /// gates thinking on a kwarg), so its controls are display-level only.
     pub fn chat_capabilities(&self) -> Option<ChatModelCapabilities> {
         let (default_thinking_enabled, reasoning_efforts, supports_preserve_thinking) = match self {
             Self::Qwen3827BFp8 => (
@@ -836,6 +838,7 @@ impl ModelVariant {
             ),
             Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
             Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
+            Self::Lfm2512BThinkingGguf => (true, Vec::new(), false),
             _ => return None,
         };
 
@@ -1241,7 +1244,14 @@ mod tests {
 
         assert_eq!(ModelVariant::Gemma31BIt.chat_capabilities(), None);
         assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
-        assert_eq!(ModelVariant::Lfm2512BThinkingGguf.chat_capabilities(), None);
+        let lfm25_thinking = ModelVariant::Lfm2512BThinkingGguf
+            .chat_capabilities()
+            .expect("LFM2.5 Thinking chat capabilities");
+        assert!(lfm25_thinking.supports_thinking);
+        assert!(lfm25_thinking.default_thinking_enabled);
+        assert!(lfm25_thinking.reasoning_efforts.is_empty());
+        assert_eq!(lfm25_thinking.default_reasoning_effort, None);
+        assert!(!lfm25_thinking.supports_preserve_thinking);
         assert_eq!(ModelVariant::Qwen34BGguf.chat_capabilities(), None);
     }
 
