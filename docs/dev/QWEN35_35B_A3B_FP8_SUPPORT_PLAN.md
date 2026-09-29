@@ -369,37 +369,67 @@ above, listed so review can check each:
 
 ## 7. Memory envelopes (representation math, from checkpoint facts)
 
-Persistent weight representation, FP8 E4M3 (~34.45B params, 1 B/elem) + BF16
-dense (~1.5B params, 2 B/elem) + F32 scale grids (rows/128 × cols/128 × 4 B):
+**Updated 2026-09-29 (Phase 5):** the numbers below are the *implemented*
+admission math (`runtime/lifecycle/qwen35moe_memory.rs`), which derives its
+element counts from the loader's own pinned tensor plan — FP8 projections
+32,862,371,840 elements, dense tensors 1,798,238,848 elements, 62,243 tensors
+counting scale companions. The materialization policy is the Phase 2 loader's
+(`projection_residency_policy`): CPU packs projections as Q8_0 and keeps dense
+tensors F32 (decision D1 resolved), Metal expands F16, CUDA expands BF16. This
+supersedes the original projections in this section (CUDA Q8_0 was the qwen38
+default; the qwen35moe CUDA route expands BF16 like its Metal sibling — the
+native CUDA FP8 kernel remains non-default and uncertified).
 
-| Backend | Materialization (proposed) | Weights resident | Notes |
+| Backend | Resident representation | Weights resident | Load peak |
 |---|---|---|---|
-| CUDA | Q8_0 requant (qwen38 default) | ≈ 36.6 GB (Q8_0: 34 B / 32 elems) + BF16 ≈ 3 GB + scales | Fits a 48 GB card tier before KV/graph; native FP8 kernel exists but stays non-default (not runtime-certified) |
-| Metal | F16 expanded (qwen38 policy) | ≈ 69 GB + BF16 | Needs 96–128 GB unified memory; fused kernels OK in F16; V-overflow NaN hazard watched (G7) |
-| CPU | **Decision D1** | F32 expanded ≈ 140 GB (qwen38 precedent) vs Q8_0 requant ≈ 37 GB | Recommend Q8_0 on CPU for this family; Candle CPU `QMatMul` works with F32 input casts |
+| CPU | Q8_0 projections + F32 dense | 42,109,225,472 B ≈ 39.2 GiB | ≈ 42.1 GiB (+1 GiB conversion scratch + 1.9 GiB per-tensor slack) |
+| Metal | F16 expanded | 69,321,221,376 B ≈ 64.6 GiB | ≈ 67.5 GiB (+ same scratch terms) |
+| CUDA | BF16 expanded | 69,321,221,376 B ≈ 64.6 GiB | device ≈ 66.7 GiB + 8 GiB host staging |
 
-Load-peak scratch: inventory-based estimate already prices
-`max(largest-tensor dequant bound, 32 KiB × ~37k tensors ≈ 1.1–1.2 GiB, …)` per
-the DS10-A1 fix; plus a per-backend staging reserve (qwen38 uses 1 GiB portable /
-8 GiB CUDA host). KV at 262K: only 10 full-attn layers × 2 KV heads × 256 dim
-(~20 KB/token F16) ≈ 5.2 GB + 30 DeltaNet recurrent states ≈ 62 MB F32 fixed —
-the context fitter prices this; publish fitted context, never the 262K
-theoretical ceiling as resident.
+Source checkpoint bytes: 36,458,849,536 (FP8 1 B + dense BF16 2 B), within 3%
+of the catalog `estimated_size` pin (37,470,000,000). The catalog
+`memory_required_gb` (140.0) stays the deliberately conservative worst-case
+CPU-F32-expansion hint; backend-specific admission replaces it. Scale
+companions are consumed during dequantization and never become resident.
+Per-tensor instantiation slack (32 KiB × 62,243 ≈ 1.9 GiB) is material at MoE
+scale and included in every load peak.
+
+**DS5/6/7 deployment budget examples (truthful `host_memory_limit_bytes`).**
+The ledger trusts declared numbers; derive them from the table above:
+
+- CPU worker: `host_memory_limit_bytes ≥ 46 GiB` (42.12 GiB load peak + KV and
+  scheduler headroom), one resident replica.
+- Metal worker: `host_memory_limit_bytes ≥ 70 GiB` unified (64.6 GiB resident +
+  load scratch + KV), 96–128 GB-class machine.
+- CUDA worker (48 GB card tier is **not** sufficient under the current BF16
+  expansion): `host_memory_limit_bytes ≥ 76 GiB` (66.7 GiB device peak + 8 GiB
+  host staging + KV), 80 GB-class card. Promotion of the native CUDA FP8
+  kernel (a separate, separately-evidenced change) would revisit this.
+
+KV at 262K context is priced separately by the context fitter: 10 full-attn
+layers × 2 KV heads × 256 dim ≈ 5.2 GB F16/F32-class + 30 DeltaNet recurrent
+states ≈ 62 MB F32 fixed + conv state. Publish fitted context, never the
+262K theoretical ceiling as resident.
+
+Load-peak scratch (historical projections kept for review context): the
+inventory-based estimate prices `max(largest-tensor dequant bound, 32 KiB ×
+tensor count)` per the DS10-A1 fix.
 
 ## 8. Open decisions (recommendations made, user can override)
 
-- **D1 — CPU residency policy**: Q8_0 requant on CPU (recommended) vs F32
-  expansion (qwen38 precedent). F32 for 35B is ~140 GB and impractical; Q8_0
-  keeps CPU serving theoretically possible and matches the CUDA default.
+- **D1 — CPU residency policy**: **RESOLVED (Phase 2/5, 2026-09-29)** — CPU
+  packs projections as packed Q8_0 with F32 dense state (`PackedQ8_0`
+  residency), ≈ 39.2 GiB resident. F32 expansion (~140 GB) stays only as the
+  catalog's conservative `memory_required_gb` hint.
+- **D4 — Routing mode**: **RESOLVED (Phase 2, 2026-09-29)** — pinned from the
+  transformers `qwen3_5_moe` source: F32 softmax → top-k → in-top-k renorm; no
+  sigmoid, no correction bias. See the routing-mode pin at the top of this doc.
 - **D2 — GGUF ingestion scope**: GGUF support recommended **only** as the tiny
   fixture path for CI (synthetic checkpoints). The official FP8 checkpoint is
   native safetensors; no production GGUF path, no conversion script.
 - **D3 — Vision tower**: out of scope (text-only), loader skips vision tensors
   but must accept the official bundle layout. Multimodal serving would be a
   separate future plan.
-- **D4 — Routing mode**: assume softmax + in-top-k renorm (Qwen3-MoE lineage)
-  as the working hypothesis; pin from transformers `qwen3_5_moe` sources before
-  numerical parity work; add sigmoid mode only if the source says so.
 - **D5 — YaRN / >262K contexts**: out of scope; native 262,144 is the metadata
   ceiling, actual context is fitter-published.
 

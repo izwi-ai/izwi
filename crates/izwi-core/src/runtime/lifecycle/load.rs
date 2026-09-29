@@ -25,8 +25,8 @@ use crate::kv::v2::{
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
-use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::models::registry::NativeAsrModel;
+use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedExecutionContract, LoadedModelBundleDraft, LoadedStatePublication,
 };
@@ -35,6 +35,8 @@ use crate::runtime::lifecycle::controller::{
 };
 use crate::runtime::service::RuntimeService;
 
+#[path = "qwen35moe_memory.rs"]
+mod qwen35moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
 
@@ -183,6 +185,11 @@ fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_byte
     // and collapse the portable context fit.
     if variant == ModelVariant::Qwen3827BFp8
         && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+    {
+        return configured_reserve_bytes;
+    }
+    if variant == ModelVariant::Qwen35Moe35BA3BFp8
+        && crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled()
     {
         return configured_reserve_bytes;
     }
@@ -388,12 +395,15 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInvent
                 let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
                     .ok()
                     .map(|infos| {
-                        infos.into_iter().fold(TensorStorageInventory::default(), |inv, info| {
-                            let elements = u64::try_from(info.layout.shape().elem_count())
-                                .unwrap_or(u64::MAX);
-                            let bytes = elements.saturating_mul(info.dtype.size_in_bytes() as u64);
-                            inv.push(bytes, elements)
-                        })
+                        infos
+                            .into_iter()
+                            .fold(TensorStorageInventory::default(), |inv, info| {
+                                let elements = u64::try_from(info.layout.shape().elem_count())
+                                    .unwrap_or(u64::MAX);
+                                let bytes =
+                                    elements.saturating_mul(info.dtype.size_in_bytes() as u64);
+                                inv.push(bytes, elements)
+                            })
                     });
                 if parsed.is_none() {
                     container_fallback = container_fallback.max(file.metadata()?.len());
@@ -1267,6 +1277,15 @@ impl ModelLifecycleController {
                 return Ok(model_resource_plan(backend, estimate));
             }
             return Ok(qwen38_resource_plan(backend));
+        }
+        if variant == ModelVariant::Qwen35Moe35BA3BFp8 {
+            if crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled() {
+                // Fixture load (benchmark/CI): price the actual checkpoint
+                // instead of the pinned 35B constants.
+                let estimate = qwen35moe_memory::synthetic_fixture_estimate(model_path)?;
+                return Ok(model_resource_plan(backend, estimate));
+            }
+            return qwen35moe_memory::resource_plan(backend);
         }
         if variant == ModelVariant::FishAudioS2Pro {
             let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
@@ -2869,7 +2888,6 @@ mod tests {
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
-    use crate::models::shared::weights::gguf::TensorStorageInventory;
     use crate::config::{ContextLengthPreference, EngineConfig};
     use crate::engine::{
         AdapterAbiRevision, AdapterInstanceId, CapacitySource, ConcurrencyClass, ExecutionGroupId,
@@ -2890,6 +2908,7 @@ mod tests {
     };
     use crate::model::ModelVariant;
     use crate::models::architectures::fish_s2::weights::FishS2ModelMemory;
+    use crate::models::shared::weights::gguf::TensorStorageInventory;
     use crate::runtime::adapters::{
         CapabilityKind, LoadedExecutionContract, RuntimeAdapterRegistry,
     };
@@ -3075,11 +3094,8 @@ mod tests {
             catalog
         );
         assert_eq!(
-            estimate_from_tensor_inventory(
-                catalog,
-                Some(TensorStorageInventory::default()),
-            )
-            .unwrap(),
+            estimate_from_tensor_inventory(catalog, Some(TensorStorageInventory::default()),)
+                .unwrap(),
             catalog
         );
     }
@@ -3099,8 +3115,7 @@ mod tests {
             largest_tensor_elements: 5_242_880,
             tensor_count: 18_432,
         };
-        let estimate =
-            estimate_from_tensor_inventory(catalog, Some(inventory)).unwrap();
+        let estimate = estimate_from_tensor_inventory(catalog, Some(inventory)).unwrap();
         assert_eq!(estimate.resident_bytes, 30_000_000_000);
         assert_eq!(estimate.load_peak_bytes, 30_603_979_776);
         // The historic formula would have reserved only the size-class proxy

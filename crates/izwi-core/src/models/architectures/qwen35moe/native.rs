@@ -68,6 +68,109 @@ const PINNED_SHARED_EXPERT_INTERMEDIATE: usize = 512;
 const PINNED_RMS_NORM_EPS: f64 = 1e-6;
 const PINNED_ARCHITECTURE: &str = "Qwen3_5MoeForConditionalGeneration";
 
+/// JSON body of the pinned 35B `config.json`, built from the constants above.
+/// Shared by geometry validation and the admission memory plan so both see
+/// one source of truth for the published geometry.
+pub(crate) fn pinned_config_json() -> serde_json::Value {
+    let mut layer_types = Vec::with_capacity(PINNED_BLOCK_COUNT);
+    for layer in 0..PINNED_BLOCK_COUNT {
+        if (layer + 1) % PINNED_FULL_ATTENTION_INTERVAL == 0 {
+            layer_types.push(serde_json::json!("full_attention"));
+        } else {
+            layer_types.push(serde_json::json!("linear_attention"));
+        }
+    }
+    serde_json::json!({
+        "architectures": [PINNED_ARCHITECTURE],
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "num_hidden_layers": PINNED_BLOCK_COUNT,
+            "full_attention_interval": PINNED_FULL_ATTENTION_INTERVAL,
+            "hidden_size": PINNED_HIDDEN_SIZE,
+            "vocab_size": PINNED_VOCAB_SIZE,
+            "max_position_embeddings": PINNED_CONTEXT_TOKENS,
+            "num_attention_heads": PINNED_ATTENTION_HEADS,
+            "num_key_value_heads": PINNED_ATTENTION_KV_HEADS,
+            "head_dim": PINNED_HEAD_DIM,
+            "num_experts": PINNED_MOE_EXPERTS,
+            "num_experts_per_tok": PINNED_MOE_EXPERTS_PER_TOK,
+            "moe_intermediate_size": PINNED_MOE_INTERMEDIATE,
+            "shared_expert_intermediate_size": PINNED_SHARED_EXPERT_INTERMEDIATE,
+            "linear_num_value_heads": PINNED_SSM_TIME_STEP_RANK,
+            "linear_num_key_heads": PINNED_SSM_GROUP_COUNT,
+            "linear_key_head_dim": PINNED_SSM_STATE_SIZE,
+            "linear_value_head_dim": PINNED_SSM_VALUE_HEAD_DIM,
+            "linear_conv_kernel_dim": 4,
+            "rms_norm_eps": PINNED_RMS_NORM_EPS,
+            "mamba_ssm_dtype": "float32",
+            "layer_types": layer_types,
+            "rope_parameters": {
+                "rope_type": "mrope",
+                "mrope_interleaved": true,
+                "mrope_section": PINNED_MROPE_SECTIONS,
+                "rope_theta": PINNED_ROPE_THETA,
+                "partial_rotary_factor": PINNED_PARTIAL_ROTARY_FACTOR
+            }
+        },
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["lm_head", "model.embed_tokens"]
+        }
+    })
+}
+
+/// The pinned 35B config, constructible without a checkpoint on disk.
+pub(crate) fn pinned_native_config() -> Qwen35MoeNativeConfig {
+    Qwen35MoeNativeConfig::from_json_with_policy(
+        &serde_json::to_vec(&pinned_config_json()).expect("pinned config serializes"),
+        Qwen35MoeGeometryPolicy::Pinned35B,
+    )
+    .expect("pinned config constants pass validation")
+}
+
+/// Element inventory of the published checkpoint's persistent representation,
+/// derived from the same tensor plan the loader validates against: block-FP8
+/// projection elements, dense elements, and the total tensor count (weights
+/// plus scale companions) that drives instantiation slack at MoE scale.
+pub(crate) struct PinnedRepresentationInventory {
+    pub fp8_elements: u64,
+    pub dense_elements: u64,
+    pub tensor_count: u64,
+}
+
+pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+    use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
+    let plan = expected_text_tensor_plan(&pinned_native_config())
+        .expect("pinned config produces the validated tensor plan");
+    let mut fp8_elements = 0u64;
+    let mut dense_elements = 0u64;
+    for expected in plan.values() {
+        let count = expected
+            .shape
+            .iter()
+            .try_fold(1u64, |acc, &dim| {
+                acc.checked_mul(u64::try_from(dim).unwrap_or(u64::MAX))
+            })
+            .unwrap_or(u64::MAX);
+        match expected.kind {
+            BlockFp8 => fp8_elements = fp8_elements.saturating_add(count),
+            Dense | OptionalDense => dense_elements = dense_elements.saturating_add(count),
+            // Scale companions are consumed during dequantization and never
+            // materialize into the persistent representation; they still count
+            // toward the checkpoint's tensor count.
+            BlockFp8Scale => {}
+        }
+    }
+    PinnedRepresentationInventory {
+        fp8_elements,
+        dense_elements,
+        tensor_count: plan.len() as u64,
+    }
+}
+
 /// Geometry-validation policy for a checkpoint open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen35MoeGeometryPolicy {
@@ -1362,54 +1465,7 @@ mod tests {
     use serde_json::json;
 
     fn pinned_text_config_value() -> serde_json::Value {
-        let mut layer_types = Vec::with_capacity(PINNED_BLOCK_COUNT);
-        for layer in 0..PINNED_BLOCK_COUNT {
-            if (layer + 1) % PINNED_FULL_ATTENTION_INTERVAL == 0 {
-                layer_types.push(json!("full_attention"));
-            } else {
-                layer_types.push(json!("linear_attention"));
-            }
-        }
-        json!({
-            "architectures": [PINNED_ARCHITECTURE],
-            "model_type": "qwen3_5_moe",
-            "text_config": {
-                "num_hidden_layers": PINNED_BLOCK_COUNT,
-                "full_attention_interval": PINNED_FULL_ATTENTION_INTERVAL,
-                "hidden_size": PINNED_HIDDEN_SIZE,
-                "vocab_size": PINNED_VOCAB_SIZE,
-                "max_position_embeddings": PINNED_CONTEXT_TOKENS,
-                "num_attention_heads": PINNED_ATTENTION_HEADS,
-                "num_key_value_heads": PINNED_ATTENTION_KV_HEADS,
-                "head_dim": PINNED_HEAD_DIM,
-                "num_experts": PINNED_MOE_EXPERTS,
-                "num_experts_per_tok": PINNED_MOE_EXPERTS_PER_TOK,
-                "moe_intermediate_size": PINNED_MOE_INTERMEDIATE,
-                "shared_expert_intermediate_size": PINNED_SHARED_EXPERT_INTERMEDIATE,
-                "linear_num_value_heads": PINNED_SSM_TIME_STEP_RANK,
-                "linear_num_key_heads": PINNED_SSM_GROUP_COUNT,
-                "linear_key_head_dim": PINNED_SSM_STATE_SIZE,
-                "linear_value_head_dim": PINNED_SSM_VALUE_HEAD_DIM,
-                "linear_conv_kernel_dim": 4,
-                "rms_norm_eps": PINNED_RMS_NORM_EPS,
-                "mamba_ssm_dtype": "float32",
-                "layer_types": layer_types,
-                "rope_parameters": {
-                    "rope_type": "mrope",
-                    "mrope_interleaved": true,
-                    "mrope_section": PINNED_MROPE_SECTIONS,
-                    "rope_theta": PINNED_ROPE_THETA,
-                    "partial_rotary_factor": PINNED_PARTIAL_ROTARY_FACTOR
-                }
-            },
-            "quantization_config": {
-                "quant_method": "fp8",
-                "fmt": "e4m3",
-                "activation_scheme": "dynamic",
-                "weight_block_size": [128, 128],
-                "modules_to_not_convert": ["lm_head", "model.embed_tokens"]
-            }
-        })
+        pinned_config_json()
     }
 
     fn pinned_config() -> Qwen35MoeNativeConfig {
@@ -1514,14 +1570,13 @@ mod tests {
         .unwrap();
 
         let device_profile = DeviceProfile::cpu();
-        let (text_config, model) = load_text_model_native(
-            &checkpoint,
-            &device_profile,
-            &candle_core::Device::Cpu,
-        )
-        .unwrap();
+        let (text_config, model) =
+            load_text_model_native(&checkpoint, &device_profile, &candle_core::Device::Cpu)
+                .unwrap();
         assert_eq!(text_config.block_count, 4);
-        let moe = text_config.moe_ffn.expect("sparse geometry from native config");
+        let moe = text_config
+            .moe_ffn
+            .expect("sparse geometry from native config");
         assert_eq!(moe.num_experts, 2);
         assert_eq!(moe.shared_expert_intermediate_size, 32);
         // One counter array per sparse layer.
@@ -1588,7 +1643,11 @@ mod tests {
             )
             .unwrap()
             .expect("prefill logits");
-        let values = logits.to_dtype(candle_core::DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_eq!(values.len(), config.text.vocab_size);
         assert!(
             values.iter().all(|v| v.is_finite()),
@@ -1598,7 +1657,11 @@ mod tests {
         let logits = model
             .forward_token_id_at_physical(4, [3, 3, 3], &mut state, &mut cache)
             .unwrap();
-        let values = logits.to_dtype(candle_core::DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
     }
 
