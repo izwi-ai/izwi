@@ -20223,3 +20223,118 @@ Ready observation is what protects it). Docs describe the implemented set.
 Next: DS7 (signal-driven worker autoscaling) per the plan's dependency order;
 CUDA lanes remain `not run` until hardware.
 
+
+## LFM2.5 Thinking UI fix (2026-09-29)
+
+Bug: desktop app with LFM2.5 1.2B Thinking GGUF (Q4_K_M) showed no thinking
+UI — reasoning text rendered as the answer.
+
+### Plan
+- [x] Investigate UI thinking-render gate and LFM2.5 server handling
+- [x] Add LFM2.5 Thinking arm to `ModelVariant::chat_capabilities()`
+- [x] Update pinned test; run catalog + server admin + UI chat suites
+- [x] Single commit (65b5dabc)
+
+### Review (2026-09-29)
+
+Root cause: the UI's entire thinking renderer is client-side tag parsing
+(`parseAssistantContent` in `ui/src/features/chat/playground/support.ts`) and
+was already LFM2.5-aware since commit bb6e2e6e (`isLfm25ThinkingModel`,
+implicit-open-tag parsing, default-on fallback, neutral system prompt). But it
+is gated on `chat_capabilities.supports_thinking` from `/admin/models`, and
+`ModelVariant::chat_capabilities()` (catalog/metadata.rs) had no LFM arm — it
+returned `None`, so `route.tsx` forced `supportsThinking=false`: no toggle, no
+parsing, `stripThinkingArtifacts` silently deleted tagged reasoning and
+untagged reasoning passed through as the answer. Compounding it, the
+thinking-off system prompt told the model not to emit `<think>` tags at all.
+
+Fix: one line — `Self::Lfm2512BThinkingGguf => (true, Vec::new(), false)` in
+`chat_capabilities()`, mirroring the Qwen3.5 4B/9B arm (no reasoning efforts,
+no preserve-thinking: LFM2.5 always reasons, the upstream GGUF template never
+gates thinking on a kwarg, and `strip_past_assistant_thinking` already strips
+past-turn thinking unconditionally). Capabilities propagate automatically:
+`ModelInfo::new` → `AdminChatModelCapabilities::from` → UI →
+`default_thinking_enabled` turns the toggle on, Mode C parses the model's
+inline `<think>...</think>`, Mode A catches close-only output, and the live
+streaming thinking box appears while only `<think>` has arrived.
+
+Deliberately NOT done: wiring `enable_thinking` into the LFM2 prompt builder
+(registry.rs drops the config for Lfm2). That would diverge from the upstream
+template (no `<think>` pre-fill) and change the frozen prompt-token contract
+in chat_integrity_tests for no user-visible gain; thinking off stays a
+display-level filter via `stripThinkingArtifacts`, same as upstream.
+
+Evidence: catalog metadata 20/20 (incl. updated
+`chat_capabilities_expose_reasoning_effort_only_for_qwen38`), izwi-core
+catalog module 113/113, izwi-server `admin::models` green, UI chat suite
+30/30. Commit 65b5dabc on production-serving.
+
+---
+
+# Qwen3.5-35B-A3B-FP8 support — implementation plan (2026-09-29, planning-only session)
+
+Full plan: docs/dev/QWEN35_35B_A3B_FP8_SUPPORT_PLAN.md. New family `Qwen35MoeChat`, variant
+`Qwen35Moe35BA3BFp8`, module `models/architectures/qwen35moe/`. Variant lands catalog-disabled
+(ADR 0008). Each phase = independently reviewable commit with its own evidence.
+
+## Phase 0 — family identity + registration sweep (disabled) — DONE (commit 4935c9af)
+- [x] Variant + family across ~19 sites (variant.rs enums/parse, metadata is_chat/chat_capabilities/is_enabled/is_quantized, sizes, cuda_support, families/mod.rs, registry loaders + family_name, NativeChatModel arm, conformance 52→53 / 76→77+, admin API, worker chat allowlist, UI MODEL_DETAILS)
+- [x] chat_capabilities: thinking default-on + preserve_thinking, no effort ladder; is_enabled explicit false
+
+## Phase 1 — native FP8 safetensors ingestion — DONE (commit 520e624a)
+- [x] qwen35moe/native: shard mmap, F8_E4M3 + BF16 weight_scale_inv block-128 decode, materialization policy seam (lift qwen38 primitives, dedicated family)
+- [x] Config parser: Qwen3_5MoeForConditionalGeneration, text_config, MoE 256/8/512 + shared 512, layer_types, mrope [11,11,10], quantization_config validation, mamba_ssm_dtype; scope prefix resolution; skip vision + MTP tensors (record names)
+- [x] Downloader index-closure bundle (config/generation_config/chat_template.jinja/tokenizer.json/tokenizer_config/vocab/merges/index/shards), pinned manifest, tolerate extra repo files, no mmproj
+- [x] Synthetic-geometry escape hatch; evidence: known-value E4M3 dequant tests, real config.json fixture test, tiny synthetic FP8 checkpoint load, failure injection
+
+## Phase 2 — architecture: hybrid backbone + sparse MoE — DONE (2026-09-29)
+- [x] Compose qwen35 GDN/gated-attn/mrope (interval 4) + Qwen35SparseMlp: router BF16 → SparseMoeDispatcher (scoring PINNED from transformers qwen3_5_moe: F32 softmax → top-k → in-top-k renorm; no sigmoid, no correction bias — dispatcher reused unchanged) → 256 experts via ExpertSet + shared expert added unconditionally (sigmoid shared_expert_gate when present)
+- [x] GGUF fixture path (qwen35moe arch + expert_count/expert_used_count/expert_feed_forward_length/expert_shared_feed_forward_length keys; fused ffn_{gate,up,down}_exps byte-split + ffn_*_shexp + optional ffn_gate_inp_shexp)
+- [x] Qwen35MoeChatModel (thin wrapper over shared Qwen35ChatExec core) + reuses qwen35 ChatDecodeState + qwen35_composite_cache_contract (3 domains); evidence: CPU/Metal fixture parity, e2e fixture generation, native-FP8 synthetic trunk forward, full izwi-core lib suite green (2708)
+
+### Phase 2 review notes (2026-09-29)
+- Dedicated family, shared trunk: `qwen35/text.rs` gains a `Qwen35WeightSource` seam
+  (GGUF source, native block-FP8 source) and a `Qwen35FeedForward::{Dense,Sparse}`
+  enum; `qwen35/chat.rs` extracts the decode machinery into `Qwen35ChatExec` which
+  both the dense wrapper and `Qwen35MoeChatModel` drive. Family-specific pieces stay
+  in `qwen35moe/`: sparse block (`sparse.rs`), fixture config/byte-split
+  (`gguf.rs`), native bridge (`native_model.rs`), text-only chat wrapper (`chat.rs`).
+- Registry: `NativeChatModel::Qwen35Moe` arm + loader (stub replaced), typed
+  `NativeChatPreparedPrompt::Qwen35Moe`, managed starter + resumable-prefill arms,
+  executor starter guard in `handler_chat.rs`. Decode-state/checkpoint enum arms are
+  SHARED with Qwen35 (same hybrid state machinery, same text-model type) — family
+  fidelity lives in the model/prepared-prompt arms and the catalog.
+- **Two Phase 1 tensor-plan corrections found by the forward evidence**: q_proj is
+  gate-fused [heads×dim×2, hidden] (8192 for the 35B, not 4096); linear_attn.norm is
+  per-head [value_head_dim] (128, not 4096). Plus the A_log → a=-exp(A_log)
+  materialization transform. All pinned against the transformers qwen3_5_moe source
+  and recorded in the plan doc.
+- Native FP8 evidence: synthetic checkpoint (rig) → config → plan validation →
+  per-backend materialization (CPU packed Q8_0) → 40-layer-pattern trunk with 2
+  routed + 1 shared expert → prefill + decode, finite logits, per-layer histograms.
+
+## Phase 3 — runtime gates
+- [ ] chat_sequence_execution (adapters.rs:435), is_continuous_physical_chat (loaded.rs:874), family_inference_state_policy arm, continuous-batch leg
+- [ ] Evidence via PUBLIC dispatch entry points (not resolver-only)
+
+## Phase 4 — chat surface
+- [ ] Thinking render (default-on <think>, enable_thinking=False empty block, preserve_thinking history re-render), EOS set im_end+endoftext
+- [ ] json_object: sampler grammar wiring + ensure_response_format_supported allowlist in the SAME slice
+- [ ] logprobs via shared sampler; evidence: API-level tests on fixture
+
+## Phase 5 — memory/admission + distributed posture
+- [ ] qwen35moe_memory resource plan (representation math, ~37k-tensor slack, staging reserves) wired into model_resource_plan; catalog byte pin matches
+- [ ] DS1 prefix_reuse cell NotEnabled (all backends); DS4 offload dormant documented; DS10 page-transfer out-of-scope documented
+- [ ] DS5/6/7 deployment examples with truthful host_memory_limit_bytes
+
+## Phase 6 — MTP speculative (optional, after core)
+- [ ] Port qwen38 mtp.rs pattern to qwen35moe (checkpoint ships 1-layer BF16 MTP); DS9 per-row-depth wiring; opt-in + kill switch
+
+## Phase 7 — evidence + hardware handoff
+- [ ] Portable gate: CPU matrix, CUDA compile no-run, failure injection, synthetic FP8 runner
+- [ ] Handoff doc: download + SHA pin, activation checklist per backend, ADR 0008 gate, post-activation flip order
+
+## Open decisions
+- [ ] D1 CPU residency: Q8_0 requant (recommended) vs F32 expand (~140 GB, impractical)
+- [ ] D4 routing mode: pin softmax/renorm vs sigmoid from transformers qwen3_5_moe before parity work
+- D2 GGUF = fixture path only; D3 vision out of scope; D5 YaRN out of scope (agreed defaults in plan doc)
