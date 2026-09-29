@@ -21,6 +21,7 @@ pub enum ModelFamily {
     Qwen3Chat,
     Qwen3MoeChat,
     Qwen35Chat,
+    Qwen35MoeChat,
     Qwen38Chat,
     Lfm2Chat,
     Lfm25Audio,
@@ -122,6 +123,7 @@ impl ModelVariant {
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
             Qwen3Moe30bA3bGguf => ModelFamily::Qwen3MoeChat,
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
+            Qwen35Moe35BA3BFp8 => ModelFamily::Qwen35MoeChat,
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
@@ -148,6 +150,7 @@ impl ModelVariant {
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => ModelTask::Chat,
@@ -525,6 +528,9 @@ fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
+    if normalized.contains("35b") {
+        return Some(Qwen35Moe35BA3BFp8);
+    }
     if normalized.contains("09b") || normalized.contains("9b") {
         return Some(Qwen359BGguf);
     }
@@ -752,6 +758,21 @@ mod tests {
     fn parse_qwen35_chat_q4_file_alias() {
         let parsed = parse_chat_model_variant(Some("Qwen3.5-9B-Q4_K_M.gguf")).unwrap();
         assert_eq!(parsed, ModelVariant::Qwen359BGguf);
+    }
+
+    #[test]
+    fn parse_qwen35_moe_fp8_chat_aliases() {
+        for alias in [
+            "Qwen3.5-35B-A3B-FP8",
+            "Qwen/Qwen3.5-35B-A3B-FP8",
+            "Qwen3.5 35B-A3B FP8",
+            "Qwen3.5-35B-A3B",
+        ] {
+            let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.5 MoE chat alias");
+            assert_eq!(parsed, ModelVariant::Qwen35Moe35BA3BFp8, "alias {alias}");
+            assert_eq!(parsed.family(), ModelFamily::Qwen35MoeChat);
+            assert_eq!(parsed.primary_task(), ModelTask::Chat);
+        }
     }
 
     #[test]

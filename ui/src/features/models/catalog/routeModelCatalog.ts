@@ -172,6 +172,9 @@ export function getChatRouteModelLabel(variant: string): string {
   if (variant === "Qwen3.8-27B-FP8") {
     return "Qwen3.8 27B (FP8)";
   }
+  if (variant === "Qwen3.5-35B-A3B-FP8") {
+    return "Qwen3.5 35B-A3B (FP8 MoE)";
+  }
   if (variant === "LFM2.5-1.2B-Instruct-GGUF") {
     return "LFM2.5 1.2B Instruct GGUF (Q4_K_M)";
   }

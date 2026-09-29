@@ -179,6 +179,9 @@ impl ModelFamily {
             Self::Qwen35Chat => excluded(
                 "hybrid linear-attention/conv reuse is not proven (DS1.1 scope); contract keeps hybrid domains Disabled",
             ),
+            Self::Qwen35MoeChat => excluded(
+                "hybrid recurrent/conv reuse is not proven and sparse-MoE committed-page evidence is not collected; contract keeps hybrid domains Disabled",
+            ),
             Self::Lfm2Chat => excluded(
                 "hybrid state domains keep per-request KV; reuse is not proven for this family",
             ),

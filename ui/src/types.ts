@@ -198,6 +198,7 @@ export const VIEW_CONFIGS: Record<ViewMode, ViewConfig> = {
       variant === "Qwen3.5-4B" ||
       variant === "Qwen3.5-9B" ||
       variant === "Qwen3.8-27B-FP8" ||
+      variant === "Qwen3.5-35B-A3B-FP8" ||
       variant === "LFM2.5-1.2B-Instruct-GGUF" ||
       variant === "LFM2.5-1.2B-Thinking-GGUF" ||
       variant === "Gemma-3-1b-it" ||

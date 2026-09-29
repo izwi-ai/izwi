@@ -189,12 +189,11 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        Qwen3MoeChat | Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat | Lfm2Chat => {
-            FamilyInferenceStatePolicy {
-                chat: Retained,
-                ..FamilyInferenceStatePolicy::STATELESS
-            }
-        }
+        Qwen3MoeChat | Qwen3Chat | Qwen35Chat | Qwen35MoeChat | Qwen38Chat | Gemma3Chat
+        | Lfm2Chat => FamilyInferenceStatePolicy {
+            chat: Retained,
+            ..FamilyInferenceStatePolicy::STATELESS
+        },
         Lfm25Audio => FamilyInferenceStatePolicy {
             tts: RetainedAndInvocation,
             asr: RetainedAndInvocation,

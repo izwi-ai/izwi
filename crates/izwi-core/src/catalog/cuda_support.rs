@@ -330,6 +330,11 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Qwen3.5 recurrent blocks have an existing Izwi CUDA causal-convolution provider with a Candle fallback",
             ),
+            ModelFamily::Qwen35MoeChat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.5 MoE recurrent blocks reuse the Qwen3.5 causal-convolution provider shape; per-family CUDA evidence is collected at activation, not before",
+            ),
             ModelFamily::Qwen38Chat => CudaOperatorCapability::source_reviewed(
                 Operator::Convolution,
                 Provider::IzwiCudaEligible,
@@ -355,6 +360,7 @@ impl ModelVariant {
             ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
@@ -492,6 +498,7 @@ impl ModelVariant {
             | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm25Audio
@@ -520,6 +527,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
                 "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv before converting projections to resident Q8_0 Candle weights, a compressed fallback rather than native FP8 execution",
+            );
+        }
+
+        if self.is_qwen35_moe_fp8() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3.5 MoE stores 128x128 block-scaled FP8 Safetensors weights; CUDA follows the same scale-aware Q8_0 compressed-projection fallback contract as Qwen3.8 FP8, not native FP8 execution",
             );
         }
 

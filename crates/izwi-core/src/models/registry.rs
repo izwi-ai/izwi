@@ -380,6 +380,23 @@ fn load_qwen38_chat_model(
     ))
 }
 
+fn load_qwen35_moe_chat_model(
+    _model_dir: &Path,
+    variant: ModelVariant,
+    _device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
+) -> Result<NativeChatModel> {
+    // Registration-sweep posture: the variant is catalog-disabled and its
+    // native block-scaled FP8 ingestion lands with the qwen35moe
+    // architecture module. Fail loudly if anything reaches this loader
+    // before that module exists.
+    Err(Error::ModelLoadError(format!(
+        "{} requires the qwen35moe native FP8 ingestion module, which is not part of this build",
+        variant.dir_name()
+    )))
+}
+
 fn load_lfm25_audio_model(
     model_dir: &Path,
     variant: ModelVariant,
@@ -506,6 +523,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen38_chat",
         family: ModelFamily::Qwen38Chat,
         loader: load_qwen38_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "qwen35_moe_chat",
+        family: ModelFamily::Qwen35MoeChat,
+        loader: load_qwen35_moe_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -5575,6 +5597,7 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen3Chat => "qwen3_chat",
         ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",
         ModelFamily::Qwen35Chat => "qwen35_chat",
+        ModelFamily::Qwen35MoeChat => "qwen35_moe_chat",
         ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
