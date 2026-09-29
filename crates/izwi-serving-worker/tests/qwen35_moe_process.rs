@@ -226,7 +226,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         .as_str()
         .is_some_and(|text| !text.is_empty()));
 
-    let response = app.oneshot(public_request(true)).await.unwrap();
+    let response = app.clone().oneshot(public_request(true)).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
         .await
@@ -237,4 +237,32 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         "streaming chunks expected"
     );
     assert!(body.contains("[DONE]"), "terminal stream marker expected");
+
+    // The json_object allowlist admits the family end to end: this request
+    // must reach the worker instead of failing with the grammar-aware-sampler
+    // 400. (The fixture tokenizer has no JSON characters, so the constrained
+    // decode legitimately finishes immediately on a stop token.)
+    let constrained = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer qwen35-moe-test-api-key")
+        .body(Body::from(
+            serde_json::json!({
+                "model": ModelVariant::Qwen35Moe35BA3BFp8.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.0,
+                "max_tokens": 4,
+                "response_format": {"type": "json_object"}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.oneshot(constrained).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["object"], "chat.completion");
 }

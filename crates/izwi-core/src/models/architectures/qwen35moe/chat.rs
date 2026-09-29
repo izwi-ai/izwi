@@ -173,8 +173,7 @@ impl Qwen35MoeChatModel {
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        self.exec
-            .continuous_decode_batch_workspace_per_row_bytes()
+        self.exec.continuous_decode_batch_workspace_per_row_bytes()
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -200,9 +199,12 @@ impl Qwen35MoeChatModel {
             Some(prepared) => prepared.clone(),
             None => self.prepare_prompt_for_execution(messages, config)?,
         };
-        let mut state = self
-            .exec
-            .begin_resumable_prefill_state_physical(&prepared, max_new_tokens, config, cache)?;
+        let mut state = self.exec.begin_resumable_prefill_state_physical(
+            &prepared,
+            max_new_tokens,
+            config,
+            cache,
+        )?;
         self.exec.continue_resumable_prefill_physical(
             &mut state,
             &prepared,
@@ -286,8 +288,11 @@ mod tests {
         fn tensor(&mut self, shape: Vec<usize>) -> QTensor {
             let count: usize = shape.iter().product();
             let values: Vec<f32> = (0..count).map(|_| self.next_f32()).collect();
-            QTensor::quantize(&Tensor::from_vec(values, shape, &Device::Cpu).unwrap(), GgmlDType::F32)
-                .unwrap()
+            QTensor::quantize(
+                &Tensor::from_vec(values, shape, &Device::Cpu).unwrap(),
+                GgmlDType::F32,
+            )
+            .unwrap()
         }
     }
 
@@ -348,7 +353,11 @@ mod tests {
             tensors.push((name, rng.tensor(shape)));
         };
 
-        push(&mut rng, "token_embd.weight".into(), vec![FIXTURE_VOCAB, hidden]);
+        push(
+            &mut rng,
+            "token_embd.weight".into(),
+            vec![FIXTURE_VOCAB, hidden],
+        );
         push(&mut rng, "output_norm.weight".into(), vec![hidden]);
 
         for layer in 0..4usize {
@@ -362,26 +371,66 @@ mod tests {
             if (layer + 1) % 2 == 0 {
                 // Gated full attention: q_proj fuses the per-head output
                 // gate, so it carries heads × head_dim × 2 rows.
-                push(&mut rng, format!("{prefix}.attn_q.weight"), vec![64, hidden]);
-                push(&mut rng, format!("{prefix}.attn_k.weight"), vec![16, hidden]);
-                push(&mut rng, format!("{prefix}.attn_v.weight"), vec![16, hidden]);
-                push(&mut rng, format!("{prefix}.attn_output.weight"), vec![hidden, hidden]);
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_q.weight"),
+                    vec![64, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_k.weight"),
+                    vec![16, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_v.weight"),
+                    vec![16, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_output.weight"),
+                    vec![hidden, hidden],
+                );
                 push(&mut rng, format!("{prefix}.attn_q_norm.weight"), vec![8]);
                 push(&mut rng, format!("{prefix}.attn_k_norm.weight"), vec![8]);
             } else {
                 // GDN: K heads 2 × state 8 twice + V 4 heads × 8.
-                push(&mut rng, format!("{prefix}.attn_qkv.weight"), vec![64, hidden]);
-                push(&mut rng, format!("{prefix}.attn_gate.weight"), vec![32, hidden]);
-                push(&mut rng, format!("{prefix}.ssm_beta.weight"), vec![4, hidden]);
-                push(&mut rng, format!("{prefix}.ssm_alpha.weight"), vec![4, hidden]);
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_qkv.weight"),
+                    vec![64, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.attn_gate.weight"),
+                    vec![32, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.ssm_beta.weight"),
+                    vec![4, hidden],
+                );
+                push(
+                    &mut rng,
+                    format!("{prefix}.ssm_alpha.weight"),
+                    vec![4, hidden],
+                );
                 push(&mut rng, format!("{prefix}.ssm_dt.bias"), vec![4]);
                 push(&mut rng, format!("{prefix}.ssm_a"), vec![4]);
                 push(&mut rng, format!("{prefix}.ssm_conv1d.weight"), vec![64, 4]);
                 push(&mut rng, format!("{prefix}.ssm_norm.weight"), vec![8]);
-                push(&mut rng, format!("{prefix}.ssm_out.weight"), vec![hidden, 32]);
+                push(
+                    &mut rng,
+                    format!("{prefix}.ssm_out.weight"),
+                    vec![hidden, 32],
+                );
             }
             // Sparse MoE feed-forward (every layer) with shared expert.
-            push(&mut rng, format!("{prefix}.ffn_gate_inp.weight"), vec![FIXTURE_EXPERTS, hidden]);
+            push(
+                &mut rng,
+                format!("{prefix}.ffn_gate_inp.weight"),
+                vec![FIXTURE_EXPERTS, hidden],
+            );
             push(
                 &mut rng,
                 format!("{prefix}.ffn_gate_exps.weight"),
@@ -397,10 +446,26 @@ mod tests {
                 format!("{prefix}.ffn_down_exps.weight"),
                 vec![FIXTURE_EXPERTS, hidden, FIXTURE_EXPERT_FF],
             );
-            push(&mut rng, format!("{prefix}.ffn_gate_shexp.weight"), vec![FIXTURE_SHARED_FF, hidden]);
-            push(&mut rng, format!("{prefix}.ffn_up_shexp.weight"), vec![FIXTURE_SHARED_FF, hidden]);
-            push(&mut rng, format!("{prefix}.ffn_down_shexp.weight"), vec![hidden, FIXTURE_SHARED_FF]);
-            push(&mut rng, format!("{prefix}.ffn_gate_inp_shexp.weight"), vec![1, hidden]);
+            push(
+                &mut rng,
+                format!("{prefix}.ffn_gate_shexp.weight"),
+                vec![FIXTURE_SHARED_FF, hidden],
+            );
+            push(
+                &mut rng,
+                format!("{prefix}.ffn_up_shexp.weight"),
+                vec![FIXTURE_SHARED_FF, hidden],
+            );
+            push(
+                &mut rng,
+                format!("{prefix}.ffn_down_shexp.weight"),
+                vec![hidden, FIXTURE_SHARED_FF],
+            );
+            push(
+                &mut rng,
+                format!("{prefix}.ffn_gate_inp_shexp.weight"),
+                vec![1, hidden],
+            );
         }
 
         let (tokenizer_values, _eos) = fixture_tokenizer_metadata();
@@ -411,56 +476,55 @@ mod tests {
             ),
             ("qwen35moe.block_count", gguf_file::Value::U64(4)),
             ("qwen35moe.context_length", gguf_file::Value::U64(64)),
-            ("qwen35moe.embedding_length", gguf_file::Value::U64(hidden as u64)),
-            ("qwen35moe.feed_forward_length",
+            (
+                "qwen35moe.embedding_length",
+                gguf_file::Value::U64(hidden as u64),
+            ),
+            (
+                "qwen35moe.feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_EXPERT_FF as u64),
             ),
-            ("qwen35moe.attention.head_count",
-                gguf_file::Value::U64(4),
-            ),
-            ("qwen35moe.attention.head_count_kv",
+            ("qwen35moe.attention.head_count", gguf_file::Value::U64(4)),
+            (
+                "qwen35moe.attention.head_count_kv",
                 gguf_file::Value::U64(2),
             ),
-            ("qwen35moe.attention.key_length",
-                gguf_file::Value::U64(8),
-            ),
-            ("qwen35moe.attention.value_length",
-                gguf_file::Value::U64(8),
-            ),
-            ("qwen35moe.attention.layer_norm_rms_epsilon",
+            ("qwen35moe.attention.key_length", gguf_file::Value::U64(8)),
+            ("qwen35moe.attention.value_length", gguf_file::Value::U64(8)),
+            (
+                "qwen35moe.attention.layer_norm_rms_epsilon",
                 gguf_file::Value::F64(1e-5),
             ),
-            ("qwen35moe.rope.dimension_sections",
+            (
+                "qwen35moe.rope.dimension_sections",
                 gguf_file::Value::Array(vec![
                     gguf_file::Value::U64(2),
                     gguf_file::Value::U64(2),
                     gguf_file::Value::U64(2),
                 ]),
             ),
-            ("qwen35moe.rope.dimension_count",
-                gguf_file::Value::U64(8),
-            ),
+            ("qwen35moe.rope.dimension_count", gguf_file::Value::U64(8)),
             ("qwen35moe.rope.freq_base", gguf_file::Value::F64(10_000.0)),
             ("qwen35moe.ssm.conv_kernel", gguf_file::Value::U64(4)),
             ("qwen35moe.ssm.state_size", gguf_file::Value::U64(8)),
             ("qwen35moe.ssm.group_count", gguf_file::Value::U64(2)),
-            ("qwen35moe.ssm.time_step_rank",
-                gguf_file::Value::U64(4),
-            ),
+            ("qwen35moe.ssm.time_step_rank", gguf_file::Value::U64(4)),
             ("qwen35moe.ssm.inner_size", gguf_file::Value::U64(32)),
-            ("qwen35moe.full_attention_interval",
+            (
+                "qwen35moe.full_attention_interval",
                 gguf_file::Value::U64(2),
             ),
-            ("qwen35moe.expert_count",
+            (
+                "qwen35moe.expert_count",
                 gguf_file::Value::U64(FIXTURE_EXPERTS as u64),
             ),
-            ("qwen35moe.expert_used_count",
-                gguf_file::Value::U64(2),
-            ),
-            ("qwen35moe.expert_feed_forward_length",
+            ("qwen35moe.expert_used_count", gguf_file::Value::U64(2)),
+            (
+                "qwen35moe.expert_feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_EXPERT_FF as u64),
             ),
-            ("qwen35moe.expert_shared_feed_forward_length",
+            (
+                "qwen35moe.expert_shared_feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_SHARED_FF as u64),
             ),
             ("tokenizer.ggml.tokens", tokenizer_values[0].clone()),
@@ -494,20 +558,17 @@ mod tests {
     fn load_fixture(tag: &str) -> (Qwen35MoeChatModel, PathBuf) {
         let dir = fixture_dir(tag);
         write_fixture(&dir);
-        let model = Qwen35MoeChatModel::load(
-            &dir,
-            ModelVariant::Qwen35Moe35BA3BFp8,
-            DeviceProfile::cpu(),
-        )
-        .expect("load qwen35moe fixture");
+        let model =
+            Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen35Moe35BA3BFp8, DeviceProfile::cpu())
+                .expect("load qwen35moe fixture");
         (model, dir)
     }
 
     fn physical_cache(model: &Qwen35MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
-        use candle_core::DeviceLocation;
-        use crate::backends::kv::{CpuKvArena, KvArena};
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::{CpuKvArena, KvArena};
+        use candle_core::DeviceLocation;
         let contract = match model.inference_state_contract().expect("contract") {
             InferenceStateCapability::Managed(contract) => contract,
             other => panic!("expected managed contract, got {other:?}"),
@@ -534,32 +595,32 @@ mod tests {
         };
         let group = KvGroupId::new(1);
         let arena_config = KvArenaConfig {
-                id,
-                group,
-                page_tokens: 8,
-                capacity_pages: 16,
-                growth: None,
-                dtype: DType::F32,
-                layers: vec![
-                    KvLayerConfig {
-                        binding: KvLayerBinding {
-                            model_layer: 1,
-                            physical_layer: 0,
-                        },
-                        num_kv_heads: kv_heads as u32,
-                        key_head_dim: head_dim as u32,
-                        value_head_dim: head_dim as u32,
+            id,
+            group,
+            page_tokens: 8,
+            capacity_pages: 16,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 1,
+                        physical_layer: 0,
                     },
-                    KvLayerConfig {
-                        binding: KvLayerBinding {
-                            model_layer: 3,
-                            physical_layer: 1,
-                        },
-                        num_kv_heads: kv_heads as u32,
-                        key_head_dim: head_dim as u32,
-                        value_head_dim: head_dim as u32,
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                },
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 3,
+                        physical_layer: 1,
                     },
-                ],
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                },
+            ],
         };
         let is_accelerator = BackendKind::from(device.kind) != BackendKind::Cpu;
         let arena: Arc<dyn KvArena> = if is_accelerator {
@@ -694,6 +755,181 @@ mod tests {
     }
 
     #[test]
+    fn thinking_render_reaches_the_moe_prepared_prompt_both_ways() {
+        let (model, dir) = load_fixture("thinking");
+        // Fixture token layout: 256 byte tokens, then the specials —
+        // <|im_start|>=256, <|im_end|>=257, <|endoftext|>=260,
+        // <think>=261, </think>=262.
+        const THINK_OPEN: u32 = 261;
+        const THINK_CLOSE: u32 = 262;
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let config_with = |enable: Option<bool>| ChatGenerationConfig {
+            request: crate::models::shared::chat::ChatRequestConfig {
+                enable_thinking: enable,
+                tools: Vec::new(),
+                media_inputs: Vec::new(),
+                ..crate::models::shared::chat::ChatRequestConfig::default()
+            },
+            ..ChatGenerationConfig::default()
+        };
+
+        // Thinking default-on for the 35B-A3B MoE variant (no explicit flag).
+        let default_ids = model
+            .prompt_token_ids_with_config(&messages, &generation_config())
+            .expect("default prompt ids");
+        let enabled = model
+            .prompt_token_ids_with_config(&messages, &config_with(Some(true)))
+            .expect("enabled prompt ids");
+        let disabled = model
+            .prompt_token_ids_with_config(&messages, &config_with(Some(false)))
+            .expect("disabled prompt ids");
+        assert_eq!(default_ids, enabled, "thinking defaults on for this family");
+
+        let open_count = |ids: &[u32]| ids.iter().filter(|id| **id == THINK_OPEN).count();
+        let close_count = |ids: &[u32]| ids.iter().filter(|id| **id == THINK_CLOSE).count();
+        assert_eq!(
+            open_count(&enabled),
+            1,
+            "enabled prompt opens one think block"
+        );
+        assert_eq!(close_count(&enabled), 0, "enabled prompt leaves it open");
+        assert_eq!(open_count(&disabled), 1);
+        assert_eq!(close_count(&disabled), 1);
+        assert!(
+            disabled.starts_with(&enabled),
+            "the closed block extends the same prompt"
+        );
+        assert_eq!(
+            disabled.len(),
+            enabled.len() + 4,
+            "the empty block adds exactly the closing delimiters"
+        );
+
+        // Assistant history before the last user query renders the visible
+        // reply only: the reasoning span is split off and dropped, so the
+        // prompt for a thinking history turn equals the prompt for the same
+        // turn with any other reasoning span.
+        let history = |assistant: &str| {
+            vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: assistant.to_string(),
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "ab".to_string(),
+                },
+            ]
+        };
+        let with_reasoning = model
+            .prompt_token_ids_with_config(
+                &history("<think>hidden chain</think>visible reply"),
+                &generation_config(),
+            )
+            .expect("history prompt ids");
+        let with_other_reasoning = model
+            .prompt_token_ids_with_config(
+                &history("<think>other span</think>visible reply"),
+                &generation_config(),
+            )
+            .expect("history prompt ids");
+        assert_eq!(
+            with_reasoning, with_other_reasoning,
+            "history reasoning spans are stripped from the prompt"
+        );
+        let with_other_reply = model
+            .prompt_token_ids_with_config(
+                &history("<think>other span</think>different reply"),
+                &generation_config(),
+            )
+            .expect("history prompt ids");
+        assert_ne!(
+            with_reasoning, with_other_reply,
+            "the visible reply itself is kept"
+        );
+        assert_eq!(
+            open_count(&with_reasoning),
+            1,
+            "only the final generation block opens a think section"
+        );
+        assert_eq!(close_count(&with_reasoning), 0);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn json_object_constraint_keeps_fixture_decode_grammar_legal() {
+        let (model, dir) = load_fixture("json-object");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let mut config = generation_config();
+        config.constrain_json_object = true;
+
+        let cache = physical_cache(&model, &DeviceProfile::cpu());
+        let mut state = model
+            .start_decode_state_physical(&messages, 24, &config, None, cache)
+            .expect("constrained decode state");
+
+        let mut assembled = String::new();
+        for _ in 0..24 {
+            let step = model.decode_step(&mut state).expect("constrained step");
+            assembled.push_str(&step.delta);
+            if step.finished {
+                break;
+            }
+        }
+        // Every committed token fed the grammar machine, so the assembled
+        // text is always a legal JSON prefix (an empty stop-first output
+        // included); an unconstrained random decode would emit arbitrary
+        // byte-level characters the machine rejects.
+        let mut machine = crate::models::shared::grammar::JsonGrammarMachine::new();
+        machine
+            .feed(&assembled)
+            .expect("output stays grammar-legal");
+
+        // The constrained decode still drains logprobs like the plain path:
+        // exactly one entry per non-stop step, in the DS9.3 OpenAI shape.
+        drop(state);
+        let cache = physical_cache(&model, &DeviceProfile::cpu());
+        let mut logged_config = config.clone();
+        logged_config.logprobs = true;
+        logged_config.top_logprobs = 2;
+        let mut logged = model
+            .start_decode_state_physical(&messages, 8, &logged_config, None, cache)
+            .expect("logprob decode state");
+        let mut drained = Vec::new();
+        let mut steps_taken = 0usize;
+        let mut finished = false;
+        for _ in 0..8 {
+            let step = model.decode_step(&mut logged).expect("logprob step");
+            drained.extend(std::mem::take(&mut logged.pending_logprobs));
+            steps_taken += 1;
+            finished = step.finished;
+            if finished {
+                break;
+            }
+        }
+        assert_eq!(
+            drained.len(),
+            steps_taken - usize::from(finished),
+            "one logprob entry per non-stop decode step"
+        );
+        assert!(
+            drained
+                .iter()
+                .all(|entry| entry.logprob.is_finite() && !entry.token.is_empty()),
+            "logprob entries keep the DS9.3 OpenAI shape"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn fixture_rejects_media_inputs() {
         let (model, dir) = load_fixture("media");
         let messages = vec![ChatMessage {
@@ -701,10 +937,13 @@ mod tests {
             content: "ab".to_string(),
         }];
         let mut config = generation_config();
-        config.request.media_inputs.push(crate::models::shared::chat::ChatMediaInput {
-            kind: crate::models::shared::chat::ChatMediaKind::Image,
-            source: "data:image/png;base64,AAAA".to_string(),
-        });
+        config
+            .request
+            .media_inputs
+            .push(crate::models::shared::chat::ChatMediaInput {
+                kind: crate::models::shared::chat::ChatMediaKind::Image,
+                source: "data:image/png;base64,AAAA".to_string(),
+            });
         let error = model
             .prepare_prompt_for_execution(&messages, &config)
             .expect_err("media must be rejected");
@@ -722,12 +961,9 @@ mod tests {
         let run = |device: DeviceProfile| -> Vec<String> {
             let dir = fixture_dir("parity");
             write_fixture(&dir);
-            let model = Qwen35MoeChatModel::load(
-                &dir,
-                ModelVariant::Qwen35Moe35BA3BFp8,
-                device.clone(),
-            )
-            .expect("load fixture");
+            let model =
+                Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen35Moe35BA3BFp8, device.clone())
+                    .expect("load fixture");
             let messages = vec![ChatMessage {
                 role: ChatRole::User,
                 content: "ab".to_string(),

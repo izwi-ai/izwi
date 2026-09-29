@@ -900,7 +900,10 @@ fn ensure_response_format_supported(
     if response_format.kind == "json_object"
         && !matches!(
             variant.family(),
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat | ModelFamily::Lfm2Chat
+            ModelFamily::Qwen3Chat
+                | ModelFamily::Gemma3Chat
+                | ModelFamily::Lfm2Chat
+                | ModelFamily::Qwen35MoeChat
         )
     {
         return Err(ApiError::bad_request(format!(
@@ -2101,6 +2104,10 @@ mod timing_contract_tests {
         assert!(
             ensure_response_format_supported(ModelVariant::Qwen3827BFp8, &format).is_err(),
             "qwen3.8 has its own sampler without the grammar seam"
+        );
+        assert!(
+            ensure_response_format_supported(ModelVariant::Qwen35Moe35BA3BFp8, &format).is_ok(),
+            "qwen3.5-moe wires the DS9.2 grammar into its decode states"
         );
     }
 

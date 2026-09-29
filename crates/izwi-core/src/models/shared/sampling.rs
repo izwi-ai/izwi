@@ -49,7 +49,7 @@ impl Clone for GrammarRuntime {
 }
 
 impl GrammarRuntime {
-    fn new(
+    pub(crate) fn new(
         tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
         always_allowed: Vec<u32>,
     ) -> Self {
@@ -81,13 +81,13 @@ impl GrammarRuntime {
 
     /// Sample one token under the grammar's current mask, then advance the
     /// machine with the token's surface text.
-    fn sample_token(
+    pub(crate) fn sample_token<R: GrammarRng>(
         &mut self,
         logits: &Tensor,
         vocab_size: usize,
         config: &ChatGenerationConfig,
         history: &[u32],
-        rng: &mut SimpleRng,
+        rng: &mut R,
     ) -> Result<(u32, Option<RawTokenLogprobs>)> {
         let surfaces = self.surfaces(vocab_size)?;
         let mask = self.masks.mask_for(&self.machine, surfaces);
@@ -469,11 +469,24 @@ pub(crate) fn raw_logprobs_stats(
 /// The existing host fallback pipeline, extracted so the logprobs route
 /// samples through the exact same math (penalties → temperature → top-k →
 /// top-p → draw) on the already-read row.
-fn sample_from_host_values(
+/// DS9.2: uniform unit draw used by host sampling paths. Abstracted so
+/// model families that own an equivalent local RNG (qwen35's decode loop)
+/// can drive the shared grammar runtime without changing their state.
+pub(crate) trait GrammarRng {
+    fn draw_unit(&mut self) -> f32;
+}
+
+impl GrammarRng for SimpleRng {
+    fn draw_unit(&mut self) -> f32 {
+        self.next_f32()
+    }
+}
+
+fn sample_from_host_values<R: GrammarRng>(
     mut values: Vec<f32>,
     config: &ChatGenerationConfig,
     history: &[u32],
-    rng: &mut SimpleRng,
+    rng: &mut R,
 ) -> Result<u32> {
     apply_chat_history_penalties(
         &mut values,
@@ -541,7 +554,7 @@ fn sample_from_host_values(
             }
         }
     }
-    let draw = rng.next_f32();
+    let draw = rng.draw_unit();
     let mut cumulative = 0.0f32;
     for (index, probability) in &probabilities {
         cumulative += *probability;

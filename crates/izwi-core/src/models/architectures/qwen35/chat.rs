@@ -140,6 +140,9 @@ pub struct ChatDecodeState {
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+    /// DS9.2: per-request constrained-decoding runtime, present only when
+    /// the request asked for `response_format: json_object`.
+    grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
 }
 
 impl ChatDecodeState {
@@ -345,7 +348,11 @@ struct GgufTokenizerMetadata {
 }
 
 impl Qwen35Tokenizer {
-    pub(crate) fn load(model_dir: &Path, variant: ModelVariant, loader: &GgufLoader) -> Result<Self> {
+    pub(crate) fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        loader: &GgufLoader,
+    ) -> Result<Self> {
         let gguf_meta = parse_gguf_tokenizer_metadata(loader)?;
         let config = load_tokenizer_config_file(model_dir)?;
         let mut inner = match Tokenizer::from_path(model_dir) {
@@ -740,7 +747,31 @@ impl Qwen35ChatExec {
             prefill_vision_progress: 0,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
+            grammar: self.grammar_runtime(config),
         })
+    }
+
+    /// DS9.2 grammar runtime for this request, or `None` when the request
+    /// did not ask for constrained decoding. Always-sampleable ids mirror
+    /// `is_stop_token` so the decode loop can still finish inside the mask.
+    fn grammar_runtime(
+        &self,
+        config: &ChatGenerationConfig,
+    ) -> Option<crate::models::shared::sampling::GrammarRuntime> {
+        if !config.constrain_json_object {
+            return None;
+        }
+        Some(crate::models::shared::sampling::GrammarRuntime::new(
+            std::sync::Arc::new(self.tokenizer.inner.clone()),
+            [
+                Some(self.tokenizer.specials.im_end),
+                Some(self.tokenizer.specials.eos),
+                self.tokenizer.specials.eos_alt,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        ))
     }
 
     pub(crate) fn continue_resumable_prefill_physical(
@@ -873,13 +904,24 @@ impl Qwen35ChatExec {
                     "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
                 )
             })?;
-            let (token, raw_logprobs) = sample_next_token_with_logprobs(
-                &output,
-                self.tokenizer.vocab_size,
-                &state.config,
-                history,
-                &mut state.rng,
-            )?;
+            let (token, raw_logprobs) = if state.grammar.is_some() {
+                let grammar = state.grammar.as_mut().expect("grammar checked above");
+                grammar.sample_token(
+                    &output,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            } else {
+                sample_next_token_with_logprobs(
+                    &output,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            };
             if let Some(raw) = raw_logprobs {
                 let entry = crate::models::shared::sampling::resolve_token_logprob(
                     &self.tokenizer.inner,
@@ -983,13 +1025,24 @@ impl Qwen35ChatExec {
             };
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
-            let (token, raw_logprobs) = sample_next_token_with_logprobs(
-                &row_logits,
-                self.tokenizer.vocab_size,
-                &state.config,
-                history,
-                &mut state.rng,
-            )?;
+            let (token, raw_logprobs) = if state.grammar.is_some() {
+                let grammar = state.grammar.as_mut().expect("grammar checked above");
+                grammar.sample_token(
+                    &row_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            } else {
+                sample_next_token_with_logprobs(
+                    &row_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            };
             let entry = raw_logprobs
                 .map(|raw| {
                     crate::models::shared::sampling::resolve_token_logprob(
@@ -1207,8 +1260,7 @@ impl Qwen35ChatModel {
     }
 
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        self.exec
-            .continuous_decode_batch_workspace_per_row_bytes()
+        self.exec.continuous_decode_batch_workspace_per_row_bytes()
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -1224,9 +1276,12 @@ impl Qwen35ChatModel {
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
-        let mut state = self
-            .exec
-            .begin_resumable_prefill_state_physical(&prepared, max_new_tokens, config, cache)?;
+        let mut state = self.exec.begin_resumable_prefill_state_physical(
+            &prepared,
+            max_new_tokens,
+            config,
+            cache,
+        )?;
         self.exec.continue_resumable_prefill_physical(
             &mut state,
             &prepared,
@@ -2216,6 +2271,12 @@ impl SimpleRng {
 
     fn next_f32(&mut self) -> f32 {
         (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
+impl crate::models::shared::sampling::GrammarRng for SimpleRng {
+    fn draw_unit(&mut self) -> f32 {
+        self.next_f32()
     }
 }
 
