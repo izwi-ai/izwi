@@ -1107,7 +1107,11 @@ impl ModelVariant {
             Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
-            Self::Nemotron3Diarization => false,
+            // Enabled by product decision (2026-09-30) after real-checkpoint
+            // CPU evidence: 8-channel load + end-to-end diarization of the
+            // conformance clip through the RoPE encoder path (commit
+            // 2e35f632). Visible in the catalog and downloadable.
+            Self::Nemotron3Diarization => true,
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
             _ => !self.is_quantized(),
@@ -1395,6 +1399,30 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn nemotron3_diarization_catalog_contract_is_enabled_eight_speakers() {
+        let variant = ModelVariant::Nemotron3Diarization;
+
+        // Enabled by product decision (2026-09-30) after real-checkpoint CPU
+        // evidence; the SortformerDiarization family shares v2.1's runtime
+        // surface with a per-checkpoint 8-speaker envelope.
+        assert!(variant.is_enabled());
+        assert!(variant.is_diarization());
+        assert!(variant.supports_diarization_records());
+        assert!(!variant.is_quantized());
+        assert_eq!(
+            variant.family(),
+            crate::catalog::ModelFamily::SortformerDiarization
+        );
+        assert_eq!(variant.primary_task(), ModelTask::Diarization);
+        assert_eq!(variant.repo_id(), "nvidia/Nemotron-3-Diarization");
+        assert_eq!(variant.dir_name(), "Nemotron-3-Diarization");
+        assert_eq!(variant.display_name(), "Nemotron 3 Diarization");
+        assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
+        assert_eq!(variant.estimated_size(), 200_000_000);
+        assert_eq!(variant.memory_required_gb(), 2.0);
     }
 
     #[test]
