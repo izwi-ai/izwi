@@ -161,6 +161,7 @@ mod tests {
             &super::super::SortformerModulesConfig::default(),
             512,
             4,
+            super::super::SortformerEncoderKind::Conformer,
         )
         .unwrap();
         assert_eq!(cfg.fifo_len, 0);
