@@ -573,7 +573,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
-            Self::Nemotron3Diarization => 400_000_000,          // ~0.4 GB .nemo (est)
+            Self::Nemotron3Diarization => 200_000_000,          // ~0.19 GB .nemo, HF, Sep 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
             Self::Qwen317B => 4_080_000_000,            // ~3.80 GB (actual: 3.44GB + 622MB shards)

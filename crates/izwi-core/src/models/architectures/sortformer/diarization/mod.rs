@@ -4500,6 +4500,41 @@ mod tests {
     }
 
     #[test]
+    fn select_speaker_channels_keeps_six_active_of_eight_channels() {
+        // Nemotron-3's head is fixed at 8 channels; six carry speech and two
+        // stay near-silent. A max_speakers=8 request must keep all six
+        // active channels, not clamp to v2.1's four.
+        let mut stats = (0..6usize)
+            .map(|speaker_idx| SpeakerActivityStats {
+                speaker_idx,
+                total_duration_secs: 8.0 - speaker_idx as f32,
+                peak_probability: 0.90 - speaker_idx as f32 * 0.05,
+                segment_count: 3,
+            })
+            .collect::<Vec<_>>();
+        stats.push(SpeakerActivityStats {
+            speaker_idx: 6,
+            total_duration_secs: 0.0,
+            peak_probability: 0.01,
+            segment_count: 0,
+        });
+        stats.push(SpeakerActivityStats {
+            speaker_idx: 7,
+            total_duration_secs: 0.0,
+            peak_probability: 0.02,
+            segment_count: 0,
+        });
+
+        let selected = select_speaker_channels(&stats, 1, 8, 8);
+        assert_eq!(selected.len(), 6);
+        assert_eq!(selected, vec![0, 1, 2, 3, 4, 5]);
+        // A v2.1-era 4-speaker request against the same 8-channel stats
+        // keeps only the four most active channels.
+        let clamped = select_speaker_channels(&stats, 1, 4, 8);
+        assert_eq!(clamped, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn resolve_streaming_config_uses_model_profile_by_default() {
         let _env = env_lock().lock().unwrap();
         let cfg = resolve_streaming_config(
@@ -4863,6 +4898,80 @@ mod tests {
                 segment
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires local Sortformer checkpoint"]
+    fn nemotron3_local_checkpoint_diarizes_eight_channels_on_cpu() {
+        let models_root = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("izwi")
+                    .join("models")
+            });
+        let model_dir = models_root.join(ModelVariant::Nemotron3Diarization.dir_name());
+        if !model_dir.join("Nemotron-3-Diarization.nemo").exists() {
+            eprintln!(
+                "Skipping Nemotron-3 checkpoint test, model not found at {}",
+                model_dir.display()
+            );
+            return;
+        }
+
+        let audio_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/diarization-2.mp3");
+        let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
+        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
+
+        let model = SortformerDiarizerModel::load(
+            &model_dir,
+            ModelVariant::Nemotron3Diarization,
+            DeviceProfile::cpu(),
+        )
+        .expect("nemotron3 checkpoint should load");
+        let config = DiarizationConfig {
+            max_speakers: Some(8),
+            ..DiarizationConfig::default()
+        };
+        let diarization = model
+            .diarize(&samples, sample_rate, &config)
+            .expect("nemotron3 diarization should run");
+
+        assert!(
+            !diarization.segments.is_empty(),
+            "expected diarization segments from the real checkpoint"
+        );
+        let duration = samples.len() as f32 / sample_rate as f32;
+        for segment in &diarization.segments {
+            let speaker = parse_test_speaker_id(&segment.speaker);
+            assert!(speaker < 8, "speaker channel out of range: {segment:?}");
+            assert!(segment.start_secs < segment.end_secs);
+            assert!(segment.end_secs <= duration + 0.1);
+            // The upsampler emits rows at the 10 ms mel rate; segment
+            // boundaries must land on that grid (within f32 slop).
+            for boundary in [segment.start_secs, segment.end_secs] {
+                let millis = (boundary * 1000.0) as f64;
+                let nearest_grid = (millis / 10.0).round() * 10.0;
+                assert!(
+                    (millis - nearest_grid).abs() < 0.05,
+                    "boundary {boundary} not on the 10 ms grid"
+                );
+            }
+        }
+        let distinct_speakers = diarization
+            .segments
+            .iter()
+            .map(|segment| parse_test_speaker_id(&segment.speaker))
+            .collect::<std::collections::BTreeSet<_>>();
+        println!(
+            "nemotron3 cpu diarization: {} segments, {} distinct channels over {duration:.1}s",
+            diarization.segments.len(),
+            distinct_speakers.len()
+        );
     }
 
     fn parse_test_speaker_id(label: &str) -> usize {

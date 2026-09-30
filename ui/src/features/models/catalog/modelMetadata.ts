@@ -475,7 +475,7 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "8-speaker streaming Sortformer-family diarization model from NVIDIA in .nemo format",
     category: "asr",
     capabilities: ["Diarization", "Up to 8 speakers", "Streaming"],
-    size: "0.4 GB",
+    size: "0.2 GB",
   },
   // Voxtral
   "Voxtral-Mini-4B-Realtime-2602": {

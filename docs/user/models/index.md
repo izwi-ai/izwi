@@ -53,7 +53,7 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 | Task | Model |
 |------|-------|
-| Speaker diarization | `diar_streaming_sortformer_4spk-v2.1` |
+| Speaker diarization | `diar_streaming_sortformer_4spk-v2.1`, `Nemotron-3-Diarization` (8 speakers) |
 | Forced alignment | `Qwen3-ForcedAligner-0.6B`, `Qwen3-ForcedAligner-0.6B-4bit` |
 
 ### Chat

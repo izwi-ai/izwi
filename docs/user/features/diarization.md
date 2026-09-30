@@ -34,6 +34,13 @@ izwi pull Parakeet-TDT-0.6B-v3
 izwi pull Qwen3-ForcedAligner-0.6B
 ```
 
+For meetings with more than four speakers, `Nemotron-3-Diarization`
+resolves up to 8 speaker channels with the same streaming pipeline:
+
+```bash
+izwi pull Nemotron-3-Diarization
+```
+
 ### Start the Server
 
 ```bash
@@ -80,7 +87,7 @@ POST /v1/speech-to-text/jobs?job_kind=diarization
 | Field | Type | Description |
 |-------|------|-------------|
 | `file` | File | Audio file to analyze |
-| `model` | String | Diarization model (for example `diar_streaming_sortformer_4spk-v2.1`) |
+| `model` | String | Diarization model (`diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization`). The selected checkpoint bounds `max_speakers`: 4 for Sortformer v2.1, 8 for Nemotron-3 |
 | `asr_model` | String | Optional ASR model override |
 | `aligner_model` | String | Optional forced aligner model override |
 | `llm_model` | String | Optional transcript refinement model |

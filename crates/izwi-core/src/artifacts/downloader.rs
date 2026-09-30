@@ -2172,7 +2172,7 @@ impl ModelDownloader {
                 ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
                 ModelVariant::Nemotron35AsrStreaming06B => 2_370_000_000,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
-                ModelVariant::Nemotron3Diarization => 400_000_000,
+                ModelVariant::Nemotron3Diarization => 200_000_000,
                 _ => 4_000_000_000,
             }
         } else if file.contains("tokenizer") && file.contains("safetensors") {
