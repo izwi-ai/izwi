@@ -11,7 +11,7 @@ use crate::kv::v2::{
 };
 use crate::models::shared::state::typed_invocation_descriptor;
 
-use super::{SortformerStreamingConfig, MAX_SUPPORTED_SPEAKERS};
+use super::SortformerStreamingConfig;
 
 pub(crate) const SORTFORMER_STREAMING_STATE_DOMAIN: StateDomainId = StateDomainId::new(1);
 const SORTFORMER_STREAMING_STATE_GROUP: StateGroupId = StateGroupId::new(1);
@@ -62,7 +62,7 @@ fn sortformer_invocation_contract(
             rows(
                 cfg.spkcache_len,
                 ShapeAxis::Custom("speakers".into()),
-                MAX_SUPPORTED_SPEAKERS,
+                cfg.num_speakers,
             ),
         ),
         component(
@@ -93,7 +93,7 @@ fn sortformer_invocation_contract(
                 rows(
                     cfg.fifo_len,
                     ShapeAxis::Custom("speakers".into()),
-                    MAX_SUPPORTED_SPEAKERS,
+                    cfg.num_speakers,
                 ),
             ),
         );
@@ -160,6 +160,7 @@ mod tests {
             crate::catalog::ModelVariant::DiarStreamingSortformer4SpkV21,
             &super::super::SortformerModulesConfig::default(),
             512,
+            4,
         )
         .unwrap();
         assert_eq!(cfg.fifo_len, 0);

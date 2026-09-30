@@ -30,7 +30,6 @@ use nemo::{ensure_sortformer_artifacts, SortformerArtifacts};
 pub(crate) use physical::SortformerPhysicalStateSpec;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
-const MAX_SUPPORTED_SPEAKERS: usize = 4;
 const DEFAULT_MIN_SPEECH_MS: f32 = 240.0;
 const DEFAULT_MIN_SILENCE_MS: f32 = 200.0;
 const PREEMPH: f32 = 0.97;
@@ -178,6 +177,7 @@ enum SortformerStreamingProfile {
 #[derive(Debug, Clone, Copy)]
 struct SortformerStreamingConfig {
     fc_d_model: usize,
+    num_speakers: usize,
     subsampling_factor: usize,
     spkcache_len: usize,
     fifo_len: usize,
@@ -196,8 +196,9 @@ struct SortformerStreamingConfig {
 
 impl SortformerStreamingConfig {
     fn validate(self) -> Result<Self> {
-        let min_spkcache_len = (1 + self.spkcache_sil_frames_per_spk) * MAX_SUPPORTED_SPEAKERS;
-        if self.subsampling_factor == 0
+        let min_spkcache_len = (1 + self.spkcache_sil_frames_per_spk) * self.num_speakers;
+        if self.num_speakers == 0
+            || self.subsampling_factor == 0
             || self.fc_d_model == 0
             || self.chunk_len == 0
             || self.spkcache_update_period == 0
@@ -205,6 +206,12 @@ impl SortformerStreamingConfig {
             return Err(Error::ModelLoadError(
                 "Sortformer streaming config contains zero-valued required fields".to_string(),
             ));
+        }
+        if self.spkcache_len % self.num_speakers != 0 {
+            return Err(Error::ModelLoadError(format!(
+                "Sortformer spkcache_len {} is not divisible by {} speaker channels",
+                self.spkcache_len, self.num_speakers
+            )));
         }
         if self.spkcache_len < min_spkcache_len {
             return Err(Error::ModelLoadError(format!(
@@ -276,6 +283,7 @@ impl SortformerWorkspaceTopology {
 fn production_workspace_streaming_config() -> SortformerStreamingConfig {
     SortformerStreamingConfig {
         fc_d_model: PRODUCTION_CONFORMER_D_MODEL,
+        num_speakers: 4,
         subsampling_factor: TS_VAD_UNIT_FRAME_COUNT,
         spkcache_len: PRODUCTION_MAX_SPKCACHE_LEN,
         fifo_len: PRODUCTION_MAX_FIFO_LEN,
@@ -339,7 +347,7 @@ fn workspace_estimate_for(
     // copies used by the streaming state are host allocations.
     let fft_scratch_bytes = (u(topology.n_fft) * 2 + u(topology.n_fft / 2 + 1)) * f32_bytes;
     let streaming_row_bytes = u(composite_frames) * u(topology.conformer_d_model) * f32_bytes * 32;
-    let output_bytes = u(feature_frames) * u(MAX_SUPPORTED_SPEAKERS) * f32_bytes;
+    let output_bytes = u(feature_frames) * u(cfg.num_speakers) * f32_bytes;
     let staging_bytes = if separate_device_memory {
         feature_bytes
     } else {
@@ -397,9 +405,9 @@ struct SortformerStreamingChunkPlan {
 #[derive(Debug, Clone)]
 struct SortformerStreamingState {
     spkcache: Vec<Vec<f32>>,
-    spkcache_preds: Option<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>>,
+    spkcache_preds: Option<Vec<Vec<f32>>>,
     fifo: Vec<Vec<f32>>,
-    fifo_preds: Vec<[f32; MAX_SUPPORTED_SPEAKERS]>,
+    fifo_preds: Vec<Vec<f32>>,
     mean_sil_emb: Vec<f32>,
     n_sil_frames: usize,
 }
@@ -445,6 +453,7 @@ fn commit_sortformer_streaming_state(
     let speaker_predictions = padded_prediction_tensor(
         state.spkcache_preds.as_deref().unwrap_or_default(),
         cfg.spkcache_len,
+        cfg.num_speakers,
         device,
     )?;
     let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, device)?;
@@ -499,7 +508,7 @@ fn commit_sortformer_streaming_state(
                 },
                 ShapeDimensionValue {
                     axis: ShapeAxis::Custom("speakers".into()),
-                    units: MAX_SUPPORTED_SPEAKERS as u64,
+                    units: cfg.num_speakers as u64,
                 },
             ],
         },
@@ -521,7 +530,8 @@ fn commit_sortformer_streaming_state(
     if cfg.fifo_len > 0 {
         let fifo_embeddings =
             padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
-        let fifo_predictions = padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, device)?;
+        let fifo_predictions =
+            padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, cfg.num_speakers, device)?;
         components.insert(
             2,
             InvocationTensorComponentValue {
@@ -563,7 +573,7 @@ fn commit_sortformer_streaming_state(
                     },
                     ShapeDimensionValue {
                         axis: ShapeAxis::Custom("speakers".into()),
-                        units: MAX_SUPPORTED_SPEAKERS as u64,
+                        units: cfg.num_speakers as u64,
                     },
                 ],
             },
@@ -602,16 +612,22 @@ fn padded_embedding_tensor(
 }
 
 fn padded_prediction_tensor(
-    rows: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    rows: &[Vec<f32>],
     capacity: usize,
+    num_speakers: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    let mut flat = vec![0.0_f32; capacity.saturating_mul(MAX_SUPPORTED_SPEAKERS)];
+    let mut flat = vec![0.0_f32; capacity.saturating_mul(num_speakers)];
     for (index, row) in rows.iter().enumerate() {
-        flat[index * MAX_SUPPORTED_SPEAKERS..(index + 1) * MAX_SUPPORTED_SPEAKERS]
-            .copy_from_slice(row);
+        if row.len() != num_speakers {
+            return Err(Error::InferenceError(format!(
+                "Sortformer prediction row has width {}; expected {num_speakers}",
+                row.len()
+            )));
+        }
+        flat[index * num_speakers..(index + 1) * num_speakers].copy_from_slice(row);
     }
-    Tensor::from_vec(flat, (capacity, MAX_SUPPORTED_SPEAKERS), device).map_err(Error::from)
+    Tensor::from_vec(flat, (capacity, num_speakers), device).map_err(Error::from)
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +638,18 @@ struct SortformerCacheCandidate {
 }
 
 const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
+
+/// Speaker-channel count pinned by each served Sortformer checkpoint.
+/// The checkpoint YAML must agree or the load fails closed.
+fn expected_speaker_count(variant: ModelVariant) -> Result<usize> {
+    match variant {
+        ModelVariant::DiarStreamingSortformer4SpkV21 => Ok(4),
+        _ => Err(Error::ModelLoadError(format!(
+            "Unsupported Sortformer diarization variant: {}",
+            variant.dir_name()
+        ))),
+    }
+}
 
 pub struct SortformerDiarizerModel {
     variant: ModelVariant,
@@ -690,10 +718,12 @@ impl SortformerDiarizerModel {
             )));
         }
 
-        let num_spks = config.max_num_of_spks.unwrap_or(MAX_SUPPORTED_SPEAKERS);
-        if num_spks != MAX_SUPPORTED_SPEAKERS {
+        let expected_spks = expected_speaker_count(variant)?;
+        let num_spks = config.max_num_of_spks.unwrap_or(expected_spks);
+        if num_spks != expected_spks {
             return Err(Error::ModelLoadError(format!(
-                "Unsupported Sortformer speaker count {num_spks}; expected {MAX_SUPPORTED_SPEAKERS}"
+                "Unsupported Sortformer speaker count {num_spks}; {} expects {expected_spks}",
+                variant.dir_name()
             )));
         }
 
@@ -726,6 +756,7 @@ impl SortformerDiarizerModel {
             &vb,
             preprocessor_cfg,
             variant,
+            num_spks,
             streaming_mode,
             config.encoder.clone(),
             modules_cfg.clone(),
@@ -885,16 +916,17 @@ impl SortformerDiarizerModel {
             min_silence_ms,
         );
 
+        let num_speakers = self.model.num_speakers;
         for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
             if !active {
-                for spk in 0..MAX_SUPPORTED_SPEAKERS {
+                for spk in 0..num_speakers {
                     gated_probs[frame_idx][spk] = 0.0;
                 }
             }
         }
 
-        let requested_max = config.max_speakers.unwrap_or(MAX_SUPPORTED_SPEAKERS);
-        let max_speakers = requested_max.clamp(1, MAX_SUPPORTED_SPEAKERS);
+        let requested_max = config.max_speakers.unwrap_or(num_speakers);
+        let max_speakers = requested_max.clamp(1, num_speakers);
         let requested_min = config.min_speakers.unwrap_or(1);
         let min_speakers = requested_min.clamp(1, max_speakers);
         let limit_speaker_channels = should_limit_speaker_channels(config);
@@ -904,7 +936,7 @@ impl SortformerDiarizerModel {
 
         let mut raw_segments = Vec::<RawSegment>::new();
         let mut speaker_stats = Vec::<SpeakerActivityStats>::new();
-        for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
+        for speaker_idx in 0..num_speakers {
             let speaker_segments =
                 ts_vad_post_processing(&gated_probs, speaker_idx, &postprocessing_params);
             if speaker_segments.is_empty() {
@@ -977,7 +1009,7 @@ impl SortformerDiarizerModel {
 
         if limit_speaker_channels {
             let selected_speakers =
-                select_speaker_channels(&speaker_stats, min_speakers, max_speakers);
+                select_speaker_channels(&speaker_stats, min_speakers, max_speakers, num_speakers);
             raw_segments.retain(|segment| selected_speakers.contains(&segment.speaker_idx));
         }
 
@@ -1110,6 +1142,7 @@ struct SortformerInferenceModel {
     encoder_proj: Linear,
     transformer: SortformerTransformerEncoder,
     head: SortformerSpeakerHead,
+    num_speakers: usize,
     streaming: Option<SortformerStreamingConfig>,
 }
 
@@ -1118,6 +1151,7 @@ impl SortformerInferenceModel {
         vb: &VarBuilder,
         preprocessor_cfg: SortformerPreprocessorConfig,
         variant: ModelVariant,
+        num_spks: usize,
         streaming_mode: bool,
         encoder_cfg: Option<SortformerEncoderConfig>,
         modules_cfg: SortformerModulesConfig,
@@ -1143,8 +1177,9 @@ impl SortformerInferenceModel {
             mlx::load_linear(proj_in, proj_out, vb.pp("sortformer_modules.encoder_proj"))?;
 
         let transformer = SortformerTransformerEncoder::load(vb.pp("transformer_encoder"))?;
-        let head = SortformerSpeakerHead::load(vb.pp("sortformer_modules"))?;
-        let streaming = resolve_streaming_config(variant, &modules_cfg, encoder.d_model())?;
+        let head = SortformerSpeakerHead::load(vb.pp("sortformer_modules"), num_spks)?;
+        let streaming =
+            resolve_streaming_config(variant, &modules_cfg, encoder.d_model(), num_spks)?;
 
         let model = Self {
             device,
@@ -1154,6 +1189,7 @@ impl SortformerInferenceModel {
             encoder_proj,
             transformer,
             head,
+            num_speakers: num_spks,
             streaming: Some(streaming),
         };
         model.validate_production_topology(proj_in, proj_out)?;
@@ -1252,7 +1288,7 @@ impl SortformerInferenceModel {
     fn infer_speaker_probabilities(
         &self,
         samples: &[f32],
-    ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
+    ) -> Result<(Vec<Vec<f32>>, usize)> {
         let feature_frames = self.preprocessor.feature_frame_count(samples.len());
         if feature_frames == 0 {
             return Ok((Vec::new(), self.encoder.frame_stride_samples()));
@@ -1276,7 +1312,7 @@ impl SortformerInferenceModel {
         &self,
         samples: &[f32],
         state: &mut InvocationTensorLease,
-    ) -> Result<(Vec<[f32; MAX_SUPPORTED_SPEAKERS]>, usize)> {
+    ) -> Result<(Vec<Vec<f32>>, usize)> {
         let feature_frames = self.preprocessor.feature_frame_count(samples.len());
         if feature_frames == 0 {
             return Ok((Vec::new(), self.encoder.frame_stride_samples()));
@@ -1304,13 +1340,13 @@ impl SortformerInferenceModel {
         &self,
         features: &Tensor,
         feature_frames: usize,
-    ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
+    ) -> Result<Vec<Vec<f32>>> {
         let (encoded, encoded_len) = self.encoder.forward(features, feature_frames)?;
         if encoded_len == 0 {
             return Ok(Vec::new());
         }
         let probs = self.forward_probabilities(&encoded, encoded_len)?;
-        tensor_to_probability_rows(&probs, encoded_len)
+        tensor_to_probability_rows(&probs, encoded_len, self.num_speakers)
     }
 
     fn infer_speaker_probabilities_streaming(
@@ -1319,7 +1355,7 @@ impl SortformerInferenceModel {
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
         mut physical_state: Option<&mut InvocationTensorLease>,
-    ) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
+    ) -> Result<Vec<Vec<f32>>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         let mut total_preds = Vec::new();
         for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
@@ -1355,7 +1391,8 @@ impl SortformerInferenceModel {
                 state.spkcache.len() + state.fifo.len() + chunk_rows.len(),
             )?;
             let probs = self.forward_probabilities(&encoded, encoded_len)?;
-            let pred_rows = tensor_to_probability_rows(&probs, encoded_len)?;
+            let pred_rows =
+                tensor_to_probability_rows(&probs, encoded_len, self.num_speakers)?;
             let (updated_state, chunk_preds) = update_streaming_state(
                 state,
                 &chunk_rows,
@@ -1382,10 +1419,10 @@ impl SortformerInferenceModel {
         x = self.transformer.forward(&x)?;
         let probs = self.head.forward(&x)?;
         let (_, _, speaker_dim) = probs.dims3()?;
-        if speaker_dim != MAX_SUPPORTED_SPEAKERS {
+        if speaker_dim != self.num_speakers {
             return Err(Error::InferenceError(format!(
                 "Unexpected Sortformer speaker dimension {}; expected {}",
-                speaker_dim, MAX_SUPPORTED_SPEAKERS
+                speaker_dim, self.num_speakers
             )));
         }
         Ok(probs)
@@ -1396,9 +1433,11 @@ fn resolve_streaming_config(
     variant: ModelVariant,
     modules_cfg: &SortformerModulesConfig,
     encoder_d_model: usize,
+    num_spks: usize,
 ) -> Result<SortformerStreamingConfig> {
     let mut cfg = SortformerStreamingConfig {
         fc_d_model: modules_cfg.fc_d_model.unwrap_or(encoder_d_model),
+        num_speakers: num_spks,
         subsampling_factor: modules_cfg
             .subsampling_factor
             .unwrap_or(TS_VAD_UNIT_FRAME_COUNT),
@@ -1516,27 +1555,25 @@ fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec
 fn tensor_to_probability_rows(
     tensor: &Tensor,
     row_count: usize,
-) -> Result<Vec<[f32; MAX_SUPPORTED_SPEAKERS]>> {
+    num_speakers: usize,
+) -> Result<Vec<Vec<f32>>> {
     if row_count == 0 {
         return Ok(Vec::new());
     }
 
     let view = tensor.i((0, ..row_count, ..))?;
     let (_, speaker_dim) = view.dims2()?;
-    if speaker_dim != MAX_SUPPORTED_SPEAKERS {
+    if speaker_dim != num_speakers {
         return Err(Error::InferenceError(format!(
             "Unexpected Sortformer probability tensor width {}; expected {}",
-            speaker_dim, MAX_SUPPORTED_SPEAKERS
+            speaker_dim, num_speakers
         )));
     }
-    crate::models::shared::telemetry::record_host_read(
-        DType::F32,
-        row_count * MAX_SUPPORTED_SPEAKERS,
-    );
+    crate::models::shared::telemetry::record_host_read(DType::F32, row_count * num_speakers);
     let values = view.flatten_all()?.to_vec1::<f32>()?;
     Ok(values
-        .chunks(MAX_SUPPORTED_SPEAKERS)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+        .chunks(num_speakers)
+        .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>())
 }
 
@@ -1565,11 +1602,11 @@ fn tensor_from_embedding_rows(
 fn update_streaming_state(
     mut state: SortformerStreamingState,
     chunk_rows: &[Vec<f32>],
-    preds: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    preds: &[Vec<f32>],
     lc: usize,
     rc: usize,
     cfg: SortformerStreamingConfig,
-) -> Result<(SortformerStreamingState, Vec<[f32; MAX_SUPPORTED_SPEAKERS]>)> {
+) -> Result<(SortformerStreamingState, Vec<Vec<f32>>)> {
     let spkcache_len = state.spkcache.len();
     let fifo_len = state.fifo.len();
     if preds.len() < spkcache_len + fifo_len + chunk_rows.len() {
@@ -1638,7 +1675,7 @@ fn update_streaming_state(
 fn update_silence_profile(
     state: &mut SortformerStreamingState,
     emb_seq: &[Vec<f32>],
-    preds: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    preds: &[Vec<f32>],
     sil_threshold: f32,
 ) {
     for (emb, pred) in emb_seq.iter().zip(preds.iter()) {
@@ -1660,10 +1697,10 @@ fn update_silence_profile(
 
 fn compress_spkcache(
     emb_seq: &[Vec<f32>],
-    preds: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    preds: &[Vec<f32>],
     mean_sil_emb: &[f32],
     cfg: SortformerStreamingConfig,
-) -> Result<(Vec<Vec<f32>>, Vec<[f32; MAX_SUPPORTED_SPEAKERS]>)> {
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     if emb_seq.len() != preds.len() {
         return Err(Error::InferenceError(format!(
             "Sortformer speaker cache compression length mismatch: {} embeddings vs {} prediction rows",
@@ -1673,15 +1710,15 @@ fn compress_spkcache(
     }
 
     let spkcache_len_per_spk =
-        cfg.spkcache_len / MAX_SUPPORTED_SPEAKERS - cfg.spkcache_sil_frames_per_spk;
+        cfg.spkcache_len / cfg.num_speakers - cfg.spkcache_sil_frames_per_spk;
     let strong_boost_per_spk =
         ((spkcache_len_per_spk as f32) * cfg.strong_boost_rate).floor() as usize;
     let weak_boost_per_spk = ((spkcache_len_per_spk as f32) * cfg.weak_boost_rate).floor() as usize;
     let min_pos_scores_per_spk =
         ((spkcache_len_per_spk as f32) * cfg.min_pos_scores_rate).floor() as usize;
 
-    let mut scores = get_log_pred_scores(preds, cfg.pred_score_threshold);
-    disable_low_scores(preds, &mut scores, min_pos_scores_per_spk);
+    let mut scores = get_log_pred_scores(preds, cfg.num_speakers, cfg.pred_score_threshold);
+    disable_low_scores(preds, &mut scores, min_pos_scores_per_spk, cfg.num_speakers);
 
     if cfg.scores_boost_latest > 0.0 && emb_seq.len() > cfg.spkcache_len {
         for row in scores.iter_mut().skip(cfg.spkcache_len) {
@@ -1691,12 +1728,12 @@ fn compress_spkcache(
         }
     }
 
-    boost_topk_scores(&mut scores, strong_boost_per_spk, 2.0);
-    boost_topk_scores(&mut scores, weak_boost_per_spk, 1.0);
+    boost_topk_scores(&mut scores, strong_boost_per_spk, 2.0, cfg.num_speakers);
+    boost_topk_scores(&mut scores, weak_boost_per_spk, 1.0, cfg.num_speakers);
 
     let speaker_frame_span = emb_seq.len() + cfg.spkcache_sil_frames_per_spk;
-    let mut candidates = Vec::with_capacity(speaker_frame_span * MAX_SUPPORTED_SPEAKERS);
-    for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
+    let mut candidates = Vec::with_capacity(speaker_frame_span * cfg.num_speakers);
+    for speaker_idx in 0..cfg.num_speakers {
         let base = speaker_idx * speaker_frame_span;
         for (frame_idx, frame_scores) in scores.iter().enumerate() {
             candidates.push(SortformerCacheCandidate {
@@ -1731,14 +1768,14 @@ fn compress_spkcache(
         if candidate.score.is_finite() {
             if let Some(frame_idx) = candidate.frame_index {
                 spkcache.push(emb_seq[frame_idx].clone());
-                spkcache_preds.push(preds[frame_idx]);
+                spkcache_preds.push(preds[frame_idx].clone());
             } else {
                 spkcache.push(mean_sil_emb.to_vec());
-                spkcache_preds.push([0.0; MAX_SUPPORTED_SPEAKERS]);
+                spkcache_preds.push(vec![0.0; cfg.num_speakers]);
             }
         } else {
             spkcache.push(mean_sil_emb.to_vec());
-            spkcache_preds.push([0.0; MAX_SUPPORTED_SPEAKERS]);
+            spkcache_preds.push(vec![0.0; cfg.num_speakers]);
         }
     }
 
@@ -1746,34 +1783,36 @@ fn compress_spkcache(
 }
 
 fn get_log_pred_scores(
-    preds: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    preds: &[Vec<f32>],
+    num_speakers: usize,
     pred_score_threshold: f32,
-) -> Vec<[f32; MAX_SUPPORTED_SPEAKERS]> {
+) -> Vec<Vec<f32>> {
     preds
         .iter()
         .map(|frame| {
-            let log_one_minus =
-                frame.map(|prob| (1.0 - prob).clamp(pred_score_threshold, 1.0).ln());
+            let log_one_minus = (0..num_speakers)
+                .map(|speaker_idx| (1.0 - frame[speaker_idx]).clamp(pred_score_threshold, 1.0).ln())
+                .collect::<Vec<f32>>();
             let log_one_minus_sum = log_one_minus.iter().copied().sum::<f32>();
-            let mut scores = [0.0; MAX_SUPPORTED_SPEAKERS];
-            for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
-                let log_prob = frame[speaker_idx].clamp(pred_score_threshold, 1.0).ln();
-                scores[speaker_idx] =
-                    log_prob - log_one_minus[speaker_idx] + log_one_minus_sum - 0.5f32.ln();
-            }
-            scores
+            (0..num_speakers)
+                .map(|speaker_idx| {
+                    let log_prob = frame[speaker_idx].clamp(pred_score_threshold, 1.0).ln();
+                    log_prob - log_one_minus[speaker_idx] + log_one_minus_sum - 0.5f32.ln()
+                })
+                .collect::<Vec<f32>>()
         })
         .collect()
 }
 
 fn disable_low_scores(
-    preds: &[[f32; MAX_SUPPORTED_SPEAKERS]],
-    scores: &mut [[f32; MAX_SUPPORTED_SPEAKERS]],
+    preds: &[Vec<f32>],
+    scores: &mut [Vec<f32>],
     min_pos_scores_per_spk: usize,
+    num_speakers: usize,
 ) {
-    let mut positive_counts = [0usize; MAX_SUPPORTED_SPEAKERS];
+    let mut positive_counts = vec![0usize; num_speakers];
     for (pred_row, score_row) in preds.iter().zip(scores.iter_mut()) {
-        for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
+        for speaker_idx in 0..num_speakers {
             if pred_row[speaker_idx] <= 0.5 {
                 score_row[speaker_idx] = f32::NEG_INFINITY;
             } else if score_row[speaker_idx] > 0.0 {
@@ -1783,7 +1822,7 @@ fn disable_low_scores(
     }
 
     for (pred_row, score_row) in preds.iter().zip(scores.iter_mut()) {
-        for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
+        for speaker_idx in 0..num_speakers {
             if pred_row[speaker_idx] > 0.5
                 && score_row[speaker_idx].is_finite()
                 && score_row[speaker_idx] <= 0.0
@@ -1796,15 +1835,16 @@ fn disable_low_scores(
 }
 
 fn boost_topk_scores(
-    scores: &mut [[f32; MAX_SUPPORTED_SPEAKERS]],
+    scores: &mut [Vec<f32>],
     n_boost_per_spk: usize,
     scale_factor: f32,
+    num_speakers: usize,
 ) {
     if n_boost_per_spk == 0 {
         return;
     }
 
-    for speaker_idx in 0..MAX_SUPPORTED_SPEAKERS {
+    for speaker_idx in 0..num_speakers {
         let mut ranked = scores
             .iter()
             .enumerate()
@@ -2670,7 +2710,7 @@ struct SortformerSpeakerHead {
 }
 
 impl SortformerSpeakerHead {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, num_speakers: usize) -> Result<Self> {
         let first_w = vb
             .pp("first_hidden_to_hidden")
             .get_unchecked_dtype("weight", DType::F32)?;
@@ -2685,9 +2725,9 @@ impl SortformerSpeakerHead {
             .pp("single_hidden_to_spks")
             .get_unchecked_dtype("weight", DType::F32)?;
         let (spk_out, spk_in) = second_w.dims2()?;
-        if spk_out != MAX_SUPPORTED_SPEAKERS {
+        if spk_out != num_speakers {
             return Err(Error::ModelLoadError(format!(
-                "Unexpected Sortformer speaker head output dim {spk_out}; expected {MAX_SUPPORTED_SPEAKERS}"
+                "Unexpected Sortformer speaker head output dim {spk_out}; expected {num_speakers}"
             )));
         }
         if spk_in != first_out {
@@ -2814,8 +2854,9 @@ fn select_speaker_channels(
     stats: &[SpeakerActivityStats],
     min_speakers: usize,
     max_speakers: usize,
+    channel_count: usize,
 ) -> Vec<usize> {
-    let keep = max_speakers.clamp(min_speakers, MAX_SUPPORTED_SPEAKERS);
+    let keep = max_speakers.clamp(min_speakers, channel_count);
     let mut ranked = stats.to_vec();
     ranked.sort_by(|a, b| {
         b.total_duration_secs
@@ -2844,7 +2885,7 @@ fn select_speaker_channels(
 }
 
 fn ts_vad_post_processing(
-    probs: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    probs: &[Vec<f32>],
     speaker_idx: usize,
     params: &PostProcessingParams,
 ) -> Vec<(f32, f32)> {
@@ -3005,7 +3046,7 @@ fn sort_ranges(segments: &[(f32, f32)]) -> Vec<(f32, f32)> {
 }
 
 fn average_speaker_probability_for_range(
-    probs: &[[f32; MAX_SUPPORTED_SPEAKERS]],
+    probs: &[Vec<f32>],
     speaker_idx: usize,
     start_secs: f32,
     end_secs: f32,
@@ -3367,6 +3408,7 @@ mod tests {
     fn streaming_cfg_for_test() -> SortformerStreamingConfig {
         SortformerStreamingConfig {
             fc_d_model: 2,
+            num_speakers: 4,
             subsampling_factor: 8,
             spkcache_len: 4,
             fifo_len: 2,
@@ -3503,7 +3545,7 @@ mod tests {
             },
         ];
 
-        let selected = select_speaker_channels(&stats, 1, 2);
+        let selected = select_speaker_channels(&stats, 1, 2, 4);
         assert_eq!(selected, vec![0, 2]);
     }
 
@@ -3536,7 +3578,7 @@ mod tests {
             },
         ];
 
-        let selected = select_speaker_channels(&stats, 2, 2);
+        let selected = select_speaker_channels(&stats, 2, 2, 4);
         assert_eq!(selected, vec![1, 2]);
     }
 
@@ -3569,7 +3611,7 @@ mod tests {
             },
         ];
 
-        let selected = select_speaker_channels(&stats, 1, 4);
+        let selected = select_speaker_channels(&stats, 1, 4, 4);
         assert_eq!(selected, vec![0, 1, 2, 3]);
     }
 
@@ -3579,6 +3621,7 @@ mod tests {
             ModelVariant::DiarStreamingSortformer4SpkV21,
             &SortformerModulesConfig::default(),
             512,
+            4,
         )
         .unwrap();
 
@@ -3599,6 +3642,7 @@ mod tests {
             ModelVariant::DiarStreamingSortformer4SpkV21,
             &SortformerModulesConfig::default(),
             512,
+            4,
         )
         .unwrap();
 
@@ -3676,7 +3720,10 @@ mod tests {
         let cfg = streaming_cfg_for_test();
         let state = SortformerStreamingState::new(2);
         let first_chunk = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
-        let first_preds = vec![[0.9, 0.0, 0.0, 0.0], [0.8, 0.0, 0.0, 0.0]];
+        let first_preds = vec![
+            vec![0.9, 0.0, 0.0, 0.0],
+            vec![0.8, 0.0, 0.0, 0.0],
+        ];
         let (state, first_chunk_preds) =
             update_streaming_state(state, &first_chunk, &first_preds, 0, 0, cfg).unwrap();
         assert_eq!(first_chunk_preds, first_preds);
@@ -3685,10 +3732,10 @@ mod tests {
 
         let second_chunk = vec![vec![3.0, 3.0], vec![4.0, 4.0]];
         let second_preds = vec![
-            [0.9, 0.0, 0.0, 0.0],
-            [0.8, 0.0, 0.0, 0.0],
-            [0.0, 0.9, 0.0, 0.0],
-            [0.0, 0.8, 0.0, 0.0],
+            vec![0.9, 0.0, 0.0, 0.0],
+            vec![0.8, 0.0, 0.0, 0.0],
+            vec![0.0, 0.9, 0.0, 0.0],
+            vec![0.0, 0.8, 0.0, 0.0],
         ];
         let (state, second_chunk_preds) =
             update_streaming_state(state, &second_chunk, &second_preds, 0, 0, cfg).unwrap();
@@ -3698,7 +3745,7 @@ mod tests {
         assert!(state.spkcache_preds.is_none());
         assert_eq!(
             second_chunk_preds,
-            vec![[0.0, 0.9, 0.0, 0.0], [0.0, 0.8, 0.0, 0.0]]
+            vec![vec![0.0, 0.9, 0.0, 0.0], vec![0.0, 0.8, 0.0, 0.0]]
         );
     }
 
