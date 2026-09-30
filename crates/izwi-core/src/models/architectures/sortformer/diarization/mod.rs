@@ -875,6 +875,7 @@ const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
 fn expected_speaker_count(variant: ModelVariant) -> Result<usize> {
     match variant {
         ModelVariant::DiarStreamingSortformer4SpkV21 => Ok(4),
+        ModelVariant::Nemotron3Diarization => Ok(8),
         _ => Err(Error::ModelLoadError(format!(
             "Unsupported Sortformer diarization variant: {}",
             variant.dir_name()
@@ -4543,6 +4544,52 @@ mod tests {
         assert_eq!(cfg.fifo_len, 40);
         assert_eq!(cfg.spkcache_update_period, 300);
         assert_eq!(cfg.spkcache_len, 188);
+    }
+
+    #[test]
+    fn resolve_streaming_config_nemotron3_uses_checkpoint_values_and_rejects_overrides() {
+        let modules_cfg = SortformerModulesConfig {
+            fc_d_model: Some(512),
+            subsampling_factor: Some(8),
+            spkcache_len: Some(264),
+            fifo_len: Some(0),
+            chunk_len: Some(264),
+            spkcache_update_period: Some(264),
+            ..SortformerModulesConfig::default()
+        };
+        let cfg = resolve_streaming_config(
+            ModelVariant::Nemotron3Diarization,
+            &modules_cfg,
+            512,
+            8,
+            SortformerEncoderKind::FeatureStackingRope,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.fc_d_model, 512);
+        assert_eq!(cfg.num_speakers, 8);
+        assert_eq!(cfg.output_frames_per_encoded_frame, 8);
+        assert_eq!(cfg.chunk_len, 264);
+        assert_eq!(cfg.spkcache_len, 264);
+        assert_eq!(cfg.spkcache_update_period, 264);
+        assert_eq!(cfg.fifo_len, 0);
+
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, "high");
+        let overridden = resolve_streaming_config(
+            ModelVariant::Nemotron3Diarization,
+            &modules_cfg,
+            512,
+            8,
+            SortformerEncoderKind::FeatureStackingRope,
+        );
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        assert!(overridden.is_err());
     }
 
     #[test]

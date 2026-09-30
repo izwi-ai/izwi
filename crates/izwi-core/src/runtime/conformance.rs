@@ -8,8 +8,8 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
 
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 53;
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 77;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 54;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 78;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConformanceCapability {
@@ -615,7 +615,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            18
+            19
         );
 
         assert_eq!(

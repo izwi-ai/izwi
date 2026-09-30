@@ -468,6 +468,15 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Diarization", "Up to 4 speakers", "Streaming"],
     size: "0.5 GB",
   },
+  "Nemotron-3-Diarization": {
+    shortName: "Nemotron 3 Diarization",
+    fullName: "NVIDIA Nemotron 3 Diarization",
+    description:
+      "8-speaker streaming Sortformer-family diarization model from NVIDIA in .nemo format",
+    category: "asr",
+    capabilities: ["Diarization", "Up to 8 speakers", "Streaming"],
+    size: "0.4 GB",
+  },
   // Voxtral
   "Voxtral-Mini-4B-Realtime-2602": {
     shortName: "Voxtral 4B",

@@ -42,6 +42,17 @@ export const DIARIZATION_PREFERRED_MODELS = [
   "diar_streaming_sortformer_4spk-v2.1",
 ] as const;
 
+/**
+ * Highest speaker count a diarization checkpoint can resolve: v2.1 exposes
+ * four channels, Nemotron-3-Diarization eight (its head is fixed at 8 and
+ * extra channels emit near-zero probabilities when fewer speakers talk).
+ */
+export function diarizationSpeakerUpperBound(
+  variant: string | null | undefined,
+): number {
+  return variant === "Nemotron-3-Diarization" ? 8 : 4;
+}
+
 export const SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS = [
   "Granite-Speech-4.1-2B-Plus",
 ] as const;

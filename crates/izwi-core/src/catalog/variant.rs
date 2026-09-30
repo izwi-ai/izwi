@@ -118,7 +118,9 @@ impl ModelVariant {
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
             GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
-            DiarStreamingSortformer4SpkV21 => ModelFamily::SortformerDiarization,
+            DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
+                ModelFamily::SortformerDiarization
+            }
             Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
             | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
             Qwen3Moe30bA3bGguf => ModelFamily::Qwen3MoeChat,
@@ -305,6 +307,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if normalized.contains("nemotron") && normalized.contains("asr") {
         return Some(Nemotron35AsrStreaming06B);
+    }
+
+    if normalized.contains("nemotron") && normalized.contains("diar") {
+        return Some(Nemotron3Diarization);
     }
 
     if let Some(granite_speech) = resolve_granite_speech_variant(normalized) {
@@ -1040,8 +1046,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_diarization_defaults_to_sortformer() {
+    fn parse_nemotron3_diarization_by_all_identifier_forms() {
+        for raw in [
+            "Nemotron-3-Diarization",
+            "nvidia/Nemotron-3-Diarization",
+            "nemotron-3-diarization",
+            "nemotron3-diarization",
+            "Nemotron 3 Diarization",
+        ] {
+            let parsed = parse_model_variant(raw).unwrap();
+            assert_eq!(parsed, ModelVariant::Nemotron3Diarization, "input: {raw}");
+        }
+        // The fuzzy heuristic resolves free-form mentions.
+        let heuristic = parse_model_variant("the new nemotron diarization model").unwrap();
+        assert_eq!(heuristic, ModelVariant::Nemotron3Diarization);
+    }
+
+    #[test]
+    fn resolve_diarization_selects_nemotron3_by_name_but_keeps_v21_default() {
+        let resolved = resolve_diarization_model_variant(Some("Nemotron-3-Diarization"));
+        assert_eq!(resolved, ModelVariant::Nemotron3Diarization);
         let resolved = resolve_diarization_model_variant(Some("unknown-model"));
+        assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
+        let resolved = resolve_diarization_model_variant(None);
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
     }
 }

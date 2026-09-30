@@ -152,6 +152,15 @@ pub enum ModelVariant {
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
+    /// NVIDIA Nemotron 3 8-speaker Sortformer-family diarization model (.nemo)
+    #[serde(
+        rename = "Nemotron-3-Diarization",
+        alias = "nvidia/nemotron-3-diarization",
+        alias = "nemotron-3-diarization",
+        alias = "nemotron3-diarization",
+        alias = "Nemotron 3 Diarization"
+    )]
+    Nemotron3Diarization,
     /// Qwen3 0.6B text model
     #[serde(rename = "Qwen3-0.6B")]
     Qwen306B,
@@ -384,6 +393,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "nvidia/nemotron-3.5-asr-streaming-0.6b",
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
+            Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
             Self::Qwen306B4Bit => "mlx-community/Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen/Qwen3-1.7B",
@@ -443,6 +453,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron 3.5 ASR Streaming 0.6B",
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
+            Self::Nemotron3Diarization => "Nemotron 3 Diarization",
             Self::Qwen306B => "Qwen3 0.6B",
             Self::Qwen306B4Bit => "Qwen3 0.6B 4-bit",
             Self::Qwen317B => "Qwen3 1.7B",
@@ -502,6 +513,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron-3.5-ASR-Streaming-0.6B",
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
+            Self::Nemotron3Diarization => "Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen3-0.6B",
             Self::Qwen306B4Bit => "Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen3-1.7B",
@@ -561,6 +573,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
+            Self::Nemotron3Diarization => 400_000_000,          // ~0.4 GB .nemo (est)
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
             Self::Qwen317B => 4_080_000_000,            // ~3.80 GB (actual: 3.44GB + 622MB shards)
@@ -619,6 +632,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 6.0,
             Self::GraniteSpeech412BPlus => 10.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
+            Self::Nemotron3Diarization => 2.0,
             Self::Qwen306B => 3.0,
             Self::Qwen306B4Bit => 2.0,
             Self::Qwen317B => 5.0,
@@ -738,7 +752,7 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
-            Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
+            Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
             Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 | Self::Qwen35Moe35BA3BFp8 => {
                 Some("Apache-2.0")
             }
@@ -1093,6 +1107,7 @@ impl ModelVariant {
             Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
+            Self::Nemotron3Diarization => false,
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
             _ => !self.is_quantized(),
@@ -1131,6 +1146,7 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B,
             Self::GraniteSpeech412BPlus,
             Self::DiarStreamingSortformer4SpkV21,
+            Self::Nemotron3Diarization,
             Self::Qwen306B,
             Self::Qwen306B4Bit,
             Self::Qwen306BGguf,

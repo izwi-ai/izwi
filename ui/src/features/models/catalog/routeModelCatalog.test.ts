@@ -8,6 +8,7 @@ import {
   SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   VOICE_CLONING_PREFERRED_MODELS,
+  diarizationSpeakerUpperBound,
   getChatRouteModelLabel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
@@ -88,6 +89,20 @@ describe("route model catalog", () => {
     });
 
     expect(selected).toBe("diar_streaming_sortformer_4spk-v2.1");
+  });
+
+  it("bounds the speaker draft by the selected checkpoint's channel count", () => {
+    expect(diarizationSpeakerUpperBound("diar_streaming_sortformer_4spk-v2.1")).toBe(4);
+    expect(diarizationSpeakerUpperBound("Nemotron-3-Diarization")).toBe(8);
+    expect(diarizationSpeakerUpperBound(null)).toBe(4);
+    expect(diarizationSpeakerUpperBound(undefined)).toBe(4);
+    // The Nemotron-3 metadata row carries the 8-speaker capability pin.
+    expect(MODEL_DETAILS["Nemotron-3-Diarization"].capabilities).toContain(
+      "Up to 8 speakers",
+    );
+    expect(MODEL_DETAILS["Nemotron-3-Diarization"] && getModelProviderLabel("Nemotron-3-Diarization")).toBe(
+      "NVIDIA",
+    );
   });
 
   it("falls back to the ready diarization summary model when it is available", () => {

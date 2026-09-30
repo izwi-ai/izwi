@@ -28,6 +28,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
+import { diarizationSpeakerUpperBound } from "@/features/models/catalog/routeModelCatalog";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
@@ -248,8 +249,14 @@ export function NewDiarizationModal({
   }, [isGranitePipeline, pipelineModelsReady, selectedModelReady]);
 
   const normalizeSettings = useCallback(() => {
-    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, 4);
-    const nextMaxSpeakers = clampIntegerDraft(maxSpeakers, 4, 1, 4);
+    const speakerUpperBound = diarizationSpeakerUpperBound(selectedModel);
+    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, speakerUpperBound);
+    const nextMaxSpeakers = clampIntegerDraft(
+      maxSpeakers,
+      speakerUpperBound,
+      1,
+      speakerUpperBound,
+    );
     const nextMinSpeechMs = clampIntegerDraft(minSpeechMs, 240, 40, 5000);
     const nextMinSilenceMs = clampIntegerDraft(minSilenceMs, 200, 40, 5000);
 
@@ -268,7 +275,7 @@ export function NewDiarizationModal({
       minSpeechMs: nextMinSpeechMs,
       minSilenceMs: nextMinSilenceMs,
     };
-  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs]);
+  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs, selectedModel]);
 
   const submitAudio = useCallback(
     async (audioBlob: Blob, options: SubmitAudioOptions = {}) => {

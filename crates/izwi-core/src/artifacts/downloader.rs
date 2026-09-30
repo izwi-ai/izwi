@@ -878,9 +878,16 @@ impl ModelDownloader {
             ModelFamily::GraniteSpeechAsr => GRANITE_SPEECH_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
-            ModelFamily::SortformerDiarization => path
-                .join("diar_streaming_sortformer_4spk-v2.1.nemo")
-                .exists(),
+            ModelFamily::SortformerDiarization => {
+                let nemo_file = match variant {
+                    ModelVariant::DiarStreamingSortformer4SpkV21 => {
+                        "diar_streaming_sortformer_4spk-v2.1.nemo"
+                    }
+                    ModelVariant::Nemotron3Diarization => "Nemotron-3-Diarization.nemo",
+                    _ => unreachable!("checked by family"),
+                };
+                path.join(nemo_file).exists()
+            }
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
@@ -1488,13 +1495,18 @@ impl ModelDownloader {
                 vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
             }
             ModelFamily::GraniteSpeechAsr => granite_speech_files(),
-            ModelFamily::SortformerDiarization => vec![
-                "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
-                "README.md".to_string(),
-                "bias.md".to_string(),
-                "privacy.md".to_string(),
-                "safety.md".to_string(),
-            ],
+            ModelFamily::SortformerDiarization => match variant {
+                ModelVariant::Nemotron3Diarization => {
+                    vec!["Nemotron-3-Diarization.nemo".to_string()]
+                }
+                _ => vec![
+                    "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
+                    "README.md".to_string(),
+                    "bias.md".to_string(),
+                    "privacy.md".to_string(),
+                    "safety.md".to_string(),
+                ],
+            },
             ModelFamily::Qwen3Chat
             | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
@@ -2160,6 +2172,7 @@ impl ModelDownloader {
                 ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
                 ModelVariant::Nemotron35AsrStreaming06B => 2_370_000_000,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
+                ModelVariant::Nemotron3Diarization => 400_000_000,
                 _ => 4_000_000_000,
             }
         } else if file.contains("tokenizer") && file.contains("safetensors") {
@@ -2473,6 +2486,27 @@ mod tests {
             files,
             vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron3_diarization_model_files_only_include_nemo_checkpoint() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Nemotron3Diarization);
+        assert_eq!(files, vec!["Nemotron-3-Diarization.nemo".to_string()]);
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron3_diarization_is_downloaded_when_nemo_checkpoint_exists() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Nemotron3Diarization;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(model_dir.join("Nemotron-3-Diarization.nemo"), [0u8])
+            .expect("nemo");
+        assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

@@ -29,6 +29,7 @@ import {
   clampIntegerDraft,
   formatDraftValue,
 } from "@/features/diarization/audioUpload";
+import { diarizationSpeakerUpperBound } from "@/features/models/catalog/routeModelCatalog";
 import {
   prepareSpeechTextUploadBlob,
   resolveSourceAudioFilename,
@@ -224,8 +225,14 @@ export function DiarizationPlayground({
   }, [onSummaryModelRequired, summaryModelGuidance, summaryModelReady]);
 
   const normalizeSidebarSettings = useCallback(() => {
-    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, 4);
-    const nextMaxSpeakers = clampIntegerDraft(maxSpeakers, 4, 1, 4);
+    const speakerUpperBound = diarizationSpeakerUpperBound(selectedModel);
+    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, speakerUpperBound);
+    const nextMaxSpeakers = clampIntegerDraft(
+      maxSpeakers,
+      speakerUpperBound,
+      1,
+      speakerUpperBound,
+    );
     const nextMinSpeechMs = clampIntegerDraft(minSpeechMs, 240, 40, 5000);
     const nextMinSilenceMs = clampIntegerDraft(minSilenceMs, 200, 40, 5000);
 
@@ -257,7 +264,7 @@ export function DiarizationPlayground({
       minSpeechMs: nextMinSpeechMs,
       minSilenceMs: nextMinSilenceMs,
     };
-  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs]);
+  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs, selectedModel]);
 
   const processAudio = useCallback(
     async (audioBlob: Blob) => {
