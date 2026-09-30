@@ -6,7 +6,8 @@ implementation on `production-serving` is complete to the portable boundary:
 every commit is backed by synthetic-fixture, reference-math, failure-injection,
 and real-process evidence, and **no runtime, quality, or performance claim is
 earned until the checks in this document run against the exact-SHA checkpoint
-on target hardware** (ADR 0008 posture; the variant ships catalog-disabled).
+on target hardware**. The variant is catalog-enabled by product decision
+(2026-09-30 — see §4); the certification steps remain evidence-gated.
 
 Planning doc: `docs/dev/QWEN35_35B_A3B_FP8_SUPPORT_PLAN.md`.
 
@@ -109,13 +110,21 @@ tolerance to absorb.
    render on/off through the public API.
 5. 40/48 GB-tier claims stay forbidden until measured (see 3.3).
 
-## 4. ADR 0008 activation gate and flip order
+## 4. Activation posture and remaining flip order
 
-The variant is catalog-disabled until real-checkpoint activation evidence
-exists. Post-activation flips, in order:
+**Update 2026-09-30:** the catalog-disabled posture was overridden by product
+decision — `Qwen35Moe35BA3BFp8` is **catalog-enabled and visible by default**
+(`izwi list`, `/v1/models`, admin API, desktop models/chat lists, download
+paths). This is a visibility and availability decision, not a certification
+claim: runtime, quality, and performance certification against the real
+checkpoint remains outstanding, and the steps below still gate anything that
+would advertise certified behavior.
 
-1. **Catalog enable** — flip `is_enabled` for `Qwen35Moe35BA3BFp8` with the
-   evidence bundle (exact SHA, device UUIDs, parity artifacts).
+Remaining flips, in order:
+
+1. ~~**Catalog enable**~~ — **done by product decision (2026-09-30)**. The
+   state-topology certification cell was added in the same change, and the
+   admission plan (Phase 5) already prices loads truthfully per backend.
 2. **Per-backend certification matrix** — CPU/Metal/CUDA rows from §3.4.
 3. **DS1 prefix-reuse re-evaluation** — the family's DS1 cell is
    `NotEnabled` on all backends (hybrid recurrent/conv reuse unproven).

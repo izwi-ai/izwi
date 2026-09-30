@@ -40,3 +40,12 @@
 - In editor-style tabs, avoid dedicating a second column to generic writing guidance when the user asks for a cleaner modal; keep status badges inline with the primary editor header instead.
 - In compact setup modals, remove secondary tuning panels like playback controls when the user asks to strip the surface back; do not preserve them out of habit if they are not central to setup.
 - For simplified left-rail tabs, keep a faint inactive border so non-active items still read as clickable navigation rather than plain text.
+- When landing support for a new model family, the user expects it visible and
+  usable by default. An internal activation-gating posture (catalog-disabled
+  until hardware evidence) hides the model from every surface — CLI list,
+  desktop models/chat lists, download paths — and reads as "not supported".
+  Gate certification CLAIMS, not VISIBILITY: enable the catalog, keep the
+  load-admission math truthful per backend, and record what remains
+  uncertified in the handoff doc. When a dedicated-family plan chooses
+  default-off visibility, surface that tradeoff to the user explicitly at
+  ship time instead of assuming the earlier gating decision carries over.

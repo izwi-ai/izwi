@@ -1059,9 +1059,7 @@ impl ModelVariant {
             | Self::Qwen314BGguf
             // DS10 groundwork posture (ADR 0008): catalog-disabled until a
             // real MoE checkpoint is validated on every buildable lane.
-            // Qwen3.5-35B-A3B-FP8 follows the same posture.
-            | Self::Qwen3Moe30bA3bGguf
-            | Self::Qwen35Moe35BA3BFp8 => false,
+            | Self::Qwen3Moe30bA3bGguf => false,
             Self::Qwen306BGguf
             | Self::Qwen317BGguf
             | Self::Qwen34BGguf
@@ -1072,6 +1070,11 @@ impl ModelVariant {
             | Self::Qwen352BGguf
             | Self::Qwen354BGguf
             | Self::Qwen359BGguf
+            // Enabled by product decision (2026-09-30): visible and usable by
+            // default. Runtime/performance certification against the real
+            // checkpoint remains an exact-SHA hardware handoff gate — see
+            // docs/dev/QWEN35_35B_A3B_FP8_HARDWARE_HANDOFF.md.
+            | Self::Qwen35Moe35BA3BFp8
             | Self::Qwen3827BFp8
             | Self::Gemma31BIt
             | Self::Qwen3Tts12Hz06BBase4Bit
@@ -1379,10 +1382,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_moe_fp8_catalog_contract_is_disabled_moe_family() {
+    fn qwen35_moe_fp8_catalog_contract_is_enabled_moe_family() {
         let variant = ModelVariant::Qwen35Moe35BA3BFp8;
 
-        assert!(!variant.is_enabled());
+        // Enabled by product decision (2026-09-30); runtime certification
+        // against the real checkpoint stays an exact-SHA hardware gate.
+        assert!(variant.is_enabled());
         assert!(variant.is_chat());
         assert!(variant.is_quantized());
         assert!(!variant.is_gguf());
