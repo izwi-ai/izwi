@@ -690,7 +690,8 @@ async fn run_gateway(
 
 struct GatewayWorkerStatusPoller {
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Number of managed worker status pollers (boot-time plus adopted).
+    /// Boot-time poller count. Runtime adoption mutates the live poller pool;
+    /// this snapshot pins the boot-sized pool for diagnostics and tests.
     poller_count: usize,
 }
 
@@ -1222,13 +1223,18 @@ async fn gateway_state(
     } else {
         state
     };
-    Ok((
-        state,
-        Some(GatewayWorkerStatusPoller {
-            poller_count: boot_poller_count,
-            tasks,
-        }),
-    ))
+    let poller = GatewayWorkerStatusPoller {
+        poller_count: boot_poller_count,
+        tasks,
+    };
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        pollers = poller.poller_count,
+        interval_ms = polling_interval.as_millis() as u64,
+        "Gateway worker status polling started"
+    );
+    Ok((state, Some(poller)))
 }
 
 fn initial_gateway_worker_expectation(

@@ -107,13 +107,12 @@ pub struct ChatCompletionRequest {
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
-/// `json_schema` is rejected with a documented error for now.
+/// `json_schema` is rejected by `kind` with a documented error, and any
+/// `json_schema` payload key is ignored by deserialization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenAiResponseFormat {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default, rename = "json_schema")]
-    pub json_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2070,10 +2069,7 @@ mod timing_contract_tests {
             presence_penalty: None,
             logprobs: None,
             top_logprobs: None,
-            response_format: Some(OpenAiResponseFormat {
-                kind: kind.into(),
-                json_schema: None,
-            }),
+            response_format: Some(OpenAiResponseFormat { kind: kind.into() }),
             stop: None,
             user: None,
             tools: None,
@@ -2095,10 +2091,19 @@ mod timing_contract_tests {
     }
 
     #[test]
+    fn response_format_deserialization_ignores_json_schema_payload_keys() {
+        let format: OpenAiResponseFormat = serde_json::from_value(serde_json::json!({
+            "type": "json_object",
+            "json_schema": { "name": "strict-output", "strict": true }
+        }))
+        .expect("the json_schema payload key is ignored, not a parse error");
+        assert_eq!(format.kind, "json_object");
+    }
+
+    #[test]
     fn json_object_is_rejected_on_models_without_a_grammar_aware_sampler() {
         let format = OpenAiResponseFormat {
             kind: "json_object".into(),
-            json_schema: None,
         };
         assert!(ensure_response_format_supported(ModelVariant::Qwen34BGguf, &format).is_ok());
         assert!(
