@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 #[cfg(test)]
@@ -135,6 +135,10 @@ pub(crate) struct ModelLifecycleController {
     pub(super) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(super) realtime_asr_sequence_capacity: u32,
     pub(super) model_last_used: Mutex<HashMap<ModelVariant, u64>>,
+    /// Explicitly loaded residents (LM Studio-style pins): excluded from
+    /// budget/pressure eviction and idle-TTL reaping until explicitly
+    /// unloaded. Session-scoped.
+    pub(super) pinned_variants: Mutex<HashSet<ModelVariant>>,
     pub(super) mutation_gate: Mutex<()>,
     state: StdMutex<LifecycleState>,
     #[cfg(test)]
@@ -173,6 +177,7 @@ impl ModelLifecycleController {
             loaded_tts_variant,
             realtime_asr_sequence_capacity,
             model_last_used: Mutex::new(HashMap::new()),
+            pinned_variants: Mutex::new(HashSet::new()),
             mutation_gate: Mutex::new(()),
             state: StdMutex::new(LifecycleState::default()),
             #[cfg(test)]

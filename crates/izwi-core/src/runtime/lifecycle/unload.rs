@@ -212,6 +212,7 @@ impl ModelLifecycleController {
         // sample taken while the model was still resident.
         self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
+        self.unpin_model(variant).await;
         Ok(())
     }
 

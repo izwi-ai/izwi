@@ -35,6 +35,10 @@ pub struct AdminModelInfo {
     pub enabled: bool,
     pub license: Option<String>,
     pub status: String,
+    /// Explicitly loaded in this session: survives budget and memory-pressure
+    /// eviction until explicitly unloaded.
+    #[serde(default)]
+    pub pinned: bool,
     pub local_path: Option<String>,
     pub size_bytes: Option<u64>,
     pub download_progress: Option<f32>,
@@ -127,18 +131,23 @@ pub struct AdminModelDownloadProgressEvent {
 
 impl From<ModelInfo> for AdminModelInfo {
     fn from(info: ModelInfo) -> Self {
-        Self::from_model_info(info, None)
+        Self::from_model_info(info, None, false)
     }
 }
 
 impl AdminModelInfo {
-    fn from_model_info(info: ModelInfo, runtime_diagnostics: Option<serde_json::Value>) -> Self {
+    fn from_model_info(
+        info: ModelInfo,
+        runtime_diagnostics: Option<serde_json::Value>,
+        pinned: bool,
+    ) -> Self {
         let variant = info.variant;
         Self {
             variant: variant.dir_name().to_string(),
             enabled: info.enabled,
             license: variant.license_label().map(str::to_string),
             status: model_status_as_str(info.status).to_string(),
+            pinned,
             local_path: info
                 .local_path
                 .map(|path| path.to_string_lossy().into_owned()),
@@ -348,12 +357,14 @@ pub async fn list_models(
         .collect();
     models.sort_by_key(model_sort_key);
     let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
+    let pinned_variants = state.runtime.pinned_model_variants().await;
     Ok(Json(AdminModelsResponse {
         models: models
             .into_iter()
             .map(|info| {
                 let diagnostics = runtime_diagnostics.get(info.variant.dir_name()).cloned();
-                AdminModelInfo::from_model_info(info, diagnostics)
+                let pinned = pinned_variants.contains(&info.variant);
+                AdminModelInfo::from_model_info(info, diagnostics, pinned)
             })
             .collect(),
     }))
@@ -377,9 +388,11 @@ pub async fn get_model_info(
         .ok_or_else(|| ApiError::not_found("Model not found"))?;
 
     let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
+    let pinned = state.runtime.pinned_model_variants().await.contains(&variant);
     Ok(Json(AdminModelInfo::from_model_info(
         info,
         runtime_diagnostics.get(variant.dir_name()).cloned(),
+        pinned,
     )))
 }
 
@@ -886,10 +899,12 @@ mod tests {
         let model = AdminModelInfo::from_model_info(
             ModelInfo::new(ModelVariant::Qwen3827BFp8),
             Some(serde_json::to_value(diagnostics).expect("serialize runtime diagnostics")),
+            true,
         );
 
         let value = serde_json::to_value(model).expect("serialize admin model");
         assert_eq!(value["variant"], "Qwen3.8-27B-FP8");
+        assert_eq!(value["pinned"], true);
         assert_eq!(value["chat_capabilities"]["supports_thinking"], true);
         assert_eq!(
             value["chat_capabilities"]["default_reasoning_effort"],

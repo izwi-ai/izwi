@@ -59,12 +59,17 @@ fn select_lru_eviction_candidate(
     resident_variants: &[ModelVariant],
     requested_variant: ModelVariant,
     active_variants: &HashSet<ModelVariant>,
+    pinned_variants: &HashSet<ModelVariant>,
     last_used: &HashMap<ModelVariant, u64>,
 ) -> Option<ModelVariant> {
     resident_variants
         .iter()
         .copied()
-        .filter(|variant| *variant != requested_variant && !active_variants.contains(variant))
+        .filter(|variant| {
+            *variant != requested_variant
+                && !active_variants.contains(variant)
+                && !pinned_variants.contains(variant)
+        })
         .min_by(|left, right| {
             last_used
                 .get(left)
@@ -1186,6 +1191,24 @@ impl ModelLifecycleController {
         last_used.insert(variant, now_unix_millis());
     }
 
+    /// Mark an explicitly loaded resident as pinned: it survives budget and
+    /// memory-pressure eviction (and the idle-TTL reaper) until an explicit
+    /// unload. Job auto-loads never call this.
+    pub(super) async fn pin_model(&self, variant: ModelVariant) {
+        let mut pinned = self.pinned_variants.lock().await;
+        if pinned.insert(variant) {
+            info!(model = %variant, "Pinning explicitly loaded model against eviction");
+        }
+    }
+
+    pub(super) async fn unpin_model(&self, variant: ModelVariant) {
+        self.pinned_variants.lock().await.remove(&variant);
+    }
+
+    pub(super) async fn pinned_model_variants(&self) -> HashSet<ModelVariant> {
+        self.pinned_variants.lock().await.clone()
+    }
+
     pub(super) async fn forget_model_usage(&self, variant: ModelVariant) {
         let mut last_used = self.model_last_used.lock().await;
         last_used.remove(&variant);
@@ -1235,14 +1258,16 @@ impl ModelLifecycleController {
                 }
             }
             let last_used = self.model_last_used.lock().await.clone();
+            let pinned_variants = self.pinned_variants.lock().await.clone();
             let Some(victim) = select_lru_eviction_candidate(
                 &ready_variants,
                 requested_variant,
                 &active_variants,
+                &pinned_variants,
                 &last_used,
             ) else {
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and ready for eviction"
+                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and available for eviction; unload a model to make room"
                 )));
             };
 
@@ -1331,14 +1356,16 @@ impl ModelLifecycleController {
                     .filter(|variant| self.model_manager.active_residency_leases(*variant) > 0),
             );
             let last_used = self.model_last_used.lock().await.clone();
+            let pinned_variants = self.pinned_variants.lock().await.clone();
             let Some(victim) = select_lru_eviction_candidate(
                 &resident_variants,
                 requested_variant,
                 &active_variants,
+                &pinned_variants,
                 &last_used,
             ) else {
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={headroom}, backend={backend:?}; no idle resident model is available for eviction"
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={headroom}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
                 )));
             };
             info!(
@@ -1379,14 +1406,16 @@ impl ModelLifecycleController {
                         }
                     }
                     let last_used = self.model_last_used.lock().await.clone();
+                    let pinned_variants = self.pinned_variants.lock().await.clone();
                     let Some(victim) = select_lru_eviction_candidate(
                         &ready_variants,
                         requested_variant,
                         &active_variants,
+                        &pinned_variants,
                         &last_used,
                     ) else {
                         return Err(Error::ModelLoadError(format!(
-                            "Cannot reserve memory for {requested_variant}: {resource_error}"
+                            "Cannot reserve memory for {requested_variant}: {resource_error}; no idle resident model is available for eviction; unload a model to make room"
                         )));
                     };
                     info!(
@@ -2856,10 +2885,20 @@ impl RuntimeService {
         }
     }
 
-    /// Load a model without retaining an inference pin.
+    /// Load a model without retaining an inference pin. The explicit load
+    /// entry (admin API, preload list) marks the resident as pinned so it
+    /// survives budget and memory-pressure eviction until explicitly
+    /// unloaded; job auto-loads use `load_model_for_inference` directly and
+    /// stay transient.
     pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
         drop(self.load_model_for_inference(variant).await?);
+        self.model_lifecycle.pin_model(variant).await;
         Ok(())
+    }
+
+    /// Variants explicitly loaded (pinned) in this server session.
+    pub async fn pinned_model_variants(&self) -> std::collections::HashSet<ModelVariant> {
+        self.model_lifecycle.pinned_model_variants().await
     }
 
     async fn ensure_model_budget_before_load(&self, requested_variant: ModelVariant) -> Result<()> {
@@ -3596,6 +3635,7 @@ mod tests {
         ];
         let requested_variant = ModelVariant::Kokoro82M;
         let active_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
+        let pinned_variants = HashSet::new();
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
             (ModelVariant::Qwen38BGguf, 5_u64),
@@ -3606,10 +3646,54 @@ mod tests {
             &resident_variants,
             requested_variant,
             &active_variants,
+            &pinned_variants,
             &last_used,
         );
 
         assert_eq!(candidate, Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+    }
+
+    #[test]
+    fn select_lru_eviction_candidate_skips_pinned_models() {
+        let resident_variants = vec![
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ModelVariant::Qwen38BGguf,
+        ];
+        let requested_variant = ModelVariant::Kokoro82M;
+        let active_variants = HashSet::new();
+        let pinned_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
+        // The pinned model is older than the unpinned one but must not be
+        // selected.
+        let last_used = HashMap::from([
+            (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
+            (ModelVariant::Qwen38BGguf, 5_u64),
+        ]);
+
+        let candidate = select_lru_eviction_candidate(
+            &resident_variants,
+            requested_variant,
+            &active_variants,
+            &pinned_variants,
+            &last_used,
+        );
+
+        assert_eq!(candidate, Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+
+        // When every resident is pinned there is no candidate.
+        let all_pinned = HashSet::from([
+            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ]);
+        assert_eq!(
+            select_lru_eviction_candidate(
+                &resident_variants,
+                requested_variant,
+                &active_variants,
+                &all_pinned,
+                &last_used,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4455,6 +4539,44 @@ mod tests {
         }
         assert!(cleanup_waiter.wait().await.is_err());
 
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            max_loaded_models: Some(1),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+
+        let error = runtime
+            .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
+            .await
+            .expect_err("a pinned resident must not be silently evicted");
+        assert!(
+            error.to_string().contains("unload a model to make room"),
+            "unexpected error: {error}"
+        );
+
+        assert!(runtime
+            .model_manager
+            .resident_variants()
+            .await
+            .contains(&ModelVariant::GraniteSpeech412BPlus));
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
