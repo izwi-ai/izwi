@@ -27,6 +27,11 @@ pub struct LiveResponse {
     pub status: &'static str,
     pub version: &'static str,
     pub uptime_secs: u64,
+    /// The inference runtime's resource authority is poisoned: new physical
+    /// work is rejected until the backend is recreated or fully drains.
+    /// Omitted while healthy so existing pollers see the old shape.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_poisoned: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,10 +53,12 @@ pub struct ReadyResponse {
 
 pub async fn live_check(State(state): State<AppState>) -> Json<LiveResponse> {
     let lifecycle = state.lifecycle.snapshot();
+    let telemetry = state.runtime.telemetry_snapshot().await;
     Json(LiveResponse {
         status: "alive",
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: now_saturating_sub(lifecycle.started_at),
+        runtime_poisoned: telemetry.coordinator.poisoned,
     })
 }
 
@@ -97,7 +104,10 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
             name: "runtime_accepting_work",
             ok: !telemetry.coordinator.draining && !telemetry.coordinator.poisoned,
             message: if telemetry.coordinator.poisoned {
-                Some("runtime inference coordinator is poisoned and must be recreated".to_string())
+                Some(
+                    "runtime inference backend is poisoned; new work is rejected until it is recreated or fully drains"
+                        .to_string(),
+                )
             } else {
                 telemetry
                     .coordinator
@@ -309,6 +319,33 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "runtime_accepting_work" && !check.ok));
+    }
+
+    #[tokio::test]
+    async fn liveness_reports_runtime_poison_only_when_poisoned() {
+        let (_guard, state) = test_state("liveness_runtime_poison");
+        state.lifecycle.mark_ready();
+
+        assert!(!state.runtime.coordinator_snapshot().poisoned);
+
+        // The poisoned shape is exercised at the serde boundary: the flag is
+        // omitted while healthy and present while poisoned.
+        let healthy = serde_json::to_string(&LiveResponse {
+            status: "alive",
+            version: "0.0.0-test",
+            uptime_secs: 1,
+            runtime_poisoned: false,
+        })
+        .unwrap();
+        assert!(!healthy.contains("runtime_poisoned"));
+        let poisoned = serde_json::to_string(&LiveResponse {
+            status: "alive",
+            version: "0.0.0-test",
+            uptime_secs: 1,
+            runtime_poisoned: true,
+        })
+        .unwrap();
+        assert!(poisoned.contains("\"runtime_poisoned\":true"));
     }
 
     #[tokio::test]

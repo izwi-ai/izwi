@@ -679,7 +679,11 @@ impl InferenceCoordinator {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
-            poisoned: self.execution.poison_reason().is_some(),
+            // The shared resource authority poisons alongside the execution
+            // guard on backend-fatal errors (Metal command-buffer OOM at a
+            // load fence); probes and the desktop must see both.
+            poisoned: self.execution.poison_reason().is_some()
+                || self.resources.poison_reason().is_some(),
         }
     }
 
@@ -3683,6 +3687,16 @@ Pages free: 10.\n";
             snapshot.available.unified_bytes,
             ResourceAmount::Known(900)
         );
+    }
+
+    #[test]
+    fn coordinator_snapshot_poisoned_includes_the_resource_authority() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 2, 2);
+        assert!(!coordinator.snapshot().poisoned);
+        coordinator.resources.poison("simulated authority poison");
+        assert!(coordinator.snapshot().poisoned);
+        coordinator.resources.clear_poison();
+        assert!(!coordinator.snapshot().poisoned);
     }
 
     #[test]

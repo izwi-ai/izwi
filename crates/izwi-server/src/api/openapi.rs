@@ -1874,6 +1874,8 @@ pub struct LiveResponse {
     pub status: String,
     pub version: String,
     pub uptime_secs: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_poisoned: bool,
 }
 
 #[allow(dead_code)]
