@@ -39,11 +39,13 @@ impl ModelManager {
         for variant in ModelVariant::all() {
             let mut info = ModelInfo::new(*variant);
 
-            // Check if already downloaded
+            // Check if already downloaded. Size is resolved lazily on the
+            // first list refresh (async + cached) rather than blocking the
+            // constructor on a recursive directory scan.
             if downloader.is_downloaded(*variant) {
                 info.status = ModelStatus::Downloaded;
                 info.local_path = Some(downloader.model_path(*variant));
-                info.size_bytes = downloader.get_cached_size(*variant);
+                info.size_bytes = None;
             } else {
                 // Use built-in estimates until Hugging Face totals are resolved.
                 info.size_bytes = Some(variant.estimated_size());
@@ -89,7 +91,7 @@ impl ModelManager {
 
                 let is_downloaded = self.downloader.is_downloaded(variant);
                 let size_bytes = if is_downloaded {
-                    self.downloader.get_cached_size(variant)
+                    self.downloader.get_cached_size(variant).await
                 } else if let Some(progress) = &latest_progress {
                     if progress.total_bytes > 0 {
                         Some(progress.total_bytes)
@@ -308,7 +310,7 @@ impl ModelManager {
                 state.info.status = ModelStatus::Downloaded;
                 state.info.local_path = Some(result.clone());
                 state.info.download_progress = Some(100.0);
-                state.info.size_bytes = self.downloader.get_cached_size(variant);
+                state.info.size_bytes = self.downloader.get_cached_size(variant).await;
             }
         }
 
@@ -347,7 +349,7 @@ impl ModelManager {
             if let Some(state) = models.get_mut(&variant) {
                 state.info.status = ModelStatus::Downloaded;
                 state.info.local_path = Some(result.clone());
-                state.info.size_bytes = self.downloader.get_cached_size(variant);
+                state.info.size_bytes = self.downloader.get_cached_size(variant).await;
             }
         }
 
@@ -459,6 +461,7 @@ impl ModelManager {
         if model_path.exists() {
             std::fs::remove_dir_all(&model_path)?;
         }
+        self.downloader.invalidate_downloaded_size(variant).await;
 
         // Update status
         {

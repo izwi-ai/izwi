@@ -542,6 +542,10 @@ pub struct ModelDownloader {
     latest_progress: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadProgress>>>,
     repo_tree_cache: Arc<RwLock<HashMap<String, HashMap<String, u64>>>>,
     expected_sizes: ExpectedSizeStore,
+    /// Cached on-disk size per downloaded variant. Recursive directory scans
+    /// are expensive and run off the async executor; the result is memoized
+    /// until a download, cancellation, or deletion changes the directory.
+    downloaded_sizes: Arc<RwLock<HashMap<ModelVariant, u64>>>,
     multi_progress: MultiProgress,
     state_manager: DownloadStateManager,
 }
@@ -571,6 +575,7 @@ impl ModelDownloader {
             latest_progress: Arc::new(RwLock::new(std::collections::HashMap::new())),
             repo_tree_cache: Arc::new(RwLock::new(HashMap::new())),
             expected_sizes,
+            downloaded_sizes: Arc::new(RwLock::new(HashMap::new())),
             multi_progress,
             state_manager: DownloadStateManager::new(),
         })
@@ -1205,6 +1210,8 @@ impl ModelDownloader {
                 .state_manager
                 .set_state(variant, final_state)
                 .await;
+            // The directory contents changed; drop any memoized size.
+            downloader.invalidate_downloaded_size(variant).await;
 
             // Remove finished task from active-downloads registry so UI/handlers
             // stop treating completed downloads as active.
@@ -1238,6 +1245,7 @@ impl ModelDownloader {
             latest_progress: Arc::clone(&self.latest_progress),
             repo_tree_cache: Arc::clone(&self.repo_tree_cache),
             expected_sizes: self.expected_sizes.clone(),
+            downloaded_sizes: Arc::clone(&self.downloaded_sizes),
             multi_progress: MultiProgress::new(), // Each spawned task gets its own multi-progress
             state_manager: self.state_manager.clone(),
         }
@@ -2282,14 +2290,33 @@ impl ModelDownloader {
             .collect()
     }
 
-    /// Get download size for a model (if available from cache)
-    pub fn get_cached_size(&self, variant: ModelVariant) -> Option<u64> {
-        let path = self.model_path(variant);
-        if path.exists() {
-            Self::dir_size(&path).ok()
-        } else {
-            None
+    /// Get the on-disk size of a downloaded model, computing it off the async
+    /// executor on first use and memoizing the result. Returns `None` when the
+    /// model directory is absent. Callers that mutate the directory must
+    /// invalidate via [`Self::invalidate_downloaded_size`].
+    pub async fn get_cached_size(&self, variant: ModelVariant) -> Option<u64> {
+        if let Some(size) = self.downloaded_sizes.read().await.get(&variant).copied() {
+            return Some(size);
         }
+        let path = self.model_path(variant);
+        if !path.exists() {
+            return None;
+        }
+        let computed = tokio::task::spawn_blocking(move || Self::dir_size(&path).ok())
+            .await
+            .ok()
+            .flatten()?;
+        self.downloaded_sizes
+            .write()
+            .await
+            .insert(variant, computed);
+        Some(computed)
+    }
+
+    /// Drop the memoized on-disk size for a variant after its directory was
+    /// created, modified, or removed.
+    pub(crate) async fn invalidate_downloaded_size(&self, variant: ModelVariant) {
+        self.downloaded_sizes.write().await.remove(&variant);
     }
 
     /// Resolve the expected total download size for a model variant.
@@ -2355,6 +2382,7 @@ impl ModelDownloader {
                 let _ = tokio::fs::remove_dir_all(&model_path).await;
             }
             self.clear_latest_progress(variant).await;
+            self.invalidate_downloaded_size(variant).await;
             // Update state
             self.state_manager
                 .set_state(variant, DownloadState::NotDownloaded)
