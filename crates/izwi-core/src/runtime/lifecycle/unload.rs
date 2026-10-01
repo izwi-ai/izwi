@@ -12,7 +12,7 @@ use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::lifecycle::load::now_unix_millis;
 use crate::runtime::service::RuntimeService;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// How often the idle keep-alive reaper scans residents.
 const IDLE_MODEL_REAP_INTERVAL_SECS: u64 = 30;
