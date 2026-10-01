@@ -579,13 +579,26 @@ impl ResourceAuthority {
 
     /// Permanently fail new work after a backend-fatal asynchronous error.
     /// Metal command-buffer OOM can leave queued command/fence bookkeeping in
-    /// an unusable state, so process/device recreation is required.
+    /// an unusable state, so process/device recreation is required — until
+    /// the backend fully drains, which lets [`Self::clear_poison`] restore
+    /// fresh loads.
     pub(crate) fn poison(&self, reason: impl Into<String>) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        state.poisoned.get_or_insert_with(|| reason.into());
+        if state.poisoned.is_some() {
+            return;
+        }
+        let reason = reason.into();
+        state.poisoned = Some(reason.clone());
+        drop(state);
+        // One canonical event for operators and the desktop monitor; the
+        // per-request errors wrap this reason afterwards.
+        tracing::error!(
+            reason = %reason,
+            "backend resource authority poisoned; new physical reservations and model loads are rejected until the backend is recreated or fully drains"
+        );
     }
 
     pub(crate) fn poison_reason(&self) -> Option<String> {
@@ -596,15 +609,25 @@ impl ResourceAuthority {
             .clone()
     }
 
-    /// Reset the poison marker. Test-only: the resource-authority registry is
-    /// process-global, so a case that poisons it must restore it before it
-    /// ends. Production recovery is a lifecycle concern, not a ledger one.
-    #[cfg(test)]
-    pub(crate) fn clear_poison_for_tests(&self) {
-        self.state
+    /// Clear the poison marker once the backend has been fully drained. With
+    /// no resident models and no active physical work, nothing queued before
+    /// the failure can be misattributed to fresh loads, so the fail-closed
+    /// guard is no longer needed — the in-process equivalent of llama.cpp's
+    /// "recreate the backend to recover". Returns whether a poison cleared.
+    pub(crate) fn clear_poison(&self) -> bool {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .poisoned = None;
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(reason) = state.poisoned.take() else {
+            return false;
+        };
+        drop(state);
+        tracing::info!(
+            reason = %reason,
+            "backend resource authority recovered after the backend fully drained"
+        );
+        true
     }
 
     /// Stable backend planning headroom for load-time sizing. Unlike guarded

@@ -137,6 +137,7 @@ impl ModelLifecycleController {
         self.remove_registry_and_auxiliary_state(variant).await;
         self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
+        self.maybe_recover_poisoned_authority().await;
         Ok(())
     }
 
@@ -218,7 +219,61 @@ impl ModelLifecycleController {
         self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
         self.unpin_model(variant).await;
+        self.maybe_recover_poisoned_authority().await;
         Ok(())
+    }
+
+    /// A poisoned authority recovers once the backend fully drains: no
+    /// authoritative residents, no manager projections, and no active engine
+    /// work means nothing queued before the failure can be misattributed to
+    /// fresh loads. Called after every unload; pinned residents keep the
+    /// device from draining, which is what makes the desktop recreate
+    /// backstop meaningful.
+    pub(super) async fn maybe_recover_poisoned_authority(&self) {
+        let authority = self.coordinator.resource_authority();
+        if authority.poison_reason().is_none() {
+            return;
+        }
+        if !self.authoritative_resident_variants().is_empty()
+            || !self.model_manager.resident_variants().await.is_empty()
+            || !self.core_engine.active_model_variants().await.is_empty()
+        {
+            return;
+        }
+        // The last unload flushed the pool only on the authoritative path;
+        // flush again so recovery starts from a clean scratch slate.
+        MetalPoolManager::global().clear_all();
+        authority.clear_poison();
+    }
+
+    /// Best-effort drain of unpinned, idle residents after the authority has
+    /// been poisoned. Ollama expires idle runners for the same reason: a
+    /// poisoned device rejects every new reservation, so keeping idle
+    /// residents loaded only delays recovery. Pinned residents and models
+    /// with active work keep their LM-Studio-style protection.
+    pub(super) async fn drain_unpinned_residents_for_recovery(&self) {
+        let pinned = self.pinned_variants.lock().await.clone();
+        let active = self.core_engine.active_model_variants().await;
+        for resident in self.authoritative_resident_variants() {
+            if pinned.contains(&resident) || active.contains(&resident) {
+                continue;
+            }
+            if self.model_manager.active_residency_leases(resident) > 0 {
+                continue;
+            }
+            info!(
+                model = %resident,
+                "Unloading an unpinned resident to drain the poisoned authority"
+            );
+            if let Err(error) = self.unload_model_locked(resident).await {
+                tracing::error!(
+                    model = %resident,
+                    %error,
+                    "Failed to unload a resident while draining the poisoned authority"
+                );
+            }
+        }
+        self.maybe_recover_poisoned_authority().await;
     }
 
     async fn run_unload(self: Arc<Self>, variant: ModelVariant) -> Result<()> {

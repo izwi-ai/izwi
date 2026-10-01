@@ -1519,6 +1519,11 @@ impl ModelLifecycleController {
                 self.coordinator.resource_authority().poison(format!(
                     "Metal command-buffer OOM while loading {variant} persisted after a pooled-scratch flush and one retry: {retry_error}"
                 ));
+                // The authority now rejects every new reservation. Evicting
+                // unpinned idle residents lets the device drain so the
+                // poison clears without operator action; pinned residents
+                // keep their protection and hold the poison until unloaded.
+                self.drain_unpinned_residents_for_recovery().await;
             }
         }
         retry
@@ -4596,7 +4601,7 @@ mod tests {
 
     impl Drop for ClearAuthorityPoisonOnDrop {
         fn drop(&mut self) {
-            self.0.clear_poison_for_tests();
+            self.0.clear_poison();
         }
     }
 
@@ -4662,6 +4667,17 @@ mod tests {
         .unwrap();
         let variant = ModelVariant::Kokoro82M;
         runtime.model_lifecycle.set_load_test_metal_ooms(2);
+        // A resident blocks the recovery drain, so the poison is observable
+        // after the failed load. Unpinned residents would be evicted and the
+        // authority would recover before the outcome lands.
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
 
         let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
         let _load_task = runtime.model_lifecycle.spawn_load_transaction(
@@ -4689,6 +4705,75 @@ mod tests {
         drop(ClearAuthorityPoisonOnDrop(
             runtime.coordinator.resource_authority(),
         ));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_authority_recovers_when_the_device_fully_drains() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-poison-recover-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 1,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let authority = runtime.coordinator.resource_authority();
+        authority.poison("simulated backend-fatal error");
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::GraniteSpeech412BPlus,
+                now_unix_millis().saturating_sub(10_000),
+            );
+
+        // The unpinned resident is the only thing keeping the device from
+        // draining; reaping it via the standard unload path must clear the
+        // poison.
+        let reaped = runtime.reap_idle_models().await;
+        assert_eq!(reaped, vec![ModelVariant::GraniteSpeech412BPlus]);
+        assert!(
+            authority.poison_reason().is_none(),
+            "a fully drained device must recover from poison"
+        );
+
+        // A pinned resident blocks the drain, so the poison persists.
+        authority.poison("simulated backend-fatal error");
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::WhisperLargeV3Turbo,
+                now_unix_millis().saturating_sub(10_000),
+            );
+        assert!(runtime.reap_idle_models().await.is_empty());
+        assert!(
+            authority.poison_reason().is_some(),
+            "a pinned resident must keep the poison until it is unloaded"
+        );
+        drop(ClearAuthorityPoisonOnDrop(authority));
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
