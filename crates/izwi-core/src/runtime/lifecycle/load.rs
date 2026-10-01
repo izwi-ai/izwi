@@ -1506,6 +1506,36 @@ impl ModelLifecycleController {
             return Err(error);
         }
         MetalPoolManager::global().clear_all();
+
+        // A retry only makes sense if the flush actually freed enough pooled
+        // scratch to fit the model's load peak. Re-probe live headroom after
+        // the flush; when it is still clearly below the model's static load
+        // peak, a second full load is guaranteed to hit the same command-buffer
+        // OOM and would burn another GGUF read + F16 materialization + fence
+        // (tens of seconds) before poisoning. Skip straight to the poison.
+        let backend = self.backend_router.context().backend_kind;
+        let required_bytes = model_memory_estimate(variant).load_peak_bytes;
+        self.coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        let retry_futile = match self
+            .coordinator
+            .resource_authority()
+            .live_preload_headroom_bytes(backend)
+        {
+            Ok(Some(live_headroom)) => live_headroom < required_bytes,
+            // No trustworthy live sample: preserve the original single-retry
+            // behavior rather than treating the unknown as unlimited.
+            Ok(None) | Err(_) => false,
+        };
+        if retry_futile {
+            self.coordinator.resource_authority().poison(format!(
+                "Metal command-buffer OOM while loading {variant}: live device headroom after a pooled-scratch flush is still below the model's load peak (load_peak_bytes={required_bytes}); not retrying a doomed load: {error}"
+            ));
+            self.drain_unpinned_residents_for_recovery().await;
+            return Err(error);
+        }
+
         info!(
             model = %variant,
             %error,
