@@ -445,6 +445,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         enterprise_hooks,
         persistence,
     )?;
+    state.runtime.spawn_idle_model_reaper();
     let mut startup_warnings = Vec::new();
     if let Err(err) = state
         .batch_runtime_store

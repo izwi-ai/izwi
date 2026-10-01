@@ -10,7 +10,12 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
+use crate::runtime::lifecycle::load::now_unix_millis;
 use crate::runtime::service::RuntimeService;
+use tracing::{debug, info, warn};
+
+/// How often the idle keep-alive reaper scans residents.
+const IDLE_MODEL_REAP_INTERVAL_SECS: u64 = 30;
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -333,6 +338,81 @@ impl RuntimeService {
     /// Unload every authoritatively resident model from memory.
     pub async fn unload_all_models(&self) -> Result<usize> {
         self.model_lifecycle.unload_all_models_detached().await
+    }
+
+    /// Spawn the idle keep-alive reaper: transient (job auto-loaded)
+    /// residents idle longer than `model_keep_alive_secs` are unloaded.
+    /// Pinned residents, models with active leases, and models with
+    /// in-flight engine work are never reaped. A no-op when the keep-alive
+    /// is disabled (0).
+    pub fn spawn_idle_model_reaper(self: &Arc<Self>) {
+        if self.config.model_keep_alive_secs == 0 {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                IDLE_MODEL_REAP_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                for variant in service.reap_idle_models().await {
+                    info!(model = %variant, "Reaped idle model past its keep-alive");
+                }
+            }
+        });
+    }
+
+    /// Unload every transient resident whose idle time exceeds the
+    /// configured keep-alive, returning the reaped variants. A no-op when
+    /// the keep-alive is disabled (0).
+    pub(crate) async fn reap_idle_models(&self) -> Vec<ModelVariant> {
+        let keep_alive_secs = self.config.model_keep_alive_secs;
+        if keep_alive_secs == 0 {
+            return Vec::new();
+        }
+        let keep_alive_millis = keep_alive_secs.saturating_mul(1000);
+        let now = now_unix_millis();
+        let pinned = self.model_lifecycle.pinned_model_variants().await;
+        let active = self.core_engine.active_model_variants().await;
+        let last_used = self.model_lifecycle.model_last_used.lock().await.clone();
+        let mut candidates = Vec::new();
+        for variant in self.model_manager.resident_variants().await {
+            if pinned.contains(&variant) || active.contains(&variant) {
+                continue;
+            }
+            if self.model_manager.active_residency_leases(variant) > 0 {
+                continue;
+            }
+            // Never touch a model that is still loading or unloading.
+            if !self.model_manager.is_ready(variant).await {
+                continue;
+            }
+            // Usage records start at load time; a resident without one is
+            // treated as fresh rather than arbitrarily idle.
+            let Some(idle_since) = last_used.get(&variant) else {
+                continue;
+            };
+            if now.saturating_sub(*idle_since) >= keep_alive_millis {
+                candidates.push(variant);
+            }
+        }
+        let mut reaped = Vec::with_capacity(candidates.len());
+        for variant in candidates {
+            match self.unload_model(variant).await {
+                Ok(()) => reaped.push(variant),
+                Err(error) => {
+                    debug!(model = %variant, %error, "Idle reaper unload skipped");
+                }
+            }
+        }
+        reaped
+    }
+
+    /// Variants currently tracked as resident (loading or ready).
+    pub async fn resident_model_variants(&self) -> Vec<ModelVariant> {
+        self.model_manager.resident_variants().await
     }
 }
 

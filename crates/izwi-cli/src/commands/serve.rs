@@ -677,6 +677,7 @@ mod tests {
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
                 max_loaded_models: 1,
+                model_keep_alive_secs: 600,
                 max_batch_size: izwi_core::BatchSizePreference::Auto,
                 physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,
                 max_physical_in_flight: izwi_core::PhysicalInFlightLimit::new(3).unwrap(),

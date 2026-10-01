@@ -72,6 +72,8 @@ pub struct RuntimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_loaded_models: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_keep_alive_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_prefix_caching: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_reuse_catalog_auto: Option<bool>,
@@ -108,6 +110,7 @@ impl RuntimeConfig {
             && self.max_physical_in_flight.is_none()
             && self.max_scheduler_batch_size.is_none()
             && self.max_loaded_models.is_none()
+            && self.model_keep_alive_secs.is_none()
             && self.enable_prefix_caching.is_none()
             && self.prefix_reuse_catalog_auto.is_none()
             && self.managed_prefix_cache_salt.is_none()
@@ -199,6 +202,7 @@ impl Config {
                 max_physical_in_flight: Some(defaults.max_physical_in_flight),
                 max_scheduler_batch_size: Some(defaults.max_scheduler_batch_size),
                 max_loaded_models: Some(defaults.max_loaded_models),
+                model_keep_alive_secs: Some(defaults.model_keep_alive_secs),
                 enable_prefix_caching: Some(defaults.enable_prefix_caching),
                 prefix_reuse_catalog_auto: Some(defaults.prefix_reuse_catalog_auto),
                 managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
@@ -240,6 +244,7 @@ impl Config {
             max_physical_in_flight: self.runtime.max_physical_in_flight,
             max_scheduler_batch_size: self.runtime.max_scheduler_batch_size,
             max_loaded_models: self.runtime.max_loaded_models,
+            model_keep_alive_secs: self.runtime.model_keep_alive_secs,
             enable_prefix_caching: self.runtime.enable_prefix_caching,
             prefix_reuse_catalog_auto: self.runtime.prefix_reuse_catalog_auto,
             managed_prefix_cache_salt: self.runtime.managed_prefix_cache_salt.clone(),
@@ -301,6 +306,10 @@ impl Config {
             }
             "runtime.max_loaded_models" => {
                 self.runtime.max_loaded_models = Some(parse_usize(value)?)
+            }
+            "runtime.model_keep_alive_secs" => {
+                self.runtime.model_keep_alive_secs =
+                    Some(u64::try_from(parse_usize(value)?).map_err(|error| anyhow!(error))?)
             }
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching = Some(parse_bool(value)?)
@@ -398,6 +407,10 @@ impl Config {
             "runtime.max_loaded_models" => self
                 .runtime
                 .max_loaded_models
+                .map(|value| toml::Value::Integer(value as i64)),
+            "runtime.model_keep_alive_secs" => self
+                .runtime
+                .model_keep_alive_secs
                 .map(|value| toml::Value::Integer(value as i64)),
             "runtime.enable_prefix_caching" => {
                 self.runtime.enable_prefix_caching.map(toml::Value::Boolean)
@@ -586,6 +599,7 @@ mod tests {
                 max_physical_in_flight: Some(PhysicalInFlightLimit::new(4).unwrap()),
                 max_scheduler_batch_size: Some(9),
                 max_loaded_models: Some(1),
+                model_keep_alive_secs: Some(300),
                 enable_prefix_caching: Some(true),
                 prefix_reuse_catalog_auto: Some(false),
                 managed_prefix_cache_salt: Some("tenant-a".to_string()),
@@ -629,6 +643,7 @@ mod tests {
         );
         assert_eq!(overrides.max_scheduler_batch_size, Some(9));
         assert_eq!(overrides.max_loaded_models, Some(1));
+        assert_eq!(overrides.model_keep_alive_secs, Some(300));
         assert_eq!(overrides.enable_prefix_caching, Some(true));
         assert_eq!(
             overrides.managed_prefix_cache_salt.as_deref(),

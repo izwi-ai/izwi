@@ -648,6 +648,13 @@ pub struct EngineConfig {
     #[serde(default)]
     pub max_loaded_models: Option<usize>,
 
+    /// Idle keep-alive for transient (job auto-loaded) residents, in
+    /// seconds: models idle longer than this are reaped. Pinned residents
+    /// and models with active leases are never reaped. `0` disables reaping
+    /// (embedded runtimes default off; server profiles resolve 10 minutes).
+    #[serde(default)]
+    pub model_keep_alive_secs: u64,
+
     /// Automatic or explicitly fixed physical tensor batch width.
     #[serde(default)]
     pub max_batch_size: BatchSizePreference,
@@ -769,6 +776,7 @@ impl Default for EngineConfig {
             performance: Default::default(),
             models_dir: default_models_dir(),
             max_loaded_models: None,
+            model_keep_alive_secs: 0,
             max_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),

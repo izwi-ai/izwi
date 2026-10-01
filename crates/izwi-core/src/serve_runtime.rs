@@ -12,6 +12,7 @@ pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_MAX_LOADED_MODELS: &str = "IZWI_MAX_LOADED_MODELS";
+pub const ENV_MODEL_KEEP_ALIVE_SECS: &str = "IZWI_MODEL_KEEP_ALIVE_SECS";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
 pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
@@ -61,6 +62,9 @@ pub struct ServeRuntimeConfig {
     pub port: u16,
     pub models_dir: PathBuf,
     pub max_loaded_models: usize,
+    /// Idle keep-alive for transient residents in seconds (0 disables the
+    /// reaper). Explicitly loaded (pinned) models are exempt.
+    pub model_keep_alive_secs: u64,
     pub backend: BackendPreference,
     pub max_batch_size: BatchSizePreference,
     pub physical_execution_mode: PhysicalExecutionMode,
@@ -98,6 +102,9 @@ impl Default for ServeRuntimeConfig {
             // ledger remains the physical admission gate and evicts idle
             // unpinned models under pressure.
             max_loaded_models: 4,
+            // Ollama-style idle keep-alive for job auto-loaded models;
+            // explicitly loaded models are pinned and never reaped. 0 = off.
+            model_keep_alive_secs: default_model_keep_alive_secs(),
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
             physical_execution_mode: PhysicalExecutionMode::Serial,
@@ -151,6 +158,9 @@ impl ServeRuntimeConfig {
         }
         if let Some(max_loaded_models) = overrides.max_loaded_models {
             self.max_loaded_models = max_loaded_models.max(1);
+        }
+        if let Some(model_keep_alive_secs) = overrides.model_keep_alive_secs {
+            self.model_keep_alive_secs = model_keep_alive_secs;
         }
         if let Some(backend) = overrides.backend {
             self.backend = backend;
@@ -230,6 +240,7 @@ impl ServeRuntimeConfig {
             performance: self.performance.clone(),
             models_dir: self.models_dir.clone(),
             max_loaded_models: Some(self.max_loaded_models.max(1)),
+            model_keep_alive_secs: self.model_keep_alive_secs,
             max_batch_size: self.max_batch_size,
             physical_execution_mode: self.physical_execution_mode,
             max_physical_in_flight: self.max_physical_in_flight,
@@ -262,6 +273,7 @@ pub struct ServeRuntimeConfigOverrides {
     pub port: Option<u16>,
     pub models_dir: Option<PathBuf>,
     pub max_loaded_models: Option<usize>,
+    pub model_keep_alive_secs: Option<u64>,
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<BatchSizePreference>,
     pub physical_execution_mode: Option<PhysicalExecutionMode>,
@@ -316,6 +328,7 @@ impl ServeRuntimeConfigOverrides {
                 &path,
             )?,
             max_loaded_models: read_user_usize(&document, &path, "max_loaded_models")?,
+            model_keep_alive_secs: read_user_u64(&document, &path, "model_keep_alive_secs")?,
             ..Self::default()
         })
     }
@@ -327,6 +340,7 @@ impl ServeRuntimeConfigOverrides {
             port: read_env_u16(ENV_PORT, &[]),
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
             max_loaded_models: read_env_usize(ENV_MAX_LOADED_MODELS, &[]),
+            model_keep_alive_secs: read_env_u64(ENV_MODEL_KEEP_ALIVE_SECS, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
             physical_execution_mode: read_env_physical_execution_mode(
@@ -433,6 +447,12 @@ fn default_request_timeout_secs() -> u64 {
     300
 }
 
+/// Ollama defaults its keep-alive to 5 minutes; 10 minutes is the
+/// conservative desktop choice for job auto-loaded models.
+fn default_model_keep_alive_secs() -> u64 {
+    600
+}
+
 fn default_cors_enabled() -> bool {
     false
 }
@@ -509,6 +529,14 @@ fn read_user_usize(
         )));
     }
     Ok(Some(parsed as usize))
+}
+
+fn read_user_u64(
+    document: &toml::Value,
+    config_path: &std::path::Path,
+    key: &str,
+) -> Result<Option<u64>> {
+    Ok(read_user_usize(document, config_path, key)?.map(|value| value as u64))
 }
 
 fn read_env_batch_size(primary: &str, aliases: &[&str]) -> Option<BatchSizePreference> {
@@ -618,8 +646,13 @@ mod tests {
         let defaults = ServeRuntimeConfig::default();
         assert_eq!(defaults.max_loaded_models, 4);
         assert_eq!(defaults.engine_config().max_loaded_models, Some(4));
+        // Ollama-style idle keep-alive: 10 minutes by default, reaper off
+        // when explicitly zeroed.
+        assert_eq!(defaults.model_keep_alive_secs, 600);
+        assert_eq!(defaults.engine_config().model_keep_alive_secs, 600);
 
         std::env::set_var(ENV_MAX_LOADED_MODELS, "3");
+        std::env::set_var(ENV_MODEL_KEEP_ALIVE_SECS, "0");
         let resolved = ServeRuntimeConfig::from_sources(
             &ServeRuntimeConfigOverrides::default(),
             &ServeRuntimeConfigOverrides::from_env(),
@@ -627,6 +660,7 @@ mod tests {
         );
         assert_eq!(resolved.max_loaded_models, 3);
         assert_eq!(resolved.engine_config().max_loaded_models, Some(3));
+        assert_eq!(resolved.model_keep_alive_secs, 0);
         clear_env();
     }
 
@@ -643,6 +677,7 @@ mod tests {
             r#"
 [runtime]
 max_loaded_models = 6
+model_keep_alive_secs = 0
 
 [runtime.performance.loading]
 workers = 5
@@ -653,6 +688,7 @@ workers = 5
         let overrides =
             ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).expect("parse");
         assert_eq!(overrides.max_loaded_models, Some(6));
+        assert_eq!(overrides.model_keep_alive_secs, Some(0));
         assert_eq!(overrides.performance.loading.workers, Some(5));
 
         // Missing keys and missing files both fall back to defaults.

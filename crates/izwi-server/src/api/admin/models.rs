@@ -27,6 +27,19 @@ use izwi_core::{
 #[derive(Serialize, ToSchema)]
 pub struct AdminModelsResponse {
     pub models: Vec<AdminModelInfo>,
+    /// Residency snapshot for the `ollama ps`-style observability surface.
+    #[serde(default)]
+    pub residency: AdminResidencySummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+pub struct AdminResidencySummary {
+    /// Models currently tracked as resident (loading or ready).
+    pub resident_count: usize,
+    /// Residency budget (`None` = unbounded).
+    pub max_loaded_models: Option<usize>,
+    /// Idle keep-alive for transient residents in seconds (0 = reaper off).
+    pub model_keep_alive_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -358,7 +371,13 @@ pub async fn list_models(
     models.sort_by_key(model_sort_key);
     let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
     let pinned_variants = state.runtime.pinned_model_variants().await;
+    let residency = AdminResidencySummary {
+        resident_count: state.runtime.resident_model_variants().await.len(),
+        max_loaded_models: state.runtime.config().max_loaded_models,
+        model_keep_alive_secs: state.runtime.config().model_keep_alive_secs,
+    };
     Ok(Json(AdminModelsResponse {
+        residency,
         models: models
             .into_iter()
             .map(|info| {

@@ -40,7 +40,7 @@ mod qwen35moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
 
-fn now_unix_millis() -> u64 {
+pub(super) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -2913,7 +2913,7 @@ impl RuntimeService {
 mod tests {
     use super::{
         automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
-        is_metal_command_buffer_oom, kokoro_effective_context_tokens,
+        is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
         model_resource_plan, plan_invocation_allocations, portable_context_ceiling,
         portable_context_reserve_bytes, portable_invocation_context_intent,
@@ -4543,8 +4543,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {
+    async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
         let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-reap-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 1,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+
+        let stale = now_unix_millis().saturating_sub(10_000);
+        {
+            let mut last_used = runtime.model_lifecycle.model_last_used.lock().await;
+            last_used.insert(ModelVariant::GraniteSpeech412BPlus, stale);
+            last_used.insert(ModelVariant::WhisperLargeV3Turbo, stale);
+        }
+
+        let reaped = runtime.reap_idle_models().await;
+        assert_eq!(reaped, vec![ModelVariant::GraniteSpeech412BPlus]);
+
+        let residents = runtime.model_manager.resident_variants().await;
+        assert!(!residents.contains(&ModelVariant::GraniteSpeech412BPlus));
+        assert!(residents.contains(&ModelVariant::WhisperLargeV3Turbo));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_is_disabled_without_keep_alive() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-reap-off-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 0,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::GraniteSpeech412BPlus,
+                now_unix_millis().saturating_sub(10_000),
+            );
+
+        assert!(runtime.reap_idle_models().await.is_empty());
+        assert!(runtime
+            .model_manager
+            .resident_variants()
+            .await
+            .contains(&ModelVariant::GraniteSpeech412BPlus));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {        let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
         let runtime = RuntimeService::new(EngineConfig {
