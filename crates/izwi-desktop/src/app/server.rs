@@ -182,8 +182,8 @@ fn spawn_server_process<R: tauri::Runtime>(
 /// rejecting all new work, so the desktop stops the child and recreates it.
 /// Polls `/livez`, swaps the caller's managed-server slot atomically, and
 /// exits when the shutdown flag is set at desktop teardown. Recreation is
-/// rate-limited so a server poisoned again immediately after a restart
-/// cannot spin the monitor.
+/// rate-limited with exponential backoff so a server that keeps poisoning
+/// immediately after each restart cannot spin the monitor.
 pub fn spawn_poison_monitor(
     app: tauri::AppHandle,
     server_url: Url,
@@ -191,10 +191,12 @@ pub fn spawn_poison_monitor(
     managed: Arc<Mutex<Option<ManagedServer>>>,
     shutdown: Arc<AtomicBool>,
 ) {
-    const RECREATION_COOLDOWN: Duration = Duration::from_secs(60);
+    const RECREATION_MIN_COOLDOWN: Duration = Duration::from_secs(60);
+    const RECREATION_MAX_COOLDOWN: Duration = Duration::from_secs(300);
     let _ = thread::Builder::new()
         .name("izwi-server-poison-monitor".to_string())
         .spawn(move || {
+            let mut cooldown = RECREATION_MIN_COOLDOWN;
             let mut last_recreation: Option<Instant> = None;
             loop {
                 thread::sleep(POISON_POLL_INTERVAL);
@@ -202,9 +204,11 @@ pub fn spawn_poison_monitor(
                     return;
                 }
                 if poll_livez_runtime_poisoned(&server_url) != Some(true) {
+                    // A healthy server resets the backoff ladder.
+                    cooldown = RECREATION_MIN_COOLDOWN;
                     continue;
                 }
-                if last_recreation.is_some_and(|at| at.elapsed() < RECREATION_COOLDOWN) {
+                if last_recreation.is_some_and(|at| at.elapsed() < cooldown) {
                     continue;
                 }
                 last_recreation = Some(Instant::now());
@@ -232,6 +236,9 @@ pub fn spawn_poison_monitor(
                         );
                     }
                 }
+                // Escalate the interval so a repeatedly poisoning server backs
+                // off instead of cycling every minute; a healthy poll resets it.
+                cooldown = (cooldown * 2).min(RECREATION_MAX_COOLDOWN);
             }
         });
 }

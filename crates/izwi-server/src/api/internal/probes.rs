@@ -53,12 +53,16 @@ pub struct ReadyResponse {
 
 pub async fn live_check(State(state): State<AppState>) -> Json<LiveResponse> {
     let lifecycle = state.lifecycle.snapshot();
-    let telemetry = state.runtime.telemetry_snapshot().await;
+    // Liveness is polled aggressively (the desktop app every 200ms during
+    // startup, the poison monitor every 10s), so it must stay off the heavy
+    // telemetry path: the poison flag is a cheap coordinator snapshot read,
+    // not a full `telemetry_snapshot()` that walks every model registry.
+    let runtime_poisoned = state.runtime.coordinator_snapshot().poisoned;
     Json(LiveResponse {
         status: "alive",
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: now_saturating_sub(lifecycle.started_at),
-        runtime_poisoned: telemetry.coordinator.poisoned,
+        runtime_poisoned,
     })
 }
 
