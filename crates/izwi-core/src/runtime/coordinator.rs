@@ -2574,6 +2574,17 @@ impl DeviceCapacityProvider {
                 )))
             }
         };
+        // Without an explicit budget the Metal advisory ledger used to admit
+        // against u64::MAX, so a model too large for the device surfaced only
+        // as a command-buffer OOM at the load fence (which poisons the
+        // resource authority). Fall back to a hardware-aware budget derived
+        // from the probed working set; an explicit operator budget always
+        // wins unchanged.
+        let configured_cap = configured_cap.or_else(|| {
+            (backend == BackendKind::Metal)
+                .then(|| derive_default_metal_budget(&device))
+                .flatten()
+        });
         let configured_host_cap = if backend == BackendKind::Cuda {
             match std::env::var("IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES") {
                 Ok(raw) => Some(
@@ -2825,6 +2836,32 @@ fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
 
 #[cfg(not(feature = "metal"))]
 fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    None
+}
+
+/// Default Metal advisory-ledger budget as a fraction of the probed working
+/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset. The remaining fraction
+/// absorbs command buffers, staging copies, and allocator metadata that no
+/// per-model static estimate tracks.
+const METAL_DEFAULT_BUDGET_NUMERATOR: u64 = 9;
+const METAL_DEFAULT_BUDGET_DENOMINATOR: u64 = 10;
+
+fn metal_default_budget_from_working_set(recommended_max_working_set: u64) -> u64 {
+    recommended_max_working_set
+        .checked_div(METAL_DEFAULT_BUDGET_DENOMINATOR)
+        .unwrap_or(0)
+        .saturating_mul(METAL_DEFAULT_BUDGET_NUMERATOR)
+}
+
+#[cfg(feature = "metal")]
+fn derive_default_metal_budget(device: &DeviceProfile) -> Option<u64> {
+    let metal = device.device.as_metal_device().ok()?.metal_device();
+    let working_set = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
+    Some(metal_default_budget_from_working_set(working_set))
+}
+
+#[cfg(not(feature = "metal"))]
+fn derive_default_metal_budget(_device: &DeviceProfile) -> Option<u64> {
     None
 }
 
@@ -3618,6 +3655,34 @@ Pages free: 10.\n";
     fn metal_capacity_is_bounded_by_working_set_pressure() {
         assert_eq!(combine_metal_memory_snapshot(100, 90, 200, 150), (100, 10));
         assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
+    }
+
+    #[test]
+    fn metal_default_budget_is_a_fraction_of_the_working_set() {
+        assert_eq!(metal_default_budget_from_working_set(1000), 900);
+        assert_eq!(metal_default_budget_from_working_set(7), 0);
+        assert_eq!(
+            metal_default_budget_from_working_set(u64::MAX),
+            u64::MAX / 10 * 9
+        );
+    }
+
+    #[test]
+    fn metal_default_budget_caps_the_admitted_capacity_snapshot() {
+        let probe = DeviceCapacityProbe {
+            backend: BackendKind::Metal,
+            device: None,
+            configured_cap: Some(metal_default_budget_from_working_set(1000)),
+            configured_host_cap: None,
+            test_capacity: Some(10_000),
+        };
+
+        let snapshot = probe.sample().expect("metal sample");
+        assert_eq!(snapshot.capacity.unified_bytes, ResourceAmount::Known(900));
+        assert_eq!(
+            snapshot.available.unified_bytes,
+            ResourceAmount::Known(900)
+        );
     }
 
     #[test]
