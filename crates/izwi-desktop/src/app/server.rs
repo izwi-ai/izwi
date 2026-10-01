@@ -5,6 +5,10 @@ use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::Manager;
@@ -12,17 +16,31 @@ use url::Url;
 
 const SERVER_LOG_FILE: &str = "izwi-server.log";
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
+/// How often the poison monitor polls `/livez` and re-attempts recreation.
+const POISON_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const POISON_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Everything needed to (re)spawn the desktop-owned izwi-server. Kept on the
+/// [`ManagedServer`] so a poisoned runtime can be recreated identically.
+#[derive(Debug, Clone)]
+pub struct ServerSpawnSpec {
+    binary: Option<PathBuf>,
+    bind_host: String,
+    port: u16,
+}
 
 pub struct ManagedServer {
     child: Option<Child>,
     log_path: PathBuf,
+    spec: ServerSpawnSpec,
 }
 
 impl ManagedServer {
-    fn new(child: Child, log_path: PathBuf) -> Self {
+    fn new(child: Child, log_path: PathBuf, spec: ServerSpawnSpec) -> Self {
         Self {
             child: Some(child),
             log_path,
+            spec,
         }
     }
 
@@ -34,6 +52,12 @@ impl ManagedServer {
 
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// Spawn parameters for recreating this server, used by the poison
+    /// monitor's recreation backstop.
+    pub fn spawn_spec(&self) -> ServerSpawnSpec {
+        self.spec.clone()
     }
 }
 
@@ -64,8 +88,6 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     server_url: &Url,
 ) -> Result<Option<ManagedServer>> {
-    const START_TIMEOUT: Duration = Duration::from_secs(15);
-    const POLL_INTERVAL: Duration = Duration::from_millis(200);
     const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
     let (host, port) = server_host_port(server_url)?;
@@ -82,36 +104,52 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
         return Ok(None);
     }
 
-    let mut cmd = match resolve_server_binary(app) {
+    let bind_host = if host == "localhost" {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    let spec = ServerSpawnSpec {
+        binary: resolve_server_binary(app),
+        bind_host,
+        port,
+    };
+    spawn_server_process(app, server_url, &spec).map(Some)
+}
+
+/// Spawn the server child and wait until it answers the liveness probe.
+fn spawn_server_process<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    server_url: &Url,
+    spec: &ServerSpawnSpec,
+) -> Result<ManagedServer> {
+    const START_TIMEOUT: Duration = Duration::from_secs(15);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+
+    let mut cmd = match &spec.binary {
         Some(path) => Command::new(path),
         None => Command::new(platform_binary_name("izwi-server")),
     };
 
-    let bind_host = if host == "localhost" {
-        "127.0.0.1"
-    } else {
-        host.as_str()
-    };
-
     let log_path = open_server_log(app, &mut cmd)?;
-
-    configure_local_server_command(&mut cmd, bind_host, port);
+    configure_local_server_command(&mut cmd, &spec.bind_host, spec.port);
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
             "failed to start izwi-server for {}:{} (log: {})",
-            host,
-            port,
+            spec.bind_host,
+            spec.port,
             log_path.display()
         )
     })?;
 
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
-        if is_server_reachable(&host, port, CONNECT_TIMEOUT)
+        if is_server_reachable(&spec.bind_host, spec.port, CONNECT_TIMEOUT)
             && probe_server(server_url, CONNECT_TIMEOUT).is_ok()
         {
-            return Ok(Some(ManagedServer::new(child, log_path)));
+            return Ok(ManagedServer::new(child, log_path, spec.clone()));
         }
 
         if let Some(status) = child
@@ -120,8 +158,8 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
         {
             anyhow::bail!(
                 "izwi-server exited before becoming ready on {}:{} (status: {}; log: {})",
-                host,
-                port,
+                spec.bind_host,
+                spec.port,
                 status,
                 log_path.display()
             );
@@ -133,10 +171,96 @@ pub fn maybe_start_local_server<R: tauri::Runtime>(
     shutdown_child(&mut child);
     anyhow::bail!(
         "timed out waiting for izwi-server on {}:{} (log: {})",
-        host,
-        port,
+        spec.bind_host,
+        spec.port,
         log_path.display()
     )
+}
+
+/// Backstop for the OOM-recovery ladder: a poison that persists (typically
+/// because pinned residents keep the device from draining) leaves the server
+/// rejecting all new work, so the desktop stops the child and recreates it.
+/// Polls `/livez`, swaps the caller's managed-server slot atomically, and
+/// exits when the shutdown flag is set at desktop teardown. Recreation is
+/// rate-limited so a server poisoned again immediately after a restart
+/// cannot spin the monitor.
+pub fn spawn_poison_monitor(
+    app: tauri::AppHandle,
+    server_url: Url,
+    spec: ServerSpawnSpec,
+    managed: Arc<Mutex<Option<ManagedServer>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    const RECREATION_COOLDOWN: Duration = Duration::from_secs(60);
+    let _ = thread::Builder::new()
+        .name("izwi-server-poison-monitor".to_string())
+        .spawn(move || {
+            let mut last_recreation: Option<Instant> = None;
+            loop {
+                thread::sleep(POISON_POLL_INTERVAL);
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                if poll_livez_runtime_poisoned(&server_url) != Some(true) {
+                    continue;
+                }
+                if last_recreation.is_some_and(|at| at.elapsed() < RECREATION_COOLDOWN) {
+                    continue;
+                }
+                last_recreation = Some(Instant::now());
+                eprintln!("izwi-server runtime is poisoned; recreating the desktop-owned server");
+                // Stop the poisoned child before respawning so the port
+                // frees; shutdown tolerates an already-exited child.
+                if let Ok(mut slot) = managed.lock() {
+                    if let Some(mut old) = slot.take() {
+                        old.shutdown();
+                    }
+                }
+                match spawn_server_process(&app, &server_url, &spec) {
+                    Ok(new) => {
+                        eprintln!(
+                            "recreated desktop-owned izwi-server; logs: {}",
+                            new.log_path().display()
+                        );
+                        if let Ok(mut slot) = managed.lock() {
+                            *slot = Some(new);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to recreate poisoned izwi-server: {error}; retrying next poll"
+                        );
+                    }
+                }
+            }
+        });
+}
+
+fn poll_livez_runtime_poisoned(server_url: &Url) -> Option<bool> {
+    let live_url = server_url.join("/livez").ok()?;
+    let body = reqwest::blocking::Client::builder()
+        .timeout(POISON_PROBE_TIMEOUT)
+        .build()
+        .ok()?
+        .get(live_url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    parse_livez_runtime_poisoned(&body)
+}
+
+#[derive(Debug, Deserialize)]
+struct MonitorLiveResponse {
+    #[serde(default)]
+    runtime_poisoned: Option<bool>,
+}
+
+fn parse_livez_runtime_poisoned(body: &str) -> Option<bool> {
+    let parsed: MonitorLiveResponse = serde_json::from_str(body).ok()?;
+    parsed.runtime_poisoned
 }
 
 fn configure_local_server_command(cmd: &mut Command, bind_host: &str, port: u16) {
@@ -349,6 +473,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("liveness response was not valid Izwi JSON"));
+    }
+
+    #[test]
+    fn livez_poison_parsing_treats_missing_and_false_as_healthy() {
+        assert_eq!(parse_livez_runtime_poisoned(r#"{"status":"alive","version":"0.1.0"}"#), None);
+        assert_eq!(
+            parse_livez_runtime_poisoned(
+                r#"{"status":"alive","version":"0.1.0","runtime_poisoned":false}"#
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_livez_runtime_poisoned(
+                r#"{"status":"alive","version":"0.1.0","runtime_poisoned":true}"#
+            ),
+            Some(true)
+        );
+        assert_eq!(parse_livez_runtime_poisoned("not json"), None);
     }
 
     #[test]

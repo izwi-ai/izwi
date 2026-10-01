@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use url::Url;
 
 pub mod autostart;
@@ -53,8 +56,11 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     };
 
     let managed_server = Arc::new(Mutex::new(None::<ManagedServer>));
+    let server_shutdown = Arc::new(AtomicBool::new(false));
     let setup_server_handle = Arc::clone(&managed_server);
+    let setup_shutdown_handle = Arc::clone(&server_shutdown);
     let event_server_handle = Arc::clone(&managed_server);
+    let event_shutdown_handle = Arc::clone(&server_shutdown);
 
     let mut builder = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -91,10 +97,23 @@ pub fn run(args: DesktopArgs) -> Result<()> {
                     "desktop-owned izwi-server logs: {}",
                     server_child.log_path().display()
                 );
-                let mut child_slot = setup_server_handle
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("failed to acquire server startup lock"))?;
-                *child_slot = Some(server_child);
+                let spawn_spec = server_child.spawn_spec();
+                {
+                    let mut child_slot = setup_server_handle
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("failed to acquire server startup lock"))?;
+                    *child_slot = Some(server_child);
+                }
+                // Backstop for the OOM-recovery ladder: recreate the server
+                // if its runtime poison persists (pinned residents can keep
+                // the device from draining). Exits on the shutdown flag.
+                server::spawn_poison_monitor(
+                    app.handle().clone(),
+                    server_url.clone(),
+                    spawn_spec,
+                    Arc::clone(&setup_server_handle),
+                    setup_shutdown_handle,
+                );
             }
 
             if let Err(err) = install::ensure_cli_setup(app.handle()) {
@@ -111,11 +130,11 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     let exit_code = app.run_return(move |app_handle, event| {
         window::handle_run_event(app_handle, &event);
         if window::event_ends_desktop_session(app_handle, &event) {
-            stop_managed_server(&event_server_handle);
+            stop_managed_server(&event_server_handle, &event_shutdown_handle);
         }
     });
 
-    stop_managed_server(&managed_server);
+    stop_managed_server(&managed_server, &server_shutdown);
 
     if exit_code != 0 {
         return Err(anyhow::anyhow!(
@@ -127,7 +146,11 @@ pub fn run(args: DesktopArgs) -> Result<()> {
     Ok(())
 }
 
-fn stop_managed_server(server: &Arc<Mutex<Option<ManagedServer>>>) {
+fn stop_managed_server(
+    server: &Arc<Mutex<Option<ManagedServer>>>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    shutdown.store(true, Ordering::Release);
     if let Ok(mut server_slot) = server.lock() {
         if let Some(mut server) = server_slot.take() {
             server.shutdown();
