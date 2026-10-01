@@ -26,6 +26,7 @@ use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
 use crate::models::registry::NativeAsrModel;
+use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedExecutionContract, LoadedModelBundleDraft, LoadedStatePublication,
@@ -1336,14 +1337,27 @@ impl ModelLifecycleController {
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        let mut pooled_scratch_flushed = false;
         loop {
-            let ResourceAmount::Known(headroom) = self
+            let ResourceAmount::Known(planning_headroom) = self
                 .coordinator
                 .resource_authority()
                 .planning_headroom_bytes(backend)?
             else {
                 return Ok(());
             };
+            // Metal loads allocate the full working set at the load fence, so
+            // the pre-load check must also respect probed live availability —
+            // static ledger estimates alone under-count GGUF materialization
+            // and pooled scratch. An unavailable live probe never blocks a
+            // load; planning headroom remains the contract then.
+            let live_headroom = self
+                .coordinator
+                .resource_authority()
+                .live_preload_headroom_bytes(backend)?;
+            let headroom = live_headroom
+                .map(|live| planning_headroom.min(live))
+                .unwrap_or(planning_headroom);
             if required_bytes <= headroom {
                 return Ok(());
             }
@@ -1364,8 +1378,28 @@ impl ModelLifecycleController {
                 &pinned_variants,
                 &last_used,
             ) else {
+                if backend == BackendKind::Metal && !pooled_scratch_flushed {
+                    // The pool retains released activation scratch until the
+                    // last model unloads, which can hide gigabytes of
+                    // reclaimable headroom from the live sample. Flushing it
+                    // is safe (only unchecked-out buffers are dropped) and
+                    // beats failing a load that would fit. One flush per
+                    // admission decision; persistent shortage still errors.
+                    pooled_scratch_flushed = true;
+                    info!(
+                        requested_variant = %requested_variant,
+                        planning_headroom,
+                        live_headroom,
+                        "Reclaiming pooled Metal scratch before rejecting the load"
+                    );
+                    MetalPoolManager::global().clear_all();
+                    self.coordinator
+                        .resource_authority()
+                        .refresh_physical_capacity_after_release();
+                    continue;
+                }
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={headroom}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
                 )));
             };
             info!(
