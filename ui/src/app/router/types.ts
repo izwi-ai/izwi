@@ -14,7 +14,7 @@ export interface SharedPageProps {
   onDelete: (variant: string) => void;
   onSelect: (variant: string) => void;
   onError: (message: string) => void;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
 }
 
 export interface VoiceRouteProps {
@@ -38,5 +38,5 @@ export interface ModelsRouteProps {
   onLoad: (variant: string) => void;
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
 }

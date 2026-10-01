@@ -55,7 +55,7 @@ interface LayoutProps {
   resolvedTheme: "light" | "dark";
   themePreference: "system" | "light" | "dark";
   onThemePreferenceChange: (preference: "system" | "light" | "dark") => void;
-  onRetryModelCatalog: () => Promise<void>;
+  onRetryModelCatalog: () => Promise<boolean>;
 }
 
 interface NavItem {

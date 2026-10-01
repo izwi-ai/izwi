@@ -116,30 +116,42 @@ describe("ModelCatalogProvider model action errors", () => {
     ).toHaveLength(2);
   });
 
-  it("surfaces an initial catalog failure and clears it after retry", async () => {
+  it("surfaces an initial catalog failure and self-heals on the bounded retry", async () => {
+    // First call rejects, the provider's init retry recovers on the next call.
     apiMocks.listModels
       .mockRejectedValueOnce(new Error("Local model service is offline"))
-      .mockResolvedValueOnce({ models: [model] });
+      .mockResolvedValue({ models: [model] });
 
     renderCatalog();
 
+    // The bounded auto-retry recovers without any manual action.
     await screen.findByText("ready");
-    expect(screen.getByTestId("model-count")).toHaveTextContent("0");
-    expect(screen.getByTestId("catalog-load-error")).toHaveTextContent(
-      "Local model service is offline",
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Retry catalog" }));
-
     await waitFor(() =>
       expect(screen.getByTestId("model-count")).toHaveTextContent("1"),
     );
     expect(screen.getByTestId("catalog-load-error")).toBeEmptyDOMElement();
-    expect(apiMocks.listModels).toHaveBeenCalledTimes(2);
+    expect(apiMocks.listModels.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps a persistent catalog failure visible after retries are exhausted", async () => {
+    apiMocks.listModels.mockRejectedValue(new Error("Local model service is offline"));
+
+    renderCatalog();
+
+    // After all bounded retries fail, the error stays visible for the user.
+    await screen.findByText("ready", undefined, { timeout: 5000 });
+    await waitFor(
+      () =>
+        expect(screen.getByTestId("catalog-load-error")).toHaveTextContent(
+          "Local model service is offline",
+        ),
+      { timeout: 5000 },
+    );
+    expect(apiMocks.listModels.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("treats an empty catalog response as loaded rather than failed", async () => {
-    apiMocks.listModels.mockResolvedValueOnce({ models: [] });
+    apiMocks.listModels.mockResolvedValue({ models: [] });
 
     renderCatalog();
 

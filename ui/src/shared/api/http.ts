@@ -4,9 +4,11 @@ export const API_BASE = API_BASE_URL;
 
 export class ApiHttpClient {
   readonly baseUrl: string;
+  private readonly defaultTimeoutMs: number;
 
-  constructor(baseUrl: string = API_BASE) {
+  constructor(baseUrl: string = API_BASE, defaultTimeoutMs: number = 15_000) {
     this.baseUrl = baseUrl;
+    this.defaultTimeoutMs = defaultTimeoutMs;
   }
 
   url(path: string): string {
@@ -14,13 +16,36 @@ export class ApiHttpClient {
   }
 
   async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(this.url(path), {
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-      },
-    });
+    // Requests to the local model service must never hang the UI indefinitely:
+    // a slow first /admin/models call otherwise leaves the catalog spinner up
+    // forever. A caller-supplied signal wins; otherwise we bound the wait.
+    const controller = new AbortController();
+    const signal = options?.signal ?? controller.signal;
+    const timeout =
+      options?.signal === undefined
+        ? setTimeout(() => controller.abort(), this.defaultTimeoutMs)
+        : undefined;
+
+    let response: Response;
+    try {
+      response = await fetch(this.url(path), {
+        ...options,
+        signal,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+        },
+      });
+    } catch (err) {
+      if (isAbortError(err)) {
+        throw new Error("The local model service took too long to respond.");
+      }
+      throw err;
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
 
     if (!response.ok) {
       throw await this.createError(response, "Request failed");

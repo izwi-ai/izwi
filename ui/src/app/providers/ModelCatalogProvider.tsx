@@ -31,7 +31,7 @@ interface ModelCatalogContextValue {
   selectModel: (variant: string | null) => void;
   reportError: (message: string) => void;
   clearError: () => void;
-  refreshModels: () => Promise<void>;
+  refreshModels: () => Promise<boolean>;
   downloadModel: (variant: string) => Promise<void>;
   cancelModelDownload: (variant: string) => Promise<void>;
   loadModel: (variant: string) => Promise<void>;
@@ -103,7 +103,7 @@ export function ModelCatalogProvider({
     setError(null);
   }, []);
 
-  const refreshModels = useCallback(async () => {
+  const refreshModels = useCallback(async (): Promise<boolean> => {
     try {
       const response = await api.listModels();
       const mergedModels = response.models
@@ -138,6 +138,7 @@ export function ModelCatalogProvider({
         const readyModel = mergedModels.find((model) => model.status === "ready");
         return readyModel?.variant ?? null;
       });
+      return true;
     } catch (err) {
       console.error("Failed to load models:", err);
       setCatalogError(
@@ -146,6 +147,7 @@ export function ModelCatalogProvider({
           "Izwi could not reach the local model service. Please try again.",
         ),
       );
+      return false;
     }
   }, []);
 
@@ -340,13 +342,41 @@ export function ModelCatalogProvider({
 
     initializedRef.current = true;
 
+    // The first catalog load can race the local server's cold start (a slow
+    // /admin/models call, a poison-monitor respawn). Retry with bounded
+    // backoff so the spinner ends with either models or a clear error instead
+    // of hanging forever on a single stalled request. Cancelled on unmount so
+    // a torn-down provider stops retrying.
+    const MAX_ATTEMPTS = 3;
+    const RETRY_DELAYS_MS = [750, 1_500];
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
     const init = async () => {
       setLoading(true);
-      await refreshModels();
-      setLoading(false);
+      for (let attempt = 0; attempt < MAX_ATTEMPTS && !cancelled; attempt++) {
+        const ok = await refreshModels();
+        if (ok || cancelled) {
+          break;
+        }
+        const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+        await new Promise((resolve) => {
+          retryTimer = setTimeout(resolve, delay);
+        });
+      }
+      if (!cancelled) {
+        setLoading(false);
+      }
     };
 
     void init();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+      }
+    };
   }, [refreshModels]);
 
   useEffect(() => {

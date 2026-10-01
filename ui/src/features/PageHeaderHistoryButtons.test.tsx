@@ -151,7 +151,7 @@ describe("Page header history buttons", () => {
     onDelete: vi.fn(),
     onSelect: vi.fn(),
     onError: vi.fn(),
-    onRefresh: vi.fn().mockResolvedValue(undefined),
+    onRefresh: vi.fn().mockResolvedValue(true),
   };
 
   it("VoiceCloningPage renders the history button in the page header slot", async () => {
