@@ -6,6 +6,7 @@ use crate::config::{
     BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionMode,
     PhysicalInFlightLimit,
 };
+use crate::Result;
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
@@ -91,7 +92,12 @@ impl Default for ServeRuntimeConfig {
             host: default_host(),
             port: default_port(),
             models_dir: default_models_dir(),
-            max_loaded_models: 1,
+            // Fits the shipped multi-model pipeline worst case (diarization
+            // + ASR + forced aligner + LLM refiner resident together). The
+            // count is a residency guardrail only: the per-backend memory
+            // ledger remains the physical admission gate and evicts idle
+            // unpinned models under pressure.
+            max_loaded_models: 4,
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
             physical_execution_mode: PhysicalExecutionMode::Serial,
@@ -281,6 +287,39 @@ pub struct ServeRuntimeConfigOverrides {
 }
 
 impl ServeRuntimeConfigOverrides {
+    /// Read the serving-relevant section of the existing user TOML: the
+    /// performance policy and residency controls. Other CLI configuration
+    /// sections keep their existing owners and schema. A missing file yields
+    /// the default overrides.
+    pub fn from_user_config(path: Option<&std::path::Path>) -> Result<Self> {
+        let path = path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(crate::performance::default_user_config_path);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => {
+                return Err(crate::Error::ConfigError(format!(
+                    "{}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        let document: toml::Value = toml::from_str(&source).map_err(|error| {
+            crate::Error::ConfigError(format!("{}: {error}", path.display()))
+        })?;
+        Ok(Self {
+            performance: crate::performance::PerformanceConfigOverrides::from_document(
+                &document,
+                &path,
+            )?,
+            max_loaded_models: read_user_usize(&document, &path, "max_loaded_models")?,
+            ..Self::default()
+        })
+    }
+
     pub fn from_env() -> Self {
         Self {
             performance: crate::performance::PerformanceConfigOverrides::from_env(),
@@ -447,6 +486,31 @@ fn read_env_usize(primary: &str, aliases: &[&str]) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+/// Extract a non-negative integer from the user TOML's `runtime` table.
+/// Absent keys yield `None`; wrong types fail closed with a config error.
+fn read_user_usize(
+    document: &toml::Value,
+    config_path: &std::path::Path,
+    key: &str,
+) -> Result<Option<usize>> {
+    let Some(value) = document.get("runtime").and_then(|runtime| runtime.get(key)) else {
+        return Ok(None);
+    };
+    let parsed = value.as_integer().ok_or_else(|| {
+        crate::Error::ConfigError(format!(
+            "{} runtime.{key} must be a non-negative integer",
+            config_path.display()
+        ))
+    })?;
+    if parsed < 0 {
+        return Err(crate::Error::ConfigError(format!(
+            "{} runtime.{key} must be a non-negative integer",
+            config_path.display()
+        )));
+    }
+    Ok(Some(parsed as usize))
+}
+
 fn read_env_batch_size(primary: &str, aliases: &[&str]) -> Option<BatchSizePreference> {
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
 }
@@ -545,13 +609,15 @@ mod tests {
     }
 
     #[test]
-    fn server_profile_defaults_to_one_resident_model_and_allows_override() {
+    fn server_profile_defaults_to_pipeline_sized_residency_and_allows_override() {
         let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
         clear_env();
 
+        // Frozen default: the desktop diarization pipeline needs diarization
+        // + ASR + aligner + LLM refiner resident together.
         let defaults = ServeRuntimeConfig::default();
-        assert_eq!(defaults.max_loaded_models, 1);
-        assert_eq!(defaults.engine_config().max_loaded_models, Some(1));
+        assert_eq!(defaults.max_loaded_models, 4);
+        assert_eq!(defaults.engine_config().max_loaded_models, Some(4));
 
         std::env::set_var(ENV_MAX_LOADED_MODELS, "3");
         let resolved = ServeRuntimeConfig::from_sources(
@@ -562,6 +628,49 @@ mod tests {
         assert_eq!(resolved.max_loaded_models, 3);
         assert_eq!(resolved.engine_config().max_loaded_models, Some(3));
         clear_env();
+    }
+
+    #[test]
+    fn user_config_supplies_residency_and_performance_overrides() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "izwi-serve-runtime-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&config_dir).expect("temp config dir");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtime]
+max_loaded_models = 6
+
+[runtime.performance.loading]
+workers = 5
+"#,
+        )
+        .expect("write config");
+
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).expect("parse");
+        assert_eq!(overrides.max_loaded_models, Some(6));
+        assert_eq!(overrides.performance.loading.workers, Some(5));
+
+        // Missing keys and missing files both fall back to defaults.
+        std::fs::write(&config_path, "[ui]\nenabled = false\n").expect("write config");
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).expect("parse");
+        assert_eq!(overrides.max_loaded_models, None);
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_dir.join("missing.toml")))
+                .expect("missing file is not an error");
+        assert_eq!(overrides.max_loaded_models, None);
+
+        // Wrong types fail closed.
+        std::fs::write(&config_path, "[runtime]\nmax_loaded_models = \"many\"\n")
+            .expect("write config");
+        assert!(ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).is_err());
+
+        std::fs::remove_dir_all(&config_dir).ok();
     }
 
     #[test]

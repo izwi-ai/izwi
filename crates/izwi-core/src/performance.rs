@@ -886,13 +886,23 @@ impl PerformanceConfigOverrides {
         };
         let document: toml::Value = toml::from_str(&source)
             .map_err(|error| Error::ConfigError(format!("{}: {error}", path.display())))?;
+        Self::from_document(&document, &path)
+    }
+
+    /// Extract the typed performance section from an already-parsed user
+    /// TOML document, so callers reading other `runtime` keys from the same
+    /// file do not need a second parse.
+    pub fn from_document(
+        document: &toml::Value,
+        config_path: &std::path::Path,
+    ) -> Result<Self> {
         if document
             .get("runtime")
             .is_some_and(|runtime| !runtime.is_table())
         {
             return Err(Error::ConfigError(format!(
                 "{} runtime must be a TOML table",
-                path.display()
+                config_path.display()
             )));
         }
         match document
@@ -900,7 +910,10 @@ impl PerformanceConfigOverrides {
             .and_then(|runtime| runtime.get("performance"))
         {
             Some(value) => value.clone().try_into().map_err(|error| {
-                Error::ConfigError(format!("{} runtime.performance: {error}", path.display()))
+                Error::ConfigError(format!(
+                    "{} runtime.performance: {error}",
+                    config_path.display()
+                ))
             }),
             None => Ok(Self::default()),
         }

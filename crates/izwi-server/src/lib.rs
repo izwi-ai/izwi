@@ -2163,12 +2163,7 @@ fn resolve_serve_runtime_config_with_env(
         max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
-    let file = ServeRuntimeConfigOverrides {
-        performance: izwi_core::PerformanceConfigOverrides::from_user_config(
-            args.config.as_deref(),
-        )?,
-        ..Default::default()
-    };
+    let file = ServeRuntimeConfigOverrides::from_user_config(args.config.as_deref())?;
     let mut runtime = ServeRuntimeConfig::from_sources(&file, env, &cli);
     for performance in &args.performance {
         runtime.performance.apply_overrides(performance);
