@@ -5,6 +5,7 @@ import {
   type DiarizationRecord,
   type DiarizationRecordRerunRequest,
   type ModelInfo,
+  type ModelResidencySummary,
 } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -39,6 +40,7 @@ interface DiarizationPageProps {
   selectedModel: string | null;
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
+  residencySummary?: ModelResidencySummary | null;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -61,6 +63,7 @@ export function DiarizationPage({
   selectedModel,
   loading,
   downloadProgress,
+  residencySummary,
   onDownload,
   onCancelDownload,
   onLoad,
@@ -665,6 +668,7 @@ export function DiarizationPage({
         onUseModel={onSelect}
         emptyMessage="No diarization pipeline models available for this route."
         zIndexClassName={isNewDiarizationModalOpen ? "z-[70]" : "z-50"}
+        residencySummary={residencySummary}
       />
     </PageShell>
   );

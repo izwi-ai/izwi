@@ -40,6 +40,21 @@ export function isDiarizationPipelineLlmVariant(variant: string): boolean {
   return variant === "Qwen3.5-4B";
 }
 
+/**
+ * Models the speech pipelines rely on as a stack (diarization checkpoint +
+ * ASR + forced aligner + refiner/summary LLM). Chat-route model switches
+ * must never evict these: unloading one silently degrades the pipeline the
+ * same way a too-small residency budget does.
+ */
+export function isSpeechPipelineManagedVariant(variant: string): boolean {
+  return (
+    isDiarizationVariant(variant) ||
+    isDiarizationPipelineAsrVariant(variant) ||
+    isDiarizationPipelineAlignerVariant(variant) ||
+    isDiarizationPipelineLlmVariant(variant)
+  );
+}
+
 export function collectManagedModels(options: {
   availableModels: ModelInfo[];
   managedVariants: Array<string | null | undefined>;

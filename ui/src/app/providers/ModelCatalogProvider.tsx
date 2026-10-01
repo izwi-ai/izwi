@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, type ModelInfo } from "@/api";
+import { api, type ModelInfo, type ModelResidencySummary } from "@/api";
 import {
   trackModelDownloadCompleted,
   trackModelDownloadStarted,
@@ -17,6 +17,7 @@ import {
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
+import { isSpeechPipelineManagedVariant } from "@/features/speech-text/modelFilters";
 
 interface ModelCatalogContextValue {
   models: ModelInfo[];
@@ -26,6 +27,7 @@ interface ModelCatalogContextValue {
   catalogError: string | null;
   downloadProgress: ModelDownloadProgressMap;
   readyModelsCount: number;
+  residencySummary: ModelResidencySummary | null;
   selectModel: (variant: string | null) => void;
   reportError: (message: string) => void;
   clearError: () => void;
@@ -52,6 +54,8 @@ export function ModelCatalogProvider({
 }: ModelCatalogProviderProps) {
   const { notify } = useNotifications();
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [residencySummary, setResidencySummary] =
+    useState<ModelResidencySummary | null>(null);
   const [selectedModel, setSelectedModelState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -121,6 +125,7 @@ export function ModelCatalogProvider({
       });
 
       setModels(mergedModels);
+      setResidencySummary(response.residency ?? null);
       setCatalogError(null);
       setSelectedModelState((current) => {
         if (
@@ -551,26 +556,30 @@ export function ModelCatalogProvider({
 
       try {
         const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
+        // Chat stays single-active, but pinned models and speech-pipeline
+        // stack members (diarization + ASR + aligner + refiner) are never
+        // evicted by a chat switch: unloading one silently degrades the
+        // pipeline. Unload them explicitly instead.
+        const isEvictableChatModel = (model: ModelInfo) =>
+          model.status === "ready" &&
+          VIEW_CONFIGS.chat.modelFilter(model.variant) &&
+          model.variant !== variant &&
+          !model.pinned &&
+          !isSpeechPipelineManagedVariant(model.variant);
         const loadedChatModels = isChatTarget
-          ? models.filter(
-              (model) =>
-                model.status === "ready" &&
-                VIEW_CONFIGS.chat.modelFilter(model.variant) &&
-                model.variant !== variant,
-            )
+          ? models.filter(isEvictableChatModel)
           : [];
 
         for (const loadedModel of loadedChatModels) {
           await api.unloadModel(loadedModel.variant);
         }
 
+        const demotedVariants = new Set(loadedChatModels.map((model) => model.variant));
         setModels((prev) =>
           prev.map((model) =>
             model.variant === variant
               ? { ...model, status: "loading" as const }
-              : isChatTarget &&
-                  model.status === "ready" &&
-                  VIEW_CONFIGS.chat.modelFilter(model.variant)
+              : demotedVariants.has(model.variant)
                 ? { ...model, status: "downloaded" as const }
                 : model,
           ),
@@ -696,6 +705,7 @@ export function ModelCatalogProvider({
       catalogError,
       downloadProgress,
       readyModelsCount: models.filter((model) => model.status === "ready").length,
+      residencySummary,
       selectModel,
       reportError,
       clearError,
@@ -719,6 +729,7 @@ export function ModelCatalogProvider({
       models,
       refreshModels,
       reportError,
+      residencySummary,
       selectModel,
       selectedModel,
       unloadModel,

@@ -194,3 +194,117 @@ describe("ModelCatalogProvider model action errors", () => {
     expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
   });
 });
+
+function ChatSwitchProbe({ targetVariant }: { targetVariant: string }) {
+  const { models, loadModel, residencySummary } = useModelCatalog();
+
+  return (
+    <div>
+      <span data-testid="resident-models">
+        {models.filter((model) => model.status === "ready").map((model) => model.variant).join(",")}
+      </span>
+      <span data-testid="residency-summary">
+        {residencySummary
+          ? `${residencySummary.resident_count}/${residencySummary.max_loaded_models}`
+          : "none"}
+      </span>
+      <button type="button" onClick={() => void loadModel(targetVariant)}>
+        Load target
+      </button>
+    </div>
+  );
+}
+
+function renderChatSwitch(targetVariant: string) {
+  return render(
+    <NotificationProvider>
+      <ModelCatalogProvider>
+        <ChatSwitchProbe targetVariant={targetVariant} />
+      </ModelCatalogProvider>
+    </NotificationProvider>,
+  );
+}
+
+describe("ModelCatalogProvider residency-aware chat eviction", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("keeps the diarization refiner resident across chat model switches", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, status: "ready" },
+        {
+          ...model,
+          variant: "Qwen3-8B-GGUF",
+          status: "ready",
+        },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+
+    renderChatSwitch("Qwen3-8B-GGUF");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF"));
+    expect(apiMocks.unloadModel).not.toHaveBeenCalled();
+  });
+
+  it("still evicts non-pipeline chat models on a chat switch", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3-8B-GGUF", status: "ready" },
+        { ...model, variant: "Qwen3-4B-GGUF", status: "ready" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+    apiMocks.unloadModel.mockResolvedValue({ status: "unloaded", message: "unloaded" });
+
+    renderChatSwitch("Qwen3-4B-GGUF");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() =>
+      expect(apiMocks.unloadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF"),
+    );
+    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF");
+  });
+
+  it("never evicts pinned models on a chat switch", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3-8B-GGUF", status: "ready", pinned: true },
+        { ...model, variant: "Qwen3-4B-GGUF", status: "ready" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+
+    renderChatSwitch("Qwen3-4B-GGUF");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF"));
+    expect(apiMocks.unloadModel).not.toHaveBeenCalled();
+  });
+
+  it("exposes the server residency summary", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+      residency: {
+        resident_count: 1,
+        max_loaded_models: 4,
+        model_keep_alive_secs: 600,
+      },
+    });
+
+    renderChatSwitch("Qwen3-8B-GGUF");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("residency-summary")).toHaveTextContent("1/4"),
+    );
+  });
+});

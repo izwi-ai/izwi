@@ -1,4 +1,4 @@
-import type { ModelInfo } from "@/api";
+import type { ModelInfo, ModelResidencySummary } from "@/api";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 
 export interface SharedPageProps {
@@ -6,6 +6,7 @@ export interface SharedPageProps {
   selectedModel: string | null;
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
+  residencySummary?: ModelResidencySummary | null;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
