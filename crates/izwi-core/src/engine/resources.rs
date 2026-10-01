@@ -588,13 +588,23 @@ impl ResourceAuthority {
         state.poisoned.get_or_insert_with(|| reason.into());
     }
 
-    #[cfg(test)]
     pub(crate) fn poison_reason(&self) -> Option<String> {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .poisoned
             .clone()
+    }
+
+    /// Reset the poison marker. Test-only: the resource-authority registry is
+    /// process-global, so a case that poisons it must restore it before it
+    /// ends. Production recovery is a lifecycle concern, not a ledger one.
+    #[cfg(test)]
+    pub(crate) fn clear_poison_for_tests(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .poisoned = None;
     }
 
     /// Stable backend planning headroom for load-time sizing. Unlike guarded

@@ -1464,7 +1464,67 @@ impl ModelLifecycleController {
         }
     }
 
+    /// Whether a load failure must trigger the Metal command-buffer OOM
+    /// ladder (pooled-scratch flush and one retry before poisoning). Real
+    /// Metal backends classify by backend kind; CPU test harnesses opt in
+    /// through the injection flag so the ladder stays regression-tested
+    /// without a Metal device.
+    fn load_failure_is_metal_command_buffer_oom(&self, error: &Error) -> bool {
+        if !is_metal_command_buffer_oom(error) {
+            return false;
+        }
+        if self.backend_router.context().backend_kind == BackendKind::Metal {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            if self.load_test_metal_oom_ladder.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn run_load_transaction_locked(
+        &self,
+        variant: ModelVariant,
+        max_loaded_models: Option<usize>,
+        generation: u64,
+    ) -> Result<()> {
+        let outcome = self
+            .run_load_attempt_locked(variant, max_loaded_models, generation)
+            .await;
+        let Err(error) = outcome else {
+            return Ok(());
+        };
+        if !self.load_failure_is_metal_command_buffer_oom(&error) {
+            return Err(error);
+        }
+        if self.coordinator.resource_authority().poison_reason().is_some() {
+            // The failed attempt could not roll back cleanly; retrying over
+            // dirty residency state would compound the damage. Fail closed.
+            return Err(error);
+        }
+        MetalPoolManager::global().clear_all();
+        info!(
+            model = %variant,
+            %error,
+            "Metal command-buffer OOM while loading; flushed pooled Metal scratch and retrying the load once"
+        );
+        let retry = self
+            .run_load_attempt_locked(variant, max_loaded_models, generation)
+            .await;
+        if let Err(retry_error) = &retry {
+            if self.load_failure_is_metal_command_buffer_oom(retry_error) {
+                self.coordinator.resource_authority().poison(format!(
+                    "Metal command-buffer OOM while loading {variant} persisted after a pooled-scratch flush and one retry: {retry_error}"
+                ));
+            }
+        }
+        retry
+    }
+
+    async fn run_load_attempt_locked(
         &self,
         variant: ModelVariant,
         max_loaded_models: Option<usize>,
@@ -1477,6 +1537,8 @@ impl ModelLifecycleController {
         }
         #[cfg(test)]
         self.maybe_panic_during_load();
+        #[cfg(test)]
+        self.maybe_fail_load_with_metal_oom()?;
 
         let load_started = Instant::now();
         let resolved = self.resolve_model_load(variant).await?;
@@ -2812,13 +2874,7 @@ impl ModelLifecycleController {
         .await;
 
         if let Err(error) = publication {
-            if self.backend_router.context().backend_kind == BackendKind::Metal
-                && is_metal_command_buffer_oom(&error)
-            {
-                self.coordinator.resource_authority().poison(format!(
-                    "Metal command-buffer OOM while loading {variant}: {error}"
-                ));
-            }
+            let metal_oom = self.load_failure_is_metal_command_buffer_oom(&error);
             if let Err(rollback_error) = self.rollback_model_locked(variant).await {
                 self.mark_slot_cleanup_required(variant);
                 tracing::error!(
@@ -2826,6 +2882,14 @@ impl ModelLifecycleController {
                     error = %rollback_error,
                     "Model load rollback failed"
                 );
+                if metal_oom {
+                    // Dirty residency state after a device-fatal OOM: new
+                    // physical work must fail closed until recreation, so a
+                    // later attempt cannot be blamed for earlier queued work.
+                    self.coordinator.resource_authority().poison(format!(
+                        "Metal command-buffer OOM while loading {variant} and rollback failed: {error}"
+                    ));
+                }
             }
             return Err(error);
         }
@@ -4520,6 +4584,111 @@ mod tests {
         assert_eq!(runtime.model_lifecycle.resident_phase(variant), None);
         assert_eq!(authority.snapshot().reservations, 0);
 
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// The resource-authority registry is process-global: the Metal OOM
+    /// ladder tests serialize against each other and restore the authority
+    /// on exit so concurrent cases never observe their poison.
+    static METAL_OOM_LADDER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct ClearAuthorityPoisonOnDrop(Arc<ResourceAuthority>);
+
+    impl Drop for ClearAuthorityPoisonOnDrop {
+        fn drop(&mut self) {
+            self.0.clear_poison_for_tests();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metal_oom_load_is_flushed_and_retried_once_before_poisoning() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-oom-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        runtime.model_lifecycle.set_load_test_metal_ooms(1);
+
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let _load_task = runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader.expect("load leader"),
+        );
+        // The first attempt fails with the injected command-buffer OOM; the
+        // wrapper must flush pooled scratch and retry once. The retry is not
+        // injected, so it fails with an ordinary missing-model error instead
+        // of the OOM — proving the attempt actually re-ran.
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+            .await
+            .expect("retry outcome timed out")
+            .expect_err("missing model artifacts must fail");
+        assert!(
+            !format!("{error}").contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the retried attempt must not surface the injected OOM: {error}"
+        );
+        assert!(
+            runtime
+                .coordinator
+                .resource_authority()
+                .poison_reason()
+                .is_none(),
+            "a single OOM must not poison the authority"
+        );
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persisted_metal_oom_after_the_retry_poisons_the_authority() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-oom2-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        runtime.model_lifecycle.set_load_test_metal_ooms(2);
+
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let _load_task = runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader.expect("load leader"),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+            .await
+            .expect("poison outcome timed out")
+            .expect_err("persisted OOM must fail");
+        assert!(
+            format!("{error}").contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the injected OOM must surface after the retry: {error}"
+        );
+        let reason = runtime
+            .coordinator
+            .resource_authority()
+            .poison_reason()
+            .expect("persisted OOM must poison the authority");
+        assert!(
+            reason.contains("persisted after a pooled-scratch flush and one retry"),
+            "unexpected poison reason: {reason}"
+        );
+        drop(ClearAuthorityPoisonOnDrop(
+            runtime.coordinator.resource_authority(),
+        ));
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
