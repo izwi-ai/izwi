@@ -26,6 +26,10 @@ use crate::error::{Error, Result};
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
 pub const ARTIFACT_MANIFEST_FILE: &str = "izwi-artifact.json";
+/// On-disk cache of resolved expected download sizes, so cold starts do not
+/// need a Hugging Face round-trip per catalog variant to render the model
+/// list. Keyed by variant dir_name (stable across process restarts).
+const EXPECTED_SIZES_CACHE_FILE: &str = "izwi-expected-sizes.json";
 
 const QWEN38_REQUIRED_METADATA_FILES: &[&str] = &[
     "config.json",
@@ -431,6 +435,83 @@ pub struct DownloadStateManager {
     state: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadState>>>,
 }
 
+/// In-memory expected-size map backed by a JSON file next to the models dir.
+/// Reads consult memory only; fresh Hugging Face resolutions append to the
+/// file so the next cold start renders sizes without any network round-trip.
+#[derive(Debug, Clone)]
+struct ExpectedSizeStore {
+    path: PathBuf,
+    sizes: Arc<RwLock<HashMap<ModelVariant, u64>>>,
+}
+
+impl ExpectedSizeStore {
+    fn load(models_dir: &Path) -> Self {
+        let path = models_dir.join(EXPECTED_SIZES_CACHE_FILE);
+        let sizes = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<HashMap<String, u64>>(&bytes)
+                    .map_err(|error| {
+                        warn!(
+                            "Ignoring unreadable expected-size cache {}: {}",
+                            path.display(),
+                            error
+                        );
+                        error
+                    })
+                    .ok()
+            })
+            .map(|raw| {
+                raw.into_iter()
+                    .filter_map(|(name, size)| {
+                        crate::catalog::parse_model_variant(&name)
+                            .ok()
+                            .map(|variant| (variant, size))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        Self {
+            path,
+            sizes: Arc::new(RwLock::new(sizes)),
+        }
+    }
+
+    async fn get(&self, variant: ModelVariant) -> Option<u64> {
+        self.sizes.read().await.get(&variant).copied()
+    }
+
+    async fn insert(&self, variant: ModelVariant, size: u64) {
+        let snapshot = {
+            let mut sizes = self.sizes.write().await;
+            if sizes.get(&variant).copied() == Some(size) {
+                return;
+            }
+            sizes.insert(variant, size);
+            sizes
+                .iter()
+                .map(|(variant, size)| (variant.dir_name().to_string(), *size))
+                .collect::<HashMap<_, _>>()
+        };
+        // Best-effort persistence: a cache write failure must never fail a
+        // download or a model-list request.
+        let path = self.path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let bytes = serde_json::to_vec_pretty(&snapshot)?;
+            let partial = path.with_extension("json.part");
+            std::fs::write(&partial, bytes)?;
+            std::fs::rename(&partial, &path)?;
+            std::result::Result::<(), Error>::Ok(())
+        })
+        .await;
+        if let Err(join) = &result {
+            warn!("Expected-size cache write task failed: {join}");
+        } else if let Ok(Err(error)) = result {
+            warn!("Failed to persist expected-size cache: {error}");
+        }
+    }
+}
+
 impl DownloadStateManager {
     pub fn new() -> Self {
         Self::default()
@@ -460,7 +541,7 @@ pub struct ModelDownloader {
     active_downloads: Arc<RwLock<std::collections::HashMap<ModelVariant, ActiveDownload>>>,
     latest_progress: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadProgress>>>,
     repo_tree_cache: Arc<RwLock<HashMap<String, HashMap<String, u64>>>>,
-    expected_size_cache: Arc<RwLock<HashMap<ModelVariant, u64>>>,
+    expected_sizes: ExpectedSizeStore,
     multi_progress: MultiProgress,
     state_manager: DownloadStateManager,
 }
@@ -481,6 +562,7 @@ impl ModelDownloader {
 
         let multi_progress = MultiProgress::new();
         multi_progress.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(10));
+        let expected_sizes = ExpectedSizeStore::load(&models_dir);
 
         Ok(Self {
             models_dir,
@@ -488,7 +570,7 @@ impl ModelDownloader {
             active_downloads: Arc::new(RwLock::new(std::collections::HashMap::new())),
             latest_progress: Arc::new(RwLock::new(std::collections::HashMap::new())),
             repo_tree_cache: Arc::new(RwLock::new(HashMap::new())),
-            expected_size_cache: Arc::new(RwLock::new(HashMap::new())),
+            expected_sizes,
             multi_progress,
             state_manager: DownloadStateManager::new(),
         })
@@ -1155,7 +1237,7 @@ impl ModelDownloader {
             active_downloads: Arc::clone(&self.active_downloads),
             latest_progress: Arc::clone(&self.latest_progress),
             repo_tree_cache: Arc::clone(&self.repo_tree_cache),
-            expected_size_cache: Arc::clone(&self.expected_size_cache),
+            expected_sizes: self.expected_sizes.clone(),
             multi_progress: MultiProgress::new(), // Each spawned task gets its own multi-progress
             state_manager: self.state_manager.clone(),
         }
@@ -2215,7 +2297,7 @@ impl ModelDownloader {
     /// This uses the same file planning logic as the downloader itself, then caches
     /// results so list APIs do not repeatedly hit Hugging Face.
     pub async fn expected_size_bytes(&self, variant: ModelVariant) -> u64 {
-        if let Some(size) = self.expected_size_cache.read().await.get(&variant).copied() {
+        if let Some(size) = self.expected_sizes.get(variant).await {
             return size;
         }
 
@@ -2230,12 +2312,16 @@ impl ModelDownloader {
             }
         };
 
-        self.expected_size_cache
-            .write()
-            .await
-            .insert(variant, resolved);
+        self.expected_sizes.insert(variant, resolved).await;
 
         resolved
+    }
+
+    /// Non-blocking lookup of a previously resolved expected size. Returns
+    /// `None` when no Hugging Face resolution has completed yet, so the caller
+    /// can fall back to the built-in estimate without any network I/O.
+    pub async fn cached_expected_size_bytes(&self, variant: ModelVariant) -> Option<u64> {
+        self.expected_sizes.get(variant).await
     }
 
     /// Subscribe to progress updates for an active download

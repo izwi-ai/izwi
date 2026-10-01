@@ -446,6 +446,10 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         persistence,
     )?;
     state.runtime.spawn_idle_model_reaper();
+    // Resolve precise Hugging Face download sizes off the request path so the
+    // model-list endpoint stays instant on cold starts; the UI picks refined
+    // sizes up on its next refresh.
+    state.runtime.model_manager().spawn_expected_size_resolution();
     let mut startup_warnings = Vec::new();
     if let Err(err) = state
         .batch_runtime_store

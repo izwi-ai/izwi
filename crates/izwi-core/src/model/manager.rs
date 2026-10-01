@@ -66,6 +66,12 @@ impl ModelManager {
         })
     }
 
+    /// Refresh per-variant catalog state. This must stay free of network and
+    /// blocking disk I/O: the model-list endpoint calls it on every request,
+    /// and a cold start once blocked it for minutes on Hugging Face lookups.
+    /// Sizes come from the persisted/in-memory expected-size cache, active
+    /// download progress, or the built-in static estimate; a background task
+    /// resolves precise Hugging Face sizes off the request path.
     async fn refresh_model_states(&self) {
         let variants: Vec<ModelVariant> = {
             let models = self.models.read().await;
@@ -88,10 +94,10 @@ impl ModelManager {
                     if progress.total_bytes > 0 {
                         Some(progress.total_bytes)
                     } else {
-                        Some(self.downloader.expected_size_bytes(variant).await)
+                        Some(self.expected_size_or_estimate(variant).await)
                     }
                 } else {
-                    Some(self.downloader.expected_size_bytes(variant).await)
+                    Some(self.expected_size_or_estimate(variant).await)
                 };
                 let residency = self.residency.state(variant).await;
 
@@ -158,6 +164,52 @@ impl ModelManager {
                 }
                 DownloadState::Downloading => {}
             }
+        }
+    }
+
+    /// Best known expected size for a not-downloaded variant without any
+    /// network I/O: the persisted/resolved cache wins, then the static
+    /// built-in estimate.
+    async fn expected_size_or_estimate(&self, variant: ModelVariant) -> u64 {
+        self.downloader
+            .cached_expected_size_bytes(variant)
+            .await
+            .unwrap_or_else(|| variant.estimated_size())
+    }
+
+    /// Spawn a one-shot background task that resolves precise Hugging Face
+    /// expected sizes for every not-downloaded variant into the shared
+    /// expected-size cache. The request path never waits on this; the UI
+    /// picks the refined sizes up on its next refresh.
+    pub fn spawn_expected_size_resolution(self: &Arc<Self>) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.resolve_expected_sizes_in_background().await;
+        });
+    }
+
+    async fn resolve_expected_sizes_in_background(&self) {
+        for variant in ModelVariant::all() {
+            if !variant.is_enabled() {
+                continue;
+            }
+            if self.downloader.is_downloaded(*variant) {
+                continue;
+            }
+            if self.downloader.is_download_active(*variant).await {
+                continue;
+            }
+            if self
+                .downloader
+                .cached_expected_size_bytes(*variant)
+                .await
+                .is_some()
+            {
+                continue;
+            }
+            // Populates the shared (persisted) cache; failures fall back to
+            // the static estimate inside expected_size_bytes.
+            let _ = self.downloader.expected_size_bytes(*variant).await;
         }
     }
 
@@ -501,6 +553,60 @@ mod tests {
     use crate::config::EngineConfig;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn list_models_uses_static_estimate_without_any_network_resolution() {
+        // A cold cache and no persisted file: the list path must not call out
+        // to Hugging Face. It returns instantly with the built-in estimate.
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let manager = ModelManager::new(EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let started = std::time::Instant::now();
+        let models = manager.list_models().await;
+        let model = models.into_iter().find(|m| m.variant == variant).unwrap();
+
+        assert_eq!(model.status, ModelStatus::NotDownloaded);
+        assert_eq!(model.size_bytes, Some(variant.estimated_size()));
+        // Network-free path: even a slow resolver would exceed this if it were
+        // called synchronously from list_models.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expected_size_resolution_persists_to_disk_for_cold_starts() {
+        // Seed the persisted cache file directly (as a previous background
+        // resolution would have), then confirm a fresh manager reads it with
+        // no network access.
+        let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let persisted = variant.estimated_size() + 1024;
+        let mut map = std::collections::HashMap::new();
+        map.insert(variant.dir_name().to_string(), persisted);
+        std::fs::write(
+            temp_dir.join("izwi-expected-sizes.json"),
+            serde_json::to_string(&map).unwrap(),
+        )
+        .unwrap();
+
+        let manager = ModelManager::new(EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let size = manager.expected_size_or_estimate(variant).await;
+        assert_eq!(size, persisted);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn refresh_keeps_downloading_status_when_partial_files_exist() {
