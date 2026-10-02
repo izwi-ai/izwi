@@ -45,10 +45,12 @@ const model: ModelInfo = {
 function CatalogProbe() {
   const {
     models,
+    selectedModel,
     error,
     catalogError,
     loading,
     refreshModels,
+    selectModel,
     loadModel,
     unloadModel,
   } = useModelCatalog();
@@ -57,10 +59,14 @@ function CatalogProbe() {
     <div>
       <span>{loading ? "loading" : "ready"}</span>
       <span data-testid="model-count">{models.length}</span>
+      <span data-testid="selected-model">{selectedModel ?? "none"}</span>
       <span data-testid="catalog-error">{error}</span>
       <span data-testid="catalog-load-error">{catalogError}</span>
       <button type="button" onClick={() => void refreshModels()}>
         Retry catalog
+      </button>
+      <button type="button" onClick={() => selectModel("Qwen3.5-4B")}>
+        Select
       </button>
       <button type="button" onClick={() => void loadModel(model.variant)}>
         Load
@@ -364,5 +370,68 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     await waitFor(() =>
       expect(screen.getByTestId("residency-summary")).toHaveTextContent("1/4"),
     );
+  });
+});
+
+describe("ModelCatalogProvider user-selected model persistence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({ models: [model] });
+  });
+
+  it("persists an explicit selection and restores it on startup", async () => {
+    const persisted = renderCatalog();
+    await screen.findByText("ready");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent("none");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("selected-model")).toHaveTextContent(
+        "Qwen3.5-4B",
+      ),
+    );
+    expect(window.localStorage.getItem("izwi.modelCatalog.userSelectedModel")).toBe(
+      "Qwen3.5-4B",
+    );
+    persisted.unmount();
+
+    renderCatalog();
+    await screen.findByText("ready");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-4B",
+    );
+  });
+
+  it("keeps a user-selected variant that vanished from the catalog", async () => {
+    window.localStorage.setItem(
+      "izwi.modelCatalog.userSelectedModel",
+      "Removed-Model",
+    );
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+    });
+
+    renderCatalog();
+    await screen.findByText("ready");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Removed-Model",
+    );
+  });
+
+  it("leaves auto-picked fallback selections unpersisted", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-4B",
+    );
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBeNull();
   });
 });

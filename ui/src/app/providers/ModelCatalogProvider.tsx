@@ -45,6 +45,28 @@ function modelActionError(err: unknown, fallback: string): string {
   return err instanceof Error && err.message.trim() ? err.message : fallback;
 }
 
+const USER_SELECTED_MODEL_STORAGE_KEY = "izwi.modelCatalog.userSelectedModel";
+
+function readPersistedUserSelectedModel(): string | null {
+  try {
+    return window.localStorage.getItem(USER_SELECTED_MODEL_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistUserSelectedModel(variant: string | null): void {
+  try {
+    if (variant === null) {
+      window.localStorage.removeItem(USER_SELECTED_MODEL_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(USER_SELECTED_MODEL_STORAGE_KEY, variant);
+    }
+  } catch {
+    // Persistence is best-effort; the in-memory selection still works.
+  }
+}
+
 interface ModelCatalogProviderProps {
   children: ReactNode;
 }
@@ -56,7 +78,13 @@ export function ModelCatalogProvider({
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [residencySummary, setResidencySummary] =
     useState<ModelResidencySummary | null>(null);
-  const [selectedModel, setSelectedModelState] = useState<string | null>(null);
+  const [selectedModel, setSelectedModelState] = useState<string | null>(() =>
+    readPersistedUserSelectedModel(),
+  );
+  // Tracks whether the current selection was made by the user (explicit
+  // select or load) versus auto-picked as a fallback. Only user choices are
+  // persisted, and only user choices survive a vanished catalog variant.
+  const userSelectedModelRef = useRef(selectedModel !== null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -89,9 +117,18 @@ export function ModelCatalogProvider({
     [models],
   );
 
-  const selectModel = useCallback((variant: string | null) => {
+  const adoptUserSelectedModel = useCallback((variant: string | null) => {
+    userSelectedModelRef.current = variant !== null;
+    persistUserSelectedModel(variant);
     setSelectedModelState(variant);
   }, []);
+
+  const selectModel = useCallback(
+    (variant: string | null) => {
+      adoptUserSelectedModel(variant);
+    },
+    [adoptUserSelectedModel],
+  );
 
   const reportError = useCallback((message: string) => {
     setError(message);
@@ -135,6 +172,12 @@ export function ModelCatalogProvider({
           current &&
           mergedModels.some((model) => model.variant === current)
         ) {
+          return current;
+        }
+        if (current && userSelectedModelRef.current) {
+          // The user explicitly picked this variant. If it disappeared from
+          // the catalog (removed upstream), keep surfacing the stale
+          // selection instead of silently swapping to whatever is ready.
           return current;
         }
 
@@ -626,7 +669,7 @@ export function ModelCatalogProvider({
         // an explicit unload or delete aborts it.
         await api.loadModel(variant, { signal: abortController.signal });
         if (!cancelledModelLoadsRef.current.has(variant)) {
-          setSelectedModelState(variant);
+          adoptUserSelectedModel(variant);
           void trackModelLoaded(variant);
           notify({
             title: "Model loaded",
@@ -655,7 +698,7 @@ export function ModelCatalogProvider({
         await refreshModels();
       }
     },
-    [getModelLabel, models, notify, refreshModels],
+    [adoptUserSelectedModel, getModelLabel, models, notify, refreshModels],
   );
 
   const unloadModel = useCallback(
@@ -675,6 +718,10 @@ export function ModelCatalogProvider({
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        if (selectedModel === variant) {
+          userSelectedModelRef.current = false;
+          persistUserSelectedModel(null);
+        }
         notify({
           title: cancellingLoad ? "Model load cancelled" : "Model unloaded",
           description: cancellingLoad
@@ -698,7 +745,7 @@ export function ModelCatalogProvider({
         cancelledModelLoadsRef.current.delete(variant);
       }
     },
-    [getModelLabel, models, notify, refreshModels],
+    [getModelLabel, models, notify, refreshModels, selectedModel],
   );
 
   const deleteModel = useCallback(
@@ -715,6 +762,10 @@ export function ModelCatalogProvider({
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        if (selectedModel === variant) {
+          userSelectedModelRef.current = false;
+          persistUserSelectedModel(null);
+        }
         notify({
           title: "Model deleted",
           description: `${getModelLabel(variant)} was removed from disk.`,
@@ -738,6 +789,7 @@ export function ModelCatalogProvider({
       getModelLabel,
       notify,
       refreshModels,
+      selectedModel,
     ],
   );
 
