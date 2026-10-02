@@ -660,7 +660,6 @@ fn commit_sortformer_streaming_state(
     lease: &mut InvocationTensorLease,
     cfg: SortformerStreamingConfig,
     state: &SortformerStreamingState,
-    device: &Device,
 ) -> Result<()> {
     if state.spkcache.len() > cfg.spkcache_len
         || state.fifo.len() > cfg.fifo_len
@@ -679,15 +678,23 @@ fn commit_sortformer_streaming_state(
     let target_cursor = expected_cursor
         .checked_add(1)
         .ok_or_else(|| Error::InferenceError("Sortformer state cursor overflow".into()))?;
+    // Stage the state tensors on the arena's own device. The Sortformer model
+    // runs on CPU for every non-CUDA backend, so the model device is NOT a
+    // valid staging device on Metal (and may differ from the worker device on
+    // multi-device CUDA): the arena backing is what validates the commit.
+    let device = {
+        let arena = lease.arena()?;
+        arena.device().clone()
+    };
     let speaker_embeddings =
-        padded_embedding_tensor(&state.spkcache, cfg.spkcache_len, cfg.fc_d_model, device)?;
+        padded_embedding_tensor(&state.spkcache, cfg.spkcache_len, cfg.fc_d_model, &device)?;
     let speaker_predictions = padded_prediction_tensor(
         state.spkcache_preds.as_deref().unwrap_or_default(),
         cfg.spkcache_len,
         cfg.num_speakers,
-        device,
+        &device,
     )?;
-    let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, device)?;
+    let silence_mean = Tensor::from_vec(state.mean_sil_emb.clone(), cfg.fc_d_model, &device)?;
     let control = Tensor::from_vec(
         vec![
             state.spkcache.len() as f32,
@@ -696,7 +703,7 @@ fn commit_sortformer_streaming_state(
             state.n_sil_frames as f32,
         ],
         4,
-        device,
+        &device,
     )?;
     let mut components = vec![
         InvocationTensorComponentValue {
@@ -760,9 +767,9 @@ fn commit_sortformer_streaming_state(
     ];
     if cfg.fifo_len > 0 {
         let fifo_embeddings =
-            padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, device)?;
+            padded_embedding_tensor(&state.fifo, cfg.fifo_len, cfg.fc_d_model, &device)?;
         let fifo_predictions =
-            padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, cfg.num_speakers, device)?;
+            padded_prediction_tensor(&state.fifo_preds, cfg.fifo_len, cfg.num_speakers, &device)?;
         components.insert(
             2,
             InvocationTensorComponentValue {
@@ -1791,7 +1798,7 @@ impl SortformerInferenceModel {
                 cfg,
             )?;
             state = if let Some(lease) = physical_state.as_deref_mut() {
-                commit_sortformer_streaming_state(lease, cfg, &updated_state, &self.device)?;
+                commit_sortformer_streaming_state(lease, cfg, &updated_state)?;
                 updated_state
             } else {
                 updated_state
@@ -4255,7 +4262,7 @@ fn normalize_all_features(mel: &mut [f32], n_mels: usize, frames: usize, valid_f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::DeviceKind;
+    use crate::backends::{BackendKind, DeviceKind};
     use crate::runtime::audio_io::decode_audio_bytes;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -4285,6 +4292,181 @@ mod tests {
             weak_boost_rate: 1.5,
             min_pos_scores_rate: 0.5,
         }
+    }
+
+    /// Builds a live invocation arena for the Sortformer streaming state on
+    /// the requested backend and hands out one lease — the exact objects the
+    /// served diarization path commits through.
+    fn streaming_state_commit_lease(
+        cfg: SortformerStreamingConfig,
+        backend: BackendKind,
+        device: Device,
+    ) -> InvocationTensorLease {
+        use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
+        use crate::engine::{InvocationTensorPoolOwner, ModelInstanceId};
+        use crate::kv::v2::{
+            InvocationStateCapacity, InvocationWorkspaceDomain, PlacementPolicy, WorkspaceFormula,
+        };
+
+        // Mirror the arena's own device-identity derivation so the negotiated
+        // plan matches the resident device on every backend (Metal's ordinal
+        // is the registry-id fold, not 0).
+        let device_ordinal = match device.location() {
+            candle_core::DeviceLocation::Cpu => None,
+            candle_core::DeviceLocation::Cuda { gpu_id } => Some(u32::try_from(gpu_id).unwrap()),
+            candle_core::DeviceLocation::Metal { gpu_id } => {
+                let id = gpu_id as u64;
+                Some((id ^ (id >> 32)) as u32)
+            }
+        };
+
+        let contract = physical::sortformer_invocation_contract(cfg).unwrap();
+        let plan = std::sync::Arc::new(
+            negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend,
+                    device_ordinal,
+                    page_tokens_hint: None,
+                    storage_dtype_hint: None,
+                },
+            )
+            .unwrap(),
+        );
+        let state_domain = contract
+            .domains
+            .iter()
+            .find(|domain| domain.id() == physical::SORTFORMER_STREAMING_STATE_DOMAIN)
+            .unwrap()
+            .clone();
+        let fixed_bytes = plan
+            .non_paged
+            .iter()
+            .find(|resolved| resolved.domain() == physical::SORTFORMER_STREAMING_STATE_DOMAIN)
+            .unwrap()
+            .maximum_bytes();
+        let workspace_domain = InvocationWorkspaceDomain::State {
+            state: state_domain,
+            capacity: InvocationStateCapacity::SemanticBounded,
+            placement: PlacementPolicy::BackendLocal,
+            formula: WorkspaceFormula {
+                fixed_bytes,
+                dimensions: vec![],
+                terms: vec![],
+            },
+        };
+        let mut owner = InvocationTensorPoolOwner::new(
+            &contract,
+            plan,
+            workspace_domain,
+            device,
+            ModelInstanceId::new(7),
+            1,
+            1,
+        )
+        .unwrap();
+        owner.lease().unwrap()
+    }
+
+    fn synthetic_streaming_state(cfg: &SortformerStreamingConfig) -> SortformerStreamingState {
+        SortformerStreamingState {
+            spkcache: vec![vec![0.5; cfg.fc_d_model]; 4.min(cfg.spkcache_len)],
+            spkcache_preds: Some(vec![vec![0.25; cfg.num_speakers]; 4.min(cfg.spkcache_len)]),
+            fifo: Vec::new(),
+            fifo_preds: Vec::new(),
+            mean_sil_emb: vec![0.1; cfg.fc_d_model],
+            n_sil_frames: 12,
+        }
+    }
+
+    #[test]
+    fn sortformer_streaming_commit_stages_state_on_the_arena_device() {
+        let cases = [
+            ("v2.1", streaming_cfg_for_test()),
+            (
+                "nemotron",
+                resolve_streaming_config(
+                    ModelVariant::Nemotron3Diarization,
+                    &SortformerModulesConfig {
+                        // The checkpoint publishes an 8-channel-divisible
+                        // cache; the 188 default is 4-channel only.
+                        spkcache_len: Some(192),
+                        ..SortformerModulesConfig::default()
+                    },
+                    512,
+                    8,
+                    SortformerEncoderKind::FeatureStackingRope,
+                )
+                .unwrap(),
+            ),
+            ("workspace", production_workspace_streaming_config()),
+        ];
+        for (label, cfg) in cases {
+            let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+            let state = synthetic_streaming_state(&cfg);
+            commit_sortformer_streaming_state(&mut lease, cfg, &state)
+                .unwrap_or_else(|err| panic!("{label} first commit failed: {err}"));
+            commit_sortformer_streaming_state(&mut lease, cfg, &state)
+                .unwrap_or_else(|err| panic!("{label} second commit failed: {err}"));
+            let arena = lease.arena().unwrap();
+            assert_eq!(arena.absolute_cursor(), 2, "{label}");
+            assert_eq!(arena.device().location(), Device::Cpu.location(), "{label}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn sortformer_streaming_commit_stages_state_on_the_metal_arena_device() {
+        let Ok(device) = Device::new_metal(0) else {
+            // No Metal device on this host: the CPU test above still covers
+            // the device-routing contract.
+            return;
+        };
+        let cfg = resolve_streaming_config(
+            ModelVariant::Nemotron3Diarization,
+            &SortformerModulesConfig {
+                spkcache_len: Some(192),
+                ..SortformerModulesConfig::default()
+            },
+            512,
+            8,
+            SortformerEncoderKind::FeatureStackingRope,
+        )
+        .unwrap();
+        let mut lease = streaming_state_commit_lease(cfg, BackendKind::Metal, device.clone());
+        let state = synthetic_streaming_state(&cfg);
+        // Before the arena-device fix this commit failed with "invocation
+        // tensor input has incompatible device, dtype, or rank": the state
+        // tensors were staged on the model's CPU device while the arena
+        // backing was Metal-resident.
+        commit_sortformer_streaming_state(&mut lease, cfg, &state).unwrap();
+        let arena = lease.arena().unwrap();
+        assert_eq!(arena.device().location(), device.location());
+        assert_eq!(arena.absolute_cursor(), 1);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[ignore = "requires CUDA hardware"]
+    #[test]
+    fn sortformer_streaming_commit_stages_state_on_the_cuda_arena_device() {
+        let device = Device::new_cuda(0).unwrap();
+        let cfg = resolve_streaming_config(
+            ModelVariant::Nemotron3Diarization,
+            &SortformerModulesConfig {
+                spkcache_len: Some(192),
+                ..SortformerModulesConfig::default()
+            },
+            512,
+            8,
+            SortformerEncoderKind::FeatureStackingRope,
+        )
+        .unwrap();
+        let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cuda, device.clone());
+        let state = synthetic_streaming_state(&cfg);
+        commit_sortformer_streaming_state(&mut lease, cfg, &state).unwrap();
+        let arena = lease.arena().unwrap();
+        assert_eq!(arena.device().location(), device.location());
+        assert_eq!(arena.absolute_cursor(), 1);
     }
 
     #[test]

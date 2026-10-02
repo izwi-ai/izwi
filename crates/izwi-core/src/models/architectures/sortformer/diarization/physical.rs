@@ -35,7 +35,7 @@ pub(crate) fn sortformer_physical_state_spec(
     })
 }
 
-fn sortformer_invocation_contract(
+pub(crate) fn sortformer_invocation_contract(
     cfg: SortformerStreamingConfig,
 ) -> Result<InferenceStateContract> {
     let component = |id, role, dimensions| TensorComponentSpec {

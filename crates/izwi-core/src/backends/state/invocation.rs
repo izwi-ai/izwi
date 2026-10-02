@@ -309,6 +309,12 @@ impl InvocationTensorArena {
         self.kind
     }
 
+    /// The device this arena's component storage is resident on: staged input
+    /// tensors must be built on (or moved to) it before `apply_intent`.
+    pub(crate) const fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub(crate) const fn absolute_cursor(&self) -> u64 {
         self.absolute_cursor
     }
