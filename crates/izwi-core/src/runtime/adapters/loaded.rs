@@ -3241,45 +3241,12 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
                 metadata.model_variant
             )));
         }
-        if streaming.asr_long_form {
-            // Same blocking-atomic shape as the Whisper long-form graph: the
-            // pipeline executes its own host-side closure after the stage
-            // guard, so no native tensor execution is attached.
-            let mut execution_profile =
-                scalar_execution_profile(metadata, self.backend_kind, false);
-            execution_profile.mode = ExecutionMode::Atomic;
-            execution_profile.prefill = PrefillMode::None;
-            execution_profile.incremental_decode = false;
-            execution_profile.cache_mode = CacheMode::None;
-            execution_profile.cache_namespace = None;
-            execution_profile.kv_dtype = "none".to_string();
-            execution_profile.concurrency = ConcurrencyClass::Exclusive;
-            execution_profile.max_batch_size = 1;
-            execution_profile.resolved_from_loaded_model = true;
-            let mut stage = StageDescriptor::from_execution_profile(
-                StageId::new(3),
-                "asr.long_form.atomic",
-                &execution_profile,
-                NativeBatchMode::None,
-            );
-            stage.selector = StageWorkSelector::Atomic;
-            stage.shape_policy = StageShapePolicy::Exact;
-            stage.output_visibility = output_visibility_for(
-                streaming.transport_output,
-                execution_profile.mode,
-                NativeBatchMode::None,
-            );
-            stage.validate()?;
-            return Ok(LoadedExecutionContract {
-                execution_group_id: self.execution_group_id,
-                model_instance_id: self.model_instance_id,
-                adapter_instance_id: self.adapter_instance_id(),
-                adapter_abi_revision: self.adapter_abi_revision(),
-                metadata,
-                execution_profile,
-                stages: Arc::from([stage]),
-            });
-        }
+        // Parakeet does not implement the long-form atomic graph: its
+        // retained predictor state and the scratch atomic workspace must be
+        // published as separate load-sealed publications (parakeet physical
+        // spec), which the single-publication load path does not support yet.
+        // The flag is therefore ignored here and the pipeline's atomic
+        // requirement fails closed at load with a capability error.
         let width = u64::try_from(self.max_batch_size)
             .map_err(|_| Error::Overloaded("Parakeet batch width exceeds u64".into()))?;
         let workspace_per_row =
@@ -7439,7 +7406,12 @@ mod tests {
     }
 
     #[test]
-    fn parakeet_long_form_graph_is_the_blocking_atomic_stage() {
+    fn parakeet_has_no_long_form_graph_until_publications_split() {
+        // Parakeet's retained predictor state and its scratch atomic
+        // workspace cannot share one load-sealed publication, so the adapter
+        // ignores the long-form flag and the pipeline's atomic requirement
+        // fails closed at load (service-level guard) until publications can
+        // be split per graph.
         let registry = RuntimeAdapterRegistry::built_in();
         let metadata = *registry
             .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
@@ -7454,19 +7426,20 @@ mod tests {
         let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
         assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
         assert_eq!(normal.stages[0].name, "asr.encoder.parakeet");
-        assert!(normal
+
+        let long_form_request = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(long_form_request.stages.len(), normal.stages.len());
+        assert_eq!(
+            long_form_request.stages[0].name,
+            normal.stages[0].name,
+            "the flag must be ignored until publications split"
+        );
+        assert!(long_form_request
             .stages
             .iter()
             .all(|stage| !matches!(stage.selector, StageWorkSelector::Atomic)));
-
-        let long = adapter
-            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
-            .unwrap();
-        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
-        assert_eq!(long.stages.len(), 1);
-        assert_eq!(long.stages[0].name, "asr.long_form.atomic");
-        assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
-        assert_eq!(long.execution_profile.cache_mode, CacheMode::None);
     }
 
     #[test]

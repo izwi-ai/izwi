@@ -2380,7 +2380,8 @@ fn loaded_binding_for_residency(
     let bundle = bundle.expect("validated by loaded_contract_for_residency");
     let binding = bundle.capability_binding_for_streaming(
         capability,
-        StreamingRequirements::native(streaming_required),
+        StreamingRequirements::native(streaming_required)
+            .with_asr_long_form(asr_long_form),
     )?;
     if binding.execution != contract.adapter_binding()? {
         return Err(Error::InferenceError(
