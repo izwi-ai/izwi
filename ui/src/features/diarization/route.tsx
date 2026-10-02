@@ -28,6 +28,7 @@ import {
   isDiarizationPipelineAsrVariant,
   isDiarizationPipelineLlmVariant,
   isDiarizationVariant,
+  resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useDiarizationHistory } from "@/features/diarization/hooks/useDiarizationHistory";
 import { useDiarizationRecord } from "@/features/diarization/hooks/useDiarizationRecord";
@@ -156,11 +157,10 @@ export function DiarizationPage({
 
   const resolvedSelectedModel = useMemo(
     () =>
-      resolvePreferredRouteModel({
+      resolveDiarizationRouteModel({
         models: diarizationModels,
         selectedModel,
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
     [diarizationModels, selectedModel],
   );

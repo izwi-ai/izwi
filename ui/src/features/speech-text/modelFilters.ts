@@ -1,4 +1,5 @@
 import type { ModelInfo } from "@/api";
+import { resolvePreferredRouteModel } from "@/features/models/catalog/routeModelCatalog";
 
 export const GRANITE_SPEECH_PLUS_VARIANT = "Granite-Speech-4.1-2B-Plus";
 
@@ -73,4 +74,31 @@ export function collectManagedModels(options: {
         options.availableModels.find((model) => model.variant === variant) ?? null,
     )
     .filter((model): model is ModelInfo => model !== null);
+}
+
+/**
+ * Resolves the diarization model a route should use. A user-selected
+ * diarization variant that has vanished from the catalog surfaces as-is (the
+ * readiness gate reports it as missing) instead of silently re-resolving to
+ * the route's preferred model — the user's pick is the source of truth.
+ */
+export function resolveDiarizationRouteModel(options: {
+  models: ModelInfo[];
+  selectedModel: string | null;
+  preferredVariants: readonly string[];
+}): string | null {
+  const { models, selectedModel, preferredVariants } = options;
+  if (
+    selectedModel != null &&
+    isDiarizationVariant(selectedModel) &&
+    !models.some((model) => model.variant === selectedModel)
+  ) {
+    return selectedModel;
+  }
+  return resolvePreferredRouteModel({
+    models,
+    selectedModel,
+    preferredVariants,
+    preferAnyPreferredBeforeReadyAny: true,
+  });
 }

@@ -581,6 +581,44 @@ describe("DiarizationPage routes", () => {
     expect(apiMocks.getDiarizationRecord).toHaveBeenCalledTimes(2);
   });
 
+  it("surfaces a stale diarization selection instead of silently re-resolving", async () => {
+    const props = createRouteProps({
+      models: [
+        {
+          variant: "diar_streaming_sortformer_4spk-v2.1",
+          status: "ready" as const,
+          local_path: "/models/diar",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+      ],
+      selectedModel: "Nemotron-3-Diarization",
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Record audio/i }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Select and load a diarization model before creating a run.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Could not access microphone. Please grant permission.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows a single load action until the full diarization stack is ready", async () => {
     const props = createRouteProps({
       models: [

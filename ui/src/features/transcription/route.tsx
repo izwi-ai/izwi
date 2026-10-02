@@ -38,6 +38,7 @@ import {
   isSpeakerAttributedAsrVariant,
   isTranscriptionAlignerVariant,
   isTranscriptionSummaryVariant,
+  resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
@@ -224,11 +225,10 @@ export function TranscriptionPage({
   );
   const resolvedDiarizationModel = useMemo(
     () =>
-      resolvePreferredRouteModel({
+      resolveDiarizationRouteModel({
         models: diarizationModels,
         selectedModel,
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
     [diarizationModels, selectedModel],
   );
