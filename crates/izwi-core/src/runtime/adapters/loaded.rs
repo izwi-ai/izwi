@@ -400,16 +400,10 @@ fn loaded_execution_contracts(
         });
         requirements.push(StreamingRequirements::native(true));
     }
-    if metadata.capability == CapabilityKind::Asr
-        && matches!(
-            metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3Asr
-                | crate::catalog::ModelFamily::WhisperAsr
-                | crate::catalog::ModelFamily::VibeVoiceAsr
-                | crate::catalog::ModelFamily::GraniteSpeechAsr
-                | crate::catalog::ModelFamily::Lfm25Audio
-        )
-    {
+    // Every ASR family enumerates its long-form variant: adapters that
+    // implement the atomic graph produce it here, and adapters whose contract
+    // ignores the flag re-seal an identical graph (consistent identities).
+    if metadata.capability == CapabilityKind::Asr {
         let long_form = requirements
             .iter()
             .copied()
@@ -3246,6 +3240,45 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
                 "Model {} has no native streaming ASR contract",
                 metadata.model_variant
             )));
+        }
+        if streaming.asr_long_form {
+            // Same blocking-atomic shape as the Whisper long-form graph: the
+            // pipeline executes its own host-side closure after the stage
+            // guard, so no native tensor execution is attached.
+            let mut execution_profile =
+                scalar_execution_profile(metadata, self.backend_kind, false);
+            execution_profile.mode = ExecutionMode::Atomic;
+            execution_profile.prefill = PrefillMode::None;
+            execution_profile.incremental_decode = false;
+            execution_profile.cache_mode = CacheMode::None;
+            execution_profile.cache_namespace = None;
+            execution_profile.kv_dtype = "none".to_string();
+            execution_profile.concurrency = ConcurrencyClass::Exclusive;
+            execution_profile.max_batch_size = 1;
+            execution_profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.atomic",
+                &execution_profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                execution_profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile,
+                stages: Arc::from([stage]),
+            });
         }
         let width = u64::try_from(self.max_batch_size)
             .map_err(|_| Error::Overloaded("Parakeet batch width exceeds u64".into()))?;
@@ -7403,6 +7436,37 @@ mod tests {
         assert_eq!(long.stages.len(), 1);
         assert_eq!(long.stages[0].name, "asr.long_form.atomic");
         assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+    }
+
+    #[test]
+    fn parakeet_long_form_graph_is_the_blocking_atomic_stage() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
+            .unwrap();
+        let adapter = ParakeetAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            4,
+        );
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(normal.stages[0].name, "asr.encoder.parakeet");
+        assert!(normal
+            .stages
+            .iter()
+            .all(|stage| !matches!(stage.selector, StageWorkSelector::Atomic)));
+
+        let long = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+        assert_eq!(long.stages.len(), 1);
+        assert_eq!(long.stages[0].name, "asr.long_form.atomic");
+        assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+        assert_eq!(long.execution_profile.cache_mode, CacheMode::None);
     }
 
     #[test]

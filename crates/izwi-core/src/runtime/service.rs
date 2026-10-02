@@ -25,9 +25,10 @@ use crate::engine::metrics::{
 };
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
-    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
-    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
-    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
+    StageWorkSelector, Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest,
+    EngineOutput, EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason,
+    ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig,
+    WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
@@ -2329,6 +2330,20 @@ fn loaded_contract_for_residency(
             lease.variant(),
             contract.metadata.execution_target,
             expected_target.expect("checked as some")
+        )));
+    }
+    if asr_long_form
+        && !contract.stages.iter().any(|stage| {
+            matches!(
+                stage.selector,
+                StageWorkSelector::Atomic | StageWorkSelector::Any
+            )
+        })
+    {
+        return Err(Error::InvalidInput(format!(
+            "loaded capability {:?} for {} does not support atomic blocking execution",
+            capability,
+            lease.variant(),
         )));
     }
     let state_binding = bundle.capability_binding_for_streaming(
