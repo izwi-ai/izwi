@@ -1,44 +1,78 @@
 import type { ModelInfo } from "@/api";
-import { resolvePreferredRouteModel } from "@/features/models/catalog/routeModelCatalog";
+import {
+  DIARIZATION_PREFERRED_SUMMARY_MODELS,
+  resolvePreferredRouteModel,
+} from "@/features/models/catalog/routeModelCatalog";
 
 export const GRANITE_SPEECH_PLUS_VARIANT = "Granite-Speech-4.1-2B-Plus";
 
 export function filterAndSortModels(
   models: ModelInfo[],
-  matchesVariant: (variant: string) => boolean,
+  matches: (model: ModelInfo) => boolean,
 ): ModelInfo[] {
   return models
-    .filter((model) => matchesVariant(model.variant))
+    .filter(matches)
     .sort((left, right) => left.variant.localeCompare(right.variant));
 }
 
-export function isTranscriptionAlignerVariant(variant: string): boolean {
-  return variant === "Qwen3-ForcedAligner-0.6B";
+type RouteCapabilityModel = Pick<ModelInfo, "route_capabilities">;
+
+function hasCapability(
+  model: RouteCapabilityModel,
+  flag: keyof NonNullable<ModelInfo["route_capabilities"]>,
+): boolean {
+  return model.route_capabilities?.[flag] === true;
 }
 
-export function isTranscriptionSummaryVariant(variant: string): boolean {
-  return variant === "Qwen3.5-4B";
+/**
+ * Pipeline roles are selected by SERVER-REPORTED CAPABILITIES, never by model
+ * id: any ASR model, aligner, diarization checkpoint, or chat model the
+ * catalog marks with the matching route capability is eligible for the role.
+ */
+export function isDiarizationModel(model: ModelInfo): boolean {
+  return hasCapability(model, "diarization_records");
 }
 
+export function isDiarizationPipelineAsrModel(model: ModelInfo): boolean {
+  // Granite-Speech serves the dedicated speaker-attributed pipeline (its
+  // transcripts are speaker turns, not plain text); the server's job kinds
+  // keep the two apart and the pipeline groups mirror that split.
+  if (model.variant === GRANITE_SPEECH_PLUS_VARIANT) {
+    return false;
+  }
+  return hasCapability(model, "openai_audio_transcriptions");
+}
+
+export function isDiarizationPipelineAlignerModel(model: ModelInfo): boolean {
+  return hasCapability(model, "forced_alignment");
+}
+
+export function isDiarizationPipelineLlmModel(model: ModelInfo): boolean {
+  return hasCapability(model, "openai_chat_completions");
+}
+
+export function isTranscriptionAlignerModel(model: ModelInfo): boolean {
+  return hasCapability(model, "forced_alignment");
+}
+
+export function isTranscriptionSummaryModel(model: ModelInfo): boolean {
+  return hasCapability(model, "openai_chat_completions");
+}
+
+/**
+ * Name-based display heuristic for a selected id that is no longer in the
+ * catalog (no model object exists to read capabilities from). Selection
+ * itself never consults this.
+ */
 export function isDiarizationVariant(variant: string): boolean {
   const normalized = variant.toLowerCase();
   return normalized.includes("sortformer") || normalized.includes("diar");
 }
 
 export function isSpeakerAttributedAsrVariant(variant: string): boolean {
+  // Speaker-attributed ASR is a Granite-only pipeline today; the server
+  // rejects other models for that job kind.
   return variant === GRANITE_SPEECH_PLUS_VARIANT;
-}
-
-export function isDiarizationPipelineAsrVariant(variant: string): boolean {
-  return variant === "Whisper-Large-v3-Turbo";
-}
-
-export function isDiarizationPipelineAlignerVariant(variant: string): boolean {
-  return variant === "Qwen3-ForcedAligner-0.6B";
-}
-
-export function isDiarizationPipelineLlmVariant(variant: string): boolean {
-  return variant === "Qwen3.5-4B";
 }
 
 /**
@@ -47,12 +81,23 @@ export function isDiarizationPipelineLlmVariant(variant: string): boolean {
  * must never evict these: unloading one silently degrades the pipeline the
  * same way a too-small residency budget does.
  */
-export function isSpeechPipelineManagedVariant(variant: string): boolean {
+export function isSpeechPipelineManagedModel(model: ModelInfo): boolean {
+  if (
+    hasCapability(model, "diarization_records") ||
+    hasCapability(model, "forced_alignment") ||
+    hasCapability(model, "openai_audio_transcriptions")
+  ) {
+    return true;
+  }
+  // The refiner/summary LLM is a chat model: capabilities cannot separate it
+  // from switchable chat models, so the preferred stack member stays
+  // protected by preference (the same effective set as the previous
+  // id-based rule).
   return (
-    isDiarizationVariant(variant) ||
-    isDiarizationPipelineAsrVariant(variant) ||
-    isDiarizationPipelineAlignerVariant(variant) ||
-    isDiarizationPipelineLlmVariant(variant)
+    hasCapability(model, "openai_chat_completions") &&
+    (DIARIZATION_PREFERRED_SUMMARY_MODELS as readonly string[]).includes(
+      model.variant,
+    )
   );
 }
 

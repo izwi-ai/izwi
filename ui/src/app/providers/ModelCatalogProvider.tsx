@@ -17,7 +17,7 @@ import {
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
-import { isSpeechPipelineManagedVariant } from "@/features/speech-text/modelFilters";
+import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
 
 interface ModelCatalogContextValue {
   models: ModelInfo[];
@@ -650,7 +650,7 @@ export function ModelCatalogProvider({
           VIEW_CONFIGS.chat.modelFilter(model.variant) &&
           model.variant !== variant &&
           !model.pinned &&
-          !isSpeechPipelineManagedVariant(model.variant);
+          !isSpeechPipelineManagedModel(model);
         const loadedChatModels = isChatTarget
           ? models.filter(isEvictableChatModel)
           : [];
@@ -681,7 +681,8 @@ export function ModelCatalogProvider({
           // adopting it as the global selection overwrote — and since the
           // persistence change, permanently rewrote — whatever the user had
           // selected.
-          if (!isSpeechPipelineManagedVariant(variant)) {
+          const loadedModel = models.find((model) => model.variant === variant);
+          if (!loadedModel || !isSpeechPipelineManagedModel(loadedModel)) {
             adoptUserSelectedModel(variant);
           }
           void trackModelLoaded(variant);

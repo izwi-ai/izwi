@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelInfo } from "@/api";
+import type { ModelRouteCapabilities } from "@/shared/api/models";
 
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import { DiarizationPage } from "./route";
@@ -71,6 +72,7 @@ vi.mock("@/features/models/components/RouteModelModal", () => ({
 const baseModels: ModelInfo[] = [
   {
     variant: "diar_streaming_sortformer_4spk-v2.1",
+    route_capabilities: caps({ diarization_records: true }),
     status: "ready" as const,
     local_path: "/models/diar",
     size_bytes: null,
@@ -79,6 +81,7 @@ const baseModels: ModelInfo[] = [
   },
   {
     variant: "Whisper-Large-v3-Turbo",
+    route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
     status: "ready" as const,
     local_path: "/models/asr",
     size_bytes: null,
@@ -87,6 +90,7 @@ const baseModels: ModelInfo[] = [
   },
   {
     variant: "Qwen3-ForcedAligner-0.6B",
+    route_capabilities: caps({ forced_alignment: true }),
     status: "ready" as const,
     local_path: "/models/aligner",
     size_bytes: null,
@@ -95,6 +99,7 @@ const baseModels: ModelInfo[] = [
   },
   {
     variant: "Qwen3.5-4B",
+    route_capabilities: caps({ openai_chat_completions: true }),
     status: "ready" as const,
     local_path: "/models/llm",
     size_bytes: null,
@@ -105,6 +110,7 @@ const baseModels: ModelInfo[] = [
 
 const graniteModel: ModelInfo = {
   variant: "Granite-Speech-4.1-2B-Plus",
+  route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
   status: "ready" as const,
   local_path: "/models/granite",
   size_bytes: null,
@@ -234,6 +240,37 @@ const fullRecord = {
   audio_mime_type: "audio/wav",
   audio_filename: "meeting.wav",
 };
+
+
+/**
+ * Full route-capability envelope for fixture models: every flag defaults to
+ * false so tests opt in per role.
+ */
+function caps(
+  overrides: Partial<ModelRouteCapabilities> = {},
+): ModelRouteCapabilities {
+  return {
+    openai_chat_completions: false,
+    openai_responses: false,
+    openai_audio_speech: false,
+    openai_audio_transcriptions: false,
+    speech_to_text_jobs: false,
+    speech_to_text_realtime: false,
+    diarization_records: false,
+    text_to_speech_records: false,
+    voice_design_records: false,
+    voice_clone_records: false,
+    saved_voice_reuse: false,
+    studio_projects: false,
+    voice_realtime_text_model: false,
+    voice_realtime_modular_asr: false,
+    voice_realtime_modular_tts: false,
+    voice_realtime_unified: false,
+    forced_alignment: false,
+    tokenizer: false,
+    ...overrides,
+  };
+}
 
 describe("DiarizationPage routes", () => {
   beforeEach(() => {
@@ -586,6 +623,7 @@ describe("DiarizationPage routes", () => {
       models: [
         {
           variant: "diar_streaming_sortformer_4spk-v2.1",
+          route_capabilities: caps({ diarization_records: true }),
           status: "ready" as const,
           local_path: "/models/diar",
           size_bytes: null,
@@ -627,6 +665,7 @@ describe("DiarizationPage routes", () => {
       models: [
         {
           variant: "diar_streaming_sortformer_4spk-v2.1",
+          route_capabilities: caps({ diarization_records: true }),
           status: "downloaded" as const,
           local_path: "/models/diar",
           size_bytes: null,
@@ -635,6 +674,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Nemotron-3-Diarization",
+          route_capabilities: caps({ diarization_records: true }),
           status: "ready" as const,
           local_path: "/models/nemotron",
           size_bytes: null,
@@ -643,6 +683,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Whisper-Large-v3-Turbo",
+          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
           status: "ready" as const,
           local_path: "/models/asr",
           size_bytes: null,
@@ -651,6 +692,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3-ForcedAligner-0.6B",
+          route_capabilities: caps({ forced_alignment: true }),
           status: "ready" as const,
           local_path: "/models/aligner",
           size_bytes: null,
@@ -696,6 +738,7 @@ describe("DiarizationPage routes", () => {
       models: [
         {
           variant: "diar_streaming_sortformer_4spk-v2.1",
+          route_capabilities: caps({ diarization_records: true }),
           status: "downloaded" as const,
           local_path: "/models/diar",
           size_bytes: null,
@@ -704,6 +747,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Whisper-Large-v3-Turbo",
+          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
           status: "not_downloaded" as const,
           local_path: "/models/asr",
           size_bytes: null,
@@ -712,6 +756,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3-ForcedAligner-0.6B",
+          route_capabilities: caps({ forced_alignment: true }),
           status: "ready" as const,
           local_path: "/models/aligner",
           size_bytes: null,
@@ -720,6 +765,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3.5-4B",
+          route_capabilities: caps({ openai_chat_completions: true }),
           status: "downloaded" as const,
           local_path: "/models/llm",
           size_bytes: null,
@@ -755,6 +801,7 @@ describe("DiarizationPage routes", () => {
       models: [
         {
           variant: "diar_streaming_sortformer_4spk-v2.1",
+          route_capabilities: caps({ diarization_records: true }),
           status: "downloaded" as const,
           local_path: "/models/diar",
           size_bytes: null,
@@ -763,6 +810,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Whisper-Large-v3-Turbo",
+          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
           status: "not_downloaded" as const,
           local_path: "/models/asr",
           size_bytes: null,
@@ -771,6 +819,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3-ForcedAligner-0.6B",
+          route_capabilities: caps({ forced_alignment: true }),
           status: "ready" as const,
           local_path: "/models/aligner",
           size_bytes: null,
@@ -779,6 +828,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3.5-4B",
+          route_capabilities: caps({ openai_chat_completions: true }),
           status: "downloaded" as const,
           local_path: "/models/llm",
           size_bytes: null,
@@ -881,6 +931,7 @@ describe("DiarizationPage routes", () => {
       models: [
         {
           variant: "diar_streaming_sortformer_4spk-v2.1",
+          route_capabilities: caps({ diarization_records: true }),
           status: "loading" as const,
           local_path: "/models/diar",
           size_bytes: null,
@@ -889,6 +940,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Whisper-Large-v3-Turbo",
+          route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
           status: "ready" as const,
           local_path: "/models/asr",
           size_bytes: null,
@@ -897,6 +949,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3-ForcedAligner-0.6B",
+          route_capabilities: caps({ forced_alignment: true }),
           status: "ready" as const,
           local_path: "/models/aligner",
           size_bytes: null,
@@ -905,6 +958,7 @@ describe("DiarizationPage routes", () => {
         },
         {
           variant: "Qwen3.5-4B",
+          route_capabilities: caps({ openai_chat_completions: true }),
           status: "ready" as const,
           local_path: "/models/llm",
           size_bytes: null,

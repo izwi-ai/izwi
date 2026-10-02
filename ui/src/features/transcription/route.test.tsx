@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
+import type { ModelRouteCapabilities } from "@/shared/api/models";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -148,6 +149,37 @@ function deferredPromise<T>() {
   return { promise, resolve, reject };
 }
 
+
+/**
+ * Full route-capability envelope for fixture models: every flag defaults to
+ * false so tests opt in per role.
+ */
+function caps(
+  overrides: Partial<ModelRouteCapabilities> = {},
+): ModelRouteCapabilities {
+  return {
+    openai_chat_completions: false,
+    openai_responses: false,
+    openai_audio_speech: false,
+    openai_audio_transcriptions: false,
+    speech_to_text_jobs: false,
+    speech_to_text_realtime: false,
+    diarization_records: false,
+    text_to_speech_records: false,
+    voice_design_records: false,
+    voice_clone_records: false,
+    saved_voice_reuse: false,
+    studio_projects: false,
+    voice_realtime_text_model: false,
+    voice_realtime_modular_asr: false,
+    voice_realtime_modular_tts: false,
+    voice_realtime_unified: false,
+    forced_alignment: false,
+    tokenizer: false,
+    ...overrides,
+  };
+}
+
 describe("TranscriptionPage detail route", () => {
   beforeEach(() => {
     apiMocks.getTranscriptionRecord.mockReset();
@@ -171,6 +203,7 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "ready",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -179,6 +212,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "diar_streaming_sortformer_4spk-v2.1",
+        route_capabilities: caps({ diarization_records: true }),
         status: "ready",
         local_path: "/models/diar",
         size_bytes: null,
@@ -187,6 +221,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Whisper-Large-v3-Turbo",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "ready",
         local_path: "/models/whisper",
         size_bytes: null,
@@ -195,6 +230,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3-ForcedAligner-0.6B",
+        route_capabilities: caps({ forced_alignment: true }),
         status: "ready",
         local_path: "/models/aligner",
         size_bytes: null,
@@ -203,6 +239,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
+        route_capabilities: caps({ openai_chat_completions: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,
@@ -724,6 +761,7 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "loading",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -732,6 +770,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3-ForcedAligner-0.6B",
+        route_capabilities: caps({ forced_alignment: true }),
         status: "ready",
         local_path: "/models/aligner",
         size_bytes: null,
@@ -740,6 +779,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
+        route_capabilities: caps({ openai_chat_completions: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,
@@ -1121,6 +1161,7 @@ describe("TranscriptionPage detail route", () => {
     baseProps.models = [
       {
         variant: "Parakeet-TDT-0.6B-v3",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "ready",
         local_path: "/models/parakeet",
         size_bytes: null,
@@ -1129,6 +1170,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "diar_streaming_sortformer_4spk-v2.1",
+        route_capabilities: caps({ diarization_records: true }),
         status: "downloaded",
         local_path: "/models/diar",
         size_bytes: null,
@@ -1137,6 +1179,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Whisper-Large-v3-Turbo",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "not_downloaded",
         local_path: "/models/whisper",
         size_bytes: null,
@@ -1145,6 +1188,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3-ForcedAligner-0.6B",
+        route_capabilities: caps({ forced_alignment: true }),
         status: "not_downloaded",
         local_path: "/models/aligner",
         size_bytes: null,
@@ -1153,6 +1197,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Qwen3.5-4B",
+        route_capabilities: caps({ openai_chat_completions: true }),
         status: "ready",
         local_path: "/models/qwen",
         size_bytes: null,
@@ -1161,6 +1206,7 @@ describe("TranscriptionPage detail route", () => {
       },
       {
         variant: "Granite-Speech-4.1-2B-Plus",
+        route_capabilities: caps({ openai_audio_transcriptions: true, speech_to_text_jobs: true }),
         status: "ready",
         local_path: "/models/granite",
         size_bytes: null,

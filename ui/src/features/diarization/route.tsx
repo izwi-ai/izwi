@@ -24,10 +24,10 @@ import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import {
   collectManagedModels,
   filterAndSortModels,
-  isDiarizationPipelineAlignerVariant,
-  isDiarizationPipelineAsrVariant,
-  isDiarizationPipelineLlmVariant,
-  isDiarizationVariant,
+  isDiarizationPipelineAlignerModel,
+  isDiarizationPipelineAsrModel,
+  isDiarizationPipelineLlmModel,
+  isDiarizationModel,
   resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useDiarizationHistory } from "@/features/diarization/hooks/useDiarizationHistory";
@@ -100,22 +100,22 @@ export function DiarizationPage({
   );
 
   const diarizationModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationVariant),
+    () => filterAndSortModels(models, isDiarizationModel),
     [models],
   );
 
   const asrPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrModel),
     [models],
   );
 
   const alignerPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerModel),
     [models],
   );
 
   const llmPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmModel),
     [models],
   );
 

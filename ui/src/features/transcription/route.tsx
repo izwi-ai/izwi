@@ -31,13 +31,13 @@ import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode
 import {
   collectManagedModels,
   filterAndSortModels,
-  isDiarizationPipelineAlignerVariant,
-  isDiarizationPipelineAsrVariant,
-  isDiarizationPipelineLlmVariant,
-  isDiarizationVariant,
+  isDiarizationPipelineAlignerModel,
+  isDiarizationPipelineAsrModel,
+  isDiarizationPipelineLlmModel,
+  isDiarizationModel,
   isSpeakerAttributedAsrVariant,
-  isTranscriptionAlignerVariant,
-  isTranscriptionSummaryVariant,
+  isTranscriptionAlignerModel,
+  isTranscriptionSummaryModel,
   resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
@@ -102,31 +102,31 @@ export function TranscriptionPage({
     useState<ModelModalContext>("transcription");
   const viewConfig = VIEW_CONFIGS.transcription;
   const transcriptionAlignerModels = useMemo(
-    () => filterAndSortModels(models, isTranscriptionAlignerVariant),
+    () => filterAndSortModels(models, isTranscriptionAlignerModel),
     [models],
   );
   const transcriptionSummaryModels = useMemo(
-    () => filterAndSortModels(models, isTranscriptionSummaryVariant),
+    () => filterAndSortModels(models, isTranscriptionSummaryModel),
     [models],
   );
   const diarizationModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationVariant),
+    () => filterAndSortModels(models, isDiarizationModel),
     [models],
   );
   const speakerAttributedAsrModels = useMemo(
-    () => filterAndSortModels(models, isSpeakerAttributedAsrVariant),
+    () => filterAndSortModels(models, (model) => isSpeakerAttributedAsrVariant(model.variant)),
     [models],
   );
   const diarizationAsrPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrModel),
     [models],
   );
   const diarizationAlignerPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerModel),
     [models],
   );
   const diarizationLlmPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmModel),
     [models],
   );
   const {
