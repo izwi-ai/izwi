@@ -41,7 +41,7 @@ use crate::runtime::request::AsrRuntimeRequest;
 use crate::runtime::service::retained_engine_request_input_bytes;
 use crate::runtime::service::{
     copy_optional_preparation_string, copy_preparation_bytes, copy_preparation_string,
-    AdmittedEngineRequest, RuntimeService,
+    CapabilityLoadOptions, AdmittedEngineRequest, RuntimeService,
 };
 use crate::runtime::types::{
     AsrTranscription, RuntimeRequestContext, SpeakerAttributedAsrResult,
@@ -1328,6 +1328,7 @@ impl RuntimeService {
                 CapabilityKind::RealtimeAsr,
                 true,
                 ExecutionTargetKind::RealtimeRunner,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let (
@@ -1559,6 +1560,7 @@ impl RuntimeService {
                 CapabilityKind::RealtimeAsr,
                 true,
                 ExecutionTargetKind::RealtimeRunner,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let physical_runtime = state_binding
@@ -2067,6 +2069,7 @@ impl RuntimeService {
                 CapabilityKind::Asr,
                 streaming_required,
                 ExecutionTargetKind::DirectModel,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let model = self
@@ -3354,6 +3357,7 @@ impl RuntimeService {
                 CapabilityKind::SpeakerAttributedAsr,
                 false,
                 ExecutionTargetKind::PipelineRunner,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let model = self

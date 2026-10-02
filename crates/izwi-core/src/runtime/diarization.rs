@@ -18,7 +18,9 @@ use crate::runtime::audio_io::{
 };
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
-use crate::runtime::service::{copy_preparation_bytes, copy_preparation_string, RuntimeService};
+use crate::runtime::service::{
+    copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
+};
 use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord,
@@ -344,6 +346,7 @@ impl RuntimeService {
                 CapabilityKind::Diarization,
                 false,
                 ExecutionTargetKind::PipelineRunner,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let model = self
@@ -673,6 +676,9 @@ impl RuntimeService {
                 CapabilityKind::Asr,
                 false,
                 asr_target,
+                CapabilityLoadOptions {
+                    asr_long_form: true,
+                },
             )
             .await?;
         let asr_model = match diarization_asr_registry_route(asr_variant) {

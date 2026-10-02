@@ -2271,11 +2271,21 @@ fn bind_request_to_residency(
     Ok(())
 }
 
+/// Requirements for loading a capability for scheduled job work.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CapabilityLoadOptions {
+    /// Request the adapter's long-form atomic graph. Required to schedule
+    /// blocking `AtomicJob` work (pipeline stages) against the loaded binding;
+    /// sequence-graph loads keep the default.
+    pub(crate) asr_long_form: bool,
+}
+
 fn loaded_contract_for_residency(
     lease: &ModelResidencyLease,
     bundle: Option<&LoadedModelBundle>,
     capability: CapabilityKind,
     streaming_required: bool,
+    asr_long_form: bool,
     execution_group_id: crate::engine::ExecutionGroupId,
     backend_kind: BackendKind,
     expected_target: Option<ExecutionTargetKind>,
@@ -2299,7 +2309,9 @@ fn loaded_contract_for_residency(
             "loaded execution bundle does not match authoritative runtime residency".to_string(),
         ));
     }
-    let contract = bundle.contract(capability, streaming_required)?;
+    let streaming = StreamingRequirements::native(streaming_required)
+        .with_asr_long_form(asr_long_form);
+    let contract = bundle.contract_for_streaming(capability, streaming)?;
     if contract.execution_group_id != execution_group_id
         || contract.model_instance_id != model_instance_id
         || contract.metadata.model_variant != lease.variant()
@@ -2321,7 +2333,8 @@ fn loaded_contract_for_residency(
     }
     let state_binding = bundle.capability_binding_for_streaming(
         capability,
-        StreamingRequirements::native(streaming_required),
+        StreamingRequirements::native(streaming_required)
+            .with_asr_long_form(asr_long_form),
     )?;
     state_binding
         .state
@@ -2334,6 +2347,7 @@ fn loaded_binding_for_residency(
     bundle: Option<&LoadedModelBundle>,
     capability: CapabilityKind,
     streaming_required: bool,
+    asr_long_form: bool,
     execution_group_id: crate::engine::ExecutionGroupId,
     backend_kind: BackendKind,
     expected_target: Option<ExecutionTargetKind>,
@@ -2343,6 +2357,7 @@ fn loaded_binding_for_residency(
         bundle,
         capability,
         streaming_required,
+        asr_long_form,
         execution_group_id,
         backend_kind,
         expected_target,
@@ -4039,6 +4054,7 @@ impl RuntimeService {
             bundle.as_deref(),
             capability,
             streaming_required,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(expected_target),
@@ -4053,6 +4069,7 @@ impl RuntimeService {
         capability: CapabilityKind,
         streaming_required: bool,
         expected_target: ExecutionTargetKind,
+        options: CapabilityLoadOptions,
     ) -> Result<(
         ModelResidencyLease,
         LoadedExecutionContract,
@@ -4065,6 +4082,7 @@ impl RuntimeService {
             bundle.as_deref(),
             capability,
             streaming_required,
+            options.asr_long_form,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(expected_target),
@@ -4312,6 +4330,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -4535,6 +4554,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -4769,6 +4789,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -4977,6 +4998,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -5190,6 +5212,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -5451,6 +5474,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -5675,6 +5699,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -5855,6 +5880,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -6055,6 +6081,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -6286,6 +6313,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -6446,6 +6474,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -8029,6 +8058,7 @@ mod tests {
             Some(&bundle),
             CapabilityKind::Tts,
             false,
+            false,
             crate::engine::ExecutionGroupId::new(3),
             BackendKind::Cpu,
             None,
@@ -8058,6 +8088,7 @@ mod tests {
             Some(&bundle),
             CapabilityKind::StreamingTts,
             false,
+            false,
             group,
             BackendKind::Cpu,
             Some(ExecutionTargetKind::DirectModel),
@@ -8071,6 +8102,7 @@ mod tests {
             Some(&bundle),
             CapabilityKind::StreamingTts,
             false,
+            false,
             group,
             BackendKind::Cpu,
             Some(ExecutionTargetKind::TokenEngine),
@@ -8080,6 +8112,7 @@ mod tests {
             &lease,
             Some(&bundle),
             CapabilityKind::StreamingTts,
+            false,
             false,
             crate::engine::ExecutionGroupId::new(group.get() + 1),
             BackendKind::Cpu,
