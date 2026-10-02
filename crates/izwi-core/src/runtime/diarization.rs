@@ -976,19 +976,31 @@ impl RuntimeService {
         let mut transcript = raw_transcript.clone();
         let mut llm_refined = false;
         if runtime_request.enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
-            let llm_variant = resolve_chat_variant(runtime_request.llm_model_id.as_deref())?;
-            match self
-                .polish_diarized_transcript(llm_variant, &raw_transcript)
-                .await
-            {
-                Ok(polished) if !polished.trim().is_empty() => {
-                    let polished_trimmed = polished.trim();
-                    transcript = polished_trimmed.to_string();
-                    llm_refined = polished_trimmed != raw_transcript_trimmed;
+            // Refinement is optional polish: an unresolvable refiner model is
+            // the same class of failure as a failed completion — return the
+            // raw speaker transcript instead of discarding the whole run.
+            match resolve_chat_variant(runtime_request.llm_model_id.as_deref()) {
+                Ok(llm_variant) => {
+                    match self
+                        .polish_diarized_transcript(llm_variant, &raw_transcript)
+                        .await
+                    {
+                        Ok(polished) if !polished.trim().is_empty() => {
+                            let polished_trimmed = polished.trim();
+                            transcript = polished_trimmed.to_string();
+                            llm_refined = polished_trimmed != raw_transcript_trimmed;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
+                        }
+                    }
                 }
-                Ok(_) => {}
                 Err(err) => {
-                    warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
+                    warn!(
+                        "Refinement model {} is unavailable, returning raw speaker transcript: {err}",
+                        runtime_request.llm_model_id.as_deref().unwrap_or("default"),
+                    );
                 }
             }
         }

@@ -121,15 +121,16 @@ impl ModelVariant {
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
-            Qwen306B | Qwen306B4Bit | Qwen306BGguf | Qwen317B | Qwen317B4Bit | Qwen317BGguf
-            | Qwen34BGguf | Qwen38BGguf | Qwen314BGguf => ModelFamily::Qwen3Chat,
+            Qwen306B | Qwen306B4Bit | Qwen317B | Qwen317B4Bit | Qwen314BGguf => {
+                ModelFamily::Qwen3Chat
+            }
             Qwen3Moe30bA3bGguf => ModelFamily::Qwen3MoeChat,
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
             Qwen35Moe35BA3BFp8 => ModelFamily::Qwen35MoeChat,
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
-            Gemma31BIt | Gemma34BIt => ModelFamily::Gemma3Chat,
+            Gemma34BIt => ModelFamily::Gemma3Chat,
             Qwen3ForcedAligner06B | Qwen3ForcedAligner06B4Bit => ModelFamily::Qwen3ForcedAligner,
             VoxtralMini4BRealtime2602 => ModelFamily::Voxtral,
         }
@@ -199,7 +200,7 @@ pub fn parse_tts_model_variant(input: &str) -> Result<ModelVariant, ParseModelVa
 pub fn parse_chat_model_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    let id = input.unwrap_or("Qwen3-8B-GGUF");
+    let id = input.unwrap_or("Qwen3.5-4B");
     let variant = parse_model_variant(id)?;
     if variant.is_chat() {
         Ok(variant)
@@ -208,18 +209,24 @@ pub fn parse_chat_model_variant(
     }
 }
 
-/// Resolve the LLM variant for diarization transcript refinement.
-/// Defaults to Qwen3.5-4B while still accepting legacy Qwen3-1.7B-GGUF ids.
+/// Resolve the LLM variant for diarization transcript refinement. Any
+/// chat-capable catalog model is accepted — the refiner prompt and the
+/// output sanitizer are model-agnostic, and summary generation already
+/// follows the same rule. Defaults to Qwen3.5-4B. Legacy records may still
+/// carry "Qwen3-1.7B-GGUF" (removed from the catalog); that id maps onto the
+/// current default instead of erroring on previously stored settings.
 pub fn resolve_diarization_llm_variant(
     input: Option<&str>,
 ) -> Result<ModelVariant, ParseModelVariantError> {
-    let id = input.unwrap_or("Qwen3.5-4B");
-    let variant = parse_model_variant(id)?;
-    if variant == ModelVariant::Qwen354BGguf || variant == ModelVariant::Qwen317BGguf {
-        Ok(variant)
-    } else {
-        Err(ParseModelVariantError::new(id))
+    let legacy_removed = input.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        normalize_identifier(tail) == normalize_identifier("Qwen3-1.7B-GGUF")
+    });
+    if legacy_removed {
+        return parse_chat_model_variant(Some("Qwen3.5-4B"));
     }
+    parse_chat_model_variant(input)
 }
 
 pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
@@ -437,37 +444,42 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         if is_14b {
             return if gguf { Some(Qwen314BGguf) } else { None };
         }
+        // The 0.6B/1.7B/4B/8B Qwen3 GGUF variants were removed from the
+        // catalog: ids that only match them must fail to parse rather than
+        // re-resolve to a different (e.g. MLX native) variant.
         if is_4b {
-            return if gguf { Some(Qwen34BGguf) } else { None };
+            return None;
         }
         if is_17b {
-            return Some(if q4 {
-                Qwen317B4Bit
-            } else if gguf {
-                Qwen317BGguf
+            return if gguf {
+                None
+            } else if q4 {
+                Some(Qwen317B4Bit)
             } else {
-                Qwen317B
-            });
+                Some(Qwen317B)
+            };
         }
         if is_8b {
-            return if gguf { Some(Qwen38BGguf) } else { None };
+            return None;
         }
         if normalized.contains("06b") || normalized.contains("0dot6b") || normalized.contains("06")
         {
-            return Some(if q4 {
-                Qwen306B4Bit
-            } else if gguf {
-                Qwen306BGguf
+            return if gguf {
+                None
+            } else if q4 {
+                Some(Qwen306B4Bit)
             } else {
-                Qwen306B
-            });
+                Some(Qwen306B)
+            };
         }
     }
 
     if normalized.contains("gemma3") || (normalized.contains("gemma") && normalized.contains("it"))
     {
+        // Gemma-3-1b-it was removed from the catalog: its ids must fail to
+        // parse rather than re-resolve to another variant.
         if normalized.contains("1b") {
-            return Some(Gemma31BIt);
+            return None;
         }
         if normalized.contains("4b") {
             return Some(Gemma34BIt);
@@ -813,9 +825,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_chat_accepts_gemma() {
-        let parsed = parse_chat_model_variant(Some("google/gemma-3-1b-it")).unwrap();
-        assert_eq!(parsed, ModelVariant::Gemma31BIt);
+    fn parse_chat_rejects_removed_gemma_1b() {
+        // Gemma-3-1b-it left the catalog: its ids must fail to parse.
+        assert!(parse_chat_model_variant(Some("Gemma-3-1b-it")).is_err());
+        assert!(parse_chat_model_variant(Some("google/gemma-3-1b-it")).is_err());
+        assert!(parse_model_variant("Gemma 3 1B Instruct").is_err());
     }
 
     #[test]
@@ -918,21 +932,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_qwen_chat_06b_gguf() {
-        let parsed = parse_chat_model_variant(Some("Qwen3-0.6B-GGUF")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen306BGguf);
+    fn parse_removed_qwen3_dense_gguf_ids_are_rejected() {
+        // The dense Qwen3 GGUF variants were removed from the catalog: every
+        // spelling must fail instead of re-resolving to another variant.
+        for id in [
+            "Qwen3-0.6B-GGUF",
+            "Qwen3-1.7B-GGUF",
+            "Qwen/Qwen3-1.7B-GGUF",
+            "Qwen3-4B-GGUF",
+            "Qwen3-4B-Q4_K_M.gguf",
+            "Qwen3-8B-GGUF",
+            "Qwen3-8B-Q4_K_M.gguf",
+        ] {
+            assert!(
+                parse_chat_model_variant(Some(id)).is_err(),
+                "removed variant {id} must not parse"
+            );
+            assert!(
+                parse_model_variant(id).is_err(),
+                "removed variant {id} must not parse"
+            );
+        }
     }
 
     #[test]
-    fn parse_qwen_chat_17b_gguf_repo() {
-        let parsed = parse_chat_model_variant(Some("Qwen/Qwen3-1.7B-GGUF")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen317BGguf);
-    }
-
-    #[test]
-    fn parse_chat_defaults_to_qwen3_8b_gguf() {
+    fn parse_chat_defaults_to_qwen35_4b() {
         let parsed = parse_chat_model_variant(None).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen38BGguf);
+        assert_eq!(parsed, ModelVariant::Qwen354BGguf);
     }
 
     #[test]
@@ -991,32 +1017,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_diarization_llm_accepts_legacy_qwen_17b_gguf_repo_alias() {
+    fn resolve_diarization_llm_maps_legacy_qwen_17b_gguf_to_default() {
+        // "Qwen3-1.7B-GGUF" left the catalog but persists in stored
+        // diarization records; it must resolve to the current default.
         let resolved = resolve_diarization_llm_variant(Some("Qwen/Qwen3-1.7B-GGUF")).unwrap();
-        assert_eq!(resolved, ModelVariant::Qwen317BGguf);
+        assert_eq!(resolved, ModelVariant::Qwen354BGguf);
+        let resolved = resolve_diarization_llm_variant(Some("Qwen3-1.7B-GGUF")).unwrap();
+        assert_eq!(resolved, ModelVariant::Qwen354BGguf);
     }
 
     #[test]
-    fn resolve_diarization_llm_rejects_other_chat_models() {
-        assert!(resolve_diarization_llm_variant(Some("Qwen3-1.7B")).is_err());
-        assert!(resolve_diarization_llm_variant(Some("google/gemma-3-1b-it")).is_err());
+    fn resolve_diarization_llm_accepts_any_chat_model_and_rejects_non_chat() {
+        let resolved = resolve_diarization_llm_variant(Some("Qwen3.5-9B")).unwrap();
+        assert_eq!(resolved, ModelVariant::Qwen359BGguf);
+        let resolved = resolve_diarization_llm_variant(Some("Gemma-3-4b-it")).unwrap();
+        assert_eq!(resolved, ModelVariant::Gemma34BIt);
+        assert!(resolve_diarization_llm_variant(Some("Whisper-Large-v3-Turbo")).is_err());
+        assert!(resolve_diarization_llm_variant(Some("Nemotron-3-Diarization")).is_err());
+        assert!(resolve_diarization_llm_variant(Some("Kokoro-82M")).is_err());
     }
 
     #[test]
     fn parse_qwen_chat_4b_repo_is_rejected() {
         assert!(parse_chat_model_variant(Some("Qwen/Qwen3-4B")).is_err());
-    }
-
-    #[test]
-    fn parse_qwen_chat_4b_gguf_file_alias() {
-        let parsed = parse_chat_model_variant(Some("Qwen3-4B-Q4_K_M.gguf")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen34BGguf);
-    }
-
-    #[test]
-    fn parse_qwen_chat_8b_gguf_file_alias() {
-        let parsed = parse_chat_model_variant(Some("Qwen3-8B-Q4_K_M.gguf")).unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen38BGguf);
     }
 
     #[test]
