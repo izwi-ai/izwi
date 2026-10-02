@@ -321,12 +321,6 @@ export function TranscriptionPage({
   const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
     (model) => model.status === "ready",
   ).length;
-  const canLoadAnyDiarizationManagedModels = diarizationManagedModels.some(
-    (model) =>
-      model.status === "downloaded" ||
-      model.status === "not_downloaded" ||
-      model.status === "error",
-  );
   const canUnloadAnyDiarizationManagedModels = diarizationManagedModels.some(
     (model) => model.status === "ready",
   );
@@ -502,18 +496,6 @@ export function TranscriptionPage({
     setNewSpeechTextMode("diarization");
     setIsNewTranscriptionModalOpen(true);
   }, [recordId, searchParams]);
-  const handleLoadAllDiarizationManagedModels = useCallback(() => {
-    for (const model of diarizationManagedModels) {
-      if (model.status === "downloaded") {
-        onLoad(model.variant);
-      } else if (
-        model.status === "not_downloaded" ||
-        model.status === "error"
-      ) {
-        onDownload(model.variant);
-      }
-    }
-  }, [diarizationManagedModels, onDownload, onLoad]);
   const handleUnloadAllDiarizationManagedModels = useCallback(() => {
     for (const model of diarizationManagedModels) {
       if (model.status === "ready") {
@@ -1001,11 +983,9 @@ export function TranscriptionPage({
                       }}
                       managedModelCount={diarizationManagedModels.length}
                       readyManagedModelCount={readyDiarizationManagedModelCount}
-                      canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}
-                      onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
                       onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
                       onCreated={handleCreatedDiarizationRecord}
                     />

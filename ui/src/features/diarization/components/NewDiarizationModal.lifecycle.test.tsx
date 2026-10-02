@@ -88,7 +88,6 @@ function renderModal(
     onModelRequired: vi.fn(),
     onPipelineModelsRequired: vi.fn(),
     onOpenModelManager: vi.fn(),
-    onLoadAllManagedModels: vi.fn(),
     onUnloadAllManagedModels: vi.fn(),
     onCreated: vi.fn(),
     ...overrides,

@@ -56,11 +56,9 @@ interface NewDiarizationModalProps {
   onPipelineModelsRequired: () => void;
   managedModelCount?: number;
   readyManagedModelCount?: number;
-  canLoadAnyManagedModels?: boolean;
   canUnloadAnyManagedModels?: boolean;
   isManagedModelActionBusy?: boolean;
   onOpenModelManager: () => void;
-  onLoadAllManagedModels: () => void;
   onUnloadAllManagedModels: () => void;
   onCreated: (record: DiarizationRecord) => Promise<void> | void;
 }
@@ -103,11 +101,9 @@ export function NewDiarizationModal({
   onPipelineModelsRequired,
   managedModelCount = 0,
   readyManagedModelCount = 0,
-  canLoadAnyManagedModels = false,
   canUnloadAnyManagedModels = false,
   isManagedModelActionBusy = false,
   onOpenModelManager,
-  onLoadAllManagedModels,
   onUnloadAllManagedModels,
   onCreated,
 }: NewDiarizationModalProps) {
@@ -555,19 +551,9 @@ export function NewDiarizationModal({
       ? "Loading"
       : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
-  const readinessActionIsUnload = allManagedModelsReady;
-  const readinessActionLabel = isManagedModelActionBusy
-    ? "Loading models..."
-    : readinessActionIsUnload
-      ? "Unload Models"
-      : "Load Models";
-  const readinessActionClass = readinessActionIsUnload
-    ? "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]"
-    : "mt-3 h-9 w-full gap-2";
   const readinessLabel = "Diarization stack";
-  const canRunReadinessAction = readinessActionIsUnload
-    ? canUnloadAnyManagedModels
-    : canLoadAnyManagedModels;
+  const readinessUnloadClass =
+    "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]";
   const submissionStatusLabel =
     uploadState?.phase === "preparing"
       ? "Preparing"
@@ -813,28 +799,26 @@ export function NewDiarizationModal({
                     </StatusBadge>
                   </div>
 
-                  <Button
-                    type="button"
-                    variant={readinessActionIsUnload ? "outline" : "default"}
-                    size="sm"
-                    className={readinessActionClass}
-                    onClick={
-                      readinessActionIsUnload
-                        ? onUnloadAllManagedModels
-                        : onLoadAllManagedModels
-                    }
-                    disabled={
-                      isSubmitting ||
-                      isRecording ||
-                      isManagedModelActionBusy ||
-                      !canRunReadinessAction
-                    }
-                  >
-                    {isManagedModelActionBusy ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : null}
-                    {readinessActionLabel}
-                  </Button>
+                  {allManagedModelsReady ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className={readinessUnloadClass}
+                      onClick={onUnloadAllManagedModels}
+                      disabled={
+                        isSubmitting ||
+                        isRecording ||
+                        isManagedModelActionBusy ||
+                        !canUnloadAnyManagedModels
+                      }
+                    >
+                      {isManagedModelActionBusy ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : null}
+                      Unload Models
+                    </Button>
+                  ) : null}
 
                   <Button
                     type="button"

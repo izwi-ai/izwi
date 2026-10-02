@@ -279,12 +279,6 @@ export function DiarizationPage({
   const readyManagedModelCount = managedModels.filter(
     (model) => model.status === "ready",
   ).length;
-  const canLoadAnyManagedModels = managedModels.some(
-    (model) =>
-      model.status === "downloaded" ||
-      model.status === "not_downloaded" ||
-      model.status === "error",
-  );
   const canUnloadAnyManagedModels = managedModels.some(
     (model) => model.status === "ready",
   );
@@ -419,19 +413,6 @@ export function DiarizationPage({
   const handleOpenModels = useCallback(() => {
     openModelManager();
   }, [openModelManager]);
-
-  const handleLoadAllManagedModels = useCallback(() => {
-    for (const model of managedModels) {
-      if (model.status === "downloaded") {
-        onLoad(model.variant);
-      } else if (
-        model.status === "not_downloaded" ||
-        model.status === "error"
-      ) {
-        onDownload(model.variant);
-      }
-    }
-  }, [managedModels, onDownload, onLoad]);
 
   const handleUnloadAllManagedModels = useCallback(() => {
     for (const model of managedModels) {
@@ -637,11 +618,9 @@ export function DiarizationPage({
             }}
             managedModelCount={managedModels.length}
             readyManagedModelCount={readyManagedModelCount}
-            canLoadAnyManagedModels={canLoadAnyManagedModels}
             canUnloadAnyManagedModels={canUnloadAnyManagedModels}
             isManagedModelActionBusy={isManagedModelActionBusy}
             onOpenModelManager={openModelManager}
-            onLoadAllManagedModels={handleLoadAllManagedModels}
             onUnloadAllManagedModels={handleUnloadAllManagedModels}
             onCreated={handleCreatedRecord}
           />

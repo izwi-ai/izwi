@@ -84,7 +84,6 @@ describe("viewport-safe creation dialogs", () => {
         onModelRequired={vi.fn()}
         onPipelineModelsRequired={vi.fn()}
         onOpenModelManager={vi.fn()}
-        onLoadAllManagedModels={vi.fn()}
         onUnloadAllManagedModels={vi.fn()}
         onCreated={vi.fn()}
       />,

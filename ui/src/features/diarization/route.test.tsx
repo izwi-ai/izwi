@@ -619,7 +619,7 @@ describe("DiarizationPage routes", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows a single load action until the full diarization stack is ready", async () => {
+  it("shows no bulk load action before the diarization stack is ready", async () => {
     const props = createRouteProps({
       models: [
         {
@@ -667,13 +667,14 @@ describe("DiarizationPage routes", () => {
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
     expect(await screen.findByText("Not loaded")).toBeInTheDocument();
     expect(
+      screen.queryByRole("button", { name: "Load Models" }),
+    ).not.toBeInTheDocument();
+    expect(
       screen.queryByRole("button", { name: "Unload Models" }),
     ).not.toBeInTheDocument();
-    fireEvent.click(await screen.findByRole("button", { name: "Load Models" }));
 
-    expect(props.onLoad).toHaveBeenCalledWith("diar_streaming_sortformer_4spk-v2.1");
-    expect(props.onLoad).toHaveBeenCalledWith("Qwen3.5-4B");
-    expect(props.onDownload).toHaveBeenCalledWith("Whisper-Large-v3-Turbo");
+    expect(props.onLoad).not.toHaveBeenCalled();
+    expect(props.onDownload).not.toHaveBeenCalled();
     expect(props.onUnload).not.toHaveBeenCalled();
   });
 
@@ -724,16 +725,9 @@ describe("DiarizationPage routes", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
 
-    const loadButton = await screen.findByRole("button", {
-      name: "Load Models",
-    });
-    const openModelsButton = screen.getByRole("button", {
+    const openModelsButton = await screen.findByRole("button", {
       name: "Open Models",
     });
-    expect(
-      loadButton.compareDocumentPosition(openModelsButton) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
 
     fireEvent.click(openModelsButton);
 
@@ -858,8 +852,11 @@ describe("DiarizationPage routes", () => {
     fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
     expect(await screen.findByText("Loading")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Loading models..." }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "Unload Models" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load Models" }),
+    ).not.toBeInTheDocument();
   });
 
   it("loads the selected diarization record on /diarization/:recordId", async () => {
