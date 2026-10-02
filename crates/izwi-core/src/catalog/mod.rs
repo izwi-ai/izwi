@@ -26,5 +26,6 @@ pub use prefix_reuse::{
 pub use variant::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
-    InferenceBackendHint, ModelFamily, ModelTask, ParseModelVariantError,
+    resolve_diarization_model_variant_strict, InferenceBackendHint, ModelFamily, ModelTask,
+    ParseModelVariantError,
 };

@@ -25,9 +25,9 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, ChatMessage, ChatRequestConfig, ChatRole,
-    DiarizationConfig, GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
-    WorkloadClass,
+    parse_chat_model_variant, parse_model_variant, resolve_diarization_model_variant_strict,
+    ChatMessage, ChatRequestConfig, ChatRole, DiarizationConfig, GenerationParams, ModelVariant,
+    RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -326,6 +326,7 @@ async fn create_pending_record(
     parsed: &mut ParsedDiarizationCreateRequest,
 ) -> Result<DiarizationRecord, ApiError> {
     reject_granite_diarization_model(parsed.model_id.as_deref())?;
+    validate_diarization_model_id(parsed.model_id.as_deref())?;
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
 
     state
@@ -385,6 +386,19 @@ fn reject_granite_diarization_model(model_id: Option<&str>) -> Result<(), ApiErr
         ));
     }
     Ok(())
+}
+
+/// An explicitly provided diarization model id is the source of truth: reject
+/// ids that do not resolve to a diarization variant instead of silently
+/// falling back to the legacy default. A missing id keeps the documented
+/// server-side default.
+fn validate_diarization_model_id(model_id: Option<&str>) -> Result<(), ApiError> {
+    let Some(raw_model_id) = model_id else {
+        return Ok(());
+    };
+    resolve_diarization_model_variant_strict(raw_model_id)
+        .map_err(ApiError::bad_request)
+        .map(|_| ())
 }
 
 #[derive(Debug)]
@@ -1362,5 +1376,22 @@ mod tests {
         assert!(update.text.is_none());
         let error = update.error.expect("error should be populated");
         assert_eq!(error.len(), 320);
+    }
+
+    #[test]
+    fn diarization_model_id_validation_accepts_diarization_variants_and_none() {
+        assert!(validate_diarization_model_id(None).is_ok());
+        assert!(validate_diarization_model_id(Some("Nemotron-3-Diarization")).is_ok());
+        assert!(validate_diarization_model_id(Some("diar_streaming_sortformer_4spk-v2.1")).is_ok());
+    }
+
+    #[test]
+    fn diarization_model_id_validation_rejects_non_diarization_and_unknown_ids() {
+        let error = validate_diarization_model_id(Some("Qwen3.5-4B"))
+            .expect_err("chat model id must be rejected");
+        assert!(error.message.contains("not a diarization model"));
+        let error = validate_diarization_model_id(Some("Not-A-Real-Model"))
+            .expect_err("unknown id must be rejected");
+        assert!(error.message.contains("Unknown diarization model id"));
     }
 }

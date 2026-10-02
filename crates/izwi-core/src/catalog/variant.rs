@@ -272,6 +272,22 @@ pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     }
 }
 
+/// Strict resolution for an explicitly provided diarization model id: the
+/// caller's pick is the source of truth, so an id that does not parse to a
+/// diarization variant is an error instead of a silent fallback to the
+/// legacy default.
+pub fn resolve_diarization_model_variant_strict(
+    input: &str,
+) -> Result<ModelVariant, String> {
+    match parse_model_variant(input) {
+        Ok(variant) if variant.is_diarization() => Ok(variant),
+        Ok(variant) => Err(format!(
+            "Model '{input}' is not a diarization model (resolved to {variant:?})."
+        )),
+        Err(_) => Err(format!("Unknown diarization model id '{input}'.")),
+    }
+}
+
 fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
     use ModelVariant::*;
 
@@ -1070,5 +1086,27 @@ mod tests {
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
         let resolved = resolve_diarization_model_variant(None);
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
+    }
+
+    #[test]
+    fn resolve_diarization_strict_accepts_diarization_ids() {
+        let resolved =
+            resolve_diarization_model_variant_strict("Nemotron-3-Diarization").unwrap();
+        assert_eq!(resolved, ModelVariant::Nemotron3Diarization);
+        let resolved = resolve_diarization_model_variant_strict(
+            "nvidia/diar_streaming_sortformer_4spk-v2.1",
+        )
+        .unwrap();
+        assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
+    }
+
+    #[test]
+    fn resolve_diarization_strict_rejects_non_diarization_and_unknown_ids() {
+        let chat_variant = resolve_diarization_model_variant_strict("Qwen3.5-4B")
+            .expect_err("chat model must not resolve as diarization");
+        assert!(chat_variant.contains("not a diarization model"));
+        let unknown = resolve_diarization_model_variant_strict("Not-A-Real-Model")
+            .expect_err("unknown id must not resolve");
+        assert!(unknown.contains("Unknown diarization model id"));
     }
 }
