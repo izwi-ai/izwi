@@ -23,6 +23,7 @@ use crate::diarization_store::{
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
 use crate::error::ApiError;
+use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, resolve_diarization_model_variant_strict,
@@ -528,6 +529,14 @@ fn spawn_diarization_processing_task(
                 }
             }
             Err(err) => {
+                // The record carries the error, but operators debug from the
+                // server log: surface every terminal pipeline failure here.
+                warn!(
+                    record_id = %record_id,
+                    model = parsed.model_id.as_deref().unwrap_or("default"),
+                    error = %err.message,
+                    "diarization pipeline failed"
+                );
                 let _ = diarization_store
                     .update_processing_status(
                         record_id,
