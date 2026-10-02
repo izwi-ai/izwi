@@ -81,6 +81,10 @@ export function collectManagedModels(options: {
  * diarization variant that has vanished from the catalog surfaces as-is (the
  * readiness gate reports it as missing) instead of silently re-resolving to
  * the route's preferred model — the user's pick is the source of truth.
+ *
+ * When falling back (no selection, or a non-diarization one such as the last
+ * loaded pipeline model), a READY diarization model wins over a not-loaded
+ * preferred default: having loaded the stack should be enough to run.
  */
 export function resolveDiarizationRouteModel(options: {
   models: ModelInfo[];
@@ -99,6 +103,6 @@ export function resolveDiarizationRouteModel(options: {
     models,
     selectedModel,
     preferredVariants,
-    preferAnyPreferredBeforeReadyAny: true,
+    preferAnyPreferredBeforeReadyAny: false,
   });
 }

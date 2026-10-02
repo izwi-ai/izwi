@@ -619,6 +619,78 @@ describe("DiarizationPage routes", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("runs diarization with a loaded diarization model and no explicit selection", async () => {
+    // The user's scenario: the pipeline stack was loaded (the aligner last, so
+    // the global selection is not a diarization variant) and the preferred
+    // v2.1 default was never loaded. The ready Nemotron must satisfy the gate.
+    const props = createRouteProps({
+      models: [
+        {
+          variant: "diar_streaming_sortformer_4spk-v2.1",
+          status: "downloaded" as const,
+          local_path: "/models/diar",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Nemotron-3-Diarization",
+          status: "ready" as const,
+          local_path: "/models/nemotron",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Whisper-Large-v3-Turbo",
+          status: "ready" as const,
+          local_path: "/models/asr",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Qwen3-ForcedAligner-0.6B",
+          status: "ready" as const,
+          local_path: "/models/aligner",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+      ],
+      selectedModel: "Qwen3-ForcedAligner-0.6B",
+    });
+
+    renderRoute("/diarization", props);
+
+    await waitFor(() =>
+      expect(apiMocks.listDiarizationRecords).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /New diarization/i }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Record audio/i }),
+    );
+
+    // The diarization gate passed (recording started and jsdom denied the
+    // microphone); neither model-required error may appear.
+    expect(
+      await screen.findByText(
+        "Could not access microphone. Please grant permission.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Select and load a diarization model before creating a run.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Load ASR and forced aligner models before diarization.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows no bulk load action before the diarization stack is ready", async () => {
     const props = createRouteProps({
       models: [
