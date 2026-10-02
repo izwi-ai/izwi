@@ -8,7 +8,7 @@ import {
   Upload,
 } from "lucide-react";
 
-import { api, type DiarizationRecord } from "@/api";
+import { api, type DiarizationRecord, type ModelInfo } from "@/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -28,7 +28,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
-import { diarizationSpeakerUpperBound } from "@/features/models/catalog/routeModelCatalog";
+import { diarizationSpeakerUpperBound, getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
@@ -48,6 +48,8 @@ interface NewDiarizationModalProps {
   pipelineMode?: "classic" | "granite";
   selectedModel: string | null;
   selectedModelReady: boolean;
+  diarizationModels: ModelInfo[];
+  onSelectModel: (variant: string) => void;
   pipelineAsrModelId?: string | null;
   pipelineAlignerModelId?: string | null;
   pipelineLlmModelId?: string | null;
@@ -93,6 +95,8 @@ export function NewDiarizationModal({
   pipelineMode = "classic",
   selectedModel,
   selectedModelReady,
+  diarizationModels,
+  onSelectModel,
   pipelineAsrModelId = null,
   pipelineAlignerModelId = null,
   pipelineLlmModelId = null,
@@ -554,6 +558,21 @@ export function NewDiarizationModal({
   const readinessLabel = "Diarization stack";
   const readinessUnloadClass =
     "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]";
+  const selectedModelInCatalog =
+    selectedModel != null &&
+    diarizationModels.some((model) => model.variant === selectedModel);
+  const pickerOptions = selectedModel != null && !selectedModelInCatalog
+    ? [
+        { variant: selectedModel, label: `${selectedModel} (not in catalog)` },
+        ...diarizationModels.map((model) => ({
+          variant: model.variant,
+          label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
+        })),
+      ]
+    : diarizationModels.map((model) => ({
+        variant: model.variant,
+        label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
+      }));
   const submissionStatusLabel =
     uploadState?.phase === "preparing"
       ? "Preparing"
@@ -790,7 +809,24 @@ export function NewDiarizationModal({
                 </div>
 
                 <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
-                  <div className="flex items-center justify-between gap-3">
+                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
+                    <span>Diarization model</span>
+                    <select
+                      aria-label="Diarization model"
+                      value={selectedModel ?? ""}
+                      onChange={(event) => onSelectModel(event.target.value)}
+                      disabled={isSubmitting || isRecording}
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
+                    >
+                      {pickerOptions.map((option) => (
+                        <option key={option.variant} value={option.variant}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <div className="mt-2.5 flex items-center justify-between gap-3">
                     <span className="text-xs text-[var(--text-muted)]">
                       {readinessLabel}
                     </span>

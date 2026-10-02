@@ -81,6 +81,17 @@ describe("viewport-safe creation dialogs", () => {
         onClose={vi.fn()}
         selectedModel="diar_streaming_sortformer_4spk-v2.1"
         selectedModelReady
+        diarizationModels={[
+          {
+            variant: "diar_streaming_sortformer_4spk-v2.1",
+            status: "ready",
+            local_path: "/models/diar",
+            size_bytes: null,
+            download_progress: null,
+            error_message: null,
+          },
+        ]}
+        onSelectModel={vi.fn()}
         onModelRequired={vi.fn()}
         onPipelineModelsRequired={vi.fn()}
         onOpenModelManager={vi.fn()}

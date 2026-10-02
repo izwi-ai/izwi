@@ -602,6 +602,8 @@ export function DiarizationPage({
             pipelineMode={pipelineMode}
             selectedModel={resolvedSelectedModel}
             selectedModelReady={selectedModelReady}
+            diarizationModels={diarizationModels}
+            onSelectModel={onSelect}
             pipelineAsrModelId={resolvedAsrModel}
             pipelineAlignerModelId={resolvedAlignerModel}
             pipelineLlmModelId={resolvedLlmModel}

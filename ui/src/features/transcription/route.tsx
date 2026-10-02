@@ -967,6 +967,8 @@ export function TranscriptionPage({
                       pipelineMode={diarizationPipelineMode}
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
+                      diarizationModels={diarizationModels}
+                      onSelectModel={onSelect}
                       pipelineAsrModelId={resolvedDiarizationAsrModel}
                       pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}

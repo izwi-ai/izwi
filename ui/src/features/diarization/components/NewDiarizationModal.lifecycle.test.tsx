@@ -82,6 +82,17 @@ function renderModal(
     onClose: vi.fn(),
     selectedModel: "diar_streaming_sortformer_4spk-v2.1",
     selectedModelReady: true,
+    diarizationModels: [
+      {
+        variant: "diar_streaming_sortformer_4spk-v2.1",
+        status: "ready",
+        local_path: "/models/diar",
+        size_bytes: null,
+        download_progress: null,
+        error_message: null,
+      },
+    ],
+    onSelectModel: vi.fn(),
     pipelineAsrModelId: "Parakeet-TDT-0.6B-v3",
     pipelineAlignerModelId: "Qwen3-ForcedAligner-0.6B",
     pipelineModelsReady: true,
@@ -194,5 +205,56 @@ describe("NewDiarizationModal recording lifecycle", () => {
     expect(stopTrack).toHaveBeenCalledTimes(1);
     expect(MockMediaRecorder.instances).toHaveLength(0);
     expect(apiMocks.createDiarizationRecord).not.toHaveBeenCalled();
+  });
+});
+
+describe("NewDiarizationModal diarization model picker", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("lists the catalog diarization models with their load status and reports the pick", () => {
+    const { props } = renderModal({
+      diarizationModels: [
+        {
+          variant: "diar_streaming_sortformer_4spk-v2.1",
+          status: "ready",
+          local_path: "/models/diar",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+        {
+          variant: "Nemotron-3-Diarization",
+          status: "downloaded",
+          local_path: "/models/nemotron",
+          size_bytes: null,
+          download_progress: null,
+          error_message: null,
+        },
+      ],
+    });
+
+    const select = screen.getByLabelText("Diarization model") as HTMLSelectElement;
+    expect(select.value).toBe("diar_streaming_sortformer_4spk-v2.1");
+    const optionLabels = Array.from(select.options).map((option) => option.textContent);
+    expect(optionLabels).toContain("Nemotron-3-Diarization — Downloaded");
+
+    fireEvent.change(select, { target: { value: "Nemotron-3-Diarization" } });
+    expect(props.onSelectModel).toHaveBeenCalledWith("Nemotron-3-Diarization");
+  });
+
+  it("keeps a stale selection visible as a not-in-catalog option", () => {
+    renderModal({
+      selectedModel: "Removed-Model",
+      selectedModelReady: false,
+      diarizationModels: [],
+    });
+
+    const select = screen.getByLabelText("Diarization model") as HTMLSelectElement;
+    expect(select.value).toBe("Removed-Model");
+    expect(Array.from(select.options).map((option) => option.textContent)).toContain(
+      "Removed-Model (not in catalog)",
+    );
   });
 });
