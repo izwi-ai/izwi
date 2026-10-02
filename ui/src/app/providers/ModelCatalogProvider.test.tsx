@@ -205,6 +205,52 @@ describe("ModelCatalogProvider model action errors", () => {
     });
     expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
   });
+
+  it("runs the load request on an abort signal instead of the request timeout", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+
+    await screen.findByText("Model loaded");
+    expect(apiMocks.loadModel).toHaveBeenCalledWith(
+      "Qwen3.5-4B",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("does not report a failed load when unload aborts the load request", async () => {
+    const unload = deferredPromise<{ status: string; message: string }>();
+    apiMocks.loadModel.mockImplementation(
+      (_variant: string, options?: { signal?: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => {
+            reject(
+              new Error("The local model service took too long to respond."),
+            );
+          });
+        }),
+    );
+    apiMocks.unloadModel.mockReturnValue(unload.promise);
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Unload" }));
+    await waitFor(() => expect(apiMocks.unloadModel).toHaveBeenCalled());
+
+    await act(async () => {
+      unload.resolve({ status: "unloaded", message: "unloaded" });
+      await unload.promise;
+    });
+    expect(screen.queryByText("Model load failed")).not.toBeInTheDocument();
+    expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
+  });
 });
 
 function ChatSwitchProbe({ targetVariant }: { targetVariant: string }) {
@@ -260,7 +306,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Load target" }));
 
-    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF"));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) })));
     expect(apiMocks.unloadModel).not.toHaveBeenCalled();
   });
 
@@ -282,7 +328,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     await waitFor(() =>
       expect(apiMocks.unloadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF"),
     );
-    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF");
+    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
   it("never evicts pinned models on a chat switch", async () => {
@@ -299,7 +345,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Load target" }));
 
-    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF"));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) })));
     expect(apiMocks.unloadModel).not.toHaveBeenCalled();
   });
 

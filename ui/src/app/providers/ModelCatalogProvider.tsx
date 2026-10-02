@@ -68,6 +68,9 @@ export function ModelCatalogProvider({
   const activeDownloadsRef = useRef<Set<string>>(new Set());
   const activeModelLoadsRef = useRef<Set<string>>(new Set());
   const cancelledModelLoadsRef = useRef<Set<string>>(new Set());
+  const loadModelAbortControllersRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  );
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
   const reconnectTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
     {},
@@ -583,6 +586,8 @@ export function ModelCatalogProvider({
       }
 
       activeModelLoadsRef.current.add(variant);
+      const abortController = new AbortController();
+      loadModelAbortControllersRef.current.set(variant, abortController);
 
       try {
         const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
@@ -615,7 +620,11 @@ export function ModelCatalogProvider({
           ),
         );
 
-        await api.loadModel(variant);
+        // The load POST blocks server-side until the weights are resident,
+        // which for large models runs far past the default request timeout.
+        // It therefore rides this controller's signal (no client timeout);
+        // an explicit unload or delete aborts it.
+        await api.loadModel(variant, { signal: abortController.signal });
         if (!cancelledModelLoadsRef.current.has(variant)) {
           setSelectedModelState(variant);
           void trackModelLoaded(variant);
@@ -629,6 +638,9 @@ export function ModelCatalogProvider({
         if (cancelledModelLoadsRef.current.has(variant)) {
           return;
         }
+        if (abortController.signal.aborted) {
+          return;
+        }
         console.error("Load failed:", err);
         const message = modelActionError(err, "Failed to load model. Please try again.");
         setError(message);
@@ -638,6 +650,7 @@ export function ModelCatalogProvider({
           tone: "danger",
         });
       } finally {
+        loadModelAbortControllersRef.current.delete(variant);
         activeModelLoadsRef.current.delete(variant);
         await refreshModels();
       }
@@ -654,6 +667,7 @@ export function ModelCatalogProvider({
         );
       if (cancellingLoad) {
         cancelledModelLoadsRef.current.add(variant);
+        loadModelAbortControllersRef.current.get(variant)?.abort();
       }
       try {
         await api.unloadModel(variant);
@@ -694,6 +708,7 @@ export function ModelCatalogProvider({
         closeDownloadStream(variant);
         activeDownloadsRef.current.delete(variant);
         clearDownloadProgress(variant);
+        loadModelAbortControllersRef.current.get(variant)?.abort();
 
         await api.deleteModel(variant);
         await refreshModels();

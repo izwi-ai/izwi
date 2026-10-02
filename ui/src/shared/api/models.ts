@@ -95,9 +95,11 @@ export class ModelApiClient {
 
   async loadModel(
     variant: string,
+    options?: { signal?: AbortSignal },
   ): Promise<{ status: string; message: string }> {
     return this.http.request(`/admin/models/${variant}/load`, {
       method: "POST",
+      signal: options?.signal,
     });
   }
 
