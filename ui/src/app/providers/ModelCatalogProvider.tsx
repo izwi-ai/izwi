@@ -391,26 +391,33 @@ export function ModelCatalogProvider({
     // The first catalog load can race the local server's cold start (a slow
     // /admin/models call, a poison-monitor respawn). Retry with bounded
     // backoff so the spinner ends with either models or a clear error instead
-    // of hanging forever on a single stalled request. Cancelled on unmount so
-    // a torn-down provider stops retrying.
+    // of hanging forever on a single stalled request. A SUCCESSFUL fetch
+    // always clears the spinner (the models are already in state, so that is
+    // simply the truth); only failure retries respect supersession, because
+    // StrictMode's mount→cleanup→mount can abandon the first run mid-flight
+    // and a superseded failure must not spin forever.
     const MAX_ATTEMPTS = 3;
     const RETRY_DELAYS_MS = [750, 1_500];
-    let cancelled = false;
+    let active = true;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
     const init = async () => {
       setLoading(true);
-      for (let attempt = 0; attempt < MAX_ATTEMPTS && !cancelled; attempt++) {
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
         const ok = await refreshModels();
-        if (ok || cancelled) {
-          break;
+        if (ok) {
+          setLoading(false);
+          return;
+        }
+        if (!active) {
+          return;
         }
         const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
         await new Promise((resolve) => {
           retryTimer = setTimeout(resolve, delay);
         });
       }
-      if (!cancelled) {
+      if (active) {
         setLoading(false);
       }
     };
@@ -418,7 +425,7 @@ export function ModelCatalogProvider({
     void init();
 
     return () => {
-      cancelled = true;
+      active = false;
       if (retryTimer !== null) {
         clearTimeout(retryTimer);
       }

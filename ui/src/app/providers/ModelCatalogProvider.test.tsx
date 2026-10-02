@@ -1,3 +1,4 @@
+import React from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -373,6 +374,29 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
     await waitFor(() =>
       expect(screen.getByTestId("residency-summary")).toHaveTextContent("1/4"),
     );
+  });
+});
+
+describe("ModelCatalogProvider catalog init", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({ models: [model] });
+  });
+
+  it("settles the catalog spinner under StrictMode's double effect invocation", async () => {
+    render(
+      <React.StrictMode>
+        <NotificationProvider>
+          <ModelCatalogProvider>
+            <CatalogProbe />
+          </ModelCatalogProvider>
+        </NotificationProvider>
+      </React.StrictMode>,
+    );
+
+    await screen.findByText("ready", undefined, { timeout: 5000 });
+    expect(screen.getByTestId("model-count")).toHaveTextContent("1");
   });
 });
 
