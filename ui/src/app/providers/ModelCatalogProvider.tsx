@@ -669,7 +669,14 @@ export function ModelCatalogProvider({
         // an explicit unload or delete aborts it.
         await api.loadModel(variant, { signal: abortController.signal });
         if (!cancelledModelLoadsRef.current.has(variant)) {
-          adoptUserSelectedModel(variant);
+          // Loading a speech-pipeline stack member (diarization checkpoint,
+          // ASR, aligner, refiner LLM) is pipeline setup, not a model switch:
+          // adopting it as the global selection overwrote — and since the
+          // persistence change, permanently rewrote — whatever the user had
+          // selected.
+          if (!isSpeechPipelineManagedVariant(variant)) {
+            adoptUserSelectedModel(variant);
+          }
           void trackModelLoaded(variant);
           notify({
             title: "Model loaded",

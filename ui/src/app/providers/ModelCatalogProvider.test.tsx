@@ -71,6 +71,9 @@ function CatalogProbe() {
       <button type="button" onClick={() => void loadModel(model.variant)}>
         Load
       </button>
+      <button type="button" onClick={() => void loadModel("Qwen3.5-9B")}>
+        Load chat
+      </button>
       <button type="button" onClick={() => void unloadModel(model.variant)}>
         Unload
       </button>
@@ -433,5 +436,43 @@ describe("ModelCatalogProvider user-selected model persistence", () => {
     expect(
       window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
     ).toBeNull();
+  });
+
+  it("does not adopt a speech-pipeline model load as the selection", async () => {
+    // Qwen3.5-4B is a pipeline stack member (refiner/summary LLM): loading it
+    // is pipeline setup, not a model switch.
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+    await screen.findByText("Model loaded");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent("none");
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBeNull();
+  });
+
+  it("still adopts a chat model load as the selection", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load chat" }));
+    await screen.findByText("Model loaded");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-9B",
+    );
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBe("Qwen3.5-9B");
   });
 });
