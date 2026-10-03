@@ -4366,10 +4366,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 let geometry = (!long_form)
                     .then(|| {
@@ -4589,10 +4598,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 let geometry = (!long_form)
                     .then(|| {
@@ -5035,10 +5053,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 // Granite's retained decoder is not quality-certified: the
                 // real model can collapse to tokenizer id 0 for every output

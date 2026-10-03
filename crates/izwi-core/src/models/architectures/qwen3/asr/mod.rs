@@ -1787,6 +1787,14 @@ impl Qwen3AsrModel {
         None
     }
 
+    /// Decoder-prompt tokens added per second of audio: the audio tower emits
+    /// 13 tokens per 100 mel frames (16 kHz at the configured hop → 160 fps).
+    pub(crate) fn audio_token_rate(&self) -> f32 {
+        let frames_per_sec =
+            QWEN3_ASR_SAMPLE_RATE as f32 / self.mel.config().hop_length.max(1) as f32;
+        13.0 * frames_per_sec / 100.0
+    }
+
     /// Resolve the exact text-decoder input span before scheduler admission.
     /// The physical KV allocator must see the CNN-downsampled audio-token
     /// count, not a text-length estimate, or its block table and receipts will

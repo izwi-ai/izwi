@@ -2560,6 +2560,21 @@ impl NativeAsrModel {
         }
     }
 
+    /// Decoder-prompt tokens added per second of audio for families whose
+    /// audio is embedded into the autoregressive prompt. `None` means audio
+    /// never reaches decoder self-attention (encoder-only, cross-attention,
+    /// or stateless families), so context fitting needs no audio budget.
+    pub(crate) fn audio_token_rate(&self) -> Option<f32> {
+        match self {
+            Self::Qwen3(model) => Some(model.audio_token_rate()),
+            Self::Parakeet(_) => None,
+            Self::Nemotron(_) => None,
+            Self::WhisperTurbo(_) => None,
+            Self::VibeVoice(model) => Some(model.audio_token_rate()),
+            Self::GraniteSpeech(model) => Some(model.audio_token_rate()),
+        }
+    }
+
     pub(crate) fn incremental_prompt_token_count(
         &self,
         audio: &[f32],

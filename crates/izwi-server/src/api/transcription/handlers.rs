@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
@@ -1420,7 +1420,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
         let model_id = payload.model_id.or(payload.model);
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
         let inspection =
-            inspect_audio_payload_with_diagnostics("transcription.create", &audio_payload)?;
+            inspect_audio_payload_canonical_with_diagnostics("transcription.create", &audio_payload)?;
         let audio_mime_type = audio_payload
             .content_type_hint()
             .map(str::to_string)
@@ -1468,7 +1468,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        let inspection = inspect_audio_payload_with_diagnostics(
+                        let inspection = inspect_audio_payload_canonical_with_diagnostics(
                             "transcription.create",
                             &payload,
                         )?;
@@ -1487,7 +1487,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        let inspection = inspect_audio_payload_with_diagnostics(
+                        let inspection = inspect_audio_payload_canonical_with_diagnostics(
                             "transcription.create",
                             &payload,
                         )?;

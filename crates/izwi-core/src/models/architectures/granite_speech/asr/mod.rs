@@ -1291,6 +1291,16 @@ impl GraniteSpeechAsrModel {
         Some(DEFAULT_MAX_AUDIO_SECONDS)
     }
 
+    /// Decoder-prompt tokens added per second of audio: 16 kHz mel at hop 160
+    /// yields 100 frames/s, paired stacking halves that to 50 encoder frames/s,
+    /// and each projector window emits `window/downsample` queries — i.e.
+    /// `50 / downsample` tokens per second for the shipped pairing.
+    pub(crate) fn audio_token_rate(&self) -> f32 {
+        let encoder_frames_per_sec = 16_000f32 / 160.0 / 2.0;
+        let downsample = self.config.downsample_rate.max(1) as f32;
+        encoder_frames_per_sec / downsample
+    }
+
     pub fn max_timestamp_audio_seconds_hint(&self) -> Option<f32> {
         Some(TIMESTAMP_MAX_AUDIO_SECONDS)
     }

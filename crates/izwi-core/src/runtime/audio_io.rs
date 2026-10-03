@@ -13,10 +13,113 @@ const MAX_DECODED_AUDIO_BYTES: usize = 256 * MIB;
 const MAX_AUDIO_DURATION_SECONDS: u64 = 60 * 60;
 const MAX_AUDIO_SAMPLE_RATE: u32 = 384_000;
 const MAX_AUDIO_CHANNELS: u16 = 32;
+/// Canonical speech representation every ASR/diarization consumer converges on:
+/// all model families resample to 16 kHz internally with identity short-circuits,
+/// so decoding straight into this rate bounds the accumulation buffer to
+/// 64 KB/s (~68 minutes under the 256 MiB guard) instead of the source rate's
+/// ~25 minutes at 44.1 kHz.
+pub(crate) const CANONICAL_SPEECH_SAMPLE_RATE: u32 = 16_000;
+/// Native-rate mono frames staged between resampler pushes for the canonical
+/// decode path. Keeps the transient native-rate buffer bounded regardless of
+/// source duration.
+const CANONICAL_RESAMPLE_WINDOW_FRAMES: usize = 65_536;
 pub(crate) const MAX_REFERENCE_SOURCE_BYTES: usize = 32 * MIB;
 const MAX_REFERENCE_DECODED_BYTES: usize = 32 * MIB;
 const MAX_REFERENCE_DURATION_SECONDS: u64 = 30;
 const MAX_BASE64_AUDIO_METADATA_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeOutputRate {
+    /// Accumulate mono samples at the source rate (legacy contract).
+    Native,
+    /// Accumulate mono samples at [`CANONICAL_SPEECH_SAMPLE_RATE`]; source
+    /// metadata still reports the true source rate.
+    CanonicalSpeech,
+}
+
+/// Streams native-rate mono windows through the high-quality resampler into a
+/// canonical-rate accumulation buffer. The projected canonical sample count is
+/// a pure function of the total native count, so the production limit is
+/// enforced before each push instead of after allocation.
+struct CanonicalAccumulator {
+    out: Vec<f32>,
+    resampler: Option<crate::audio::HighQualityResampler>,
+    src_rate: u32,
+    native_mono_samples: usize,
+    max_canonical_samples: usize,
+}
+
+impl CanonicalAccumulator {
+    fn new(max_canonical_samples: usize) -> Self {
+        Self {
+            out: Vec::new(),
+            resampler: None,
+            src_rate: 0,
+            native_mono_samples: 0,
+            max_canonical_samples,
+        }
+    }
+
+    fn ensure(&mut self, src_rate: u32) -> Result<()> {
+        if self.src_rate != 0 {
+            if self.src_rate != src_rate {
+                return Err(Error::InvalidInput(format!(
+                    "Audio sample rate changed while decoding ({src_rate} Hz cannot join {} Hz canonical accumulation)",
+                    self.src_rate
+                )));
+            }
+            return Ok(());
+        }
+        self.src_rate = src_rate;
+        self.resampler = (src_rate != CANONICAL_SPEECH_SAMPLE_RATE).then(|| {
+            crate::audio::HighQualityResampler::new(
+                src_rate,
+                CANONICAL_SPEECH_SAMPLE_RATE,
+            )
+        }).transpose()?;
+        Ok(())
+    }
+
+    fn push(&mut self, mono: &[f32]) -> Result<()> {
+        if mono.is_empty() {
+            return Ok(());
+        }
+        let native_total = self
+            .native_mono_samples
+            .checked_add(mono.len())
+            .ok_or_else(|| Error::InvalidInput("Decoded audio sample count overflowed".to_string()))?;
+        let projected = crate::audio::target_sample_count(
+            native_total,
+            self.src_rate,
+            CANONICAL_SPEECH_SAMPLE_RATE,
+        );
+        if projected > self.max_canonical_samples {
+            return Err(Error::InvalidInput(format!(
+                "Decoded audio would contain {projected} canonical samples at {CANONICAL_SPEECH_SAMPLE_RATE} Hz, exceeding the {}-sample production limit",
+                self.max_canonical_samples
+            )));
+        }
+        self.native_mono_samples = native_total;
+        match &mut self.resampler {
+            Some(resampler) => resampler.push(mono, &mut self.out)?,
+            None => self.out.extend_from_slice(mono),
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<f32>> {
+        let target = crate::audio::target_sample_count(
+            self.native_mono_samples,
+            self.src_rate,
+            CANONICAL_SPEECH_SAMPLE_RATE,
+        );
+        if let Some(mut resampler) = self.resampler.take() {
+            resampler.finish(&mut self.out, target)?;
+        }
+        crate::audio::align_resampled_length(&mut self.out, target);
+        Ok(self.out)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AudioDecodeLimits {
@@ -97,7 +200,7 @@ impl AudioDecodeLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeErrorMode {
+pub(crate) enum DecodeErrorMode {
     Permissive,
     Strict,
 }
@@ -235,13 +338,35 @@ pub(crate) fn decode_audio_bytes_with_metadata(
         audio_bytes,
         DecodeErrorMode::Strict,
         AudioDecodeLimits::inference(),
+        DecodeOutputRate::Native,
     )
+}
+
+/// Decode into the canonical 16 kHz mono speech representation. Returned
+/// samples are always at [`CANONICAL_SPEECH_SAMPLE_RATE`]; the source metadata
+/// keeps the true source rate and channel count.
+pub(crate) fn decode_audio_bytes_canonical_with_metadata(
+    audio_bytes: &[u8],
+    error_mode: DecodeErrorMode,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    decode_audio_bytes_with_metadata_and_limits(
+        audio_bytes,
+        error_mode,
+        AudioDecodeLimits::inference(),
+        DecodeOutputRate::CanonicalSpeech,
+    )
+}
+
+pub(crate) fn decode_audio_bytes_canonical(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    decode_audio_bytes_canonical_with_metadata(audio_bytes, DecodeErrorMode::Permissive)
+        .map(|(samples, _)| (samples, CANONICAL_SPEECH_SAMPLE_RATE))
 }
 
 fn decode_audio_bytes_with_metadata_and_limits(
     audio_bytes: &[u8],
     error_mode: DecodeErrorMode,
     limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     if audio_bytes.is_empty() {
         return Err(Error::InvalidInput("Empty audio input".to_string()));
@@ -254,18 +379,19 @@ fn decode_audio_bytes_with_metadata_and_limits(
                 Error::InferenceError(format!("Failed to decode WAV strictly: {err}"))
             })?;
         }
-        match decode_wav_bytes_with_metadata(audio_bytes, error_mode, limits) {
+        match decode_wav_bytes_with_metadata(audio_bytes, error_mode, limits, output_rate) {
             Ok((samples, source)) => {
-                return finalize_decoded_audio_with_metadata(samples, source, limits);
+                return finalize_decoded_output(samples, source, limits, output_rate);
             }
             Err(wav_err) => {
                 return match decode_audio_bytes_symphonia_with_metadata(
                     audio_bytes,
                     error_mode,
                     limits,
+                    output_rate,
                 ) {
                     Ok((samples, source)) => {
-                        finalize_decoded_audio_with_metadata(samples, source, limits)
+                        finalize_decoded_output(samples, source, limits, output_rate)
                     }
                     Err(symphonia_err) => Err(Error::InferenceError(format!(
                         "Failed to decode WAV strictly. WAV path: {wav_err}; Symphonia: {symphonia_err}"
@@ -275,20 +401,21 @@ fn decode_audio_bytes_with_metadata_and_limits(
         }
     }
 
-    match decode_audio_bytes_symphonia_with_metadata(audio_bytes, error_mode, limits) {
-        Ok((samples, source)) => finalize_decoded_audio_with_metadata(samples, source, limits),
+    match decode_audio_bytes_symphonia_with_metadata(audio_bytes, error_mode, limits, output_rate) {
+        Ok((samples, source)) => finalize_decoded_output(samples, source, limits, output_rate),
         Err(symphonia_err) => {
             let (samples, source) = decode_wav_bytes_hound_with_metadata(
                 audio_bytes,
                 error_mode,
                 limits,
+                output_rate,
             )
             .map_err(|wav_err| {
                 Error::InferenceError(format!(
                             "Failed to decode audio strictly. Symphonia: {symphonia_err}; WAV fallback: {wav_err}"
                         ))
             })?;
-            finalize_decoded_audio_with_metadata(samples, source, limits)
+            finalize_decoded_output(samples, source, limits, output_rate)
         }
     }
 }
@@ -298,6 +425,7 @@ pub(crate) fn decode_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> 
         audio_bytes,
         DecodeErrorMode::Permissive,
         AudioDecodeLimits::inference(),
+        DecodeOutputRate::Native,
     )
     .map(|(samples, source)| (samples, source.sample_rate))
 }
@@ -307,6 +435,7 @@ pub(crate) fn decode_reference_audio_bytes(audio_bytes: &[u8]) -> Result<(Vec<f3
         audio_bytes,
         DecodeErrorMode::Permissive,
         AudioDecodeLimits::reference(),
+        DecodeOutputRate::Native,
     )
     .map(|(samples, source)| (samples, source.sample_rate))
 }
@@ -423,6 +552,7 @@ fn decode_wav_bytes_fast(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         wav_bytes,
         DecodeErrorMode::Permissive,
         AudioDecodeLimits::inference(),
+        DecodeOutputRate::Native,
     )
     .map(|(samples, source)| (samples, source.sample_rate))
 }
@@ -431,15 +561,17 @@ fn decode_wav_bytes_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
     limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
-    decode_wav_pcm16_mono_with_metadata(wav_bytes, error_mode, limits)
-        .or_else(|_| decode_wav_bytes_hound_with_metadata(wav_bytes, error_mode, limits))
+    decode_wav_pcm16_mono_with_metadata(wav_bytes, error_mode, limits, output_rate)
+        .or_else(|_| decode_wav_bytes_hound_with_metadata(wav_bytes, error_mode, limits, output_rate))
 }
 
 fn decode_wav_pcm16_mono_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
     limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let mut offset = 12usize;
     let mut audio_format = None;
@@ -542,24 +674,36 @@ fn decode_wav_pcm16_mono_with_metadata(
             "Decoded audio produced zero samples".to_string(),
         ));
     }
-    limits.validate_mono_samples(frame_count, sample_rate)?;
 
-    let mut samples = Vec::with_capacity(frame_count);
-    if channels == 1 {
-        for bytes in data[..frame_count * block_align].as_chunks::<2>().0 {
-            let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32767.0;
-            samples.push(sample.clamp(-1.0, 1.0));
+    let samples = match output_rate {
+        DecodeOutputRate::Native => {
+            limits.validate_mono_samples(frame_count, sample_rate)?;
+            let mut samples = Vec::with_capacity(frame_count);
+            downmix_pcm16_frames(
+                data,
+                channels,
+                block_align,
+                0..frame_count,
+                &mut samples,
+            );
+            samples
         }
-    } else {
-        for frame in data[..frame_count * block_align].chunks_exact(block_align) {
-            let mut sum = 0.0f32;
-            for channel in 0..channels {
-                let idx = channel * 2;
-                sum += i16::from_le_bytes([frame[idx], frame[idx + 1]]) as f32;
+        DecodeOutputRate::CanonicalSpeech => {
+            let mut accumulator = CanonicalAccumulator::new(
+                limits.max_mono_samples(CANONICAL_SPEECH_SAMPLE_RATE)?,
+            );
+            accumulator.ensure(sample_rate)?;
+            let window_frames = CANONICAL_RESAMPLE_WINDOW_FRAMES.min(frame_count);
+            let mut window: Vec<f32> = Vec::with_capacity(window_frames);
+            for start in (0..frame_count).step_by(CANONICAL_RESAMPLE_WINDOW_FRAMES) {
+                let end = (start + CANONICAL_RESAMPLE_WINDOW_FRAMES).min(frame_count);
+                window.clear();
+                downmix_pcm16_frames(data, channels, block_align, start..end, &mut window);
+                accumulator.push(&window)?;
             }
-            samples.push((sum / channels as f32 / 32767.0).clamp(-1.0, 1.0));
+            accumulator.finish()?
         }
-    }
+    };
 
     Ok((
         samples,
@@ -572,11 +716,39 @@ fn decode_wav_pcm16_mono_with_metadata(
     ))
 }
 
+/// Downmix a frame range of a PCM16 WAV data chunk to mono. Frame indices are
+/// in source frames; `block_align` is the byte width of one interleaved frame.
+fn downmix_pcm16_frames(
+    data: &[u8],
+    channels: usize,
+    block_align: usize,
+    frame_range: std::ops::Range<usize>,
+    out: &mut Vec<f32>,
+) {
+    let frames = &data[frame_range.start * block_align..frame_range.end * block_align];
+    if channels == 1 {
+        for bytes in frames.as_chunks::<2>().0 {
+            let sample = i16::from_le_bytes([bytes[0], bytes[1]]) as f32 / 32767.0;
+            out.push(sample.clamp(-1.0, 1.0));
+        }
+    } else {
+        for frame in frames.chunks_exact(block_align) {
+            let mut sum = 0.0f32;
+            for channel in 0..channels {
+                let idx = channel * 2;
+                sum += i16::from_le_bytes([frame[idx], frame[idx + 1]]) as f32;
+            }
+            out.push((sum / channels as f32 / 32767.0).clamp(-1.0, 1.0));
+        }
+    }
+}
+
 fn decode_audio_bytes_symphonia(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     decode_audio_bytes_symphonia_with_metadata(
         audio_bytes,
         DecodeErrorMode::Permissive,
         AudioDecodeLimits::inference(),
+        DecodeOutputRate::Native,
     )
     .map(|(samples, source)| (samples, source.sample_rate))
 }
@@ -585,6 +757,7 @@ fn decode_audio_bytes_symphonia_with_metadata(
     audio_bytes: &[u8],
     error_mode: DecodeErrorMode,
     limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
@@ -637,6 +810,13 @@ fn decode_audio_bytes_symphonia_with_metadata(
         .map_err(|e| Error::InferenceError(format!("Failed to create audio decoder: {e}")))?;
 
     let mut samples = Vec::new();
+    let mut canonical = match output_rate {
+        DecodeOutputRate::Native => None,
+        DecodeOutputRate::CanonicalSpeech => Some((
+            CanonicalAccumulator::new(limits.max_mono_samples(CANONICAL_SPEECH_SAMPLE_RATE)?),
+            Vec::<f32>::new(),
+        )),
+    };
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -715,13 +895,21 @@ fn decode_audio_bytes_symphonia_with_metadata(
             )));
         }
         limits.validate_format(sample_rate, decoded_channel_count)?;
-        append_decoded_packet(
-            decoded,
-            channels,
-            &mut samples,
-            limits.max_mono_samples(sample_rate)?,
-            limits.max_decoded_bytes,
-        )?;
+        match canonical.as_mut() {
+            None => append_decoded_packet(
+                decoded,
+                channels,
+                &mut samples,
+                limits.max_mono_samples(sample_rate)?,
+                limits.max_decoded_bytes,
+            )?,
+            Some((accumulator, mono_window)) => {
+                mono_window.clear();
+                downmix_decoded_packet(&decoded, channels, mono_window)?;
+                accumulator.ensure(sample_rate)?;
+                accumulator.push(mono_window)?;
+            }
+        }
     }
 
     if sample_rate == 0 {
@@ -729,6 +917,10 @@ fn decode_audio_bytes_symphonia_with_metadata(
             "Decoded audio is missing sample rate metadata".to_string(),
         ));
     }
+    let samples = match canonical {
+        Some((accumulator, _)) => accumulator.finish()?,
+        None => samples,
+    };
     if samples.is_empty() {
         return Err(Error::InferenceError(
             "Decoded audio produced zero samples".to_string(),
@@ -802,6 +994,29 @@ fn append_decoded_packet(
     }
 }
 
+/// Downmix any decoded packet to interleaved-free mono without appending to
+/// the bounded accumulation machinery. Used by the canonical-rate path, which
+/// enforces its limits against the resampled projection.
+fn downmix_decoded_packet(
+    decoded: &symphonia::core::audio::AudioBufferRef<'_>,
+    channels: usize,
+    out: &mut Vec<f32>,
+) -> Result<()> {
+    use symphonia::core::audio::AudioBufferRef;
+    match decoded {
+        AudioBufferRef::U8(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::U16(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::U24(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::U32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::S8(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::S16(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::S24(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::S32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::F32(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+        AudioBufferRef::F64(buffer) => downmix_planar_packet(buffer.as_ref(), channels, out),
+    }
+}
+
 fn append_planar_packet<S>(
     decoded: &symphonia::core::audio::AudioBuffer<S>,
     channels: usize,
@@ -812,13 +1027,6 @@ where
     S: symphonia::core::sample::Sample + symphonia::core::conv::IntoSample<f32>,
 {
     use symphonia::core::audio::Signal;
-    use symphonia::core::conv::IntoSample;
-
-    if channels == 0 || channels > decoded.spec().channels.count() {
-        return Err(Error::InvalidInput(
-            "Decoded audio packet has an invalid channel count".to_string(),
-        ));
-    }
 
     let packet_bytes = decoded
         .capacity()
@@ -842,6 +1050,25 @@ where
     out.try_reserve(decoded.frames()).map_err(|_| {
         Error::Overloaded("Unable to reserve bounded decoded audio output".to_string())
     })?;
+    downmix_planar_packet(decoded, channels, out)
+}
+
+fn downmix_planar_packet<S>(
+    decoded: &symphonia::core::audio::AudioBuffer<S>,
+    channels: usize,
+    out: &mut Vec<f32>,
+) -> Result<()>
+where
+    S: symphonia::core::sample::Sample + symphonia::core::conv::IntoSample<f32>,
+{
+    use symphonia::core::audio::Signal;
+    use symphonia::core::conv::IntoSample;
+
+    if channels == 0 || channels > decoded.spec().channels.count() {
+        return Err(Error::InvalidInput(
+            "Decoded audio packet has an invalid channel count".to_string(),
+        ));
+    }
 
     if channels == 1 {
         out.extend(
@@ -869,6 +1096,7 @@ fn decode_wav_bytes_hound(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
         wav_bytes,
         DecodeErrorMode::Permissive,
         AudioDecodeLimits::inference(),
+        DecodeOutputRate::Native,
     )
     .map(|(samples, source)| (samples, source.sample_rate))
 }
@@ -877,6 +1105,7 @@ fn decode_wav_bytes_hound_with_metadata(
     wav_bytes: &[u8],
     error_mode: DecodeErrorMode,
     limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
 ) -> Result<(Vec<f32>, AudioSourceMetadata)> {
     let cursor = Cursor::new(wav_bytes);
     let mut reader = hound::WavReader::new(cursor)
@@ -892,12 +1121,30 @@ fn decode_wav_bytes_hound_with_metadata(
     let source_channel_count = spec.channels.max(1);
     let channels = source_channel_count as usize;
     limits.validate_format(sample_rate, source_channel_count)?;
-    let max_mono_samples = limits.max_mono_samples(sample_rate)?;
     let declared_frames = usize::try_from(reader.duration()).unwrap_or(usize::MAX);
-    if declared_frames > max_mono_samples {
-        return Err(Error::InvalidInput(format!(
-            "Decoded WAV would exceed the {max_mono_samples}-sample production limit"
-        )));
+    match output_rate {
+        DecodeOutputRate::Native => {
+            let max_mono_samples = limits.max_mono_samples(sample_rate)?;
+            if declared_frames > max_mono_samples {
+                return Err(Error::InvalidInput(format!(
+                    "Decoded WAV would exceed the {max_mono_samples}-sample production limit"
+                )));
+            }
+        }
+        DecodeOutputRate::CanonicalSpeech => {
+            let max_canonical_samples =
+                limits.max_mono_samples(CANONICAL_SPEECH_SAMPLE_RATE)?;
+            let projected = crate::audio::target_sample_count(
+                declared_frames,
+                sample_rate,
+                CANONICAL_SPEECH_SAMPLE_RATE,
+            );
+            if projected > max_canonical_samples {
+                return Err(Error::InvalidInput(format!(
+                    "Decoded WAV would contain {projected} canonical samples at {CANONICAL_SPEECH_SAMPLE_RATE} Hz, exceeding the {max_canonical_samples}-sample production limit"
+                )));
+            }
+        }
     }
 
     let samples = match spec.sample_format {
@@ -914,6 +1161,9 @@ fn decode_wav_bytes_hound_with_metadata(
                 declared_frames,
                 error_mode,
                 |sample| (sample as f32 / max_val).clamp(-1.0, 1.0),
+                output_rate,
+                limits,
+                sample_rate,
             )?
         }
         hound::SampleFormat::Float => decode_hound_frames::<_, f32, _>(
@@ -922,6 +1172,9 @@ fn decode_wav_bytes_hound_with_metadata(
             declared_frames,
             error_mode,
             |sample| sample,
+            output_rate,
+            limits,
+            sample_rate,
         )?,
     };
 
@@ -942,6 +1195,9 @@ fn decode_hound_frames<R, S, F>(
     declared_frames: usize,
     error_mode: DecodeErrorMode,
     mut convert: F,
+    output_rate: DecodeOutputRate,
+    limits: AudioDecodeLimits,
+    sample_rate: u32,
 ) -> Result<Vec<f32>>
 where
     R: std::io::Read,
@@ -952,12 +1208,30 @@ where
     // source is truncated. Start with a small bounded allocation and let the
     // vector grow only as samples are successfully read.
     const INITIAL_OUTPUT_FRAMES: usize = 16 * 1024;
+    let mut canonical = match output_rate {
+        DecodeOutputRate::Native => None,
+        DecodeOutputRate::CanonicalSpeech => {
+            let mut accumulator = CanonicalAccumulator::new(
+                limits.max_mono_samples(CANONICAL_SPEECH_SAMPLE_RATE)?,
+            );
+            accumulator.ensure(sample_rate)?;
+            Some(accumulator)
+        }
+    };
+    let mut staging: Vec<f32> = Vec::new();
+    if canonical.is_some() {
+        staging.try_reserve_exact(CANONICAL_RESAMPLE_WINDOW_FRAMES.min(declared_frames))
+            .map_err(|_| {
+                Error::Overloaded("Unable to reserve bounded decoded WAV output".to_string())
+            })?;
+    }
     let mut output = Vec::new();
-    output
-        .try_reserve_exact(declared_frames.min(INITIAL_OUTPUT_FRAMES))
-        .map_err(|_| {
-            Error::Overloaded("Unable to reserve bounded decoded WAV output".to_string())
-        })?;
+    if canonical.is_none() {
+        output.try_reserve_exact(declared_frames.min(INITIAL_OUTPUT_FRAMES))
+            .map_err(|_| {
+                Error::Overloaded("Unable to reserve bounded decoded WAV output".to_string())
+            })?;
+    }
     let mut input = reader.samples::<S>();
     'frames: for _ in 0..declared_frames {
         let mut sum = 0.0f32;
@@ -978,9 +1252,25 @@ where
                 None => break 'frames,
             }
         }
-        output.push((sum / channels as f32).clamp(-1.0, 1.0));
+        let frame = (sum / channels as f32).clamp(-1.0, 1.0);
+        match canonical.as_mut() {
+            Some(accumulator) => {
+                staging.push(frame);
+                if staging.len() >= CANONICAL_RESAMPLE_WINDOW_FRAMES {
+                    accumulator.push(&staging)?;
+                    staging.clear();
+                }
+            }
+            None => output.push(frame),
+        }
     }
-    Ok(output)
+    match canonical {
+        Some(mut accumulator) => {
+            accumulator.push(&staging)?;
+            accumulator.finish()
+        }
+        None => Ok(output),
+    }
 }
 
 fn hound_codec_name(sample_format: hound::SampleFormat, bits_per_sample: u16) -> String {
@@ -1070,6 +1360,34 @@ fn finalize_decoded_audio_with_metadata(
     let (samples, sample_rate) = finalize_decoded_audio(samples, source.sample_rate, limits)?;
     debug_assert_eq!(sample_rate, source.sample_rate);
     Ok((samples, source))
+}
+
+/// Final validation shared by both accumulation modes. Canonical output is
+/// validated at the canonical rate while the metadata keeps the true source
+/// rate, so the two rates intentionally disagree in that mode.
+fn finalize_decoded_output(
+    samples: Vec<f32>,
+    source: AudioSourceMetadata,
+    limits: AudioDecodeLimits,
+    output_rate: DecodeOutputRate,
+) -> Result<(Vec<f32>, AudioSourceMetadata)> {
+    match output_rate {
+        DecodeOutputRate::Native => {
+            finalize_decoded_audio_with_metadata(samples, source, limits)
+        }
+        DecodeOutputRate::CanonicalSpeech => {
+            if source.channel_count == 0 {
+                return Err(Error::InferenceError(
+                    "Decoded audio has invalid source channel count 0".to_string(),
+                ));
+            }
+            limits.validate_format(source.sample_rate, source.channel_count)?;
+            let (samples, sample_rate) =
+                finalize_decoded_audio(samples, CANONICAL_SPEECH_SAMPLE_RATE, limits)?;
+            debug_assert_eq!(sample_rate, CANONICAL_SPEECH_SAMPLE_RATE);
+            Ok((samples, source))
+        }
+    }
 }
 
 pub(crate) fn preprocess_reference_audio(mut samples: Vec<f32>, sample_rate: u32) -> Vec<f32> {
@@ -1251,6 +1569,7 @@ mod tests {
             &wav_bytes,
             DecodeErrorMode::Permissive,
             limits,
+            DecodeOutputRate::Native,
         )
         .expect_err("duration above the configured bound must fail");
         assert!(matches!(
@@ -1289,9 +1608,13 @@ mod tests {
             max_channels: MAX_AUDIO_CHANNELS,
         };
 
-        let (samples, source) =
-            decode_wav_bytes_hound_with_metadata(&wav_bytes, DecodeErrorMode::Strict, limits)
-                .expect("bounded planar downmix");
+        let (samples, source) = decode_wav_bytes_hound_with_metadata(
+            &wav_bytes,
+            DecodeErrorMode::Strict,
+            limits,
+            DecodeOutputRate::Native,
+        )
+        .expect("bounded planar downmix");
         assert_eq!(source.channel_count, channels);
         assert_eq!(samples.len(), frames);
         assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 1e-6));
@@ -1317,6 +1640,7 @@ mod tests {
             &wav_bytes,
             DecodeErrorMode::Permissive,
             AudioDecodeLimits::inference(),
+            DecodeOutputRate::Native,
         )
         .expect("permissive decode should stop at the first truncated sample");
         assert!(samples.is_empty());
@@ -1378,6 +1702,104 @@ mod tests {
             .expect_err("strict decode must reject a truncated WAV frame");
 
         assert!(error.to_string().contains("Failed to decode WAV strictly"));
+    }
+
+    fn pcm16_wav_bytes(channels: u16, sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut wav_bytes = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut wav_bytes);
+            let mut writer = hound::WavWriter::new(cursor, spec).expect("writer");
+            for sample in samples {
+                writer.write_sample(*sample).expect("sample");
+            }
+            writer.finalize().expect("finalize");
+        }
+        wav_bytes
+    }
+
+    #[test]
+    fn canonical_decode_resamples_to_16k_and_preserves_source_metadata() {
+        let sample_rate = 44_100u32;
+        let frames = sample_rate as usize; // 1 s of 220 Hz tone, stereo
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (0.4f32
+                * (2.0 * std::f32::consts::PI * 220.0 * index as f32 / sample_rate as f32).sin()
+                * 32767.0) as i16;
+            interleaved.push(value);
+            interleaved.push(value);
+        }
+        let wav_bytes = pcm16_wav_bytes(2, sample_rate, &interleaved);
+
+        let (samples, source) =
+            decode_audio_bytes_canonical_with_metadata(&wav_bytes, DecodeErrorMode::Strict)
+                .expect("canonical decode should succeed");
+
+        assert_eq!(source.sample_rate, 44_100, "source metadata keeps the true source rate");
+        assert_eq!(source.channel_count, 2);
+        assert_eq!(source.codec, "pcm_s16le");
+        let expected = crate::audio::target_sample_count(
+            frames,
+            sample_rate,
+            CANONICAL_SPEECH_SAMPLE_RATE,
+        );
+        assert_eq!(samples.len(), expected);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn canonical_decode_identity_passthrough_at_canonical_rate() {
+        let interleaved = [8_192_i16, -8_192, 16_384, -16_384, 8_192, 8_192];
+        let wav_bytes = pcm16_wav_bytes(2, CANONICAL_SPEECH_SAMPLE_RATE, &interleaved);
+
+        let (samples, rate) = decode_audio_bytes_canonical(&wav_bytes)
+            .expect("canonical identity decode should succeed");
+
+        assert_eq!(rate, CANONICAL_SPEECH_SAMPLE_RATE);
+        assert_eq!(samples.len(), 3);
+    }
+
+    #[test]
+    fn canonical_decode_rebases_the_production_limit_off_the_source_rate() {
+        // 2.5 s @ 44.1 kHz = 110,250 native mono samples, over the scaled
+        // 100,000-sample native cap, but only 40,000 canonical samples — the
+        // same byte budget must accept the canonical representation.
+        let sample_rate = 44_100u32;
+        let frames = 110_250usize;
+        let interleaved = vec![0_i16; frames];
+        let wav_bytes = pcm16_wav_bytes(1, sample_rate, &interleaved);
+        let limits = AudioDecodeLimits {
+            max_source_bytes: MIB,
+            max_decoded_bytes: 400_000, // 100,000 mono f32 samples
+            max_duration_seconds: 3600,
+            max_sample_rate: MAX_AUDIO_SAMPLE_RATE,
+            max_channels: MAX_AUDIO_CHANNELS,
+        };
+
+        let native_error = decode_audio_bytes_with_metadata_and_limits(
+            &wav_bytes,
+            DecodeErrorMode::Permissive,
+            limits,
+            DecodeOutputRate::Native,
+        )
+        .expect_err("native-rate accumulation must hit the scaled production limit");
+        assert!(native_error.to_string().contains("100000-sample production limit"));
+
+        let (samples, source) = decode_audio_bytes_with_metadata_and_limits(
+            &wav_bytes,
+            DecodeErrorMode::Permissive,
+            limits,
+            DecodeOutputRate::CanonicalSpeech,
+        )
+        .expect("canonical accumulation must fit the same byte budget");
+        assert_eq!(source.sample_rate, 44_100);
+        assert_eq!(samples.len(), 40_000);
     }
 
     #[test]

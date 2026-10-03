@@ -6703,10 +6703,16 @@ impl NativeExecutor {
                         request.streaming,
                         matches!(family, ModelFamily::WhisperAsr),
                     );
+                let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
+                    model.max_audio_seconds_hint(),
+                    model.audio_token_rate(),
+                    self.asr_effective_context(variant),
+                    |_| MAX_ASR_NEW_TOKENS,
+                )?;
                 let chunk_plan = Self::asr_chunk_plan(
                     &samples,
                     sample_rate,
-                    model.max_audio_seconds_hint(),
+                    audio_limit_secs,
                     streaming_low_latency,
                     allow_speech_planner,
                 );
@@ -7062,10 +7068,16 @@ impl NativeExecutor {
                     request.streaming,
                     matches!(family, ModelFamily::WhisperAsr),
                 );
+            let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
+                model.max_audio_seconds_hint(),
+                model.audio_token_rate(),
+                self.asr_effective_context(variant),
+                |_| MAX_ASR_NEW_TOKENS,
+            )?;
             let chunk_plan = Self::asr_chunk_plan(
                 samples,
                 sample_rate,
-                model.max_audio_seconds_hint(),
+                audio_limit_secs,
                 streaming_low_latency,
                 allow_speech_planner,
             );
@@ -7550,6 +7562,16 @@ impl NativeExecutor {
             stop_token_ids: request.params.stop_token_ids.clone(),
             stop_sequences: request.params.stop_sequences.clone(),
         }
+    }
+
+    /// Effective invocation context for the loaded variant, when the executor
+    /// shares the lifecycle model registry. Executors without a registry
+    /// (mock workers, standalone tests) fall back to hint-only planning.
+    fn asr_effective_context(&self, variant: crate::model::ModelVariant) -> Option<usize> {
+        self.config
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.effective_context(variant))
     }
 
     fn asr_chunk_generation_options(

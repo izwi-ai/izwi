@@ -164,24 +164,6 @@ fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> 
     available_bytes / remaining_groups.max(1)
 }
 
-fn portable_context_ceiling(
-    variant: ModelVariant,
-    preference: ContextLengthPreference,
-    maximum: u64,
-) -> u64 {
-    if preference.explicit_tokens().is_some() {
-        return maximum;
-    }
-    match variant {
-        ModelVariant::Lfm25Audio15BGguf => maximum.min(4_096),
-        ModelVariant::VibeVoice15BTts => maximum.min(1_024),
-        ModelVariant::Qwen3Asr06BGguf
-        | ModelVariant::Qwen3Asr17BGguf
-        | ModelVariant::GraniteSpeech412BPlus => maximum.min(1_024),
-        _ => maximum,
-    }
-}
-
 fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_bytes: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -1057,7 +1039,8 @@ impl ModelLifecycleController {
             }
             return Ok(());
         };
-        let maximum = portable_context_ceiling(variant, self.config.max_sequence_length, maximum);
+        // The invocation context ceiling is the model-authored maximum; the
+        // memory-budgeted binary search below decides how much of it fits.
         let intent = portable_invocation_context_intent(
             self.config.max_sequence_length,
             self.model_registry.effective_context(variant),
@@ -1845,20 +1828,12 @@ impl ModelLifecycleController {
                                     "Granite Speech retained decoder has no context bound".into(),
                                 )
                             })?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(retained_max_tokens).map_err(|_| {
+                        let retained_max_tokens =
+                            usize::try_from(retained_max_tokens).map_err(|_| {
                                 Error::ModelLoadError(
-                                    "Granite Speech retained context exceeds u64".into(),
+                                    "Granite Speech retained context exceeds usize".into(),
                                 )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "Granite Speech retained context exceeds usize".into(),
-                            )
-                        })?;
+                            })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -1980,20 +1955,12 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
+                        let retained_max_tokens =
+                            usize::try_from(physical_spec.retained_max_tokens).map_err(|_| {
                                 Error::ModelLoadError(
-                                    "Qwen3 ASR retained context exceeds u64".into(),
+                                    "Qwen3 ASR retained context exceeds usize".into(),
                                 )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "Qwen3 ASR retained context exceeds usize".into(),
-                            )
-                        })?;
+                            })?;
                         let physical = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2424,20 +2391,12 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     if capability == CapabilityKind::Asr {
                         let physical_spec = model.retained_asr_state_spec(&stage_graphs)?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
+                        let retained_max_tokens =
+                            usize::try_from(physical_spec.retained_max_tokens).map_err(|_| {
                                 Error::ModelLoadError(
-                                    "LFM2.5 Audio retained context exceeds u64".into(),
+                                    "LFM2.5 Audio retained context exceeds usize".into(),
                                 )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "LFM2.5 Audio retained context exceeds usize".into(),
-                            )
-                        })?;
+                            })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2697,26 +2656,7 @@ impl ModelLifecycleController {
                         "VibeVoice TTS normal graph did not publish retained state".into(),
                     )
                 })?;
-                let retained_max_tokens = physical_spec
-                    .retained_max_tokens
-                    .map(|maximum| {
-                        let maximum = u64::try_from(maximum).map_err(|_| {
-                            Error::ModelLoadError(
-                                "VibeVoice retained context exceeds u64".into(),
-                            )
-                        })?;
-                        usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            maximum,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "VibeVoice retained context exceeds usize".into(),
-                            )
-                        })
-                    })
-                    .transpose()?;
+                let retained_max_tokens = physical_spec.retained_max_tokens;
                 let retained = self
                     .core_engine
                     .load_managed_model_state(
@@ -3048,8 +2988,8 @@ mod tests {
         automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
         is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, portable_context_ceiling,
-        portable_context_reserve_bytes, portable_invocation_context_intent,
+        model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
+        portable_invocation_context_intent,
         qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
         select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
@@ -4150,60 +4090,6 @@ mod tests {
             portable_context_reserve_bytes(ModelVariant::Kokoro82M, GIB),
             GIB
         );
-    }
-
-    #[test]
-    fn portable_automatic_context_uses_validated_model_ceilings() {
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Lfm25Audio15BGguf,
-                ContextLengthPreference::Auto,
-                128_000
-            ),
-            4_096
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Lfm25Audio15BGguf,
-                ContextLengthPreference::explicit(8_192).unwrap(),
-                128_000
-            ),
-            128_000
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Kokoro82M,
-                ContextLengthPreference::Auto,
-                128_000
-            ),
-            128_000
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::VibeVoice15BTts,
-                ContextLengthPreference::Auto,
-                65_536
-            ),
-            1_024
-        );
-        for variant in [
-            ModelVariant::Qwen3Asr06BGguf,
-            ModelVariant::Qwen3Asr17BGguf,
-            ModelVariant::GraniteSpeech412BPlus,
-        ] {
-            assert_eq!(
-                portable_context_ceiling(variant, ContextLengthPreference::Auto, 65_536),
-                1_024
-            );
-            assert_eq!(
-                portable_context_ceiling(
-                    variant,
-                    ContextLengthPreference::explicit(8_192).unwrap(),
-                    65_536
-                ),
-                65_536
-            );
-        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
-use crate::runtime::audio_io::{base64_decode, decode_audio_bytes};
+use crate::runtime::audio_io::{base64_decode, decode_audio_bytes_canonical};
 
 use super::super::output::{AsrProgress, AsrProgressPhase};
 use super::super::request::{EngineStreamPolicy, StreamStagingBuffer};
@@ -1024,14 +1024,14 @@ fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
     let audio_bytes = base64_decode(audio_b64)?;
-    decode_audio_bytes(&audio_bytes)
+    decode_audio_bytes_canonical(&audio_bytes)
 }
 
 pub(super) fn decode_request_audio_with_rate(
     request: &EngineCoreRequest,
 ) -> Result<(Vec<f32>, u32)> {
     if let Some(audio_bytes) = request.audio_bytes_for_execution() {
-        return decode_audio_bytes(audio_bytes);
+        return decode_audio_bytes_canonical(audio_bytes);
     }
 
     let audio_b64 = request

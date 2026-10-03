@@ -32,7 +32,7 @@ use crate::runtime::adapters::{
     CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
 };
 use crate::runtime::audio_io::{
-    base64_decode, decode_audio_bytes, validate_base64_audio_retained_size,
+    base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
@@ -111,9 +111,9 @@ impl OwnedAsrAudioInput {
         match self {
             Self::Base64(audio) => {
                 let audio = base64_decode(audio)?;
-                decode_audio_bytes(&audio)
+                decode_audio_bytes_canonical(&audio)
             }
-            Self::Bytes(audio) => decode_audio_bytes(audio),
+            Self::Bytes(audio) => decode_audio_bytes_canonical(audio),
         }
     }
 
@@ -157,6 +157,102 @@ const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT
 const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 16;
 const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 10 * 60;
 const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// Conservative decoder-prompt token reserve for the text surrounding the
+/// audio placeholder (system block, role markers, task instructions). Chunk
+/// planners subtract it from the effective invocation context before
+/// budgeting audio tokens; per-invocation admission uses exact counts.
+pub(crate) const ASR_TEXT_PROMPT_TOKEN_RESERVE: usize = 128;
+
+/// Smallest audio duration in seconds an invocation chunk planner will still
+/// emit before declaring the invocation context infeasible.
+pub(crate) const ASR_MIN_VIABLE_CHUNK_SECS: f32 = 4.0;
+
+const ASR_MAX_SOLVED_CHUNK_SECS: f32 = 24.0 * 3600.0;
+
+/// Outcome of fitting an audio duration to an invocation context.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum InvocationAudioLimit {
+    /// Even the smallest viable invocation cannot fit the context.
+    Infeasible,
+    /// Largest admissible audio duration in seconds.
+    Limited(f32),
+}
+
+/// Largest audio duration whose invocation demand — text reserve, audio
+/// tokens at the family's rate, and the route's decode budget — fits
+/// `context_tokens`. Demand is monotone non-decreasing in duration, so the
+/// boundary is found by exponential bracketing plus bisection.
+pub(crate) fn solve_invocation_audio_limit(
+    context_tokens: usize,
+    audio_token_rate: f32,
+    text_reserve_tokens: usize,
+    decode_budget_for_duration: impl Fn(f32) -> usize,
+) -> InvocationAudioLimit {
+    if context_tokens == 0 || !audio_token_rate.is_finite() || audio_token_rate <= 0.0 {
+        return InvocationAudioLimit::Infeasible;
+    }
+    let fits = |secs: f32| -> bool {
+        let audio_tokens = (secs * audio_token_rate).ceil() as usize;
+        text_reserve_tokens
+            .saturating_add(audio_tokens)
+            .saturating_add(decode_budget_for_duration(secs))
+            <= context_tokens
+    };
+    if !fits(ASR_MIN_VIABLE_CHUNK_SECS) {
+        return InvocationAudioLimit::Infeasible;
+    }
+    let mut low = ASR_MIN_VIABLE_CHUNK_SECS;
+    let mut high = ASR_MIN_VIABLE_CHUNK_SECS * 2.0;
+    while fits(high) && high < ASR_MAX_SOLVED_CHUNK_SECS {
+        low = high;
+        high *= 2.0;
+    }
+    if fits(high) {
+        return InvocationAudioLimit::Limited(high);
+    }
+    for _ in 0..40 {
+        let middle = (low + high) / 2.0;
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    InvocationAudioLimit::Limited(low)
+}
+
+/// Compose the family's audio-seconds hint with the invocation-context budget:
+/// whichever is smaller governs chunk planning. Families whose audio never
+/// reaches the decoder (`audio_token_rate == None`) keep their hint alone.
+/// `Err` means the effective context cannot admit even a minimal invocation.
+pub(crate) fn compose_invocation_audio_limit(
+    audio_seconds_hint: Option<f32>,
+    audio_token_rate: Option<f32>,
+    effective_context: Option<usize>,
+    decode_budget_for_duration: impl Fn(f32) -> usize,
+) -> Result<Option<f32>> {
+    let Some(context) = effective_context else {
+        return Ok(audio_seconds_hint);
+    };
+    let Some(rate) = audio_token_rate else {
+        return Ok(audio_seconds_hint);
+    };
+    match solve_invocation_audio_limit(
+        context,
+        rate,
+        ASR_TEXT_PROMPT_TOKEN_RESERVE,
+        &decode_budget_for_duration,
+    ) {
+        InvocationAudioLimit::Infeasible => Err(Error::InvalidInput(format!(
+            "Effective invocation context ({context} tokens) cannot fit even a minimal {rate:.1}-token/second audio invocation; free memory or raise the configured max_sequence_length"
+        ))),
+        InvocationAudioLimit::Limited(secs) => Ok(match audio_seconds_hint {
+            Some(hint) => Some(hint.min(secs)),
+            None => Some(secs),
+        }),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraniteSaaPrefixMode {
@@ -3398,7 +3494,27 @@ impl RuntimeService {
         let retained_input_bytes = input_bytes.checked_add(language_bytes).ok_or_else(|| {
             Error::Overloaded("speaker-attributed ASR retained input overflowed".to_string())
         })?;
-        let model_limit_secs = model.max_audio_seconds_hint();
+        // FullTranscript prefix mode grows every chunk's prompt with the
+        // prior transcript; reserve headroom for the capped prefix so chunk
+        // sizing leaves room for it instead of failing mid-job.
+        let prefix_token_allowance = match GraniteSaaPrefixMode::from_env() {
+            GraniteSaaPrefixMode::None => 0usize,
+            GraniteSaaPrefixMode::FullTranscript => GRANITE_SAA_PREFIX_MAX_CHARS / 4,
+        };
+        let model_limit_secs = compose_invocation_audio_limit(
+            model.max_audio_seconds_hint(),
+            model.audio_token_rate(),
+            self.model_registry.effective_context(variant),
+            move |secs| {
+                granite_saa_max_new_tokens_for_duration(secs)
+                    .saturating_add(prefix_token_allowance)
+            },
+        )?;
+        tracing::info!(
+            variant = %variant,
+            model_limit_secs = ?model_limit_secs,
+            "resolved speaker-attributed ASR invocation audio limit"
+        );
         if granite_saa_should_use_single_pass(duration_secs, model_limit_secs) {
             let task_language = language_owned.clone();
             let task_model = model.clone();
@@ -3905,6 +4021,21 @@ fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormCon
     if let Some(limit) = model_limit_secs.filter(|value| value.is_finite() && *value > 0.0) {
         cfg.hard_max_chunk_secs = cfg.hard_max_chunk_secs.min(limit * 0.95);
     }
+
+    // A context-derived limit below the family's minimum chunk size forces
+    // graceful degradation: smaller chunks keep Speaker-Attributed ASR
+    // functional on constrained hosts instead of failing every invocation.
+    if let Some(limit) = model_limit_secs
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < cfg.min_chunk_secs)
+    {
+        tracing::warn!(
+            context_limit_secs = limit,
+            family_min_chunk_secs = cfg.min_chunk_secs,
+            "Granite SAA invocation context limits chunks below the family minimum; speaker continuity degrades"
+        );
+        cfg.min_chunk_secs = limit.max(1.0);
+    }
+
     cfg.hard_max_chunk_secs = cfg
         .hard_max_chunk_secs
         .max(cfg.min_chunk_secs.max(1.0))
@@ -4212,6 +4343,28 @@ fn granite_saa_transcribe_chunk(
     max_new_tokens: usize,
     cache: &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
 ) -> Result<NativeAsrTranscription> {
+    if let Some(rate) = model.audio_token_rate() {
+        // Uniform invocation admission: refuse before spending encoder work
+        // on an invocation whose demand provably cannot fit. The family's
+        // exact per-step check remains the authority behind this estimate.
+        let duration_secs = if sample_rate > 0 {
+            audio.len() as f32 / sample_rate as f32
+        } else {
+            0.0
+        };
+        let audio_tokens = (duration_secs * rate).ceil() as usize;
+        let prefix_tokens = prefix_text.map_or(0, |text| text.chars().count() / 4);
+        let demand = ASR_TEXT_PROMPT_TOKEN_RESERVE
+            .saturating_add(audio_tokens)
+            .saturating_add(prefix_tokens)
+            .saturating_add(max_new_tokens);
+        let capacity = cache.capacity_tokens();
+        if demand > capacity {
+            return Err(Error::InvalidInput(format!(
+                "Speaker-attributed ASR invocation needs about {demand} KV tokens (prompt reserve + {audio_tokens} audio + {prefix_tokens} prefix + {max_new_tokens} decode) but the invocation cache has capacity for {capacity}; reduce chunk length or free memory"
+            )));
+        }
+    }
     model.transcribe_granite_speech_task_and_options_physical(
         audio,
         sample_rate,
@@ -4520,6 +4673,87 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn saa_decode_policy(secs: f32) -> usize {
+        (GRANITE_SAA_NEW_TOKEN_RESERVE
+            + (secs * GRANITE_SAA_NEW_TOKENS_PER_SECOND).ceil() as usize)
+            .clamp(GRANITE_SAA_MIN_NEW_TOKENS, GRANITE_SAA_MAX_NEW_TOKENS)
+    }
+
+    fn saa_demand_fits(context_tokens: usize, secs: f32) -> bool {
+        let audio_tokens = (secs * 10.0).ceil() as usize;
+        ASR_TEXT_PROMPT_TOKEN_RESERVE
+            .saturating_add(audio_tokens)
+            .saturating_add(saa_decode_policy(secs))
+            <= context_tokens
+    }
+
+    #[test]
+    fn invocation_solver_bounds_chunk_seconds_to_context() {
+        let InvocationAudioLimit::Limited(limit) =
+            solve_invocation_audio_limit(4_096, 10.0, ASR_TEXT_PROMPT_TOKEN_RESERVE, saa_decode_policy)
+        else {
+            panic!("a 4096-token context must admit audio chunks");
+        };
+        assert!(
+            (205.0..=207.0).contains(&limit),
+            "unexpected solved limit {limit}"
+        );
+        assert!(saa_demand_fits(4_096, limit));
+        assert!(!saa_demand_fits(4_096, limit + 0.5));
+
+        // A 1024-token context cannot fit the 30 s family minimum: the solver
+        // degrades to roughly 9.6 s so constrained hosts stay functional.
+        let InvocationAudioLimit::Limited(small) =
+            solve_invocation_audio_limit(1_024, 10.0, ASR_TEXT_PROMPT_TOKEN_RESERVE, saa_decode_policy)
+        else {
+            panic!("a 1024-token context must still admit minimal chunks");
+        };
+        assert!((9.0..=9.65).contains(&small), "unexpected limit {small}");
+        assert!(small < GRANITE_SAA_MIN_CHUNK_SECS);
+    }
+
+    #[test]
+    fn invocation_solver_fails_closed_when_minimum_does_not_fit() {
+        let outcome =
+            solve_invocation_audio_limit(512, 10.0, ASR_TEXT_PROMPT_TOKEN_RESERVE, saa_decode_policy);
+        assert_eq!(outcome, InvocationAudioLimit::Infeasible);
+        let outcome = solve_invocation_audio_limit(4_096, 0.0, ASR_TEXT_PROMPT_TOKEN_RESERVE, saa_decode_policy);
+        assert_eq!(outcome, InvocationAudioLimit::Infeasible);
+    }
+
+    #[test]
+    fn compose_keeps_hint_when_audio_never_reaches_the_decoder() {
+        let composed = compose_invocation_audio_limit(Some(30.0), None, Some(1_024), saa_decode_policy)
+            .expect("no-rate families compose to their hint");
+        assert_eq!(composed, Some(30.0));
+
+        let composed =
+            compose_invocation_audio_limit(Some(30.0), Some(10.0), None, saa_decode_policy)
+                .expect("no context resolves to the hint alone");
+        assert_eq!(composed, Some(30.0));
+    }
+
+    #[test]
+    fn compose_applies_the_smaller_of_hint_and_context_budget() {
+        let composed = compose_invocation_audio_limit(
+            Some(540.0),
+            Some(10.0),
+            Some(4_096),
+            saa_decode_policy,
+        )
+        .expect("feasible context composes");
+        let InvocationAudioLimit::Limited(context_limit) =
+            solve_invocation_audio_limit(4_096, 10.0, ASR_TEXT_PROMPT_TOKEN_RESERVE, saa_decode_policy)
+        else {
+            panic!("feasible context expected");
+        };
+        assert_eq!(composed, Some(540.0_f32.min(context_limit)));
+
+        let error = compose_invocation_audio_limit(Some(540.0), Some(10.0), Some(512), saa_decode_policy)
+            .expect_err("infeasible context must fail closed");
+        assert!(error.to_string().contains("cannot fit even a minimal"));
     }
 
     #[test]
