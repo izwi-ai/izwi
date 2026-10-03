@@ -76,17 +76,17 @@ huggingface-cli download <repo-id> \
 **Example for macOS:**
 
 ```bash
-huggingface-cli download google/gemma-3-1b-it \
+huggingface-cli download <repo-id> \
   --repo-type model \
-  --local-dir "$HOME/Library/Application Support/izwi/models/Gemma-3-1b-it"
+  --local-dir "$HOME/Library/Application Support/izwi/models/<model-name>"
 ```
 
 **Example for Linux:**
 
 ```bash
-huggingface-cli download google/gemma-3-1b-it \
+huggingface-cli download <repo-id> \
   --repo-type model \
-  --local-dir "$HOME/.local/share/izwi/models/Gemma-3-1b-it"
+  --local-dir "$HOME/.local/share/izwi/models/<model-name>"
 ```
 
 ### Step 3: Verify the Download
@@ -138,11 +138,7 @@ huggingface-cli download <repo-id> --local-dir "<path>"
 
 | Model | Repository | Notes |
 |-------|------------|-------|
-| Gemma 3 1B | `google/gemma-3-1b-it` | Requires license acceptance |
 | Llama 3 | `meta-llama/Llama-3-*` | Requires license acceptance |
-
-See specific guides:
-- [Gemma 3 1B Download](/models/manual-gemma-3-1b-download)
 
 ---
 

@@ -17,7 +17,7 @@ const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
 
 #[tokio::test]
 async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() {
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let worker_config = MockWorkerConfig {
         public_model: model_alias,
@@ -206,7 +206,7 @@ const SCOPED_OPS_KEY: &str = "ds05-scoped-ops-metrics-key";
 /// root key fully backward compatible.
 #[tokio::test]
 async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_store() {
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let worker_config = MockWorkerConfig {
         public_model: model_alias,
@@ -403,7 +403,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     use std::collections::BTreeSet;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     // The gateway always boots its chat route, so one chat worker is
     // approved alongside the realtime ASR worker under test.
@@ -679,7 +679,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     use std::collections::BTreeSet;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let chat_worker = MockWorker::spawn(MockWorkerConfig {
         worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
@@ -985,7 +985,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let chat_worker = MockWorker::spawn(MockWorkerConfig {
         worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
@@ -1220,7 +1220,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
-    let model = ModelVariant::Qwen34BGguf;
+    let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     let chat_worker = MockWorker::spawn(MockWorkerConfig {
         worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),

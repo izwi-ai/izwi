@@ -1216,7 +1216,7 @@ mod tests {
         let remote = RemoteChatExecution::new(
             client,
             RemoteChatExecutionConfig {
-                public_model_variant: ModelVariant::Qwen34BGguf,
+                public_model_variant: ModelVariant::Qwen354BGguf,
                 expected_worker_incarnation: incarnation,
                 deployment_id: deployment,
                 expected_model_generation: generation,
@@ -1292,7 +1292,7 @@ mod tests {
     }
 
     fn public_chat_request() -> Request<Body> {
-        public_chat_request_for_model(ModelVariant::Qwen34BGguf)
+        public_chat_request_for_model(ModelVariant::Qwen354BGguf)
     }
 
     async fn send_public_chat(mut app: Router) -> Response {
@@ -1306,7 +1306,7 @@ mod tests {
         let mut request = public_chat_request();
         *request.body_mut() = Body::from(
             json!({
-                "model": ModelVariant::Qwen34BGguf.dir_name(),
+                "model": ModelVariant::Qwen354BGguf.dir_name(),
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": true,
                 "max_tokens": 32
@@ -1444,7 +1444,7 @@ mod tests {
 
         let response = app
             .as_service::<Body>()
-            .call(public_chat_request_for_model(ModelVariant::Qwen317BGguf))
+            .call(public_chat_request_for_model(ModelVariant::Qwen359BGguf))
             .await
             .expect("router request should succeed");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn to_core_messages_collects_multimodal_parts() {
         let (messages, media_inputs) = to_core_messages_with_media(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen314BGguf,
             vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Parts(vec![
@@ -1767,7 +1767,7 @@ mod tests {
         assert!(messages[0].content.contains("<|image_pad|>"));
         assert_eq!(media_inputs.len(), 1);
         assert!(
-            validate_media_inputs_for_variant(ModelVariant::Qwen38BGguf, &media_inputs)
+            validate_media_inputs_for_variant(ModelVariant::Qwen314BGguf, &media_inputs)
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
         );
@@ -1776,7 +1776,7 @@ mod tests {
     #[test]
     fn validates_rejects_non_zero_frequency_penalty() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -1814,7 +1814,7 @@ mod tests {
     #[test]
     fn validates_rejects_stop_sequences() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -1852,7 +1852,7 @@ mod tests {
     #[test]
     fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -2105,7 +2105,7 @@ mod timing_contract_tests {
         let format = OpenAiResponseFormat {
             kind: "json_object".into(),
         };
-        assert!(ensure_response_format_supported(ModelVariant::Qwen34BGguf, &format).is_ok());
+        assert!(ensure_response_format_supported(ModelVariant::Qwen314BGguf, &format).is_ok());
         assert!(
             ensure_response_format_supported(ModelVariant::Qwen3827BFp8, &format).is_err(),
             "qwen3.8 has its own sampler without the grammar seam"

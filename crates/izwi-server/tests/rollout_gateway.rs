@@ -29,7 +29,7 @@ use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
 use izwi_serving_protocol::{ModelAlias, ModelGeneration, NodeId, WorkerId};
 
 const GATEWAY_API_KEY: &str = "rollout-rig-api-key";
-const MODEL: ModelVariant = ModelVariant::Qwen34BGguf;
+const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
 const DEPLOYMENT_ID: &str = "mock-chat-v1";
 
 async fn reserve_port() -> u16 {

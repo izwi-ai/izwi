@@ -145,7 +145,7 @@ Returns enabled model variants in OpenAI list format.
   "object": "list",
   "data": [
     {
-      "id": "Qwen3-8B-GGUF",
+      "id": "Qwen3.5-4B",
       "object": "model",
       "created": 1760000000,
       "owned_by": "agentem"
@@ -168,7 +168,7 @@ Basic request:
 
 ```json
 {
-  "model": "Qwen3-8B-GGUF",
+  "model": "Qwen3.5-4B",
   "messages": [
     { "role": "system", "content": "You are concise." },
     { "role": "user", "content": "Say hello." }
@@ -440,7 +440,7 @@ Preview OpenAI-compatible Responses API shape.
 
 ```json
 {
-  "model": "Qwen3-8B-GGUF",
+  "model": "Qwen3.5-4B",
   "instructions": "Be concise.",
   "input": "Write one sentence.",
   "max_output_tokens": 128,
@@ -974,7 +974,7 @@ Download progress SSE payload:
 
 ```json
 {
-  "variant": "Qwen3-8B-GGUF",
+  "variant": "Qwen3.5-4B",
   "downloaded_bytes": 1048576,
   "total_bytes": 2147483648,
   "current_file": "model.gguf",

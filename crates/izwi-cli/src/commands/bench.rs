@@ -6788,7 +6788,7 @@ concurrent = [1, 2]
         let text = std::fs::read_to_string(path).expect("CUDA family manifest");
         let manifest: BenchmarkManifest = toml::from_str(&text).expect("valid CUDA manifest");
         let cases = expand_manifest_cases(&manifest).expect("unique CUDA cases");
-        assert_eq!(cases.len(), 17);
+        assert_eq!(cases.len(), 15);
         assert!(cases.iter().all(|case| case.model.is_some()));
         assert!(cases
             .iter()
@@ -6812,7 +6812,7 @@ concurrent = [1, 2]
             let manifest: BenchmarkManifest =
                 toml::from_str(&text).expect("valid chat performance manifest");
             let cases = expand_manifest_cases(&manifest).expect("unique chat performance cases");
-            assert_eq!(cases.len(), 5, "{name}");
+            assert_eq!(cases.len(), 3, "{name}");
             assert!(cases.iter().all(|case| case.command == "chat"), "{name}");
             assert!(cases.iter().all(|case| case.model.is_some()), "{name}");
         }

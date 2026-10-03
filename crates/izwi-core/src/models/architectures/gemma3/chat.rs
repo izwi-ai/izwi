@@ -209,15 +209,6 @@ struct GemmaDefaults {
 
 fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
     match variant {
-        ModelVariant::Gemma31BIt => GemmaDefaults {
-            hidden_size: 1152,
-            intermediate_size: 6912,
-            num_attention_heads: 4,
-            num_hidden_layers: 26,
-            num_key_value_heads: 1,
-            head_dim: 256,
-            max_position_embeddings: 32_768,
-        },
         ModelVariant::Gemma34BIt => GemmaDefaults {
             hidden_size: 2560,
             intermediate_size: 10240,
@@ -1128,12 +1119,9 @@ mod tests {
     #[test]
     fn missing_context_uses_variant_native_limit() {
         let config = r#"{"vocab_size": 262208}"#;
-        let one_b = parse_gemma3_config(config, ModelVariant::Gemma31BIt, 262_208, None)
-            .expect("1B defaults");
         let four_b = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
             .expect("4B defaults");
 
-        assert_eq!(one_b.max_position_embeddings, 32_768);
         assert_eq!(four_b.max_position_embeddings, 131_072);
     }
 

@@ -291,11 +291,11 @@ mod tests {
             .plan(
                 RoutingRequest::new(RouteSource::OpenAiChatCompletions, CapabilityKind::Chat)
                     .with_input_kind(RoutingInputKind::Text)
-                    .with_model_variant(ModelVariant::Qwen38BGguf),
+                    .with_model_variant(ModelVariant::Qwen359BGguf),
             )
             .expect("route decision");
 
-        assert_eq!(decision.selected_model_variant, ModelVariant::Qwen38BGguf);
+        assert_eq!(decision.selected_model_variant, ModelVariant::Qwen359BGguf);
         assert_eq!(decision.backend_kind, BackendKind::Cpu);
         assert_eq!(
             decision.execution_plan.execution_target,
@@ -331,12 +331,12 @@ mod tests {
                     .with_model_fallback(true)
                     .with_candidate_models(vec![
                         ModelVariant::Kokoro82M,
-                        ModelVariant::Qwen38BGguf,
+                        ModelVariant::Qwen359BGguf,
                     ]),
             )
             .expect("fallback route decision");
 
-        assert_eq!(decision.selected_model_variant, ModelVariant::Qwen38BGguf);
+        assert_eq!(decision.selected_model_variant, ModelVariant::Qwen359BGguf);
         assert_eq!(decision.fallback_chain.len(), 2);
         assert!(!decision.fallback_chain[0].accepted);
         assert!(decision.fallback_chain[0]
@@ -386,7 +386,7 @@ mod tests {
                 RoutingRequest::new(RouteSource::OpenAiAudioSpeech, CapabilityKind::Tts)
                     .with_model_fallback(true)
                     .with_candidate_models(vec![
-                        ModelVariant::Qwen38BGguf,
+                        ModelVariant::Qwen359BGguf,
                         ModelVariant::WhisperLargeV3Turbo,
                     ]),
             )
@@ -395,7 +395,7 @@ mod tests {
         assert!(err.to_string().contains("No route found"));
         assert!(err
             .to_string()
-            .contains(ModelVariant::Qwen38BGguf.display_name()));
+            .contains(ModelVariant::Qwen359BGguf.display_name()));
         assert!(err
             .to_string()
             .contains(ModelVariant::WhisperLargeV3Turbo.display_name()));

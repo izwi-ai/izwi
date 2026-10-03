@@ -2884,7 +2884,7 @@ mod tests {
             "--worker-deployment",
             "qwen3-chat-v1",
             "--public-model",
-            ModelVariant::Qwen34BGguf.dir_name(),
+            ModelVariant::Qwen354BGguf.dir_name(),
             "--worker-model-generation",
             "7",
         ]);
@@ -2897,7 +2897,7 @@ mod tests {
         assert_eq!(args.role, ServerRole::Gateway);
         assert_eq!(
             remote.config().public_model_variant,
-            ModelVariant::Qwen34BGguf
+            ModelVariant::Qwen354BGguf
         );
         assert_eq!(remote.config().expected_model_generation.get(), 7);
         assert_eq!(remote.config().max_queue_wait, Duration::from_millis(250));
@@ -3021,7 +3021,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_gateway_configuration_approves_worker_without_runtime() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let public_model = ModelAlias::new(model.dir_name()).expect("static model alias");
         let first = MockWorker::spawn(MockWorkerConfig {
             worker_id: WorkerId::new("gateway-worker-a").expect("static worker id"),
@@ -3071,7 +3071,7 @@ mod tests {
 
     #[tokio::test]
     async fn restarted_worker_reapproval_pins_stable_identity_and_deployment() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker = MockWorker::spawn(MockWorkerConfig {
             worker_id: WorkerId::new("restart-worker").expect("static worker id"),
             node_id: NodeId::new("restart-node").expect("static node id"),

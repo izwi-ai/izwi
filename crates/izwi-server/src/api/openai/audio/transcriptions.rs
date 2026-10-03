@@ -1322,7 +1322,7 @@ mod tests {
             .expect_err("TTS model should be rejected for transcription");
         assert!(tts.message.contains("Unsupported transcription model"));
 
-        let chat = validate_transcription_model(Some("Qwen3-8B-GGUF"))
+        let chat = validate_transcription_model(Some("Qwen3.5-4B"))
             .expect_err("chat model should be rejected for transcription");
         assert!(chat.message.contains("Unsupported transcription model"));
     }

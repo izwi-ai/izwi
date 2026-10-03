@@ -337,58 +337,59 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
         { ...model, status: "ready" },
         {
           ...model,
-          variant: "Qwen3-8B-GGUF",
+          variant: "Qwen3.5-9B",
+          route_capabilities: caps({ openai_chat_completions: true }),
           status: "ready",
         },
       ],
     });
     apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
 
-    renderChatSwitch("Qwen3-8B-GGUF");
+    renderChatSwitch("Qwen3.5-9B");
     await screen.findByTestId("resident-models");
 
     fireEvent.click(screen.getByRole("button", { name: "Load target" }));
 
-    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-9B", expect.objectContaining({ signal: expect.any(AbortSignal) })));
     expect(apiMocks.unloadModel).not.toHaveBeenCalled();
   });
 
   it("still evicts non-pipeline chat models on a chat switch", async () => {
     apiMocks.listModels.mockResolvedValue({
       models: [
-        { ...model, variant: "Qwen3-8B-GGUF", status: "ready" },
-        { ...model, variant: "Qwen3-4B-GGUF", status: "ready" },
+        { ...model, variant: "Qwen3.5-9B", status: "ready" },
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
       ],
     });
     apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
     apiMocks.unloadModel.mockResolvedValue({ status: "unloaded", message: "unloaded" });
 
-    renderChatSwitch("Qwen3-4B-GGUF");
+    renderChatSwitch("Qwen3.5-4B");
     await screen.findByTestId("resident-models");
 
     fireEvent.click(screen.getByRole("button", { name: "Load target" }));
 
     await waitFor(() =>
-      expect(apiMocks.unloadModel).toHaveBeenCalledWith("Qwen3-8B-GGUF"),
+      expect(apiMocks.unloadModel).toHaveBeenCalledWith("Qwen3.5-9B"),
     );
-    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-4B", expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
   it("never evicts pinned models on a chat switch", async () => {
     apiMocks.listModels.mockResolvedValue({
       models: [
-        { ...model, variant: "Qwen3-8B-GGUF", status: "ready", pinned: true },
-        { ...model, variant: "Qwen3-4B-GGUF", status: "ready" },
+        { ...model, variant: "Qwen3.5-9B", status: "ready", pinned: true },
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
       ],
     });
     apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
 
-    renderChatSwitch("Qwen3-4B-GGUF");
+    renderChatSwitch("Qwen3.5-4B");
     await screen.findByTestId("resident-models");
 
     fireEvent.click(screen.getByRole("button", { name: "Load target" }));
 
-    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3-4B-GGUF", expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-4B", expect.objectContaining({ signal: expect.any(AbortSignal) })));
     expect(apiMocks.unloadModel).not.toHaveBeenCalled();
   });
 
@@ -402,7 +403,7 @@ describe("ModelCatalogProvider residency-aware chat eviction", () => {
       },
     });
 
-    renderChatSwitch("Qwen3-8B-GGUF");
+    renderChatSwitch("Qwen3.5-9B");
 
     await waitFor(() =>
       expect(screen.getByTestId("residency-summary")).toHaveTextContent("1/4"),

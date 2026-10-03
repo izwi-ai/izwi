@@ -229,14 +229,14 @@ describe("RouteModelModal", () => {
     expect(deleteButton).toHaveFocus();
   });
 
-  it("offers an actionable manual-download guide", () => {
+  it("offers a download action for not-downloaded models", () => {
     render(
       <RouteModelModal
         isOpen
         onClose={vi.fn()}
         title="Chat Models"
         description="Manage chat models."
-        models={[buildModel({ variant: "Gemma-3-1b-it", status: "not_downloaded" })]}
+        models={[buildModel({ variant: "Qwen3.5-4B", status: "not_downloaded" })]}
         loading={false}
         selectedVariant={null}
         downloadProgress={{}}
@@ -249,12 +249,7 @@ describe("RouteModelModal", () => {
     );
 
     expect(
-      screen.getByRole("link", {
-        name: "Open manual download guide for Gemma-3-1b-it",
-      }),
-    ).toHaveAttribute(
-      "href",
-      "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md",
-    );
+      screen.getByRole("button", { name: /Download/i }),
+    ).toBeInTheDocument();
   });
 });

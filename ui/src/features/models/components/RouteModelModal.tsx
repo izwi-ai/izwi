@@ -158,13 +158,6 @@ function getModelSizeLabel(
   return "Size unknown";
 }
 
-function requiresManualDownload(variant: string): boolean {
-  return variant === "Gemma-3-1b-it";
-}
-
-const MANUAL_GEMMA_DOWNLOAD_GUIDE =
-  "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md";
-
 export function RouteModelModal({
   isOpen,
   onClose,
@@ -409,21 +402,7 @@ export function RouteModelModal({
                                           )}
 
                                         {(model.status === "not_downloaded" ||
-                                          model.status === "error") &&
-                                          (requiresManualDownload(
-                                            model.variant,
-                                          ) ? (
-                                            <a
-                                              href={MANUAL_GEMMA_DOWNLOAD_GUIDE}
-                                              target="_blank"
-                                              rel="noreferrer"
-                                              className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
-                                              aria-label={`Open manual download guide for ${modelLabel}`}
-                                            >
-                                              <Download aria-hidden="true" className="h-3.5 w-3.5" />
-                                              Manual download guide
-                                            </a>
-                                          ) : (
+                                          model.status === "error") && (
                                             <button
                                               type="button"
                                               onClick={() =>
@@ -434,7 +413,7 @@ export function RouteModelModal({
                                               <Download aria-hidden="true" className="h-3.5 w-3.5" />
                                               Download
                                             </button>
-                                          ))}
+                                          )}
 
                                         {model.status === "downloaded" && (
                                           <button

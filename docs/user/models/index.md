@@ -60,11 +60,9 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 
 | Family | Canonical IDs |
 |--------|---------------|
-| Qwen3 GGUF | `Qwen3-0.6B-GGUF`, `Qwen3-1.7B-GGUF`, `Qwen3-4B-GGUF`, `Qwen3-8B-GGUF` |
 | Qwen3.5 GGUF | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text chat; 28.74 GiB checkpoint payload) |
 | LFM2.5 text | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
-| Gemma | `Gemma-3-1b-it` |
 
 `Qwen3.8-27B-FP8` uses the separate `Qwen38Chat` architecture/model family.
 Qwen3.5 compatibility or backend evidence is not applied to it implicitly.
@@ -179,9 +177,9 @@ izwi serve
 
 ## Manual Downloads
 
-Some models (for example Gemma) may require manual Hugging Face access setup:
+Some models may require manual Hugging Face access setup (for example gated
+repositories that need license acceptance):
 
-- [Manual Download: Gemma 3 1B](/models/manual-gemma-3-1b-download)
 - [Manual Download Guide](/models/manual-download)
 
 ---

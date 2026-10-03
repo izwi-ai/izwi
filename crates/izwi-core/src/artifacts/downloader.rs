@@ -46,10 +46,6 @@ const QWEN38_REQUIRED_METADATA_FILES: &[&str] = &[
 
 fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
-        ModelVariant::Qwen306BGguf => Some("Qwen3-0.6B-Q8_0.gguf"),
-        ModelVariant::Qwen317BGguf => Some("Qwen3-1.7B-Q8_0.gguf"),
-        ModelVariant::Qwen34BGguf => Some("Qwen3-4B-Q4_K_M.gguf"),
-        ModelVariant::Qwen38BGguf => Some("Qwen3-8B-Q4_K_M.gguf"),
         ModelVariant::Qwen314BGguf => Some("Qwen3-14B-Q4_K_M.gguf"),
         ModelVariant::Qwen3Moe30bA3bGguf => Some("Qwen3-30B-A3B-Q4_K_M.gguf"),
         _ => None,
@@ -1788,10 +1784,6 @@ impl ModelDownloader {
 
         if variant.is_qwen_chat_gguf() {
             let tokenizer_repo = match variant {
-                ModelVariant::Qwen306BGguf => "Qwen/Qwen3-0.6B",
-                ModelVariant::Qwen317BGguf => "Qwen/Qwen3-1.7B",
-                ModelVariant::Qwen34BGguf => "Qwen/Qwen3-4B",
-                ModelVariant::Qwen38BGguf => "Qwen/Qwen3-8B",
                 ModelVariant::Qwen314BGguf => "Qwen/Qwen3-14B",
                 _ => variant.repo_id(),
             };
@@ -2171,15 +2163,7 @@ impl ModelDownloader {
             150_000_000
         } else if file.ends_with(".gguf") {
             let lower = file.to_ascii_lowercase();
-            if file.contains("Qwen3-0.6B") {
-                1_100_000_000
-            } else if file.contains("Qwen3-1.7B") {
-                2_400_000_000
-            } else if file.contains("Qwen3-4B") {
-                2_500_000_000
-            } else if file.contains("Qwen3-8B") {
-                5_200_000_000
-            } else if file.contains("Qwen3-14B") {
+            if file.contains("Qwen3-14B") {
                 9_200_000_000
             } else if file.contains("Qwen3.5-0.8B") {
                 685_000_000
@@ -2236,16 +2220,11 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
                     ModelVariant::Qwen3ForcedAligner06B4Bit => 703_000_000,
-                    ModelVariant::Qwen306BGguf => 1_100_000_000,
-                    ModelVariant::Qwen317BGguf => 2_400_000_000,
-                    ModelVariant::Qwen34BGguf => 2_500_000_000,
-                    ModelVariant::Qwen38BGguf => 5_200_000_000,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Qwen3508BGguf => 685_000_000,
                     ModelVariant::Qwen352BGguf => 1_850_000_000,
                     ModelVariant::Qwen354BGguf => 3_250_000_000,
                     ModelVariant::Qwen359BGguf => 6_350_000_000,
-                    ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
                     ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
                     _ => 1_500_000_000,

@@ -1397,7 +1397,7 @@ mod tests {
     #[test]
     fn explicit_overrides_win_over_default_generation_params() {
         let request = ChatExecutionRequest {
-            variant: ModelVariant::Qwen34BGguf,
+            variant: ModelVariant::Qwen354BGguf,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
@@ -1530,10 +1530,6 @@ mod tests {
         for variant in [
             ModelVariant::Gemma34BIt,
             ModelVariant::Lfm2512BInstructGguf,
-            ModelVariant::Qwen306BGguf,
-            ModelVariant::Qwen317BGguf,
-            ModelVariant::Qwen34BGguf,
-            ModelVariant::Qwen38BGguf,
             ModelVariant::Qwen314BGguf,
             ModelVariant::Qwen352BGguf,
         ] {

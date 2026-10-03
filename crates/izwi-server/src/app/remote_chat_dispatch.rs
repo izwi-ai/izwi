@@ -943,7 +943,7 @@ mod tests {
     fn deployment() -> LoadedDeployment {
         LoadedDeployment {
             deployment_id: id::<DeploymentId>("chat-prod"),
-            public_model: ModelAlias::new(ModelVariant::Qwen34BGguf.dir_name()).unwrap(),
+            public_model: ModelAlias::new(ModelVariant::Qwen354BGguf.dir_name()).unwrap(),
             artifact_revision: id::<ArtifactRevision>("artifact-v1"),
             model_generation: ModelGeneration::new(1).unwrap(),
             task: TaskKind::Chat,
@@ -1043,7 +1043,7 @@ mod tests {
         RemoteChatDispatcher::new(
             registry,
             RemoteChatDispatchConfig {
-                public_model_variant: ModelVariant::Qwen34BGguf,
+                public_model_variant: ModelVariant::Qwen354BGguf,
                 deployment_id: id::<DeploymentId>("chat-prod"),
                 policy_revision: id::<PolicyRevision>("policy-v1"),
                 backend_policy: BackendPolicy::ANY,
@@ -1059,7 +1059,7 @@ mod tests {
 
     fn request() -> ChatExecutionRequest {
         ChatExecutionRequest {
-            variant: ModelVariant::Qwen34BGguf,
+            variant: ModelVariant::Qwen354BGguf,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".into(),
@@ -1531,7 +1531,7 @@ mod tests {
             }
         }
         ChatExecutionRequest {
-            variant: ModelVariant::Qwen34BGguf,
+            variant: ModelVariant::Qwen354BGguf,
             messages,
             max_completion_tokens: None,
             max_tokens: Some(32),

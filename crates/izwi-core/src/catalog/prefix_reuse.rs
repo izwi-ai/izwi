@@ -276,20 +276,9 @@ mod tests {
         assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::NotRun);
     }
 
-    #[test]
-    fn dense_fixture_suite_cells_engage_on_cpu_only() {
-        for variant in [ModelVariant::Qwen34BGguf, ModelVariant::Gemma31BIt] {
-            let cpu = variant.prefix_reuse_support(BackendKind::Cpu);
-            assert!(cpu.engages(), "{variant:?} cpu cell must engage");
-            assert_eq!(cpu.evidence, PrefixReuseEvidenceLevel::FixtureSuite);
-            for backend in [BackendKind::Metal, BackendKind::Cuda] {
-                assert!(
-                    !variant.prefix_reuse_support(backend).engages(),
-                    "{variant:?} must stay off on {backend:?}"
-                );
-            }
-        }
-    }
+    // Note: the dense fixture-suite cell (Qwen3Chat | Gemma3Chat) currently has
+    // no enabled variant after the dense Qwen3 GGUF and Gemma-3-1b-it removals,
+    // so it is inert; the inventory test above covers its fail-closed behavior.
 
     #[test]
     fn hybrid_unproven_families_stay_excluded() {

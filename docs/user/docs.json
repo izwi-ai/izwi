@@ -146,8 +146,7 @@
         "pages": [
           "models/management",
           "models/voice-presets",
-          "models/manual-download",
-          "models/manual-gemma-3-1b-download"
+          "models/manual-download"
         ]
       },
       {
@@ -161,11 +160,6 @@
     ]
   },
   "redirects": [
-    {
-      "source": "/manual-gemma-3-1b-download",
-      "destination": "/models/manual-gemma-3-1b-download",
-      "permanent": true
-    },
     {
       "source": "/features/voice-studio",
       "destination": "/features/voices",

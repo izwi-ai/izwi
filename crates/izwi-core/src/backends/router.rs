@@ -512,7 +512,7 @@ mod tests {
             "Synthetic CUDA profile",
         );
         let router = BackendRouter::from_context(context);
-        let plan = router.cuda_execution_plan(ModelVariant::Qwen34BGguf);
+        let plan = router.cuda_execution_plan(ModelVariant::Qwen354BGguf);
 
         assert!(plan.eligibility.eligible);
         assert!(!plan.executable);

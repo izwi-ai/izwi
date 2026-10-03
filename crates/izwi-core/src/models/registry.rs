@@ -7290,7 +7290,7 @@ mod tests {
     fn loaded_model_diagnostics_entry_reports_backend_family_and_dtype_policy() {
         let diagnostics = loaded_model_diagnostics_entry(
             &DeviceProfile::cpu(),
-            ModelVariant::Qwen306BGguf,
+            ModelVariant::Qwen314BGguf,
             "native_chat",
             "qwen3_chat",
             LoadedModelActualRuntime::default(),
@@ -7299,7 +7299,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(diagnostics.variant_id, "Qwen3-0.6B-GGUF");
+        assert_eq!(diagnostics.variant_id, "Qwen3-14B-GGUF");
         assert_eq!(diagnostics.family, "qwen3_chat");
         assert_eq!(diagnostics.task, "chat");
         assert_eq!(diagnostics.handle_kind, "native_chat");
@@ -7331,7 +7331,7 @@ mod tests {
     fn loaded_model_diagnostics_keeps_observed_runtime_separate_from_policy() {
         let diagnostics = loaded_model_diagnostics_entry(
             &DeviceProfile::cpu(),
-            ModelVariant::Qwen306BGguf,
+            ModelVariant::Qwen314BGguf,
             "native_chat",
             "qwen3_chat",
             LoadedModelActualRuntime::from_values(Some("CUDA"), Some("BF16")),

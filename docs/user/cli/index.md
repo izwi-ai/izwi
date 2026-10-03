@@ -119,7 +119,7 @@ izwi align audio.wav "Hello world, this is a test."
 
 ```bash
 izwi chat
-izwi chat --model Gemma-3-1b-it --system "You are a helpful assistant"
+izwi chat --model Qwen3.5-4B --system "You are a helpful assistant"
 ```
 
 ---

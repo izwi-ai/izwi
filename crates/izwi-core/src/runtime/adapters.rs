@@ -787,7 +787,7 @@ mod tests {
             .require(CapabilityKind::Chat, ModelVariant::Qwen35Moe35BA3BFp8)
             .unwrap();
         let gemma_chat = *registry
-            .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
+            .require(CapabilityKind::Chat, ModelVariant::Gemma34BIt)
             .unwrap();
         let lfm_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Lfm2512BInstructGguf)
@@ -865,8 +865,7 @@ mod tests {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let variants = registry.continuous_tensor_batch_variants(backend);
             assert!(variants.contains(&ModelVariant::Qwen306B));
-            assert!(variants.contains(&ModelVariant::Qwen306BGguf));
-            assert!(variants.contains(&ModelVariant::Gemma31BIt));
+            assert!(variants.contains(&ModelVariant::Qwen354BGguf));
             assert!(variants.contains(&ModelVariant::Gemma34BIt));
             assert!(variants.contains(&ModelVariant::Qwen3508BGguf));
             assert!(variants.contains(&ModelVariant::Qwen3Asr06BGguf));
@@ -909,7 +908,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .require(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
+                .require(CapabilityKind::Chat, ModelVariant::Qwen359BGguf)
                 .expect("qwen chat adapter")
                 .execution_target,
             ExecutionTargetKind::TokenEngine
@@ -1153,7 +1152,7 @@ mod tests {
         let registry = RuntimeAdapterRegistry::built_in();
 
         let err = registry
-            .require(CapabilityKind::Tts, ModelVariant::Qwen38BGguf)
+            .require(CapabilityKind::Tts, ModelVariant::Qwen359BGguf)
             .expect_err("chat model should not satisfy TTS");
 
         assert!(matches!(err, Error::InvalidInput(_)));

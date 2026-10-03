@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn builds_messages_from_text_and_instructions() {
         let (messages, stored, media_inputs) = build_input_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
             None,
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn build_input_messages_collects_multimodal_input() {
         let (messages, _stored, media_inputs) = build_input_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen314BGguf,
             None,
             Some(ResponseInput::Many(vec![ResponseInputItem {
                 role: Some("user".to_string()),
@@ -1119,7 +1119,7 @@ mod tests {
         assert!(messages[0].content.contains("<|image_pad|>"));
         assert_eq!(media_inputs.len(), 1);
         assert!(
-            validate_media_inputs_for_variant(ModelVariant::Qwen38BGguf, &media_inputs)
+            validate_media_inputs_for_variant(ModelVariant::Qwen314BGguf, &media_inputs)
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
         );

@@ -41,7 +41,7 @@ const WORKER_ONE_ID: &str = "fleet-rig-worker-1";
 const WORKER_TWO_ID: &str = "fleet-rig-worker-2";
 const WORKER_ONE_MARKER: &str = "fleet-rig-worker-one-response";
 const WORKER_TWO_MARKER: &str = "fleet-rig-worker-two-response";
-const MODEL: ModelVariant = ModelVariant::Qwen34BGguf;
+const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
 
 async fn reserve_port() -> u16 {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")

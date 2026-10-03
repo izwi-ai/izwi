@@ -1825,7 +1825,7 @@ export function VoicePage({
               )}
             </div>
             <p className="mt-2 text-sm leading-relaxed text-[var(--text-muted)]">
-              Uses a fixed local stack: Parakeet ASR, Qwen3-1.7B-GGUF, and
+              Uses a fixed local stack: Parakeet ASR, Qwen3.5-4B, and
               Kokoro-82M.
             </p>
           </button>

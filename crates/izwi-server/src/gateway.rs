@@ -1016,7 +1016,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
-                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "model": ModelVariant::Qwen354BGguf.dir_name(),
                     "messages": [{"role": "user", "content": "quota test"}],
                     "max_tokens": max_tokens
                 })
@@ -1033,7 +1033,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
-                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "model": ModelVariant::Qwen354BGguf.dir_name(),
                     "messages": [{"role": "user", "content": "scoped principal test"}],
                     "max_tokens": max_tokens
                 })
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_chat_nonstream_and_stream_use_registry_dispatcher() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let (state, _worker) = registry_gateway_state(model).await;
         let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
 
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             fault: MockFault::Hang,
@@ -1327,7 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_crash_cannot_duplicate_execution_and_recovery_is_explicit() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             fault: MockFault::Hang,
@@ -1436,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_stream_disconnect_releases_only_after_exact_worker_teardown() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let (state, worker) = registry_gateway_state_with_config(
             model,
             MockWorkerConfig {
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let deployment_id = MockWorkerConfig::default().deployment_id;
         let incarnation = |suffix: &str| MockWorkerConfig {
             worker_id: "mock-worker-fleet".try_into().expect("test id valid"),
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_without_retry() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let deployment_id = MockWorkerConfig::default().deployment_id;
         let replica = |suffix: &str, output_text: &str| MockWorkerConfig {
             worker_id: format!("mock-replica-{suffix}")
@@ -1807,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_router_uses_only_the_remote_worker_and_hides_local_routes() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             ..MockWorkerConfig::default()
@@ -1939,7 +1939,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_readiness_rejects_a_stale_model_generation() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             ..MockWorkerConfig::default()
@@ -1985,7 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_admission_rejects_instead_of_queueing() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             ..MockWorkerConfig::default()
@@ -2051,7 +2051,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({
-                    "model": ModelVariant::Qwen34BGguf.dir_name(),
+                    "model": ModelVariant::Qwen354BGguf.dir_name(),
                     "messages": [{"role": "user", "content": "hello"}]
                 })
                 .to_string(),
@@ -2085,7 +2085,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "model": ModelVariant::Qwen34BGguf.dir_name(),
+                        "model": ModelVariant::Qwen354BGguf.dir_name(),
                         "messages": [{"role": "user", "content": "hello"}]
                     })
                     .to_string(),
@@ -2108,7 +2108,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
-        let model = ModelVariant::Qwen34BGguf;
+        let model = ModelVariant::Qwen354BGguf;
         let worker_config = MockWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             fault: MockFault::Hang,
@@ -2303,7 +2303,7 @@ mod tests {
             TEST_METRICS_API_KEY,
             "test-gateway-principal",
             "test-tenant",
-            ModelVariant::Qwen34BGguf.dir_name(),
+            ModelVariant::Qwen354BGguf.dir_name(),
             "quota test",
         ] {
             assert!(!body.contains(private));
@@ -3025,7 +3025,7 @@ mod tests {
         let remote = RemoteChatExecution::new(
             client,
             crate::app::chat::RemoteChatExecutionConfig {
-                public_model_variant: ModelVariant::Qwen34BGguf,
+                public_model_variant: ModelVariant::Qwen354BGguf,
                 expected_worker_incarnation: worker_config.incarnation_id,
                 deployment_id: worker_config.deployment_id,
                 expected_model_generation: worker_config.model_generation,

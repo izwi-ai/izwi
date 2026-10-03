@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn support_metadata_serializes_execution_and_evidence_independently() {
-        let value = serde_json::to_value(ModelVariant::Qwen34BGguf.cuda_support())
+        let value = serde_json::to_value(ModelVariant::Qwen354BGguf.cuda_support())
             .expect("serialize CUDA support");
 
         assert_eq!(value["level"], "candle_cuda_generic");
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn cuda_quantization_marks_dequantized_and_candle_paths() {
         assert_eq!(
-            ModelVariant::Qwen34BGguf.cuda_quantization().level,
+            ModelVariant::Qwen354BGguf.cuda_quantization().level,
             CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
         assert_eq!(

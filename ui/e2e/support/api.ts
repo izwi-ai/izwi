@@ -2,7 +2,7 @@ import type { Page } from "@playwright/test";
 
 export const READY_MODELS = [
   {
-    variant: "Qwen3-1.7B-GGUF",
+    variant: "Qwen3.5-4B",
     status: "ready",
     local_path: "/tmp/qwen.gguf",
     size_bytes: 1_000_000,

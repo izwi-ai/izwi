@@ -3763,15 +3763,15 @@ mod tests {
     fn select_lru_eviction_candidate_skips_requested_and_active_models() {
         let resident_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             ModelVariant::Kokoro82M,
         ];
         let requested_variant = ModelVariant::Kokoro82M;
-        let active_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
+        let active_variants = HashSet::from([ModelVariant::Qwen359BGguf]);
         let pinned_variants = HashSet::new();
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
-            (ModelVariant::Qwen38BGguf, 5_u64),
+            (ModelVariant::Qwen359BGguf, 5_u64),
             (ModelVariant::Kokoro82M, 20_u64),
         ]);
 
@@ -3790,16 +3790,16 @@ mod tests {
     fn select_lru_eviction_candidate_skips_pinned_models() {
         let resident_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
         ];
         let requested_variant = ModelVariant::Kokoro82M;
         let active_variants = HashSet::new();
-        let pinned_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
+        let pinned_variants = HashSet::from([ModelVariant::Qwen359BGguf]);
         // The pinned model is older than the unpinned one but must not be
         // selected.
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
-            (ModelVariant::Qwen38BGguf, 5_u64),
+            (ModelVariant::Qwen359BGguf, 5_u64),
         ]);
 
         let candidate = select_lru_eviction_candidate(
@@ -3814,7 +3814,7 @@ mod tests {
 
         // When every resident is pinned there is no candidate.
         let all_pinned = HashSet::from([
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
         ]);
         assert_eq!(
@@ -3835,7 +3835,7 @@ mod tests {
 
         assert!(!residency_budget_has_capacity(
             &resident_variants,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             1,
         ));
         assert!(residency_budget_has_capacity(
@@ -3845,7 +3845,7 @@ mod tests {
         ));
         assert!(residency_budget_has_capacity(
             &resident_variants,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             2,
         ));
     }
@@ -4477,7 +4477,7 @@ mod tests {
             ..EngineConfig::default()
         })
         .unwrap();
-        let variants = [ModelVariant::Kokoro82M, ModelVariant::Qwen38BGguf];
+        let variants = [ModelVariant::Kokoro82M, ModelVariant::Qwen359BGguf];
         let mut registrations = Vec::new();
         for variant in variants {
             let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);

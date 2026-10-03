@@ -173,18 +173,6 @@ pub enum ModelVariant {
     /// Qwen3 1.7B text model (MLX 4-bit)
     #[serde(rename = "Qwen3-1.7B-4bit")]
     Qwen317B4Bit,
-    /// Qwen3 0.6B text model (GGUF Q8_0)
-    #[serde(rename = "Qwen3-0.6B-GGUF")]
-    Qwen306BGguf,
-    /// Qwen3 1.7B text model (GGUF Q8_0)
-    #[serde(rename = "Qwen3-1.7B-GGUF")]
-    Qwen317BGguf,
-    /// Qwen3 4B text model (GGUF Q4_K_M)
-    #[serde(rename = "Qwen3-4B-GGUF")]
-    Qwen34BGguf,
-    /// Qwen3 8B text model (GGUF Q4_K_M)
-    #[serde(rename = "Qwen3-8B-GGUF")]
-    Qwen38BGguf,
     /// Qwen3 14B text model (GGUF Q4_K_M)
     #[serde(rename = "Qwen3-14B-GGUF")]
     Qwen314BGguf,
@@ -249,9 +237,6 @@ pub enum ModelVariant {
         alias = "Qwen3.5-35B-A3B"
     )]
     Qwen35Moe35BA3BFp8,
-    /// Gemma 3 1B instruction-tuned chat model
-    #[serde(rename = "Gemma-3-1b-it")]
-    Gemma31BIt,
     /// Gemma 3 4B instruction-tuned chat model
     #[serde(rename = "Gemma-3-4b-it")]
     Gemma34BIt,
@@ -398,10 +383,6 @@ impl ModelVariant {
             Self::Qwen306B4Bit => "mlx-community/Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen/Qwen3-1.7B",
             Self::Qwen317B4Bit => "mlx-community/Qwen3-1.7B-4bit",
-            Self::Qwen306BGguf => "Qwen/Qwen3-0.6B-GGUF",
-            Self::Qwen317BGguf => "Qwen/Qwen3-1.7B-GGUF",
-            Self::Qwen34BGguf => "Qwen/Qwen3-4B-GGUF",
-            Self::Qwen38BGguf => "Qwen/Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen/Qwen3-14B-GGUF",
             Self::Qwen3Moe30bA3bGguf => "Qwen/Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "unsloth/Qwen3.5-0.8B-GGUF",
@@ -410,7 +391,6 @@ impl ModelVariant {
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
             Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
             Self::Qwen35Moe35BA3BFp8 => "Qwen/Qwen3.5-35B-A3B-FP8",
-            Self::Gemma31BIt => "google/gemma-3-1b-it",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
@@ -458,10 +438,6 @@ impl ModelVariant {
             Self::Qwen306B4Bit => "Qwen3 0.6B 4-bit",
             Self::Qwen317B => "Qwen3 1.7B",
             Self::Qwen317B4Bit => "Qwen3 1.7B 4-bit",
-            Self::Qwen306BGguf => "Qwen3 0.6B GGUF",
-            Self::Qwen317BGguf => "Qwen3 1.7B GGUF",
-            Self::Qwen34BGguf => "Qwen3 4B GGUF",
-            Self::Qwen38BGguf => "Qwen3 8B GGUF",
             Self::Qwen314BGguf => "Qwen3 14B GGUF",
             Self::Qwen3Moe30bA3bGguf => "Qwen3 MoE 30B-A3B GGUF",
             Self::Qwen3508BGguf => "Qwen3.5 0.8B GGUF",
@@ -470,7 +446,6 @@ impl ModelVariant {
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
             Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
             Self::Qwen35Moe35BA3BFp8 => "Qwen3.5 35B-A3B FP8",
-            Self::Gemma31BIt => "Gemma 3 1B Instruct",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
@@ -518,10 +493,6 @@ impl ModelVariant {
             Self::Qwen306B4Bit => "Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen3-1.7B",
             Self::Qwen317B4Bit => "Qwen3-1.7B-4bit",
-            Self::Qwen306BGguf => "Qwen3-0.6B-GGUF",
-            Self::Qwen317BGguf => "Qwen3-1.7B-GGUF",
-            Self::Qwen34BGguf => "Qwen3-4B-GGUF",
-            Self::Qwen38BGguf => "Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen3-14B-GGUF",
             Self::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "Qwen3.5-0.8B",
@@ -530,7 +501,6 @@ impl ModelVariant {
             Self::Qwen359BGguf => "Qwen3.5-9B",
             Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
             Self::Qwen35Moe35BA3BFp8 => "Qwen3.5-35B-A3B-FP8",
-            Self::Gemma31BIt => "Gemma-3-1b-it",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
@@ -578,10 +548,6 @@ impl ModelVariant {
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
             Self::Qwen317B => 4_080_000_000,            // ~3.80 GB (actual: 3.44GB + 622MB shards)
             Self::Qwen317B4Bit => 1_115_700_000,        // ~1.04 GB
-            Self::Qwen306BGguf => 1_100_000_000,        // ~1.02 GB (Q8_0 est)
-            Self::Qwen317BGguf => 2_400_000_000,        // ~2.24 GB (Q8_0 est)
-            Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
-            Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
             Self::Qwen3Moe30bA3bGguf => 18_600_000_000, // ~17.3 GB Q4_K_M estimate (128 routed experts, ~3B active)
             Self::Qwen3508BGguf => 737_504_352,         // local GGUF + mmproj + tokenizer assets
@@ -590,7 +556,6 @@ impl ModelVariant {
             Self::Qwen359BGguf => 6_598_688_544,        // local GGUF + mmproj + tokenizer assets
             Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
             Self::Qwen35Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
-            Self::Gemma31BIt => 2_200_000_000,          // ~2.05 GB (est)
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
@@ -637,10 +602,6 @@ impl ModelVariant {
             Self::Qwen306B4Bit => 2.0,
             Self::Qwen317B => 5.0,
             Self::Qwen317B4Bit => 3.0,
-            Self::Qwen306BGguf => 2.5,
-            Self::Qwen317BGguf => 4.0,
-            Self::Qwen34BGguf => 6.0,
-            Self::Qwen38BGguf => 10.0,
             Self::Qwen314BGguf => 16.0,
             Self::Qwen3Moe30bA3bGguf => 32.0,
             Self::Qwen3508BGguf => 3.5,
@@ -655,7 +616,6 @@ impl ModelVariant {
             // envelope (34.45B FP8 params + 1.5B BF16 params, dequantized);
             // the Qwen3.5 MoE representation plan replaces it per backend.
             Self::Qwen35Moe35BA3BFp8 => 140.0,
-            Self::Gemma31BIt => 3.5,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
             Self::Qwen3ForcedAligner06B4Bit => 1.5,
@@ -971,10 +931,6 @@ impl ModelVariant {
                 | Self::Qwen317B4Bit
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
-                | Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
                 | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
@@ -991,11 +947,7 @@ impl ModelVariant {
     pub fn is_gguf(&self) -> bool {
         matches!(
             self,
-            Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
-                | Self::Qwen314BGguf
+            Self::Qwen314BGguf
                 | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
                 | Self::Qwen352BGguf
@@ -1013,11 +965,7 @@ impl ModelVariant {
     pub fn is_qwen_chat_gguf(&self) -> bool {
         matches!(
             self,
-            Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
-                | Self::Qwen314BGguf
+            Self::Qwen314BGguf
                 | Self::Qwen3Moe30bA3bGguf
         )
     }
@@ -1074,11 +1022,7 @@ impl ModelVariant {
             // DS10 groundwork posture (ADR 0008): catalog-disabled until a
             // real MoE checkpoint is validated on every buildable lane.
             | Self::Qwen3Moe30bA3bGguf => false,
-            Self::Qwen306BGguf
-            | Self::Qwen317BGguf
-            | Self::Qwen34BGguf
-            | Self::Qwen38BGguf
-            | Self::Qwen3Asr06BGguf
+            Self::Qwen3Asr06BGguf
             | Self::Qwen3Asr17BGguf
             | Self::Qwen3508BGguf
             | Self::Qwen352BGguf
@@ -1090,7 +1034,6 @@ impl ModelVariant {
             // docs/dev/QWEN35_35B_A3B_FP8_HARDWARE_HANDOFF.md.
             | Self::Qwen35Moe35BA3BFp8
             | Self::Qwen3827BFp8
-            | Self::Gemma31BIt
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
             | Self::Qwen3Tts12Hz17BBase4Bit
@@ -1153,12 +1096,8 @@ impl ModelVariant {
             Self::Nemotron3Diarization,
             Self::Qwen306B,
             Self::Qwen306B4Bit,
-            Self::Qwen306BGguf,
             Self::Qwen317B,
             Self::Qwen317B4Bit,
-            Self::Qwen317BGguf,
-            Self::Qwen34BGguf,
-            Self::Qwen38BGguf,
             Self::Qwen314BGguf,
             Self::Qwen3Moe30bA3bGguf,
             Self::Qwen3508BGguf,
@@ -1167,7 +1106,6 @@ impl ModelVariant {
             Self::Qwen359BGguf,
             Self::Qwen3827BFp8,
             Self::Qwen35Moe35BA3BFp8,
-            Self::Gemma31BIt,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
             Self::Qwen3ForcedAligner06B4Bit,
@@ -1303,7 +1241,6 @@ mod tests {
         assert!(qwen35.reasoning_efforts.is_empty());
         assert_eq!(qwen35.default_reasoning_effort, None);
 
-        assert_eq!(ModelVariant::Gemma31BIt.chat_capabilities(), None);
         assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
         let lfm25_thinking = ModelVariant::Lfm2512BThinkingGguf
             .chat_capabilities()
@@ -1313,7 +1250,7 @@ mod tests {
         assert!(lfm25_thinking.reasoning_efforts.is_empty());
         assert_eq!(lfm25_thinking.default_reasoning_effort, None);
         assert!(!lfm25_thinking.supports_preserve_thinking);
-        assert_eq!(ModelVariant::Qwen34BGguf.chat_capabilities(), None);
+        assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
     }
 
     #[test]
@@ -1735,6 +1672,6 @@ mod tests {
             ModelVariant::WhisperLargeV3Turbo.speech_capabilities(),
             None
         );
-        assert_eq!(ModelVariant::Qwen38BGguf.speech_capabilities(), None);
+        assert_eq!(ModelVariant::Qwen359BGguf.speech_capabilities(), None);
     }
 }

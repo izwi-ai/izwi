@@ -5,7 +5,7 @@ import {
 } from "@/shared/api/http";
 import type { ChatReasoningEffort } from "@/shared/api/models";
 
-const DEFAULT_CHAT_MODEL = "Qwen3-8B-GGUF";
+const DEFAULT_CHAT_MODEL = "Qwen3.5-4B";
 const CHAT_STREAM_TRUNCATED_ERROR =
   "Chat stream ended before a terminal event";
 const RESPONSE_STREAM_TRUNCATED_ERROR =

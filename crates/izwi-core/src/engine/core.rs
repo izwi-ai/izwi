@@ -6712,17 +6712,17 @@ mod tests {
 
         let mut req_a = EngineCoreRequest::tts("variant-a");
         req_a.id = "req-a".to_string();
-        req_a.model_variant = Some(ModelVariant::Qwen34BGguf);
+        req_a.model_variant = Some(ModelVariant::Qwen354BGguf);
 
         let mut req_b = EngineCoreRequest::tts("variant-b");
         req_b.id = "req-b".to_string();
-        req_b.model_variant = Some(ModelVariant::Qwen38BGguf);
+        req_b.model_variant = Some(ModelVariant::Qwen359BGguf);
 
         core.add_request(req_a).unwrap();
         core.add_request(req_b).unwrap();
 
         let aborted = core
-            .abort_requests_for_variant(ModelVariant::Qwen34BGguf)
+            .abort_requests_for_variant(ModelVariant::Qwen354BGguf)
             .await;
         assert_eq!(aborted, vec!["req-a".to_string()]);
         assert!(!core.has_request(&"req-a".to_string()));
@@ -8079,7 +8079,7 @@ mod tests {
 
     #[test]
     fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
-        let variant = ModelVariant::Qwen306BGguf;
+        let variant = ModelVariant::Qwen3508BGguf;
         let mut request = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
             content: "continuous cost fixture".to_string(),
@@ -9062,11 +9062,11 @@ mod tests {
         let mut bad = EngineCoreRequest::tts("bad");
         bad.id = "bad".to_string();
         bad.prompt_tokens = vec![1];
-        bad.model_variant = Some(ModelVariant::Qwen34BGguf);
+        bad.model_variant = Some(ModelVariant::Qwen354BGguf);
         let mut good = EngineCoreRequest::tts("good");
         good.id = "good".to_string();
         good.prompt_tokens = vec![1];
-        good.model_variant = Some(ModelVariant::Qwen38BGguf);
+        good.model_variant = Some(ModelVariant::Qwen359BGguf);
         core.add_request(bad).unwrap();
         core.add_request(good).unwrap();
 

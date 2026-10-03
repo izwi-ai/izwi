@@ -650,10 +650,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let variant = ModelVariant::Qwen34BGguf;
+        let variant = ModelVariant::Qwen314BGguf;
         let model_dir = temp_dir.join(variant.dir_name());
         std::fs::create_dir_all(&model_dir).unwrap();
-        std::fs::write(model_dir.join("Qwen3-4B-Q4_K_M.gguf"), [0u8]).unwrap();
+        std::fs::write(model_dir.join("Qwen3-14B-Q4_K_M.gguf"), [0u8]).unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
 
@@ -679,10 +679,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("izwi-manager-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let variant = ModelVariant::Qwen34BGguf;
+        let variant = ModelVariant::Qwen314BGguf;
         let model_dir = temp_dir.join(variant.dir_name());
         std::fs::create_dir_all(&model_dir).unwrap();
-        std::fs::write(model_dir.join("Qwen3-4B-Q4_K_M.gguf"), [0u8]).unwrap();
+        std::fs::write(model_dir.join("Qwen3-14B-Q4_K_M.gguf"), [0u8]).unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
 
@@ -694,7 +694,7 @@ mod tests {
 
         assert_eq!(manager.downloaded_model_path(variant), Some(model_dir));
         assert_eq!(
-            manager.downloaded_model_path(ModelVariant::Qwen38BGguf),
+            manager.downloaded_model_path(ModelVariant::Qwen3Moe30bA3bGguf),
             None
         );
 

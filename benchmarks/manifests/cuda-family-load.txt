@@ -12,11 +12,9 @@ VibeVoice-ASR
 Nemotron-3.5-ASR-Streaming-0.6B
 Granite-Speech-4.1-2B-Plus
 diar_streaming_sortformer_4spk-v2.1
-Qwen3-0.6B-GGUF
 Qwen3.5-0.8B
 LFM2.5-1.2B-Instruct-GGUF
 LFM2.5-Audio-1.5B-GGUF
-Gemma-3-1b-it
 Qwen3-ForcedAligner-0.6B
 Voxtral-Mini-4B-Realtime-2602
 Qwen3-TTS-Tokenizer-12Hz

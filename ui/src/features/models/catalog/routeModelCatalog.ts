@@ -1,5 +1,4 @@
 import type { ModelInfo } from "@/api";
-import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 type RouteModelLike = Pick<ModelInfo, "variant" | "status">;
 
@@ -68,14 +67,10 @@ export const DIARIZATION_PREFERRED_ALIGNER_MODELS = [
 export const DIARIZATION_PREFERRED_SUMMARY_MODELS = ["Qwen3.5-4B"] as const;
 
 export const CHAT_PREFERRED_MODELS = [
-  "Qwen3-8B-GGUF",
-  "Qwen3-4B-GGUF",
-  "Qwen3.5-9B",
   "Qwen3.5-4B",
+  "Qwen3.5-9B",
   "Qwen3.8-27B-FP8",
-  "Qwen3-1.7B-GGUF",
   "Qwen3.5-2B",
-  "Qwen3-0.6B-GGUF",
   "Qwen3.5-0.8B",
 ] as const;
 
@@ -156,18 +151,6 @@ export function resolvePreferredRouteModel(options: {
 }
 
 export function getChatRouteModelLabel(variant: string): string {
-  if (variant === "Qwen3-0.6B-GGUF") {
-    return withQwen3Prefix("0.6B GGUF (Q8_0)", variant);
-  }
-  if (variant === "Qwen3-1.7B-GGUF") {
-    return withQwen3Prefix("1.7B GGUF (Q8_0)", variant);
-  }
-  if (variant === "Qwen3-4B-GGUF") {
-    return withQwen3Prefix("4B GGUF (Q4_K_M)", variant);
-  }
-  if (variant === "Qwen3-8B-GGUF") {
-    return withQwen3Prefix("8B GGUF (Q4_K_M)", variant);
-  }
   if (variant === "Qwen3.5-0.8B") {
     return "Qwen3.5 0.8B GGUF (Q4_K_M)";
   }
@@ -191,9 +174,6 @@ export function getChatRouteModelLabel(variant: string): string {
   }
   if (variant === "LFM2.5-1.2B-Thinking-GGUF") {
     return "LFM2.5 1.2B Thinking GGUF (Q4_K_M)";
-  }
-  if (variant === "Gemma-3-1b-it") {
-    return "Gemma 3 1B Instruct";
   }
   if (variant === "Gemma-3-4b-it") {
     return "Gemma 3 4B Instruct";

@@ -226,38 +226,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     size: "10.7 GB",
   },
   // Text Chat
-  "Qwen3-0.6B-GGUF": {
-    shortName: "Qwen3 0.6B",
-    fullName: "Qwen3 0.6B (GGUF Q8_0)",
-    description: "Compact Qwen3 text model in GGUF Q8_0 format",
-    category: "chat",
-    capabilities: ["Text Generation", "GGUF", "Q8_0"],
-    size: "1.0 GB",
-  },
-  "Qwen3-1.7B-GGUF": {
-    shortName: "Qwen3 1.7B",
-    fullName: "Qwen3 1.7B (GGUF Q8_0)",
-    description: "Higher-quality Qwen3 text model in GGUF Q8_0 format",
-    category: "chat",
-    capabilities: ["Text Generation", "GGUF", "Q8_0"],
-    size: "2.2 GB",
-  },
-  "Qwen3-4B-GGUF": {
-    shortName: "Qwen3 4B",
-    fullName: "Qwen3 4B (GGUF Q4_K_M)",
-    description: "Qwen3 4B model in GGUF Q4_K_M format",
-    category: "chat",
-    capabilities: ["Text Generation", "GGUF", "Q4_K_M"],
-    size: "2.5 GB",
-  },
-  "Qwen3-8B-GGUF": {
-    shortName: "Qwen3 8B",
-    fullName: "Qwen3 8B (GGUF Q4_K_M)",
-    description: "Qwen3 8B model in GGUF Q4_K_M format",
-    category: "chat",
-    capabilities: ["Text Generation", "GGUF", "Q4_K_M"],
-    size: "5.2 GB",
-  },
   "Qwen3.5-0.8B": {
     shortName: "Qwen3.5 0.8B",
     fullName: "Qwen3.5 0.8B (GGUF Q4_K_M)",
@@ -346,14 +314,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
       "Unified Voice",
     ],
     size: "1.14 GB",
-  },
-  "Gemma-3-1b-it": {
-    shortName: "Gemma 3 1B",
-    fullName: "Gemma 3 1B Instruct",
-    description: "Lightweight Gemma 3 instruction model for local chat",
-    category: "chat",
-    capabilities: ["Text Chat", "Instruction Tuned"],
-    size: "2.1 GB",
   },
   "Gemma-3-4b-it": {
     shortName: "Gemma 3 4B",

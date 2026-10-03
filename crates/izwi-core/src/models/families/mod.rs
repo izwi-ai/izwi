@@ -56,12 +56,8 @@ const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen306B,
     ModelVariant::Qwen306B4Bit,
-    ModelVariant::Qwen306BGguf,
     ModelVariant::Qwen317B,
     ModelVariant::Qwen317B4Bit,
-    ModelVariant::Qwen317BGguf,
-    ModelVariant::Qwen34BGguf,
-    ModelVariant::Qwen38BGguf,
     ModelVariant::Qwen314BGguf,
 ];
 const QWEN3_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3Moe30bA3bGguf];
@@ -78,7 +74,7 @@ const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BThinkingGguf,
 ];
 const LFM25_AUDIO_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm25Audio15BGguf];
-const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma31BIt, ModelVariant::Gemma34BIt];
+const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma34BIt];
 const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3ForcedAligner06B,
     ModelVariant::Qwen3ForcedAligner06B4Bit,
