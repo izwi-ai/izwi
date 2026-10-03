@@ -84,10 +84,12 @@ test("supports custom onboarding and model-catalog error recovery", async ({
 }) => {
   await page.unroute("**/v1/admin/models");
   await page.unroute("**/v1/onboarding");
-  let modelRequestCount = 0;
+  // The catalog auto-retries a failed initial load before the error becomes
+  // terminal, so keep failing until the test flips this flag; the manual
+  // retry below is then the request that recovers.
+  let recovering = false;
   await page.route("**/v1/admin/models", async (route) => {
-    modelRequestCount += 1;
-    if (modelRequestCount === 1) {
+    if (!recovering) {
       await route.fulfill({ status: 503, json: { error: "Model service unavailable" } });
       return;
     }
@@ -104,7 +106,12 @@ test("supports custom onboarding and model-catalog error recovery", async ({
   await expect(
     onboarding.getByText("Model service unavailable", { exact: true }),
   ).toBeVisible();
-  await onboarding.getByRole("button", { name: "Retry models" }).click();
+  const retryButton = onboarding.getByRole("button", { name: "Retry models" });
+  // Enabled means the automatic retries have been exhausted and the error is
+  // the user-facing terminal state.
+  await expect(retryButton).toBeEnabled();
+  recovering = true;
+  await retryButton.click();
   await expect(
     onboarding.getByText("Model service unavailable", { exact: true }),
   ).toHaveCount(0);
