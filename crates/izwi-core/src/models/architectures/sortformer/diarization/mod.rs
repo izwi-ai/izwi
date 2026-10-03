@@ -4417,7 +4417,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_metal_arena_device() {
-        let Ok(device) = Device::new_metal(0) else {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
             // No Metal device on this host: the CPU test above still covers
             // the device-routing contract.
             return;
