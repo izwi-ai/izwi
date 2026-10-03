@@ -1,8 +1,8 @@
 # Parser-compatible single-node example for the production serving boundary.
 # Replace every absolute path, resource budget, artifact revision, and secret
 # before use. The packaged supervisor accepts explicit CPU, Metal, and CUDA
-# assignments (see docs/dev/adr/0003-supervisor-multi-lane-supervision.md);
-# provide the matching --<backend>-worker-binary and device declarations.
+# assignments; provide the matching --<backend>-worker-binary and device
+# declarations.
 
 schema_version = 2
 node_id = "node-a"

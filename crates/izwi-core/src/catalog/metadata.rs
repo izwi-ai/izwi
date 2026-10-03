@@ -1030,8 +1030,7 @@ impl ModelVariant {
             | Self::Qwen359BGguf
             // Enabled by product decision (2026-09-30): visible and usable by
             // default. Runtime/performance certification against the real
-            // checkpoint remains an exact-SHA hardware handoff gate — see
-            // docs/dev/QWEN35_35B_A3B_FP8_HARDWARE_HANDOFF.md.
+            // checkpoint remains an exact-SHA hardware handoff gate.
             | Self::Qwen35Moe35BA3BFp8
             | Self::Qwen3827BFp8
             | Self::Qwen3Tts12Hz06BBase4Bit

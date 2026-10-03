@@ -2,8 +2,8 @@
 //!
 //! Two threads of one test binary exchange DS10 page-transfer frames over a
 //! real loopback TCP socket: the producer captures pages from arena-shaped
-//! backing tensors with the genuine DS4 codec, frames them per the
-//! `PD_DISAGGREGATION_DESIGN.md` §2 spec (IZKV1 header, geometry, tenant
+//! backing tensors with the genuine DS4 codec, frames them per the DS10
+//! page-transfer spec (IZKV1 header, geometry, tenant
 //! namespace, SHA-256 digest chain), and streams them; the consumer verifies
 //! the chain, re-keys the pages into its own fresh backing, and the rig
 //! demands bit-identical bytes on both sides. A tampered payload must be

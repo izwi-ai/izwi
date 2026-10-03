@@ -11,12 +11,7 @@ the currently packaged supervisor command rejects Metal and CUDA assignments.
 See the [evidence matrix](#evidence-and-support-matrix) before choosing a
 profile.
 
-The architecture and route decisions are recorded in
-[ADR 0002](adr/0002-production-worker-boundary.md), the
-[route migration ledger](PRODUCTION_SERVING_DISCOVERY.md), and the
-[packaging evidence](PRODUCTION_SERVING_PACKAGING.md). Use the
-[release checklist and risk register](PRODUCTION_SERVING_RELEASE_CHECKLIST.md)
-and the [exact-profile support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md)
+Use the [exact-profile support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md)
 for profile approval. Node configuration
 examples live in [`config/serving/examples`](../../config/serving/examples/README.md).
 
@@ -525,9 +520,7 @@ through their existing local/desktop profile where applicable:
 Multimodal chat is also local-only. Realtime transcription/voice, agent and chat
 workflows, durable jobs/history, media, saved voices, Studio, and model administration
 must not be published through the gateway until their state, artifact,
-streaming, ownership, and cancellation contracts are migrated. The complete
-ownership decision is in the
-[route migration ledger](PRODUCTION_SERVING_DISCOVERY.md#route-migration-ledger).
+streaming, ownership, and cancellation contracts are migrated.
 
 Do not replace the local server with the gateway for desktop or local workflows.
 `--role local` remains the compatibility profile and continues to own its

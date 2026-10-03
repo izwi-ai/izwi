@@ -52,8 +52,7 @@ rig: `scripts/bench/run-ds4-offload-benchmark.sh` (shared workload, off/on
 legs, sequential trailer, hard gates on completion, demotion, promotion, and
 budget containment); acceptance test `ds4_host_offload.rs` (concurrent
 shared-prefix sessions on an undersized arena, greedy replay byte-identical
-to the cold run). Design and as-built deviations:
-[DS4_KV_OFFLOAD_DESIGN.md](DS4_KV_OFFLOAD_DESIGN.md).
+to the cold run).
 
 | Lane | Status | Evidence |
 |---|---|---|
@@ -71,8 +70,7 @@ drain of the old generation. Automatic aborts (canary/replacement readiness
 failure, replacement exit during the window, SIGUSR2, shutdown) restore the
 pre-rollout approvals byte-identically and leave the old generation serving
 (ADR 0006). Design and evidence:
-[ADR 0006](adr/0006-coordinated-blue-green-rollout.md); runbook section
-"Coordinated blue-green rollout".
+runbook section "Coordinated blue-green rollout".
 
 | Scope | Status | Evidence |
 |---|---|---|
@@ -95,8 +93,7 @@ gateway-side change. Scale decisions respect the node resource ledger
 (declared host memory, CPU threads, device exclusivity; overcommitting
 scale-ups are rejected with diagnostics, never launched), per-deployment
 hysteresis, and drain-before-stop (never below the declared min set). Design
-and evidence: [ADR 0007](adr/0007-signal-driven-worker-autoscaling.md);
-runbook section "Signal-driven worker autoscaling (DS7)".
+and evidence: runbook section "Signal-driven worker autoscaling (DS7)".
 
 | Scope | Status | Evidence |
 |---|---|---|
@@ -117,18 +114,17 @@ semantics, and older workers tolerate the new fields.
 |---|---|---|
 | `usage.cached_tokens` (DS9.1) | Supported | Scheduler-authoritative managed-prefix cursor through `ChatGeneration` into public `usage.prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (responses); mock knob for tests; process test proves 64 cached tokens flow worker→public (`b2fb8415`) |
 | `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming `choices[].logprobs`, streaming `delta.logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
-| `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`); design note `docs/dev/CONSTRAINED_DECODING_DESIGN.md` |
+| `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`) |
 | `response_format: json_object` on own-sampler families; `json_schema` everywhere | Documented 400, never silently ignored | Rejection is the recorded spike decision pending the schema→FSM follow-up (`c1f4b1af`) |
 | Shared speculative MTP envelopes in continuous batches (DS9.4) | Supported on the CUDA+MTP lane; perf claim hardware-gated | CPU fixture tests prove the two-row envelope commits exactly the solo sequence per row (greedy and sampled) with ragged exits and the opt-in gate both ways (`b6211f24`); the tokens/s-improvement / no-ITL-regression acceptance runs on CUDA via the qwen38 continuous-batching manifest's `IZWI_CUDA_MTP_IN_CONTINUOUS=off` vs default comparison using `summary.itl_ms` — recorded `not run` until hardware evidence exists |
 
 The constrained-decoding spike deliberately ships the grammar machine per
-state/key masking rather than a compressed-FSM grammar compiler; the design
-note records the survey and the follow-up path for `json_schema`.
+state/key masking rather than a compressed-FSM grammar compiler; the
+`json_schema` follow-up is the schema→FSM conversion noted above.
 
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
-Every other route family remains explicitly local-only or absent as recorded in
-the [route migration ledger](PRODUCTION_SERVING_DISCOVERY.md#route-migration-ledger).
+Every other route family remains explicitly local-only or absent.
 
 ## Single-gateway failure semantics
 
@@ -183,5 +179,5 @@ test commands, raw results, and approver. At minimum:
 - Multiple gateways need shared or conservatively partitioned registry, quota,
   active-work, durable-state, artifact, and session ownership with outage tests.
 
-Use the [release checklist](PRODUCTION_SERVING_RELEASE_CHECKLIST.md) to approve
-an exact cell. Unavailable lanes must remain `not run` rather than `passed`.
+Approve one exact cell explicitly. Unavailable lanes must remain `not run`
+rather than `passed`.

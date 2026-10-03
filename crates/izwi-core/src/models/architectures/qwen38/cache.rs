@@ -116,8 +116,8 @@ pub(crate) fn qwen38_composite_cache_contract_with_mtp(
 
     // DS1.2: cross-request prefix reuse for the hybrid contract. Attention
     // domains publish committed pages; the recurrent and conv domains publish
-    // transactional tensor snapshots aligned to page boundaries (spike
-    // DS1_CONV_STATE_SPIKE_ANALYSIS.md). MTP draft state does not share.
+    // transactional tensor snapshots aligned to page boundaries (DS1
+    // conv-state spike). MTP draft state does not share.
     let share_prefixes = prefix_caching && !mtp_enabled;
     let attention_prefix = || {
         if share_prefixes {
