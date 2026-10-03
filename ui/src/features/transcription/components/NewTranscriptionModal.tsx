@@ -179,7 +179,6 @@ export function NewTranscriptionModal({
 
       if (timestampAlignerModelId && timestampAlignerReady) {
         setIncludeTimestamps(true);
-        setStreamingEnabled(false);
         return;
       }
 
@@ -195,10 +194,14 @@ export function NewTranscriptionModal({
 
   const handleStreamingEnabledChange = useCallback((nextValue: boolean) => {
     setStreamingEnabled(nextValue);
-    if (nextValue) {
-      setIncludeTimestamps(false);
-    }
   }, []);
+
+  const streamingUnavailableReason = includeTimestamps
+    ? "Streaming is unavailable while timestamps are enabled. Turn timestamps off to stream."
+    : null;
+  const timestampsUnavailableReason = streamingEnabled
+    ? "Timestamps are unavailable while streaming is enabled. Turn streaming off to add timestamps."
+    : null;
 
   const requireTimestampAligner = useCallback(() => {
     if (isSpeakerAttributedAsrMode) {
@@ -729,7 +732,8 @@ export function NewTranscriptionModal({
                         Include timestamps
                       </div>
                       <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                        Add word and segment timing when the aligner path is ready.
+                        {timestampsUnavailableReason ??
+                          "Add word and segment timing when the aligner path is ready."}
                       </div>
                     </div>
                     <div className="relative mt-0.5 shrink-0">
@@ -740,7 +744,8 @@ export function NewTranscriptionModal({
                           handleIncludeTimestampsChange(event.target.checked)
                         }
                         className="peer sr-only"
-                        disabled={isSubmitting}
+                        disabled={isSubmitting || streamingEnabled}
+                        title={timestampsUnavailableReason ?? undefined}
                       />
                       <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
                         <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />
@@ -754,8 +759,8 @@ export function NewTranscriptionModal({
                         Stream results
                       </div>
                       <div className="mt-0.5 text-[13px] leading-5 text-[var(--text-muted)]">
-                        Start the job with live transcript updates instead of waiting
-                        for a single final response.
+                        {streamingUnavailableReason ??
+                          "Start the job with live transcript updates instead of waiting for a single final response."}
                       </div>
                     </div>
                     <div className="relative mt-0.5 shrink-0">
@@ -766,7 +771,8 @@ export function NewTranscriptionModal({
                           handleStreamingEnabledChange(event.target.checked)
                         }
                         className="peer sr-only"
-                        disabled={isSubmitting}
+                        disabled={isSubmitting || includeTimestamps}
+                        title={streamingUnavailableReason ?? undefined}
                       />
                       <span className="flex h-5 w-5 items-center justify-center rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-0)] text-white transition peer-checked:border-[var(--status-info-text)] peer-checked:bg-[var(--status-info-text)] peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring/45 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background peer-disabled:opacity-50">
                         <Check className="h-3.5 w-3.5 opacity-0 transition peer-checked:opacity-100" />

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ModelInfo } from "@/api";
@@ -72,6 +72,52 @@ describe("viewport-safe creation dialogs", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Generate summary")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("gates the conflicting transcription options behind an explanation", () => {
+    render(
+      <NewTranscriptionModal
+        isOpen
+        onClose={vi.fn()}
+        selectedModel="Parakeet-TDT-0.6B-v3"
+        selectedModelReady
+        timestampAlignerModelId="Qwen3-ForcedAligner-0.6B"
+        timestampAlignerReady
+        onOpenModelManager={vi.fn()}
+        onModelRequired={vi.fn()}
+        onTimestampAlignerRequired={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+
+    const streamToggle = screen.getByLabelText(
+      /Stream results/i,
+    ) as HTMLInputElement;
+    const timestampToggle = screen.getByLabelText(
+      /Include timestamps/i,
+    ) as HTMLInputElement;
+
+    // Streaming defaults on, so timestamps are disabled with an explanation
+    // instead of being allowed and silently flipping streaming off.
+    expect(streamToggle.checked).toBe(true);
+    expect(timestampToggle.disabled).toBe(true);
+    expect(
+      screen.getByText(
+        /Timestamps are unavailable while streaming is enabled/i,
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(streamToggle);
+    expect(streamToggle.checked).toBe(false);
+    expect(timestampToggle.disabled).toBe(false);
+
+    fireEvent.click(timestampToggle);
+    expect(timestampToggle.checked).toBe(true);
+    expect(streamToggle.disabled).toBe(true);
+    expect(
+      screen.getByText(/Streaming is unavailable while timestamps are enabled/i),
+    ).toBeInTheDocument();
+    expect(streamToggle.checked).toBe(false);
   });
 
   it("keeps the diarization title, capture actions, and final setting reachable", () => {
