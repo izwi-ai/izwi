@@ -37,7 +37,6 @@ RUN apt-get update && apt-get install -y \
 # Copy Cargo files first for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY third_party/ third_party/
 
 # Build CPU release binaries (server, supervisor, worker)
 RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker
@@ -72,7 +71,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # Copy Cargo files first for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY third_party/ third_party/
 
 # Build CUDA release binaries (server, supervisor, worker)
 RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features "${IZWI_CUDA_FEATURES}"
