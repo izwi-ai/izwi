@@ -6698,13 +6698,18 @@ impl NativeExecutor {
                         initial_media_decode_ms = Some(audio_decode_ms);
                         let samples_len = samples.len();
 
-                        let chunk_plan = Self::asr_chunk_plan(
-                            &samples,
-                            sample_rate,
-                            model.max_audio_seconds_hint(),
-                            false,
-                            matches!(family, ModelFamily::WhisperAsr),
-                        );
+                let (streaming_low_latency, allow_speech_planner) =
+                    Self::asr_chunk_plan_streaming_args(
+                        request.streaming,
+                        matches!(family, ModelFamily::WhisperAsr),
+                    );
+                let chunk_plan = Self::asr_chunk_plan(
+                    &samples,
+                    sample_rate,
+                    model.max_audio_seconds_hint(),
+                    streaming_low_latency,
+                    allow_speech_planner,
+                );
                         if chunk_plan.requires_chunk_path() {
                             if managed_cache.is_some() {
                                 return Err(Error::InvalidInput(
@@ -7052,12 +7057,17 @@ impl NativeExecutor {
 
             let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
+            let (streaming_low_latency, allow_speech_planner) =
+                Self::asr_chunk_plan_streaming_args(
+                    request.streaming,
+                    matches!(family, ModelFamily::WhisperAsr),
+                );
             let chunk_plan = Self::asr_chunk_plan(
                 samples,
                 sample_rate,
                 model.max_audio_seconds_hint(),
-                request.streaming && !model.supports_incremental_decode(),
-                matches!(family, ModelFamily::WhisperAsr),
+                streaming_low_latency,
+                allow_speech_planner,
             );
             if chunk_plan.requires_chunk_path() {
                 let chunked = Self::transcribe_with_chunk_plan_with_context_and_details(

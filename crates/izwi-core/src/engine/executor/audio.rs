@@ -351,6 +351,19 @@ impl NativeExecutor {
         )
     }
 
+    /// Chunk-planner flags for an ASR request. A streaming request always plans
+    /// for latency; the VAD speech planner is a non-streaming accuracy feature
+    /// and must never override a streaming request's plan, for any family.
+    pub(super) fn asr_chunk_plan_streaming_args(
+        request_streaming: bool,
+        family_accuracy_planner: bool,
+    ) -> (bool, bool) {
+        (
+            request_streaming,
+            !request_streaming && family_accuracy_planner,
+        )
+    }
+
     fn asr_chunk_plan_with_options(
         samples: &[f32],
         sample_rate: u32,
@@ -1015,6 +1028,60 @@ mod tests {
     }
 
     #[test]
+    fn asr_chunk_plan_streaming_args_request_drives_the_plan() {
+        let (low_latency, speech_planner) =
+            NativeExecutor::asr_chunk_plan_streaming_args(true, true);
+        assert!(low_latency, "streaming requests always plan for latency");
+        assert!(
+            !speech_planner,
+            "the VAD speech planner is a non-streaming accuracy feature"
+        );
+
+        let (low_latency, speech_planner) =
+            NativeExecutor::asr_chunk_plan_streaming_args(false, true);
+        assert!(!low_latency);
+        assert!(speech_planner, "non-streaming keeps family accuracy policy");
+
+        let (low_latency, speech_planner) =
+            NativeExecutor::asr_chunk_plan_streaming_args(true, false);
+        assert!(low_latency);
+        assert!(!speech_planner);
+
+        let (low_latency, speech_planner) =
+            NativeExecutor::asr_chunk_plan_streaming_args(false, false);
+        assert!(!low_latency);
+        assert!(!speech_planner);
+    }
+
+    #[test]
+    fn speech_planner_still_overrides_streaming_if_both_requested() {
+        // Internal invariant of the planner: the speech planner wins if a caller
+        // ever requests both. Call-site policy (asr_chunk_plan_streaming_args)
+        // keeps the two mutually exclusive.
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 30];
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
+        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
+    }
+
+    #[test]
+    fn streaming_plan_sizes_long_audio_for_latency_not_accuracy() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 60];
+        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
+        assert!(
+            plan.config.target_chunk_secs <= super::DEFAULT_STREAM_LONG_TARGET_CHUNK_SECS,
+            "expected latency-sized streaming chunks, got target {}s",
+            plan.config.target_chunk_secs
+        );
+        assert!(
+            plan.chunks.len() > 1,
+            "expected 60s audio to split into streaming chunks, got {}",
+            plan.chunks.len()
+        );
+    }
+
+    #[test]
     fn streaming_low_latency_chunk_plan_keeps_very_short_audio_single_chunk() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 4];
@@ -1114,7 +1181,11 @@ mod tests {
     }
 
     #[test]
-    fn whisper_streaming_chunk_plan_keeps_standard_long_form_chunks() {
+    fn speech_planner_plan_is_identical_for_streaming_and_standard_requests() {
+        // Documents planner dominance inside asr_chunk_plan: when the speech
+        // planner runs it produces the same plan regardless of the streaming
+        // flag. Call-site policy keeps the planner out of streaming requests
+        // entirely (asr_chunk_plan_streaming_args).
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 40];
         let streaming = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
