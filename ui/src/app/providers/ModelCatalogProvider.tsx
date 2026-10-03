@@ -108,7 +108,6 @@ export function ModelCatalogProvider({
   >({});
   const lastProgressAtRef = useRef<Record<string, number>>({});
   const suppressReconnectRef = useRef<Set<string>>(new Set());
-  const initializedRef = useRef(false);
   const lastDownloadTerminalStateRef = useRef<Record<string, string>>({});
 
   const getModelLabel = useCallback(
@@ -382,12 +381,12 @@ export function ModelCatalogProvider({
   );
 
   useEffect(() => {
-    if (initializedRef.current) {
-      return;
-    }
-
-    initializedRef.current = true;
-
+    // No once-guard here: StrictMode's dev mount→cleanup→mount must be free to
+    // start a second init run, because the first run exits at its next failure
+    // check once cleaned up and can neither retry nor clear the spinner. The
+    // supersession rules below are what keep that hand-off single-owner; in
+    // production the effect runs once and nothing else changes.
+    //
     // The first catalog load can race the local server's cold start (a slow
     // /admin/models call, a poison-monitor respawn). Retry with bounded
     // backoff so the spinner ends with either models or a clear error instead
