@@ -170,11 +170,10 @@ current native CUDA ceilings are:
 
 | Model | CUDA ceiling | Source |
 |---|---:|---|
-| Qwen3 chat | 40,960 tokens | [Official Qwen3 config](https://huggingface.co/Qwen/Qwen3-4B/blob/main/config.json) |
 | Qwen3.5 chat | 262,144 tokens | [Official Qwen3.5 config](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json) |
 | Qwen3.8 chat | 262,144 logical tokens; effective context is resource-fitted | [Pinned official Qwen3.8 config](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/blob/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a/config.json) |
 | LFM2.5 chat | 128,000 tokens | [Official LFM2.5 config](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct/blob/main/config.json) |
-| Gemma 3 1B / 4B | 32,768 / 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
+| Gemma 3 4B (catalog-disabled) | 131,072 tokens | [Google Gemma 3 model card](https://ai.google.dev/gemma/docs/core/model_card_3) |
 
 Optional YaRN extensions are not included: the local adapters do not implement
 their scaling parameters. Qwen3.8 fits its effective context to remaining

@@ -28,6 +28,8 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
+pub(crate) use asr::compose_invocation_audio_limit;
+
 pub(crate) use asr::granite_auto_asr_max_tokens_for_duration;
 pub use asr::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use conformance::{
@@ -36,7 +38,10 @@ pub use conformance::{
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
-pub use service::RuntimeService;
+pub use service::{
+    RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
+    RuntimeChatTeardown, RuntimeChatTeardownDisposition, RuntimeService,
+};
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,

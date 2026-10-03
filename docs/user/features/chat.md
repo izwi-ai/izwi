@@ -24,13 +24,13 @@ Izwi chat provides:
 ### Download a Chat Model
 
 ```bash
-izwi pull Qwen3-8B-GGUF
+izwi pull Qwen3.5-4B
 ```
 
 ### Start Chatting
 
 ```bash
-izwi chat --model Qwen3-8B-GGUF
+izwi chat --model Qwen3.5-4B
 ```
 
 Web UI:
@@ -50,16 +50,15 @@ http://localhost:8080/chat
 | `--voice`, `-v` | Voice for spoken responses | — |
 
 `qwen3-0.6b-4bit` remains the CLI default for backward compatibility.
-For new setups, prefer an enabled model from `izwi list`, such as `Qwen3-8B-GGUF` or `Qwen3.5-4B`.
+For new setups, prefer an enabled model from `izwi list`, such as `Qwen3.5-4B` or `Qwen3.5-9B`.
 
 Examples:
 
 ```bash
 izwi chat --system "You are a helpful coding assistant."
-izwi chat --model Qwen3-8B-GGUF
+izwi chat --model Qwen3.5-4B
 izwi chat --model Qwen3.5-4B
 izwi chat --model LFM2.5-1.2B-Instruct-GGUF
-izwi chat --model Gemma-3-1b-it
 ```
 
 ---
@@ -85,7 +84,7 @@ POST /v1/chat/completions
 
 ```json
 {
-  "model": "Qwen3-8B-GGUF",
+  "model": "Qwen3.5-4B",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Summarize this project in three bullets."}
@@ -100,7 +99,7 @@ POST /v1/chat/completions
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3-8B-GGUF",
+    "model": "Qwen3.5-4B",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -135,11 +134,9 @@ streaming sequence.
 
 | Family | Models |
 |--------|--------|
-| Qwen3 | `Qwen3-0.6B-GGUF`, `Qwen3-1.7B-GGUF`, `Qwen3-4B-GGUF`, `Qwen3-8B-GGUF` |
 | Qwen3.5 | `Qwen3.5-0.8B`, `Qwen3.5-2B`, `Qwen3.5-4B`, `Qwen3.5-9B` |
 | Qwen3.8 FP8 | `Qwen3.8-27B-FP8` (text only) |
 | LFM2.5 | `LFM2.5-1.2B-Instruct-GGUF`, `LFM2.5-1.2B-Thinking-GGUF` |
-| Gemma | `Gemma-3-1b-it` |
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
@@ -160,7 +157,7 @@ not native FP8 execution.
 ## Tips
 
 1. Use `izwi list` to pick a currently enabled model ID.
-2. Use stronger models (`Qwen3-8B-GGUF`, `Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory; check the [Qwen3.8 CUDA residency requirements](/support-matrix#qwen38-cuda-weight-residency) before deploying the 27B checkpoint.
+2. Use stronger models (`Qwen3.5-9B`, `Qwen3.8-27B-FP8`) for harder tasks when the host has sufficient memory; check the [Qwen3.8 CUDA residency requirements](/support-matrix#qwen38-cuda-weight-residency) before deploying the 27B checkpoint.
 3. Use smaller models (`Qwen3.5-0.8B`, `LFM2.5-1.2B-*`) for low-latency usage.
 
 ---

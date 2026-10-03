@@ -20,16 +20,59 @@ pub async fn initialize_default() -> anyhow::Result<DatabaseConnection> {
 }
 
 pub async fn connect_default() -> anyhow::Result<DatabaseConnection> {
-    let db_path = storage_layout::resolve_db_path();
+    let source = storage_layout::resolve_database_source()?;
     let media_root = storage_layout::resolve_media_root();
-    storage_layout::ensure_storage_dirs(&db_path, &media_root)
-        .context("Failed to prepare storage layout for SeaORM")?;
+    if let storage_layout::DatabaseSource::Path(db_path) = &source {
+        storage_layout::ensure_storage_dirs(db_path, &media_root)
+            .context("Failed to prepare storage layout for SeaORM")?;
+    }
 
-    connect_path(&db_path).await
+    connect_source(&source).await
 }
 
 pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> {
     let mut options = ConnectOptions::new(sqlite_url(db_path));
+    apply_sqlite_options(&mut options);
+
+    Database::connect(options).await.with_context(|| {
+        format!(
+            "Unable to open SeaORM SQLite database at {}",
+            db_path.display()
+        )
+    })
+}
+
+/// Connect to a database by URL. SQLite URLs keep the file-mode options the
+/// path form provides; server backends (PostgreSQL, MySQL) connect with the
+/// same bounded pool settings and no filesystem side effects.
+pub async fn connect_url(url: &str) -> anyhow::Result<DatabaseConnection> {
+    let mut options = ConnectOptions::new(url.to_string());
+    if url.trim_start().starts_with("sqlite://") {
+        apply_sqlite_options(&mut options);
+    } else {
+        options
+            .max_connections(SQLITE_MAX_CONNECTIONS)
+            .min_connections(1)
+            .connect_timeout(SQLITE_BUSY_TIMEOUT)
+            .acquire_timeout(SQLITE_BUSY_TIMEOUT)
+            .sqlx_logging(false);
+    }
+
+    Database::connect(options)
+        .await
+        .with_context(|| format!("Unable to open SeaORM database at {url}"))
+}
+
+async fn connect_source(
+    source: &storage_layout::DatabaseSource,
+) -> anyhow::Result<DatabaseConnection> {
+    match source {
+        storage_layout::DatabaseSource::Path(path) => connect_path(path).await,
+        storage_layout::DatabaseSource::Url(url) => connect_url(url).await,
+    }
+}
+
+fn apply_sqlite_options(options: &mut ConnectOptions) {
     options
         .max_connections(SQLITE_MAX_CONNECTIONS)
         .min_connections(1)
@@ -43,33 +86,40 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
                 .foreign_keys(true)
                 .journal_mode(SqliteJournalMode::Wal)
         });
-
-    Database::connect(options).await.with_context(|| {
-        format!(
-            "Unable to open SeaORM SQLite database at {}",
-            db_path.display()
-        )
-    })
 }
 
 #[derive(Clone)]
 pub struct StoreDatabase {
-    db_path: Option<PathBuf>,
+    source: Option<storage_layout::DatabaseSource>,
     connection: Arc<OnceCell<DatabaseConnection>>,
 }
 
 impl StoreDatabase {
     pub fn from_default_path() -> anyhow::Result<Self> {
-        let db_path = storage_layout::resolve_db_path();
+        let source = storage_layout::resolve_database_source()?;
         let media_root = storage_layout::resolve_media_root();
-        storage_layout::ensure_storage_dirs(&db_path, &media_root)
-            .context("Failed to prepare storage layout for SeaORM store")?;
-        Ok(Self::new(db_path))
+        if let storage_layout::DatabaseSource::Path(db_path) = &source {
+            storage_layout::ensure_storage_dirs(db_path, &media_root)
+                .context("Failed to prepare storage layout for SeaORM store")?;
+        }
+        Ok(Self {
+            source: Some(source),
+            connection: Arc::new(OnceCell::new()),
+        })
     }
 
     pub fn new(db_path: PathBuf) -> Self {
         Self {
-            db_path: Some(db_path),
+            source: Some(storage_layout::DatabaseSource::Path(db_path)),
+            connection: Arc::new(OnceCell::new()),
+        }
+    }
+
+    /// Address the store through a bounded database URL (DS5 fleet profile:
+    /// the coordination store may be a shared PostgreSQL database).
+    pub fn from_url(url: String) -> Self {
+        Self {
+            source: Some(storage_layout::DatabaseSource::Url(url)),
             connection: Arc::new(OnceCell::new()),
         }
     }
@@ -80,20 +130,20 @@ impl StoreDatabase {
             .map_err(|_| ())
             .expect("new OnceCell should accept initial database connection");
         Self {
-            db_path: None,
+            source: None,
             connection: Arc::new(cell),
         }
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
-        if let Some(db_path) = self.db_path.clone() {
+        if let Some(source) = self.source.clone() {
             return self
                 .connection
                 .get_or_try_init(|| async move {
-                    let db = connect_path(&db_path).await?;
+                    let db = connect_source(&source).await?;
                     Migrator::up(&db)
                         .await
-                        .context("Failed to run SQLite migrations for SeaORM store")?;
+                        .context("Failed to run migrations for SeaORM store")?;
                     Ok(db)
                 })
                 .await;
@@ -108,7 +158,7 @@ impl StoreDatabase {
 impl fmt::Debug for StoreDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoreDatabase")
-            .field("db_path", &self.db_path)
+            .field("source", &self.source)
             .field("has_connection", &self.connection.get().is_some())
             .finish()
     }
@@ -130,6 +180,24 @@ mod tests {
     use crate::voice_defaults::DEFAULT_VOICE_PROFILE_ID;
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn url_source_migrates_a_sqlite_database_without_a_path() {
+        let _guard = env_lock();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("url-sourced.sqlite3");
+        let url = sqlite_url(&db_path);
+
+        let store = StoreDatabase::from_url(url);
+        let db = store.connection().await.expect("url-sourced store opens");
+        assert_eq!(db.get_database_backend(), DbBackend::Sqlite);
+
+        let tables = user_tables(db).await.expect("table list");
+        for table in EXPECTED_TABLES {
+            assert!(tables.contains(*table), "{table} table exists");
+        }
+        assert!(db_path.exists(), "sqlite url created the database file");
+    }
 
     #[tokio::test]
     async fn default_connection_preserves_sqlite_pragmas() {
@@ -197,6 +265,42 @@ mod tests {
         .await
         .expect("default profile count");
         assert_eq!(default_profiles, 1);
+
+        let legacy_provider_writes = query_i64_scalar(
+            &db,
+            "SELECT COUNT(*) FROM provider_write_reservations WHERE write_id = '00000000-0000-4000-8000-000000000001' AND provider_request_json IS NULL",
+        )
+        .await
+        .expect("legacy provider write count");
+        assert_eq!(legacy_provider_writes, 1);
+
+        let legacy_speech = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT audio_storage_path, audio_media_asset_id, audio_artifact_tenant FROM speech_history_records WHERE id = 'legacy-speech'"
+                    .to_string(),
+            ))
+            .await
+            .expect("legacy speech query")
+            .expect("legacy speech row");
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<String>(0)
+                .expect("legacy audio path"),
+            "generated-speech/legacy.wav"
+        );
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<Option<String>>(1)
+                .expect("opaque media id"),
+            None
+        );
+        assert_eq!(
+            legacy_speech
+                .try_get_by_index::<Option<String>>(2)
+                .expect("opaque tenant"),
+            None
+        );
 
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
@@ -274,13 +378,22 @@ mod tests {
         "studio_project_snapshots",
         "studio_project_render_jobs",
         "media_assets",
+        "artifact_cleanup_intents",
+        "provider_write_reservations",
+        "durable_idempotency_keys_v2",
+        "fleet_worker_observations",
+        "fleet_capacity_claims",
+        "gateway_principal_keys",
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
+        ("runtime_jobs", "cancellation_state"),
+        ("job_stages", "cancellation_state"),
         ("chat_threads", "system_prompt"),
         ("chat_messages", "content_parts"),
         ("media_assets", "source_asset_id"),
         ("media_assets", "canonical_profile_version"),
+        ("provider_write_reservations", "provider_request_json"),
         ("onboarding_state", "analytics_opt_in"),
         ("transcription_records", "transcription_mode"),
         ("transcription_records", "aligner_model_id"),
@@ -306,6 +419,8 @@ mod tests {
         ("speech_history_records", "processing_error"),
         ("speech_history_records", "runtime_stage_id"),
         ("speech_history_records", "runtime_attempt_token"),
+        ("speech_history_records", "audio_media_asset_id"),
+        ("speech_history_records", "audio_artifact_tenant"),
         ("diarization_records", "speaker_name_overrides_json"),
         ("diarization_records", "processing_status"),
         ("diarization_records", "processing_error"),
@@ -367,6 +482,42 @@ mod tests {
             metadata_json TEXT NOT NULL DEFAULT '{}'
         );
 
+        CREATE TABLE provider_write_reservations (
+            write_id TEXT PRIMARY KEY,
+            reservation_token TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            available_at INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            tenant_scope TEXT NOT NULL,
+            storage_namespace TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            filename TEXT NULL,
+            expected_size_bytes INTEGER NOT NULL,
+            expected_sha256 TEXT NOT NULL,
+            storage_key TEXT NULL,
+            cleanup_claim_token TEXT NULL,
+            cleanup_claim_expires_at INTEGER NULL,
+            cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NULL
+        );
+
+        INSERT INTO provider_write_reservations (
+            write_id, reservation_token, created_at, updated_at, expires_at,
+            available_at, state, tenant_scope, storage_namespace, content_type,
+            filename, expected_size_bytes, expected_sha256, storage_key,
+            cleanup_claim_token, cleanup_claim_expires_at,
+            cleanup_attempt_count, last_error
+        ) VALUES (
+            '00000000-0000-4000-8000-000000000001',
+            '00000000-0000-4000-8000-000000000002',
+            1, 1, 2, 2, 'reserved', 'tenant-a', 'artifact-store',
+            'application/octet-stream', NULL, 1,
+            '0000000000000000000000000000000000000000000000000000000000000000',
+            NULL, NULL, NULL, 0, NULL
+        );
+
         CREATE TABLE transcription_records (
             id TEXT PRIMARY KEY,
             created_at INTEGER NOT NULL,
@@ -399,6 +550,17 @@ mod tests {
             audio_mime_type TEXT NOT NULL,
             audio_filename TEXT NULL,
             audio_storage_path TEXT NOT NULL
+        );
+
+        INSERT INTO speech_history_records (
+            id, created_at, route_kind, model_id, speaker, language, input_text,
+            voice_description, reference_text, generation_time_ms,
+            audio_duration_secs, rtf, tokens_generated, audio_mime_type,
+            audio_filename, audio_storage_path
+        ) VALUES (
+            'legacy-speech', 1, 'text_to_speech', NULL, NULL, NULL, 'legacy',
+            NULL, NULL, 1.0, NULL, NULL, NULL, 'audio/wav', 'legacy.wav',
+            'generated-speech/legacy.wav'
         );
 
         CREATE TABLE diarization_records (

@@ -1,0 +1,132 @@
+# =============================================================================
+# Izwi Audio - Separated Production Serving Topology (Gateway + Worker)
+# =============================================================================
+#
+# Illustrates the separated production-serving architecture in Docker Compose:
+#
+#   Client ---> [gateway:8080] ---> [worker:9470] (private network)
+#
+# The gateway is hardware-independent and never loads models or constructs an
+# inference engine. The worker is an isolated process hosting RuntimeService,
+# model weights, and device context.
+#
+# Usage:
+#   1. Set credentials in your environment or a .env file:
+#        export GATEWAY_API_KEY="your-secret-gateway-api-key"
+#        export WORKER_BEARER_TOKEN="your-internal-worker-secret"
+#        export ADMIN_API_KEY="your-secret-admin-drain-key"
+#
+#   2. Start the serving topology:
+#        docker compose -f config/serving/docker-compose.serving.yml up -d
+#
+#   3. Test the gateway:
+#        curl -f http://localhost:8080/readyz
+#        curl -X POST http://localhost:8080/v1/chat/completions \
+#          -H "Authorization: Bearer ${GATEWAY_API_KEY}" \
+#          -H "Content-Type: application/json" \
+#          -d '{"model":"LFM2.5-1.2B-Instruct-GGUF","messages":[{"role":"user","content":"Hello"}]}'
+#
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Gateway: Public-facing, hardware-independent API router
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+    image: izwi:serving-latest
+    container_name: izwi-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - IZWI_GATEWAY_API_KEY=${GATEWAY_API_KEY:-dev-insecure-gateway-api-key}
+      - IZWI_GATEWAY_ADMIN_API_KEY=${ADMIN_API_KEY:-dev-insecure-admin-api-key}
+      - IZWI_GATEWAY_ADMIN_API_KEY_REF=env:IZWI_GATEWAY_ADMIN_API_KEY
+      - IZWI_GATEWAY_WORKER_CREDENTIAL_ID=gateway-worker-key-1
+      - IZWI_GATEWAY_WORKER_BEARER_TOKEN=${WORKER_BEARER_TOKEN:-dev-insecure-worker-bearer-token}
+      - IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1
+      - IZWI_HTTP_SHUTDOWN_GRACE_SECS=30
+    command:
+      - "izwi-server"
+      - "--role"
+      - "gateway"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--public-model"
+      - "LFM2.5-1.2B-Instruct-GGUF"
+      - "--gateway-worker-approval"
+      - "http://worker:9470|chat|LFM2.5-1.2B-Instruct-GGUF|lfm25-cpu-v1|1"
+      - "--gateway-max-in-flight"
+      - "32"
+    depends_on:
+      worker:
+        condition: service_healthy
+    networks:
+      - izwi-public
+      - izwi-private
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Worker: Private inference worker hosting the model and execution engine
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production
+    image: izwi:serving-latest
+    container_name: izwi-worker-cpu
+    restart: unless-stopped
+    volumes:
+      - izwi-serving-models:/app/models
+    environment:
+      - IZWI_WORKER_BIND=0.0.0.0:9470
+      # Internal Docker bridge network; production multi-machine deployments
+      # should mount TLS certificates and omit this acknowledgement.
+      - IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1
+      - IZWI_WORKER_MODEL=LFM2.5-1.2B-Instruct-GGUF
+      - IZWI_BACKEND=cpu
+      - IZWI_WORKER_CPU_THREADS=2
+      - IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES=2147483648
+      - IZWI_CPU_MEMORY_BUDGET_BYTES=2147483648
+      - IZWI_WORKER_ID=worker-cpu-1
+      - IZWI_WORKER_NODE_ID=node-docker-1
+      - IZWI_WORKER_DEPLOYMENT_ID=lfm25-cpu-v1
+      - IZWI_WORKER_ARTIFACT_REVISION=docker-cpu-v1
+      - IZWI_WORKER_MODEL_GENERATION=1
+      - IZWI_WORKER_CREDENTIAL_ID=gateway-worker-key-1
+      - IZWI_WORKER_BEARER_TOKEN=${WORKER_BEARER_TOKEN:-dev-insecure-worker-bearer-token}
+      - IZWI_WORKER_MAX_ACTIVE=2
+      - IZWI_WORKER_MAX_REQUEST_BYTES=1048576
+      - IZWI_WORKER_MAX_RETAINED_ATTEMPTS=64
+      - IZWI_WORKER_ATTEMPT_RETENTION_SECS=300
+      - IZWI_WORKER_STREAMING=true
+      - IZWI_MODELS_DIR=/app/models
+    networks:
+      - izwi-private
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer ${WORKER_BEARER_TOKEN:-dev-insecure-worker-bearer-token}", "-H", "x-izwi-service-credential-id: gateway-worker-key-1", "http://localhost:9470/internal/v1/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+networks:
+  izwi-public:
+    driver: bridge
+  izwi-private:
+    internal: true
+
+volumes:
+  izwi-serving-models:

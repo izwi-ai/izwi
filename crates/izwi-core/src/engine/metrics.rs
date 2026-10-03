@@ -44,6 +44,11 @@ pub const ENGINE_KV_CACHE_UTILIZATION_RATIO: &str = "engine.kv_cache.utilization
 pub const ENGINE_KV_CACHE_MEMORY_USED_BYTES: &str = "engine.kv_cache.memory_used_bytes";
 pub const ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES: &str = "engine.kv_cache.memory_capacity_bytes";
 pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resident_blocks";
+pub const ENGINE_KV_HOST_PAGES: &str = "engine.kv_cache.host_pages";
+pub const ENGINE_KV_DEMOTIONS_TOTAL: &str = "engine.kv_cache.demotions_total";
+pub const ENGINE_KV_PROMOTIONS_TOTAL: &str = "engine.kv_cache.promotions_total";
+pub const ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS: &str =
+    "engine.kv_cache.promotion_latency_avg_seconds";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
 pub const ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL: &str =
     "engine.stream.checkpoints_committed_total";
@@ -214,6 +219,22 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS,
         description:
             "Allocated physical KV pages in Metal or CUDA arenas (legacy metric name retained).",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_HOST_PAGES,
+        description: "Host-resident offloaded KV pages currently held by the DS4 host pool.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_DEMOTIONS_TOTAL,
+        description: "Cumulative pages demoted from device arenas to the DS4 host pool.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_PROMOTIONS_TOTAL,
+        description: "Cumulative pages promoted from the DS4 host pool back into device arenas.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
+        description: "Mean promotion copy latency in seconds across promoted pages (DS4).",
     },
     EngineMetricDescriptor {
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,

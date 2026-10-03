@@ -10,6 +10,7 @@ export type {
   ChatModelCapabilities,
   ChatReasoningEffort,
   ModelInfo,
+  ModelResidencySummary,
   ModelsResponse,
   SpeechModelCapabilities,
 } from "@/shared/api/models";

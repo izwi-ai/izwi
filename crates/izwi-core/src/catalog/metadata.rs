@@ -152,6 +152,15 @@ pub enum ModelVariant {
     /// Streaming Sortformer 4-speaker diarization model (.nemo)
     #[serde(rename = "diar_streaming_sortformer_4spk-v2.1")]
     DiarStreamingSortformer4SpkV21,
+    /// NVIDIA Nemotron 3 8-speaker Sortformer-family diarization model (.nemo)
+    #[serde(
+        rename = "Nemotron-3-Diarization",
+        alias = "nvidia/nemotron-3-diarization",
+        alias = "nemotron-3-diarization",
+        alias = "nemotron3-diarization",
+        alias = "Nemotron 3 Diarization"
+    )]
+    Nemotron3Diarization,
     /// Qwen3 0.6B text model
     #[serde(rename = "Qwen3-0.6B")]
     Qwen306B,
@@ -164,21 +173,19 @@ pub enum ModelVariant {
     /// Qwen3 1.7B text model (MLX 4-bit)
     #[serde(rename = "Qwen3-1.7B-4bit")]
     Qwen317B4Bit,
-    /// Qwen3 0.6B text model (GGUF Q8_0)
-    #[serde(rename = "Qwen3-0.6B-GGUF")]
-    Qwen306BGguf,
-    /// Qwen3 1.7B text model (GGUF Q8_0)
-    #[serde(rename = "Qwen3-1.7B-GGUF")]
-    Qwen317BGguf,
-    /// Qwen3 4B text model (GGUF Q4_K_M)
-    #[serde(rename = "Qwen3-4B-GGUF")]
-    Qwen34BGguf,
-    /// Qwen3 8B text model (GGUF Q4_K_M)
-    #[serde(rename = "Qwen3-8B-GGUF")]
-    Qwen38BGguf,
     /// Qwen3 14B text model (GGUF Q4_K_M)
     #[serde(rename = "Qwen3-14B-GGUF")]
     Qwen314BGguf,
+    /// Qwen3 MoE 30B-A3B text model (GGUF; sparse experts, ~3B active params).
+    /// Catalog-disabled until real-checkpoint activation evidence exists
+    /// (DS10 groundwork posture, ADR 0008).
+    #[serde(
+        rename = "Qwen3-30B-A3B-GGUF",
+        alias = "Qwen3-30B-A3B",
+        alias = "unsloth/Qwen3-30B-A3B-GGUF",
+        alias = "Qwen3-30B-A3B-Q4_K_M.gguf"
+    )]
+    Qwen3Moe30bA3bGguf,
     /// Qwen3.5 0.8B multimodal chat model (GGUF Q4_K_M only)
     #[serde(
         rename = "Qwen3.5-0.8B",
@@ -219,9 +226,17 @@ pub enum ModelVariant {
         alias = "Qwen3.8-27B"
     )]
     Qwen3827BFp8,
-    /// Gemma 3 1B instruction-tuned chat model
-    #[serde(rename = "Gemma-3-1b-it")]
-    Gemma31BIt,
+    /// Qwen3.5 35B-A3B hybrid sparse-MoE chat model with block-scaled FP8
+    /// Safetensors weights (256 experts, 8 routed + 1 shared). Catalog-disabled
+    /// until real-checkpoint activation evidence exists (ADR 0008 posture,
+    /// mirroring the Qwen3 MoE groundwork variant).
+    #[serde(
+        rename = "Qwen3.5-35B-A3B-FP8",
+        alias = "Qwen/Qwen3.5-35B-A3B-FP8",
+        alias = "qwen3.5-35b-a3b-fp8",
+        alias = "Qwen3.5-35B-A3B"
+    )]
+    Qwen35Moe35BA3BFp8,
     /// Gemma 3 4B instruction-tuned chat model
     #[serde(rename = "Gemma-3-4b-it")]
     Gemma34BIt,
@@ -265,6 +280,10 @@ impl ModelVariant {
     /// Revision used for the first supported Qwen3.8-27B-FP8 artifact contract.
     pub const QWEN38_27B_FP8_ARTIFACT_REVISION: &'static str =
         "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
+    /// Revision used for the first supported Qwen3.5-35B-A3B-FP8 artifact
+    /// contract (HF repo state 2026-04-24).
+    pub const QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION: &'static str =
+        "9d1823d2dee688a6b25e77009dc727688c44936e";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -308,6 +327,7 @@ impl ModelVariant {
     pub fn artifact_revision(self) -> Option<&'static str> {
         match self {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
+            Self::Qwen35Moe35BA3BFp8 => Some(Self::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             _ => None,
         }
@@ -358,21 +378,19 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "nvidia/nemotron-3.5-asr-streaming-0.6b",
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
+            Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen/Qwen3-0.6B",
             Self::Qwen306B4Bit => "mlx-community/Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen/Qwen3-1.7B",
             Self::Qwen317B4Bit => "mlx-community/Qwen3-1.7B-4bit",
-            Self::Qwen306BGguf => "Qwen/Qwen3-0.6B-GGUF",
-            Self::Qwen317BGguf => "Qwen/Qwen3-1.7B-GGUF",
-            Self::Qwen34BGguf => "Qwen/Qwen3-4B-GGUF",
-            Self::Qwen38BGguf => "Qwen/Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen/Qwen3-14B-GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen/Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "unsloth/Qwen3.5-0.8B-GGUF",
             Self::Qwen352BGguf => "unsloth/Qwen3.5-2B-GGUF",
             Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
             Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
-            Self::Gemma31BIt => "google/gemma-3-1b-it",
+            Self::Qwen35Moe35BA3BFp8 => "Qwen/Qwen3.5-35B-A3B-FP8",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
@@ -415,21 +433,19 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron 3.5 ASR Streaming 0.6B",
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
+            Self::Nemotron3Diarization => "Nemotron 3 Diarization",
             Self::Qwen306B => "Qwen3 0.6B",
             Self::Qwen306B4Bit => "Qwen3 0.6B 4-bit",
             Self::Qwen317B => "Qwen3 1.7B",
             Self::Qwen317B4Bit => "Qwen3 1.7B 4-bit",
-            Self::Qwen306BGguf => "Qwen3 0.6B GGUF",
-            Self::Qwen317BGguf => "Qwen3 1.7B GGUF",
-            Self::Qwen34BGguf => "Qwen3 4B GGUF",
-            Self::Qwen38BGguf => "Qwen3 8B GGUF",
             Self::Qwen314BGguf => "Qwen3 14B GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen3 MoE 30B-A3B GGUF",
             Self::Qwen3508BGguf => "Qwen3.5 0.8B GGUF",
             Self::Qwen352BGguf => "Qwen3.5 2B GGUF",
             Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
             Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
-            Self::Gemma31BIt => "Gemma 3 1B Instruct",
+            Self::Qwen35Moe35BA3BFp8 => "Qwen3.5 35B-A3B FP8",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
@@ -472,21 +488,19 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => "Nemotron-3.5-ASR-Streaming-0.6B",
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
+            Self::Nemotron3Diarization => "Nemotron-3-Diarization",
             Self::Qwen306B => "Qwen3-0.6B",
             Self::Qwen306B4Bit => "Qwen3-0.6B-4bit",
             Self::Qwen317B => "Qwen3-1.7B",
             Self::Qwen317B4Bit => "Qwen3-1.7B-4bit",
-            Self::Qwen306BGguf => "Qwen3-0.6B-GGUF",
-            Self::Qwen317BGguf => "Qwen3-1.7B-GGUF",
-            Self::Qwen34BGguf => "Qwen3-4B-GGUF",
-            Self::Qwen38BGguf => "Qwen3-8B-GGUF",
             Self::Qwen314BGguf => "Qwen3-14B-GGUF",
+            Self::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-GGUF",
             Self::Qwen3508BGguf => "Qwen3.5-0.8B",
             Self::Qwen352BGguf => "Qwen3.5-2B",
             Self::Qwen354BGguf => "Qwen3.5-4B",
             Self::Qwen359BGguf => "Qwen3.5-9B",
             Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
-            Self::Gemma31BIt => "Gemma-3-1b-it",
+            Self::Qwen35Moe35BA3BFp8 => "Qwen3.5-35B-A3B-FP8",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
@@ -529,27 +543,25 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
+            Self::Nemotron3Diarization => 200_000_000,          // ~0.19 GB .nemo, HF, Sep 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
             Self::Qwen317B => 4_080_000_000,            // ~3.80 GB (actual: 3.44GB + 622MB shards)
             Self::Qwen317B4Bit => 1_115_700_000,        // ~1.04 GB
-            Self::Qwen306BGguf => 1_100_000_000,        // ~1.02 GB (Q8_0 est)
-            Self::Qwen317BGguf => 2_400_000_000,        // ~2.24 GB (Q8_0 est)
-            Self::Qwen34BGguf => 2_500_000_000, // ~2.33 GB (Q4_K_M GGUF, HF file size, Feb 2026)
-            Self::Qwen38BGguf => 5_200_000_000, // ~4.84 GB (Q4_K_M est)
             Self::Qwen314BGguf => 9_200_000_000, // ~8.57 GB (Q4_K_M est)
-            Self::Qwen3508BGguf => 737_504_352, // local GGUF + mmproj + tokenizer assets
-            Self::Qwen352BGguf => 1_949_063_104, // local GGUF + mmproj + tokenizer assets
-            Self::Qwen354BGguf => 3_413_361_504, // local GGUF + mmproj + tokenizer assets
-            Self::Qwen359BGguf => 6_598_688_544, // local GGUF + mmproj + tokenizer assets
+            Self::Qwen3Moe30bA3bGguf => 18_600_000_000, // ~17.3 GB Q4_K_M estimate (128 routed experts, ~3B active)
+            Self::Qwen3508BGguf => 737_504_352,         // local GGUF + mmproj + tokenizer assets
+            Self::Qwen352BGguf => 1_949_063_104,        // local GGUF + mmproj + tokenizer assets
+            Self::Qwen354BGguf => 3_413_361_504,        // local GGUF + mmproj + tokenizer assets
+            Self::Qwen359BGguf => 6_598_688_544,        // local GGUF + mmproj + tokenizer assets
             Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
-            Self::Gemma31BIt => 2_200_000_000,    // ~2.05 GB (est)
-            Self::Gemma34BIt => 8_600_000_000,    // ~8.01 GB (est)
+            Self::Qwen35Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
+            Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
             Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
-            Self::Voxtral4BTts2603 => 8_650_000_000, // ~8.04 GB plus voice assets
-            Self::VibeVoice15BTts => 5_408_043_974, // safetensors index metadata total_size
+            Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
+            Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
         }
     }
@@ -585,15 +597,13 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 6.0,
             Self::GraniteSpeech412BPlus => 10.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
+            Self::Nemotron3Diarization => 2.0,
             Self::Qwen306B => 3.0,
             Self::Qwen306B4Bit => 2.0,
             Self::Qwen317B => 5.0,
             Self::Qwen317B4Bit => 3.0,
-            Self::Qwen306BGguf => 2.5,
-            Self::Qwen317BGguf => 4.0,
-            Self::Qwen34BGguf => 6.0,
-            Self::Qwen38BGguf => 10.0,
             Self::Qwen314BGguf => 16.0,
+            Self::Qwen3Moe30bA3bGguf => 32.0,
             Self::Qwen3508BGguf => 3.5,
             Self::Qwen352BGguf => 5.5,
             Self::Qwen354BGguf => 9.0,
@@ -601,7 +611,11 @@ impl ModelVariant {
             // Backend-specific admission replaces this coarse catalog hint:
             // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
             Self::Qwen3827BFp8 => 80.0,
-            Self::Gemma31BIt => 3.5,
+            // Same contract as Qwen38_27B_FP8: backend-specific admission
+            // replaces this hint. 140.0 is the worst-case CPU F32 expanded
+            // envelope (34.45B FP8 params + 1.5B BF16 params, dequantized);
+            // the Qwen3.5 MoE representation plan replaces it per backend.
+            Self::Qwen35Moe35BA3BFp8 => 140.0,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
             Self::Qwen3ForcedAligner06B4Bit => 1.5,
@@ -666,7 +680,9 @@ impl ModelVariant {
         matches!(
             self.family(),
             crate::catalog::ModelFamily::Qwen3Chat
+                | crate::catalog::ModelFamily::Qwen3MoeChat
                 | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Qwen35MoeChat
                 | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
@@ -696,8 +712,10 @@ impl ModelVariant {
             Self::Voxtral4BTts2603 => Some("CC BY-NC 4.0"),
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
-            Self::Nemotron35AsrStreaming06B => Some("OpenMDW-1.1"),
-            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 => Some("Apache-2.0"),
+            Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
+            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 | Self::Qwen35Moe35BA3BFp8 => {
+                Some("Apache-2.0")
+            }
             _ => None,
         }
     }
@@ -806,7 +824,9 @@ impl ModelVariant {
 
     /// Machine-readable chat controls that the selected runtime actually
     /// consumes. Keep reasoning effort narrower than generic thinking support:
-    /// today only Qwen3.8 implements the three-level effort contract.
+    /// today only Qwen3.8 implements the three-level effort contract. The
+    /// LFM2.5 Thinking checkpoint always reasons (the upstream template never
+    /// gates thinking on a kwarg), so its controls are display-level only.
     pub fn chat_capabilities(&self) -> Option<ChatModelCapabilities> {
         let (default_thinking_enabled, reasoning_efforts, supports_preserve_thinking) = match self {
             Self::Qwen3827BFp8 => (
@@ -820,6 +840,8 @@ impl ModelVariant {
             ),
             Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
             Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
+            Self::Qwen35Moe35BA3BFp8 => (true, Vec::new(), false),
+            Self::Lfm2512BThinkingGguf => (true, Vec::new(), false),
             _ => return None,
         };
 
@@ -909,16 +931,14 @@ impl ModelVariant {
                 | Self::Qwen317B4Bit
                 | Self::Qwen3Asr06BGguf
                 | Self::Qwen3Asr17BGguf
-                | Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
                 | Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
                 | Self::Qwen359BGguf
                 | Self::Qwen3827BFp8
+                | Self::Qwen35Moe35BA3BFp8
                 | Self::Qwen3ForcedAligner06B4Bit
         )
     }
@@ -927,11 +947,8 @@ impl ModelVariant {
     pub fn is_gguf(&self) -> bool {
         matches!(
             self,
-            Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
-                | Self::Qwen314BGguf
+            Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
                 | Self::Qwen3508BGguf
                 | Self::Qwen352BGguf
                 | Self::Qwen354BGguf
@@ -944,16 +961,18 @@ impl ModelVariant {
         )
     }
 
-    /// Whether this is a Qwen3 chat GGUF variant.
+    /// Whether this is a Qwen3 chat GGUF variant (dense or sparse/MoE).
     pub fn is_qwen_chat_gguf(&self) -> bool {
         matches!(
             self,
-            Self::Qwen306BGguf
-                | Self::Qwen317BGguf
-                | Self::Qwen34BGguf
-                | Self::Qwen38BGguf
-                | Self::Qwen314BGguf
+            Self::Qwen314BGguf
+                | Self::Qwen3Moe30bA3bGguf
         )
+    }
+
+    /// Whether this is the sparse-expert (MoE) Qwen3 chat GGUF variant.
+    pub fn is_qwen3_moe_chat_gguf(&self) -> bool {
+        matches!(self, Self::Qwen3Moe30bA3bGguf)
     }
 
     /// Whether this is a Qwen3 ASR GGUF variant.
@@ -972,6 +991,11 @@ impl ModelVariant {
     /// Whether this is the revision-pinned native Qwen3.8 FP8 checkpoint.
     pub fn is_qwen38_fp8(&self) -> bool {
         matches!(self, Self::Qwen3827BFp8)
+    }
+
+    /// Whether this is the native Qwen3.5 MoE FP8 checkpoint.
+    pub fn is_qwen35_moe_fp8(&self) -> bool {
+        matches!(self, Self::Qwen35Moe35BA3BFp8)
     }
 
     /// Whether this is an LFM2.5 chat GGUF variant.
@@ -994,19 +1018,21 @@ impl ModelVariant {
             | Self::Qwen306B4Bit
             | Self::Qwen317B
             | Self::Qwen317B4Bit
-            | Self::Qwen314BGguf => false,
-            Self::Qwen306BGguf
-            | Self::Qwen317BGguf
-            | Self::Qwen34BGguf
-            | Self::Qwen38BGguf
-            | Self::Qwen3Asr06BGguf
+            | Self::Qwen314BGguf
+            // DS10 groundwork posture (ADR 0008): catalog-disabled until a
+            // real MoE checkpoint is validated on every buildable lane.
+            | Self::Qwen3Moe30bA3bGguf => false,
+            Self::Qwen3Asr06BGguf
             | Self::Qwen3Asr17BGguf
             | Self::Qwen3508BGguf
             | Self::Qwen352BGguf
             | Self::Qwen354BGguf
             | Self::Qwen359BGguf
+            // Enabled by product decision (2026-09-30): visible and usable by
+            // default. Runtime/performance certification against the real
+            // checkpoint remains an exact-SHA hardware handoff gate.
+            | Self::Qwen35Moe35BA3BFp8
             | Self::Qwen3827BFp8
-            | Self::Gemma31BIt
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
             | Self::Qwen3Tts12Hz17BBase4Bit
@@ -1023,6 +1049,11 @@ impl ModelVariant {
             Self::ParakeetTdt06BV3 => true,
             Self::WhisperLargeV3Turbo => true,
             Self::DiarStreamingSortformer4SpkV21 => true,
+            // Enabled by product decision (2026-09-30) after real-checkpoint
+            // CPU evidence: 8-channel load + end-to-end diarization of the
+            // conformance clip through the RoPE encoder path (commit
+            // 2e35f632). Visible in the catalog and downloadable.
+            Self::Nemotron3Diarization => true,
             Self::Qwen3ForcedAligner06B => true,
             Self::FishAudioS2Pro => true,
             _ => !self.is_quantized(),
@@ -1061,21 +1092,19 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B,
             Self::GraniteSpeech412BPlus,
             Self::DiarStreamingSortformer4SpkV21,
+            Self::Nemotron3Diarization,
             Self::Qwen306B,
             Self::Qwen306B4Bit,
-            Self::Qwen306BGguf,
             Self::Qwen317B,
             Self::Qwen317B4Bit,
-            Self::Qwen317BGguf,
-            Self::Qwen34BGguf,
-            Self::Qwen38BGguf,
             Self::Qwen314BGguf,
+            Self::Qwen3Moe30bA3bGguf,
             Self::Qwen3508BGguf,
             Self::Qwen352BGguf,
             Self::Qwen354BGguf,
             Self::Qwen359BGguf,
             Self::Qwen3827BFp8,
-            Self::Gemma31BIt,
+            Self::Qwen35Moe35BA3BFp8,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
             Self::Qwen3ForcedAligner06B4Bit,
@@ -1211,10 +1240,16 @@ mod tests {
         assert!(qwen35.reasoning_efforts.is_empty());
         assert_eq!(qwen35.default_reasoning_effort, None);
 
-        assert_eq!(ModelVariant::Gemma31BIt.chat_capabilities(), None);
         assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
-        assert_eq!(ModelVariant::Lfm2512BThinkingGguf.chat_capabilities(), None);
-        assert_eq!(ModelVariant::Qwen34BGguf.chat_capabilities(), None);
+        let lfm25_thinking = ModelVariant::Lfm2512BThinkingGguf
+            .chat_capabilities()
+            .expect("LFM2.5 Thinking chat capabilities");
+        assert!(lfm25_thinking.supports_thinking);
+        assert!(lfm25_thinking.default_thinking_enabled);
+        assert!(lfm25_thinking.reasoning_efforts.is_empty());
+        assert_eq!(lfm25_thinking.default_reasoning_effort, None);
+        assert!(!lfm25_thinking.supports_preserve_thinking);
+        assert_eq!(ModelVariant::Lfm2512BInstructGguf.chat_capabilities(), None);
     }
 
     #[test]
@@ -1300,6 +1335,62 @@ mod tests {
                 variant.dir_name()
             );
         }
+    }
+
+    #[test]
+    fn nemotron3_diarization_catalog_contract_is_enabled_eight_speakers() {
+        let variant = ModelVariant::Nemotron3Diarization;
+
+        // Enabled by product decision (2026-09-30) after real-checkpoint CPU
+        // evidence; the SortformerDiarization family shares v2.1's runtime
+        // surface with a per-checkpoint 8-speaker envelope.
+        assert!(variant.is_enabled());
+        assert!(variant.is_diarization());
+        assert!(variant.supports_diarization_records());
+        assert!(!variant.is_quantized());
+        assert_eq!(
+            variant.family(),
+            crate::catalog::ModelFamily::SortformerDiarization
+        );
+        assert_eq!(variant.primary_task(), ModelTask::Diarization);
+        assert_eq!(variant.repo_id(), "nvidia/Nemotron-3-Diarization");
+        assert_eq!(variant.dir_name(), "Nemotron-3-Diarization");
+        assert_eq!(variant.display_name(), "Nemotron 3 Diarization");
+        assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
+        assert_eq!(variant.estimated_size(), 200_000_000);
+        assert_eq!(variant.memory_required_gb(), 2.0);
+    }
+
+    #[test]
+    fn qwen35_moe_fp8_catalog_contract_is_enabled_moe_family() {
+        let variant = ModelVariant::Qwen35Moe35BA3BFp8;
+
+        // Enabled by product decision (2026-09-30); runtime certification
+        // against the real checkpoint stays an exact-SHA hardware gate.
+        assert!(variant.is_enabled());
+        assert!(variant.is_chat());
+        assert!(variant.is_quantized());
+        assert!(!variant.is_gguf());
+        assert!(variant.is_qwen35_moe_fp8());
+        assert!(!variant.is_qwen38_fp8());
+        assert_eq!(variant.family(), crate::catalog::ModelFamily::Qwen35MoeChat);
+        assert_eq!(variant.primary_task(), ModelTask::Chat);
+        assert_eq!(variant.repo_id(), "Qwen/Qwen3.5-35B-A3B-FP8");
+        assert_eq!(variant.dir_name(), "Qwen3.5-35B-A3B-FP8");
+        assert_eq!(variant.display_name(), "Qwen3.5 35B-A3B FP8");
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        assert_eq!(
+            variant.artifact_revision(),
+            Some(ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION)
+        );
+        let caps = variant
+            .chat_capabilities()
+            .expect("qwen3.5 moe chat capabilities");
+        assert!(caps.supports_thinking);
+        assert!(caps.default_thinking_enabled);
+        assert!(caps.reasoning_efforts.is_empty());
+        assert_eq!(caps.default_reasoning_effort, None);
+        assert!(!caps.supports_preserve_thinking);
     }
 
     #[test]
@@ -1580,6 +1671,6 @@ mod tests {
             ModelVariant::WhisperLargeV3Turbo.speech_capabilities(),
             None
         );
-        assert_eq!(ModelVariant::Qwen38BGguf.speech_capabilities(), None);
+        assert_eq!(ModelVariant::Qwen359BGguf.speech_capabilities(), None);
     }
 }

@@ -214,7 +214,7 @@ fn voxtral_realtime_offline_frame_limit(
 
 impl VoxtralRealtimeModel {
     /// Load model from directory
-    pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
+    pub fn load(model_dir: &Path, device: DeviceProfile, prefix_reuse: bool) -> Result<Self> {
         // Try params.json (Voxtral format) first, then config.json (standard)
         let config_path = if model_dir.join("params.json").exists() {
             model_dir.join("params.json")
@@ -301,7 +301,8 @@ impl VoxtralRealtimeModel {
         )?;
 
         // Language model uses root-level layers.* and norm (Mistral-style)
-        let language_model = VoxtralLM::load(config.text_config().into(), vb.clone())?;
+        let language_model =
+            VoxtralLM::load(config.text_config().into(), vb.clone(), prefix_reuse)?;
 
         let time_embedding =
             TimeEmbedding::new(config.text_config().hidden_size, 10000.0, &device.device)?;

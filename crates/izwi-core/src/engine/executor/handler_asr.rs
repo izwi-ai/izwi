@@ -990,6 +990,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_staged_stream_outputs(staged[index].clone())
                 .with_clocked_state_completion(completions[index].clone())
@@ -1323,6 +1324,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_clocked_state_completion(completion)
@@ -1742,6 +1744,7 @@ impl NativeExecutor {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_staged_stream_outputs(staged)
                     .with_managed_cache_completions(completions)
@@ -2077,6 +2080,7 @@ impl NativeExecutor {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_staged_stream_outputs(staged)
                     .with_managed_cache_completions(completions)
@@ -2464,6 +2468,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_managed_cache_completions(completions)
@@ -2882,6 +2887,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_staged_stream_outputs(staged)
         .with_managed_cache_completions(completions)
@@ -3197,6 +3203,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -3573,6 +3580,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -3868,6 +3876,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
     }
@@ -4300,6 +4309,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions);
         Ok(match clocked_state_completion {
@@ -4766,6 +4776,7 @@ impl NativeExecutor {
                 .map(ExecutorPhaseTiming::with_media_decode_ms),
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(managed_cache_completions))
     }
@@ -5313,6 +5324,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(completions),
             );
@@ -5644,6 +5656,7 @@ impl NativeExecutor {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
             continuing[index] = !step.finished;
         }
@@ -5838,6 +5851,7 @@ impl NativeExecutor {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
         }
         let host_cancelled = host
@@ -6053,6 +6067,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: diagnostics,
                     error: None,
+                    logprobs: Vec::new(),
                 }));
                 let _ = sample_count;
             }
@@ -6499,6 +6514,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(managed_cache_completions),
             );
@@ -6682,13 +6698,24 @@ impl NativeExecutor {
                         initial_media_decode_ms = Some(audio_decode_ms);
                         let samples_len = samples.len();
 
-                        let chunk_plan = Self::asr_chunk_plan(
-                            &samples,
-                            sample_rate,
-                            model.max_audio_seconds_hint(),
-                            false,
-                            matches!(family, ModelFamily::WhisperAsr),
-                        );
+                let (streaming_low_latency, allow_speech_planner) =
+                    Self::asr_chunk_plan_streaming_args(
+                        request.streaming,
+                        matches!(family, ModelFamily::WhisperAsr),
+                    );
+                let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
+                    model.max_audio_seconds_hint(),
+                    model.audio_token_rate(),
+                    self.asr_effective_context(variant),
+                    |_| MAX_ASR_NEW_TOKENS,
+                )?;
+                let chunk_plan = Self::asr_chunk_plan(
+                    &samples,
+                    sample_rate,
+                    audio_limit_secs,
+                    streaming_low_latency,
+                    allow_speech_planner,
+                );
                         if chunk_plan.requires_chunk_path() {
                             if managed_cache.is_some() {
                                 return Err(Error::InvalidInput(
@@ -6698,7 +6725,7 @@ impl NativeExecutor {
                             }
                             let mut sequence = 0usize;
                             let chunk_stream_options = if matches!(family, ModelFamily::Qwen3Asr) {
-                                Self::qwen_asr_chunk_stream_options()
+                                Self::asr_chunk_stream_options()
                             } else {
                                 Default::default()
                             };
@@ -6758,6 +6785,7 @@ impl NativeExecutor {
                                 ),
                                 asr_diagnostics: diagnostics,
                                 error: None,
+                                logprobs: Vec::new(),
                             }));
                         }
 
@@ -6918,6 +6946,7 @@ impl NativeExecutor {
                             .map(ExecutorPhaseTiming::with_media_decode_ms),
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_managed_cache_completions(managed_cache_completions));
                 }
@@ -7034,15 +7063,26 @@ impl NativeExecutor {
 
             let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
+            let (streaming_low_latency, allow_speech_planner) =
+                Self::asr_chunk_plan_streaming_args(
+                    request.streaming,
+                    matches!(family, ModelFamily::WhisperAsr),
+                );
+            let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
+                model.max_audio_seconds_hint(),
+                model.audio_token_rate(),
+                self.asr_effective_context(variant),
+                |_| MAX_ASR_NEW_TOKENS,
+            )?;
             let chunk_plan = Self::asr_chunk_plan(
                 samples,
                 sample_rate,
-                model.max_audio_seconds_hint(),
-                request.streaming && !model.supports_incremental_decode(),
-                matches!(family, ModelFamily::WhisperAsr),
+                audio_limit_secs,
+                streaming_low_latency,
+                allow_speech_planner,
             );
             if chunk_plan.requires_chunk_path() {
-                let chunked = Self::transcribe_with_chunk_plan_with_context_and_details(
+                let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
                     &request.id,
                     stream_tx.as_ref(),
                     stream_policy,
@@ -7051,7 +7091,8 @@ impl NativeExecutor {
                     sample_rate,
                     &chunk_plan.chunks,
                     &chunk_plan.config,
-                    |chunk_audio, sr, prefix_text| {
+                    Self::asr_chunk_stream_options(),
+                    |chunk_audio, sr, prefix_text, partial| {
                         let bounded_prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
                             .then(|| Self::granite_asr_prefix_replay_text(prefix_text));
                         let prefix_text = bounded_prefix_text
@@ -7077,6 +7118,27 @@ impl NativeExecutor {
                                 })?
                             }
                             ModelFamily::VibeVoiceAsr => {
+                                if let Some(emit) = partial {
+                                    return with_vibevoice_invocation_state(
+                                        request,
+                                        scheduled,
+                                        |leases| {
+                                            model.transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                asr_prompt,
+                                                chunk_generation_options.clone(),
+                                                leases,
+                                                emit,
+                                            )
+                                        },
+                                    )
+                                    .map(|text| AsrChunkTranscription {
+                                        text,
+                                        diagnostics: None,
+                                    });
+                                }
                                 with_vibevoice_invocation_state(request, scheduled, |leases| {
                                     model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                                         chunk_audio,
@@ -7101,21 +7163,63 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::WhisperAsr => with_whisper_invocation_state(
-                                request,
-                                scheduled,
-                                |self_kv, cross_kv| {
-                                    model.transcribe_whisper_with_details_and_prompt_physical(
-                                        chunk_audio,
-                                        sr,
-                                        language,
-                                        asr_prompt,
-                                        self_kv,
-                                        cross_kv,
+                            ModelFamily::WhisperAsr => {
+                                if let Some(emit) = partial {
+                                    return with_whisper_invocation_state(
+                                        request,
+                                        scheduled,
+                                        |self_kv, cross_kv| {
+                                            model.transcribe_whisper_with_callback_and_prompt_physical(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                asr_prompt,
+                                                self_kv,
+                                                cross_kv,
+                                                emit,
+                                            )
+                                        },
                                     )
-                                },
-                            )?,
+                                    .map(|text| AsrChunkTranscription {
+                                        text,
+                                        diagnostics: None,
+                                    });
+                                }
+                                with_whisper_invocation_state(
+                                    request,
+                                    scheduled,
+                                    |self_kv, cross_kv| {
+                                        model.transcribe_whisper_with_details_and_prompt_physical(
+                                            chunk_audio,
+                                            sr,
+                                            language,
+                                            asr_prompt,
+                                            self_kv,
+                                            cross_kv,
+                                        )
+                                    },
+                                )?
+                            }
                             ModelFamily::ParakeetAsr => {
+                                if let Some(emit) = partial {
+                                    return with_single_invocation_tensor(
+                                        request,
+                                        scheduled,
+                                        |state| {
+                                            model.transcribe_parakeet_with_callback_physical(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                state,
+                                                emit,
+                                            )
+                                        },
+                                    )
+                                    .map(|text| AsrChunkTranscription {
+                                        text,
+                                        diagnostics: None,
+                                    });
+                                }
                                 with_single_invocation_tensor(request, scheduled, |state| {
                                     model.transcribe_parakeet_with_details_physical(
                                         chunk_audio,
@@ -7125,20 +7229,43 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::NemotronAsr => with_nemotron_offline_state(
-                                request,
-                                scheduled,
-                                |predictor, acoustic| {
-                                    model.transcribe_nemotron_with_details_and_prompt_physical(
-                                        chunk_audio,
-                                        sr,
-                                        language,
-                                        asr_prompt,
-                                        predictor,
-                                        acoustic,
+                            ModelFamily::NemotronAsr => {
+                                if let Some(emit) = partial {
+                                    return with_nemotron_offline_state(
+                                        request,
+                                        scheduled,
+                                        |predictor, acoustic| {
+                                            model.transcribe_nemotron_with_callback_and_prompt_physical(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                asr_prompt,
+                                                predictor,
+                                                acoustic,
+                                                emit,
+                                            )
+                                        },
                                     )
-                                },
-                            )?,
+                                    .map(|text| AsrChunkTranscription {
+                                        text,
+                                        diagnostics: None,
+                                    });
+                                }
+                                with_nemotron_offline_state(
+                                    request,
+                                    scheduled,
+                                    |predictor, acoustic| {
+                                        model.transcribe_nemotron_with_details_and_prompt_physical(
+                                            chunk_audio,
+                                            sr,
+                                            language,
+                                            asr_prompt,
+                                            predictor,
+                                            acoustic,
+                                        )
+                                    },
+                                )?
+                            }
                             _ => model.transcribe_with_details_prompt_prefix_and_options(
                                 chunk_audio,
                                 sr,
@@ -7394,6 +7521,7 @@ impl NativeExecutor {
             phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
             asr_diagnostics,
             error: None,
+            logprobs: Vec::new(),
         }))
     }
 
@@ -7434,6 +7562,16 @@ impl NativeExecutor {
             stop_token_ids: request.params.stop_token_ids.clone(),
             stop_sequences: request.params.stop_sequences.clone(),
         }
+    }
+
+    /// Effective invocation context for the loaded variant, when the executor
+    /// shares the lifecycle model registry. Executors without a registry
+    /// (mock workers, standalone tests) fall back to hint-only planning.
+    fn asr_effective_context(&self, variant: crate::model::ModelVariant) -> Option<usize> {
+        self.config
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.effective_context(variant))
     }
 
     fn asr_chunk_generation_options(

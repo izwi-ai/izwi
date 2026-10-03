@@ -560,7 +560,8 @@ jq -n \
                     first_audio_ms: .report.summary.first_audio_ms,
                     inter_frame_ms: .report.summary.inter_frame_ms,
                     first_transcript_ms: .report.summary.first_transcript_ms,
-                    inter_transcript_ms: .report.summary.inter_transcript_ms
+                    inter_transcript_ms: .report.summary.inter_transcript_ms,
+                    chat_itl_ms: .report.summary.itl_ms
                 },
                 telemetry_delta_available: .report.telemetry.delta_available,
                 backend_kind: $runtime.backend_kind,

@@ -189,7 +189,8 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             asr: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
-        Qwen3Chat | Qwen35Chat | Qwen38Chat | Gemma3Chat | Lfm2Chat => FamilyInferenceStatePolicy {
+        Qwen3MoeChat | Qwen3Chat | Qwen35Chat | Qwen35MoeChat | Qwen38Chat | Gemma3Chat
+        | Lfm2Chat => FamilyInferenceStatePolicy {
             chat: Retained,
             ..FamilyInferenceStatePolicy::STATELESS
         },
@@ -433,8 +434,10 @@ fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
 fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
     if matches!(
         model_variant.family(),
-        ModelFamily::Qwen3Chat
+        ModelFamily::Qwen3MoeChat
+            | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Gemma3Chat
             | ModelFamily::Lfm2Chat
@@ -780,8 +783,11 @@ mod tests {
         let qwen_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
             .unwrap();
+        let qwen35_moe_chat = *registry
+            .require(CapabilityKind::Chat, ModelVariant::Qwen35Moe35BA3BFp8)
+            .unwrap();
         let gemma_chat = *registry
-            .require(CapabilityKind::Chat, ModelVariant::Gemma31BIt)
+            .require(CapabilityKind::Chat, ModelVariant::Gemma34BIt)
             .unwrap();
         let lfm_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Lfm2512BInstructGguf)
@@ -797,6 +803,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(qwen_chat.sequence_execution, SequenceExecutionMode::Always);
+        assert_eq!(
+            qwen35_moe_chat.sequence_execution,
+            SequenceExecutionMode::Always
+        );
+        assert_eq!(
+            qwen35_moe_chat.state_requirement,
+            InferenceStateRequirement::Retained
+        );
         assert_eq!(gemma_chat.sequence_execution, SequenceExecutionMode::Always);
         assert_eq!(
             gemma_chat.state_requirement,
@@ -851,8 +865,7 @@ mod tests {
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let variants = registry.continuous_tensor_batch_variants(backend);
             assert!(variants.contains(&ModelVariant::Qwen306B));
-            assert!(variants.contains(&ModelVariant::Qwen306BGguf));
-            assert!(variants.contains(&ModelVariant::Gemma31BIt));
+            assert!(variants.contains(&ModelVariant::Qwen354BGguf));
             assert!(variants.contains(&ModelVariant::Gemma34BIt));
             assert!(variants.contains(&ModelVariant::Qwen3508BGguf));
             assert!(variants.contains(&ModelVariant::Qwen3Asr06BGguf));
@@ -895,7 +908,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .require(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
+                .require(CapabilityKind::Chat, ModelVariant::Qwen359BGguf)
                 .expect("qwen chat adapter")
                 .execution_target,
             ExecutionTargetKind::TokenEngine
@@ -1139,7 +1152,7 @@ mod tests {
         let registry = RuntimeAdapterRegistry::built_in();
 
         let err = registry
-            .require(CapabilityKind::Tts, ModelVariant::Qwen38BGguf)
+            .require(CapabilityKind::Tts, ModelVariant::Qwen359BGguf)
             .expect_err("chat model should not satisfy TTS");
 
         assert!(matches!(err, Error::InvalidInput(_)));

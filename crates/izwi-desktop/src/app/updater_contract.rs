@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn parses_beta_sequence_with_valid_tag() {
         let channel = UpdateChannel::Beta010;
-        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta-12"), Some(10));
+        assert_eq!(parse_beta_sequence(channel, "v0.1.0-beta-12"), Some(12));
     }
 
     #[test]

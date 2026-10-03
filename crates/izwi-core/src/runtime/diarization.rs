@@ -14,11 +14,14 @@ use crate::models::registry::{
 use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, InferenceStateRequirement};
 use crate::runtime::audio_io::{
-    base64_decode, decode_audio_bytes, validate_base64_audio_retained_size, MAX_AUDIO_SOURCE_BYTES,
+    base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
+    MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
-use crate::runtime::service::{copy_preparation_bytes, copy_preparation_string, RuntimeService};
+use crate::runtime::service::{
+    copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
+};
 use crate::runtime::types::{
     DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
     DiarizationUtterance, DiarizationWord,
@@ -212,6 +215,15 @@ impl DiarizationAsrModel {
         }
     }
 
+    /// Decoder-prompt tokens per second of audio; Voxtral's geometry is not
+    /// exposed here, so its pipeline chunking stays hint-driven.
+    fn audio_token_rate(&self) -> Option<f32> {
+        match self {
+            Self::Native(model) => model.audio_token_rate(),
+            Self::Voxtral(_) => None,
+        }
+    }
+
     fn transcribe_with_details(
         &self,
         audio: &[f32],
@@ -344,6 +356,7 @@ impl RuntimeService {
                 CapabilityKind::Diarization,
                 false,
                 ExecutionTargetKind::PipelineRunner,
+                CapabilityLoadOptions::default(),
             )
             .await?;
         let model = self
@@ -673,6 +686,9 @@ impl RuntimeService {
                 CapabilityKind::Asr,
                 false,
                 asr_target,
+                CapabilityLoadOptions {
+                    asr_long_form: true,
+                },
             )
             .await?;
         let asr_model = match diarization_asr_registry_route(asr_variant) {
@@ -723,6 +739,20 @@ impl RuntimeService {
         } else {
             None
         };
+
+        // Compose the ASR family hint with the invocation context so
+        // invocation-backed families chunk within the memory-fitted cache.
+        let asr_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+            asr_model.max_audio_seconds_hint(),
+            asr_model.audio_token_rate(),
+            self.model_registry.effective_context(asr_variant),
+            |_| NativeAsrGenerationOptions::default().max_new_tokens,
+        )?;
+        tracing::info!(
+            variant = %asr_variant,
+            asr_limit_secs = ?asr_limit_secs,
+            "resolved diarization pipeline ASR invocation audio limit"
+        );
 
         let aligner_limit = aligner_model
             .as_ref()
@@ -783,8 +813,8 @@ impl RuntimeService {
             (transcription.text, Vec::new(), transcription.language)
         } else if invocation_asr {
             let cfg = pipeline_chunk_config();
-            let chunk_limit =
-                combined_chunk_limit(asr_model.max_audio_seconds_hint(), aligner_limit);
+            let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
+            let cfg = degrade_pipeline_chunk_config(cfg, chunk_limit);
             let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
             if chunks.is_empty() {
                 return Err(Error::InvalidInput(
@@ -831,23 +861,24 @@ impl RuntimeService {
                 });
             }
             (assembler.finish().trim().to_string(), transcribed, None)
-        } else {
-            let audio_for_task = audio.clone();
-            let (text, chunks) = self
-                .coordinator
-                .run_loaded_blocking_stage(
-                    &pipeline_job,
-                    asr_contract,
-                    WorkUnit::AtomicJob {
-                        kind: "diarization.transcribe_chunks".to_string(),
-                    },
-                    move || {
-                        transcribe_audio_chunks(asr_model, &audio_for_task, None, aligner_limit)
-                    },
-                )
-                .await?;
-            (text, chunks, None)
-        };
+    } else {
+        let audio_for_task = audio.clone();
+        let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
+        let (text, chunks) = self
+            .coordinator
+            .run_loaded_blocking_stage(
+                &pipeline_job,
+                asr_contract,
+                WorkUnit::AtomicJob {
+                    kind: "diarization.transcribe_chunks".to_string(),
+                },
+                move || {
+                    transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit)
+                },
+            )
+            .await?;
+        (text, chunks, None)
+    };
         let asr_words = extract_words(&asr_text);
 
         let mut model_aligned_words = 0usize;
@@ -970,19 +1001,31 @@ impl RuntimeService {
         let mut transcript = raw_transcript.clone();
         let mut llm_refined = false;
         if runtime_request.enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
-            let llm_variant = resolve_chat_variant(runtime_request.llm_model_id.as_deref())?;
-            match self
-                .polish_diarized_transcript(llm_variant, &raw_transcript)
-                .await
-            {
-                Ok(polished) if !polished.trim().is_empty() => {
-                    let polished_trimmed = polished.trim();
-                    transcript = polished_trimmed.to_string();
-                    llm_refined = polished_trimmed != raw_transcript_trimmed;
+            // Refinement is optional polish: an unresolvable refiner model is
+            // the same class of failure as a failed completion — return the
+            // raw speaker transcript instead of discarding the whole run.
+            match resolve_chat_variant(runtime_request.llm_model_id.as_deref()) {
+                Ok(llm_variant) => {
+                    match self
+                        .polish_diarized_transcript(llm_variant, &raw_transcript)
+                        .await
+                    {
+                        Ok(polished) if !polished.trim().is_empty() => {
+                            let polished_trimmed = polished.trim();
+                            transcript = polished_trimmed.to_string();
+                            llm_refined = polished_trimmed != raw_transcript_trimmed;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
+                        }
+                    }
                 }
-                Ok(_) => {}
                 Err(err) => {
-                    warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
+                    warn!(
+                        "Refinement model {} is unavailable, returning raw speaker transcript: {err}",
+                        runtime_request.llm_model_id.as_deref().unwrap_or("default"),
+                    );
                 }
             }
         }
@@ -1046,7 +1089,7 @@ fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
 }
 
 fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
-    let (samples, sample_rate) = decode_audio_bytes(audio_bytes)?;
+    let (samples, sample_rate) = decode_audio_bytes_canonical(audio_bytes)?;
     let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE)?;
     let duration_secs = if PIPELINE_SAMPLE_RATE > 0 {
         normalized.len() as f32 / PIPELINE_SAMPLE_RATE as f32
@@ -1091,6 +1134,28 @@ fn combined_chunk_limit(asr_limit: Option<f32>, aligner_limit: Option<f32>) -> O
     }
 }
 
+/// A context-derived limit below the pipeline's minimum chunk size forces
+/// graceful degradation: smaller chunks keep the pipeline functional on
+/// constrained hosts instead of failing every invocation.
+fn degrade_pipeline_chunk_config(
+    mut cfg: AsrLongFormConfig,
+    chunk_limit: Option<f32>,
+) -> AsrLongFormConfig {
+    if let Some(limit) = chunk_limit.filter(|value| value.is_finite() && *value > 0.0)
+    {
+        if limit < cfg.min_chunk_secs {
+            tracing::warn!(
+                context_limit_secs = limit,
+                family_min_chunk_secs = cfg.min_chunk_secs,
+                "ASR pipeline invocation context limits chunks below the family minimum; transcription accuracy degrades"
+            );
+            cfg.min_chunk_secs = limit.max(1.0);
+            cfg.target_chunk_secs = cfg.target_chunk_secs.max(cfg.min_chunk_secs);
+        }
+    }
+    cfg
+}
+
 fn should_use_single_pass_diarization_asr(
     duration_secs: f32,
     aligner_limit: Option<f32>,
@@ -1110,10 +1175,9 @@ fn transcribe_audio_chunks(
     model: DiarizationAsrModel,
     audio: &PipelineAudio,
     language: Option<&str>,
-    aligner_limit: Option<f32>,
+    chunk_limit: Option<f32>,
 ) -> Result<(String, Vec<TranscribedChunk>)> {
     let cfg = pipeline_chunk_config();
-    let chunk_limit = combined_chunk_limit(model.max_audio_seconds_hint(), aligner_limit);
     let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
     if chunks.is_empty() {
         return Err(Error::InvalidInput(

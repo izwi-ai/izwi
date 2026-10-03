@@ -330,12 +330,17 @@ impl ModelVariant {
                 Provider::IzwiCudaEligible,
                 "Qwen3.5 recurrent blocks have an existing Izwi CUDA causal-convolution provider with a Candle fallback",
             ),
+            ModelFamily::Qwen35MoeChat => CudaOperatorCapability::source_reviewed(
+                Operator::Convolution,
+                Provider::IzwiCudaEligible,
+                "Qwen3.5 MoE recurrent blocks reuse the Qwen3.5 causal-convolution provider shape; per-family CUDA evidence is collected at activation, not before",
+            ),
             ModelFamily::Qwen38Chat => CudaOperatorCapability::source_reviewed(
                 Operator::Convolution,
                 Provider::IzwiCudaEligible,
                 "Qwen3.8 DeltaNet blocks require independently verified Izwi CUDA causal-convolution coverage with a Candle fallback; Qwen3.5 evidence is not inherited",
             ),
-            ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
+            ModelFamily::Qwen3MoeChat | ModelFamily::Qwen3Chat | ModelFamily::Gemma3Chat => {
                 CudaOperatorCapability::source_reviewed(
                     Operator::Convolution,
                     Provider::NotApplicable,
@@ -352,8 +357,10 @@ impl ModelVariant {
             _ => Provider::CandleFlashAttentionEligible,
         };
         let paged_provider = match family {
-            ModelFamily::Qwen3Chat
+            ModelFamily::Qwen3MoeChat
+            | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat
@@ -488,8 +495,10 @@ impl ModelVariant {
             | ModelFamily::WhisperAsr
             | ModelFamily::Qwen3Asr
             | ModelFamily::VibeVoiceAsr
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen3Chat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Lfm25Audio
@@ -518,6 +527,13 @@ impl ModelVariant {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
                 "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv before converting projections to resident Q8_0 Candle weights, a compressed fallback rather than native FP8 execution",
+            );
+        }
+
+        if self.is_qwen35_moe_fp8() {
+            return CudaQuantizationInfo::new(
+                CudaQuantizationSupportLevel::CandleQuantizedGeneric,
+                "Qwen3.5 MoE stores 128x128 block-scaled FP8 Safetensors weights; CUDA follows the same scale-aware Q8_0 compressed-projection fallback contract as Qwen3.8 FP8, not native FP8 execution",
             );
         }
 
@@ -711,7 +727,7 @@ mod tests {
 
     #[test]
     fn support_metadata_serializes_execution_and_evidence_independently() {
-        let value = serde_json::to_value(ModelVariant::Qwen34BGguf.cuda_support())
+        let value = serde_json::to_value(ModelVariant::Qwen354BGguf.cuda_support())
             .expect("serialize CUDA support");
 
         assert_eq!(value["level"], "candle_cuda_generic");
@@ -813,7 +829,7 @@ mod tests {
     #[test]
     fn cuda_quantization_marks_dequantized_and_candle_paths() {
         assert_eq!(
-            ModelVariant::Qwen34BGguf.cuda_quantization().level,
+            ModelVariant::Qwen354BGguf.cuda_quantization().level,
             CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
         assert_eq!(

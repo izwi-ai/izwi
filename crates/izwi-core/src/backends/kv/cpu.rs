@@ -14,9 +14,9 @@ use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding,
 use crate::Result;
 
 use super::{
-    validate_attention_softcap, DeviceFence, KvArena, KvArenaConfig, KvArenaOperationStats,
-    KvAttentionProvider, KvBackendRuntime, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs,
-    KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    arena_page_bytes, page_transfer, validate_attention_softcap, DeviceFence, KvArena,
+    KvArenaConfig, KvArenaOperationStats, KvAttentionProvider, KvBackendRuntime, KvDeviceFence,
+    KvPageCopy, KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
 };
 
 #[derive(Debug)]
@@ -302,6 +302,56 @@ impl KvArena for CpuKvArena {
         }
         self.page_copy_dispatches.fetch_add(1, Ordering::Relaxed);
         Ok(ready_fence())
+    }
+
+    fn capture_page(&self, page: CacheBlockRef, destination: &mut [u8]) -> Result<()> {
+        let page = self.validate_block(page)?;
+        let expected = arena_page_bytes(&self.config) as usize;
+        if destination.len() != expected {
+            return Err(Error::InferenceError(format!(
+                "KV host page buffer must be {expected} bytes, got {}",
+                destination.len()
+            )));
+        }
+        // A read guard blocks concurrent mutation writers so the captured
+        // page is consistent across layers.
+        let _guard = self
+            .mutation_lock
+            .read()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let mut offset = 0usize;
+        for layer in &self.config.layers {
+            let storage = self.layer(layer.binding)?;
+            offset +=
+                page_transfer::capture_block(&storage.keys, page, &mut destination[offset..])?;
+            offset +=
+                page_transfer::capture_block(&storage.values, page, &mut destination[offset..])?;
+        }
+        debug_assert_eq!(offset, expected);
+        Ok(())
+    }
+
+    fn restore_page(&self, page: CacheBlockRef, source: &[u8]) -> Result<()> {
+        let page = self.validate_block(page)?;
+        let expected = arena_page_bytes(&self.config) as usize;
+        if source.len() != expected {
+            return Err(Error::InferenceError(format!(
+                "KV host page buffer must be {expected} bytes, got {}",
+                source.len()
+            )));
+        }
+        let _guard = self
+            .mutation_lock
+            .write()
+            .map_err(|_| Error::InferenceError("CPU KV arena mutation lock was poisoned".into()))?;
+        let mut offset = 0usize;
+        for layer in &self.config.layers {
+            let storage = self.layer(layer.binding)?;
+            offset += page_transfer::restore_block(&storage.keys, page, &source[offset..])?;
+            offset += page_transfer::restore_block(&storage.values, page, &source[offset..])?;
+        }
+        debug_assert_eq!(offset, expected);
+        Ok(())
     }
 
     fn write_slots(
@@ -1775,5 +1825,98 @@ mod tests {
             assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn host_page_capture_and_restore_round_trips_bytes() {
+        let cfg = config(DType::F32);
+        // One layer: K holds 2*2*2 elements and V holds 2*2*1, so a whole
+        // page is 12 f32 elements = 48 bytes.
+        let expected_len = super::arena_page_bytes(&cfg) as usize;
+        assert_eq!(expected_len, 48);
+
+        let arena = CpuKvArena::new(cfg).unwrap();
+        let mut captured = vec![0_u8; expected_len];
+        arena.capture_page(block(1), &mut captured).unwrap();
+        assert!(captured.iter().all(|byte| *byte == 0), "fresh page is zero");
+
+        let mut seeded = vec![0_u8; expected_len];
+        for (index, bits) in [
+            0x3f80_0000_u32,
+            0x4000_0000,
+            0x4040_0000,
+            0x4080_0000,
+            0x40a0_0000,
+            0x40c0_0000,
+            0x40e0_0000,
+            0x4100_0000,
+            0x4110_0000,
+            0x4120_0000,
+            0x4130_0000,
+            0x4140_0000,
+        ]
+        .iter()
+        .enumerate()
+        {
+            seeded[index * 4..(index + 1) * 4].copy_from_slice(&bits.to_ne_bytes());
+        }
+        arena.restore_page(block(1), &seeded).unwrap();
+
+        let mut captured = vec![0_u8; expected_len];
+        arena.capture_page(block(1), &mut captured).unwrap();
+        assert_eq!(
+            captured, seeded,
+            "capture must reproduce the restored bytes"
+        );
+
+        let mut untouched = vec![0_u8; expected_len];
+        arena.capture_page(block(0), &mut untouched).unwrap();
+        assert!(untouched.iter().all(|byte| *byte == 0));
+
+        assert!(arena
+            .capture_page(block(1), &mut vec![0_u8; expected_len - 1])
+            .is_err());
+        assert!(arena
+            .restore_page(block(1), &vec![0_u8; expected_len + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn host_page_capture_layers_are_ordered_and_sized() {
+        let cfg = KvArenaConfig {
+            layers: vec![
+                KvLayerConfig {
+                    binding: LAYER,
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                },
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 9,
+                        physical_layer: 3,
+                    },
+                    num_kv_heads: 2,
+                    key_head_dim: 1,
+                    value_head_dim: 1,
+                },
+            ],
+            ..config(DType::BF16)
+        };
+        // Layer 0: 2*1*(2+2) = 8 bf16, layer 1: 2*2*(1+1) = 8 bf16 => 32 bytes.
+        let expected_len = super::arena_page_bytes(&cfg) as usize;
+        assert_eq!(expected_len, 32);
+
+        let arena = CpuKvArena::new(cfg).unwrap();
+        let mut seeded = vec![0_u8; expected_len];
+        for index in 0..16_usize {
+            let bits = 0x3800_u16 + index as u16; // small distinct bf16 values
+            seeded[index * 2..(index + 1) * 2].copy_from_slice(&bits.to_ne_bytes());
+        }
+        arena.restore_page(block(2), &seeded).unwrap();
+
+        let mut captured = vec![0_u8; expected_len];
+        arena.capture_page(block(2), &mut captured).unwrap();
+        assert_eq!(captured, seeded);
     }
 }

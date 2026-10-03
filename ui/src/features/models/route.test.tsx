@@ -43,7 +43,7 @@ describe("MyModelsPage", () => {
       <MyModelsPage
         models={[
           buildModel({ variant: "Qwen3.5-0.8B", size_bytes: 715_600_000 }),
-          buildModel({ variant: "Qwen3-0.6B-GGUF", size_bytes: 1_073_741_824 }),
+          buildModel({ variant: "Qwen3.8-27B-FP8", size_bytes: 30_889_968_808 }),
         ]}
         loading={false}
         downloadProgress={{}}
@@ -58,8 +58,8 @@ describe("MyModelsPage", () => {
     expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
     expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
     expect(screen.getByText("Qwen3.5 0.8B")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3 0.6B")).toBeInTheDocument();
-    expect(screen.queryByText(/Qwen3 Chat 0\.6B/i)).not.toBeInTheDocument();
+    expect(screen.getByText("Qwen3.8 27B")).toBeInTheDocument();
+    expect(screen.queryByText(/Qwen3 Chat 27B/i)).not.toBeInTheDocument();
   });
 
   it("renders VibeVoice models from the backend catalog under Microsoft", () => {

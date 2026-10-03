@@ -8,7 +8,7 @@
 //! to be loaded from either safetensors or GGUF formats with minimal code changes.
 
 use candle_core::quantized::gguf_file::{Content as GgufContent, Value as GgufValue};
-use candle_core::quantized::QTensor;
+use candle_core::quantized::{QStorage, QTensor};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
@@ -33,6 +33,59 @@ pub struct GgufModelInfo {
 }
 
 /// GGUF model loader that provides a unified interface for loading quantized models.
+/// Aggregate tensor payload facts taken from a checkpoint's metadata without
+/// materializing any tensor data. `largest_tensor_elements` belongs to the
+/// tensor reported by `largest_tensor_bytes`, so load-scratch bounds can be
+/// derived from both storage and destination-dtype expansion. `tensor_count`
+/// carries the allocation-count dimension that MoE-shaped checkpoints make
+/// material (many same-sized expert tensors).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TensorStorageInventory {
+    pub total_bytes: u64,
+    pub largest_tensor_bytes: u64,
+    pub largest_tensor_elements: u64,
+    pub tensor_count: u64,
+}
+
+impl TensorStorageInventory {
+    pub(crate) fn push(self, tensor_bytes: u64, tensor_elements: u64) -> Self {
+        let total_bytes = self.total_bytes.saturating_add(tensor_bytes);
+        let tensor_count = self.tensor_count.saturating_add(1);
+        if tensor_bytes > self.largest_tensor_bytes {
+            Self {
+                total_bytes,
+                largest_tensor_bytes: tensor_bytes,
+                largest_tensor_elements: tensor_elements,
+                tensor_count,
+            }
+        } else {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..self
+            }
+        }
+    }
+
+    pub(crate) fn merge(self, other: Self) -> Self {
+        let total_bytes = self.total_bytes.saturating_add(other.total_bytes);
+        let tensor_count = self.tensor_count.saturating_add(other.tensor_count);
+        if other.largest_tensor_bytes > self.largest_tensor_bytes {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..other
+            }
+        } else {
+            Self {
+                total_bytes,
+                tensor_count,
+                ..self
+            }
+        }
+    }
+}
+
 pub struct GgufLoader {
     path: PathBuf,
     content: GgufContent,
@@ -154,31 +207,29 @@ impl GgufLoader {
 
     /// Return exact stored tensor payload bytes and the largest individual
     /// tensor without materializing checkpoint data.
-    pub fn tensor_storage_inventory(&self) -> Result<(u64, u64)> {
+    pub fn tensor_storage_inventory(&self) -> Result<TensorStorageInventory> {
         self.content
             .tensor_infos
             .values()
-            .try_fold((0_u64, 0_u64), |(total, largest), info| {
-                let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
-                })?;
-                let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
-                })?;
-                let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
-                    Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
-                })?;
-                let bytes = elements
-                    .checked_div(block)
-                    .and_then(|blocks| blocks.checked_mul(type_bytes))
-                    .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
-                Ok((
-                    total.checked_add(bytes).ok_or_else(|| {
-                        Error::ModelLoadError("GGUF tensor inventory overflow".into())
-                    })?,
-                    largest.max(bytes),
-                ))
-            })
+            .try_fold(
+                TensorStorageInventory::default(),
+                |inv, info| {
+                    let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
+                    })?;
+                    let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
+                    })?;
+                    let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
+                        Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
+                    })?;
+                    let bytes = elements
+                        .checked_div(block)
+                        .and_then(|blocks| blocks.checked_mul(type_bytes))
+                        .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
+                    Ok(inv.push(bytes, elements))
+                },
+            )
     }
 
     /// Get a raw metadata value.
@@ -411,15 +462,58 @@ where
 
 /// Check if a file is in GGUF format by examining the magic bytes.
 pub fn is_gguf_file(path: &Path) -> bool {
-    if let Ok(mut file) = std::fs::File::open(path) {
-        use std::io::Read;
-        let mut magic = [0u8; 4];
-        if file.read_exact(&mut magic).is_ok() {
-            // GGUF magic: 'GGUF' in little-endian
-            return magic == [0x47, 0x47, 0x55, 0x46]; // "GGUF"
-        }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_ok() {
+        // GGUF magic: 'GGUF' in little-endian
+        return magic == [0x47, 0x47, 0x55, 0x46]; // "GGUF"
     }
     false
+}
+
+/// Split one fused GGUF expert tensor into per-expert 2D `QTensor`s without
+/// dequantizing. Fused llama.cpp expert tensors (`ffn_{gate,up,down}_exps`)
+/// store each expert's quantized blocks contiguously along the leading
+/// dimension, so a per-expert view is a byte-range re-wrap at full quantized
+/// fidelity — residency stays quantized and the dispatcher can apply experts
+/// one at a time with plain per-expert matmuls.
+pub fn split_fused_expert_qtensor(
+    fused: &QTensor,
+    num_experts: usize,
+    expert_rows: usize,
+    expert_cols: usize,
+) -> Result<Vec<QTensor>> {
+    let expected = [num_experts, expert_rows, expert_cols];
+    if fused.shape().dims() != expected {
+        return Err(Error::ModelLoadError(format!(
+            "fused GGUF expert tensor shape {:?} does not match the MoE geometry {expected:?}",
+            fused.shape().dims()
+        )));
+    }
+    let dtype = fused.dtype();
+    let device = fused.device();
+    let data = fused.data()?;
+    if num_experts == 0 || data.len() % num_experts != 0 {
+        return Err(Error::ModelLoadError(format!(
+            "fused GGUF expert tensor of {} bytes does not divide evenly across {num_experts} experts",
+            data.len()
+        )));
+    }
+    let expert_bytes = data.len() / num_experts;
+    (0..num_experts)
+        .map(|expert| {
+            let range = expert * expert_bytes..(expert + 1) * expert_bytes;
+            let storage = QStorage::from_data(
+                std::borrow::Cow::Borrowed(&data[range]),
+                &device,
+                dtype,
+            )?;
+            QTensor::new(storage, (expert_rows, expert_cols)).map_err(Error::from)
+        })
+        .collect()
 }
 
 /// Helper function to format GGUF metadata values for display.

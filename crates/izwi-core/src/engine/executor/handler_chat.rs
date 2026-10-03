@@ -21,8 +21,19 @@ use super::{
 const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
 const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
 
-fn begins_resumable_prefill_state(scheduled: &ScheduledRequest, resumable_prefill: bool) -> bool {
-    scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens == 0
+fn begins_resumable_prefill_state(
+    scheduled: &ScheduledRequest,
+    resumable_prefill: bool,
+    request: &EngineCoreRequest,
+) -> bool {
+    scheduled.is_prefill
+        && resumable_prefill
+        && (scheduled.num_computed_tokens == 0
+            // DS1.5: a jumped request starts its first span at the probed
+            // prefix cursor before it has ever executed.
+            || Some(
+                u32::try_from(scheduled.num_computed_tokens).unwrap_or(u32::MAX),
+            ) == request.managed_prefix_cursor())
 }
 
 fn finish_resumable_prefill_step(
@@ -41,6 +52,7 @@ fn finish_resumable_prefill_step(
         tokens_generated: last_tokens_generated,
         input_tokens_committed: 0,
         finished: false,
+        logprobs: Vec::new(),
     })
 }
 
@@ -227,6 +239,7 @@ impl NativeExecutor {
                 last_tokens_generated: state.last_tokens_generated,
                 stream_sequence: state.stream_sequence,
                 streamed_text: state.streamed_text.clone(),
+                logprobs: state.logprobs.clone(),
             },
         );
         // All CPU continuation state is installed before dropping GPU owners.
@@ -409,6 +422,7 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             }));
         }
 
@@ -466,6 +480,7 @@ impl NativeExecutor {
                     last_tokens_generated: saved.last_tokens_generated,
                     stream_sequence: saved.stream_sequence,
                     streamed_text: saved.streamed_text.clone(),
+                    logprobs: saved.logprobs.clone(),
                 })?;
                 suspended.remove(&session);
                 started_replay = true;
@@ -512,14 +527,20 @@ impl NativeExecutor {
                     request.id.clone(),
                 )));
             }
-            if scheduled.is_prefill && resumable_prefill && scheduled.num_computed_tokens > 0 {
+            if scheduled.is_prefill
+                && resumable_prefill
+                && scheduled.num_computed_tokens > 0
+                && !begins_resumable_prefill_state(scheduled, resumable_prefill, request)
+            {
                 return Err(Error::InferenceError(format!(
                     "resumable prefill request {} lost its decode state before span continuation; retry requires a fresh prompt",
                     request.id
                 )));
             }
             let mut decode_state = match managed_cache.take() {
-                Some(cache) if begins_resumable_prefill_state(scheduled, resumable_prefill) => {
+                Some(cache)
+                    if begins_resumable_prefill_state(scheduled, resumable_prefill, request) =>
+                {
                     Self::run_blocking(|| {
                         model.start_resumable_prefill_state_managed(
                             messages,
@@ -539,6 +560,17 @@ impl NativeExecutor {
                             max_new_tokens,
                             &generation_config,
                             prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35()),
+                            cache,
+                        )
+                    })?
+                }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35Moe(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_qwen35_moe_decode_state_managed(
+                            messages,
+                            max_new_tokens,
+                            &generation_config,
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35_moe()),
                             cache,
                         )
                     })?
@@ -565,6 +597,16 @@ impl NativeExecutor {
                         )
                     })?
                 }
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Lfm2(_)) => {
+                    Self::run_blocking(|| {
+                        model.start_lfm2_decode_state_managed(
+                            &request.prompt_tokens,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
+                    })?
+                }
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(
                         messages,
@@ -581,6 +623,16 @@ impl NativeExecutor {
             };
             if let Some(reservation) = tensor_reservation {
                 decode_state.bind_hybrid_tensor_sequence(reservation.sequence)?;
+                // Only a resumable begin starts above zero on an attached
+                // prefix: adopt the forked hybrid tensor state before the
+                // first span. A monolithic begin already consumed its prompt
+                // inside the begin call, and an empty fresh sequence restores
+                // nothing, so both must skip the restore.
+                if begins_resumable_prefill_state(scheduled, resumable_prefill, request) {
+                    if let Some(arena) = tensor_arena.as_ref() {
+                        decode_state.restore_hybrid_tensor_state(arena)?;
+                    }
+                }
             }
             state_lease.install_state(ActiveChatDecode {
                 variant,
@@ -588,6 +640,7 @@ impl NativeExecutor {
                 last_tokens_generated: 0,
                 stream_sequence: 0,
                 streamed_text: String::new(),
+                logprobs: Vec::new(),
             })?;
         }
 
@@ -618,7 +671,7 @@ impl NativeExecutor {
             })
             .transpose()?;
         state_lease.mark_dirty();
-        let (step, final_text, finished, managed_cache_completions) = {
+        let (step, final_text, finished, managed_cache_completions, terminal_logprobs) = {
             let active_state = state_lease.require_state_mut()?;
             if matches!(active_state.state, NativeChatDecodeState::Lfm2(_))
                 && crate::models::architectures::lfm2::diagnostics::enabled()
@@ -643,8 +696,19 @@ impl NativeExecutor {
                     tokens_generated: active_state.last_tokens_generated,
                     input_tokens_committed: 0,
                     finished: false,
+                    logprobs: Vec::new(),
                 }
-            } else if let Some((span_start, span_end)) = resumable_span {
+            } else if let Some((scheduled_start, span_end)) = resumable_span {
+                // A managed prefix attach leaves the state's logical prefill
+                // cursor at the attached physical cursor, which can sit above
+                // the scheduler's span start. The model always feeds from its
+                // own cursor; the scheduler still receives the scheduled span
+                // length as progress.
+                let span_start = active_state
+                    .state
+                    .prefill_progress()
+                    .unwrap_or(scheduled_start)
+                    .max(scheduled_start);
                 let prefill_complete = Self::run_blocking(|| {
                     model.continue_resumable_prefill(
                         &mut active_state.state,
@@ -689,14 +753,16 @@ impl NativeExecutor {
                     .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
             }
 
+            active_state.logprobs.extend(step.logprobs.clone());
             if let Some(tx) = stream_tx.as_ref() {
                 if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
+                    Self::stream_chat_text_with_policy(
                         tx,
                         stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
+                        step.logprobs.clone(),
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }
@@ -712,7 +778,18 @@ impl NativeExecutor {
                 }
             }
             let managed_cache_completions = active_state.state.take_managed_write_completions();
-            (step, final_text, finished, managed_cache_completions)
+            let terminal_logprobs = if finished {
+                std::mem::take(&mut active_state.logprobs)
+            } else {
+                Vec::new()
+            };
+            (
+                step,
+                final_text,
+                finished,
+                managed_cache_completions,
+                terminal_logprobs,
+            )
         };
 
         let tokens_processed = if let Some(span_tokens) = resumable_span_tokens {
@@ -739,6 +816,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: terminal_logprobs,
         })
         .with_managed_cache_completions(managed_cache_completions))
     }
@@ -764,12 +842,28 @@ impl NativeExecutor {
         if scheduled.is_empty()
             || scheduled
                 .iter()
-                .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens != 1)
+                .any(|scheduled| scheduled.is_prefill || scheduled.num_tokens < 1)
         {
             return Err(Error::InvalidInput(
-                "continuous chat execution requires one decode token per row".to_string(),
+                "continuous chat execution requires a positive decode token count per row".to_string(),
             ));
         }
+        // DS9.4: a speculative envelope is homogeneous — every row carries the
+        // same multi-token quantum. Mixed widths cannot arise because the
+        // quantum gates are per-model and per-step global.
+        let speculative_width = {
+            let width = scheduled[0].num_tokens;
+            if width > 1
+                && scheduled
+                    .iter()
+                    .any(|scheduled| scheduled.num_tokens != width)
+            {
+                return Err(Error::InvalidInput(
+                    "continuous chat execution requires homogeneous speculative quanta".to_string(),
+                ));
+            }
+            (width > 1).then_some(width)
+        };
         if managed_caches.len() != scheduled.len() {
             return Err(Error::InvalidInput(
                 "continuous chat managed-cache rows do not match batch width".to_string(),
@@ -941,7 +1035,19 @@ impl NativeExecutor {
             .map(|(_, _, lease, _)| lease.require_state_mut().map(|state| &mut state.state))
             .collect::<Result<Vec<_>>>()?;
         let live_width = state_refs.len();
-        let steps = Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?;
+        let steps = match speculative_width {
+            Some(budget) => {
+                if !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+                    return Err(Error::InvalidInput(
+                        "speculative envelopes require the Qwen3.8 MTP model".to_string(),
+                    ));
+                }
+                Self::run_blocking(|| {
+                    model.decode_speculative_batch(&mut state_refs, budget)
+                })?
+            }
+            None => Self::run_blocking(|| model.decode_step_batch(&mut state_refs))?,
+        };
         drop(state_refs);
         if steps.len() != active_states.rows.len() {
             return Err(Error::InferenceError(
@@ -986,13 +1092,15 @@ impl NativeExecutor {
                 let Some(tx) = Self::stream_sender(request) else {
                     return Ok(());
                 };
+                active_state.logprobs.extend(step.logprobs.clone());
                 if !step.delta.is_empty() {
-                    Self::stream_text_with_policy(
+                    Self::stream_chat_text_with_policy(
                         &tx,
                         request.stream_policy,
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
+                        step.logprobs.clone(),
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }
@@ -1031,6 +1139,11 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: if step.finished {
+                        std::mem::take(&mut active_state.logprobs)
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .with_managed_cache_completions(managed_cache_completions),
             );
@@ -1088,8 +1201,9 @@ mod tests {
             },
         };
 
-        assert!(begins_resumable_prefill_state(&scheduled, true));
-        assert!(!begins_resumable_prefill_state(&scheduled, false));
+        let request = EngineCoreRequest::tts("resumable-prefill-state");
+        assert!(begins_resumable_prefill_state(&scheduled, true, &request));
+        assert!(!begins_resumable_prefill_state(&scheduled, false, &request));
         assert_eq!(resumable_prefill_span(&scheduled, 16).unwrap(), (0, 16));
     }
 
@@ -1124,6 +1238,7 @@ mod tests {
                 tokens_generated: 1,
                 input_tokens_committed: 0,
                 finished: false,
+                logprobs: Vec::new(),
             })
         })
         .unwrap();

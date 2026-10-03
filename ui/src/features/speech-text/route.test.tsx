@@ -30,7 +30,7 @@ const sharedProps = {
   onDelete: vi.fn(),
   onSelect: vi.fn(),
   onError: vi.fn(),
-  onRefresh: vi.fn(async () => undefined),
+  onRefresh: vi.fn(async () => true),
 };
 
 function renderRoute(entry: string) {

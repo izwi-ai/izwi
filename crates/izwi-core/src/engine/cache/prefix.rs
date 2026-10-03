@@ -177,9 +177,16 @@ impl CommittedPrefixIndex {
         }
         let digest = key.digest();
         if let Some(existing) = self.entries.get(&digest) {
-            if existing.key != key || existing.block != block {
+            if existing.key != key {
                 return Err(KvPrefixIndexError::DigestConflict);
             }
+            if existing.block == block {
+                return Ok(Vec::new());
+            }
+            // The exact page is already published under this identity from
+            // another session's block. The index deliberately keeps one block
+            // per digest: the recomputing session's private page is simply
+            // not shared, and the original binding stays authoritative.
             return Ok(Vec::new());
         }
         if self.entries.values().any(|entry| entry.block == block) {
@@ -282,11 +289,40 @@ pub struct KvPrefixPublication {
     pub block: CacheBlockRef,
 }
 
+/// DS4: the host-resident continuation of a matched prefix chain. The device
+/// index holds the head (`KvPrefixMatch::blocks`); these pages live in the
+/// arena's host pool until a preparing transaction restores them into the
+/// fresh pages it reserved for the span they cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvHostTailMatch {
+    /// Token boundary where the device-resident head ends (page-aligned).
+    pub device_end_tokens: u32,
+    /// Host page digests in chain order.
+    pub digests: Vec<[u8; 32]>,
+    /// Host pool slot holding each page's bytes, in chain order.
+    pub slots: Vec<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KvPrefixMatch {
     pub blocks: Vec<CacheBlockRef>,
     pub page_digests: Vec<[u8; 32]>,
     pub reused_tokens: u32,
+    /// Host-resident pages that continue the matched chain beyond `blocks`.
+    /// `None` when the match is fully device-resident.
+    pub host_tail: Option<KvHostTailMatch>,
+}
+
+/// Non-removing view of one LRU subtree, returned by
+/// [`CommittedPrefixIndex::lru_subtree`] for the DS4 demotion picker. The
+/// keys are cloned so the host chain index can re-register the pages under
+/// their exact identity.
+#[derive(Debug, Clone)]
+pub struct LruSubtreeView {
+    pub root_digest: [u8; 32],
+    pub digests: Vec<[u8; 32]>,
+    pub keys: Vec<KvPrefixPageKey>,
+    pub blocks: Vec<CacheBlockRef>,
 }
 
 /// Couples index visibility to coordinator ownership. Index changes are built
@@ -487,6 +523,75 @@ impl CoordinatedPrefixIndex {
         }
         Ok(Vec::new())
     }
+
+    /// Inspect the least-recently-used subtree without removing it, refreshing
+    /// its access ticks. The DS4 demotion picker uses this to select the same
+    /// victim an eviction would remove while protecting the selection from a
+    /// concurrent eviction pass until the transfer pins land.
+    pub fn lru_subtree(&mut self) -> Option<LruSubtreeView> {
+        let root = self
+            .index
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(digest, _)| *digest)?;
+        let access = self.index.tick().ok()?;
+        let mut digests = Vec::new();
+        let mut keys = Vec::new();
+        let mut blocks = Vec::new();
+        let mut pending = vec![root];
+        while let Some(digest) = pending.pop() {
+            let (key, block) = match self.index.entries.get(&digest) {
+                Some(entry) => (entry.key.clone(), entry.block),
+                None => continue,
+            };
+            pending.extend(
+                self.index
+                    .entries
+                    .iter()
+                    .filter_map(|(child_digest, child)| {
+                        (child.key.previous_page == Some(digest)).then_some(*child_digest)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(entry) = self.index.entries.get_mut(&digest) {
+                entry.last_access = access;
+            }
+            digests.push(digest);
+            keys.push(key);
+            blocks.push(block);
+        }
+        Some(LruSubtreeView {
+            root_digest: root,
+            digests,
+            keys,
+            blocks,
+        })
+    }
+
+    /// Remove an exact subtree from the device index and release exactly its
+    /// durable prefix references (DS4 demotion completion). The arena pages
+    /// recycle once nothing else holds them. A failure leaves the live index
+    /// untouched.
+    pub fn remove_subtree(
+        &mut self,
+        coordinator: &mut KvCacheCoordinator,
+        digests: &[[u8; 32]],
+    ) -> Result<(), KvPrefixIndexError> {
+        let mut staged = self.index.clone();
+        let mut blocks = Vec::new();
+        for digest in digests {
+            if let Some(block) = staged.remove(*digest) {
+                blocks.push(block);
+            }
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        coordinator.release_prefixes(&blocks)?;
+        self.index = staged;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -585,14 +690,18 @@ mod tests {
         let third =
             KvPrefixPageKey::new(&namespace(1), Some(second.digest()), 4, vec![5, 6]).unwrap();
 
-        assert!(index
-            .publish(first.clone(), 2, block(0))
-            .unwrap()
-            .is_empty());
-        assert!(index
-            .publish(second.clone(), 2, block(1))
-            .unwrap()
-            .is_empty());
+        assert!(
+            index
+                .publish(first.clone(), 2, block(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .publish(second.clone(), 2, block(1))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(index.lookup(&first).unwrap().unwrap().block, block(0));
         assert_eq!(
             index.publish(third, 2, block(2)).unwrap(),
@@ -603,15 +712,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_publication_is_idempotent_but_conflicting_binding_fails() {
+    fn duplicate_publication_is_idempotent_and_keeps_the_original_binding() {
         let mut index = CommittedPrefixIndex::new(2);
         let key = KvPrefixPageKey::new(&namespace(1), None, 0, vec![1, 2]).unwrap();
         index.publish(key.clone(), 2, block(0)).unwrap();
+        // Identical republication from the owning block is a no-op.
         assert!(index.publish(key.clone(), 2, block(0)).unwrap().is_empty());
-        assert_eq!(
-            index.publish(key, 2, block(1)).unwrap_err(),
-            KvPrefixIndexError::DigestConflict
-        );
+        // A recomputing session re-publishes the same page identity from its
+        // own private block; the index keeps one authoritative binding per
+        // digest instead of rejecting the commit.
+        assert!(index.publish(key.clone(), 2, block(1)).unwrap().is_empty());
+        assert_eq!(index.lookup(&key).unwrap().unwrap().block, block(0));
     }
 
     #[test]
@@ -626,11 +737,13 @@ mod tests {
         let key = KvPrefixPageKey::new(&namespace(1), None, 0, vec![1, 2]).unwrap();
         let mut index = CoordinatedPrefixIndex::new(2);
 
-        assert!(index
-            .lookup_longest(&namespace(1), &[1, 2], 2)
-            .unwrap()
-            .blocks
-            .is_empty());
+        assert!(
+            index
+                .lookup_longest(&namespace(1), &[1, 2], 2)
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
         index
             .commit_transaction(
                 &mut coordinator,
@@ -688,11 +801,13 @@ mod tests {
         );
         assert!(index.is_empty());
         assert!(coordinator.abort(12).unwrap());
-        assert!(index
-            .lookup_longest(&namespace(1), &[7, 8], 2)
-            .unwrap()
-            .blocks
-            .is_empty());
+        assert!(
+            index
+                .lookup_longest(&namespace(1), &[7, 8], 2)
+                .unwrap()
+                .blocks
+                .is_empty()
+        );
         assert_eq!(coordinator.stats().prefix_refs, 0);
         coordinator.check_invariants().unwrap();
     }

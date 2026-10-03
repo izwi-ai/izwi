@@ -728,6 +728,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 }));
             }
         }
@@ -960,6 +961,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions);
         Ok(match clocked_state_completion {
@@ -1092,6 +1094,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         };
         let result = if codec_ready {
             ModelSessionResult::yielded(output, crate::engine::YieldReason::AwaitingFinalization)
@@ -1392,6 +1395,7 @@ impl NativeExecutor {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             };
             let result = if codec_ready {
                 ModelSessionResult::yielded(
@@ -1510,6 +1514,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         }))
     }
 
@@ -1744,6 +1749,7 @@ impl NativeExecutor {
                     phase_timing_override: Some(timing),
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 };
                 let result = if pending >= threshold || (active.state.finished() && pending > 0) {
                     ModelSessionResult::yielded(
@@ -1888,6 +1894,7 @@ impl NativeExecutor {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                         crate::engine::YieldReason::AwaitingAudioOutput { max_frames },
                     ));
@@ -1977,6 +1984,7 @@ impl NativeExecutor {
                     phase_timing_override: Some(timing),
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 };
                 let reason = if pending > 0 {
                     crate::engine::YieldReason::AwaitingAudioDecode {
@@ -2083,6 +2091,7 @@ impl NativeExecutor {
             phase_timing_override: Some(timing),
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         }))
     }
 
@@ -2286,6 +2295,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions)
         .with_managed_cache_append(main_append))
@@ -2791,6 +2801,7 @@ impl NativeExecutor {
                 phase_timing_override,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             })
             .with_managed_cache_completions(managed_cache_completions))
         }
@@ -3081,6 +3092,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(completions)
                 .with_managed_cache_append(main_append),
@@ -3412,6 +3424,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(completions)
                 .with_managed_cache_append(main_append),
@@ -3638,6 +3651,7 @@ impl NativeExecutor {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     })
                     .with_managed_cache_completions(completions),
                 );
@@ -3983,6 +3997,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .with_managed_cache_completions(completions))
             })();

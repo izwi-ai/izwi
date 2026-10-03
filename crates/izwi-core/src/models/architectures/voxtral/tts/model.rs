@@ -148,7 +148,9 @@ impl VoxtralTtsModel {
             load_voxtral_tts_weights(model_dir, model.dtype_plan.acoustic_transformer, &device)?;
         let codec_vb = load_voxtral_tts_weights(model_dir, model.dtype_plan.codec, &device)?;
         let tokenizer = VoxtralTtsTokenizer::load(model_dir, &model.config)?;
-        let language_model = VoxtralLM::load(model.config.text_config(), language_vb.clone())?;
+        // Managed prefix reuse is chat-task-gated; the TTS route never shares.
+        let language_model =
+            VoxtralLM::load(model.config.text_config(), language_vb.clone(), false)?;
         let acoustic_transformer = FlowMatchingAudioTransformer::load(
             &model.config,
             acoustic_vb.pp("acoustic_transformer"),

@@ -24,10 +24,10 @@ use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole,
 
 use super::dto::{
     ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
-    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList, ResponseObject,
-    ResponseOutputContent, ResponseOutputItem, ResponseStreamCompletedPayload,
-    ResponseStreamCreatedPayload, ResponseStreamDeltaPayload, ResponseStreamEnvelope,
-    ResponseUsage, ResponsesCreateRequest,
+    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList,
+    ResponseInputTokensDetails, ResponseObject, ResponseOutputContent, ResponseOutputItem,
+    ResponseStreamCompletedPayload, ResponseStreamCreatedPayload, ResponseStreamDeltaPayload,
+    ResponseStreamEnvelope, ResponseUsage, ResponsesCreateRequest,
 };
 
 const RESPONSE_STREAM_INTERRUPTED_ERROR: &str = "Response stream ended before a terminal event";
@@ -88,6 +88,9 @@ pub async fn create_response(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        logprobs: None,
+        top_logprobs: None,
+        response_format_json_object: false,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
@@ -105,6 +108,9 @@ pub async fn create_response(
         input_tokens: output.prompt_tokens,
         output_tokens: output.tokens_generated,
         total_tokens: output.prompt_tokens + output.tokens_generated,
+        input_tokens_details: ResponseInputTokensDetails {
+            cached_tokens: output.cached_prompt_tokens.unwrap_or(0),
+        },
     };
 
     let response = ResponseObject {
@@ -130,6 +136,7 @@ pub async fn create_response(
             output_text: Some(output.text),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            input_cached_tokens: usage.input_tokens_details.cached_tokens,
             error: None,
             metadata: req.metadata,
         },
@@ -250,6 +257,9 @@ async fn create_streaming_response(
                 input_tokens: 0,
                 output_tokens: 0,
                 total_tokens: 0,
+                input_tokens_details: ResponseInputTokensDetails {
+                    cached_tokens: 0,
+                },
             },
             error: None,
             metadata: metadata.clone(),
@@ -308,14 +318,14 @@ async fn create_streaming_response(
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
                 ChatStreamEvent::Started => continue,
-                ChatStreamEvent::Delta(delta) => {
-                    full_text.push_str(&delta);
+                ChatStreamEvent::Delta { text, .. } => {
+                    full_text.push_str(&text);
                     (
                         serde_json::to_string(&ResponseStreamEnvelope {
                             event_type: "response.output_text.delta",
                             payload: ResponseStreamDeltaPayload {
                                 response_id: response_id_for_task.clone(),
-                                delta,
+                                delta: text,
                             },
                         })
                         .unwrap_or_default(),
@@ -342,6 +352,9 @@ async fn create_streaming_response(
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
                             total_tokens: generation.prompt_tokens + generation.tokens_generated,
+                            input_tokens_details: ResponseInputTokensDetails {
+                                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
+                            },
                         },
                         error: None,
                         metadata: metadata.clone(),
@@ -358,6 +371,9 @@ async fn create_streaming_response(
                             output_text: Some(output_text.clone()),
                             input_tokens: generation.prompt_tokens,
                             output_tokens: generation.tokens_generated,
+                            input_cached_tokens: generation
+                                .cached_prompt_tokens
+                                .unwrap_or(0),
                             error: None,
                             metadata: metadata.clone(),
                         },
@@ -433,6 +449,7 @@ async fn create_streaming_response(
                             output_text: None,
                             input_tokens: 0,
                             output_tokens: 0,
+                            input_cached_tokens: 0,
                             error: Some("Response generation failed".to_string()),
                             metadata: metadata.clone(),
                         },
@@ -457,6 +474,7 @@ async fn create_streaming_response(
                             output_text: None,
                             input_tokens: 0,
                             output_tokens: 0,
+                            input_cached_tokens: 0,
                             error: Some("Server is shutting down".to_string()),
                             metadata: metadata.clone(),
                         },
@@ -493,6 +511,7 @@ async fn create_streaming_response(
                     output_text: None,
                     input_tokens: 0,
                     output_tokens: 0,
+                    input_cached_tokens: 0,
                     error: Some(RESPONSE_STREAM_INTERRUPTED_ERROR.to_string()),
                     metadata: metadata.clone(),
                 },
@@ -833,6 +852,9 @@ fn record_to_response(record: StoredResponseRecord) -> ResponseObject {
             input_tokens: record.input_tokens,
             output_tokens: record.output_tokens,
             total_tokens: record.input_tokens + record.output_tokens,
+            input_tokens_details: ResponseInputTokensDetails {
+                cached_tokens: record.input_cached_tokens,
+            },
         },
         error: record.error.map(|message| ResponseError {
             message,
@@ -893,9 +915,29 @@ mod tests {
     }
 
     #[test]
+    fn stored_record_usage_reports_openai_shaped_cached_tokens() {
+        let record = StoredResponseRecord {
+            id: "resp_cached".to_string(),
+            created_at: 0,
+            status: "completed".to_string(),
+            model: "test".to_string(),
+            input_items: Vec::new(),
+            output_text: Some("done".to_string()),
+            input_tokens: 12,
+            output_tokens: 3,
+            input_cached_tokens: 7,
+            error: None,
+            metadata: None,
+        };
+        let response = record_to_response(record);
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.input_tokens_details.cached_tokens, 7);
+    }
+
+    #[test]
     fn builds_messages_from_text_and_instructions() {
         let (messages, stored, media_inputs) = build_input_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
             None,
@@ -1048,7 +1090,7 @@ mod tests {
     #[test]
     fn build_input_messages_collects_multimodal_input() {
         let (messages, _stored, media_inputs) = build_input_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen314BGguf,
             None,
             Some(ResponseInput::Many(vec![ResponseInputItem {
                 role: Some("user".to_string()),
@@ -1077,7 +1119,7 @@ mod tests {
         assert!(messages[0].content.contains("<|image_pad|>"));
         assert_eq!(media_inputs.len(), 1);
         assert!(
-            validate_media_inputs_for_variant(ModelVariant::Qwen38BGguf, &media_inputs)
+            validate_media_inputs_for_variant(ModelVariant::Qwen314BGguf, &media_inputs)
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
         );
@@ -1131,6 +1173,7 @@ mod tests {
             output_text: Some("ok".to_string()),
             input_tokens: 1,
             output_tokens: 1,
+            input_cached_tokens: 0,
             error: None,
             metadata: None,
         }

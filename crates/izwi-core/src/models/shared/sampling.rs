@@ -24,6 +24,139 @@ pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
 /// CUDA-only entry point.
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = DEVICE_SAMPLING_CANDIDATE_LIMIT;
 
+/// DS9.2: per-request constrained-decoding runtime. The mask cache is shared
+/// across sampler clones; the machine advances per committed token.
+pub struct GrammarRuntime {
+    tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+    /// Token ids that must remain sampleable regardless of the grammar
+    /// (the family's end-of-sequence tokens and configured stops).
+    always_allowed: Vec<u32>,
+    surfaces: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
+    masks: super::grammar::JsonGrammarMasks,
+    machine: super::grammar::JsonGrammarMachine,
+}
+
+impl Clone for GrammarRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.clone(),
+            always_allowed: self.always_allowed.clone(),
+            surfaces: self.surfaces.clone(),
+            masks: self.masks.clone(),
+            machine: self.machine.clone(),
+        }
+    }
+}
+
+impl GrammarRuntime {
+    pub(crate) fn new(
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        always_allowed: Vec<u32>,
+    ) -> Self {
+        Self {
+            tokenizer,
+            always_allowed,
+            surfaces: std::sync::Arc::new(std::sync::OnceLock::new()),
+            masks: super::grammar::JsonGrammarMasks::new(),
+            machine: super::grammar::JsonGrammarMachine::new(),
+        }
+    }
+
+    fn surfaces(&self, vocab_size: usize) -> Result<&[String]> {
+        if let Some(surfaces) = self.surfaces.get() {
+            if surfaces.len() >= vocab_size {
+                return Ok(&surfaces[..vocab_size]);
+            }
+        }
+        let surfaces = (0..vocab_size)
+            .map(|id| self.tokenizer.decode(&[id as u32]).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let _ = self.surfaces.set(surfaces);
+        Ok(self
+            .surfaces
+            .get()
+            .expect("surfaces just inserted")
+            .as_slice())
+    }
+
+    /// Sample one token under the grammar's current mask, then advance the
+    /// machine with the token's surface text.
+    pub(crate) fn sample_token<R: GrammarRng>(
+        &mut self,
+        logits: &Tensor,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: &[u32],
+        rng: &mut R,
+    ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        let surfaces = self.surfaces(vocab_size)?;
+        let mask = self.masks.mask_for(&self.machine, surfaces);
+        let row = chat_logits_row(logits)?;
+        let mut values = read_f32_values_to_host(&row)?;
+        values.truncate(vocab_size.min(values.len()));
+        if values.is_empty() {
+            return Err(Error::InvalidInput(
+                "chat sampler received no in-vocabulary logits".to_string(),
+            ));
+        }
+        // Raw stats (for logprobs) come from the unmasked row.
+        let raw_logprobs = if config.logprobs {
+            let (logsumexp, top) = raw_logprobs_stats(&values, config.top_logprobs)?;
+            Some((logsumexp, top))
+        } else {
+            None
+        };
+        for (index, value) in values.iter_mut().enumerate() {
+            let allowed = mask.get(index).copied().unwrap_or(false)
+                || self.always_allowed.iter().any(|id| *id as usize == index);
+            if !allowed {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+        let token = sample_from_host_values(values, config, history, rng)?;
+        if config.stop_token_ids.contains(&token) || self.always_allowed.contains(&token) {
+            // A stop token ends generation; the machine state stays put.
+        } else {
+            let surface = surfaces
+                .get(token as usize)
+                .ok_or_else(|| {
+                    Error::InferenceError("sampled token outside the grammar vocab".into())
+                })?
+                .clone();
+            self.machine.feed(&surface).map_err(|_| {
+                Error::InferenceError("grammar machine rejected a masked-in token".into())
+            })?;
+        }
+        let logprobs = match raw_logprobs {
+            Some((logsumexp, top)) => {
+                let chosen_raw = read_chosen_raw(&row, vocab_size, token)?;
+                Some(RawTokenLogprobs {
+                    token,
+                    logprob: chosen_raw - logsumexp,
+                    top,
+                })
+            }
+            None => None,
+        };
+        Ok((token, logprobs))
+    }
+}
+
+fn read_chosen_raw(row: &Tensor, vocab_size: usize, token: u32) -> Result<f32> {
+    let value = row
+        .i(token as usize)?
+        .to_dtype(DType::F32)?
+        .to_scalar::<f32>()?;
+    let _ = vocab_size;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ))
+    }
+}
+
 /// Request-owned chat sampler used after a shared tensor forward. Continuous
 /// batching shares logits computation, never sampling policy or RNG state.
 #[derive(Clone)]
@@ -32,6 +165,7 @@ pub struct ChatSampler {
     history: Vec<u32>,
     track_history: bool,
     rng: SimpleRng,
+    grammar: Option<GrammarRuntime>,
 }
 
 impl ChatSampler {
@@ -47,11 +181,50 @@ impl ChatSampler {
             },
             config,
             track_history,
+            grammar: None,
         }
     }
 
+    /// DS9.2: constrain this request to emit one valid JSON value
+    /// (`response_format: json_object`). `always_allowed` lists token ids
+    /// (typically end-of-sequence) that must stay sampleable in every state.
+    pub fn with_json_object_constraint(
+        mut self,
+        tokenizer: std::sync::Arc<crate::tokenizer::Tokenizer>,
+        always_allowed: Vec<u32>,
+    ) -> Self {
+        if self.config.constrain_json_object {
+            self.grammar = Some(GrammarRuntime::new(tokenizer, always_allowed));
+        }
+        self
+    }
+
     pub fn sample(&mut self, logits: &Tensor, vocab_size: usize) -> Result<u32> {
-        let token = sample_chat_token(
+        let (token, _) = self.sample_with_logprobs(logits, vocab_size)?;
+        Ok(token)
+    }
+
+    /// DS9.3: sample a token and, when the request asked for logprobs,
+    /// return its raw-distribution logprob plus the top alternatives.
+    pub fn sample_with_logprobs(
+        &mut self,
+        logits: &Tensor,
+        vocab_size: usize,
+    ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        if let Some(grammar) = self.grammar.as_mut() {
+            let (token, logprobs) = grammar.sample_token(
+                logits,
+                vocab_size,
+                &self.config,
+                &self.history,
+                &mut self.rng,
+            )?;
+            if self.track_history {
+                self.history.push(token);
+            }
+            return Ok((token, logprobs));
+        }
+        let (token, logprobs) = sample_chat_token_and_logprobs(
             logits,
             vocab_size,
             &self.config,
@@ -61,7 +234,12 @@ impl ChatSampler {
         if self.track_history {
             self.history.push(token);
         }
-        Ok(token)
+        Ok((token, logprobs))
+    }
+
+    /// DS9.3: whether this request collects per-token logprobs.
+    pub fn wants_logprobs(&self) -> bool {
+        self.config.logprobs
     }
 
     pub fn is_configured_stop(&self, token: u32) -> bool {
@@ -115,19 +293,104 @@ fn sample_chat_token(
     history: &[u32],
     rng: &mut SimpleRng,
 ) -> Result<u32> {
+    sample_chat_token_and_logprobs(logits, vocab_size, config, history, rng).map(|(token, _)| token)
+}
+
+/// DS9.3: raw-distribution logprob of the sampled token plus its top
+/// alternatives. `None` when the request did not ask for logprobs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawTokenLogprobs {
+    pub token: u32,
+    pub logprob: f32,
+    /// Top-k `(token id, raw logprob)` pairs sorted by descending logprob.
+    pub top: Vec<(u32, f32)>,
+}
+
+/// DS9.3: resolve raw sampler logprobs into the public per-token payload.
+///
+/// Token strings use single-token decoding: byte-level pieces that split a
+/// multi-byte UTF-8 sequence decode lossily, and `bytes` carries those
+/// lossy bytes.
+pub fn resolve_token_logprob(
+    tokenizer: &crate::tokenizer::Tokenizer,
+    raw: &RawTokenLogprobs,
+) -> Result<crate::engine::TokenLogprob> {
+    fn decode_one(tokenizer: &crate::tokenizer::Tokenizer, id: u32) -> Result<String> {
+        tokenizer.decode(&[id])
+    }
+    let token = decode_one(tokenizer, raw.token)?;
+    let mut top_logprobs = Vec::with_capacity(raw.top.len());
+    for (id, logprob) in &raw.top {
+        let text = decode_one(tokenizer, *id)?;
+        top_logprobs.push(crate::engine::TopTokenLogprob {
+            bytes: text.as_bytes().to_vec(),
+            token: text,
+            logprob: *logprob,
+        });
+    }
+    Ok(crate::engine::TokenLogprob {
+        bytes: token.as_bytes().to_vec(),
+        token,
+        logprob: raw.logprob,
+        top_logprobs,
+    })
+}
+
+fn sample_chat_token_and_logprobs(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<(u32, Option<RawTokenLogprobs>)> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
             "chat sampler received vocab_size=0".to_string(),
         ));
     }
     let row = chat_logits_row(logits)?;
+    let collect_logprobs = config.logprobs;
+
+    // DS9.3: logprobs need the full raw row on host (logsumexp + top-k over
+    // the raw distribution), so requests that ask for them route through the
+    // host sampler instead of the device fast paths.
+    if collect_logprobs {
+        let values = read_f32_values_to_host(&row)?;
+        let mut sampled = values.clone();
+        sampled.truncate(vocab_size.min(sampled.len()));
+        if sampled.is_empty() {
+            return Err(Error::InvalidInput(
+                "chat sampler received no in-vocabulary logits".to_string(),
+            ));
+        }
+        let (logsumexp, top) = raw_logprobs_stats(&sampled, config.top_logprobs)?;
+        let token = sample_from_host_values(sampled, config, history, rng)?;
+        let chosen_raw = values
+            .get(token as usize)
+            .copied()
+            .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
+        if !chosen_raw.is_finite() {
+            return Err(Error::InferenceError(
+                "sampled token has a non-finite raw logit".into(),
+            ));
+        }
+        return Ok((
+            token,
+            Some(RawTokenLogprobs {
+                token,
+                logprob: chosen_raw - logsumexp,
+                top,
+            }),
+        ));
+    }
+
     let deterministic_greedy = config.temperature <= 1e-5
         && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
         && config.presence_penalty.abs() <= f32::EPSILON
         && config.top_k == 0
         && config.top_p >= 1.0;
     if deterministic_greedy {
-        return chat_argmax_clamped(&row, vocab_size);
+        return chat_argmax_clamped(&row, vocab_size).map(|token| (token, None));
     }
 
     if let Some(candidates) = bounded_device_sampling_candidates(
@@ -144,7 +407,7 @@ fn sample_chat_token(
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
-                return Ok(sampled);
+                return Ok((sampled, None));
             }
         }
     }
@@ -156,6 +419,75 @@ fn sample_chat_token(
             "chat sampler received no in-vocabulary logits".to_string(),
         ));
     }
+    let token = sample_from_host_values(values, config, history, rng)?;
+    Ok((token, None))
+}
+
+/// DS9.3: raw-distribution log_softmax statistics over the full row:
+/// the logsumexp plus the top-k `(token id, raw logprob)` pairs.
+pub(crate) fn raw_logprobs_stats(
+    values: &[f32],
+    top_logprobs: usize,
+) -> Result<(f32, Vec<(u32, f32)>)> {
+    let finite = values.iter().filter(|v| v.is_finite());
+    let max_logit = finite.clone().fold(f32::NEG_INFINITY, |acc, v| acc.max(*v));
+    if !max_logit.is_finite() {
+        return Err(Error::InferenceError(
+            "chat sampler received no finite logits for logprobs".into(),
+        ));
+    }
+    let logsumexp = max_logit
+        + finite
+            .clone()
+            .map(|v| (v - max_logit).exp())
+            .sum::<f32>()
+            .ln();
+    let mut indexed: Vec<(usize, f32)> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .map(|(index, v)| (index, *v))
+        .collect();
+    indexed.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top = indexed
+        .into_iter()
+        .take(top_logprobs)
+        .map(|(index, value)| {
+            u32::try_from(index)
+                .map(|token| (token, value - logsumexp))
+                .map_err(|_| Error::InferenceError("token id exceeds u32".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((logsumexp, top))
+}
+
+/// The existing host fallback pipeline, extracted so the logprobs route
+/// samples through the exact same math (penalties → temperature → top-k →
+/// top-p → draw) on the already-read row.
+/// DS9.2: uniform unit draw used by host sampling paths. Abstracted so
+/// model families that own an equivalent local RNG (qwen35's decode loop)
+/// can drive the shared grammar runtime without changing their state.
+pub(crate) trait GrammarRng {
+    fn draw_unit(&mut self) -> f32;
+}
+
+impl GrammarRng for SimpleRng {
+    fn draw_unit(&mut self) -> f32 {
+        self.next_f32()
+    }
+}
+
+fn sample_from_host_values<R: GrammarRng>(
+    mut values: Vec<f32>,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut R,
+) -> Result<u32> {
     apply_chat_history_penalties(
         &mut values,
         history,
@@ -222,7 +554,7 @@ fn sample_chat_token(
             }
         }
     }
-    let draw = rng.next_f32();
+    let draw = rng.draw_unit();
     let mut cumulative = 0.0f32;
     for (index, probability) in &probabilities {
         cumulative += *probability;
@@ -780,6 +1112,86 @@ mod tests {
                 permuted as f32 * 0.03125 + index as f32 * 0.000_001
             })
             .collect()
+    }
+
+    #[test]
+    fn logprob_collection_reports_raw_softmax_and_top_k_ordering() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], 4, &device).unwrap();
+        let config = ChatGenerationConfig {
+            logprobs: true,
+            top_logprobs: 3,
+            ..ChatGenerationConfig::default()
+        };
+        let mut sampler = ChatSampler::new(config, &[]);
+        let (token, logprobs) = sampler.sample_with_logprobs(&logits, 4).unwrap();
+        assert_eq!(token, 3, "greedy argmax over raw logits");
+        let logprobs = logprobs.expect("logprobs collected");
+        let lse = (1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp() + 4.0f32.exp()).ln();
+        assert!((logprobs.logprob - (4.0 - lse)).abs() < 1e-5);
+        assert_eq!(
+            logprobs.top.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+        for (index, (id, logprob)) in logprobs.top.iter().enumerate() {
+            let expected_logit = 4.0 - index as f32;
+            assert_eq!(*id as usize, 3 - index);
+            assert!((logprob - (expected_logit - lse)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn logprob_collection_preserves_sampled_tokens_exactly() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, 0.9, 0.3, 0.7], 4, &device).unwrap();
+        let base = ChatGenerationConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: 97,
+            ..ChatGenerationConfig::default()
+        };
+        let mut plain = ChatSampler::new(base.clone(), &[]);
+        let mut measured = ChatSampler::new(
+            ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 2,
+                ..base
+            },
+            &[],
+        );
+        for _ in 0..16 {
+            let expected = plain.sample(&logits, 4).unwrap();
+            let (actual, _) = measured.sample_with_logprobs(&logits, 4).unwrap();
+            assert_eq!(
+                actual, expected,
+                "logprob collection must not move the draw"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_token_logprob_decodes_single_token_surfaces() {
+        let tokenizer = crate::tokenizer::Tokenizer::from_hf_json_bytes(
+            br#"{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"a":0,"b":1,"c":2,"d":3},"unk_token":"a"}
+        }"#,
+        )
+        .unwrap();
+        let raw = RawTokenLogprobs {
+            token: 1,
+            logprob: -0.5,
+            top: vec![(1, -0.5), (0, -1.5)],
+        };
+        let resolved = resolve_token_logprob(&tokenizer, &raw).unwrap();
+        assert_eq!(resolved.token, "b");
+        assert_eq!(resolved.bytes, b"b".to_vec());
+        assert_eq!(resolved.logprob, -0.5);
+        assert_eq!(resolved.top_logprobs.len(), 2);
+        assert_eq!(resolved.top_logprobs[0].token, "b");
+        assert_eq!(resolved.top_logprobs[1].token, "a");
+        assert_eq!(resolved.top_logprobs[1].logprob, -1.5);
     }
 
     #[test]

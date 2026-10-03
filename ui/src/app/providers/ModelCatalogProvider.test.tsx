@@ -1,3 +1,4 @@
+import React from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -7,6 +8,7 @@ import {
 } from "@/app/providers/ModelCatalogProvider";
 import { NotificationProvider } from "@/app/providers/NotificationProvider";
 import type { ModelInfo } from "@/api";
+import type { ModelRouteCapabilities } from "@/shared/api/models";
 
 const apiMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
@@ -35,6 +37,7 @@ vi.mock("@/app/analytics/events", () => ({
 
 const model: ModelInfo = {
   variant: "Qwen3.5-4B",
+  route_capabilities: caps({ openai_chat_completions: true }),
   status: "downloaded",
   local_path: "/models/qwen",
   size_bytes: 42,
@@ -45,10 +48,12 @@ const model: ModelInfo = {
 function CatalogProbe() {
   const {
     models,
+    selectedModel,
     error,
     catalogError,
     loading,
     refreshModels,
+    selectModel,
     loadModel,
     unloadModel,
   } = useModelCatalog();
@@ -57,13 +62,20 @@ function CatalogProbe() {
     <div>
       <span>{loading ? "loading" : "ready"}</span>
       <span data-testid="model-count">{models.length}</span>
+      <span data-testid="selected-model">{selectedModel ?? "none"}</span>
       <span data-testid="catalog-error">{error}</span>
       <span data-testid="catalog-load-error">{catalogError}</span>
       <button type="button" onClick={() => void refreshModels()}>
         Retry catalog
       </button>
+      <button type="button" onClick={() => selectModel("Qwen3.5-4B")}>
+        Select
+      </button>
       <button type="button" onClick={() => void loadModel(model.variant)}>
         Load
+      </button>
+      <button type="button" onClick={() => void loadModel("Qwen3.5-9B")}>
+        Load chat
       </button>
       <button type="button" onClick={() => void unloadModel(model.variant)}>
         Unload
@@ -88,6 +100,37 @@ function deferredPromise<T>() {
     resolve = nextResolve;
   });
   return { promise, resolve };
+}
+
+
+/**
+ * Full route-capability envelope for fixture models: every flag defaults to
+ * false so tests opt in per role.
+ */
+function caps(
+  overrides: Partial<ModelRouteCapabilities> = {},
+): ModelRouteCapabilities {
+  return {
+    openai_chat_completions: false,
+    openai_responses: false,
+    openai_audio_speech: false,
+    openai_audio_transcriptions: false,
+    speech_to_text_jobs: false,
+    speech_to_text_realtime: false,
+    diarization_records: false,
+    text_to_speech_records: false,
+    voice_design_records: false,
+    voice_clone_records: false,
+    saved_voice_reuse: false,
+    studio_projects: false,
+    voice_realtime_text_model: false,
+    voice_realtime_modular_asr: false,
+    voice_realtime_modular_tts: false,
+    voice_realtime_unified: false,
+    forced_alignment: false,
+    tokenizer: false,
+    ...overrides,
+  };
 }
 
 describe("ModelCatalogProvider model action errors", () => {
@@ -116,30 +159,42 @@ describe("ModelCatalogProvider model action errors", () => {
     ).toHaveLength(2);
   });
 
-  it("surfaces an initial catalog failure and clears it after retry", async () => {
+  it("surfaces an initial catalog failure and self-heals on the bounded retry", async () => {
+    // First call rejects, the provider's init retry recovers on the next call.
     apiMocks.listModels
       .mockRejectedValueOnce(new Error("Local model service is offline"))
-      .mockResolvedValueOnce({ models: [model] });
+      .mockResolvedValue({ models: [model] });
 
     renderCatalog();
 
+    // The bounded auto-retry recovers without any manual action.
     await screen.findByText("ready");
-    expect(screen.getByTestId("model-count")).toHaveTextContent("0");
-    expect(screen.getByTestId("catalog-load-error")).toHaveTextContent(
-      "Local model service is offline",
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Retry catalog" }));
-
     await waitFor(() =>
       expect(screen.getByTestId("model-count")).toHaveTextContent("1"),
     );
     expect(screen.getByTestId("catalog-load-error")).toBeEmptyDOMElement();
-    expect(apiMocks.listModels).toHaveBeenCalledTimes(2);
+    expect(apiMocks.listModels.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps a persistent catalog failure visible after retries are exhausted", async () => {
+    apiMocks.listModels.mockRejectedValue(new Error("Local model service is offline"));
+
+    renderCatalog();
+
+    // After all bounded retries fail, the error stays visible for the user.
+    await screen.findByText("ready", undefined, { timeout: 5000 });
+    await waitFor(
+      () =>
+        expect(screen.getByTestId("catalog-load-error")).toHaveTextContent(
+          "Local model service is offline",
+        ),
+      { timeout: 5000 },
+    );
+    expect(apiMocks.listModels.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("treats an empty catalog response as loaded rather than failed", async () => {
-    apiMocks.listModels.mockResolvedValueOnce({ models: [] });
+    apiMocks.listModels.mockResolvedValue({ models: [] });
 
     renderCatalog();
 
@@ -192,5 +247,290 @@ describe("ModelCatalogProvider model action errors", () => {
       await unload.promise;
     });
     expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
+  });
+
+  it("runs the load request on an abort signal instead of the request timeout", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+
+    await screen.findByText("Model loaded");
+    expect(apiMocks.loadModel).toHaveBeenCalledWith(
+      "Qwen3.5-4B",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("does not report a failed load when unload aborts the load request", async () => {
+    const unload = deferredPromise<{ status: string; message: string }>();
+    apiMocks.loadModel.mockImplementation(
+      (_variant: string, options?: { signal?: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => {
+            reject(
+              new Error("The local model service took too long to respond."),
+            );
+          });
+        }),
+    );
+    apiMocks.unloadModel.mockReturnValue(unload.promise);
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Unload" }));
+    await waitFor(() => expect(apiMocks.unloadModel).toHaveBeenCalled());
+
+    await act(async () => {
+      unload.resolve({ status: "unloaded", message: "unloaded" });
+      await unload.promise;
+    });
+    expect(screen.queryByText("Model load failed")).not.toBeInTheDocument();
+    expect(await screen.findByText("Model load cancelled")).toBeInTheDocument();
+  });
+});
+
+function ChatSwitchProbe({ targetVariant }: { targetVariant: string }) {
+  const { models, loadModel, residencySummary } = useModelCatalog();
+
+  return (
+    <div>
+      <span data-testid="resident-models">
+        {models.filter((model) => model.status === "ready").map((model) => model.variant).join(",")}
+      </span>
+      <span data-testid="residency-summary">
+        {residencySummary
+          ? `${residencySummary.resident_count}/${residencySummary.max_loaded_models}`
+          : "none"}
+      </span>
+      <button type="button" onClick={() => void loadModel(targetVariant)}>
+        Load target
+      </button>
+    </div>
+  );
+}
+
+function renderChatSwitch(targetVariant: string) {
+  return render(
+    <NotificationProvider>
+      <ModelCatalogProvider>
+        <ChatSwitchProbe targetVariant={targetVariant} />
+      </ModelCatalogProvider>
+    </NotificationProvider>,
+  );
+}
+
+describe("ModelCatalogProvider residency-aware chat eviction", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("keeps the diarization refiner resident across chat model switches", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, status: "ready" },
+        {
+          ...model,
+          variant: "Qwen3.5-9B",
+          route_capabilities: caps({ openai_chat_completions: true }),
+          status: "ready",
+        },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+
+    renderChatSwitch("Qwen3.5-9B");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-9B", expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    expect(apiMocks.unloadModel).not.toHaveBeenCalled();
+  });
+
+  it("still evicts non-pipeline chat models on a chat switch", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-9B", status: "ready" },
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+    apiMocks.unloadModel.mockResolvedValue({ status: "unloaded", message: "unloaded" });
+
+    renderChatSwitch("Qwen3.5-4B");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() =>
+      expect(apiMocks.unloadModel).toHaveBeenCalledWith("Qwen3.5-9B"),
+    );
+    expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-4B", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("never evicts pinned models on a chat switch", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [
+        { ...model, variant: "Qwen3.5-9B", status: "ready", pinned: true },
+        { ...model, variant: "Qwen3.5-4B", status: "ready" },
+      ],
+    });
+    apiMocks.loadModel.mockResolvedValue({ status: "loaded", message: "loaded" });
+
+    renderChatSwitch("Qwen3.5-4B");
+    await screen.findByTestId("resident-models");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load target" }));
+
+    await waitFor(() => expect(apiMocks.loadModel).toHaveBeenCalledWith("Qwen3.5-4B", expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    expect(apiMocks.unloadModel).not.toHaveBeenCalled();
+  });
+
+  it("exposes the server residency summary", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+      residency: {
+        resident_count: 1,
+        max_loaded_models: 4,
+        model_keep_alive_secs: 600,
+      },
+    });
+
+    renderChatSwitch("Qwen3.5-9B");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("residency-summary")).toHaveTextContent("1/4"),
+    );
+  });
+});
+
+describe("ModelCatalogProvider catalog init", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({ models: [model] });
+  });
+
+  it("settles the catalog spinner under StrictMode's double effect invocation", async () => {
+    render(
+      <React.StrictMode>
+        <NotificationProvider>
+          <ModelCatalogProvider>
+            <CatalogProbe />
+          </ModelCatalogProvider>
+        </NotificationProvider>
+      </React.StrictMode>,
+    );
+
+    await screen.findByText("ready", undefined, { timeout: 5000 });
+    expect(screen.getByTestId("model-count")).toHaveTextContent("1");
+  });
+});
+
+describe("ModelCatalogProvider user-selected model persistence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    apiMocks.listModels.mockResolvedValue({ models: [model] });
+  });
+
+  it("persists an explicit selection and restores it on startup", async () => {
+    const persisted = renderCatalog();
+    await screen.findByText("ready");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent("none");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("selected-model")).toHaveTextContent(
+        "Qwen3.5-4B",
+      ),
+    );
+    expect(window.localStorage.getItem("izwi.modelCatalog.userSelectedModel")).toBe(
+      "Qwen3.5-4B",
+    );
+    persisted.unmount();
+
+    renderCatalog();
+    await screen.findByText("ready");
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-4B",
+    );
+  });
+
+  it("keeps a user-selected variant that vanished from the catalog", async () => {
+    window.localStorage.setItem(
+      "izwi.modelCatalog.userSelectedModel",
+      "Removed-Model",
+    );
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+    });
+
+    renderCatalog();
+    await screen.findByText("ready");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Removed-Model",
+    );
+  });
+
+  it("leaves auto-picked fallback selections unpersisted", async () => {
+    apiMocks.listModels.mockResolvedValue({
+      models: [{ ...model, status: "ready" }],
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-4B",
+    );
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBeNull();
+  });
+
+  it("does not adopt a speech-pipeline model load as the selection", async () => {
+    // Qwen3.5-4B is a pipeline stack member (refiner/summary LLM): loading it
+    // is pipeline setup, not a model switch.
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load" }));
+    await screen.findByText("Model loaded");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent("none");
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBeNull();
+  });
+
+  it("still adopts a chat model load as the selection", async () => {
+    apiMocks.loadModel.mockResolvedValue({
+      status: "loaded",
+      message: "loaded",
+    });
+    renderCatalog();
+    await screen.findByText("ready");
+
+    fireEvent.click(screen.getByRole("button", { name: "Load chat" }));
+    await screen.findByText("Model loaded");
+
+    expect(screen.getByTestId("selected-model")).toHaveTextContent(
+      "Qwen3.5-9B",
+    );
+    expect(
+      window.localStorage.getItem("izwi.modelCatalog.userSelectedModel"),
+    ).toBe("Qwen3.5-9B");
   });
 });

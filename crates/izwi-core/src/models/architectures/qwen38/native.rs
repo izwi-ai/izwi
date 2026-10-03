@@ -22,8 +22,11 @@ use crate::error::{Error, Result};
 use crate::performance::LoadingPerformanceConfig;
 
 mod cache;
-mod loading;
-mod q8;
+// Crate-internal so sibling native families (qwen35moe) can reuse the narrow
+// stable ingestion primitives on `IndexedSafetensors`; execution graphs stay
+// family-owned.
+pub(crate) mod loading;
+pub(crate) mod q8;
 #[cfg(feature = "cuda")]
 mod upload;
 pub use loading::RawBlockFp8Projection;
@@ -39,6 +42,43 @@ const WEIGHT_SUFFIX: &str = ".weight";
 /// designed and validated.
 pub const QWEN38_27B_FP8_REVISION: &str = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
 pub const QWEN38_MTP_TENSOR_COUNT: usize = 22;
+
+/// Opt a process into accepting synthetic (non-27B) Qwen3.8 checkpoint
+/// geometry. Production loads fail closed on anything but the published 27B
+/// shape; benchmark and CI fixtures opt in explicitly with this variable.
+/// Structural invariants (layer-type pattern, rope coverage, SSM width
+/// product, FP8 quantization routing) stay enforced under both policies.
+pub const ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY: &str = "IZWI_ALLOW_SYNTHETIC_QWEN38_GEOMETRY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen38GeometryPolicy {
+    /// Every configuration field is pinned to the published 27B checkpoint.
+    Pinned27B,
+    /// Benchmark/CI fixture geometry: values are free, structure is checked.
+    Synthetic,
+}
+
+fn geometry_policy_from_env() -> Qwen38GeometryPolicy {
+    let enabled = std::env::var(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY)
+        .map(|value| {
+            let trimmed = value.trim();
+            trimmed.eq_ignore_ascii_case("1") || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if enabled {
+        Qwen38GeometryPolicy::Synthetic
+    } else {
+        Qwen38GeometryPolicy::Pinned27B
+    }
+}
+
+/// Whether this process opted into synthetic Qwen3.8 fixture geometry via
+/// [`ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`]. Load admission uses this to derive
+/// memory estimates from the actual checkpoint instead of the pinned 27B
+/// constants.
+pub fn synthetic_geometry_enabled() -> bool {
+    geometry_policy_from_env() == Qwen38GeometryPolicy::Synthetic
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen38LayerType {
@@ -90,10 +130,18 @@ impl Qwen38NativeConfig {
     }
 
     pub fn from_json(raw: &[u8]) -> Result<Self> {
-        let config: HfConfig = serde_json::from_slice(raw).map_err(|err| {
-            Error::ModelLoadError(format!("Invalid native Qwen3.8 config.json: {err}"))
-        })?;
-        validate_hf_config(config)
+        let policy = geometry_policy_from_env();
+        let config = parse_hf_config(raw)?;
+        if policy == Qwen38GeometryPolicy::Synthetic {
+            tracing::warn!(
+                env = ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY,
+                layers = config.text_config.num_hidden_layers,
+                hidden_size = config.text_config.hidden_size,
+                vocab_size = config.text_config.vocab_size,
+                "Accepting SYNTHETIC Qwen3.8 checkpoint geometry; this load is for benchmark/CI fixtures only and must not be used in production"
+            );
+        }
+        validate_hf_config(config, policy)
     }
 }
 
@@ -160,7 +208,22 @@ struct HfQuantizationConfig {
     weight_block_size: Vec<usize>,
 }
 
-fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
+fn parse_hf_config(raw: &[u8]) -> Result<HfConfig> {
+    serde_json::from_slice(raw)
+        .map_err(|err| Error::ModelLoadError(format!("Invalid native Qwen3.8 config.json: {err}")))
+}
+
+fn require_positive(field: &str, value: usize) -> Result<()> {
+    if value == 0 {
+        return Err(config_error(field, "must be greater than zero"));
+    }
+    Ok(())
+}
+
+fn validate_hf_config(
+    config: HfConfig,
+    policy: Qwen38GeometryPolicy,
+) -> Result<Qwen38NativeConfig> {
     require_config_eq(
         "architectures",
         config.architectures,
@@ -179,96 +242,137 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
     require_config_eq("text_config.attention_bias", text.attention_bias, false)?;
     require_config_float("text_config.attention_dropout", text.attention_dropout, 0.0)?;
     require_config_eq("text_config.attn_output_gate", text.attn_output_gate, true)?;
-    require_config_eq("text_config.bos_token_id", text.bos_token_id, 248_044)?;
-    require_config_eq("text_config.eos_token_id", text.eos_token_id, 248_044)?;
-    require_config_eq("text_config.dtype", text.dtype.as_str(), "bfloat16")?;
-    require_config_eq(
-        "text_config.full_attention_interval",
-        text.full_attention_interval,
-        4,
-    )?;
-    require_config_eq("text_config.head_dim", text.head_dim, 256)?;
     require_config_eq("text_config.hidden_act", text.hidden_act.as_str(), "silu")?;
-    require_config_eq("text_config.hidden_size", text.hidden_size, 5_120)?;
     require_config_eq(
-        "text_config.intermediate_size",
-        text.intermediate_size,
-        17_408,
+        "text_config.output_gate_type",
+        text.output_gate_type.as_str(),
+        "swish",
     )?;
-    require_config_eq(
-        "text_config.linear_conv_kernel_dim",
-        text.linear_conv_kernel_dim,
-        4,
-    )?;
-    require_config_eq(
-        "text_config.linear_key_head_dim",
-        text.linear_key_head_dim,
-        128,
-    )?;
-    require_config_eq(
-        "text_config.linear_num_key_heads",
-        text.linear_num_key_heads,
-        16,
-    )?;
-    require_config_eq(
-        "text_config.linear_num_value_heads",
-        text.linear_num_value_heads,
-        48,
-    )?;
-    require_config_eq(
-        "text_config.linear_value_head_dim",
-        text.linear_value_head_dim,
-        128,
-    )?;
-    require_config_eq(
-        "text_config.mamba_ssm_dtype",
-        text.mamba_ssm_dtype.as_str(),
-        "float32",
-    )?;
-    require_config_eq(
-        "text_config.max_position_embeddings",
-        text.max_position_embeddings,
-        262_144,
-    )?;
-    require_config_eq(
-        "text_config.mtp_num_hidden_layers",
-        text.mtp_num_hidden_layers,
-        1,
-    )?;
+    if policy == Qwen38GeometryPolicy::Pinned27B {
+        require_config_eq("text_config.bos_token_id", text.bos_token_id, 248_044)?;
+        require_config_eq("text_config.eos_token_id", text.eos_token_id, 248_044)?;
+        require_config_eq("text_config.dtype", text.dtype.as_str(), "bfloat16")?;
+        require_config_eq(
+            "text_config.full_attention_interval",
+            text.full_attention_interval,
+            4,
+        )?;
+        require_config_eq("text_config.head_dim", text.head_dim, 256)?;
+        require_config_eq("text_config.hidden_size", text.hidden_size, 5_120)?;
+        require_config_eq(
+            "text_config.intermediate_size",
+            text.intermediate_size,
+            17_408,
+        )?;
+        require_config_eq(
+            "text_config.linear_conv_kernel_dim",
+            text.linear_conv_kernel_dim,
+            4,
+        )?;
+        require_config_eq(
+            "text_config.linear_key_head_dim",
+            text.linear_key_head_dim,
+            128,
+        )?;
+        require_config_eq(
+            "text_config.linear_num_key_heads",
+            text.linear_num_key_heads,
+            16,
+        )?;
+        require_config_eq(
+            "text_config.linear_num_value_heads",
+            text.linear_num_value_heads,
+            48,
+        )?;
+        require_config_eq(
+            "text_config.linear_value_head_dim",
+            text.linear_value_head_dim,
+            128,
+        )?;
+        require_config_eq(
+            "text_config.mamba_ssm_dtype",
+            text.mamba_ssm_dtype.as_str(),
+            "float32",
+        )?;
+        require_config_eq(
+            "text_config.max_position_embeddings",
+            text.max_position_embeddings,
+            262_144,
+        )?;
+        require_config_eq(
+            "text_config.mtp_num_hidden_layers",
+            text.mtp_num_hidden_layers,
+            1,
+        )?;
+        require_config_eq(
+            "text_config.num_attention_heads",
+            text.num_attention_heads,
+            24,
+        )?;
+        require_config_eq("text_config.num_hidden_layers", text.num_hidden_layers, 64)?;
+        require_config_eq(
+            "text_config.num_key_value_heads",
+            text.num_key_value_heads,
+            4,
+        )?;
+        require_config_float(
+            "text_config.partial_rotary_factor",
+            text.partial_rotary_factor,
+            0.25,
+        )?;
+        require_config_float("text_config.rms_norm_eps", text.rms_norm_eps, 1e-6)?;
+        require_config_eq("text_config.use_cache", text.use_cache, true)?;
+        require_config_eq("text_config.vocab_size", text.vocab_size, 248_320)?;
+    } else {
+        // Synthetic fixture geometry: values are free, but the loader cannot
+        // execute empty dimensions.
+        require_positive(
+            "text_config.full_attention_interval",
+            text.full_attention_interval,
+        )?;
+        require_positive("text_config.head_dim", text.head_dim)?;
+        require_positive("text_config.hidden_size", text.hidden_size)?;
+        require_positive("text_config.intermediate_size", text.intermediate_size)?;
+        require_positive(
+            "text_config.linear_conv_kernel_dim",
+            text.linear_conv_kernel_dim,
+        )?;
+        require_positive("text_config.linear_key_head_dim", text.linear_key_head_dim)?;
+        require_positive(
+            "text_config.linear_num_key_heads",
+            text.linear_num_key_heads,
+        )?;
+        require_positive(
+            "text_config.linear_num_value_heads",
+            text.linear_num_value_heads,
+        )?;
+        require_positive(
+            "text_config.linear_value_head_dim",
+            text.linear_value_head_dim,
+        )?;
+        require_positive(
+            "text_config.max_position_embeddings",
+            text.max_position_embeddings,
+        )?;
+        require_positive(
+            "text_config.mtp_num_hidden_layers",
+            text.mtp_num_hidden_layers,
+        )?;
+        require_positive("text_config.num_attention_heads", text.num_attention_heads)?;
+        require_positive("text_config.num_hidden_layers", text.num_hidden_layers)?;
+        require_positive("text_config.num_key_value_heads", text.num_key_value_heads)?;
+        require_positive("text_config.vocab_size", text.vocab_size)?;
+    }
     require_config_eq(
         "text_config.mtp_use_dedicated_embeddings",
         text.mtp_use_dedicated_embeddings,
         false,
     )?;
     require_config_eq(
-        "text_config.num_attention_heads",
-        text.num_attention_heads,
-        24,
-    )?;
-    require_config_eq("text_config.num_hidden_layers", text.num_hidden_layers, 64)?;
-    require_config_eq(
-        "text_config.num_key_value_heads",
-        text.num_key_value_heads,
-        4,
-    )?;
-    require_config_eq(
-        "text_config.output_gate_type",
-        text.output_gate_type.as_str(),
-        "swish",
-    )?;
-    require_config_float(
-        "text_config.partial_rotary_factor",
-        text.partial_rotary_factor,
-        0.25,
-    )?;
-    require_config_float("text_config.rms_norm_eps", text.rms_norm_eps, 1e-6)?;
-    require_config_eq(
         "text_config.tie_word_embeddings",
         text.tie_word_embeddings,
         false,
     )?;
-    require_config_eq("text_config.use_cache", text.use_cache, true)?;
-    require_config_eq("text_config.vocab_size", text.vocab_size, 248_320)?;
 
     let expected_layers = (0..text.num_hidden_layers)
         .map(|index| {
@@ -304,25 +408,27 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
         rope.rope_type.as_str(),
         "default",
     )?;
-    require_config_eq(
-        "text_config.rope_parameters.mrope_interleaved",
-        rope.mrope_interleaved,
-        true,
-    )?;
-    require_config_eq(
-        "text_config.rope_parameters.mrope_section",
-        rope.mrope_section.as_slice(),
-        [11, 11, 10].as_slice(),
-    )?;
+    if policy == Qwen38GeometryPolicy::Pinned27B {
+        require_config_eq(
+            "text_config.rope_parameters.mrope_interleaved",
+            rope.mrope_interleaved,
+            true,
+        )?;
+        require_config_eq(
+            "text_config.rope_parameters.mrope_section",
+            rope.mrope_section.as_slice(),
+            [11, 11, 10].as_slice(),
+        )?;
+        require_config_float(
+            "text_config.rope_parameters.rope_theta",
+            rope.rope_theta,
+            10_000_000.0,
+        )?;
+    }
     require_config_float(
         "text_config.rope_parameters.partial_rotary_factor",
         rope.partial_rotary_factor,
         text.partial_rotary_factor,
-    )?;
-    require_config_float(
-        "text_config.rope_parameters.rope_theta",
-        rope.rope_theta,
-        10_000_000.0,
     )?;
     let rope_dimension_count = (text.head_dim as f64 * text.partial_rotary_factor) as usize;
     let section_dimensions = rope.mrope_section.iter().sum::<usize>() * 2;
@@ -347,11 +453,18 @@ fn validate_hf_config(config: HfConfig) -> Result<Qwen38NativeConfig> {
         quant.activation_scheme.as_str(),
         "dynamic",
     )?;
-    require_config_eq(
-        "quantization_config.weight_block_size",
-        quant.weight_block_size.as_slice(),
-        [128, 128].as_slice(),
-    )?;
+    if policy == Qwen38GeometryPolicy::Pinned27B {
+        require_config_eq(
+            "quantization_config.weight_block_size",
+            quant.weight_block_size.as_slice(),
+            [128, 128].as_slice(),
+        )?;
+    } else if quant.weight_block_size.len() != 2 || quant.weight_block_size.contains(&0) {
+        return Err(config_error(
+            "quantization_config.weight_block_size",
+            "must be two positive dimensions",
+        ));
+    }
 
     let ssm_inner_size = text
         .linear_num_value_heads
@@ -2364,5 +2477,137 @@ mod tests {
             NativeTensorScope::Vision
         );
         assert_eq!(native_tensor_scope("mtp.fc.weight"), NativeTensorScope::Mtp);
+    }
+
+    fn synthetic_geometry_config_json() -> Vec<u8> {
+        let text_config = json!({
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": 2,
+            "dtype": "bfloat16",
+            "eos_token_id": 2,
+            "full_attention_interval": 2,
+            "head_dim": 2,
+            "hidden_act": "silu",
+            "hidden_size": 4,
+            "intermediate_size": 4,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_conv_kernel_dim": 3,
+            "linear_key_head_dim": 1,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_value_head_dim": 1,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 512,
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "output_gate_type": "swish",
+            "partial_rotary_factor": 1.0,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "use_cache": true,
+            "vocab_size": 8,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [1, 0, 0],
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000.0,
+                "rope_type": "default"
+            }
+        });
+        json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "language_model_only": false,
+            "model_type": "qwen3_5",
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [2, 2]
+            },
+            "text_config": text_config
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn pinned_policy_rejects_synthetic_geometry() {
+        let error = validate_hf_config(
+            parse_hf_config(&synthetic_geometry_config_json()).unwrap(),
+            Qwen38GeometryPolicy::Pinned27B,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Unsupported native Qwen3.8 config field"),
+            "pinned policy must reject synthetic geometry: {error}"
+        );
+    }
+
+    #[test]
+    fn synthetic_policy_accepts_fixture_geometry_with_derived_runtime_config() {
+        let config = validate_hf_config(
+            parse_hf_config(&synthetic_geometry_config_json()).unwrap(),
+            Qwen38GeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        assert_eq!(config.text.block_count, 2);
+        assert_eq!(config.text.full_attention_interval, 2);
+        assert_eq!(config.text.embedding_length, 4);
+        assert_eq!(config.text.attention_key_length, 2);
+        assert_eq!(config.text.ssm_inner_size, 1);
+        assert_eq!(config.layer_types.len(), 2);
+        assert_eq!(config.vocab_size, 8);
+        assert_eq!(config.block_fp8.block_shape, [2, 2]);
+        assert_eq!(config.mtp.num_hidden_layers, 1);
+    }
+
+    #[test]
+    fn synthetic_policy_still_enforces_structural_invariants() {
+        let mut raw = synthetic_geometry_config_json();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        // A layer-type pattern that contradicts the declared interval.
+        value["text_config"]["layer_types"] = json!(["full_attention", "full_attention"]);
+        raw = value.to_string().into_bytes();
+        let error = validate_hf_config(
+            parse_hf_config(&raw).unwrap(),
+            Qwen38GeometryPolicy::Synthetic,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("layer_types"), "{error}");
+
+        // Rope sections that do not cover the rotary dimensions.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&synthetic_geometry_config_json()).unwrap();
+        value["text_config"]["rope_parameters"]["mrope_section"] = json!([4, 0, 0]);
+        raw = value.to_string().into_bytes();
+        let error = validate_hf_config(
+            parse_hf_config(&raw).unwrap(),
+            Qwen38GeometryPolicy::Synthetic,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rotary dimensions"), "{error}");
+
+        // A zero dimension cannot execute.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&synthetic_geometry_config_json()).unwrap();
+        value["text_config"]["hidden_size"] = json!(0);
+        raw = value.to_string().into_bytes();
+        let error = validate_hf_config(
+            parse_hf_config(&raw).unwrap(),
+            Qwen38GeometryPolicy::Synthetic,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hidden_size"), "{error}");
     }
 }

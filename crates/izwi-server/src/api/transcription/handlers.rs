@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::request_context::RequestContext;
@@ -688,9 +688,7 @@ async fn execute_batch_asr_stage(
     let output_artifact = output_artifact
         .ok_or_else(|| anyhow::anyhow!("ASR stage did not publish its primary transcript"))?;
 
-    Ok(StageExecutionOutcome {
-        output_artifact_ids: vec![output_artifact.id],
-    })
+    StageExecutionOutcome::try_new(vec![output_artifact.id])
 }
 
 fn runtime_projection_attempt(
@@ -843,6 +841,28 @@ async fn send_transcription_terminal_events(
             ),
         )
         .await;
+    }
+}
+
+/// Deltas and progress are intentionally lossy under backpressure: a drop
+/// never blocks the transcription job, but every drop is counted in the
+/// `realtime.transcription_stream_backpressure_total` metric and the first
+/// drop per stream is warn-logged so silent degradation stays visible.
+fn send_stream_event_lossy(
+    event_tx: &mpsc::Sender<String>,
+    runtime: &RuntimeService,
+    backpressure_warned: &std::cell::Cell<bool>,
+    what: &'static str,
+    payload: String,
+) {
+    if event_tx.try_send(payload).is_err() {
+        runtime.record_transcription_stream_backpressure();
+        if !backpressure_warned.replace(true) {
+            tracing::warn!(
+                what,
+                "transcription stream event dropped under backpressure"
+            );
+        }
     }
 }
 
@@ -1028,6 +1048,10 @@ async fn process_transcription_record_inner(
     };
     let delta_tx = event_tx.clone();
     let progress_tx = event_tx.clone();
+    let delta_runtime = runtime.clone();
+    let progress_runtime = runtime.clone();
+    let delta_backpressure_warned = std::cell::Cell::new(false);
+    let progress_backpressure_warned = std::cell::Cell::new(false);
     let progress_store = transcription_store.clone();
     let progress_record_id = record_id.clone();
     let progress_attempt = projection_attempt.cloned();
@@ -1054,7 +1078,11 @@ async fn process_transcription_record_inner(
                 runtime_context,
                 move |delta| {
                     if let Some(tx) = &delta_tx {
-                        let _ = tx.try_send(
+                        send_stream_event_lossy(
+                            tx,
+                            &delta_runtime,
+                            &delta_backpressure_warned,
+                            "delta",
                             serde_json::to_string(&StreamDeltaEvent {
                                 event: "delta",
                                 delta,
@@ -1065,7 +1093,13 @@ async fn process_transcription_record_inner(
                 },
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.try_send(progress_event_payload(progress.clone()));
+                        send_stream_event_lossy(
+                            tx,
+                            &progress_runtime,
+                            &progress_backpressure_warned,
+                            "progress",
+                            progress_event_payload(progress.clone()),
+                        );
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
@@ -1099,7 +1133,13 @@ async fn process_transcription_record_inner(
                 input_duration_secs,
                 move |progress| {
                     if let Some(tx) = &progress_tx {
-                        let _ = tx.try_send(progress_event_payload(progress.clone()));
+                        send_stream_event_lossy(
+                            tx,
+                            &progress_runtime,
+                            &progress_backpressure_warned,
+                            "progress",
+                            progress_event_payload(progress.clone()),
+                        );
                     }
                     let store = progress_store.clone();
                     let id = progress_record_id.clone();
@@ -1380,7 +1420,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
         let model_id = payload.model_id.or(payload.model);
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
         let inspection =
-            inspect_audio_payload_with_diagnostics("transcription.create", &audio_payload)?;
+            inspect_audio_payload_canonical_with_diagnostics("transcription.create", &audio_payload)?;
         let audio_mime_type = audio_payload
             .content_type_hint()
             .map(str::to_string)
@@ -1428,7 +1468,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        let inspection = inspect_audio_payload_with_diagnostics(
+                        let inspection = inspect_audio_payload_canonical_with_diagnostics(
                             "transcription.create",
                             &payload,
                         )?;
@@ -1447,7 +1487,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
                     )
                     .await?
                     {
-                        let inspection = inspect_audio_payload_with_diagnostics(
+                        let inspection = inspect_audio_payload_canonical_with_diagnostics(
                             "transcription.create",
                             &payload,
                         )?;
@@ -2027,11 +2067,14 @@ mod tests {
         alignments_to_word_records, asr_queue_class, build_segment_records,
         duration_secs_from_millis, initial_summary_state, multipart_field_api_error, parse_bool,
         parse_create_request, progress_event_payload, sanitize_summary_output,
-        send_transcription_terminal_events, should_retry_transcription_summary_generation,
-        transcription_summary_messages, transcription_summary_params,
-        validate_batch_transcription_model, QueueClass, TranscriptionSummaryStatus,
-        TranscriptionWordRecord, TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+        send_stream_event_lossy, send_transcription_terminal_events,
+        should_retry_transcription_summary_generation, transcription_summary_messages,
+        transcription_summary_params, validate_batch_transcription_model, QueueClass,
+        TranscriptionSummaryStatus, TranscriptionWordRecord,
+        TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
+    use izwi_core::RuntimeService;
+    use tokio::sync::mpsc;
 
     fn wav_bytes() -> Vec<u8> {
         AudioEncoder::new(16_000, 1)
@@ -2240,6 +2283,56 @@ mod tests {
         assert_eq!(value["progress"]["current_chunk"], 1);
         assert_eq!(value["progress"]["total_chunks"], 2);
         assert_eq!(value["progress"]["percent"], 50.0);
+    }
+
+    #[tokio::test]
+    async fn lossy_stream_events_record_backpressure_for_every_drop() {
+        let runtime = std::sync::Arc::new(RuntimeService::new(
+            izwi_core::EngineConfig::default(),
+        )
+        .expect("runtime"));
+        let before = runtime
+            .telemetry_snapshot()
+            .await
+            .realtime
+            .transcription_stream_backpressure_total;
+
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send("occupied".to_string())
+            .expect("fill the bounded queue");
+        let warned = std::cell::Cell::new(false);
+
+        send_stream_event_lossy(
+            &event_tx,
+            &runtime,
+            &warned,
+            "delta",
+            "delta-1".to_string(),
+        );
+        send_stream_event_lossy(
+            &event_tx,
+            &runtime,
+            &warned,
+            "delta",
+            "delta-2".to_string(),
+        );
+
+        let after = runtime
+            .telemetry_snapshot()
+            .await
+            .realtime
+            .transcription_stream_backpressure_total;
+        assert_eq!(
+            after,
+            before + 2,
+            "every dropped stream event must be counted"
+        );
+
+        // The dropped payloads never reach the consumer, and the queued event
+        // is untouched.
+        assert_eq!(event_rx.recv().await.as_deref(), Some("occupied"));
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

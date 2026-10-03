@@ -10,7 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ModelInfo } from "@/api";
+import type { ModelInfo, ModelResidencySummary } from "@/api";
 import {
   Dialog,
   DialogContent,
@@ -65,6 +65,7 @@ interface RouteModelModalProps {
   getModelLabel?: (variant: string) => string;
   selectionMode?: "route" | "manage";
   zIndexClassName?: string;
+  residencySummary?: ModelResidencySummary | null;
 }
 
 function formatBytes(bytes: number): string {
@@ -73,6 +74,16 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024 * 1024)
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatKeepAlive(seconds: number): string {
+  if (seconds % 3600 === 0 && seconds > 0) {
+    return `${seconds / 3600}h`;
+  }
+  if (seconds % 60 === 0 && seconds > 0) {
+    return `${seconds / 60} min`;
+  }
+  return `${seconds}s`;
 }
 
 function getStatusDotClass(status: ModelInfo["status"]): string {
@@ -147,13 +158,6 @@ function getModelSizeLabel(
   return "Size unknown";
 }
 
-function requiresManualDownload(variant: string): boolean {
-  return variant === "Gemma-3-1b-it";
-}
-
-const MANUAL_GEMMA_DOWNLOAD_GUIDE =
-  "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md";
-
 export function RouteModelModal({
   isOpen,
   onClose,
@@ -176,6 +180,7 @@ export function RouteModelModal({
   getModelLabel,
   selectionMode = "route",
   zIndexClassName = "z-50",
+  residencySummary = null,
 }: RouteModelModalProps) {
   const [deleteTargetVariant, setDeleteTargetVariant] = useState<string | null>(
     null,
@@ -365,6 +370,11 @@ export function RouteModelModal({
                                         <h3 className="truncate text-sm font-medium text-[var(--text-primary)]">
                                           {modelLabel}
                                         </h3>
+                                        {model.pinned && (
+                                          <span className="shrink-0 rounded-full border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+                                            Pinned
+                                          </span>
+                                        )}
                                       </div>
 
                                       <div className="shrink-0 flex items-center gap-1.5">
@@ -392,21 +402,7 @@ export function RouteModelModal({
                                           )}
 
                                         {(model.status === "not_downloaded" ||
-                                          model.status === "error") &&
-                                          (requiresManualDownload(
-                                            model.variant,
-                                          ) ? (
-                                            <a
-                                              href={MANUAL_GEMMA_DOWNLOAD_GUIDE}
-                                              target="_blank"
-                                              rel="noreferrer"
-                                              className="flex items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface-2)] px-3 py-1.5 text-xs font-medium text-[var(--text-muted)]"
-                                              aria-label={`Open manual download guide for ${modelLabel}`}
-                                            >
-                                              <Download aria-hidden="true" className="h-3.5 w-3.5" />
-                                              Manual download guide
-                                            </a>
-                                          ) : (
+                                          model.status === "error") && (
                                             <button
                                               type="button"
                                               onClick={() =>
@@ -417,7 +413,7 @@ export function RouteModelModal({
                                               <Download aria-hidden="true" className="h-3.5 w-3.5" />
                                               Download
                                             </button>
-                                          ))}
+                                          )}
 
                                         {model.status === "downloaded" && (
                                           <button
@@ -514,6 +510,21 @@ export function RouteModelModal({
                 </div>
               )}
             </div>
+            {residencySummary && (
+              <div
+                data-testid="route-model-residency-summary"
+                className="shrink-0 border-t border-[var(--border-muted)] px-4 py-2.5 text-xs text-[var(--text-muted)] sm:px-5"
+              >
+                {residencySummary.resident_count} model
+                {residencySummary.resident_count === 1 ? "" : "s"} resident of{" "}
+                {residencySummary.max_loaded_models ?? "unlimited"} allowed
+                {residencySummary.model_keep_alive_secs > 0
+                  ? ` · idle models unload after ${formatKeepAlive(
+                      residencySummary.model_keep_alive_secs,
+                    )}`
+                  : ""}
+              </div>
+            )}
         <Dialog
           open={Boolean(deleteTargetModel)}
           onOpenChange={(open) => {

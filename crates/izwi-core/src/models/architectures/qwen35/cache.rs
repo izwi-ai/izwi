@@ -213,6 +213,7 @@ mod tests {
             ssm_time_step_rank: 8,
             ssm_inner_size: 1_024,
             full_attention_interval: 4,
+            moe_ffn: None,
         }
     }
 

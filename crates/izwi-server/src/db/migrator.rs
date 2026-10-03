@@ -1,3 +1,4 @@
+use crate::db::raw;
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
 };
@@ -8,8 +9,10 @@ pub struct Migrator;
 
 impl Migrator {
     pub async fn up(db: &DatabaseConnection) -> anyhow::Result<()> {
+        let backend = db.get_database_backend();
         for statement in BASELINE_SCHEMA {
-            db.execute_unprepared(statement).await?;
+            db.execute_unprepared(&dialect_ddl(backend, statement))
+                .await?;
         }
 
         for column in COMPATIBILITY_COLUMNS {
@@ -17,12 +20,95 @@ impl Migrator {
         }
 
         for statement in POST_COMPATIBILITY_SCHEMA {
-            db.execute_unprepared(statement).await?;
+            db.execute_unprepared(&dialect_ddl(backend, statement))
+                .await?;
         }
 
         ensure_default_voice_profile(db).await?;
         Ok(())
     }
+}
+
+/// Translate the shared SQLite-flavored DDL into the target backend's
+/// dialect. The schema is deliberately portable (TEXT/INTEGER/REAL, no
+/// stored procedures); only three constructs need translation:
+///
+/// - `INTEGER` holds epoch-milli timestamps and counters, which overflow a
+///   4-byte server INTEGER: promote to BIGINT.
+/// - `REAL` maps to a 4-byte float on PostgreSQL: promote to DOUBLE
+///   PRECISION so f64 values round-trip exactly.
+/// - `COLLATE NOCASE` is a SQLite-only collation. The case-insensitive
+///   uniqueness contract on `saved_voices.name` becomes a LOWER(name)
+///   functional unique index on PostgreSQL; remaining occurrences are
+///   dropped (server default collations are case-sensitive on PostgreSQL).
+pub fn dialect_ddl(backend: DbBackend, sql: &str) -> String {
+    match backend {
+        DbBackend::Sqlite => sql.to_string(),
+        DbBackend::Postgres => {
+            let sql = sql.replace(
+                "ON saved_voices(name COLLATE NOCASE)",
+                "ON saved_voices(LOWER(name))",
+            );
+            let sql = replace_word(&sql, "COLLATE NOCASE", "");
+            let sql = replace_word(&sql, "INTEGER", "BIGINT");
+            replace_word(&sql, "REAL", "DOUBLE PRECISION")
+        }
+        DbBackend::MySql => {
+            let sql = replace_word(sql, "COLLATE NOCASE", "");
+            let sql = replace_word(&sql, "INTEGER", "BIGINT");
+            replace_word(&sql, "REAL", "DOUBLE")
+        }
+        _ => sql.to_string(),
+    }
+}
+
+/// Replace whole-word occurrences of `word` with `replacement`, leaving
+/// identifier substrings (for example `max_words`) and single-quoted SQL
+/// string literals untouched.
+fn replace_word(haystack: &str, word: &str, replacement: &str) -> String {
+    let boundary = |byte: Option<&u8>| {
+        byte.is_none_or(|candidate| !candidate.is_ascii_alphanumeric() && *candidate != b'_')
+    };
+    let bytes = haystack.as_bytes();
+    let mut result = String::with_capacity(haystack.len());
+    let mut segment_start = 0;
+    let mut cursor = 0;
+    let mut in_single_quote = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\'' {
+            let is_escaped_quote = in_single_quote && bytes.get(cursor + 1) == Some(&b'\'');
+            in_single_quote = if is_escaped_quote {
+                in_single_quote
+            } else {
+                !in_single_quote
+            };
+            cursor += if is_escaped_quote { 2 } else { 1 };
+            continue;
+        }
+        if in_single_quote || bytes[cursor] >= 0x80 {
+            cursor += 1;
+            continue;
+        }
+        if haystack[cursor..].starts_with(word) {
+            let end = cursor + word.len();
+            let before = if cursor == 0 {
+                None
+            } else {
+                Some(&bytes[cursor - 1])
+            };
+            let after = bytes.get(end);
+            if boundary(before) && boundary(after) {
+                result.push_str(&haystack[segment_start..cursor]);
+                result.push_str(replacement);
+                segment_start = end;
+            }
+            cursor = end;
+            continue;
+        }
+        cursor += 1;
+    }
+    result.push_str(&haystack[segment_start..]);
+    result
 }
 
 struct CompatibilityColumn {
@@ -232,7 +318,9 @@ const BASELINE_SCHEMA: &[&str] = &[
         tokens_generated INTEGER NULL,
         audio_mime_type TEXT NOT NULL,
         audio_filename TEXT NULL,
-        audio_storage_path TEXT NOT NULL
+        audio_storage_path TEXT NOT NULL,
+        audio_media_asset_id TEXT NULL,
+        audio_artifact_tenant TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_speech_history_route_created_at ON speech_history_records(route_kind, created_at DESC);",
@@ -378,6 +466,44 @@ const BASELINE_SCHEMA: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_storage_key ON media_assets(storage_key);",
     "CREATE INDEX IF NOT EXISTS idx_media_assets_created_at ON media_assets(created_at DESC, id DESC);",
     r#"
+    CREATE TABLE IF NOT EXISTS artifact_cleanup_intents (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        storage_key TEXT NOT NULL UNIQUE,
+        tenant_scope TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason = 'artifact_deleted'),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_artifact_cleanup_due ON artifact_cleanup_intents(available_at ASC, created_at ASC, id ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS provider_write_reservations (
+        write_id TEXT PRIMARY KEY,
+        reservation_token TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        available_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'stored', 'cleanup_pending', 'cleanup_claimed')),
+        tenant_scope TEXT NOT NULL,
+        storage_namespace TEXT NOT NULL,
+        content_type TEXT NOT NULL,
+        filename TEXT NULL,
+        expected_size_bytes INTEGER NOT NULL,
+        expected_sha256 TEXT NOT NULL,
+        provider_request_json TEXT NULL,
+        storage_key TEXT NULL,
+        cleanup_claim_token TEXT NULL,
+        cleanup_claim_expires_at INTEGER NULL,
+        cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_provider_write_cleanup_due ON provider_write_reservations(state, available_at ASC, expires_at ASC, created_at ASC, write_id ASC);",
+    r#"
     CREATE TABLE IF NOT EXISTS text_assets (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
@@ -421,6 +547,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         idempotency_key TEXT NULL,
         correlation_id TEXT NULL,
         cancellation_reason TEXT NULL,
+        cancellation_state TEXT NULL,
         FOREIGN KEY(input_media_asset_id) REFERENCES media_assets(id) ON DELETE SET NULL,
         FOREIGN KEY(input_text_asset_id) REFERENCES text_assets(id) ON DELETE SET NULL
     );
@@ -459,6 +586,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         finished_at INTEGER NULL,
         error_code TEXT NULL,
         error_message TEXT NULL,
+        cancellation_state TEXT NULL,
         FOREIGN KEY(job_id) REFERENCES runtime_jobs(id) ON DELETE CASCADE
     );
     "#,
@@ -508,6 +636,29 @@ const BASELINE_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_runtime_job ON idempotency_keys(runtime_job_id);",
+    // Version two deliberately uses a new table instead of rewriting the legacy
+    // primary key in place. Existing installations retain their local-only
+    // records while new callers get tenant-scoped reservation semantics.
+    r#"
+    CREATE TABLE IF NOT EXISTS durable_idempotency_keys_v2 (
+        tenant_scope TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        digest_version INTEGER NOT NULL,
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'committed')),
+        reservation_token TEXT NOT NULL,
+        runtime_job_id TEXT NULL,
+        response_json TEXT NULL,
+        PRIMARY KEY(tenant_scope, operation, idempotency_key),
+        FOREIGN KEY(runtime_job_id) REFERENCES runtime_jobs(id) ON DELETE SET NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_expiry ON durable_idempotency_keys_v2(expires_at ASC, created_at ASC, tenant_scope ASC, operation ASC, idempotency_key ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_runtime_job ON durable_idempotency_keys_v2(runtime_job_id);",
     r#"
     CREATE TABLE IF NOT EXISTS runtime_worker_heartbeats (
         worker_id TEXT PRIMARY KEY,
@@ -529,6 +680,19 @@ const BASELINE_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_runtime_worker_heartbeats_last ON runtime_worker_heartbeats(last_heartbeat_at DESC);",
+    // DS0.5 scoped credentials: only salted HMAC digests of gateway API keys
+    // are persisted here; key material lives exclusively in env:/file: refs.
+    r#"
+    CREATE TABLE IF NOT EXISTS gateway_principal_keys (
+        principal_id TEXT PRIMARY KEY,
+        roles_json TEXT NOT NULL,
+        tenant_id TEXT NULL,
+        key_salt TEXT NOT NULL,
+        key_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
@@ -538,9 +702,51 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_job_stages_queue_resources ON job_stages(queue_class, resource_target, required_backend, required_device_class, min_resource_memory_bytes, resource_concurrency_weight, status);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_speech_history_audio_media_asset ON speech_history_records(audio_media_asset_id);",
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_worker_observations (
+        worker_id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        status_sequence INTEGER NOT NULL,
+        process_state TEXT NOT NULL,
+        available_admission_credits INTEGER NOT NULL,
+        active_invocations INTEGER NOT NULL,
+        deployments_json TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        observer_gateway_id TEXT NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_worker_observations_observed ON fleet_worker_observations(observed_at ASC);",
+    r#"
+    CREATE TABLE IF NOT EXISTS fleet_capacity_claims (
+        claim_id TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        incarnation_id TEXT NOT NULL,
+        gateway_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
 ];
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "provider_write_reservations",
+        column: "provider_request_json",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "job_stages",
+        column: "cancellation_state",
+        definition: "TEXT NULL",
+    },
     CompatibilityColumn {
         table: "runtime_jobs",
         column: "admission_tenant",
@@ -782,6 +988,16 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_media_asset_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "audio_artifact_tenant",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
         table: "saved_voices",
         column: "permission_scope",
         definition: "TEXT NOT NULL DEFAULT 'legacy_local'",
@@ -875,9 +1091,10 @@ async fn ensure_column(
     if table_has_column(db, column.table, column.column).await? {
         return Ok(());
     }
+    let definition = dialect_ddl(db.get_database_backend(), column.definition);
     db.execute_unprepared(&format!(
         "ALTER TABLE {} ADD COLUMN {} {}",
-        column.table, column.column, column.definition
+        column.table, column.column, definition
     ))
     .await?;
     Ok(())
@@ -888,28 +1105,45 @@ async fn table_has_column(
     table: &str,
     target: &str,
 ) -> anyhow::Result<bool> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            DbBackend::Sqlite,
-            format!("PRAGMA table_info({table})"),
-        ))
-        .await?;
-    for row in rows {
-        let name: String = row.try_get_by_index(1)?;
-        if name == target {
-            return Ok(true);
+    match db.get_database_backend() {
+        DbBackend::Sqlite => {
+            let rows = db
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("PRAGMA table_info({table})"),
+                ))
+                .await?;
+            for row in rows {
+                let name: String = row.try_get_by_index(1)?;
+                if name == target {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        backend => {
+            let sql = match backend {
+                DbBackend::Postgres => {
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
+                }
+                DbBackend::MySql => {
+                    "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
+                }
+                other => anyhow::bail!("Unsupported migration backend: {other:?}"),
+            };
+            let statement = raw::statement(db, sql, vec![table.into(), target.into()])?;
+            Ok(db.query_one_raw(statement).await?.is_some())
         }
     }
-    Ok(false)
 }
 
 async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result<()> {
     let exists = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
+        .query_one_raw(raw::statement(
+            db,
             "SELECT 1 FROM voice_profiles WHERE id = ?1 LIMIT 1",
             vec![DEFAULT_VOICE_PROFILE_ID.into()],
-        ))
+        )?)
         .await?
         .is_some();
     if exists {
@@ -917,8 +1151,8 @@ async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result
     }
 
     let now = current_timestamp_millis();
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
+    db.execute_raw(raw::statement(
+        db,
         r#"
         INSERT INTO voice_profiles (
             id,
@@ -936,7 +1170,7 @@ async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result
             DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.into(),
             now.into(),
         ],
-    ))
+    )?)
     .await?;
 
     Ok(())
@@ -947,4 +1181,79 @@ fn current_timestamp_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_ddl_passes_through_unchanged() {
+        let sql =
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NULL);";
+        assert_eq!(dialect_ddl(DbBackend::Sqlite, sql), sql);
+    }
+
+    #[test]
+    fn postgres_ddl_promotes_integer_and_real_and_drops_nocase() {
+        let sql = "CREATE TABLE t (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, score REAL NOT NULL);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE TABLE t (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, score DOUBLE PRECISION NOT NULL);"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_does_not_rewrite_word_fragments() {
+        let sql = "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('INTEGER REAL'); -- general_max_words"
+        );
+    }
+
+    #[test]
+    fn postgres_ddl_respects_escaped_quotes_and_multibyte_literals() {
+        let sql = "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "INSERT INTO t (message) VALUES ('it''s INTEGER wide — résumé REAL');"
+        );
+        let sql = "ALTER TABLE résumé ADD COLUMN count INTEGER NULL";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "ALTER TABLE résumé ADD COLUMN count BIGINT NULL"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_nocase_index_becomes_lower_functional_index() {
+        let sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(name COLLATE NOCASE);";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_voices_name_nocase ON saved_voices(LOWER(name));"
+        );
+    }
+
+    #[test]
+    fn postgres_saved_voices_column_drops_nocase_collation() {
+        let sql = "name TEXT NOT NULL COLLATE NOCASE,";
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, sql),
+            "name TEXT NOT NULL ,"
+        );
+    }
+
+    #[test]
+    fn compatibility_column_definitions_are_promoted_for_postgres() {
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "INTEGER NOT NULL DEFAULT 0"),
+            "BIGINT NOT NULL DEFAULT 0"
+        );
+        assert_eq!(
+            dialect_ddl(DbBackend::Postgres, "REAL NULL"),
+            "DOUBLE PRECISION NULL"
+        );
+        assert_eq!(dialect_ddl(DbBackend::MySql, "INTEGER NULL"), "BIGINT NULL");
+    }
 }

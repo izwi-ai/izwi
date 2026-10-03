@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
+    artifact_store::{ArtifactId, ArtifactRetention, ArtifactStore, ArtifactTenant},
+    batch_runtime::store::BatchRuntimeStore,
     db::{raw, StoreDatabase},
     entity::{speech_history_records, RuntimeProjectionAttempt},
     ids::new_uuid,
@@ -24,7 +26,7 @@ use crate::{
 /// cancellation or disconnect. `finish_file` retains the file without an upload buffer.
 pub(crate) struct SpeechWavSpool {
     file: tokio::fs::File,
-    temporary: tempfile::NamedTempFile,
+    temporary: crate::speech_spool::SpeechTempFile,
     sample_rate: u32,
     pcm_bytes: usize,
     max_pcm_bytes: usize,
@@ -81,7 +83,8 @@ impl SpeechWavSpool {
             sample_rate > 0 && sample_rate <= u32::MAX / 2,
             "Invalid WAV sample rate"
         );
-        let temporary = tempfile::NamedTempFile::new().context("Create speech WAV spool")?;
+        let temporary =
+            crate::speech_spool::new_speech_tempfile().context("Create speech WAV spool")?;
         let mut file = temporary.reopen()?;
         std::io::Write::write_all(&mut file, &[0; 44])?;
         Ok(Self {
@@ -191,7 +194,7 @@ impl SpeechWavSpool {
 
 /// Owns both the finalized file and its disk reservation through upload/response.
 pub(crate) struct SpeechWavArtifact {
-    temporary: tempfile::NamedTempFile,
+    temporary: crate::speech_spool::SpeechTempFile,
     sample_rate: u32,
     pcm_bytes: usize,
     _disk_reservation: crate::speech_resource_budget::ByteReservation,
@@ -403,13 +406,39 @@ pub struct CompleteSpeechHistoryRecord {
     pub preexisting_audio_storage_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpeechAudioReference {
+    LegacyPath(String),
+    Opaque {
+        id: ArtifactId,
+        tenant: ArtifactTenant,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SpeechAudioLocation {
+    reference: SpeechAudioReference,
+    audio_mime_type: String,
+    audio_filename: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SpeechAudioRow {
+    raw_storage_path: String,
+    reference: Option<SpeechAudioReference>,
+    audio_mime_type: String,
+    audio_filename: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SpeechHistoryStore {
     db: StoreDatabase,
     media_storage: Arc<dyn MediaStorageProvider>,
+    artifact_store: Arc<ArtifactStore>,
 }
 
 impl SpeechHistoryStore {
+    #[allow(dead_code)]
     pub fn initialize() -> anyhow::Result<Self> {
         let db_path = storage_layout::resolve_db_path();
         let media_root = storage_layout::resolve_media_root();
@@ -417,17 +446,31 @@ impl SpeechHistoryStore {
         storage_layout::ensure_storage_dirs(&db_path, &media_root)
             .context("Failed to prepare speech history storage layout")?;
 
+        let db = StoreDatabase::new(db_path);
+        let media_storage =
+            Arc::new(LocalMediaStorageProvider::new(media_root)) as Arc<dyn MediaStorageProvider>;
+        let artifact_store = Arc::new(ArtifactStore::new(
+            Arc::new(BatchRuntimeStore::initialize_with_database(db.clone())),
+            media_storage.clone(),
+            Default::default(),
+        )?);
         Ok(Self {
-            db: StoreDatabase::new(db_path),
-            media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
+            db,
+            media_storage,
+            artifact_store,
         })
     }
 
     pub fn initialize_with_storage(
         db: StoreDatabase,
         media_storage: Arc<dyn MediaStorageProvider>,
+        artifact_store: Arc<ArtifactStore>,
     ) -> Self {
-        Self { db, media_storage }
+        Self {
+            db,
+            media_storage,
+            artifact_store,
+        }
     }
 
     pub async fn list_records_page(
@@ -503,37 +546,35 @@ impl SpeechHistoryStore {
         record_id: String,
     ) -> anyhow::Result<Option<StoredSpeechAudio>> {
         let db = self.db.connection().await?;
-        let audio = db
-            .query_one_raw(raw::statement(
-                db,
-                r#"
-                SELECT audio_storage_path, audio_mime_type, audio_filename
-                FROM speech_history_records
-                WHERE route_kind = ?1 AND id = ?2
-                "#,
-                vec![route_kind.as_db_value().into(), record_id.into()],
-            )?)
-            .await
-            .context("Failed to load speech history audio metadata")?;
-        let Some(row) = audio else {
+        let Some(location) = fetch_audio_location(db, route_kind, &record_id).await? else {
             return Ok(None);
         };
-
-        let audio_storage_path: Option<String> = row.try_get_by_index(0)?;
-        let audio_mime_type: String = row.try_get_by_index(1)?;
-        let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let Some(audio_storage_path) = sanitize_media_path(audio_storage_path.as_deref()) else {
-            return Ok(None);
+        let audio_bytes = match &location.reference {
+            SpeechAudioReference::LegacyPath(path) => {
+                read_media_object(&self.media_storage, path)
+                    .await
+                    .context("Failed to read speech history media")?
+                    .bytes
+            }
+            SpeechAudioReference::Opaque { id, tenant } => {
+                let artifact = self
+                    .artifact_store
+                    .read(tenant, id)
+                    .await
+                    .context("Failed to read opaque speech history media")?;
+                validate_speech_artifact_descriptor(
+                    &artifact.descriptor,
+                    &location.audio_mime_type,
+                    location.audio_filename.as_deref(),
+                )?;
+                artifact.bytes
+            }
         };
-
-        let audio = read_media_object(&self.media_storage, audio_storage_path.as_str())
-            .await
-            .context("Failed to read speech history media")?;
 
         Ok(Some(StoredSpeechAudio {
-            audio_bytes: audio.bytes,
-            audio_mime_type,
-            audio_filename,
+            audio_bytes,
+            audio_mime_type: location.audio_mime_type,
+            audio_filename: location.audio_filename,
         }))
     }
 
@@ -543,38 +584,47 @@ impl SpeechHistoryStore {
         record_id: String,
     ) -> anyhow::Result<Option<StoredSpeechAudioStream>> {
         let db = self.db.connection().await?;
-        let audio = db
-            .query_one_raw(raw::statement(
-                db,
-                r#"
-                SELECT audio_storage_path, audio_mime_type, audio_filename
-                FROM speech_history_records
-                WHERE route_kind = ?1 AND id = ?2
-                "#,
-                vec![route_kind.as_db_value().into(), record_id.into()],
-            )?)
-            .await
-            .context("Failed to load speech history audio metadata")?;
-        let Some(row) = audio else {
+        let Some(location) = fetch_audio_location(db, route_kind, &record_id).await? else {
             return Ok(None);
         };
-
-        let audio_storage_path: Option<String> = row.try_get_by_index(0)?;
-        let audio_mime_type: String = row.try_get_by_index(1)?;
-        let audio_filename: Option<String> = row.try_get_by_index(2)?;
-        let Some(audio_storage_path) = sanitize_media_path(audio_storage_path.as_deref()) else {
-            return Ok(None);
+        let audio = match &location.reference {
+            SpeechAudioReference::LegacyPath(path) => {
+                crate::persistence::read_media_stream(&self.media_storage, path)
+                    .await
+                    .context("Failed to read speech history media")?
+            }
+            SpeechAudioReference::Opaque { id, tenant } => {
+                let artifact = self
+                    .artifact_store
+                    .read_stream(tenant, id)
+                    .await
+                    .context("Failed to stream opaque speech history media")?;
+                validate_speech_artifact_descriptor(
+                    &artifact.descriptor,
+                    &location.audio_mime_type,
+                    location.audio_filename.as_deref(),
+                )?;
+                izwi_hooks::StoredMediaStream {
+                    reader: artifact.reader,
+                    metadata: izwi_hooks::MediaObjectMetadata {
+                        content_type: artifact.descriptor.content_type,
+                        filename: artifact.descriptor.filename,
+                        // Verification completes only after the provider reports EOF. Keep
+                        // HTTP responses indeterminate-length so a terminal digest/length error
+                        // cannot be mistaken for a successfully completed fixed-length body.
+                        content_length: None,
+                        sha256: Some(artifact.descriptor.sha256),
+                        tenant_id: Some(tenant.as_str().to_string()),
+                        attributes: HookMetadata::new(),
+                    },
+                }
+            }
         };
-
-        let audio =
-            crate::persistence::read_media_stream(&self.media_storage, audio_storage_path.as_str())
-                .await
-                .context("Failed to read speech history media")?;
 
         Ok(Some(StoredSpeechAudioStream {
             audio,
-            audio_mime_type,
-            audio_filename,
+            audio_mime_type: location.audio_mime_type,
+            audio_filename: location.audio_filename,
         }))
     }
 
@@ -669,6 +719,8 @@ impl SpeechHistoryStore {
                 audio_mime_type: Set(audio_mime_type),
                 audio_filename: Set(audio_filename),
                 audio_storage_path: Set(audio_storage_path.clone().unwrap_or_default()),
+                audio_media_asset_id: Set(None),
+                audio_artifact_tenant: Set(None),
             })
             .exec(db)
             .await
@@ -906,25 +958,30 @@ impl SpeechHistoryStore {
             .and_then(|value| i64::try_from(value).ok());
         let audio_mime_type = sanitize_audio_mime_type(record.audio_mime_type.as_str());
         let audio_filename = sanitize_optional_text(record.audio_filename.as_deref(), 260);
-
-        if record.audio_bytes.is_empty()
-            && sanitize_media_path(record.preexisting_audio_storage_path.as_deref()).is_none()
-        {
-            return Err(anyhow!(
-                "Audio payload cannot be empty when completing speech history records",
-            ));
-        }
+        let preexisting_audio_storage_path =
+            sanitize_media_path(record.preexisting_audio_storage_path.as_deref());
+        let source_count = usize::from(!record.audio_bytes.is_empty())
+            + usize::from(preexisting_audio_storage_path.is_some());
+        anyhow::ensure!(
+            source_count == 1,
+            "Speech history completion requires exactly one audio source"
+        );
 
         let mut metadata = HookMetadata::new();
         metadata.insert(
             "route_kind".to_string(),
             route_kind.as_db_value().to_string(),
         );
-        let previous_audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
+        let previous_audio_storage_path = match fetch_audio_location(db, route_kind, &record_id)
             .await?
-            .flatten();
-        let preexisting_audio_storage_path =
-            sanitize_media_path(record.preexisting_audio_storage_path.as_deref());
+            .map(|location| location.reference)
+        {
+            Some(SpeechAudioReference::LegacyPath(path)) => Some(path),
+            Some(SpeechAudioReference::Opaque { .. }) => anyhow::bail!(
+                "Opaque speech history audio replacement requires atomic artifact settlement"
+            ),
+            None => None,
+        };
         let owns_next_audio_object = preexisting_audio_storage_path.is_none();
         let next_audio_storage_path = match preexisting_audio_storage_path {
             Some(path) => path,
@@ -1015,6 +1072,14 @@ impl SpeechHistoryStore {
                 speech_history_records::Column::AudioStoragePath,
                 Expr::value(next_audio_storage_path.clone()),
             )
+            .col_expr(
+                speech_history_records::Column::AudioMediaAssetId,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                speech_history_records::Column::AudioArtifactTenant,
+                Expr::value(Option::<String>::None),
+            )
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
             .filter(speech_history_records::Column::Id.eq(record_id.clone()));
         if let Some(attempt) = attempt {
@@ -1056,7 +1121,7 @@ impl SpeechHistoryStore {
             return Ok(None);
         }
 
-        if let Some(previous_path) = sanitize_media_path(previous_audio_storage_path.as_deref())
+        if let Some(previous_path) = previous_audio_storage_path
             .filter(|previous_path| previous_path != &next_audio_storage_path)
         {
             let _ = delete_media_object(&self.media_storage, Some(previous_path.as_str())).await;
@@ -1071,19 +1136,32 @@ impl SpeechHistoryStore {
         record_id: String,
     ) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
-        let audio_storage_path = fetch_audio_storage_path(db, route_kind, &record_id)
-            .await?
-            .flatten();
+        let Some(audio_row) = fetch_audio_row(db, route_kind, &record_id).await? else {
+            return Ok(false);
+        };
+        let audio_storage_path = match audio_row.reference {
+            Some(SpeechAudioReference::LegacyPath(path)) => Some(path),
+            Some(SpeechAudioReference::Opaque { id, tenant }) => {
+                return self
+                    .artifact_store
+                    .delete_speech_history_audio(route_kind.as_db_value(), &record_id, &tenant, &id)
+                    .await
+                    .context("Failed to atomically delete opaque speech history audio");
+            }
+            None => None,
+        };
         let result = speech_history_records::Entity::delete_many()
             .filter(speech_history_records::Column::RouteKind.eq(route_kind.as_db_value()))
             .filter(speech_history_records::Column::Id.eq(record_id))
+            .filter(speech_history_records::Column::AudioStoragePath.eq(audio_row.raw_storage_path))
+            .filter(speech_history_records::Column::AudioMediaAssetId.is_null())
+            .filter(speech_history_records::Column::AudioArtifactTenant.is_null())
             .exec(db)
             .await
             .context("Failed to delete speech history record")?;
 
         if result.rows_affected > 0 {
-            let normalized_audio_path = sanitize_media_path(audio_storage_path.as_deref());
-            delete_media_object(&self.media_storage, normalized_audio_path.as_deref()).await?;
+            delete_media_object(&self.media_storage, audio_storage_path.as_deref()).await?;
         }
 
         Ok(result.rows_affected > 0)
@@ -1181,22 +1259,82 @@ async fn fetch_record_without_audio(
     row.as_ref().map(map_speech_history_record).transpose()
 }
 
-async fn fetch_audio_storage_path(
+async fn fetch_audio_location(
     db: &sea_orm::DatabaseConnection,
     route_kind: SpeechRouteKind,
     record_id: &str,
-) -> anyhow::Result<Option<Option<String>>> {
+) -> anyhow::Result<Option<SpeechAudioLocation>> {
+    let row = fetch_audio_row(db, route_kind, record_id).await?;
+    Ok(row.and_then(|row| {
+        row.reference.map(|reference| SpeechAudioLocation {
+            reference,
+            audio_mime_type: row.audio_mime_type,
+            audio_filename: row.audio_filename,
+        })
+    }))
+}
+
+async fn fetch_audio_row(
+    db: &sea_orm::DatabaseConnection,
+    route_kind: SpeechRouteKind,
+    record_id: &str,
+) -> anyhow::Result<Option<SpeechAudioRow>> {
     let row = db
         .query_one_raw(raw::statement(
             db,
-            "SELECT audio_storage_path FROM speech_history_records WHERE route_kind = ?1 AND id = ?2",
+            r#"
+            SELECT audio_storage_path, audio_media_asset_id, audio_artifact_tenant,
+                   audio_mime_type, audio_filename
+            FROM speech_history_records
+            WHERE route_kind = ?1 AND id = ?2
+            "#,
             vec![route_kind.as_db_value().into(), record_id.into()],
         )?)
         .await
-        .context("Failed to load speech history media path")?;
-    row.map(|row| row.try_get_by_index::<Option<String>>(0))
-        .transpose()
-        .map_err(Into::into)
+        .context("Failed to load speech history media reference")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let raw_storage_path = row.try_get_by_index::<String>(0)?;
+    let legacy = sanitize_media_path(Some(raw_storage_path.as_str()));
+    let media_asset_id: Option<String> = row.try_get_by_index(1)?;
+    let artifact_tenant: Option<String> = row.try_get_by_index(2)?;
+    let opaque = match (media_asset_id, artifact_tenant) {
+        (None, None) => None,
+        (Some(id), Some(tenant)) => Some(SpeechAudioReference::Opaque {
+            id: ArtifactId::parse(id)?,
+            tenant: ArtifactTenant::parse(tenant)?,
+        }),
+        _ => anyhow::bail!("Speech history opaque audio reference is incomplete"),
+    };
+    let reference = match (legacy, opaque) {
+        (Some(_), Some(_)) => anyhow::bail!("Speech history audio reference is ambiguous"),
+        (Some(path), None) => Some(SpeechAudioReference::LegacyPath(path)),
+        (None, Some(reference)) => Some(reference),
+        (None, None) => None,
+    };
+    let audio_mime_type: String = row.try_get_by_index(3)?;
+    let audio_filename: Option<String> = row.try_get_by_index(4)?;
+    Ok(Some(SpeechAudioRow {
+        raw_storage_path,
+        reference,
+        audio_mime_type,
+        audio_filename,
+    }))
+}
+
+fn validate_speech_artifact_descriptor(
+    descriptor: &crate::artifact_store::ArtifactDescriptor,
+    audio_mime_type: &str,
+    audio_filename: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        descriptor.content_type == audio_mime_type
+            && descriptor.filename.as_deref() == audio_filename
+            && descriptor.retention == ArtifactRetention::Durable,
+        "Opaque speech history audio metadata mismatch"
+    );
+    Ok(())
 }
 
 fn map_speech_history_summary(row: &QueryResult) -> anyhow::Result<SpeechHistoryRecordSummary> {
@@ -1275,7 +1413,7 @@ fn input_preview(content: &str) -> String {
     truncate_string(&normalized, 180)
 }
 
-fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String> {
+pub(crate) fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String> {
     let normalized = raw
         .unwrap_or("")
         .split_whitespace()
@@ -1288,7 +1426,7 @@ fn sanitize_optional_text(raw: Option<&str>, max_chars: usize) -> Option<String>
     }
 }
 
-fn sanitize_audio_mime_type(raw: &str) -> String {
+pub(crate) fn sanitize_audio_mime_type(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         "audio/wav".to_string()
@@ -1349,9 +1487,11 @@ fn active_speech_attempt_condition(
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
               AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
               AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
               AND j.route_record_id = speech_history_records.id
               AND j.route_record_kind = {route_placeholder}
         )
@@ -1397,6 +1537,7 @@ pub const fn default_list_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact_store::{ArtifactStoreError, ArtifactWrite};
     use crate::batch_runtime::{
         store::{BatchRuntimeStore, NewJobStage, NewRuntimeJob},
         types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
@@ -1839,13 +1980,15 @@ mod tests {
             .expect("record should exist");
 
         let db = store.db.connection().await.expect("database should open");
-        let persisted_path =
-            fetch_audio_storage_path(db, SpeechRouteKind::TextToSpeech, pending.id.as_str())
+        let persisted =
+            fetch_audio_location(db, SpeechRouteKind::TextToSpeech, pending.id.as_str())
                 .await
-                .expect("storage path lookup should succeed")
-                .expect("record should exist")
-                .expect("storage path should exist");
-        assert_eq!(persisted_path, storage_path);
+                .expect("storage reference lookup should succeed")
+                .expect("storage reference should exist");
+        assert_eq!(
+            persisted.reference,
+            SpeechAudioReference::LegacyPath(storage_path.clone())
+        );
 
         let stored = store
             .get_audio(SpeechRouteKind::TextToSpeech, pending.id)
@@ -1854,6 +1997,183 @@ mod tests {
             .expect("stored audio should exist");
         assert_eq!(stored.audio_bytes, audio_bytes);
 
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn opaque_audio_reopens_streams_deletes_atomically_and_fences_replacement() {
+        use tokio::io::AsyncReadExt;
+
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-opaque-history").unwrap();
+        let bytes = b"opaque wav fixture".to_vec();
+        let descriptor = store
+            .artifact_store
+            .put(
+                &tenant,
+                ArtifactWrite {
+                    content_type: "audio/wav".into(),
+                    filename: Some("attempt.wav".into()),
+                    bytes: bytes.clone(),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap();
+        let db = store.db.connection().await.unwrap();
+        db.execute_raw(
+            raw::statement(
+                db,
+                r#"
+                UPDATE speech_history_records
+                SET processing_status = 'ready', audio_storage_path = '',
+                    audio_media_asset_id = ?1, audio_artifact_tenant = ?2,
+                    audio_mime_type = 'audio/wav', audio_filename = 'attempt.wav'
+                WHERE id = ?3
+                "#,
+                vec![
+                    descriptor.id.as_str().into(),
+                    tenant.as_str().into(),
+                    pending.id.clone().into(),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let second = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .unwrap();
+        assert!(db
+            .execute_raw(
+                raw::statement(
+                    db,
+                    r#"
+                    UPDATE speech_history_records
+                    SET audio_storage_path = '', audio_media_asset_id = ?1,
+                        audio_artifact_tenant = ?2
+                    WHERE id = ?3
+                    "#,
+                    vec![
+                        descriptor.id.as_str().into(),
+                        tenant.as_str().into(),
+                        second.id.into(),
+                    ],
+                )
+                .unwrap(),
+            )
+            .await
+            .is_err());
+
+        drop(store);
+        let reopened = SpeechHistoryStore::initialize().unwrap();
+        let loaded = reopened
+            .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.audio_bytes, bytes);
+        let mut streamed = reopened
+            .get_audio_stream(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(streamed.audio.metadata.content_length, None);
+        let mut stream_bytes = Vec::new();
+        streamed
+            .audio
+            .reader
+            .read_to_end(&mut stream_bytes)
+            .await
+            .unwrap();
+        assert_eq!(stream_bytes, bytes);
+
+        let db = reopened.db.connection().await.unwrap();
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE speech_history_records SET audio_artifact_tenant = 'wrong' WHERE id = ?1",
+                vec![pending.id.clone().into()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened
+            .get_audio(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .is_err());
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE speech_history_records SET audio_artifact_tenant = NULL WHERE id = ?1",
+                vec![pending.id.clone().into()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened
+            .get_audio_stream(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .is_err());
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE speech_history_records SET audio_artifact_tenant = ?1, audio_storage_path = 'legacy.wav' WHERE id = ?2",
+                vec![tenant.as_str().into(), pending.id.clone().into()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened
+            .get_audio_stream(SpeechRouteKind::TextToSpeech, pending.id.clone())
+            .await
+            .is_err());
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE speech_history_records SET audio_storage_path = '' WHERE id = ?1",
+                vec![pending.id.clone().into()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(reopened
+            .complete_record(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                completed_record(vec![1, 2, 3]),
+            )
+            .await
+            .is_err());
+        assert!(reopened
+            .delete_record(SpeechRouteKind::TextToSpeech, pending.id)
+            .await
+            .unwrap());
+        assert!(matches!(
+            reopened.artifact_store.stat(&tenant, &descriptor.id).await,
+            Err(ArtifactStoreError::NotFound)
+        ));
         clear_env();
     }
 
@@ -1965,6 +2285,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_request_fences_attempt_audio_completion() {
+        let _guard = env_lock();
+        let (temp, store) = setup_store();
+        let media_dir = temp.path().join("media");
+        let pending = store
+            .create_record(NewSpeechHistoryRecord {
+                processing_status: SpeechHistoryProcessingStatus::Pending,
+                audio_bytes: Vec::new(),
+                audio_filename: None,
+                ..ready_record()
+            })
+            .await
+            .expect("pending record");
+        let (runtime, attempt) =
+            claim_projection_attempt(&store, SpeechRouteKind::TextToSpeech, pending.id.as_str())
+                .await;
+        store
+            .bind_runtime_attempt(SpeechRouteKind::TextToSpeech, pending.id.clone(), &attempt)
+            .await
+            .expect("attempt binding")
+            .expect("active attempt should bind");
+        let stage = runtime
+            .get_stage(&attempt.stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        runtime
+            .cancel_job(&stage.job_id, Some("cancel before publication".to_string()))
+            .await
+            .expect("cancellation request")
+            .expect("job should accept cancellation");
+
+        assert!(store
+            .complete_record_for_attempt(
+                SpeechRouteKind::TextToSpeech,
+                pending.id.clone(),
+                &attempt,
+                completed_record(vec![4, 5, 6]),
+            )
+            .await
+            .expect("cancelled completion should be ignored")
+            .is_none());
+        assert_eq!(regular_file_count(&media_dir), 0);
+        let unchanged = store
+            .get_record(SpeechRouteKind::TextToSpeech, pending.id)
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_ne!(
+            unchanged.processing_status,
+            SpeechHistoryProcessingStatus::Ready
+        );
+
+        clear_env();
+    }
+
+    #[tokio::test]
     async fn startup_reconciliation_fails_only_processing_records_without_active_jobs() {
         let _guard = env_lock();
         let (_temp, store) = setup_store();
@@ -2029,26 +2406,40 @@ mod tests {
             .await
             .expect("active job lookup")
             .expect("active job");
-        runtime
+        let cancelled = runtime
             .cancel_job(&active_job.id, Some("test cancellation".to_string()))
             .await
             .expect("cancel runtime job")
             .expect("cancelled runtime job");
+        assert_eq!(cancelled.status, RuntimeJobStatus::Running);
+        assert_eq!(
+            cancelled.cancellation_state,
+            Some(crate::batch_runtime::types::RuntimeCancellationState::Requested)
+        );
+        let cancelling = store
+            .get_record(SpeechRouteKind::TextToSpeech, resumable.id.clone())
+            .await
+            .expect("cancelling projection lookup")
+            .expect("cancelling projection");
+        assert_eq!(
+            cancelling.processing_status,
+            SpeechHistoryProcessingStatus::Pending
+        );
         assert_eq!(
             store
                 .reconcile_stale_processing_records()
                 .await
-                .expect("terminal reconciliation"),
-            1
+                .expect("cancelling reconciliation"),
+            0
         );
-        let terminal = store
+        let still_cancelling = store
             .get_record(SpeechRouteKind::TextToSpeech, resumable.id)
             .await
-            .expect("terminal lookup")
-            .expect("terminal record");
+            .expect("post-reconciliation lookup")
+            .expect("post-reconciliation record");
         assert_eq!(
-            terminal.processing_status,
-            SpeechHistoryProcessingStatus::Failed
+            still_cancelling.processing_status,
+            SpeechHistoryProcessingStatus::Pending
         );
 
         clear_env();

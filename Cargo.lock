@@ -3801,12 +3801,19 @@ dependencies = [
  "clap",
  "config",
  "dirs 5.0.1",
+ "fs2",
  "futures",
+ "hmac",
  "hound",
  "izwi-agent",
  "izwi-core",
  "izwi-hooks",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
  "izwi-vad",
+ "libc",
+ "rand 0.8.5",
+ "reqwest 0.11.27",
  "scalar_api_reference",
  "sea-orm",
  "serde",
@@ -3816,12 +3823,96 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "toml 0.8.2",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "utoipa",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "izwi-serving-client"
+version = "0.1.0-beta-18"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures",
+ "izwi-serving-protocol",
+ "reqwest 0.11.27",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "izwi-serving-protocol"
+version = "0.1.0-beta-18"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "izwi-serving-supervisor"
+version = "0.1.0-beta-18"
+dependencies = [
+ "fs2",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.2",
+ "uuid",
+]
+
+[[package]]
+name = "izwi-serving-worker"
+version = "0.1.0-beta-18"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "candle-core",
+ "dirs 5.0.1",
+ "futures",
+ "half",
+ "izwi-core",
+ "izwi-hooks",
+ "izwi-server",
+ "izwi-serving-client",
+ "izwi-serving-protocol",
+ "izwi-serving-supervisor",
+ "rustls-pemfile",
+ "safetensors 0.4.5",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-tungstenite",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -8720,8 +8811,12 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.36",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -9023,6 +9118,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.2",
+ "rustls 0.23.36",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
 ]
@@ -9653,6 +9750,15 @@ name = "webpki-roots"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.5",
+]
 
 [[package]]
 name = "webpki-roots"

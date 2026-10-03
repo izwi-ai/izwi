@@ -101,6 +101,60 @@ jobs:
       - name: Run CPU backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
+  fleet-stores:
+    name: Fleet Store Validation (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: izwi
+          POSTGRES_PASSWORD: izwi
+          POSTGRES_DB: izwi_fleet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U izwi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      IZWI_TEST_FLEET_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_test
+      IZWI_TEST_FLEET_RIG_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_rig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Create the fleet rig database
+        run: |
+          PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_fleet_rig"
+
+      - name: Run fleet store validation
+        run: scripts/ci/check-backend-truth.sh cargo-fleet-stores
+
+      - name: Run the fleet rig PostgreSQL lane
+        run: scripts/ci/check-backend-truth.sh cargo-fleet-rig-postgres
+
   cargo-cuda:
     name: CUDA Compile (Driverless)
     runs-on: ubuntu-latest

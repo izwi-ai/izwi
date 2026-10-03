@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
@@ -15,6 +15,7 @@ use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
 use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
 use crate::backends::{
     BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
+    RuntimeDeviceAssignment,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
@@ -23,37 +24,39 @@ use crate::engine::metrics::{
     ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL, ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL,
 };
 use crate::engine::{
-    AdapterBindingKey, ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
+    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
+    StageWorkSelector, Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest,
+    EngineOutput, EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason,
+    ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig,
+    WorkloadClass,
+    ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
     ENGINE_EXECUTOR_DEADLINE_PHASE_ROWS_TOTAL, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
     ENGINE_EXECUTOR_FAILURE_ORIGIN_ROWS_TOTAL, ENGINE_EXECUTOR_MODEL_DECODE_CALLS_TOTAL,
-    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL,
+    ENGINE_EXECUTOR_MODEL_SCALAR_ROW_DISPATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_ROWS_TOTAL,
-    ENGINE_EXECUTOR_MODEL_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
+    ENGINE_EXECUTOR_MODEL_TENSOR_MULTIROW_CALLS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_BATCH_REJECTIONS_TOTAL,
-    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_REQUEST_PARALLEL_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_CAPACITY_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_FILL_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_MATERIALIZED_ELEMENTS_TOTAL,
     ENGINE_EXECUTOR_TENSOR_BATCH_MAX_WIDTH, ENGINE_EXECUTOR_TENSOR_BATCH_PADDING_RATIO,
     ENGINE_EXECUTOR_TENSOR_BATCH_ROWS_TOTAL, ENGINE_EXECUTOR_TENSOR_BATCH_USEFUL_ELEMENTS_TOTAL,
-    ENGINE_EXECUTOR_TENSOR_BATCHES_TOTAL, ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
+    ENGINE_EXECUTOR_TENSOR_CONTINUOUS_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_CONTINUOUS_MULTIROW_BATCHES_TOTAL,
     ENGINE_EXECUTOR_TENSOR_STATIC_BATCHES_TOTAL, ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_KV_DEMOTIONS_TOTAL,
+    ENGINE_KV_HOST_PAGES, ENGINE_KV_PROMOTIONS_TOTAL, ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_STREAM_BACKPRESSURE_TOTAL,
-    ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL,
-    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, Engine as CoreEngine, EngineAudioInput,
-    EngineCoreConfig, EngineCoreRequest, EngineOutput, EngineStreamPolicy, EngineTask,
-    GenerationParams, OutputFinishReason, REQUEST_DEADLINE_EXCEEDED, ResourceAmount,
-    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
-    engine_batch_metrics_snapshot, engine_stream_metrics_snapshot,
+    ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL, ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL,
+    ENGINE_STREAM_DELIVERY_FAILURES_TOTAL, REQUEST_DEADLINE_EXCEEDED,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelResidencyLease;
@@ -70,7 +73,7 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
-    VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams, vibevoice_tts_auto_max_frames_for_text,
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
@@ -95,12 +98,13 @@ use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
-    EngineRuntimeTelemetrySnapshot, RuntimeObservationContext, RuntimeStageObservation,
-    RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot, push_engine_labeled_metric, push_engine_labeled_metric_f64,
-    push_engine_metric, push_engine_metric_f64, push_engine_physical_execution_metrics,
+    push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
+    push_engine_metric_f64, push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
+    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
+    RuntimeTelemetrySnapshot,
 };
-use crate::runtime::types::RuntimeRequestContext;
+use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
 use crate::tokenizer::Tokenizer;
 
@@ -1995,6 +1999,171 @@ pub(crate) struct AdmittedEngineRequest {
     residency_lease: ModelResidencyLease,
 }
 
+/// Fully owned input for one worker-facing chat invocation.
+///
+/// The runtime applies coordinator admission, model lifecycle fencing and
+/// exact Engine session admission before returning a [`RuntimeChatInvocation`].
+#[derive(Debug, Clone)]
+pub struct RuntimeChatInvocationRequest {
+    pub variant: ModelVariant,
+    pub messages: Vec<ChatMessage>,
+    pub params: GenerationParams,
+    pub chat_config: ChatRequestConfig,
+    pub correlation_id: Option<String>,
+    pub runtime_context: RuntimeRequestContext,
+    /// Require native model streaming and expose committed text deltas.
+    pub streaming: bool,
+}
+
+/// Ordered output emitted by an admitted chat invocation.
+#[derive(Debug, Clone)]
+pub enum RuntimeChatInvocationEvent {
+    /// DS9.3: a text delta with its per-token logprob entries (empty unless
+    /// the request asked for logprobs).
+    TextDelta {
+        text: String,
+        logprobs: Vec<crate::engine::TokenLogprob>,
+    },
+    Completed(ChatGeneration),
+}
+
+/// Why an invocation reached confirmed teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeChatTeardownDisposition {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Proof that the invocation no longer owns coordinator or model residency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeChatTeardown {
+    pub request_id: String,
+    pub disposition: RuntimeChatTeardownDisposition,
+}
+
+const RUNTIME_CHAT_INVOCATION_EVENT_CAPACITY: usize = 16;
+
+/// Opaque transport-facing handle for an authoritatively admitted chat request.
+///
+/// A successful constructor return is the acceptance boundary: the request
+/// already owns coordinator capacity, an exact model generation and an exact
+/// Engine session. The background driver, not this handle, owns those leases.
+/// Dropping the handle requests cancellation, while the driver retains all
+/// capacity until normal completion or exact-session cleanup is confirmed.
+pub struct RuntimeChatInvocation {
+    request_id: String,
+    cancellation: Arc<AtomicBool>,
+    cancellation_wakeup: Arc<Notify>,
+    events: mpsc::Receiver<Result<RuntimeChatInvocationEvent>>,
+    teardown: Option<oneshot::Receiver<RuntimeChatTeardown>>,
+    cancel_on_drop: bool,
+}
+
+impl std::fmt::Debug for RuntimeChatInvocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeChatInvocation")
+            .field("request_id", &self.request_id)
+            .field(
+                "cancellation_requested",
+                &self.cancellation.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeChatInvocation {
+    fn from_failed_post_admission(
+        request_id: String,
+        cancellation: Arc<AtomicBool>,
+        mut guard: PendingRequestGuard,
+        error: Error,
+    ) -> Self {
+        cancellation.store(true, Ordering::Release);
+        let (event_sender, events) = mpsc::channel(1);
+        let _ = event_sender.try_send(Err(error));
+        drop(event_sender);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let cleanup_request_id = request_id.clone();
+        tokio::spawn(async move {
+            if guard.confirm_cleanup().await.is_ok() {
+                let _ = teardown_sender.send(RuntimeChatTeardown {
+                    request_id: cleanup_request_id,
+                    disposition: RuntimeChatTeardownDisposition::Failed,
+                });
+            }
+            // A failed cleanup leaves the guard armed. Its Drop path retries
+            // exact-session cleanup while retaining admission fail closed; the
+            // closed teardown channel tells the worker it has no proof yet.
+        });
+        Self {
+            request_id,
+            cancellation,
+            cancellation_wakeup: Arc::new(Notify::new()),
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: false,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Cooperatively request cancellation without waiting for an Engine lock.
+    ///
+    /// `true` means this call installed the signal. It is not teardown proof;
+    /// callers that need that proof must await [`Self::wait_for_teardown`].
+    pub fn request_cancel(&self) -> bool {
+        let newly_requested = self
+            .cancellation
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.cancellation_wakeup.notify_one();
+        newly_requested
+    }
+
+    /// Receive the next committed text delta or terminal generation.
+    pub async fn next_event(&mut self) -> Result<Option<RuntimeChatInvocationEvent>> {
+        match self.events.recv().await {
+            Some(event) => event.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Stop consuming output and wait for confirmed physical teardown.
+    ///
+    /// Closing the event receiver is treated like a disconnected transport and
+    /// therefore requests cancellation if execution has not already finished.
+    pub async fn wait_for_teardown(mut self) -> Result<RuntimeChatTeardown> {
+        self.events.close();
+        self.request_cancel();
+        self.cancel_on_drop = false;
+        let teardown = self.teardown.take().ok_or_else(|| {
+            Error::InferenceError(format!(
+                "chat invocation {} lost its teardown waiter",
+                self.request_id
+            ))
+        })?;
+        teardown.await.map_err(|_| {
+            Error::InferenceError(format!(
+                "chat invocation {} ended without teardown confirmation",
+                self.request_id
+            ))
+        })
+    }
+}
+
+impl Drop for RuntimeChatInvocation {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.cancellation.store(true, Ordering::Release);
+            self.cancellation_wakeup.notify_one();
+        }
+    }
+}
+
 fn bind_request_to_residency(
     request: &mut EngineCoreRequest,
     residency_lease: Option<&ModelResidencyLease>,
@@ -2103,11 +2272,21 @@ fn bind_request_to_residency(
     Ok(())
 }
 
+/// Requirements for loading a capability for scheduled job work.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CapabilityLoadOptions {
+    /// Request the adapter's long-form atomic graph. Required to schedule
+    /// blocking `AtomicJob` work (pipeline stages) against the loaded binding;
+    /// sequence-graph loads keep the default.
+    pub(crate) asr_long_form: bool,
+}
+
 fn loaded_contract_for_residency(
     lease: &ModelResidencyLease,
     bundle: Option<&LoadedModelBundle>,
     capability: CapabilityKind,
     streaming_required: bool,
+    asr_long_form: bool,
     execution_group_id: crate::engine::ExecutionGroupId,
     backend_kind: BackendKind,
     expected_target: Option<ExecutionTargetKind>,
@@ -2131,7 +2310,9 @@ fn loaded_contract_for_residency(
             "loaded execution bundle does not match authoritative runtime residency".to_string(),
         ));
     }
-    let contract = bundle.contract(capability, streaming_required)?;
+    let streaming = StreamingRequirements::native(streaming_required)
+        .with_asr_long_form(asr_long_form);
+    let contract = bundle.contract_for_streaming(capability, streaming)?;
     if contract.execution_group_id != execution_group_id
         || contract.model_instance_id != model_instance_id
         || contract.metadata.model_variant != lease.variant()
@@ -2151,9 +2332,24 @@ fn loaded_contract_for_residency(
             expected_target.expect("checked as some")
         )));
     }
+    if asr_long_form
+        && !contract.stages.iter().any(|stage| {
+            matches!(
+                stage.selector,
+                StageWorkSelector::Atomic | StageWorkSelector::Any
+            )
+        })
+    {
+        return Err(Error::InvalidInput(format!(
+            "loaded capability {:?} for {} does not support atomic blocking execution",
+            capability,
+            lease.variant(),
+        )));
+    }
     let state_binding = bundle.capability_binding_for_streaming(
         capability,
-        StreamingRequirements::native(streaming_required),
+        StreamingRequirements::native(streaming_required)
+            .with_asr_long_form(asr_long_form),
     )?;
     state_binding
         .state
@@ -2166,6 +2362,7 @@ fn loaded_binding_for_residency(
     bundle: Option<&LoadedModelBundle>,
     capability: CapabilityKind,
     streaming_required: bool,
+    asr_long_form: bool,
     execution_group_id: crate::engine::ExecutionGroupId,
     backend_kind: BackendKind,
     expected_target: Option<ExecutionTargetKind>,
@@ -2175,6 +2372,7 @@ fn loaded_binding_for_residency(
         bundle,
         capability,
         streaming_required,
+        asr_long_form,
         execution_group_id,
         backend_kind,
         expected_target,
@@ -2182,7 +2380,8 @@ fn loaded_binding_for_residency(
     let bundle = bundle.expect("validated by loaded_contract_for_residency");
     let binding = bundle.capability_binding_for_streaming(
         capability,
-        StreamingRequirements::native(streaming_required),
+        StreamingRequirements::native(streaming_required)
+            .with_asr_long_form(asr_long_form),
     )?;
     if binding.execution != contract.adapter_binding()? {
         return Err(Error::InferenceError(
@@ -2353,6 +2552,31 @@ impl PendingRequestGuard {
         self.residency_lease.take();
     }
 
+    /// Cancel and fence the exact Engine session before releasing admission.
+    ///
+    /// This future is cancellation-safe: if its owner disappears while the
+    /// Engine step lock is held, `Drop` transfers the still-owned leases into
+    /// the existing fail-closed detached cleanup path.
+    async fn confirm_cleanup(&mut self) -> Result<bool> {
+        remove_waiter_registration(
+            self.completion_waiters.as_ref(),
+            &self.session.request_id,
+            self.waiter_registration_id,
+        )
+        .await;
+        let aborted = self
+            .core_engine
+            .abort_request_session(&self.session)
+            .await?;
+        if aborted {
+            self.telemetry
+                .record_request_cancelled(&self.session.request_id)
+                .await;
+        }
+        self.disarm();
+        Ok(aborted)
+    }
+
     /// Transfer cancellation cleanup to a detached exact-session task without
     /// waiting for the engine core lock. Streaming callbacks execute outside
     /// the engine, so a failed or timed-out transport must be able to return
@@ -2393,6 +2617,313 @@ impl Drop for PendingRequestGuard {
     }
 }
 
+struct RuntimeChatInvocationDriver {
+    request_id: String,
+    deadline: Option<Instant>,
+    observation_context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    telemetry: Arc<RuntimeTelemetryCollector>,
+    cancellation: Arc<AtomicBool>,
+    cancellation_wakeup: Arc<Notify>,
+    events: mpsc::Sender<Result<RuntimeChatInvocationEvent>>,
+    teardown: Option<oneshot::Sender<RuntimeChatTeardown>>,
+    completion: oneshot::Receiver<Result<EngineOutput>>,
+    stream: Option<mpsc::Receiver<StreamingOutput>>,
+    stream_order: Option<StreamOutputOrder>,
+    streamed_text: String,
+    guard: PendingRequestGuard,
+}
+
+enum RuntimeChatCompletion {
+    Delivered(Result<EngineOutput>),
+    ChannelClosed,
+}
+
+impl RuntimeChatInvocationDriver {
+    fn try_send_event(&self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+        self.events.try_send(event).is_ok()
+    }
+
+    async fn finish_with_output(&mut self, output: EngineOutput) -> RuntimeChatTeardownDisposition {
+        let generation = match invocation_chat_generation(&mut self.streamed_text, &output) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.record_error(&error);
+                self.guard.disarm();
+                let _ = self.try_send_event(Err(error));
+                return RuntimeChatTeardownDisposition::Failed;
+            }
+        };
+        self.telemetry
+            .record_stage_observation(engine_output_observation(
+                self.observation_context.clone(),
+                self.admission_ms,
+                &output,
+            ));
+        self.guard.disarm();
+        let _ = self.try_send_event(Ok(RuntimeChatInvocationEvent::Completed(generation)));
+        // Engine completion is already physical teardown. A disconnected or
+        // slow output consumer cannot turn it back into cancellation.
+        RuntimeChatTeardownDisposition::Completed
+    }
+
+    fn finish_with_terminal_error(&mut self, error: Error) -> RuntimeChatTeardownDisposition {
+        self.record_error(&error);
+        self.guard.disarm();
+        let disposition = if matches!(error, Error::Cancelled(_)) {
+            RuntimeChatTeardownDisposition::Cancelled
+        } else {
+            RuntimeChatTeardownDisposition::Failed
+        };
+        let _ = self.try_send_event(Err(error));
+        disposition
+    }
+
+    fn record_error(&self, error: &Error) {
+        self.telemetry
+            .record_stage_observation(engine_error_observation(
+                self.observation_context.clone(),
+                self.admission_ms,
+                error.to_string(),
+            ));
+    }
+
+    async fn cancel_and_confirm(&mut self) -> Option<RuntimeChatTeardownDisposition> {
+        self.cancellation.store(true, Ordering::Release);
+        if let Some(stream) = self.stream.as_mut() {
+            stream.close();
+        }
+        match self.guard.confirm_cleanup().await {
+            Ok(_) => Some(RuntimeChatTeardownDisposition::Cancelled),
+            Err(error) => {
+                // A failed exact abort is not teardown proof. Best-effort error
+                // delivery must not block the guard's fail-closed cleanup path.
+                let _ = self.try_send_event(Err(error));
+                None
+            }
+        }
+    }
+
+    async fn fail_and_confirm(&mut self, error: Error) -> Option<RuntimeChatTeardownDisposition> {
+        match self.cancel_and_confirm().await {
+            Some(_) => {
+                self.record_error(&error);
+                let _ = self.try_send_event(Err(error));
+                Some(RuntimeChatTeardownDisposition::Failed)
+            }
+            None => None,
+        }
+    }
+
+    async fn finish_completion(
+        &mut self,
+        completion: RuntimeChatCompletion,
+    ) -> Option<RuntimeChatTeardownDisposition> {
+        match completion {
+            RuntimeChatCompletion::Delivered(Ok(output)) => {
+                Some(self.finish_with_output(output).await)
+            }
+            RuntimeChatCompletion::Delivered(Err(error)) => {
+                Some(self.finish_with_terminal_error(error))
+            }
+            RuntimeChatCompletion::ChannelClosed => {
+                self.fail_and_confirm(Error::InferenceError(format!(
+                    "Request {} completion channel closed unexpectedly",
+                    self.request_id
+                )))
+                .await
+            }
+        }
+    }
+
+    async fn drive(mut self) {
+        if let Some(disposition) = self.drive_until_terminal().await {
+            let _ = self.teardown.take().map(|sender| {
+                sender.send(RuntimeChatTeardown {
+                    request_id: self.request_id.clone(),
+                    disposition,
+                })
+            });
+        }
+    }
+
+    async fn drive_until_terminal(&mut self) -> Option<RuntimeChatTeardownDisposition> {
+        let mut completion_result = None;
+        let invocation_deadline = self.deadline;
+        let deadline_wait = async move {
+            match invocation_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline_wait);
+
+        loop {
+            if self.cancellation.load(Ordering::Acquire) || self.events.is_closed() {
+                return self.cancel_and_confirm().await;
+            }
+
+            if self.stream_order.is_none() && completion_result.is_some() {
+                return self
+                    .finish_completion(completion_result.take().expect("checked completion"))
+                    .await;
+            } else if self.stream.is_none() {
+                if let Some(completion) = completion_result.take() {
+                    let Some(stream_order) = self.stream_order.as_ref() else {
+                        unreachable!("non-streaming invocation handled above");
+                    };
+                    if let Err(error) = stream_order.require_final(&self.request_id) {
+                        return self.fail_and_confirm(error).await;
+                    }
+                    return self.finish_completion(completion).await;
+                }
+            }
+
+            tokio::select! {
+                _ = self.cancellation_wakeup.notified() => {
+                    if self.cancellation.load(Ordering::Acquire) || self.events.is_closed() {
+                        return self.cancel_and_confirm().await;
+                    }
+                }
+                _ = &mut deadline_wait => {
+                    self.cancellation.store(true, Ordering::Release);
+                    let error = Error::Timeout(self.request_id.clone());
+                    let disposition = self.cancel_and_confirm().await;
+                    if disposition.is_some() {
+                        let _ = self.try_send_event(Err(error));
+                    }
+                    return disposition;
+                }
+                completion = &mut self.completion, if completion_result.is_none() => {
+                    completion_result = Some(match completion {
+                        Ok(result) => RuntimeChatCompletion::Delivered(result),
+                        Err(_) => RuntimeChatCompletion::ChannelClosed,
+                    });
+                }
+                chunk = async {
+                    match self.stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.stream.is_some() => {
+                    match chunk {
+                        Some(chunk) => {
+                            let observed = self
+                                .stream_order
+                                .as_mut()
+                                .expect("streaming invocation has output order")
+                                .observe(&self.request_id, &chunk);
+                            if let Err(error) = observed {
+                                return self.fail_and_confirm(error).await;
+                            }
+                            if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
+                                self.streamed_text.push_str(&delta);
+                                if !self.try_send_event(Ok(
+                                    RuntimeChatInvocationEvent::TextDelta {
+                                        text: delta,
+                                        logprobs: chunk.logprobs.clone(),
+                                    },
+                                )) {
+                                    return self.cancel_and_confirm().await;
+                                }
+                            }
+                        }
+                        None => {
+                            self.stream = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn invocation_chat_generation(
+    streamed_text: &mut String,
+    output: &EngineOutput,
+) -> Result<ChatGeneration> {
+    let terminal_text = output.text.clone();
+    let text = if streamed_text.is_empty() {
+        terminal_text.unwrap_or_default()
+    } else if terminal_text
+        .as_ref()
+        .is_none_or(|terminal| terminal.is_empty() || terminal == streamed_text)
+    {
+        std::mem::take(streamed_text)
+    } else {
+        return Err(Error::InferenceError(format!(
+            "Streaming chat text did not match terminal output (streamed {} bytes, terminal {} bytes)",
+            streamed_text.len(),
+            terminal_text.as_ref().map_or(0, String::len)
+        )));
+    };
+    Ok(ChatGeneration {
+        latency_breakdown: output.latency_breakdown.clone(),
+        finish_reason: output.finish_reason,
+        text,
+        prompt_tokens: output.token_stats.prompt_tokens,
+        tokens_generated: output.num_tokens,
+        generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+        cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+        logprobs: output.logprobs.clone(),
+    })
+}
+
+fn engine_output_observation(
+    context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    output: &EngineOutput,
+) -> RuntimeStageObservation {
+    let mut timing = RuntimeStageTiming {
+        admission_ms,
+        total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
+        ..RuntimeStageTiming::default()
+    };
+    if let Some(latency) = output.latency_breakdown.as_ref() {
+        timing.queue_wait_ms = Some(latency.queue_wait_ms);
+        timing.media_decode_ms = latency.media_decode_ms;
+        timing.normalization_ms = latency.normalization_ms;
+        timing.prefill_ms = Some(latency.prefill_ms);
+        timing.decode_ms = Some(latency.decode_ms);
+        timing.ttft_ms = latency.ttft_ms;
+        timing.sampling_ms = latency.sampling_ms;
+        timing.codec_ms = latency.codec_ms;
+        timing.postprocess_ms = latency.postprocess_ms;
+        timing.total_ms = Some(latency.total_ms);
+    }
+
+    let outcome = if output.error.is_some() {
+        RuntimeStageOutcome::Failed
+    } else {
+        RuntimeStageOutcome::Completed
+    };
+    let mut observation = RuntimeStageObservation::new(context, outcome);
+    observation.timing = timing;
+    observation.outputs = RuntimeStageOutputCounters {
+        prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
+        generated_tokens: Some(output.token_stats.generated_tokens as u64),
+        audio_samples: Some(output.audio.samples.len() as u64),
+        transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
+        stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
+        ..RuntimeStageOutputCounters::default()
+    };
+    if let Some(error) = output.error.as_ref() {
+        observation.error_kind = Some(error.clone());
+    }
+    observation
+}
+
+fn engine_error_observation(
+    context: RuntimeObservationContext,
+    admission_ms: Option<f64>,
+    error_kind: impl Into<String>,
+) -> RuntimeStageObservation {
+    let mut observation = RuntimeStageObservation::new(context, RuntimeStageOutcome::Failed)
+        .with_error_kind(error_kind);
+    observation.timing.admission_ms = admission_ms;
+    observation
+}
+
 impl RuntimeService {
     pub fn backend_context(&self) -> crate::backends::BackendContext {
         self.backend_router.context().clone()
@@ -2413,17 +2944,72 @@ impl RuntimeService {
     /// Create a new inference engine.
     pub fn new(mut config: EngineConfig) -> Result<Self> {
         config.performance = config.performance.resolve_env()?;
+        let backend_context =
+            BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
+        Self::ensure_requested_backend_available(&backend_context)?;
+        Self::new_with_backend_context(config, backend_context)
+    }
+
+    /// Create a production worker runtime on exactly the supervisor-assigned device.
+    pub fn new_assigned(
+        mut config: EngineConfig,
+        assignment: RuntimeDeviceAssignment,
+    ) -> Result<Self> {
+        config.performance = config.performance.resolve_env()?;
+        let backend_context =
+            BackendRouter::resolve_assigned_context(&assignment, BackendSelectionSource::Config)?;
+        config.backend = BackendPreference::from(assignment.backend_kind());
+        Self::new_with_backend_context(config, backend_context)
+    }
+
+    fn new_with_backend_context(
+        mut config: EngineConfig,
+        backend_context: crate::backends::BackendContext,
+    ) -> Result<Self> {
+        // Resolve catalog-auto prefix reuse (DS1.6) once, before the fail-closed
+        // cache-policy boundary: explicit operator enablement keeps its salt
+        // contract, catalog-auto engages with the operator namespace or a
+        // generated per-process one, and the registry consults the catalog cell
+        // of each loaded family on the active backend.
+        let prefix_reuse_mode = if config.enable_prefix_caching {
+            crate::catalog::PrefixReuseMode::Explicit
+        } else if config.prefix_reuse_catalog_auto {
+            crate::catalog::PrefixReuseMode::CatalogAuto
+        } else {
+            crate::catalog::PrefixReuseMode::Disabled
+        };
+        let (prefix_engaged, prefix_namespace) = crate::config::resolve_prefix_engagement(
+            config.enable_prefix_caching,
+            config.prefix_reuse_catalog_auto,
+            config.managed_prefix_cache_salt.as_deref(),
+        );
+        if prefix_engaged {
+            config.enable_prefix_caching = true;
+            if let Some(namespace) = prefix_namespace {
+                config.managed_prefix_cache_salt = Some(namespace);
+            }
+        }
+        // The auto flag stays set for catalog-auto engagements so the policy
+        // resolver can degrade instead of failing startup on a zero budget.
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
         let cache_policy =
             config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
+        if prefix_engaged
+            && matches!(
+                cache_policy.effective.prefix,
+                crate::config::PrefixCachePolicy::Disabled
+            )
+        {
+            // Catalog-auto degraded on this runtime's page budget; the
+            // resolved policy is the truth for the engine core as well.
+            config.enable_prefix_caching = false;
+            config.managed_prefix_cache_salt = None;
+        }
         configure_runtime_threading(config.num_threads.max(1));
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
-        let backend_context =
-            BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
         let device = backend_context.device.clone();
-        Self::ensure_requested_backend_available(&backend_context)?;
         let selected_backend_kind = backend_context.backend_kind;
         // Zero means automatic administrative capacity, not zero usable rows.
         // This is only an upper bound: each loaded model fits exact physical state.
@@ -2447,11 +3033,14 @@ impl RuntimeService {
             }
         }
 
-        let model_registry = Arc::new(ModelRegistry::new_with_performance(
-            config.models_dir.clone(),
-            device.clone(),
-            config.performance.clone(),
-        ));
+        let model_registry = Arc::new(
+            ModelRegistry::new_with_performance(
+                config.models_dir.clone(),
+                device.clone(),
+                config.performance.clone(),
+            )
+            .with_prefix_reuse_mode(prefix_reuse_mode),
+        );
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();
         core_config.portable_context_auto = config.max_sequence_length.explicit_tokens().is_none();
@@ -2472,12 +3061,24 @@ impl RuntimeService {
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
+        // Prefix engagement is fully resolved above (the engine core reuses
+        // the resolved namespace verbatim), but the auto marker is carried so
+        // the core's own budget check degrades instead of failing startup.
+        core_config.prefix_reuse_catalog_auto = config.prefix_reuse_catalog_auto;
         core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
             PrefixCachePolicy::Disabled => 0,
             PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
         };
         core_config.enable_chunked_prefill = config.enable_chunked_prefill;
         core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
+        // DS4 hierarchical offload: explicit opt-in through the host pool
+        // budget; the manager materializes pools only where committed prefix
+        // pages exist.
+        core_config.kv_host_pool_budget_bytes = config.kv_host_pool_budget_bytes;
+        core_config.kv_offload_high_watermark = config.kv_offload_high_watermark;
+        core_config.kv_offload_low_watermark = config.kv_offload_low_watermark;
+        core_config.kv_offload_max_in_flight_pages = config.kv_offload_max_in_flight_pages;
+        core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
         worker_config.models_dir = config.models_dir.clone();
@@ -3077,46 +3678,12 @@ impl RuntimeService {
         output: &EngineOutput,
         streaming: bool,
     ) {
-        let mut timing = RuntimeStageTiming {
-            admission_ms: request.admission_ms,
-            total_ms: Some(output.generation_time.as_secs_f64() * 1000.0),
-            ..RuntimeStageTiming::default()
-        };
-        if let Some(latency) = output.latency_breakdown.as_ref() {
-            timing.queue_wait_ms = Some(latency.queue_wait_ms);
-            timing.media_decode_ms = latency.media_decode_ms;
-            timing.normalization_ms = latency.normalization_ms;
-            timing.prefill_ms = Some(latency.prefill_ms);
-            timing.decode_ms = Some(latency.decode_ms);
-            timing.ttft_ms = latency.ttft_ms;
-            timing.sampling_ms = latency.sampling_ms;
-            timing.codec_ms = latency.codec_ms;
-            timing.postprocess_ms = latency.postprocess_ms;
-            timing.total_ms = Some(latency.total_ms);
-        }
-
-        let outcome = if output.error.is_some() {
-            RuntimeStageOutcome::Failed
-        } else {
-            RuntimeStageOutcome::Completed
-        };
-        let mut observation = RuntimeStageObservation::new(
-            self.engine_observation_context(request, streaming),
-            outcome,
-        );
-        observation.timing = timing;
-        observation.outputs = RuntimeStageOutputCounters {
-            prompt_tokens: Some(output.token_stats.prompt_tokens as u64),
-            generated_tokens: Some(output.token_stats.generated_tokens as u64),
-            audio_samples: Some(output.audio.samples.len() as u64),
-            transcript_chars: output.text.as_ref().map(|text| text.chars().count() as u64),
-            stop_reason: output.finish_reason.map(|reason| format!("{reason:?}")),
-            ..RuntimeStageOutputCounters::default()
-        };
-        if let Some(error) = output.error.as_ref() {
-            observation.error_kind = Some(error.clone());
-        }
-        self.telemetry.record_stage_observation(observation);
+        self.telemetry
+            .record_stage_observation(engine_output_observation(
+                self.engine_observation_context(request, streaming),
+                request.admission_ms,
+                output,
+            ));
     }
 
     fn record_engine_error_observation(
@@ -3125,13 +3692,12 @@ impl RuntimeService {
         streaming: bool,
         error_kind: impl Into<String>,
     ) {
-        let mut observation = RuntimeStageObservation::new(
-            self.engine_observation_context(request, streaming),
-            RuntimeStageOutcome::Failed,
-        )
-        .with_error_kind(error_kind);
-        observation.timing.admission_ms = request.admission_ms;
-        self.telemetry.record_stage_observation(observation);
+        self.telemetry
+            .record_stage_observation(engine_error_observation(
+                self.engine_observation_context(request, streaming),
+                request.admission_ms,
+                error_kind,
+            ));
     }
 
     pub(crate) fn coordinator_job_for_input(
@@ -3504,6 +4070,7 @@ impl RuntimeService {
             bundle.as_deref(),
             capability,
             streaming_required,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(expected_target),
@@ -3518,6 +4085,7 @@ impl RuntimeService {
         capability: CapabilityKind,
         streaming_required: bool,
         expected_target: ExecutionTargetKind,
+        options: CapabilityLoadOptions,
     ) -> Result<(
         ModelResidencyLease,
         LoadedExecutionContract,
@@ -3530,6 +4098,7 @@ impl RuntimeService {
             bundle.as_deref(),
             capability,
             streaming_required,
+            options.asr_long_form,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(expected_target),
@@ -3585,6 +4154,165 @@ impl RuntimeService {
             .await
     }
 
+    /// Establish an exact Engine session for a prepared chat invocation.
+    ///
+    /// Returning from this method is the worker acceptance boundary. All
+    /// admission and model residency is transferred to a background driver so
+    /// dropping the returned transport handle cannot release capacity early.
+    pub(crate) async fn start_admitted_chat_invocation(
+        &self,
+        admitted: AdmittedEngineRequest,
+    ) -> Result<RuntimeChatInvocation> {
+        let AdmittedEngineRequest {
+            mut request,
+            job,
+            residency_lease,
+        } = admitted;
+        let streaming = request.streaming;
+        self.observe_broker_request(&request)?;
+        let (prepared, job) = self
+            .prepare_request_for_binding(request, job, Some(&residency_lease))
+            .await?;
+        request = prepared;
+        let loaded_bundle = self
+            .model_lifecycle
+            .try_get_ready_bundle(residency_lease.variant());
+        bind_request_to_residency(
+            &mut request,
+            Some(&residency_lease),
+            loaded_bundle.as_deref(),
+            streaming,
+        )?;
+        if job.spec.request_id != request.id || job.spec.deadline != request.deadline {
+            return Err(Error::InvalidInput(
+                "chat invocation does not match its coordinator admission".to_string(),
+            ));
+        }
+
+        let observation_context = self.engine_observation_context(&request, streaming);
+        let admission_ms = request.admission_ms;
+        self.ensure_step_driver_started().await;
+        let request_id = request.id.clone();
+        let deadline = request.deadline;
+        let stream_policy = request.stream_policy;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        request.set_cancellation_signal(cancellation.clone());
+        let (waiter_registration_id, completion) = self.register_waiter(&request_id).await?;
+        let mut waiter_guard = WaiterRegistrationGuard::new(
+            request_id.clone(),
+            waiter_registration_id,
+            self.completion_waiters.clone(),
+        );
+
+        let (session, stream) = if streaming {
+            match self
+                .await_engine_admission_for_job(
+                    &job,
+                    self.core_engine.generate_streaming_with_session(request),
+                )
+                .await
+            {
+                Ok((session, stream)) => (session, Some(stream)),
+                Err(error) => {
+                    self.remove_waiter(&request_id, waiter_registration_id)
+                        .await;
+                    waiter_guard.disarm();
+                    return Err(error);
+                }
+            }
+        } else {
+            match self
+                .await_engine_admission_for_job(
+                    &job,
+                    self.core_engine.add_request_with_session(request),
+                )
+                .await
+            {
+                Ok(session) => (session, None),
+                Err(error) => {
+                    self.remove_waiter(&request_id, waiter_registration_id)
+                        .await;
+                    waiter_guard.disarm();
+                    return Err(error);
+                }
+            }
+        };
+
+        let mut guard = PendingRequestGuard::new(
+            session,
+            self.core_engine.clone(),
+            self.completion_waiters.clone(),
+            waiter_registration_id,
+            self.telemetry.clone(),
+            job,
+            Some(residency_lease),
+        );
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            let timeout = Error::Timeout(request_id.clone());
+            return match guard.confirm_cleanup().await {
+                Ok(_) => Err(timeout),
+                Err(cleanup_error) => Ok(RuntimeChatInvocation::from_failed_post_admission(
+                    request_id,
+                    cancellation,
+                    guard,
+                    Error::InferenceError(format!(
+                        "{timeout}; exact-session cleanup was not confirmed: {cleanup_error}"
+                    )),
+                )),
+            };
+        }
+        if let Err(bind_error) = self
+            .bind_waiter(&request_id, waiter_registration_id, guard.session.epoch)
+            .await
+        {
+            waiter_guard.disarm();
+            return match guard.confirm_cleanup().await {
+                Ok(_) => Err(bind_error),
+                Err(cleanup_error) => Ok(RuntimeChatInvocation::from_failed_post_admission(
+                    request_id,
+                    cancellation,
+                    guard,
+                    Error::InferenceError(format!(
+                        "{bind_error}; exact-session cleanup was not confirmed: {cleanup_error}"
+                    )),
+                )),
+            };
+        }
+        waiter_guard.disarm();
+        self.telemetry.record_request_queued(&request_id).await;
+
+        let (event_sender, events) = mpsc::channel(RUNTIME_CHAT_INVOCATION_EVENT_CAPACITY);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let cancellation_wakeup = Arc::new(Notify::new());
+        let driver = RuntimeChatInvocationDriver {
+            request_id: request_id.clone(),
+            deadline,
+            observation_context,
+            admission_ms,
+            telemetry: self.telemetry.clone(),
+            cancellation: cancellation.clone(),
+            cancellation_wakeup: cancellation_wakeup.clone(),
+            events: event_sender,
+            teardown: Some(teardown_sender),
+            completion,
+            stream,
+            stream_order: streaming.then(|| StreamOutputOrder::new(stream_policy)),
+            streamed_text: String::new(),
+            guard,
+        };
+        tokio::spawn(driver.drive());
+        self.step_driver_wakeup.notify_one();
+
+        Ok(RuntimeChatInvocation {
+            request_id,
+            cancellation,
+            cancellation_wakeup,
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        })
+    }
+
     async fn prepare_qwen3_asr_shape_for_binding(
         &self,
         request: EngineCoreRequest,
@@ -3618,6 +4346,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -3637,10 +4366,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 let geometry = (!long_form)
                     .then(|| {
@@ -3842,6 +4580,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -3859,10 +4598,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 let geometry = (!long_form)
                     .then(|| {
@@ -4075,6 +4823,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -4284,6 +5033,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -4303,10 +5053,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+                    model_for_shape.max_audio_seconds_hint(),
+                    model_for_shape.audio_token_rate(),
+                    Some(context_limit),
+                    |_| {
+                        crate::models::registry::NativeAsrGenerationOptions::default()
+                            .max_new_tokens
+                    },
+                )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,
                     sample_rate,
-                    model_for_shape.max_audio_seconds_hint(),
+                    audio_limit_secs,
                 );
                 // Granite's retained decoder is not quality-certified: the
                 // real model can collapse to tokenizer id 0 for every output
@@ -4496,6 +5255,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -4757,6 +5517,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Asr,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -4981,6 +5742,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -5161,6 +5923,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -5361,6 +6124,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -5592,6 +6356,7 @@ impl RuntimeService {
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
             false,
+            false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
@@ -5752,6 +6517,7 @@ impl RuntimeService {
             residency,
             loaded_bundle.as_deref(),
             CapabilityKind::Tts,
+            false,
             false,
             self.coordinator.execution_group_id(),
             self.backend_router.context().backend_kind,
@@ -6593,6 +7359,32 @@ impl RuntimeService {
             ENGINE_KV_CACHE_EVICTIONS_TOTAL,
             snapshot.kv_cache.counters.prefix_evictions,
         );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_HOST_PAGES,
+            snapshot.kv_cache.counters.kv_host_pages,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_DEMOTIONS_TOTAL,
+            snapshot.kv_cache.counters.demotions_total,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_PROMOTIONS_TOTAL,
+            snapshot.kv_cache.counters.promotions_total,
+        );
+        push_engine_metric_f64(
+            payload,
+            ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
+            if snapshot.kv_cache.counters.promotions_total > 0 {
+                snapshot.kv_cache.counters.promotion_latency_ns_total as f64
+                    / snapshot.kv_cache.counters.promotions_total as f64
+                    / 1e9
+            } else {
+                0.0
+            },
+        );
         push_engine_labeled_metric(
             payload,
             ENGINE_KV_CACHE_ALLOCATED_BLOCKS,
@@ -7063,6 +7855,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_chat_handle_cancellation_is_idempotent_and_teardown_is_explicit() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_wakeup = Arc::new(Notify::new());
+        let wakeup_observer = cancellation_wakeup.clone();
+        let (_event_sender, events) = mpsc::channel(1);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let handle = RuntimeChatInvocation {
+            request_id: "serving-request".into(),
+            cancellation: cancellation.clone(),
+            cancellation_wakeup,
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        };
+
+        assert!(handle.request_cancel());
+        assert!(!handle.request_cancel());
+        tokio::time::timeout(Duration::from_millis(50), wakeup_observer.notified())
+            .await
+            .expect("cancellation wakeup must persist until the driver observes it");
+        teardown_sender
+            .send(RuntimeChatTeardown {
+                request_id: "serving-request".into(),
+                disposition: RuntimeChatTeardownDisposition::Cancelled,
+            })
+            .unwrap();
+
+        let confirmed = handle.wait_for_teardown().await.unwrap();
+        assert_eq!(confirmed.request_id, "serving-request");
+        assert_eq!(
+            confirmed.disposition,
+            RuntimeChatTeardownDisposition::Cancelled
+        );
+        assert!(cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_runtime_chat_handle_requests_cancellation() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_event_sender, events) = mpsc::channel(1);
+        let (_teardown_sender, teardown) = oneshot::channel();
+        let handle = RuntimeChatInvocation {
+            request_id: "disconnected-request".into(),
+            cancellation: cancellation.clone(),
+            cancellation_wakeup: Arc::new(Notify::new()),
+            events,
+            teardown: Some(teardown),
+            cancel_on_drop: true,
+        };
+
+        drop(handle);
+
+        assert!(cancellation.load(Ordering::Acquire));
+    }
+
     fn terminal_output(reason: ExecutionFinishReason) -> EngineOutput {
         OutputProcessor::new(24_000).process_execution(
             ExecutorOutput::terminal("terminal-request".to_string()),
@@ -7080,37 +7928,29 @@ mod tests {
         order.observe(request_id, &first).unwrap();
 
         let duplicate = StreamingOutput::new(request_id.to_string(), 0, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &duplicate)
-                .unwrap_err()
-                .to_string()
-                .contains("not greater")
-        );
+        assert!(order
+            .observe(request_id, &duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("not greater"));
         let wrong_request = StreamingOutput::new("stale".to_string(), 1, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &wrong_request)
-                .unwrap_err()
-                .to_string()
-                .contains("carried request ID")
-        );
-        assert!(
-            order
-                .require_final(request_id)
-                .unwrap_err()
-                .to_string()
-                .contains("without a final marker")
-        );
+        assert!(order
+            .observe(request_id, &wrong_request)
+            .unwrap_err()
+            .to_string()
+            .contains("carried request ID"));
+        assert!(order
+            .require_final(request_id)
+            .unwrap_err()
+            .to_string()
+            .contains("without a final marker"));
 
         let gap = StreamingOutput::new(request_id.to_string(), 4, Vec::new(), 0);
-        assert!(
-            order
-                .observe(request_id, &gap)
-                .unwrap_err()
-                .to_string()
-                .contains("did not match expected 1")
-        );
+        assert!(order
+            .observe(request_id, &gap)
+            .unwrap_err()
+            .to_string()
+            .contains("did not match expected 1"));
 
         // Gaps remain valid only for an explicitly lossy DropNewest transport,
         // while every observed sequence must still advance monotonically.
@@ -7122,13 +7962,11 @@ mod tests {
         order.require_final(request_id).unwrap();
 
         let after_final = StreamingOutput::new(request_id.to_string(), 5, vec![0.0], 24_000);
-        assert!(
-            order
-                .observe(request_id, &after_final)
-                .unwrap_err()
-                .to_string()
-                .contains("after its final marker")
-        );
+        assert!(order
+            .observe(request_id, &after_final)
+            .unwrap_err()
+            .to_string()
+            .contains("after its final marker"));
     }
 
     #[test]
@@ -7263,6 +8101,7 @@ mod tests {
             Some(&bundle),
             CapabilityKind::Tts,
             false,
+            false,
             crate::engine::ExecutionGroupId::new(3),
             BackendKind::Cpu,
             None,
@@ -7292,6 +8131,7 @@ mod tests {
             Some(&bundle),
             CapabilityKind::StreamingTts,
             false,
+            false,
             group,
             BackendKind::Cpu,
             Some(ExecutionTargetKind::DirectModel),
@@ -7300,30 +8140,28 @@ mod tests {
         assert_eq!(contract.model_instance_id, instance);
         assert_eq!(contract.execution_group_id, group);
 
-        assert!(
-            loaded_contract_for_residency(
-                &lease,
-                Some(&bundle),
-                CapabilityKind::StreamingTts,
-                false,
-                group,
-                BackendKind::Cpu,
-                Some(ExecutionTargetKind::TokenEngine),
-            )
-            .is_err()
-        );
-        assert!(
-            loaded_contract_for_residency(
-                &lease,
-                Some(&bundle),
-                CapabilityKind::StreamingTts,
-                false,
-                crate::engine::ExecutionGroupId::new(group.get() + 1),
-                BackendKind::Cpu,
-                Some(ExecutionTargetKind::DirectModel),
-            )
-            .is_err()
-        );
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::StreamingTts,
+            false,
+            false,
+            group,
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::TokenEngine),
+        )
+        .is_err());
+        assert!(loaded_contract_for_residency(
+            &lease,
+            Some(&bundle),
+            CapabilityKind::StreamingTts,
+            false,
+            false,
+            crate::engine::ExecutionGroupId::new(group.get() + 1),
+            BackendKind::Cpu,
+            Some(ExecutionTargetKind::DirectModel),
+        )
+        .is_err());
     }
 
     async fn pending_streaming_guard_fixture(
@@ -7404,13 +8242,11 @@ mod tests {
 
         assert!(matches!(duplicate, Err(Error::InvalidInput(_))));
         assert_eq!(runtime.completion_waiters.lock().await.len(), 1);
-        assert!(
-            runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key("same-request")
-        );
+        assert!(runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key("same-request"));
         drop(original);
         runtime
             .remove_waiter("same-request", original_registration)
@@ -7624,12 +8460,10 @@ mod tests {
         step_entered_rx.await.expect("step lock was not acquired");
 
         drop(guard);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("cleanup did not remove its waiter before exact abort")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("cleanup did not remove its waiter before exact abort")
+            .is_err());
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -7707,13 +8541,11 @@ mod tests {
             "the core lock was released too early"
         );
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
-        assert!(
-            !runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key(&request_id)
-        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
 
         release_step_tx.send(()).expect("release step lock");
         step_lock.await.expect("step-lock task");
@@ -7802,13 +8634,11 @@ mod tests {
                 .active_residency_leases(residency_variant),
             0
         );
-        assert!(
-            !runtime
-                .completion_waiters
-                .lock()
-                .await
-                .contains_key(&request_id)
-        );
+        assert!(!runtime
+            .completion_waiters
+            .lock()
+            .await
+            .contains_key(&request_id));
 
         release_step_tx.send(()).expect("release step lock");
         step_lock.await.expect("step-lock task");
@@ -7864,13 +8694,11 @@ mod tests {
                 runtime.core_engine.request_session_key(&request_id).await,
                 None
             );
-            assert!(
-                !runtime
-                    .completion_waiters
-                    .lock()
-                    .await
-                    .contains_key(&request_id)
-            );
+            assert!(!runtime
+                .completion_waiters
+                .lock()
+                .await
+                .contains_key(&request_id));
         }
     }
 
@@ -7975,12 +8803,10 @@ mod tests {
             !callback_invoked.load(Ordering::Acquire),
             "an expired request invoked synchronous callback code"
         );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("deadline cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if runtime.coordinator_snapshot().active_jobs == 0
@@ -8023,12 +8849,10 @@ mod tests {
         .expect("hung callback outlived the absolute request deadline")
         .expect_err("hung callback unexpectedly succeeded");
         assert!(matches!(err, Error::Timeout(id) if id == request_id));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("deadline cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("deadline cleanup did not remove its exact waiter")
+            .is_err());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if runtime.coordinator_snapshot().active_jobs == 0
@@ -8083,12 +8907,10 @@ mod tests {
         .expect("callback failure waited for the in-flight core step")
         .expect_err("failing callback unexpectedly succeeded");
         assert!(err.to_string().contains("streaming callback failed"));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), receiver)
-                .await
-                .expect("detached cleanup did not remove its exact waiter")
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("detached cleanup did not remove its exact waiter")
+            .is_err());
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8163,12 +8985,10 @@ mod tests {
 
         tokio::task::yield_now().await;
         cleanup.abort();
-        assert!(
-            cleanup
-                .await
-                .expect_err("cleanup task unexpectedly completed")
-                .is_cancelled()
-        );
+        assert!(cleanup
+            .await
+            .expect_err("cleanup task unexpectedly completed")
+            .is_cancelled());
         assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8188,13 +9008,11 @@ mod tests {
             .await
         );
         assert!(receiver.await.is_err());
-        assert!(
-            runtime
-                .core_engine
-                .abort_request_session(&session)
-                .await
-                .expect("manual exact abort")
-        );
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&session)
+            .await
+            .expect("manual exact abort"));
         assert_eq!(isolated_coordinator.snapshot().active_jobs, 1);
         assert_eq!(
             runtime
@@ -8464,13 +9282,11 @@ mod tests {
             None,
         );
 
-        assert!(
-            runtime
-                .core_engine
-                .abort_request_session(&old_session)
-                .await
-                .expect("old exact abort")
-        );
+        assert!(runtime
+            .core_engine
+            .abort_request_session(&old_session)
+            .await
+            .expect("old exact abort"));
         let old_terminal = runtime
             .core_engine
             .step_for_dispatch()
@@ -8604,11 +9420,23 @@ mod tests {
         assert!(message.contains("no usable CUDA device"));
     }
 
+    #[test]
+    fn assigned_cpu_runtime_uses_exact_production_selection() {
+        let runtime =
+            RuntimeService::new_assigned(EngineConfig::default(), RuntimeDeviceAssignment::Cpu)
+                .expect("assigned CPU runtime");
+
+        let context = runtime.backend_context();
+        assert_eq!(context.backend_kind, BackendKind::Cpu);
+        assert_eq!(context.preference, BackendPreference::Cpu);
+        assert!(context.reason.contains("exact cpu device"));
+    }
+
     #[tokio::test]
     async fn runtime_concurrency_metrics_preserve_real_width_and_recovery_counts() {
         use crate::engine::metrics::{
-            EngineModelCall, record_capacity_replay, record_capacity_suspension,
-            record_engine_model_call,
+            record_capacity_replay, record_capacity_suspension, record_engine_model_call,
+            EngineModelCall,
         };
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let before = runtime.engine_telemetry_snapshot().await;
@@ -8643,13 +9471,9 @@ mod tests {
             serde_json::json!(after.capacity_replay_tokens_total)
         );
         let payload = runtime.telemetry_prometheus().await;
-        assert!(
-            payload
-                .contains("izwi_engine_executor_model_tensor_batch_width_calls_total{width=\"3\"}")
-        );
-        assert!(
-            payload.contains("# TYPE izwi_engine_scheduler_capacity_suspensions_total counter")
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_model_tensor_batch_width_calls_total{width=\"3\"}"));
+        assert!(payload.contains("# TYPE izwi_engine_scheduler_capacity_suspensions_total counter"));
         assert!(
             payload.contains("# TYPE izwi_engine_scheduler_capacity_replay_tokens_total counter")
         );
@@ -8663,22 +9487,16 @@ mod tests {
 
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
-        assert!(
-            payload
-                .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}")
-        );
-        assert!(
-            payload
-                .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}")
-        );
+        assert!(payload
+            .contains("izwi_engine_kv_cache_allocated_blocks{accounting=\"physical_pages\"}"));
+        assert!(payload
+            .contains("izwi_engine_kv_cache_utilization_ratio{accounting=\"physical_pages\"}"));
         assert!(payload.contains(
             "izwi_engine_kv_cache_memory_capacity_bytes{accounting=\"resident_paged_plus_authorized_tensor\"}"
         ));
         assert!(payload.contains("allocated physical KV-cache pages"));
-        assert!(
-            payload
-                .contains("Resident managed KV pages plus authorized retained tensor-state bytes")
-        );
+        assert!(payload
+            .contains("Resident managed KV pages plus authorized retained tensor-state bytes"));
         assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
         assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
@@ -8700,22 +9518,15 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_rows_total"));
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_max_width"));
         assert!(payload.contains("izwi_engine_executor_model_scalar_row_dispatches_total"));
-        assert!(
-            payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total")
-        );
+        assert!(payload.contains("izwi_engine_executor_continuous_envelope_scalar_fallbacks_total"));
         assert!(payload.contains("izwi_engine_executor_physical_batch_rejections_total"));
-        assert!(
-            payload
-                .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}")
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_dispatch_state_rows_total{state=\"not_started\"}"));
         assert!(
             payload.contains("izwi_engine_executor_failure_origin_rows_total{origin=\"model\"}")
         );
-        assert!(
-            payload.contains(
-                "izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"
-            )
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_deadline_phase_rows_total{phase=\"dispatch_wait\"}"));
         assert!(payload.contains(
             "izwi_engine_executor_batch_workspace_domain_bytes_total{domain=\"device\"}"
         ));
@@ -8728,11 +9539,8 @@ mod tests {
         assert!(payload.contains(
             "izwi_engine_executor_physical_fallbacks_total{reason=\"uncertified_profile\"}"
         ));
-        assert!(
-            payload.contains(
-                "izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"
-            )
-        );
+        assert!(payload
+            .contains("izwi_engine_executor_physical_defers_total{reason=\"workspace_capacity\"}"));
         assert!(payload.contains(
             "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"}"
         ));
@@ -8793,12 +9601,10 @@ mod tests {
 
         assert!(runtime.is_draining());
         assert!(runtime.telemetry_snapshot().await.coordinator.draining);
-        assert!(
-            runtime
-                .telemetry_prometheus()
-                .await
-                .contains("izwi_inference_coordinator_draining 1")
-        );
+        assert!(runtime
+            .telemetry_prometheus()
+            .await
+            .contains("izwi_inference_coordinator_draining 1"));
     }
 
     #[test]

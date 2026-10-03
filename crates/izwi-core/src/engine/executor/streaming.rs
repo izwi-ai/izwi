@@ -381,6 +381,36 @@ impl NativeExecutor {
                 text: Some(text),
                 stats: None,
                 asr_progress: None,
+                logprobs: Vec::new(),
+            },
+            policy,
+        )?;
+        if outcome == StreamPushOutcome::Accepted {
+            *sequence += 1;
+        }
+        Ok(())
+    }
+
+    /// DS9.3: stream a chat text delta with its per-token logprob entries.
+    pub(super) fn stream_chat_text_with_policy(
+        tx: &StreamStagingBuffer,
+        policy: StreamBackpressurePolicy,
+        request_id: &str,
+        sequence: &mut usize,
+        text: String,
+        logprobs: Vec<crate::engine::TokenLogprob>,
+    ) -> Result<()> {
+        let outcome = tx.push_with_policy(
+            StreamingOutput {
+                request_id: request_id.to_string(),
+                sequence: *sequence,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: Some(text),
+                stats: None,
+                asr_progress: None,
+                logprobs,
             },
             policy,
         )?;
@@ -460,6 +490,7 @@ impl NativeExecutor {
                 text: None,
                 stats: None,
                 asr_progress: None,
+                logprobs: Vec::new(),
             },
             policy,
         )?;
@@ -486,6 +517,7 @@ impl NativeExecutor {
                 text: None,
                 stats: None,
                 asr_progress: Some(progress),
+                logprobs: Vec::new(),
             },
             policy,
         )?;
@@ -562,6 +594,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         }
     }
 

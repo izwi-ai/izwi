@@ -31,13 +31,14 @@ import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode
 import {
   collectManagedModels,
   filterAndSortModels,
-  isDiarizationPipelineAlignerVariant,
-  isDiarizationPipelineAsrVariant,
-  isDiarizationPipelineLlmVariant,
-  isDiarizationVariant,
+  isDiarizationPipelineAlignerModel,
+  isDiarizationPipelineAsrModel,
+  isDiarizationPipelineLlmModel,
+  isDiarizationModel,
   isSpeakerAttributedAsrVariant,
-  isTranscriptionAlignerVariant,
-  isTranscriptionSummaryVariant,
+  isTranscriptionAlignerModel,
+  isTranscriptionSummaryModel,
+  resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useTranscriptionHistory } from "@/features/transcription/hooks/useTranscriptionHistory";
 import { useTranscriptionRecord } from "@/features/transcription/hooks/useTranscriptionRecord";
@@ -101,31 +102,31 @@ export function TranscriptionPage({
     useState<ModelModalContext>("transcription");
   const viewConfig = VIEW_CONFIGS.transcription;
   const transcriptionAlignerModels = useMemo(
-    () => filterAndSortModels(models, isTranscriptionAlignerVariant),
+    () => filterAndSortModels(models, isTranscriptionAlignerModel),
     [models],
   );
   const transcriptionSummaryModels = useMemo(
-    () => filterAndSortModels(models, isTranscriptionSummaryVariant),
+    () => filterAndSortModels(models, isTranscriptionSummaryModel),
     [models],
   );
   const diarizationModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationVariant),
+    () => filterAndSortModels(models, isDiarizationModel),
     [models],
   );
   const speakerAttributedAsrModels = useMemo(
-    () => filterAndSortModels(models, isSpeakerAttributedAsrVariant),
+    () => filterAndSortModels(models, (model) => isSpeakerAttributedAsrVariant(model.variant)),
     [models],
   );
   const diarizationAsrPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrModel),
     [models],
   );
   const diarizationAlignerPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerModel),
     [models],
   );
   const diarizationLlmPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmModel),
     [models],
   );
   const {
@@ -224,11 +225,10 @@ export function TranscriptionPage({
   );
   const resolvedDiarizationModel = useMemo(
     () =>
-      resolvePreferredRouteModel({
+      resolveDiarizationRouteModel({
         models: diarizationModels,
         selectedModel,
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
     [diarizationModels, selectedModel],
   );
@@ -321,12 +321,6 @@ export function TranscriptionPage({
   const readyDiarizationManagedModelCount = diarizationManagedModels.filter(
     (model) => model.status === "ready",
   ).length;
-  const canLoadAnyDiarizationManagedModels = diarizationManagedModels.some(
-    (model) =>
-      model.status === "downloaded" ||
-      model.status === "not_downloaded" ||
-      model.status === "error",
-  );
   const canUnloadAnyDiarizationManagedModels = diarizationManagedModels.some(
     (model) => model.status === "ready",
   );
@@ -502,18 +496,6 @@ export function TranscriptionPage({
     setNewSpeechTextMode("diarization");
     setIsNewTranscriptionModalOpen(true);
   }, [recordId, searchParams]);
-  const handleLoadAllDiarizationManagedModels = useCallback(() => {
-    for (const model of diarizationManagedModels) {
-      if (model.status === "downloaded") {
-        onLoad(model.variant);
-      } else if (
-        model.status === "not_downloaded" ||
-        model.status === "error"
-      ) {
-        onDownload(model.variant);
-      }
-    }
-  }, [diarizationManagedModels, onDownload, onLoad]);
   const handleUnloadAllDiarizationManagedModels = useCallback(() => {
     for (const model of diarizationManagedModels) {
       if (model.status === "ready") {
@@ -985,6 +967,8 @@ export function TranscriptionPage({
                       pipelineMode={diarizationPipelineMode}
                       selectedModel={resolvedDiarizationModel}
                       selectedModelReady={diarizationModelReady}
+                      diarizationModels={diarizationModels}
+                      onSelectModel={onSelect}
                       pipelineAsrModelId={resolvedDiarizationAsrModel}
                       pipelineAlignerModelId={resolvedDiarizationAlignerModel}
                       pipelineLlmModelId={resolvedDiarizationLlmModel}
@@ -1001,11 +985,9 @@ export function TranscriptionPage({
                       }}
                       managedModelCount={diarizationManagedModels.length}
                       readyManagedModelCount={readyDiarizationManagedModelCount}
-                      canLoadAnyManagedModels={canLoadAnyDiarizationManagedModels}
                       canUnloadAnyManagedModels={canUnloadAnyDiarizationManagedModels}
                       isManagedModelActionBusy={isDiarizationManagedModelActionBusy}
                       onOpenModelManager={openDiarizationModelManager}
-                      onLoadAllManagedModels={handleLoadAllDiarizationManagedModels}
                       onUnloadAllManagedModels={handleUnloadAllDiarizationManagedModels}
                       onCreated={handleCreatedDiarizationRecord}
                     />

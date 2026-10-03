@@ -2,15 +2,9 @@
 # Models must be preprovisioned on the protected NVIDIA certification runner.
 # Forced alignment, diarization, and the standalone speech tokenizer do not yet
 # have benchmark subcommands; their absence is reported by the workflow rather
-# than silently treated as model evidence.
-
-[[benchmarks]]
-name = "qwen3-chat-cuda"
-command = "chat"
-model = "Qwen3-0.6B-GGUF"
-iterations = 1
-prompt = "Reply with one short sentence about CUDA batching."
-max_tokens = 16
+# than silently treated as model evidence. The dense Qwen3 chat family has no
+# entry since its catalog members were removed/disabled (2026-10-02), and the
+# Gemma 3 chat family lost its last enabled member with Gemma-3-1b-it.
 
 [[benchmarks]]
 name = "qwen35-chat-cuda"
@@ -26,14 +20,6 @@ command = "chat"
 model = "LFM2.5-1.2B-Instruct-GGUF"
 iterations = 1
 prompt = "Reply with one short sentence about KV caches."
-max_tokens = 16
-
-[[benchmarks]]
-name = "gemma3-chat-cuda"
-command = "chat"
-model = "Gemma-3-1b-it"
-iterations = 1
-prompt = "Reply with one short sentence about GPU inference."
 max_tokens = 16
 
 [[benchmarks]]

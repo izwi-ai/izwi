@@ -96,13 +96,13 @@ mod tests {
     fn replay_record_is_sanitized_metadata_only() {
         let record = RuntimeReplayRecord::sanitized("req-1", ConformanceCapability::Chat)
             .with_correlation_id("corr-1")
-            .with_model_variant(ModelVariant::Qwen38BGguf)
+            .with_model_variant(ModelVariant::Qwen359BGguf)
             .with_phase(RuntimeTracePhase::Decode);
 
         assert_eq!(record.request_id, "req-1");
         assert_eq!(record.correlation_id.as_deref(), Some("corr-1"));
         assert_eq!(record.capability, ConformanceCapability::Chat);
-        assert_eq!(record.model_variant, Some(ModelVariant::Qwen38BGguf));
+        assert_eq!(record.model_variant, Some(ModelVariant::Qwen359BGguf));
         assert_eq!(record.phase, RuntimeTracePhase::Decode);
         assert_eq!(record.redaction, ReplayRedaction::SanitizedMetadataOnly);
         assert!(record.payload_redacted());

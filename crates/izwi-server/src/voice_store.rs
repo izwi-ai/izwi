@@ -801,7 +801,7 @@ mod tests {
                 mode: "modular".to_string(),
                 vad_end_reason: Some("silence".to_string()),
                 asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
-                text_model_id: Some("Qwen3-1.7B-GGUF".to_string()),
+                text_model_id: Some("Qwen3.5-4B".to_string()),
                 tts_model_id: Some("Kokoro-82M".to_string()),
                 s2s_model_id: None,
                 speaker: Some("Serena".to_string()),

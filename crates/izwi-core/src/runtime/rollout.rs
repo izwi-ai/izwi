@@ -77,8 +77,10 @@ pub(crate) fn validate_managed_state_plan_eligibility(
     let route_validated = matches!(
         (variant.family(), capability),
         (
-            ModelFamily::Qwen3Chat
+            ModelFamily::Qwen3MoeChat
+                | ModelFamily::Qwen3Chat
                 | ModelFamily::Qwen35Chat
+                | ModelFamily::Qwen35MoeChat
                 | ModelFamily::Qwen38Chat
                 | ModelFamily::Gemma3Chat
                 | ModelFamily::Lfm2Chat,
@@ -195,6 +197,15 @@ mod tests {
         assert_eq!(
             validate_managed_state_plan_eligibility(
                 ModelVariant::Lfm2512BInstructGguf,
+                CapabilityKind::Chat,
+                &plan,
+            )
+            .unwrap(),
+            KvProviderEligibility::PortableRouteValidated
+        );
+        assert_eq!(
+            validate_managed_state_plan_eligibility(
+                ModelVariant::Qwen35Moe35BA3BFp8,
                 CapabilityKind::Chat,
                 &plan,
             )

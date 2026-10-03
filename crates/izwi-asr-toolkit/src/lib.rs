@@ -496,6 +496,15 @@ impl TranscriptAssembler {
         &self.merged
     }
 
+    /// Merged text as it would stand after pushing `chunk_text`, without
+    /// mutating this assembler. Used to stream provisional intra-chunk deltas
+    /// through the same boundary-dedup rules that commit-time merging applies.
+    pub fn preview_merged_text(&self, chunk_text: &str) -> String {
+        let mut preview = self.clone();
+        preview.push_chunk_text(chunk_text);
+        preview.merged
+    }
+
     pub fn finish(self) -> String {
         self.merged
     }
@@ -938,6 +947,32 @@ mod tests {
         for chunk in &chunks {
             assert!(chunk.len_samples() <= max_allowed);
         }
+    }
+
+    #[test]
+    fn assembler_preview_merged_text_dedups_overlap_without_mutating() {
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        assembler.push_chunk_text("hello world this is a test");
+
+        let preview = assembler.preview_merged_text("is a test of chunk stitching");
+
+        assert_eq!(preview, "hello world this is a test of chunk stitching");
+        assert_eq!(
+            assembler.text(),
+            "hello world this is a test",
+            "preview must not advance the assembler"
+        );
+    }
+
+    #[test]
+    fn assembler_preview_matches_later_commit() {
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        assembler.push_chunk_text("the quick brown fox");
+        let preview = assembler.preview_merged_text("brown fox jumps over");
+
+        assembler.push_chunk_text("brown fox jumps over");
+
+        assert_eq!(preview, assembler.text());
     }
 
     #[test]

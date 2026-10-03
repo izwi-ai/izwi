@@ -1576,9 +1576,11 @@ fn active_transcription_attempt_condition(
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
               AND s.status IN ('running', 'postprocessing')
+              AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
               AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.cancellation_state IS NULL
               AND j.route_record_id = transcription_records.id
               AND j.route_record_kind IN ('transcription', 'speaker_attributed_asr')
         )
@@ -2266,6 +2268,55 @@ mod tests {
             .expect("record lookup")
             .expect("record");
         assert_eq!(
+            unchanged.processing_status,
+            TranscriptionProcessingStatus::Ready
+        );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_fences_attempt_transcript_completion() {
+        let (store, root) = build_test_store();
+        let mut record = sample_record();
+        record.processing_status = TranscriptionProcessingStatus::Pending;
+        record.transcription.clear();
+        record.segments.clear();
+        record.words.clear();
+        let created = store.create_record(record).await.expect("pending record");
+        let (runtime, attempt) = claim_projection_attempt(
+            &store,
+            TranscriptionRecordMode::Transcription.as_db_value(),
+            &created.id,
+        )
+        .await;
+        store
+            .bind_runtime_attempt(created.id.clone(), &attempt)
+            .await
+            .expect("attempt binding")
+            .expect("active attempt should bind");
+        let stage = runtime
+            .get_stage(&attempt.stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        runtime
+            .cancel_job(&stage.job_id, Some("cancel before publication".to_string()))
+            .await
+            .expect("cancellation request")
+            .expect("job should accept cancellation");
+
+        assert!(store
+            .complete_record_for_attempt(created.id.clone(), &attempt, completed_record())
+            .await
+            .expect("cancelled completion should be ignored")
+            .is_none());
+        let unchanged = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_ne!(
             unchanged.processing_status,
             TranscriptionProcessingStatus::Ready
         );

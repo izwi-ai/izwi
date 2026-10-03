@@ -1,7 +1,13 @@
 # Exact-SHA CUDA continuous-batching certification workload for Qwen3.8-27B-FP8.
 # The Qwen3.8 chat adapter declares shared-step continuous decode support; solo
 # (c1) rows exercise the MTP scalar path and concurrent (c4/c8) rows exercise
-# multi-row shared-step batches. Run only with
+# multi-row shared-step batches. With DS9.4 the concurrent rows also carry
+# shared speculative MTP envelopes (per-row quanta inside the batch) because
+# the model opts in via `cuda.mtp_in_continuous` (default Auto = follows MTP).
+# The perf claim (tokens/s improvement, no ITL regression — report
+# `summary.itl_ms`) is certified by running this manifest twice per SHA, once
+# with `IZWI_CUDA_MTP_IN_CONTINUOUS=off` and once unset/on, and comparing the
+# per-case completion TPS and ITL in the certificate digest. Run only with
 # scripts/bench/run-cuda-model-evidence.sh --require-continuous-batch-evidence.
 
 [[benchmarks]]

@@ -1477,4 +1477,95 @@ mod tests {
         arena.release(sequence).unwrap();
         arena.close_and_validate_drained().unwrap();
     }
+    /// DS1.1 spike prototype: a hybrid model's retained tensor state (conv /
+    /// linear-attention) forks at a committed cursor without recompute. Sequence
+    /// B is seeded from sequence A's committed snapshot and advances identically,
+    /// which is the soundness basis for attaching a second request to a shared
+    /// prefix under `PrefixPolicy::CommittedSnapshots` on composite contracts.
+    #[test]
+    fn committed_state_forks_to_a_new_sequence_and_advances_identically() {
+        let arena = arena();
+        // Sequence A ingests two tokens of retained state.
+        let a = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(a).unwrap();
+        let seed_a = PhysicalStateTransactionId::new(1).unwrap();
+        arena.begin(seed_a, a).unwrap();
+        arena
+            .stage_replace(
+                seed_a,
+                StateDomainId::new(1),
+                0,
+                2,
+                vec![value(&[1.0, 2.0])],
+            )
+            .unwrap();
+        arena.commit(seed_a, 2).unwrap();
+
+        // Fork B from A's committed snapshot: seed B's domains with exactly the
+        // committed components at A's cursor, transactionally.
+        let snapshot = arena
+            .read(a, StateDomainId::new(1))
+            .unwrap()
+            .expect("sequence A has committed state");
+        assert_eq!(snapshot.cursor, 2);
+        let forked: Vec<StateComponentValue> = snapshot
+            .components
+            .iter()
+            .map(|component| StateComponentValue {
+                component: component.component,
+                tensor: component.tensor.as_ref().map(|tensor| {
+                    let values = tensor.to_vec1::<f32>().unwrap();
+                    Tensor::from_slice(&values, values.len(), &Device::Cpu).unwrap()
+                }),
+            })
+            .collect();
+        let b = PhysicalStateSequenceId::new(2).unwrap();
+        arena.register(b).unwrap();
+        let seed_b = PhysicalStateTransactionId::new(2).unwrap();
+        arena.begin(seed_b, b).unwrap();
+        arena
+            .stage_replace(seed_b, StateDomainId::new(1), 0, 2, forked)
+            .unwrap();
+        arena.commit(seed_b, 2).unwrap();
+
+        // Both sequences continue from the fork cursor with the same update.
+        let continue_a = PhysicalStateTransactionId::new(3).unwrap();
+        arena.begin(continue_a, a).unwrap();
+        arena
+            .stage_replace(continue_a, StateDomainId::new(1), 2, 3, vec![value(&[9.0])])
+            .unwrap();
+        arena.commit(continue_a, 3).unwrap();
+        let continue_b = PhysicalStateTransactionId::new(4).unwrap();
+        arena.begin(continue_b, b).unwrap();
+        arena
+            .stage_replace(continue_b, StateDomainId::new(1), 2, 3, vec![value(&[9.0])])
+            .unwrap();
+        arena.commit(continue_b, 3).unwrap();
+
+        let a_state = arena
+            .read(a, StateDomainId::new(1))
+            .unwrap()
+            .expect("sequence A retains state");
+        let b_state = arena
+            .read(b, StateDomainId::new(1))
+            .unwrap()
+            .expect("forked sequence B retains state");
+        assert_eq!(a_state.cursor, b_state.cursor, "fork cursors align");
+        for (a_component, b_component) in a_state
+            .components
+            .as_ref()
+            .iter()
+            .zip(b_state.components.as_ref())
+        {
+            let a_values = a_component
+                .tensor
+                .as_ref()
+                .map(|tensor| tensor.to_vec1::<f32>().unwrap());
+            let b_values = b_component
+                .tensor
+                .as_ref()
+                .map(|tensor| tensor.to_vec1::<f32>().unwrap());
+            assert_eq!(a_values, b_values, "forked state must advance identically");
+        }
+    }
 }

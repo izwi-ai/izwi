@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, type ModelInfo } from "@/api";
+import { api, type ModelInfo, type ModelResidencySummary } from "@/api";
 import {
   trackModelDownloadCompleted,
   trackModelDownloadStarted,
@@ -17,6 +17,7 @@ import {
 import { useNotifications } from "@/app/providers/NotificationProvider";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
+import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
 
 interface ModelCatalogContextValue {
   models: ModelInfo[];
@@ -26,10 +27,11 @@ interface ModelCatalogContextValue {
   catalogError: string | null;
   downloadProgress: ModelDownloadProgressMap;
   readyModelsCount: number;
+  residencySummary: ModelResidencySummary | null;
   selectModel: (variant: string | null) => void;
   reportError: (message: string) => void;
   clearError: () => void;
-  refreshModels: () => Promise<void>;
+  refreshModels: () => Promise<boolean>;
   downloadModel: (variant: string) => Promise<void>;
   cancelModelDownload: (variant: string) => Promise<void>;
   loadModel: (variant: string) => Promise<void>;
@@ -43,6 +45,28 @@ function modelActionError(err: unknown, fallback: string): string {
   return err instanceof Error && err.message.trim() ? err.message : fallback;
 }
 
+const USER_SELECTED_MODEL_STORAGE_KEY = "izwi.modelCatalog.userSelectedModel";
+
+function readPersistedUserSelectedModel(): string | null {
+  try {
+    return window.localStorage.getItem(USER_SELECTED_MODEL_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistUserSelectedModel(variant: string | null): void {
+  try {
+    if (variant === null) {
+      window.localStorage.removeItem(USER_SELECTED_MODEL_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(USER_SELECTED_MODEL_STORAGE_KEY, variant);
+    }
+  } catch {
+    // Persistence is best-effort; the in-memory selection still works.
+  }
+}
+
 interface ModelCatalogProviderProps {
   children: ReactNode;
 }
@@ -52,7 +76,15 @@ export function ModelCatalogProvider({
 }: ModelCatalogProviderProps) {
   const { notify } = useNotifications();
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [selectedModel, setSelectedModelState] = useState<string | null>(null);
+  const [residencySummary, setResidencySummary] =
+    useState<ModelResidencySummary | null>(null);
+  const [selectedModel, setSelectedModelState] = useState<string | null>(() =>
+    readPersistedUserSelectedModel(),
+  );
+  // Tracks whether the current selection was made by the user (explicit
+  // select or load) versus auto-picked as a fallback. Only user choices are
+  // persisted, and only user choices survive a vanished catalog variant.
+  const userSelectedModelRef = useRef(selectedModel !== null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -64,6 +96,9 @@ export function ModelCatalogProvider({
   const activeDownloadsRef = useRef<Set<string>>(new Set());
   const activeModelLoadsRef = useRef<Set<string>>(new Set());
   const cancelledModelLoadsRef = useRef<Set<string>>(new Set());
+  const loadModelAbortControllersRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  );
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
   const reconnectTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>(
     {},
@@ -82,9 +117,18 @@ export function ModelCatalogProvider({
     [models],
   );
 
-  const selectModel = useCallback((variant: string | null) => {
+  const adoptUserSelectedModel = useCallback((variant: string | null) => {
+    userSelectedModelRef.current = variant !== null;
+    persistUserSelectedModel(variant);
     setSelectedModelState(variant);
   }, []);
+
+  const selectModel = useCallback(
+    (variant: string | null) => {
+      adoptUserSelectedModel(variant);
+    },
+    [adoptUserSelectedModel],
+  );
 
   const reportError = useCallback((message: string) => {
     setError(message);
@@ -99,7 +143,7 @@ export function ModelCatalogProvider({
     setError(null);
   }, []);
 
-  const refreshModels = useCallback(async () => {
+  const refreshModels = useCallback(async (): Promise<boolean> => {
     try {
       const response = await api.listModels();
       const mergedModels = response.models
@@ -121,6 +165,7 @@ export function ModelCatalogProvider({
       });
 
       setModels(mergedModels);
+      setResidencySummary(response.residency ?? null);
       setCatalogError(null);
       setSelectedModelState((current) => {
         if (
@@ -129,10 +174,17 @@ export function ModelCatalogProvider({
         ) {
           return current;
         }
+        if (current && userSelectedModelRef.current) {
+          // The user explicitly picked this variant. If it disappeared from
+          // the catalog (removed upstream), keep surfacing the stale
+          // selection instead of silently swapping to whatever is ready.
+          return current;
+        }
 
         const readyModel = mergedModels.find((model) => model.status === "ready");
         return readyModel?.variant ?? null;
       });
+      return true;
     } catch (err) {
       console.error("Failed to load models:", err);
       setCatalogError(
@@ -141,6 +193,7 @@ export function ModelCatalogProvider({
           "Izwi could not reach the local model service. Please try again.",
         ),
       );
+      return false;
     }
   }, []);
 
@@ -335,13 +388,48 @@ export function ModelCatalogProvider({
 
     initializedRef.current = true;
 
+    // The first catalog load can race the local server's cold start (a slow
+    // /admin/models call, a poison-monitor respawn). Retry with bounded
+    // backoff so the spinner ends with either models or a clear error instead
+    // of hanging forever on a single stalled request. A SUCCESSFUL fetch
+    // always clears the spinner (the models are already in state, so that is
+    // simply the truth); only failure retries respect supersession, because
+    // StrictMode's mount→cleanup→mount can abandon the first run mid-flight
+    // and a superseded failure must not spin forever.
+    const MAX_ATTEMPTS = 3;
+    const RETRY_DELAYS_MS = [750, 1_500];
+    let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
     const init = async () => {
       setLoading(true);
-      await refreshModels();
-      setLoading(false);
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        const ok = await refreshModels();
+        if (ok) {
+          setLoading(false);
+          return;
+        }
+        if (!active) {
+          return;
+        }
+        const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+        await new Promise((resolve) => {
+          retryTimer = setTimeout(resolve, delay);
+        });
+      }
+      if (active) {
+        setLoading(false);
+      }
     };
 
     void init();
+
+    return () => {
+      active = false;
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+      }
+    };
   }, [refreshModels]);
 
   useEffect(() => {
@@ -548,37 +636,55 @@ export function ModelCatalogProvider({
       }
 
       activeModelLoadsRef.current.add(variant);
+      const abortController = new AbortController();
+      loadModelAbortControllersRef.current.set(variant, abortController);
 
       try {
         const isChatTarget = VIEW_CONFIGS.chat.modelFilter(variant);
+        // Chat stays single-active, but pinned models and speech-pipeline
+        // stack members (diarization + ASR + aligner + refiner) are never
+        // evicted by a chat switch: unloading one silently degrades the
+        // pipeline. Unload them explicitly instead.
+        const isEvictableChatModel = (model: ModelInfo) =>
+          model.status === "ready" &&
+          VIEW_CONFIGS.chat.modelFilter(model.variant) &&
+          model.variant !== variant &&
+          !model.pinned &&
+          !isSpeechPipelineManagedModel(model);
         const loadedChatModels = isChatTarget
-          ? models.filter(
-              (model) =>
-                model.status === "ready" &&
-                VIEW_CONFIGS.chat.modelFilter(model.variant) &&
-                model.variant !== variant,
-            )
+          ? models.filter(isEvictableChatModel)
           : [];
 
         for (const loadedModel of loadedChatModels) {
           await api.unloadModel(loadedModel.variant);
         }
 
+        const demotedVariants = new Set(loadedChatModels.map((model) => model.variant));
         setModels((prev) =>
           prev.map((model) =>
             model.variant === variant
               ? { ...model, status: "loading" as const }
-              : isChatTarget &&
-                  model.status === "ready" &&
-                  VIEW_CONFIGS.chat.modelFilter(model.variant)
+              : demotedVariants.has(model.variant)
                 ? { ...model, status: "downloaded" as const }
                 : model,
           ),
         );
 
-        await api.loadModel(variant);
+        // The load POST blocks server-side until the weights are resident,
+        // which for large models runs far past the default request timeout.
+        // It therefore rides this controller's signal (no client timeout);
+        // an explicit unload or delete aborts it.
+        await api.loadModel(variant, { signal: abortController.signal });
         if (!cancelledModelLoadsRef.current.has(variant)) {
-          setSelectedModelState(variant);
+          // Loading a speech-pipeline stack member (diarization checkpoint,
+          // ASR, aligner, refiner LLM) is pipeline setup, not a model switch:
+          // adopting it as the global selection overwrote — and since the
+          // persistence change, permanently rewrote — whatever the user had
+          // selected.
+          const loadedModel = models.find((model) => model.variant === variant);
+          if (!loadedModel || !isSpeechPipelineManagedModel(loadedModel)) {
+            adoptUserSelectedModel(variant);
+          }
           void trackModelLoaded(variant);
           notify({
             title: "Model loaded",
@@ -590,6 +696,9 @@ export function ModelCatalogProvider({
         if (cancelledModelLoadsRef.current.has(variant)) {
           return;
         }
+        if (abortController.signal.aborted) {
+          return;
+        }
         console.error("Load failed:", err);
         const message = modelActionError(err, "Failed to load model. Please try again.");
         setError(message);
@@ -599,11 +708,12 @@ export function ModelCatalogProvider({
           tone: "danger",
         });
       } finally {
+        loadModelAbortControllersRef.current.delete(variant);
         activeModelLoadsRef.current.delete(variant);
         await refreshModels();
       }
     },
-    [getModelLabel, models, notify, refreshModels],
+    [adoptUserSelectedModel, getModelLabel, models, notify, refreshModels],
   );
 
   const unloadModel = useCallback(
@@ -615,6 +725,7 @@ export function ModelCatalogProvider({
         );
       if (cancellingLoad) {
         cancelledModelLoadsRef.current.add(variant);
+        loadModelAbortControllersRef.current.get(variant)?.abort();
       }
       try {
         await api.unloadModel(variant);
@@ -622,6 +733,10 @@ export function ModelCatalogProvider({
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        if (selectedModel === variant) {
+          userSelectedModelRef.current = false;
+          persistUserSelectedModel(null);
+        }
         notify({
           title: cancellingLoad ? "Model load cancelled" : "Model unloaded",
           description: cancellingLoad
@@ -645,7 +760,7 @@ export function ModelCatalogProvider({
         cancelledModelLoadsRef.current.delete(variant);
       }
     },
-    [getModelLabel, models, notify, refreshModels],
+    [getModelLabel, models, notify, refreshModels, selectedModel],
   );
 
   const deleteModel = useCallback(
@@ -655,12 +770,17 @@ export function ModelCatalogProvider({
         closeDownloadStream(variant);
         activeDownloadsRef.current.delete(variant);
         clearDownloadProgress(variant);
+        loadModelAbortControllersRef.current.get(variant)?.abort();
 
         await api.deleteModel(variant);
         await refreshModels();
         setSelectedModelState((current) =>
           current === variant ? null : current,
         );
+        if (selectedModel === variant) {
+          userSelectedModelRef.current = false;
+          persistUserSelectedModel(null);
+        }
         notify({
           title: "Model deleted",
           description: `${getModelLabel(variant)} was removed from disk.`,
@@ -684,6 +804,7 @@ export function ModelCatalogProvider({
       getModelLabel,
       notify,
       refreshModels,
+      selectedModel,
     ],
   );
 
@@ -696,6 +817,7 @@ export function ModelCatalogProvider({
       catalogError,
       downloadProgress,
       readyModelsCount: models.filter((model) => model.status === "ready").length,
+      residencySummary,
       selectModel,
       reportError,
       clearError,
@@ -719,6 +841,7 @@ export function ModelCatalogProvider({
       models,
       refreshModels,
       reportError,
+      residencySummary,
       selectModel,
       selectedModel,
       unloadModel,

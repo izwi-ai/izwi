@@ -7,8 +7,8 @@ use std::{
 };
 
 use izwi_core::audio::{
-    decode_and_inspect_audio_bytes, resample_mono_high_quality, AudioEncoder, AudioFormat,
-    AudioInspection, AudioSourceMetadata,
+    decode_and_inspect_audio_bytes, decode_and_inspect_audio_bytes_canonical,
+    resample_mono_high_quality, AudioEncoder, AudioFormat, AudioInspection, AudioSourceMetadata,
 };
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider, StoredMediaBytes};
 use serde::Serialize;
@@ -831,15 +831,29 @@ fn prepare_audio_blocking(
     policy: &AudioIngestPolicy,
     profile: CanonicalAudioProfile,
 ) -> Result<PreparedAudio, MediaIngestError> {
+    // The speech profile decodes straight into the canonical 16 kHz mono
+    // representation so long source-rate audio stays within the decoded-byte
+    // guard; the reference profile must keep source-rate samples because the
+    // stored reference WAV preserves the source rate.
     let decoded = match policy.corruption_policy {
-        AudioCorruptionPolicy::Reject => decode_and_inspect_audio_bytes(&source_bytes),
+        AudioCorruptionPolicy::Reject => match profile {
+            CanonicalAudioProfile::SpeechRecognition16KhzMonoWav => {
+                decode_and_inspect_audio_bytes_canonical(&source_bytes)
+            }
+            CanonicalAudioProfile::ReferenceVoiceSourceRateMonoWav => {
+                decode_and_inspect_audio_bytes(&source_bytes)
+            }
+        },
     }
     .map_err(|err| MediaIngestError::InvalidInput(format!("Invalid audio payload: {err}")))?;
     policy.validate_source(source_bytes.len(), &decoded.source, &decoded.inspection)?;
+    // `inspection.sample_rate` is the rate of `mono_samples` in both decode
+    // modes (source rate natively, canonical 16 kHz canonically).
+    let decoded_sample_rate = decoded.inspection.sample_rate;
     let target_sample_rate = profile.target_sample_rate(decoded.source.sample_rate);
     let canonical_samples = resample_mono_high_quality(
         &decoded.mono_samples,
-        decoded.source.sample_rate,
+        decoded_sample_rate,
         target_sample_rate,
     )
     .map_err(|err| {

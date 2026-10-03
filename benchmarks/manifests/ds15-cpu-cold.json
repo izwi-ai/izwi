@@ -1,0 +1,88 @@
+{
+  "schema": "izwi.ds15-prefix-benchmark.v1",
+  "lane": "cpu",
+  "workload": "cold",
+  "benchmark": {
+    "completed": 40,
+    "concurrency": 4,
+    "failed": 0,
+    "failures": {},
+    "latency_ms": {
+      "max": 203.25787493493408,
+      "p50": 56.939645495731384,
+      "p95": 159.88793179858462,
+      "p99": 203.14094005851075
+    },
+    "max_retries": 40,
+    "max_tokens": 16,
+    "metadata": {
+      "artifact_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+      "backend": "cpu",
+      "chunked_prefill_threshold": 224,
+      "concurrency": 4,
+      "deployed_sha": "509caac14d16dc917965754ebcd663f0e8ec952e",
+      "deployment_id": "ds15-cpu-bench-v1",
+      "fixture": "tiny synthetic qwen38 hybrid; no speed claim",
+      "kv_page_size": 64,
+      "model": "Qwen3.8-27B-FP8",
+      "prefix_tokens": 64,
+      "requests": 40,
+      "suffix_tokens": 16,
+      "topology": "single-node-loopback",
+      "vocab": "a,b,c",
+      "workload": "cold"
+    },
+    "prefix_tokens": 64,
+    "rejected": 0,
+    "requests": 40,
+    "route": "POST /v1/chat/completions",
+    "stream": true,
+    "suffix_tokens": 16,
+    "throughput_req_per_s": 31.52325698879092,
+    "ttft_ms": {
+      "p50": 56.92874995293096,
+      "p95": 159.88070624298402,
+      "p99": 203.13347436022013
+    },
+    "vocab": [
+      "a",
+      "b",
+      "c"
+    ],
+    "wall_secs": 1.2689044160069898,
+    "workload": "cold"
+  },
+  "counters_before": {
+    "izwi_engine_kv_cache_hits_total": 74,
+    "izwi_engine_kv_cache_misses_total": 17,
+    "izwi_engine_kv_cache_evictions_total": 0,
+    "izwi_engine_kv_cache_reused_tokens_total": 4736,
+    "izwi_engine_kv_cache_avoided_prefill_tokens_total": 4736,
+    "izwi_engine_tensor_snapshot_publishes_total": 1,
+    "izwi_engine_tensor_snapshot_attaches_total": 36,
+    "izwi_engine_tensor_snapshot_truncations_total": 2,
+    "izwi_engine_tensor_snapshot_evictions_total": 0
+  },
+  "counters_after": {
+    "izwi_engine_kv_cache_hits_total": 74,
+    "izwi_engine_kv_cache_misses_total": 112,
+    "izwi_engine_kv_cache_evictions_total": 37,
+    "izwi_engine_kv_cache_reused_tokens_total": 4736,
+    "izwi_engine_kv_cache_avoided_prefill_tokens_total": 4736,
+    "izwi_engine_tensor_snapshot_publishes_total": 41,
+    "izwi_engine_tensor_snapshot_attaches_total": 36,
+    "izwi_engine_tensor_snapshot_truncations_total": 2,
+    "izwi_engine_tensor_snapshot_evictions_total": 37
+  },
+  "counters_delta": {
+    "izwi_engine_kv_cache_hits_total": 0,
+    "izwi_engine_kv_cache_misses_total": 95,
+    "izwi_engine_kv_cache_evictions_total": 37,
+    "izwi_engine_kv_cache_reused_tokens_total": 0,
+    "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+    "izwi_engine_tensor_snapshot_publishes_total": 40,
+    "izwi_engine_tensor_snapshot_attaches_total": 0,
+    "izwi_engine_tensor_snapshot_truncations_total": 0,
+    "izwi_engine_tensor_snapshot_evictions_total": 37
+  }
+}

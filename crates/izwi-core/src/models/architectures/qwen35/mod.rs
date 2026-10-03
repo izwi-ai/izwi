@@ -1,8 +1,8 @@
 //! Qwen3.5 family implementations.
 
-mod cache;
+pub(crate) mod cache;
 pub mod chat;
-mod text;
+pub(crate) mod text;
 mod vision;
 
 pub use vision::{media_resource_estimate, Qwen35MediaResourceEstimate};

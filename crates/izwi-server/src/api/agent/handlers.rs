@@ -24,7 +24,7 @@ use crate::state::{AppState, StoredAgentSessionRecord};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
-const DEFAULT_CHAT_MODEL: &str = "Qwen3-1.7B-GGUF";
+const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
 
 #[derive(Debug, Deserialize)]
 pub struct CreateAgentSessionRequest {
@@ -246,7 +246,6 @@ fn resolve_max_output_tokens_for_model(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let default = match variant {
         izwi_core::ModelVariant::Gemma34BIt => 4096,
-        izwi_core::ModelVariant::Gemma31BIt => 4096,
         izwi_core::ModelVariant::Lfm2512BInstructGguf => 4096,
         izwi_core::ModelVariant::Lfm2512BThinkingGguf => 4096,
         _ => 1536,

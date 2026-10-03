@@ -2758,6 +2758,24 @@ impl EngineCore {
             }) {
                 Some(Ok(reservation)) => reservation,
                 None => None,
+                Some(Err(Error::Backpressure(reason)))
+                    if reason
+                        .starts_with(crate::engine::cache::managed::MANAGED_PREFIX_CURSOR_LOST) =>
+                {
+                    // The probed prefix vanished before execution. Drop the
+                    // cursor and replan this request as a zero-start prefill.
+                    if !self
+                        .scheduler
+                        .reset_managed_prefix_cursor(&scheduled.request_id)
+                    {
+                        warn!(
+                            request_id = %scheduled.request_id,
+                            "prefix cursor lost without scheduler cursor state"
+                        );
+                    }
+                    capacity_blocked.push(scheduled.clone());
+                    continue;
+                }
                 Some(Err(Error::Backpressure(reason))) => {
                     super::metrics::record_engine_physical_defer(
                         super::metrics::EnginePhysicalDeferReason::ManagedCacheCapacity,
@@ -2961,8 +2979,10 @@ impl EngineCore {
             phase_timing_override,
             asr_diagnostics,
             error,
+            logprobs,
         } = current;
 
+        merged.logprobs.extend(logprobs);
         merged.audio = Self::merge_audio_output(merged.audio.take(), audio);
         if text.is_some() {
             merged.text = text;
@@ -3026,8 +3046,12 @@ impl EngineCore {
         managed_resource_authority: Option<Arc<super::ResourceAuthority>>,
         managed_worker: Option<(BackendKind, candle_core::Device)>,
     ) -> Result<Self> {
+        let mut config = config;
         // Direct EngineCore users must cross the same fail-closed cache-policy
         // boundary as RuntimeService users before workers or arenas start.
+        // Catalog-auto prefix reuse resolves to one namespace here so the
+        // policy and the managed cache salt cannot diverge.
+        config.apply_prefix_engagement();
         let cache_policy = config.resolved_kv_cache_policy()?;
         // Create scheduler
         let scheduler_config = SchedulerConfig::from(&config);
@@ -3046,7 +3070,7 @@ impl EngineCore {
             crate::config::PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
         };
 
-        let (managed_kv_cache, physical_state) = match managed_worker {
+        let (mut managed_kv_cache, physical_state) = match managed_worker {
             Some((backend, device)) => (
                 ManagedKvCacheManager::for_worker_with_prefix_cache_policy(
                     managed_resource_authority.clone(),
@@ -3066,6 +3090,11 @@ impl EngineCore {
                 PhysicalStateManager::cpu(managed_resource_authority),
             ),
         };
+        // DS4 hierarchical offload is explicit opt-in: a resolved policy only
+        // exists when the operator configured a host pool budget.
+        managed_kv_cache.set_host_offload_policy(
+            crate::engine::cache::offload::HostOffloadPolicy::resolve(&config)?,
+        );
 
         Ok(Self {
             config,
@@ -3160,7 +3189,24 @@ impl EngineCore {
                 })?;
                 runtime.validate_against(self.managed_kv_cache.worker_backend(), execution)?;
                 if let Some(physical) = runtime.managed_kv_runtime() {
-                    request.install_managed_cache_runtime(physical)?;
+                    request.install_managed_cache_runtime(physical.clone())?;
+                    // DS1.5: probe the managed prefix index at admission so
+                    // the first prefill span can start above an already-
+                    // resident shared prefix. The probe self-gates on the
+                    // prefix namespace; a probe error plans a zero-start
+                    // prefill and leaves the row to surface the underlying
+                    // index failure at prepare time.
+                    match self
+                        .managed_kv_cache
+                        .probe_managed_prefix(&physical, &request)
+                    {
+                        Ok(cursor) => request.set_managed_prefix_cursor(cursor),
+                        Err(error) => warn!(
+                            request_id = %request_id,
+                            error = %error,
+                            "managed prefix probe failed; planning a zero-start prefill"
+                        ),
+                    }
                 }
             }
         }
@@ -4716,6 +4762,11 @@ impl EngineCore {
                 .get(&request_id)
                 .map(|request| request.num_prompt_tokens())
                 .unwrap_or(engine_output.token_stats.prompt_tokens);
+            // DS9.1: the managed prefix depth this request actually ran with.
+            // The scheduler's cursor copy is authoritative — it is cleared
+            // when the probed prefix is lost and the row replans from zero.
+            engine_output.token_stats.cached_prefix_tokens =
+                self.scheduler.managed_prefix_cursor(&request_id);
             if exec_output.finished {
                 if let Some((_, total_generated)) = self.scheduler.get_running_info(&request_id) {
                     let resolved_total = total_generated.max(engine_output.num_tokens);
@@ -4757,6 +4808,14 @@ impl EngineCore {
 
             // Update scheduler state only from the authoritative disposition.
             if let Some(cause) = Self::terminal_release_cause(&disposition) {
+                if let ExecutionDisposition::Failed(failure) = &disposition {
+                    tracing::error!(
+                        request_id = %request_id,
+                        kind = ?failure.kind,
+                        message = %failure.message,
+                        "row failed terminally"
+                    );
+                }
                 self.begin_terminal_release(&session, cause).await;
                 self.requests.remove(&request_id);
                 self.request_start_times.remove(&request_id);
@@ -5855,6 +5914,7 @@ mod tests {
             text: Some(format!("delta-{sequence}")),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         }
     }
 
@@ -5897,6 +5957,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect()
         }
@@ -5999,6 +6060,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     );
                     result.dispatch = dispatch;
@@ -6164,6 +6226,7 @@ mod tests {
                         phase_timing_override: None,
                         asr_diagnostics: None,
                         error: None,
+                        logprobs: Vec::new(),
                     },
                 ));
             }
@@ -6253,6 +6316,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -6355,6 +6419,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -6406,6 +6471,7 @@ mod tests {
                     }),
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 })
                 .collect();
             Ok(wrap_outputs(scheduled, outputs))
@@ -6646,17 +6712,17 @@ mod tests {
 
         let mut req_a = EngineCoreRequest::tts("variant-a");
         req_a.id = "req-a".to_string();
-        req_a.model_variant = Some(ModelVariant::Qwen34BGguf);
+        req_a.model_variant = Some(ModelVariant::Qwen354BGguf);
 
         let mut req_b = EngineCoreRequest::tts("variant-b");
         req_b.id = "req-b".to_string();
-        req_b.model_variant = Some(ModelVariant::Qwen38BGguf);
+        req_b.model_variant = Some(ModelVariant::Qwen359BGguf);
 
         core.add_request(req_a).unwrap();
         core.add_request(req_b).unwrap();
 
         let aborted = core
-            .abort_requests_for_variant(ModelVariant::Qwen34BGguf)
+            .abort_requests_for_variant(ModelVariant::Qwen354BGguf)
             .await;
         assert_eq!(aborted, vec!["req-a".to_string()]);
         assert!(!core.has_request(&"req-a".to_string()));
@@ -7135,6 +7201,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         };
         let second = ExecutorOutput {
             request_id: "req-a".to_string(),
@@ -7147,6 +7214,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         };
 
         let merged = EngineCore::merge_executor_output(Some(first), second);
@@ -8011,7 +8079,7 @@ mod tests {
 
     #[test]
     fn prepared_continuous_cost_scales_an_isolated_multi_token_quantum() {
-        let variant = ModelVariant::Qwen306BGguf;
+        let variant = ModelVariant::Qwen3508BGguf;
         let mut request = EngineCoreRequest::chat(vec![ChatMessage {
             role: ChatRole::User,
             content: "continuous cost fixture".to_string(),
@@ -8230,6 +8298,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         invalid.disposition = ExecutionDisposition::Progress;
@@ -8269,6 +8338,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: Some("transient backend failure".to_string()),
+                    logprobs: Vec::new(),
                 },
                 disposition: ExecutionDisposition::Failed(ExecutionFailure {
                     kind: super::super::execution::FailureKind::Backend,
@@ -8589,6 +8659,7 @@ mod tests {
                     text: None,
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 });
             let committed = core.commit_executor_result(result, 1.0).await.unwrap();
             assert_eq!(committed.staged_stream_outputs.len(), 1);
@@ -8809,6 +8880,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         let output = core
@@ -8869,6 +8941,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         )
         .with_observed_resources(observed);
@@ -8956,6 +9029,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
         );
         let output = core
@@ -8988,11 +9062,11 @@ mod tests {
         let mut bad = EngineCoreRequest::tts("bad");
         bad.id = "bad".to_string();
         bad.prompt_tokens = vec![1];
-        bad.model_variant = Some(ModelVariant::Qwen34BGguf);
+        bad.model_variant = Some(ModelVariant::Qwen354BGguf);
         let mut good = EngineCoreRequest::tts("good");
         good.id = "good".to_string();
         good.prompt_tokens = vec![1];
-        good.model_variant = Some(ModelVariant::Qwen38BGguf);
+        good.model_variant = Some(ModelVariant::Qwen359BGguf);
         core.add_request(bad).unwrap();
         core.add_request(good).unwrap();
 

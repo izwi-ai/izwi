@@ -10,13 +10,14 @@ use axum::{
 use scalar_api_reference::{get_asset_with_mime, scalar_html};
 use serde_json::{json, Value};
 
-use crate::state::AppState;
-
 pub const DOCS_PATH: &str = "/docs";
 pub const SCALAR_JS_PATH: &str = "/docs/scalar.js";
 pub const OPENAPI_PATH: &str = "/openapi.json";
 
-pub fn router() -> Router<AppState> {
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
         .route(DOCS_PATH, get(scalar_docs))
         .route(SCALAR_JS_PATH, get(scalar_js))

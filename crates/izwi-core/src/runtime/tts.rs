@@ -27,7 +27,7 @@ use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::TtsRuntimeRequest;
-use crate::runtime::service::RuntimeService;
+use crate::runtime::service::{CapabilityLoadOptions, RuntimeService};
 use crate::runtime::telemetry::{
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming,
@@ -521,6 +521,7 @@ impl RuntimeService {
                 CapabilityKind::Tts,
                 streaming_required,
                 ExecutionTargetKind::DirectModel,
+                CapabilityLoadOptions::default(),
             )
             .await?;
 
@@ -626,6 +627,7 @@ impl RuntimeService {
                 CapabilityKind::Tts,
                 streaming_required,
                 ExecutionTargetKind::DirectModel,
+                CapabilityLoadOptions::default(),
             )
             .await?;
 
@@ -754,6 +756,7 @@ impl RuntimeService {
                 CapabilityKind::Tts,
                 streaming_required,
                 ExecutionTargetKind::DirectModel,
+                CapabilityLoadOptions::default(),
             )
             .await?;
 

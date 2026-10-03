@@ -75,6 +75,10 @@ fn certified_topology(
         // Qwen3.5 commits full-attention pages, recurrent state, and
         // convolution state as one composite transaction.
         (Qwen35Chat, Chat) => RetainedPagedTensorTensor,
+        // The Qwen3.5-MoE family shares the dense family's three-domain
+        // composite contract (paged KV + F32 recurrent + conv) through the
+        // same hybrid decode machinery.
+        (Qwen35MoeChat, Chat) => RetainedPagedTensorTensor,
         // Qwen3.8 owns an independent implementation of the same three-state
         // topology so either family can optimize its representation separately.
         (Qwen38Chat, Chat) => RetainedPagedTensorTensor,

@@ -2050,6 +2050,11 @@ impl NemotronAsrModel {
         Some(DEFAULT_MAX_AUDIO_SECONDS_HINT)
     }
 
+    /// Stateless streaming encoder — no decoder prompt to budget.
+    pub(crate) fn audio_token_rate(&self) -> Option<f32> {
+        None
+    }
+
     pub fn available_streaming_profiles(&self) -> &[NemotronStreamingProfile] {
         &self.runtime_plan.streaming_profiles
     }

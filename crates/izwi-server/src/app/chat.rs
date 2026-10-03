@@ -1,13 +1,28 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
+use izwi_serving_client::{InvocationStream, WorkerClient, WorkerClientError};
+use izwi_serving_protocol::{
+    AttemptId, AttemptIdentity, CallerId, ChatInput, ChatMessage as WorkerChatMessage,
+    ChatParameters as WorkerChatParameters, ChatRole as WorkerChatRole, DeploymentId,
+    FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
+    InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
+    ModelReadiness, OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode,
+    RequestDigest, RequestId, ServiceClass, TaskKind, TenantId, Usage, WorkerProcessState,
+    PROTOCOL_V1,
+};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
+use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
+use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort,
@@ -25,6 +40,11 @@ pub struct ChatExecutionRequest {
     pub top_k: Option<usize>,
     pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// DS9.3: OpenAI `logprobs` flag and `top_logprobs` count (0-20).
+    pub logprobs: Option<bool>,
+    pub top_logprobs: Option<u8>,
+    /// DS9.2: the request carried `response_format: json_object`.
+    pub response_format_json_object: bool,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
 }
@@ -69,11 +89,106 @@ impl ChatExecutionRequest {
         if let Some(presence_penalty) = self.presence_penalty {
             params.presence_penalty = presence_penalty;
         }
+        if self.logprobs.unwrap_or(false) {
+            params.logprobs = true;
+        }
+        if let Some(top_logprobs) = self.top_logprobs {
+            params.top_logprobs = top_logprobs as usize;
+        }
+        if self.response_format_json_object {
+            params.constrain_json_object = true;
+        }
         params
     }
 
     fn resolved_chat_config(&self) -> ChatRequestConfig {
         self.chat_config.clone()
+    }
+}
+
+/// Pinned Phase 1 route target for plain non-streaming chat. Discovery and
+/// multi-worker selection are deliberately deferred; the worker still makes
+/// authoritative admission and generation checks on every invocation.
+#[derive(Debug, Clone)]
+pub struct RemoteChatExecutionConfig {
+    pub public_model_variant: ModelVariant,
+    pub expected_worker_incarnation: IncarnationId,
+    pub deployment_id: DeploymentId,
+    pub expected_model_generation: ModelGeneration,
+    pub policy_revision: PolicyRevision,
+    pub max_queue_wait: Duration,
+    pub max_output_tokens: u32,
+    pub max_output_bytes: u64,
+    pub slow_consumer_timeout: Duration,
+}
+
+impl RemoteChatExecutionConfig {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.max_output_tokens == 0
+            || self.max_output_bytes == 0
+            || self.slow_consumer_timeout.is_zero()
+        {
+            return Err(ApiError::internal(
+                "Remote chat output limits and slow-consumer timeout must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteChatExecution {
+    client: WorkerClient,
+    config: RemoteChatExecutionConfig,
+}
+
+impl RemoteChatExecution {
+    pub fn new(client: WorkerClient, config: RemoteChatExecutionConfig) -> Result<Self, ApiError> {
+        config.validate()?;
+        Ok(Self { client, config })
+    }
+
+    #[cfg(test)]
+    pub fn config(&self) -> &RemoteChatExecutionConfig {
+        &self.config
+    }
+
+    pub(crate) const fn max_output_tokens(&self) -> u32 {
+        self.config.max_output_tokens
+    }
+
+    /// Verify that the pinned worker incarnation still advertises the exact
+    /// chat deployment and model generation configured by the gateway.
+    pub async fn readiness_check(&self) -> Result<(), String> {
+        let status = self
+            .client
+            .status()
+            .await
+            .map_err(|error| format!("worker status request failed: {error}"))?;
+        if status.incarnation_id != self.config.expected_worker_incarnation {
+            return Err("worker incarnation does not match the pinned gateway target".into());
+        }
+        if status.process_state != WorkerProcessState::Running {
+            return Err(format!(
+                "worker process is {:?}, expected running",
+                status.process_state
+            ));
+        }
+        let deployment = status
+            .deployments
+            .iter()
+            .find(|deployment| deployment.deployment_id == self.config.deployment_id)
+            .ok_or_else(|| "pinned chat deployment is not advertised by the worker".to_string())?;
+        if deployment.model_generation != self.config.expected_model_generation {
+            return Err("worker model generation does not match the pinned gateway target".into());
+        }
+        if deployment.public_model.as_str() != self.config.public_model_variant.dir_name() {
+            return Err("worker public model does not match the gateway route model".into());
+        }
+        if deployment.task != TaskKind::Chat || deployment.readiness != ModelReadiness::Ready {
+            return Err("pinned worker deployment is not ready for chat".into());
+        }
+        Ok(())
     }
 }
 
@@ -127,7 +242,12 @@ pub fn resolve_chat_request_config(
 #[derive(Debug, Clone)]
 pub enum ChatStreamEvent {
     Started,
-    Delta(String),
+    /// DS9.3: a text delta with its per-token logprob entries (empty unless
+    /// the request asked for logprobs).
+    Delta {
+        text: String,
+        logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    },
     Completed(Box<ChatGeneration>),
     Failed(String),
     ShuttingDown,
@@ -185,8 +305,12 @@ fn try_send_chat_delta(
     event_tx: &mpsc::Sender<ChatStreamEvent>,
     backpressure: &ChatStreamBackpressure,
     delta: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
 ) {
-    match event_tx.try_send(ChatStreamEvent::Delta(delta)) {
+    match event_tx.try_send(ChatStreamEvent::Delta {
+        text: delta,
+        logprobs,
+    }) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => backpressure.trip(),
         // The receiver has gone away, so there is nobody to notify with a
@@ -226,10 +350,18 @@ where
 }
 
 async fn send_chat_terminal(event_tx: mpsc::Sender<ChatStreamEvent>, event: ChatStreamEvent) {
+    send_chat_terminal_with_timeout(event_tx, event, CHAT_TERMINAL_SEND_TIMEOUT).await;
+}
+
+async fn send_chat_terminal_with_timeout(
+    event_tx: mpsc::Sender<ChatStreamEvent>,
+    event: ChatStreamEvent,
+    timeout: Duration,
+) {
     // A connected receiver may stop polling forever. Terminal delivery remains
     // best-effort for that transport, but it must never retain inference or
     // workload capacity indefinitely.
-    let _ = tokio::time::timeout(CHAT_TERMINAL_SEND_TIMEOUT, event_tx.send(event)).await;
+    let _ = tokio::time::timeout(timeout, event_tx.send(event)).await;
 }
 
 pub fn max_new_tokens(
@@ -276,6 +408,774 @@ pub async fn generate_chat(
         )
         .await
         .map_err(ApiError::from)
+}
+
+/// Execute the explicitly configured Phase 1 chat slice over the private HTTP
+/// worker contract. This function never falls back to local execution and never
+/// retries a request whose acceptance may be uncertain.
+pub async fn generate_remote_chat(
+    state: &AppState,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<ChatGeneration, ApiError> {
+    let remote = state
+        .remote_chat_execution
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("Remote chat execution is not configured"))?;
+    generate_remote_chat_with_execution(remote, state.request_timeout_secs, context, request).await
+}
+
+pub async fn generate_remote_chat_with_execution(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<ChatGeneration, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let started = Instant::now();
+    let mut stream = remote
+        .client
+        .invoke(invocation)
+        .await
+        .map_err(map_worker_client_error)?;
+    collect_started_remote_chat(remote, &mut stream, started, |_| {}).await
+}
+
+pub(crate) async fn generate_remote_chat_with_execution_and_tenant(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<ChatGeneration, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let started = Instant::now();
+    let started_invocation =
+        start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
+            .await
+            .map_err(|failure| map_worker_client_error(failure.error))?;
+    let mut stream = started_invocation.stream;
+    collect_started_remote_chat_with_tenant(
+        remote,
+        &mut stream,
+        started,
+        |_| {},
+        started_invocation.tenant_work,
+    )
+    .await
+}
+
+pub(crate) async fn collect_started_remote_chat<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
+    on_worker_error: F,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
+    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, None).await
+}
+
+pub(crate) async fn collect_started_remote_chat_with_tenant<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
+    on_worker_error: F,
+    tenant_work: BoundTenantWorkLease,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
+    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, Some(tenant_work))
+        .await
+}
+
+async fn collect_started_remote_chat_inner<F>(
+    remote: &RemoteChatExecution,
+    stream: &mut InvocationStream,
+    started: Instant,
+    mut on_worker_error: F,
+    mut tenant_work: Option<BoundTenantWorkLease>,
+) -> Result<ChatGeneration, ApiError>
+where
+    F: FnMut(&WorkerClientError),
+{
+    let mut text = String::new();
+    let mut latest_usage = None;
+    let mut logprob_entries = RemoteLogprobCollector::default();
+
+    loop {
+        let event = match stream.next_event().await {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                on_worker_error(&error);
+                return Err(map_worker_client_error(error));
+            }
+        };
+        match event.event {
+            InvocationEventKind::Accepted { .. } => {}
+            InvocationEventKind::TextDelta {
+                text: delta,
+                logprobs,
+            } => {
+                append_remote_text(&mut text, &delta, remote.config.max_output_bytes)?;
+                logprob_entries.extend(logprobs);
+            }
+            InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
+            InvocationEventKind::Completed {
+                finish_reason,
+                usage,
+            } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
+                return worker_chat_generation(
+                    text,
+                    finish_reason,
+                    usage.or(latest_usage),
+                    started,
+                    logprob_entries.finish(),
+                );
+            }
+            InvocationEventKind::Error { code, message } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
+                return Err(map_worker_terminal_error(code, message));
+            }
+            InvocationEventKind::Cancelled { reason } => {
+                if let Some(lease) = tenant_work.take() {
+                    lease.confirm_stopped();
+                }
+                return Err(cancelled_error(
+                    reason.unwrap_or_else(|| "Worker cancelled chat invocation".to_string()),
+                ));
+            }
+        }
+    }
+
+    Err(bad_gateway_error(
+        "Worker chat stream ended without a terminal event",
+    ))
+}
+
+pub(crate) struct StartedTenantInvocation {
+    pub(crate) stream: InvocationStream,
+    pub(crate) tenant_work: BoundTenantWorkLease,
+}
+
+pub(crate) struct TenantInvocationStartFailure {
+    pub(crate) error: WorkerClientError,
+    /// Present only when the failure proves the exact attempt was never
+    /// admitted. The same public-request lease may then be rebound to the one
+    /// permitted alternate attempt.
+    pub(crate) retry_tenant_work: Option<UnboundTenantWorkLease>,
+}
+
+pub(crate) async fn start_remote_chat_invocation_with_tenant(
+    remote: &RemoteChatExecution,
+    invocation: InvocationRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<StartedTenantInvocation, TenantInvocationStartFailure> {
+    let identity = AttemptIdentity::from(&invocation);
+    let bound = tenant_work.bind(remote.client.clone(), identity);
+    match remote.client.invoke(invocation).await {
+        Ok(stream) => Ok(StartedTenantInvocation {
+            stream,
+            tenant_work: bound,
+        }),
+        Err(error) if error.proves_attempt_unaccepted() => Err(TenantInvocationStartFailure {
+            error,
+            retry_tenant_work: Some(bound.prove_unaccepted()),
+        }),
+        Err(error) => {
+            // Dropping a bound lease retains ownership and reconciles the exact
+            // attempt; an uncertain failure is never made eligible for retry.
+            drop(bound);
+            Err(TenantInvocationStartFailure {
+                error,
+                retry_tenant_work: None,
+            })
+        }
+    }
+}
+
+pub(crate) fn prepare_remote_chat_invocation(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<InvocationRequest, ApiError> {
+    if request.variant != remote.config.public_model_variant {
+        return Err(ApiError::bad_request(format!(
+            "Requested model is incompatible with remote deployment {}",
+            remote.config.deployment_id
+        )));
+    }
+    validate_remote_chat_scope(&request)?;
+
+    let remaining = context
+        .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| request_timeout_error("Chat request deadline expired before dispatch"))?;
+    let remaining_time_ms = u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    build_remote_chat_invocation(context, request, remote, remaining_time_ms)
+}
+
+pub(crate) fn retarget_remote_chat_invocation(
+    invocation: &InvocationRequest,
+    remote: &RemoteChatExecution,
+    remaining: Duration,
+) -> Result<InvocationRequest, ApiError> {
+    if remaining.is_zero() {
+        return Err(request_timeout_error(
+            "Chat request deadline expired before alternate dispatch",
+        ));
+    }
+    let remaining_time_ms = u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let mut alternate = invocation.clone();
+    alternate.attempt_id = AttemptId::new(new_uuid()).map_err(identifier_error)?;
+    alternate.expected_worker_incarnation = remote.config.expected_worker_incarnation.clone();
+    alternate.deployment_id = remote.config.deployment_id.clone();
+    alternate.expected_model_generation = remote.config.expected_model_generation;
+    alternate.remaining_time_ms = remaining_time_ms;
+    alternate.max_queue_wait_ms = u64::try_from(remote.config.max_queue_wait.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(remaining_time_ms);
+    alternate.output_limits.max_tokens = alternate
+        .output_limits
+        .max_tokens
+        .min(remote.config.max_output_tokens)
+        .max(1);
+    alternate.output_limits.max_bytes = remote.config.max_output_bytes;
+    alternate.request_digest = request_digest(
+        &alternate.caller.tenant_id,
+        &alternate.deployment_id,
+        alternate.expected_model_generation,
+        &alternate.input,
+        alternate.output_limits.max_tokens,
+        alternate.output_limits.max_bytes,
+    )?;
+    alternate
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(alternate)
+}
+
+fn append_remote_text(text: &mut String, delta: &str, max_bytes: u64) -> Result<(), ApiError> {
+    let next_len = text.len().checked_add(delta.len()).ok_or_else(|| {
+        bad_gateway_error("Worker chat output exceeded the configured byte limit")
+    })?;
+    if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+        return Err(bad_gateway_error(
+            "Worker chat output exceeded the configured byte limit",
+        ));
+    }
+    text.push_str(delta);
+    Ok(())
+}
+
+/** DS9.3: bound on accumulated worker logprob entries per response. */
+const REMOTE_CHAT_LOGPROB_ENTRY_LIMIT: usize = 65_536;
+
+/// DS9.3: map protocol logprob entries onto the core payload shape.
+fn remote_logprobs(
+    entries: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
+) -> Vec<izwi_core::engine::TokenLogprob> {
+    entries
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| izwi_core::engine::TokenLogprob {
+            token: entry.token,
+            logprob: entry.logprob,
+            bytes: entry.bytes,
+            top_logprobs: entry
+                .top_logprobs
+                .into_iter()
+                .map(|top| izwi_core::engine::TopTokenLogprob {
+                    token: top.token,
+                    logprob: top.logprob,
+                    bytes: top.bytes,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// DS9.3: bounded accumulator for entries collected across worker deltas.
+#[derive(Default)]
+struct RemoteLogprobCollector {
+    entries: Vec<izwi_core::engine::TokenLogprob>,
+    overflow: bool,
+}
+
+impl RemoteLogprobCollector {
+    fn extend(
+        &mut self,
+        entries: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
+    ) -> Vec<izwi_core::engine::TokenLogprob> {
+        let mapped = remote_logprobs(entries);
+        if !self.overflow {
+            let room = REMOTE_CHAT_LOGPROB_ENTRY_LIMIT.saturating_sub(self.entries.len());
+            if mapped.len() <= room {
+                self.entries.extend(mapped.iter().cloned());
+            } else {
+                self.entries.extend(mapped.into_iter().take(room));
+                self.overflow = true;
+            }
+        }
+        self.entries.clone()
+    }
+
+    fn finish(self) -> Vec<izwi_core::engine::TokenLogprob> {
+        self.entries
+    }
+}
+
+fn worker_chat_generation(
+    text: String,
+    finish_reason: WorkerFinishReason,
+    usage: Option<Usage>,
+    started: Instant,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+) -> Result<ChatGeneration, ApiError> {
+    let usage = usage.unwrap_or(Usage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: None,
+    });
+    Ok(ChatGeneration {
+        latency_breakdown: None,
+        finish_reason: Some(match finish_reason {
+            WorkerFinishReason::Stop => izwi_core::engine::OutputFinishReason::StopToken,
+            WorkerFinishReason::Length => izwi_core::engine::OutputFinishReason::MaxTokens,
+        }),
+        text,
+        prompt_tokens: usize::try_from(usage.input_tokens)
+            .map_err(|_| bad_gateway_error("Worker reported an invalid input token count"))?,
+        tokens_generated: usize::try_from(usage.output_tokens)
+            .map_err(|_| bad_gateway_error("Worker reported an invalid output token count"))?,
+        generation_time_ms: started.elapsed().as_secs_f64() * 1000.0,
+        cached_prompt_tokens: usage.cached_tokens,
+        logprobs,
+    })
+}
+
+/// Start an accepted private worker invocation and forward its bounded events
+/// through the existing public chat stream channel. Dropping the receiver
+/// closes the channel, drops the private stream, and schedules exact-attempt
+/// cancellation; neither layer retries the invocation.
+pub async fn spawn_remote_chat_stream_with_execution(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let worker_stream = remote
+        .client
+        .invoke(invocation)
+        .await
+        .map_err(map_worker_client_error)?;
+    Ok(spawn_started_remote_chat_stream_with_execution(
+        remote,
+        worker_stream,
+        |_| {},
+    ))
+}
+
+pub(crate) async fn spawn_remote_chat_stream_with_tenant(
+    remote: &RemoteChatExecution,
+    request_timeout_secs: u64,
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    tenant_work: UnboundTenantWorkLease,
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
+    let invocation =
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+    let started = start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
+        .await
+        .map_err(|failure| map_worker_client_error(failure.error))?;
+    Ok(spawn_started_remote_chat_stream_with_tenant(
+        remote,
+        started.stream,
+        |_| {},
+        started.tenant_work,
+    ))
+}
+
+pub(crate) fn spawn_started_remote_chat_stream_with_execution<F>(
+    remote: &RemoteChatExecution,
+    worker_stream: InvocationStream,
+    on_worker_error: F,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
+    spawn_started_remote_chat_stream_inner(remote, worker_stream, on_worker_error, None)
+}
+
+pub(crate) fn spawn_started_remote_chat_stream_with_tenant<F>(
+    remote: &RemoteChatExecution,
+    worker_stream: InvocationStream,
+    on_worker_error: F,
+    tenant_work: BoundTenantWorkLease,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
+    spawn_started_remote_chat_stream_inner(
+        remote,
+        worker_stream,
+        on_worker_error,
+        Some(tenant_work),
+    )
+}
+
+fn spawn_started_remote_chat_stream_inner<F>(
+    remote: &RemoteChatExecution,
+    mut worker_stream: InvocationStream,
+    on_worker_error: F,
+    mut tenant_work: Option<BoundTenantWorkLease>,
+) -> mpsc::Receiver<ChatStreamEvent>
+where
+    F: Fn(&WorkerClientError) + Send + Sync + 'static,
+{
+    let max_output_bytes = remote.config.max_output_bytes;
+    let slow_consumer_timeout = remote.config.slow_consumer_timeout;
+    let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let mut logprob_entries = RemoteLogprobCollector::default();
+        let backpressure = Arc::new(ChatStreamBackpressure::default());
+        let mut text = String::new();
+        let mut latest_usage = None;
+        let terminal = loop {
+            let event = tokio::select! {
+                event = worker_stream.next_event() => event,
+                () = event_tx.closed() => return,
+            };
+            let event = match event {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    break ChatStreamEvent::Failed(
+                        "Worker chat stream ended without a terminal event".into(),
+                    )
+                }
+                Err(error) => {
+                    on_worker_error(&error);
+                    break ChatStreamEvent::Failed(map_worker_client_error(error).message);
+                }
+            };
+            match event.event {
+                InvocationEventKind::Accepted { .. } => {
+                    if event_tx.try_send(ChatStreamEvent::Started).is_err() {
+                        return;
+                    }
+                }
+                InvocationEventKind::TextDelta {
+                    text: delta,
+                    logprobs,
+                } => {
+                    if let Err(error) = append_remote_text(&mut text, &delta, max_output_bytes) {
+                        break ChatStreamEvent::Failed(error.message);
+                    }
+                    let entries = logprob_entries.extend(logprobs);
+                    try_send_chat_delta(&event_tx, &backpressure, delta, entries);
+                    if event_tx.is_closed() {
+                        return;
+                    }
+                    if backpressure.is_tripped() {
+                        break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
+                    }
+                }
+                InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
+                InvocationEventKind::Completed {
+                    finish_reason,
+                    usage,
+                } => {
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
+                    match worker_chat_generation(
+                        text,
+                        finish_reason,
+                        usage.or(latest_usage),
+                        started,
+                        logprob_entries.finish(),
+                    ) {
+                        Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
+                        Err(error) => break ChatStreamEvent::Failed(error.message),
+                    }
+                }
+                InvocationEventKind::Error { code, message } => {
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
+                    break ChatStreamEvent::Failed(
+                        map_worker_terminal_error(code, message).message,
+                    );
+                }
+                InvocationEventKind::Cancelled { reason } => {
+                    if let Some(lease) = tenant_work.take() {
+                        lease.confirm_stopped();
+                    }
+                    break ChatStreamEvent::Failed(
+                        reason.unwrap_or_else(|| "Worker cancelled chat invocation".into()),
+                    );
+                }
+            }
+        };
+        // Release or cancel the private stream before terminal delivery can
+        // wait on a slow public consumer. Worker capacity remains governed by
+        // confirmed teardown, not by this gateway channel.
+        drop(worker_stream);
+        // On a transport/protocol interruption this starts exact-attempt
+        // reconciliation. On a validated terminal event the lease was already
+        // consumed above, so this is a no-op.
+        drop(tenant_work);
+        send_chat_terminal_with_timeout(event_tx, terminal, slow_consumer_timeout).await;
+    });
+    event_rx
+}
+
+fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiError> {
+    if !request.chat_config.media_inputs.is_empty() {
+        return Err(ApiError::bad_request(
+            "Remote chat execution currently supports text-only requests",
+        ));
+    }
+    if !request.chat_config.tools.is_empty()
+        || request.chat_config.enable_thinking.is_some()
+        || request.chat_config.reasoning_effort.is_some()
+        || request.chat_config.preserve_thinking.is_some()
+        || request.top_k.is_some()
+        || request.repetition_penalty.is_some()
+        || request.presence_penalty.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Remote chat execution does not yet support tools or advanced generation controls",
+        ));
+    }
+    Ok(())
+}
+
+fn build_remote_chat_invocation(
+    context: &RequestContext,
+    request: ChatExecutionRequest,
+    remote: &RemoteChatExecution,
+    remaining_time_ms: u64,
+) -> Result<InvocationRequest, ApiError> {
+    let requested_tokens = request.resolved_max_new_tokens();
+    let max_tokens = u32::try_from(requested_tokens)
+        .unwrap_or(u32::MAX)
+        .min(remote.config.max_output_tokens)
+        .max(1);
+    let input = InvocationInput::Chat {
+        input: ChatInput {
+            messages: request
+                .messages
+                .into_iter()
+                .map(|message| WorkerChatMessage {
+                    role: match message.role {
+                        izwi_core::ChatRole::System => WorkerChatRole::System,
+                        izwi_core::ChatRole::User => WorkerChatRole::User,
+                        izwi_core::ChatRole::Assistant => WorkerChatRole::Assistant,
+                    },
+                    content: message.content,
+                })
+                .collect(),
+        },
+        parameters: WorkerChatParameters {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            seed: None,
+            stop: Vec::new(),
+        },
+    };
+    let request_id = RequestId::new(new_uuid()).map_err(identifier_error)?;
+    let attempt_id = AttemptId::new(new_uuid()).map_err(identifier_error)?;
+    let tenant_namespace = context
+        .principal
+        .tenant_id
+        .as_deref()
+        .map(|tenant| format!("tenant:{tenant}"))
+        .unwrap_or_else(|| format!("principal:{}", context.principal.id));
+    let caller = GatewayAttestedCallerContext {
+        tenant_id: TenantId::new(hashed_identity("tenant", &tenant_namespace))
+            .map_err(identifier_error)?,
+        caller_id: CallerId::new(hashed_identity("caller", &context.principal.id))
+            .map_err(identifier_error)?,
+        policy_revision: remote.config.policy_revision.clone(),
+        permitted_actions: [
+            PermittedAction::Invoke,
+            PermittedAction::CancelOwnInvocation,
+        ]
+        .into_iter()
+        .collect(),
+        allowed_data_regions: Vec::new(),
+    };
+    let request_digest = request_digest(
+        &caller.tenant_id,
+        &remote.config.deployment_id,
+        remote.config.expected_model_generation,
+        &input,
+        max_tokens,
+        remote.config.max_output_bytes,
+    )?;
+
+    let invocation = InvocationRequest {
+        schema_version: PROTOCOL_V1,
+        request_id,
+        attempt_id,
+        expected_worker_incarnation: remote.config.expected_worker_incarnation.clone(),
+        deployment_id: remote.config.deployment_id.clone(),
+        expected_model_generation: remote.config.expected_model_generation,
+        caller,
+        task: TaskKind::Chat,
+        service_class: ServiceClass::Interactive,
+        remaining_time_ms,
+        max_queue_wait_ms: u64::try_from(remote.config.max_queue_wait.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(remaining_time_ms),
+        output_limits: OutputLimits {
+            max_tokens,
+            max_bytes: remote.config.max_output_bytes,
+        },
+        requested_output_format: OutputFormat::Text,
+        session_id: None,
+        request_digest,
+        input,
+    };
+    invocation
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(invocation)
+}
+
+fn request_digest(
+    tenant_id: &TenantId,
+    deployment_id: &DeploymentId,
+    generation: ModelGeneration,
+    input: &InvocationInput,
+    max_tokens: u32,
+    max_bytes: u64,
+) -> Result<RequestDigest, ApiError> {
+    let canonical = serde_json::to_vec(&(
+        tenant_id,
+        deployment_id,
+        generation,
+        input,
+        max_tokens,
+        max_bytes,
+    ))
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    RequestDigest::new(hashed_identity("sha256", &canonical)).map_err(identifier_error)
+}
+
+fn hashed_identity(prefix: &str, value: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(value.as_ref());
+    let mut encoded = String::with_capacity(prefix.len() + 1 + digest.len() * 2);
+    encoded.push_str(prefix);
+    encoded.push(':');
+    for byte in digest {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+fn identifier_error(error: izwi_serving_protocol::IdentifierError) -> ApiError {
+    ApiError::internal(format!(
+        "Failed to construct private serving identity: {error}"
+    ))
+}
+
+pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
+    match error {
+        WorkerClientError::Rejected { rejection } => {
+            let message = rejection.message;
+            match rejection.code {
+                RejectionCode::Unauthorized | RejectionCode::PolicyDenied => {
+                    ApiError::forbidden(message)
+                }
+                RejectionCode::UnknownDeployment | RejectionCode::IncompatibleTask => {
+                    ApiError::bad_request(message)
+                }
+                RejectionCode::WrongWorkerIncarnation
+                | RejectionCode::WrongModelGeneration
+                | RejectionCode::ModelNotReady
+                | RejectionCode::WorkerDraining
+                | RejectionCode::CapacityExhausted
+                | RejectionCode::QueueWaitExceeded => ApiError::service_unavailable(message),
+                RejectionCode::InvalidRequest => ApiError::bad_request(message),
+                RejectionCode::DuplicateAttemptConflict => ApiError {
+                    status: StatusCode::CONFLICT,
+                    message,
+                },
+                RejectionCode::Unauthenticated | RejectionCode::UnsupportedProtocolVersion => {
+                    bad_gateway_error(message)
+                }
+            }
+        }
+        WorkerClientError::Deadline(_) => request_timeout_error(error.to_string()),
+        WorkerClientError::InvalidInvocation(validation) => {
+            ApiError::bad_request(validation.to_string())
+        }
+        WorkerClientError::InvalidConfiguration(_)
+        | WorkerClientError::InvalidEndpoint(_)
+        | WorkerClientError::Build(_)
+        | WorkerClientError::Encode(_)
+        | WorkerClientError::RequestTooLarge { .. }
+        | WorkerClientError::ConnectionNotEstablished(_)
+        | WorkerClientError::Transport(_)
+        | WorkerClientError::HttpStatus { .. }
+        | WorkerClientError::ResponseTooLarge { .. }
+        | WorkerClientError::InvalidJson(_)
+        | WorkerClientError::Ndjson(_)
+        | WorkerClientError::Protocol(_)
+        | WorkerClientError::InterruptedUnknown => bad_gateway_error(error.to_string()),
+    }
+}
+
+fn map_worker_terminal_error(code: InvocationErrorCode, message: String) -> ApiError {
+    match code {
+        InvocationErrorCode::InvalidInput => ApiError::bad_request(message),
+        InvocationErrorCode::DeadlineExceeded => request_timeout_error(message),
+        InvocationErrorCode::WorkerUnavailable => ApiError::service_unavailable(message),
+        InvocationErrorCode::ExecutionFailed
+        | InvocationErrorCode::OutputLimitExceeded
+        | InvocationErrorCode::Internal => ApiError::internal(message),
+    }
+}
+
+fn request_timeout_error(message: impl Into<String>) -> ApiError {
+    ApiError {
+        status: StatusCode::REQUEST_TIMEOUT,
+        message: message.into(),
+    }
+}
+
+fn cancelled_error(message: impl Into<String>) -> ApiError {
+    ApiError {
+        status: StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+        message: message.into(),
+    }
+}
+
+fn bad_gateway_error(message: impl Into<String>) -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        message: message.into(),
+    }
 }
 
 pub fn spawn_chat_stream(
@@ -342,7 +1242,7 @@ where
                 return;
             }
 
-            let generation = runtime.chat_generate_streaming_with_runtime_context(
+            let generation = runtime.chat_generate_streaming_tokens_with_runtime_context(
                 variant,
                 messages,
                 params,
@@ -352,8 +1252,8 @@ where
                 {
                     let event_tx = event_tx.clone();
                     let backpressure = backpressure.clone();
-                    move |delta| {
-                        try_send_chat_delta(&event_tx, &backpressure, delta);
+                    move |delta: String, logprobs: Vec<izwi_core::engine::TokenLogprob>| {
+                        try_send_chat_delta(&event_tx, &backpressure, delta, logprobs);
                     }
                 },
             );
@@ -462,9 +1362,42 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
+    fn worker_usage_maps_cached_tokens_into_the_generation() {
+        let measured = worker_chat_generation(
+            "text".to_string(),
+            WorkerFinishReason::Stop,
+            Some(Usage {
+                input_tokens: 12,
+                output_tokens: 3,
+                cached_tokens: Some(7),
+            }),
+            std::time::Instant::now(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(measured.prompt_tokens, 12);
+        assert_eq!(measured.tokens_generated, 3);
+        assert_eq!(measured.cached_prompt_tokens, Some(7));
+
+        let unmeasured = worker_chat_generation(
+            "text".to_string(),
+            WorkerFinishReason::Stop,
+            None,
+            std::time::Instant::now(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(unmeasured.prompt_tokens, 0);
+        assert_eq!(
+            unmeasured.cached_prompt_tokens, None,
+            "unmeasured cache stays absent so the public surface renders zero"
+        );
+    }
+
+    #[test]
     fn explicit_overrides_win_over_default_generation_params() {
         let request = ChatExecutionRequest {
-            variant: ModelVariant::Qwen34BGguf,
+            variant: ModelVariant::Qwen354BGguf,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
@@ -476,6 +1409,9 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: Some(0.25),
+            logprobs: None,
+            top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         };
@@ -502,6 +1438,9 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format_json_object: false,
             chat_config: ChatRequestConfig {
                 enable_thinking,
                 ..Default::default()
@@ -591,10 +1530,6 @@ mod tests {
         for variant in [
             ModelVariant::Gemma34BIt,
             ModelVariant::Lfm2512BInstructGguf,
-            ModelVariant::Qwen306BGguf,
-            ModelVariant::Qwen317BGguf,
-            ModelVariant::Qwen34BGguf,
-            ModelVariant::Qwen38BGguf,
             ModelVariant::Qwen314BGguf,
             ModelVariant::Qwen352BGguf,
         ] {
@@ -621,9 +1556,9 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let mut event_rx =
             spawn_chat_stream_with_task(semaphore, 4, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string(), Vec::new());
                 tokio::time::sleep(Duration::from_millis(25)).await;
-                try_send_chat_delta(&event_tx, &backpressure, " world".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, " world".to_string(), Vec::new());
                 Ok(ChatGeneration {
                     text: "Hello world".to_string(),
                     prompt_tokens: 12,
@@ -631,6 +1566,8 @@ mod tests {
                     generation_time_ms: 25.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             });
 
@@ -640,12 +1577,12 @@ mod tests {
         }
 
         match event_rx.recv().await {
-            Some(ChatStreamEvent::Delta(delta)) => assert_eq!(delta, "Hello"),
+            Some(ChatStreamEvent::Delta { text, .. }) => assert_eq!(text, "Hello"),
             other => panic!("expected first delta event, got {other:?}"),
         }
 
         match event_rx.recv().await {
-            Some(ChatStreamEvent::Delta(delta)) => assert_eq!(delta, " world"),
+            Some(ChatStreamEvent::Delta { text, .. }) => assert_eq!(text, " world"),
             other => panic!("expected second delta event, got {other:?}"),
         }
 
@@ -663,8 +1600,8 @@ mod tests {
         let semaphore = Arc::new(Semaphore::new(1));
         let mut event_rx =
             spawn_chat_stream_with_task(semaphore, 2, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "first".to_string());
-                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string());
+                try_send_chat_delta(&event_tx, &backpressure, "first".to_string(), Vec::new());
+                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string(), Vec::new());
                 // Completion in the same poll as the overflow must not win the
                 // race and turn a truncated stream into apparent success.
                 Ok(ChatGeneration {
@@ -674,6 +1611,8 @@ mod tests {
                     generation_time_ms: 1.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             });
 
@@ -683,7 +1622,7 @@ mod tests {
         ));
         assert!(matches!(
             event_rx.recv().await,
-            Some(ChatStreamEvent::Delta(delta)) if delta == "first"
+            Some(ChatStreamEvent::Delta { text, .. }) if text == "first"
         ));
         assert!(matches!(
             event_rx.recv().await,
@@ -712,6 +1651,8 @@ mod tests {
                     generation_time_ms: 1.0,
                     latency_breakdown: None,
                     finish_reason: None,
+                    cached_prompt_tokens: None,
+                    logprobs: Vec::new(),
                 })
             },
         );

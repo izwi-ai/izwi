@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn resolve_audio_chat_variant_rejects_non_audio_chat_models() {
         let err =
-            resolve_audio_chat_variant(Some("Qwen3-1.7B-GGUF")).expect_err("expected rejection");
+            resolve_audio_chat_variant(Some("Qwen3.5-4B")).expect_err("expected rejection");
         assert!(err.to_string().contains("not an audio-chat model"));
     }
 

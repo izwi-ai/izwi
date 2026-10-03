@@ -22,6 +22,7 @@ pub fn ensure_sortformer_artifacts(
 ) -> Result<SortformerArtifacts> {
     let nemo_filename = match variant {
         ModelVariant::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1.nemo",
+        ModelVariant::Nemotron3Diarization => "Nemotron-3-Diarization.nemo",
         _ => {
             return Err(Error::InvalidInput(format!(
                 "Unsupported Sortformer diarization variant: {}",

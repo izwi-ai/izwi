@@ -54,7 +54,7 @@ use crate::voice_defaults::{
 };
 use crate::voice_memory::extract_observation_candidates;
 use crate::voice_store::CreateVoiceTurnRequest;
-const DEFAULT_CHAT_MODEL: &str = "Qwen3-1.7B-GGUF";
+const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";

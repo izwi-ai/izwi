@@ -6,7 +6,61 @@ use std::path::{Component, Path, PathBuf};
 const APP_NAME_DIR: &str = "izwi";
 const DEFAULT_DB_FILENAME: &str = "izwi.sqlite3";
 const DB_ENV_PRIMARY: &str = "IZWI_DB_PATH";
+const DATABASE_URL_ENV: &str = "IZWI_DATABASE_URL";
 const MEDIA_ENV_PRIMARY: &str = "IZWI_MEDIA_DIR";
+const SPEECH_SPOOL_ENV_PRIMARY: &str = "IZWI_SPEECH_SPOOL_DIR";
+const MAX_DATABASE_URL_BYTES: usize = 4096;
+
+/// Database backends the store layer can address by URL. SQLite paths stay
+/// the default resolution; the URL form exists for fleet deployments where
+/// the durable store lives in a shared server database (DS5).
+pub const DATABASE_URL_SCHEMES: &[&str] = &["postgres", "postgresql", "mysql", "sqlite"];
+
+/// Where the store database lives: a SQLite file path (the historical and
+/// default form) or a bounded database URL such as `postgres://...`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseSource {
+    Path(PathBuf),
+    Url(String),
+}
+
+/// Parse a raw database reference. Values carrying a recognized `scheme://`
+/// prefix become [`DatabaseSource::Url`]; anything else is treated as a
+/// file path. Unknown URL schemes are rejected instead of being silently
+/// downgraded to paths so a mistyped URL fails loudly.
+pub fn database_source_from_raw(raw: &str) -> anyhow::Result<DatabaseSource> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Database reference must not be empty"));
+    }
+    if trimmed.len() > MAX_DATABASE_URL_BYTES {
+        return Err(anyhow!(
+            "Database reference exceeds its {MAX_DATABASE_URL_BYTES} byte limit"
+        ));
+    }
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
+        if !DATABASE_URL_SCHEMES.contains(&scheme) || rest.is_empty() {
+            return Err(anyhow!(
+                "Database URL scheme must be one of: {}",
+                DATABASE_URL_SCHEMES.join(", ")
+            ));
+        }
+        return Ok(DatabaseSource::Url(trimmed.to_string()));
+    }
+    Ok(DatabaseSource::Path(PathBuf::from(trimmed)))
+}
+
+/// Resolve the durable store database source. `IZWI_DATABASE_URL` wins over
+/// the historical `IZWI_DB_PATH` file path; the default remains the local
+/// SQLite layout under the data root. An empty URL value means unset.
+pub fn resolve_database_source() -> anyhow::Result<DatabaseSource> {
+    if let Ok(raw) = std::env::var(DATABASE_URL_ENV) {
+        if !raw.trim().is_empty() {
+            return database_source_from_raw(&raw);
+        }
+    }
+    Ok(DatabaseSource::Path(resolve_db_path()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaGroup {
@@ -37,6 +91,19 @@ pub fn resolve_media_root() -> PathBuf {
     }
 
     resolve_data_root().join("media")
+}
+
+/// Resolve the process-owned scratch root used by local speech requests.
+///
+/// This is intentionally separate from durable media: files below this root
+/// are temporary and can be reclaimed only through the ownership protocol in
+/// `speech_spool`.
+pub fn resolve_speech_spool_root() -> PathBuf {
+    if let Some(path) = env_path(SPEECH_SPOOL_ENV_PRIMARY) {
+        return path;
+    }
+
+    std::env::temp_dir().join(APP_NAME_DIR).join("speech-spool")
 }
 
 pub fn ensure_storage_dirs(db_path: &Path, media_root: &Path) -> anyhow::Result<()> {
@@ -173,6 +240,7 @@ pub fn content_type_from_media_path(path: &str) -> &'static str {
         Some("flac") => "audio/flac",
         Some("m4a") => "audio/mp4",
         Some("aac") => "audio/aac",
+        Some("f32le") => "audio/pcm-f32le",
         _ => "application/octet-stream",
     }
 }
@@ -228,7 +296,19 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         .trim()
         .to_ascii_lowercase();
 
-    let mapped = match mime.as_str() {
+    media_extension_for_content_type(&mime).to_string()
+}
+
+/// Stable extension mapping used by local providers that reconstruct MIME
+/// metadata from object keys on read.
+pub fn media_extension_for_content_type(mime_type: &str) -> &'static str {
+    let mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
         "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
         "audio/mpeg" | "audio/mp3" => "mp3",
         "audio/ogg" | "audio/vorbis" => "ogg",
@@ -236,6 +316,7 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         "audio/webm" => "webm",
         "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
         "audio/aac" => "aac",
+        "audio/pcm-f32le" => "f32le",
         "audio/basic" => "au",
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -254,9 +335,7 @@ fn resolve_audio_extension(preferred_filename: Option<&str>, mime_type: &str) ->
         "video/mpeg" => "mpeg",
         "video/3gpp" => "3gp",
         _ => "bin",
-    };
-
-    mapped.to_string()
+    }
 }
 
 fn is_safe_extension(ext: &str) -> bool {
@@ -286,4 +365,19 @@ pub fn resolve_media_path(media_root: &Path, relative_path: &str) -> anyhow::Res
 
 fn normalize_relative_path(path: PathBuf) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_f32_pcm_content_type_round_trips_through_local_object_keys() {
+        let extension = media_extension_for_content_type("audio/pcm-f32le");
+        assert_eq!(extension, "f32le");
+        assert_eq!(
+            content_type_from_media_path(&format!("chunk.{extension}")),
+            "audio/pcm-f32le"
+        );
+    }
 }

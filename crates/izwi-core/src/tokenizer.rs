@@ -31,6 +31,7 @@ pub struct SpecialTokens {
     pub audio_end_id: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct Tokenizer {
     inner: HfTokenizer,
     special_tokens: SpecialTokens,

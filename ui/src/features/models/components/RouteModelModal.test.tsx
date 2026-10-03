@@ -87,6 +87,65 @@ describe("RouteModelModal", () => {
     expect(row.className).not.toContain("border-[var(--border-strong)]");
   });
 
+  it("shows pinned badges and the residency summary in manage mode", () => {
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="Diarization Models"
+        description="Manage pipeline models for /v1/diarizations."
+        models={[
+          buildModel({ variant: "diar_streaming_sortformer_4spk-v2.1", pinned: true }),
+          buildModel({ variant: "Nemotron-3-Diarization", status: "downloaded" }),
+        ]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+        selectionMode="manage"
+        residencySummary={{
+          resident_count: 1,
+          max_loaded_models: 4,
+          model_keep_alive_secs: 600,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    const summary = screen.getByTestId("route-model-residency-summary");
+    expect(summary).toHaveTextContent("1 model resident of 4 allowed");
+    expect(summary).toHaveTextContent("idle models unload after 10 min");
+  });
+
+  it("omits the residency summary when the server does not provide one", () => {
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="Diarization Models"
+        description="Manage pipeline models for /v1/diarizations."
+        models={[buildModel({})]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+        selectionMode="manage"
+      />,
+    );
+
+    expect(
+      screen.queryByTestId("route-model-residency-summary"),
+    ).not.toBeInTheDocument();
+  });
+
   it("uses a named modal dialog, closes with Escape, and returns focus", async () => {
     function ModalHarness() {
       const [open, setOpen] = useState(false);
@@ -170,14 +229,14 @@ describe("RouteModelModal", () => {
     expect(deleteButton).toHaveFocus();
   });
 
-  it("offers an actionable manual-download guide", () => {
+  it("offers a download action for not-downloaded models", () => {
     render(
       <RouteModelModal
         isOpen
         onClose={vi.fn()}
         title="Chat Models"
         description="Manage chat models."
-        models={[buildModel({ variant: "Gemma-3-1b-it", status: "not_downloaded" })]}
+        models={[buildModel({ variant: "Qwen3.5-4B", status: "not_downloaded" })]}
         loading={false}
         selectedVariant={null}
         downloadProgress={{}}
@@ -190,12 +249,7 @@ describe("RouteModelModal", () => {
     );
 
     expect(
-      screen.getByRole("link", {
-        name: "Open manual download guide for Gemma-3-1b-it",
-      }),
-    ).toHaveAttribute(
-      "href",
-      "https://github.com/izwi-ai/izwi/blob/main/docs/user/models/manual-gemma-3-1b-download.md",
-    );
+      screen.getByRole("button", { name: /Download/i }),
+    ).toBeInTheDocument();
   });
 });

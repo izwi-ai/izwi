@@ -1,7 +1,7 @@
 use super::{
     store::{
-        BatchRuntimeStore, NewStageOutputArtifact, RegisteredWorkerHeartbeatUpdate,
-        StageClaimFilter,
+        validate_stage_output_artifact_ids, BatchRuntimeStore, NewStageOutputArtifact,
+        RegisteredWorkerHeartbeatUpdate, StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
@@ -9,6 +9,7 @@ use super::{
         WORKER_REGISTRATION_VERSION,
     },
 };
+use crate::artifact_store::ArtifactStore;
 use crate::ids::new_uuid;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ pub struct BatchWorkerConfig {
     pub poll_interval: Duration,
     pub lease_duration: Duration,
     pub maintenance_interval: Duration,
+    pub maintenance_batch_limit: usize,
     pub execution_timeout: Option<Duration>,
     pub drain_timeout: Duration,
 }
@@ -60,6 +62,7 @@ impl BatchWorkerConfig {
             poll_interval: Duration::from_millis(250),
             lease_duration: Duration::from_secs(60),
             maintenance_interval: Duration::from_secs(30),
+            maintenance_batch_limit: DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
             execution_timeout: None,
             drain_timeout: Duration::from_secs(20),
         }
@@ -230,9 +233,9 @@ impl BatchWorkerHealth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StageExecutionOutcome {
-    pub output_artifact_ids: Vec<String>,
+    output_artifact_ids: Vec<String>,
 }
 
 impl StageExecutionOutcome {
@@ -241,11 +244,27 @@ impl StageExecutionOutcome {
             output_artifact_ids: Vec::new(),
         }
     }
+
+    pub fn try_new(output_artifact_ids: Vec<String>) -> anyhow::Result<Self> {
+        validate_stage_output_artifact_ids(&output_artifact_ids)?;
+        Ok(Self {
+            output_artifact_ids,
+        })
+    }
+
+    pub fn output_artifact_count(&self) -> usize {
+        self.output_artifact_ids.len()
+    }
+
+    fn into_output_artifact_ids(self) -> Vec<String> {
+        self.output_artifact_ids
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StageCancellationReason {
+    UserRequested,
     ExecutionDeadline,
     DrainDeadline,
     LeaseLost,
@@ -255,6 +274,7 @@ pub enum StageCancellationReason {
 impl StageCancellationReason {
     fn as_error_code(self) -> &'static str {
         match self {
+            Self::UserRequested => "user_requested",
             Self::ExecutionDeadline => "execution_deadline",
             Self::DrainDeadline => "drain_deadline",
             Self::LeaseLost => "lease_lost",
@@ -382,9 +402,20 @@ impl StageExecutionContext {
 
     pub async fn ensure_active(&self) -> anyhow::Result<()> {
         self.check_cancelled()?;
-        if !self.store.stage_lease_is_active(&self.lease).await? {
-            self.cancellation.cancel(StageCancellationReason::LeaseLost);
-            return Err(anyhow!("Stage attempt no longer owns an active lease"));
+        match self.store.stage_lease_state(&self.lease).await? {
+            Some(super::store::StageLeaseState::Active) => {}
+            Some(
+                super::store::StageLeaseState::CancellationRequested
+                | super::store::StageLeaseState::ExecutionStopping,
+            ) => {
+                self.cancellation
+                    .cancel(StageCancellationReason::UserRequested);
+                return Err(anyhow!("Stage attempt is being cancelled"));
+            }
+            None => {
+                self.cancellation.cancel(StageCancellationReason::LeaseLost);
+                return Err(anyhow!("Stage attempt no longer owns an active lease"));
+            }
         }
         Ok(())
     }
@@ -488,6 +519,7 @@ pub struct BatchWorkerRunner {
     active_executions: Arc<RwLock<HashMap<String, ActiveExecution>>>,
     claim_lock: Arc<tokio::sync::Mutex<()>>,
     heartbeat_lock: Arc<tokio::sync::Mutex<()>>,
+    artifact_store: Option<Arc<ArtifactStore>>,
 }
 
 impl BatchWorkerRunner {
@@ -528,6 +560,7 @@ impl BatchWorkerRunner {
             health,
             drain,
             runtime_observer: None,
+            artifact_store: None,
             last_maintenance_at: Arc::new(RwLock::new(None)),
             active_executions: Arc::new(RwLock::new(HashMap::new())),
             claim_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -537,6 +570,11 @@ impl BatchWorkerRunner {
 
     pub fn with_runtime_observer(mut self, runtime: Arc<RuntimeService>) -> Self {
         self.runtime_observer = Some(runtime);
+        self
+    }
+
+    pub fn with_artifact_store(mut self, artifact_store: Arc<ArtifactStore>) -> Self {
+        self.artifact_store = Some(artifact_store);
         self
     }
 
@@ -730,55 +768,110 @@ impl BatchWorkerRunner {
         let mut cancellation_tick = tokio::time::interval(cancellation_poll_interval);
         cancellation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         cancellation_tick.tick().await;
+        let mut awaiting_teardown = false;
+        let mut ownership_lost = false;
         let execution_result = loop {
             tokio::select! {
                 result = &mut execution => {
-                    break match cancellation.reason() {
-                        Some(reason) => StageExecutionResolution::Cancelled(reason),
-                        None => StageExecutionResolution::Finished(result),
-                    };
+                    break result;
                 },
-                reason = cancellation.cancelled() => {
-                    break StageExecutionResolution::Cancelled(reason);
+                _reason = cancellation.cancelled(), if !awaiting_teardown => {
+                    // Cancellation requests are not teardown proof. Keep the
+                    // executor future and its capacity guard alive until the
+                    // implementation actually resolves.
+                    awaiting_teardown = true;
                 },
-                _ = &mut deadline_wait => {
+                _ = &mut deadline_wait, if !awaiting_teardown => {
                     cancellation.cancel(StageCancellationReason::ExecutionDeadline);
-                    break StageExecutionResolution::Cancelled(
-                        StageCancellationReason::ExecutionDeadline,
-                    );
+                    awaiting_teardown = true;
                 },
-                _ = renewal_tick.tick() => {
-                    let renewed = self.store.renew_stage_lease(
+                _ = renewal_tick.tick(), if !ownership_lost => {
+                    match self.store.renew_stage_lease(
                         &lease,
                         self.config.lease_duration.as_millis() as u64,
-                    ).await?;
-                    if !renewed {
-                        cancellation.cancel(StageCancellationReason::LeaseLost);
-                        break StageExecutionResolution::Cancelled(
-                            StageCancellationReason::LeaseLost,
-                        );
+                    ).await {
+                        Ok(true) => {
+                            if let Err(error) = self.record_heartbeat(
+                                "running",
+                                Some((claimed.job.id.clone(), claimed.stage.id.clone())),
+                            ).await {
+                                self.health.record_error(format!(
+                                    "Failed to record batch worker heartbeat while execution remained active: {error:#}"
+                                ));
+                            }
+                        }
+                        Ok(false) => {
+                            ownership_lost = true;
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                        }
+                        Err(error) => {
+                            // A control-plane failure makes ownership unknown;
+                            // it does not stop the underlying executor. Request
+                            // cooperative cancellation, retain capacity, and
+                            // keep trying the exact renewal until ownership is
+                            // conclusively lost or execution resolves.
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                            self.health.record_error(format!(
+                                "Failed to renew active batch stage lease: {error:#}"
+                            ));
+                        }
                     }
-                    self.record_heartbeat(
-                        "running",
-                        Some((claimed.job.id.clone(), claimed.stage.id.clone())),
-                    ).await?;
                 },
                 _ = cancellation_tick.tick() => {
-                    if !self.store.stage_lease_is_active(&lease).await? {
-                        cancellation.cancel(StageCancellationReason::LeaseLost);
-                        break StageExecutionResolution::Cancelled(
-                            StageCancellationReason::LeaseLost,
-                        );
+                    match self.store.stage_lease_state(&lease).await {
+                        Ok(Some(super::store::StageLeaseState::Active)) => {}
+                        Ok(Some(super::store::StageLeaseState::CancellationRequested)) => {
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::UserRequested);
+                            if let Err(error) = self.store.mark_stage_execution_stopping(&lease).await {
+                                self.health.record_error(format!(
+                                    "Failed to mark batch stage execution stopping: {error:#}"
+                                ));
+                            }
+                        }
+                        Ok(Some(super::store::StageLeaseState::ExecutionStopping)) => {
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::UserRequested);
+                        }
+                        Ok(None) => {
+                            ownership_lost = true;
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                        }
+                        Err(error) => {
+                            awaiting_teardown = true;
+                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                            self.health.record_error(format!(
+                                "Failed to query active batch stage lease: {error:#}"
+                            ));
+                        }
                     }
                 }
             }
         };
+        let persisted_state = self.store.stage_lease_state(&lease).await?;
+        let cancellation_reason = match persisted_state {
+            Some(super::store::StageLeaseState::CancellationRequested) => {
+                self.store.mark_stage_execution_stopping(&lease).await?;
+                Some(StageCancellationReason::UserRequested)
+            }
+            Some(super::store::StageLeaseState::ExecutionStopping) => {
+                Some(StageCancellationReason::UserRequested)
+            }
+            _ => cancellation.reason(),
+        };
+        let execution_result = match cancellation_reason {
+            Some(reason) => StageExecutionResolution::Cancelled(reason),
+            None => StageExecutionResolution::Finished(execution_result),
+        };
         match execution_result {
             StageExecutionResolution::Finished(Ok(outcome)) => {
-                let output_artifact_count = outcome.output_artifact_ids.len();
+                let output_artifact_count = outcome.output_artifact_count();
                 let completed = self
                     .store
-                    .complete_stage(&lease, outcome.output_artifact_ids)
+                    .complete_stage(&lease, outcome.into_output_artifact_ids())
                     .await?;
                 self.record_stage_observation(
                     &claimed,
@@ -832,6 +925,32 @@ impl BatchWorkerRunner {
                 self.record_heartbeat("idle", None).await?;
             }
             StageExecutionResolution::Cancelled(reason) => {
+                if reason == StageCancellationReason::UserRequested {
+                    let finalized = self.store.finalize_stage_cancellation(&lease).await?;
+                    self.record_stage_observation(
+                        &claimed,
+                        RuntimeStageOutcome::Cancelled,
+                        Some(stage_started.elapsed().as_secs_f64() * 1000.0),
+                        None,
+                        Some(reason.as_error_code().to_string()),
+                    );
+                    self.record_heartbeat(
+                        if self.drain.is_draining() {
+                            "draining"
+                        } else {
+                            "idle"
+                        },
+                        None,
+                    )
+                    .await?;
+                    if finalized.is_none() {
+                        self.health.record_error(
+                            "User-cancelled stage lost ownership before finalization".to_string(),
+                        );
+                    }
+                    drop(_active_execution);
+                    return Ok(true);
+                }
                 // Always attempt an owner-fenced relinquish, even after an
                 // observed lease loss: an expired-but-unreclaimed attempt is
                 // still ours to retry, while a reclaimed attempt safely no-ops
@@ -903,13 +1022,19 @@ impl BatchWorkerRunner {
         }
 
         self.store
-            .reconcile_inconsistent_states()
+            .reconcile_inconsistent_states(self.config.maintenance_batch_limit)
             .await
             .context("Failed to reconcile durable runtime state")?;
         self.store
-            .recover_expired_stage_leases()
+            .recover_expired_stage_leases(self.config.maintenance_batch_limit)
             .await
             .context("Failed to recover expired runtime stage leases")?;
+        if let Some(artifact_store) = self.artifact_store.as_ref() {
+            artifact_store
+                .cleanup_due(self.config.maintenance_batch_limit)
+                .await
+                .context("Failed to clean tombstoned artifact objects")?;
+        }
         for executor in self.executors.values() {
             executor.maintenance().await?;
         }
@@ -978,10 +1103,12 @@ impl BatchWorkerRunner {
                         Ok(result) => result,
                         Err(_) => {
                             runner.cancel_active_execution(StageCancellationReason::DrainDeadline);
-                            match tokio::time::timeout(Duration::from_secs(1), &mut iteration).await {
-                                Ok(result) => result,
-                                Err(_) => Err(anyhow!("Batch worker drain cancellation did not settle")),
-                            }
+                            // The supervisor applies a bounded wait around the
+                            // worker task. This slot must keep owning the
+                            // pinned executor if cooperative cancellation does
+                            // not settle; dropping it would not prove that
+                            // synchronous or device work stopped.
+                            iteration.await
                         }
                     }
                 },
@@ -1184,12 +1311,33 @@ impl BatchWorkerSupervisor {
             .expect("batch worker supervisor handle must exist");
         match tokio::time::timeout(self.shutdown_timeout, &mut handle).await {
             Ok(joined) => joined.map_err(|err| anyhow!("Batch worker task join failed: {err}")),
+            Err(_) => Err(anyhow!(
+                "Batch worker shutdown exceeded its bounded deadline; execution ownership remains attached"
+            )),
+        }
+    }
+
+    /// Drain the worker without allowing the process runtime to disappear
+    /// while an executor still owns capacity. The bounded [`Self::shutdown`]
+    /// variant is appropriate for embedders whose Tokio runtime remains alive;
+    /// the server process must instead wait for exact settlement (or be killed
+    /// as a whole by its supervisor).
+    pub async fn shutdown_for_process(mut self) -> anyhow::Result<()> {
+        self.begin_drain();
+        let mut handle = self
+            .handle
+            .take()
+            .expect("batch worker supervisor handle must exist");
+        match tokio::time::timeout(self.shutdown_timeout, &mut handle).await {
+            Ok(joined) => joined.map_err(|err| anyhow!("Batch worker task join failed: {err}")),
             Err(_) => {
-                handle.abort();
-                let _ = handle.await;
-                Err(anyhow!(
-                    "Batch worker shutdown exceeded its bounded deadline"
-                ))
+                error!(
+                    timeout_ms = self.shutdown_timeout.as_millis(),
+                    "Batch worker exceeded its shutdown deadline; retaining the process runtime until execution ownership settles"
+                );
+                handle
+                    .await
+                    .map_err(|err| anyhow!("Batch worker task join failed: {err}"))
             }
         }
     }
@@ -1256,7 +1404,10 @@ mod tests {
     use crate::{
         batch_runtime::{
             store::{NewJobStage, NewRuntimeJob},
-            types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+            types::{
+                RuntimeArtifactKind, RuntimeArtifactRole, RuntimeCancellationState, RuntimeJobKind,
+                RuntimeJobStatus, RuntimeStageStatus,
+            },
         },
         db::StoreDatabase,
     };
@@ -1276,8 +1427,15 @@ mod tests {
 
     struct ContextProgressExecutor;
 
-    struct ContextBlockingExecutor {
+    struct CancellationAwareBlockingExecutor {
         started: Arc<Notify>,
+        release: Arc<Notify>,
+        cancellation: Arc<RwLock<Option<StageCancellationSignal>>>,
+    }
+
+    struct SynchronousBlockingExecutor {
+        started: Arc<Notify>,
+        release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         cancellation: Arc<RwLock<Option<StageCancellationSignal>>>,
     }
 
@@ -1288,13 +1446,34 @@ mod tests {
         }
 
         async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+            anyhow::bail!("runner did not invoke context-aware fake stage execution")
+        }
+
+        async fn execute_with_context(
+            &self,
+            context: StageExecutionContext,
+        ) -> anyhow::Result<StageExecutionOutcome> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && call == 0 {
                 anyhow::bail!("planned fake failure");
             }
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["artifact-1".to_string()],
-            })
+            let artifact = context
+                .publish_output_artifact(NewStageOutputArtifact {
+                    publication_key: "fake-result".to_string(),
+                    artifact_kind: RuntimeArtifactKind::Text,
+                    artifact_role: RuntimeArtifactRole::OutputPrimary,
+                    media_asset_id: None,
+                    text_asset_id: None,
+                    storage_key: None,
+                    content_type: Some("text/plain".to_string()),
+                    filename: None,
+                    size_bytes: Some(0),
+                    sha256: None,
+                    metadata_json: json!({"fixture": true}),
+                    retention_policy: "test".to_string(),
+                })
+                .await?;
+            StageExecutionOutcome::try_new(vec![artifact.id])
         }
     }
 
@@ -1307,9 +1486,7 @@ mod tests {
         async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
             self.started.notify_one();
             self.release.notified().await;
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec!["blocking-artifact".to_string()],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
     }
 
@@ -1339,7 +1516,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StageExecutor for ContextBlockingExecutor {
+    impl StageExecutor for CancellationAwareBlockingExecutor {
         fn stage_kind(&self) -> &'static str {
             "fake_stage"
         }
@@ -1357,7 +1534,43 @@ mod tests {
                 .write()
                 .unwrap_or_else(|poison| poison.into_inner()) = Some(context.cancellation());
             self.started.notify_one();
-            std::future::pending::<anyhow::Result<StageExecutionOutcome>>().await
+            self.release.notified().await;
+            Ok(StageExecutionOutcome::empty())
+        }
+    }
+
+    #[async_trait]
+    impl StageExecutor for SynchronousBlockingExecutor {
+        fn stage_kind(&self) -> &'static str {
+            "fake_stage"
+        }
+
+        async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+            anyhow::bail!("runner did not invoke context-aware stage execution")
+        }
+
+        async fn execute_with_context(
+            &self,
+            context: StageExecutionContext,
+        ) -> anyhow::Result<StageExecutionOutcome> {
+            *self
+                .cancellation
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(context.cancellation());
+            let release = self.release.clone();
+            self.started.notify_one();
+            tokio::task::spawn_blocking(move || {
+                let (released, notify) = &*release;
+                let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
+                while !*released {
+                    released = notify
+                        .wait(released)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            })
+            .await
+            .context("synchronous test executor join")?;
+            Ok(StageExecutionOutcome::empty())
         }
     }
 
@@ -1429,11 +1642,12 @@ mod tests {
         // lease flaked when renewal heartbeats slipped under parallel load.
         config.lease_duration = Duration::from_millis(800);
         config.drain_timeout = Duration::from_millis(300);
+        let release = Arc::new(Notify::new());
         let runner = BatchWorkerRunner::new(
             store.clone(),
             vec![Arc::new(BlockingExecutor {
                 started: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
+                release: release.clone(),
             })],
             config,
             BatchWorkerHealth::new("concurrent-worker"),
@@ -1472,6 +1686,7 @@ mod tests {
             .unwrap();
         assert_eq!(heartbeat.details.active_lease_ids.len(), 2);
         assert_eq!(heartbeat.details.available_slots, 0);
+        release.notify_waiters();
         supervisor.shutdown().await.unwrap();
         assert!(runner.active_executions.read().unwrap().is_empty());
         for id in &stage_ids {
@@ -1561,10 +1776,26 @@ mod tests {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(SpeechStageYield.into());
             }
-            Ok(StageExecutionOutcome {
-                output_artifact_ids: vec![],
-            })
+            Ok(StageExecutionOutcome::empty())
         }
+    }
+
+    #[test]
+    fn stage_execution_outcome_is_bounded_and_uuid_typed() {
+        let id = new_uuid();
+        assert_eq!(
+            StageExecutionOutcome::try_new(vec![id])
+                .expect("canonical output")
+                .output_artifact_count(),
+            1
+        );
+        assert!(StageExecutionOutcome::try_new(vec!["not-a-uuid".to_string()]).is_err());
+        assert!(StageExecutionOutcome::try_new(
+            (0..=super::super::store::MAX_STAGE_OUTPUT_ARTIFACTS)
+                .map(|_| new_uuid())
+                .collect(),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -1622,7 +1853,12 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(stage.status, RuntimeStageStatus::Completed);
-        assert_eq!(stage.output_artifact_ids, vec!["artifact-1"]);
+        assert_eq!(stage.output_artifact_ids.len(), 1);
+        assert!(store
+            .get_artifact(&stage.output_artifact_ids[0])
+            .await
+            .expect("artifact lookup")
+            .is_some());
         let job = store
             .get_job(&job_id)
             .await
@@ -1661,32 +1897,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_deadline_cancels_context_and_relinquishes_lease() {
+    async fn execution_deadline_retains_ownership_until_executor_teardown() {
         let store = build_store();
         let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
         let started = Arc::new(Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let cancellation = Arc::new(RwLock::new(None));
         let mut config = BatchWorkerConfig::local("worker-test");
         config.execution_timeout = Some(Duration::from_millis(50));
+        config.lease_duration = Duration::from_millis(500);
         let runner = BatchWorkerRunner::new(
             store.clone(),
-            vec![Arc::new(ContextBlockingExecutor {
+            vec![Arc::new(SynchronousBlockingExecutor {
                 started: started.clone(),
+                release: release.clone(),
                 cancellation: cancellation.clone(),
             })],
             config,
             BatchWorkerHealth::new("worker-test"),
         );
 
-        let run = tokio::spawn(async move { runner.run_once().await });
+        let mut run = tokio::spawn(async move { runner.run_once().await });
         tokio::time::timeout(Duration::from_secs(2), started.notified())
             .await
             .expect("executor should start");
-        assert!(tokio::time::timeout(Duration::from_secs(2), run)
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cancellation
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .is_some_and(StageCancellationSignal::is_cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner should request deadline cancellation");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut run)
             .await
-            .expect("runner should honor execution deadline")
-            .expect("runner join")
-            .expect("run once"));
+            .is_err());
 
         let signal = cancellation
             .read()
@@ -1698,6 +1950,30 @@ mod tests {
             signal.reason(),
             Some(StageCancellationReason::ExecutionDeadline)
         );
+        let running = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(running.status, RuntimeStageStatus::Running);
+        assert_eq!(running.worker_id.as_deref(), Some("worker-test"));
+        assert!(running.lease_expires_at.is_some());
+        assert!(store
+            .claim_next_stage("replacement-worker", 60_000)
+            .await
+            .expect("replacement claim")
+            .is_none());
+
+        {
+            let (released, notify) = &*release;
+            *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            notify.notify_all();
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("executor should settle")
+            .expect("runner join")
+            .expect("run once"));
         let stage = store
             .get_stage(&stage_id)
             .await
@@ -1708,6 +1984,174 @@ mod tests {
         assert_eq!(stage.lease_expires_at, None);
         assert_eq!(stage.attempt_token, None);
         assert_eq!(stage.error_code.as_deref(), Some("execution_deadline"));
+    }
+
+    #[tokio::test]
+    async fn reclaimed_lease_does_not_release_the_stale_local_executor_early() {
+        let store = build_store();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 3).await.expect("stage");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let cancellation = Arc::new(RwLock::new(None));
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.poll_interval = Duration::from_millis(10);
+        config.lease_duration = Duration::from_secs(60);
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(CancellationAwareBlockingExecutor {
+                started: started.clone(),
+                release: release.clone(),
+                cancellation: cancellation.clone(),
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        );
+        let ownership = runner.clone();
+        let mut run = tokio::spawn(async move { runner.run_once().await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("executor should start");
+
+        let stale_stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        let stale = super::super::types::StageLease {
+            stage_id: stale_stage.id,
+            worker_id: stale_stage.worker_id.expect("active worker"),
+            attempt_count: stale_stage.attempt_count,
+            attempt_token: stale_stage.attempt_token,
+        };
+        store
+            .relinquish_stage_lease(&stale, "injected_loss", "replace exact attempt")
+            .await
+            .expect("replace stale attempt")
+            .expect("stage should retry");
+        let replacement = store
+            .claim_next_stage("replacement-worker", 60_000)
+            .await
+            .expect("replacement claim")
+            .expect("replacement should own the durable stage");
+        assert_ne!(replacement.stage.attempt_token, stale.attempt_token);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cancellation
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .is_some_and(StageCancellationSignal::is_cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runner should observe exact lease loss");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut run)
+            .await
+            .is_err());
+        assert_eq!(
+            ownership
+                .active_executions
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len(),
+            1
+        );
+        assert_eq!(ownership.claim_filter().resources.concurrency_slots, 0);
+
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("stale executor should settle")
+            .expect("runner join")
+            .expect("run once"));
+        let current = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(current.worker_id.as_deref(), Some("replacement-worker"));
+        assert_eq!(current.attempt_token, replacement.stage.attempt_token);
+        assert!(ownership
+            .active_executions
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_user_cancellation_wins_after_a_deadline_signal() {
+        let store = build_store();
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let cancellation = Arc::new(RwLock::new(None));
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.execution_timeout = Some(Duration::from_millis(30));
+        config.poll_interval = Duration::from_millis(10);
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(CancellationAwareBlockingExecutor {
+                started: started.clone(),
+                release: release.clone(),
+                cancellation: cancellation.clone(),
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        );
+        let run = tokio::spawn(async move { runner.run_once().await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("executor should start");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cancellation
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .and_then(StageCancellationSignal::reason)
+                    == Some(StageCancellationReason::ExecutionDeadline)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline signal");
+        store
+            .cancel_job(
+                &job_id,
+                Some("user cancellation after deadline".to_string()),
+            )
+            .await
+            .expect("cancel job")
+            .expect("cancellation request");
+
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("executor should settle")
+            .expect("runner join")
+            .expect("run once"));
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(stage.cancellation_state, None);
+        let job = store
+            .get_job(&job_id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(job.cancellation_state, None);
     }
 
     #[tokio::test]
@@ -1784,33 +2228,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_execution_cannot_be_overwritten() {
-        let store = build_store();
+    async fn cancellation_retains_capacity_until_non_cooperative_executor_teardown() {
+        let clock = Arc::new(AtomicI64::new(
+            super::super::store::current_timestamp_millis(),
+        ));
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("runtime.sqlite"),
+        ));
+        store.set_test_clock(clock.clone());
+        let store = Arc::new(store);
         let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
+        let observed_cancellation = Arc::new(RwLock::new(None));
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.lease_duration = Duration::from_millis(40);
+        config.poll_interval = Duration::from_millis(10);
         let runner = BatchWorkerRunner::new(
             store.clone(),
-            vec![Arc::new(BlockingExecutor {
+            vec![Arc::new(CancellationAwareBlockingExecutor {
                 started: started.clone(),
                 release: release.clone(),
+                cancellation: observed_cancellation.clone(),
             })],
-            BatchWorkerConfig::local("worker-test"),
+            config,
             BatchWorkerHealth::new("worker-test"),
         );
-        let run = tokio::spawn(async move { runner.run_once().await });
+        let mut run = tokio::spawn(async move { runner.run_once().await });
         tokio::time::timeout(Duration::from_secs(2), started.notified())
             .await
             .expect("executor should start");
 
-        store
+        let cancellation = store
             .cancel_job(&job_id, Some("cancel while executing".to_string()))
             .await
             .expect("cancel")
             .expect("cancelled job");
+        assert_eq!(cancellation.status, RuntimeJobStatus::Running);
+        assert_eq!(
+            cancellation.cancellation_state,
+            Some(RuntimeCancellationState::Requested)
+        );
+
+        let requested = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        let owner = requested.worker_id.clone();
+        let lease_expiry = requested.lease_expires_at;
+        let attempt_token = requested.attempt_token.clone();
+        assert_eq!(requested.status, RuntimeStageStatus::Running);
+        assert_eq!(
+            requested.cancellation_state,
+            Some(RuntimeCancellationState::Requested)
+        );
+        assert!(owner.is_some());
+        assert!(lease_expiry.is_some());
+        assert!(attempt_token.is_some());
+
+        clock.fetch_add(100, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stage = store
+                    .get_stage(&stage_id)
+                    .await
+                    .expect("stage")
+                    .expect("stage exists");
+                if stage.cancellation_state == Some(RuntimeCancellationState::ExecutionStopping) {
+                    assert_eq!(stage.worker_id, owner);
+                    assert_eq!(stage.attempt_token, attempt_token);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should observe cancellation request");
+        let signal = observed_cancellation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .expect("executor cancellation signal");
+        assert_eq!(
+            signal.reason(),
+            Some(StageCancellationReason::UserRequested)
+        );
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut run)
+            .await
+            .is_err());
+        let still_stopping = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(still_stopping.status, RuntimeStageStatus::Running);
+        assert_eq!(still_stopping.worker_id, owner);
+        assert!(still_stopping.lease_expires_at.is_some_and(
+            |expires_at| expires_at > u64::try_from(clock.load(Ordering::SeqCst)).unwrap()
+        ));
+
+        release.notify_one();
         assert!(tokio::time::timeout(Duration::from_secs(2), run)
             .await
-            .expect("cancelled execution should stop without executor cooperation")
+            .expect("cancelled execution should finish after executor teardown")
             .expect("runner join")
             .expect("run once"));
 
@@ -1820,8 +2344,17 @@ mod tests {
             .expect("stage")
             .expect("stage exists");
         assert_eq!(stage.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(stage.cancellation_state, None);
         assert!(stage.output_artifact_ids.is_empty());
         assert_eq!(stage.lease_expires_at, None);
+        assert_eq!(stage.worker_id, None);
+        let job = store
+            .get_job(&job_id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(job.cancellation_state, None);
     }
 
     #[tokio::test]
@@ -1905,12 +2438,22 @@ mod tests {
         assert_eq!(completed.status, RuntimeStageStatus::Completed);
         assert_eq!(completed.worker_id, None);
         assert_eq!(completed.lease_expires_at, None);
-        assert_eq!(completed.output_artifact_ids, vec!["blocking-artifact"]);
-        let heartbeat = store
-            .get_worker_heartbeat("worker-test")
-            .await
-            .expect("heartbeat")
-            .expect("heartbeat exists");
+        assert!(completed.output_artifact_ids.is_empty());
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let heartbeat = store
+                    .get_worker_heartbeat("worker-test")
+                    .await
+                    .expect("heartbeat")
+                    .expect("heartbeat exists");
+                if heartbeat.status == "stopped" {
+                    break heartbeat;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should publish stopped heartbeat");
         assert_eq!(heartbeat.status, "stopped");
         assert_eq!(heartbeat.current_stage_id, None);
         assert_eq!(heartbeat.details.available_slots, 0);
@@ -1921,18 +2464,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_shutdown_relinquishes_lease_for_replacement_worker() {
+    async fn bounded_shutdown_detaches_and_retains_unresolved_execution_ownership() {
         let store = build_store();
         let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut config = BatchWorkerConfig::local("worker-test");
         config.drain_timeout = Duration::from_millis(60);
+        config.lease_duration = Duration::from_millis(500);
         let supervisor = BatchWorkerRunner::new(
             store.clone(),
             vec![Arc::new(BlockingExecutor {
                 started: started.clone(),
-                release,
+                release: release.clone(),
             })],
             config,
             BatchWorkerHealth::new("worker-test"),
@@ -1943,38 +2487,64 @@ mod tests {
             .expect("executor should start");
 
         let shutdown_started = Instant::now();
-        tokio::time::timeout(Duration::from_secs(2), supervisor.shutdown())
+        let error = tokio::time::timeout(Duration::from_secs(5), supervisor.shutdown())
             .await
             .expect("shutdown should remain bounded")
-            .expect("worker shutdown");
-        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+            .expect_err("unresolved executor must not report a clean shutdown");
+        assert!(error
+            .to_string()
+            .contains("execution ownership remains attached"));
+        assert!(shutdown_started.elapsed() < Duration::from_secs(3));
 
-        let relinquished = store
+        let retained = store
             .get_stage(&stage_id)
             .await
             .expect("stage")
             .expect("stage exists");
-        assert_eq!(relinquished.status, RuntimeStageStatus::Retrying);
-        assert_eq!(relinquished.worker_id, None);
-        assert_eq!(relinquished.lease_expires_at, None);
-        assert_eq!(relinquished.error_code.as_deref(), Some("drain_deadline"));
-
-        let replacement = store
+        assert_eq!(retained.status, RuntimeStageStatus::Running);
+        assert_eq!(retained.worker_id.as_deref(), Some("worker-test"));
+        assert!(retained.lease_expires_at.is_some());
+        assert!(store
             .claim_next_stage("replacement-worker", 60_000)
             .await
             .expect("replacement claim")
-            .expect("replacement should take over relinquished stage");
-        assert_eq!(replacement.stage.id, stage_id);
-        assert_eq!(
-            replacement.stage.worker_id.as_deref(),
-            Some("replacement-worker")
-        );
+            .is_none());
 
-        let heartbeat = store
-            .get_worker_heartbeat("worker-test")
-            .await
-            .expect("heartbeat")
-            .expect("heartbeat exists");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stage = store
+                    .get_stage(&stage_id)
+                    .await
+                    .expect("stage")
+                    .expect("stage exists");
+                if stage.status == RuntimeStageStatus::Retrying {
+                    assert_eq!(stage.worker_id, None);
+                    assert_eq!(stage.lease_expires_at, None);
+                    assert_eq!(stage.error_code.as_deref(), Some("drain_deadline"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached worker should settle after executor teardown");
+
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let heartbeat = store
+                    .get_worker_heartbeat("worker-test")
+                    .await
+                    .expect("heartbeat")
+                    .expect("heartbeat exists");
+                if heartbeat.status == "stopped" {
+                    break heartbeat;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached worker should publish stopped heartbeat");
         assert_eq!(heartbeat.status, "stopped");
         assert_eq!(heartbeat.current_stage_id, None);
         assert_eq!(heartbeat.details.available_slots, 0);
@@ -1982,6 +2552,51 @@ mod tests {
             heartbeat.details.health_json.get("running"),
             Some(&json!(false))
         );
+    }
+
+    #[tokio::test]
+    async fn process_shutdown_keeps_runtime_alive_until_exact_execution_teardown() {
+        let store = build_store();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.drain_timeout = Duration::from_millis(60);
+        config.lease_duration = Duration::from_millis(500);
+        let supervisor = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(BlockingExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        )
+        .spawn();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("executor should start");
+
+        let mut shutdown = tokio::spawn(supervisor.shutdown_for_process());
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "process shutdown must retain the runtime owner after its bounded warning deadline"
+        );
+        let retained = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(retained.status, RuntimeStageStatus::Running);
+        assert_eq!(retained.worker_id.as_deref(), Some("worker-test"));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .expect("process shutdown should finish after exact teardown")
+            .expect("shutdown join")
+            .expect("worker shutdown");
     }
 
     #[tokio::test]

@@ -252,10 +252,17 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
     );
     cmd.env("IZWI_SERVE_MODE", serve_mode_label(&args.mode));
 
-    cmd.env(
-        "IZWI_ENABLE_PREFIX_CACHING",
-        args.runtime.enable_prefix_caching.to_string(),
-    );
+    // Prefix reuse is tri-state (DS1.6): export the resolved decision so a
+    // child cannot inherit a stale explicit switch, and leave the variable
+    // unset so the child applies the catalog-auto default when the operator
+    // made no explicit choice.
+    if args.runtime.enable_prefix_caching {
+        cmd.env("IZWI_ENABLE_PREFIX_CACHING", "true");
+    } else if !args.runtime.prefix_reuse_catalog_auto {
+        cmd.env("IZWI_ENABLE_PREFIX_CACHING", "false");
+    } else {
+        cmd.env_remove("IZWI_ENABLE_PREFIX_CACHING");
+    }
     cmd.env(
         "IZWI_ENABLE_CHUNKED_PREFILL",
         args.runtime.enable_chunked_prefill.to_string(),
@@ -670,11 +677,13 @@ mod tests {
                 port: 8080,
                 models_dir: PathBuf::from("/tmp/models"),
                 max_loaded_models: 1,
+                model_keep_alive_secs: 600,
                 max_batch_size: izwi_core::BatchSizePreference::Auto,
                 physical_execution_mode: izwi_core::PhysicalExecutionMode::Shadow,
                 max_physical_in_flight: izwi_core::PhysicalInFlightLimit::new(3).unwrap(),
                 max_scheduler_batch_size: 8,
                 enable_prefix_caching: false,
+                prefix_reuse_catalog_auto: false,
                 managed_prefix_cache_salt: None,
                 max_prefix_cache_pages: 128,
                 enable_chunked_prefill: false,

@@ -10,6 +10,142 @@ use crate::error::{Error, Result};
 
 const DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES: usize = 4096;
 
+/// Incremental high-quality mono resampler.
+///
+/// Feed native-rate mono samples through [`Self::push`] and collect
+/// canonical-rate output; [`Self::finish`] flushes the resampler's internal
+/// tail. The first `output_delay` produced samples are held back so the
+/// concatenated stream matches the whole-buffer [`resample_mono_high_quality`]
+/// contract: the caller aligns the final buffer with
+/// [`align_resampled_length`] once the total input length is known.
+pub(crate) struct HighQualityResampler {
+    resampler: FftFixedInOut<f32>,
+    outbuffer: Vec<Vec<f32>>,
+    input_tail: Vec<f32>,
+    delay_holdback: Vec<f32>,
+    delay_holdback_open: bool,
+    produced_total: usize,
+    finished: bool,
+}
+
+impl HighQualityResampler {
+    pub(crate) fn new(src_rate: u32, dst_rate: u32) -> Result<Self> {
+        if src_rate == 0 || dst_rate == 0 {
+            return Err(Error::InvalidInput(
+                "Resampling sample rates must be greater than zero".to_string(),
+            ));
+        }
+        let resampler = FftFixedInOut::<f32>::new(
+            src_rate as usize,
+            dst_rate as usize,
+            DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES,
+            1,
+        )
+        .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))?;
+        Ok(Self {
+            outbuffer: vec![vec![0.0f32; resampler.output_frames_max()]; 1],
+            resampler,
+            input_tail: Vec::new(),
+            delay_holdback: Vec::new(),
+            delay_holdback_open: true,
+            produced_total: 0,
+            finished: false,
+        })
+    }
+
+    /// Push native-rate mono samples, appending produced output to `out`.
+    pub(crate) fn push(&mut self, samples: &[f32], out: &mut Vec<f32>) -> Result<()> {
+        debug_assert!(!self.finished, "push after finish");
+        if samples.is_empty() {
+            return Ok(());
+        }
+        self.input_tail.extend_from_slice(samples);
+        while self.input_tail.len() >= self.resampler.input_frames_next() {
+            let input = [&self.input_tail[..]];
+            let (consumed, written) = self
+                .resampler
+                .process_into_buffer(&input, &mut self.outbuffer, None)
+                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            if consumed == 0 {
+                break;
+            }
+            self.emit(written, out);
+            self.input_tail.drain(..consumed);
+        }
+        Ok(())
+    }
+
+    /// Flush the retained input tail and the resampler's internal pipeline.
+    ///
+    /// `target_len` is the expected total canonical output length for the
+    /// whole input stream (see [`target_sample_count`]). rubato keeps
+    /// returning buffered frames from `process_partial(None)`, so the flush
+    /// must be bounded by the expected output length exactly like the
+    /// whole-buffer implementation — an unbounded drain spins forever.
+    pub(crate) fn finish(&mut self, out: &mut Vec<f32>, target_len: usize) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let output_delay = self.resampler.output_delay();
+        let flush_limit = target_len.saturating_add(output_delay);
+        if !self.input_tail.is_empty() {
+            let input = [&self.input_tail[..]];
+            let (_consumed, written) = self
+                .resampler
+                .process_partial_into_buffer(Some(&input), &mut self.outbuffer, None)
+                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            self.emit(written, out);
+            self.input_tail.clear();
+        }
+        while self.produced_total < flush_limit {
+            let (_consumed, written) = self
+                .resampler
+                .process_partial_into_buffer::<Vec<f32>, Vec<f32>>(None, &mut self.outbuffer, None)
+                .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
+            if written == 0 {
+                break;
+            }
+            self.emit(written, out);
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, written: usize, out: &mut Vec<f32>) {
+        if written == 0 {
+            return;
+        }
+        self.produced_total = self.produced_total.saturating_add(written);
+        let produced = &self.outbuffer[0][..written];
+        if !self.delay_holdback_open {
+            out.extend_from_slice(produced);
+            return;
+        }
+        let delay = self.resampler.output_delay();
+        self.delay_holdback.extend_from_slice(produced);
+        if self.delay_holdback.len() >= delay {
+            out.extend_from_slice(&self.delay_holdback[delay..]);
+            self.delay_holdback.clear();
+            self.delay_holdback_open = false;
+        }
+    }
+}
+
+/// Align streamed resampler output to the exact duration contract of the
+/// whole-buffer API: truncate or zero-pad to the target length, then sanitize
+/// non-finite samples.
+pub(crate) fn align_resampled_length(output: &mut Vec<f32>, target_len: usize) {
+    output.truncate(target_len);
+    if output.len() < target_len {
+        output.resize(target_len, 0.0);
+    }
+    for sample in output.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+}
+
 pub fn resample_mono_high_quality(
     samples: &[f32],
     src_rate: u32,
@@ -29,60 +165,11 @@ pub fn resample_mono_high_quality(
         return Ok(Vec::new());
     }
 
-    let chunk_frames = samples.len().clamp(1, DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES);
-    let mut resampler =
-        FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, chunk_frames, 1)
-            .map_err(|err| Error::AudioError(format!("Failed to construct resampler: {err}")))?;
-    let output_delay = resampler.output_delay();
-    let mut output = Vec::with_capacity(target_len.saturating_add(output_delay));
-    let mut outbuffer = vec![vec![0.0f32; resampler.output_frames_max()]; 1];
-    let mut input_offset = 0usize;
-
-    while samples.len().saturating_sub(input_offset) >= resampler.input_frames_next() {
-        let input = [&samples[input_offset..]];
-        let (consumed, written) = resampler
-            .process_into_buffer(&input, &mut outbuffer, None)
-            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
-        input_offset = input_offset.saturating_add(consumed);
-        output.extend_from_slice(&outbuffer[0][..written]);
-    }
-
-    if input_offset < samples.len() {
-        let input = [&samples[input_offset..]];
-        let (_consumed, written) = resampler
-            .process_partial_into_buffer(Some(&input), &mut outbuffer, None)
-            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
-        output.extend_from_slice(&outbuffer[0][..written]);
-    }
-
-    while output.len() < target_len.saturating_add(output_delay) {
-        let (_consumed, written) = resampler
-            .process_partial_into_buffer::<Vec<f32>, Vec<f32>>(None, &mut outbuffer, None)
-            .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
-        if written == 0 {
-            break;
-        }
-        output.extend_from_slice(&outbuffer[0][..written]);
-    }
-
-    if output_delay > 0 {
-        if output.len() > output_delay {
-            output.drain(..output_delay);
-        } else {
-            output.clear();
-        }
-    }
-    output.truncate(target_len);
-
-    if output.len() < target_len {
-        output.resize(target_len, 0.0);
-    }
-    for sample in &mut output {
-        if !sample.is_finite() {
-            *sample = 0.0;
-        }
-    }
-
+    let mut resampler = HighQualityResampler::new(src_rate, dst_rate)?;
+    let mut output = Vec::with_capacity(target_len);
+    resampler.push(samples, &mut output)?;
+    resampler.finish(&mut output, target_len)?;
+    align_resampled_length(&mut output, target_len);
     Ok(output)
 }
 
@@ -168,6 +255,46 @@ mod tests {
         let err =
             resample_mono_high_quality(&[0.0], 0, 16_000).expect_err("zero input rate should fail");
         assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn streaming_resampler_matches_whole_buffer_output() {
+        let input = sine(220.0, 44_100, 96_000);
+        let whole = resample_mono_high_quality(&input, 44_100, 16_000).expect("whole-buffer");
+        let target = target_sample_count(input.len(), 44_100, 16_000);
+        for chunk_frames in [1usize, 333, 4_096, 12_257] {
+            let mut streamed = Vec::new();
+            let mut resampler = HighQualityResampler::new(44_100, 16_000).expect("resampler");
+            for chunk in input.chunks(chunk_frames) {
+                resampler.push(chunk, &mut streamed).expect("push");
+            }
+            resampler.finish(&mut streamed, target).expect("finish");
+            align_resampled_length(&mut streamed, target);
+            assert_eq!(streamed.len(), whole.len(), "chunk size {chunk_frames}");
+            let max_delta = streamed
+                .iter()
+                .zip(&whole)
+                .map(|(streamed, whole)| (streamed - whole).abs())
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                max_delta, 0.0,
+                "streamed output diverged at chunk size {chunk_frames}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_resampler_preserves_short_clip_duration() {
+        let input = sine(440.0, 44_100, 22_050);
+        let target = target_sample_count(input.len(), 44_100, 16_000);
+        let mut streamed = Vec::new();
+        let mut resampler = HighQualityResampler::new(44_100, 16_000).expect("resampler");
+        for chunk in input.chunks(1_024) {
+            resampler.push(chunk, &mut streamed).expect("push");
+        }
+        resampler.finish(&mut streamed, target).expect("finish");
+        align_resampled_length(&mut streamed, target);
+        assert_eq!(streamed.len(), 8_000);
     }
 
     fn sine(frequency_hz: f32, sample_rate: u32, samples: usize) -> Vec<f32> {
