@@ -20449,3 +20449,15 @@ local toolchain before pushing lint-sensitive changes; (2) run 194's hygiene
 the only trustworthy one after lint-affecting changes; (3) run 194's
 cpu/metal 101s did not recur after the 1.99 fixes; if a mid-compile 101
 ever recurs on a runner, suspect runner resources before code.
+
+### Round 3 — runner-fleet flake confirmation and close-out (2026-10-04)
+
+After the 1.99.0 fixes, failures kept MOVING between lanes on identical code
+(run 197: both macOS lanes; run 198: fleet-rig at 1m37s — all exit 101, all
+green in adjacent runs). Conclusion: intermittent runner-level 101s, not
+code. Evidence cycle: annotation probes re-added per failing lane
+(7117d570, 0e735cc4), run 199 green on every lane including a
+41-minute CUDA compile under runner contention, probes removed in 54045e55.
+Final probe-free validation run: 54045e55. If a random lane 101 recurs,
+re-run before diagnosing code; probes pattern is in the round-2 commits'
+history (tee + `::error::` annotation, ~4 min per iteration).
