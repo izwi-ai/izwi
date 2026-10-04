@@ -18,6 +18,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  compareQwenVersionRank,
   getModelProviderLabel,
   PROVIDER_ORDER,
 } from "@/features/models/catalog/modelMetadata";
@@ -137,7 +138,16 @@ function groupModelsByProvider(models: ModelInfo[]): ProviderGroup[] {
     .sort(([left], [right]) => compareProviders(left, right))
     .map(([provider, sectionModels]) => ({
       provider,
-      models: sectionModels,
+      // Within a provider, Qwen variants follow version number first
+      // (Qwen3 → 3.5 → 3.6 → …) so a smaller newer release does not
+      // leapfrog an older larger one; everything else stays size-ordered.
+      models: [...sectionModels].sort((a, b) => {
+        const versionDelta = compareQwenVersionRank(a.variant, b.variant);
+        if (versionDelta !== 0) return versionDelta;
+        const sizeDelta = (a.size_bytes ?? 0) - (b.size_bytes ?? 0);
+        if (sizeDelta !== 0) return sizeDelta;
+        return a.variant.localeCompare(b.variant);
+      }),
     }));
 }
 

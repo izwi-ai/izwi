@@ -62,6 +62,47 @@ describe("MyModelsPage", () => {
     expect(screen.queryByText(/Qwen3 Chat 27B/i)).not.toBeInTheDocument();
   });
 
+  it("lists Qwen3.6 under Qwen and orders Qwen chat models by version number", () => {
+    render(
+      <MyModelsPage
+        models={[
+          buildModel({ variant: "Qwen3.8-27B-FP8", size_bytes: 30_889_968_808 }),
+          buildModel({
+            variant: "Qwen3.6-35B-A3B-FP8",
+            size_bytes: 37_470_000_000,
+          }),
+          buildModel({ variant: "Qwen3.5-9B", size_bytes: 6_598_688_544 }),
+          buildModel({ variant: "Qwen3.5-0.8B", size_bytes: 715_600_000 }),
+        ]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+
+    // Version order wins over size order: the 27B Qwen3.8 renders after the
+    // 35B Qwen3.6, and the Qwen3.5 family stays before both.
+    const orderedCards = [
+      "Qwen3.5 0.8B",
+      "Qwen3.5 9B",
+      "Qwen3.6 35B-A3B",
+      "Qwen3.8 27B",
+    ].map((name) => screen.getByText(name));
+    for (let index = 0; index + 1 < orderedCards.length; index += 1) {
+      expect(
+        orderedCards[index].compareDocumentPosition(orderedCards[index + 1]) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
+
   it("renders VibeVoice models from the backend catalog under Microsoft", () => {
     render(
       <MyModelsPage
