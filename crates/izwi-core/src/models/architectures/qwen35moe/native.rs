@@ -1114,29 +1114,33 @@ pub fn expected_text_tensor_plan(
                 ExpectedTensorKind::Dense,
             );
         } else {
-            // DeltaNet in_proj and conv tensors stay dense per the published
-            // `modules_to_not_convert` contract; only out_proj is block FP8.
-            insert(
+            // The published FP8 checkpoints quantize the two wide DeltaNet
+            // input projections as 128x128 block FP8; the per-head tensors
+            // (in_proj_a/b, A_log, dt_bias, conv1d, norm) stay dense alongside
+            // the block-FP8 out_proj.
+            insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                vec![text.ssm_conv_channels(), hidden],
-                ExpectedTensorKind::Dense,
+                text.ssm_conv_channels(),
+                hidden,
+                block_shape,
             );
-            insert(
+            insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.linear_attn.in_proj_z.weight"),
-                vec![text.ssm_v_width(), hidden],
-                ExpectedTensorKind::Dense,
+                text.ssm_v_width(),
+                hidden,
+                block_shape,
             );
             insert(
                 &mut plan,
-                format!("{prefix}.linear_attn.b_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_b.weight"),
                 vec![text.ssm_time_step_rank, hidden],
                 ExpectedTensorKind::Dense,
             );
             insert(
                 &mut plan,
-                format!("{prefix}.linear_attn.a_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_a.weight"),
                 vec![text.ssm_time_step_rank, hidden],
                 ExpectedTensorKind::Dense,
             );
@@ -1796,18 +1800,18 @@ mod tests {
         // 3 shared (embed + lm_head + final norm) + per layer: 2 norms +
         // router + 256 experts x 3 + shared expert x 3 + optional gate +
         // attention-role tensors (6 full, 9 linear) + one BF16 scale
-        // companion per block-FP8 projection (775 full, 772 linear).
+        // companion per block-FP8 projection (775 full, 774 linear).
         let shared = 3usize;
         let per_layer_common = 2 + 1 + 256 * 3 + 3 + 1;
         let full_count = 10usize;
         let linear_count = 30usize;
         let full_scales = 256 * 3 + 3 + 4;
-        let linear_scales = 256 * 3 + 3 + 1;
+        let linear_scales = 256 * 3 + 3 + 3;
         let expected_count = shared
             + full_count * (per_layer_common + 6 + full_scales)
             + linear_count * (per_layer_common + 9 + linear_scales);
         assert_eq!(plan.len(), expected_count);
-        assert_eq!(plan.len(), 62_243);
+        assert_eq!(plan.len(), 62_303);
 
         let expert0 = plan
             .get("model.layers.0.mlp.experts.0.gate_proj.weight")
@@ -1835,8 +1839,26 @@ mod tests {
         let linear_in_proj = plan
             .get("model.layers.0.linear_attn.in_proj_qkv.weight")
             .expect("linear in_proj in plan");
-        assert_eq!(linear_in_proj.kind, ExpectedTensorKind::Dense);
+        assert_eq!(linear_in_proj.kind, ExpectedTensorKind::BlockFp8);
         assert_eq!(linear_in_proj.shape, vec![8_192, 2_048]);
+
+        let linear_in_proj_scale = plan
+            .get("model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv")
+            .expect("linear in_proj scale in plan");
+        assert_eq!(linear_in_proj_scale.kind, ExpectedTensorKind::BlockFp8Scale);
+        assert_eq!(linear_in_proj_scale.shape, vec![64, 16]);
+
+        let linear_in_proj_z = plan
+            .get("model.layers.0.linear_attn.in_proj_z.weight")
+            .expect("linear in_proj_z in plan");
+        assert_eq!(linear_in_proj_z.kind, ExpectedTensorKind::BlockFp8);
+        assert_eq!(linear_in_proj_z.shape, vec![4_096, 2_048]);
+
+        let linear_beta = plan
+            .get("model.layers.0.linear_attn.in_proj_b.weight")
+            .expect("linear beta projection in plan");
+        assert_eq!(linear_beta.kind, ExpectedTensorKind::Dense);
+        assert_eq!(linear_beta.shape, vec![32, 2_048]);
 
         let out_proj = plan
             .get("model.layers.0.linear_attn.out_proj.weight")
@@ -2113,24 +2135,28 @@ mod tests {
                     vec![text.attention_key_length],
                 );
             } else {
-                push_dense(
+                push_fp8_proj(
                     &mut tensors,
+                    config,
                     format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                    vec![text.ssm_conv_channels(), hidden],
+                    text.ssm_conv_channels(),
+                    hidden,
                 );
-                push_dense(
+                push_fp8_proj(
                     &mut tensors,
+                    config,
                     format!("{prefix}.linear_attn.in_proj_z.weight"),
-                    vec![text.ssm_v_width(), hidden],
+                    text.ssm_v_width(),
+                    hidden,
                 );
                 push_dense(
                     &mut tensors,
-                    format!("{prefix}.linear_attn.b_proj.weight"),
+                    format!("{prefix}.linear_attn.in_proj_b.weight"),
                     vec![text.ssm_time_step_rank, hidden],
                 );
                 push_dense(
                     &mut tensors,
-                    format!("{prefix}.linear_attn.a_proj.weight"),
+                    format!("{prefix}.linear_attn.in_proj_a.weight"),
                     vec![text.ssm_time_step_rank, hidden],
                 );
                 push_dense(

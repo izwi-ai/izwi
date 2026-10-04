@@ -122,11 +122,12 @@ mod tests {
         let inventory = pinned_representation_inventory();
         // Exact element counts derived from the pinned geometry: 40 layers ×
         // (256 experts + shared) of [512, 2048]/[2048, 512] projections, the
-        // gate-fused [8192, 2048] q_proj on 10 full-attention layers, dense
-        // DeltaNet in_proj on 30 GDN layers, and the 248,320-row embeddings.
-        assert_eq!(inventory.fp8_elements, 32_862_371_840);
+        // gate-fused [8192, 2048] q_proj on 10 full-attention layers, the
+        // block-FP8 DeltaNet in_proj_qkv/in_proj_z on 30 GDN layers, and the
+        // 248,320-row embeddings.
+        assert_eq!(inventory.fp8_elements, 33_617_346_560);
         assert!(inventory.fp8_elements.is_multiple_of(Q8_0_BLOCK_ELEMENTS));
-        assert_eq!(inventory.dense_elements, 1_798_238_848);
+        assert_eq!(inventory.dense_elements, 1_043_264_128);
         // MoE scale: weights plus scale companions exceed 50k tensors, so the
         // per-tensor instantiation slack is a load-peak term, not noise.
         assert!(inventory.tensor_count > 50_000);

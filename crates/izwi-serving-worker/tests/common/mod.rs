@@ -915,25 +915,26 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
                 1.0,
             ));
         } else {
-            // Gated DeltaNet: fused input projections are dense, out_proj is
-            // a block-FP8 pair — the checkpoint contract.
-            tensors.push(dense(
+            // Gated DeltaNet: in_proj_qkv/in_proj_z and out_proj are
+            // block-FP8 pairs, the per-head tensors stay dense — the
+            // checkpoint contract.
+            tensors.extend(fp8_projection(
                 format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                &[SSM_CONV_CHANNELS, HIDDEN],
-                1.0,
+                SSM_CONV_CHANNELS,
+                HIDDEN,
             ));
-            tensors.push(dense(
+            tensors.extend(fp8_projection(
                 format!("{prefix}.linear_attn.in_proj_z.weight"),
-                &[SSM_V_WIDTH, HIDDEN],
-                1.0,
+                SSM_V_WIDTH,
+                HIDDEN,
             ));
             tensors.push(dense(
-                format!("{prefix}.linear_attn.b_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_b.weight"),
                 &[SSM_TIME_STEP_RANK, HIDDEN],
                 1.0,
             ));
             tensors.push(dense(
-                format!("{prefix}.linear_attn.a_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_a.weight"),
                 &[SSM_TIME_STEP_RANK, HIDDEN],
                 1.0,
             ));
