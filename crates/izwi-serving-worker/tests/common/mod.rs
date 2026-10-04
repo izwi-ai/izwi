@@ -686,7 +686,7 @@ fn generate_qwen38_benchmark_fixture() {
     let dir = write_tiny_qwen38_hybrid_fixture(std::path::Path::new(&root));
     println!("fixture model dir: {}", dir.display());
 }
-/// Tiny synthetic native block-FP8 Qwen3.5-MoE checkpoint: a forward-capable
+/// Tiny synthetic native block-FP8 Qwen3.5/3.6-MoE checkpoint: a forward-capable
 /// 4-layer hybrid trunk (3 DeltaNet + 1 gated full attention, interval 4) with
 /// 2 routed experts (top-1) plus a shared expert. Values mirror the in-process
 /// `qwen35moe::native` recovery fixtures exactly: all-ones weights, 0x38
