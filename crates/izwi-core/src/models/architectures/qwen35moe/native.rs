@@ -1875,6 +1875,302 @@ mod tests {
     }
 
     #[test]
+    fn plan_matches_the_published_checkpoint_census() {
+        let config = pinned_config();
+        let plan = expected_text_tensor_plan(&config).unwrap();
+
+        // Fold the per-index plan into name-pattern rows: every digit run in
+        // a canonical name (layer, expert, even the `1` in conv1d) becomes
+        // `{}`. All entries sharing a pattern must agree on kind and shape.
+        fn pattern(name: &str) -> String {
+            let mut out = String::with_capacity(name.len());
+            let mut chars = name.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    out.push_str("{}");
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let mut rows: BTreeMap<String, (ExpectedTensorKind, Vec<usize>, usize)> = BTreeMap::new();
+        for (name, expected) in &plan {
+            let entry = rows
+                .entry(pattern(name))
+                .or_insert_with(|| (expected.kind, expected.shape.clone(), 0));
+            assert_eq!(entry.0, expected.kind, "pattern kind drift at {name}");
+            assert_eq!(entry.1, expected.shape, "pattern shape drift at {name}");
+            entry.2 += 1;
+        }
+
+        // Frozen census of the published Qwen/Qwen3.6-35B-A3B-FP8 safetensors
+        // headers (fetched 2026-10-04): 62,303 text-scope tensors, every
+        // F8_E4M3 weight carrying a BF16 `weight_scale_inv` companion at
+        // [ceil(rows/128), ceil(cols/128)]. The 3.5 checkpoint matches every
+        // row except linear_attn.A_log and linear_attn.norm.weight (F32
+        // there; both accepted by Dense). Fixtures derived from the plan
+        // cannot catch plan-vs-published drift, so the observed census is
+        // pinned here as executable contract.
+        let published: &[(&str, ExpectedTensorKind, &[usize], usize)] = &[
+            (
+                "lm_head.weight",
+                ExpectedTensorKind::Dense,
+                &[248_320, 2_048],
+                1,
+            ),
+            (
+                "model.embed_tokens.weight",
+                ExpectedTensorKind::Dense,
+                &[248_320, 2_048],
+                1,
+            ),
+            ("model.norm.weight", ExpectedTensorKind::Dense, &[2_048], 1),
+            (
+                "model.layers.{}.input_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.post_attention_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.gate.weight",
+                ExpectedTensorKind::Dense,
+                &[256, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert_gate.weight",
+                ExpectedTensorKind::OptionalDense,
+                &[1, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10_240,
+            ),
+            (
+                "model.layers.{}.self_attn.k_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.k_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.k_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.v_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.v_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.o_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.o_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                10,
+            ),
+            (
+                "model.layers.{}.linear_attn.A_log",
+                ExpectedTensorKind::Dense,
+                &[32],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.conv{}d.weight",
+                ExpectedTensorKind::Dense,
+                &[8_192, 1, 4],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.dt_bias",
+                ExpectedTensorKind::Dense,
+                &[32],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_a.weight",
+                ExpectedTensorKind::Dense,
+                &[32, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_b.weight",
+                ExpectedTensorKind::Dense,
+                &[32, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_qkv.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_qkv.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_z.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[4_096, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_z.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[32, 16],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.norm.weight",
+                ExpectedTensorKind::Dense,
+                &[128],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.out_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.out_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                30,
+            ),
+        ];
+        assert_eq!(rows.len(), published.len(), "pattern-set size");
+        for (name, kind, shape, count) in published {
+            let row = rows
+                .get(*name)
+                .unwrap_or_else(|| panic!("plan has no row for published pattern {name}"));
+            assert_eq!(row.0, *kind, "{name}");
+            assert_eq!(row.1, *shape, "{name}");
+            assert_eq!(row.2, *count, "{name}");
+        }
+    }
+
+    #[test]
     fn projection_residency_policy_matches_backend_envelopes() {
         let cpu = DeviceProfile::cpu();
         assert_eq!(
