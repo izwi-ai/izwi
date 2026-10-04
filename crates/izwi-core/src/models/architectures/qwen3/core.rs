@@ -4223,8 +4223,7 @@ mod tests {
 
         // Decode steps continue to agree on fresh tokens; the dense side keeps
         // its own model-owned cache with the same prefill history.
-        let mut owned_position = managed.context_len();
-        for token in [3u32, 6] {
+        for (owned_position, token) in (managed.context_len()..).zip([3u32, 6]) {
             let dense_step = dense
                 .forward(
                     &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
@@ -4240,7 +4239,6 @@ mod tests {
                 )
                 .unwrap();
             assert_tensor_close(&dense_step, &sparse_step);
-            owned_position += 1;
         }
     }
 

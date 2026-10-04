@@ -60,7 +60,7 @@ impl AsrTokenizer {
         let config_str = fs::read_to_string(config_path)?;
         let config: TokenizerConfig = serde_json::from_str(&config_str)?;
 
-        let mut id_for = |token: &str| -> Option<u32> {
+        let id_for = |token: &str| -> Option<u32> {
             config.added_tokens_decoder.iter().find_map(|(id, entry)| {
                 if entry.content == token {
                     id.parse().ok()
@@ -93,13 +93,13 @@ impl AsrTokenizer {
         let eos = config
             .eos_token
             .as_deref()
-            .and_then(&mut id_for)
+            .and_then(id_for)
             .unwrap_or(im_end);
         let eos_alt = id_for("<|endoftext|>");
         let pad = config
             .pad_token
             .as_deref()
-            .and_then(&mut id_for)
+            .and_then(id_for)
             .unwrap_or(eos);
 
         let timestamp_token_indices: HashMap<u32, u32> = config
