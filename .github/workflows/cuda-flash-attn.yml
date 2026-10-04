@@ -28,6 +28,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # The workspace .cargo/config.toml sets a python3 rustc-wrapper; the
+      # NVIDIA base image ships no python interpreter, so install one or
+      # every cargo invocation in this container dies at startup.
       - name: Install container build dependencies
         run: |
           apt-get update
@@ -37,13 +40,16 @@ jobs:
             curl \
             git \
             pkg-config \
-            libssl-dev
+            libssl-dev \
+            python3
 
+      # Keep the required PR compile on the same toolchain as the shipped
+      # Docker CUDA builder (Dockerfile rust-builder-cuda).
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
             --profile minimal \
-            --default-toolchain stable
+            --default-toolchain 1.88.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Compile CUDA FlashAttention harnesses without execution
