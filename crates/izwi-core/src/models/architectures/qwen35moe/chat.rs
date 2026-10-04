@@ -55,7 +55,7 @@ impl Qwen35MoeChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::Qwen36Moe35BA3BFp8 {
             return Err(Error::ModelLoadError(format!(
-                "Unsupported Qwen3.5-MoE chat variant: {variant}"
+                "Unsupported Qwen3.5/3.6-MoE chat variant: {variant}"
             )));
         }
         let device_kind = BackendKind::from(device.kind);
@@ -158,7 +158,7 @@ impl Qwen35MoeChatModel {
     ) -> Result<Qwen35PreparedPrompt> {
         if !config.request.media_inputs.is_empty() {
             return Err(Error::InvalidInput(
-                "Qwen3.5-MoE serving is text-only and does not accept media inputs".to_string(),
+                "Qwen3.5/3.6-MoE serving is text-only and does not accept media inputs".to_string(),
             ));
         }
         self.exec.prepare_text_prompt(messages, config)

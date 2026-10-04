@@ -21,7 +21,7 @@ const Q8_0_BLOCK_ELEMENTS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
 
 fn overflow() -> Error {
-    Error::ModelLoadError("Qwen3.5-MoE memory estimate overflow".into())
+    Error::ModelLoadError("Qwen3.5/3.6-MoE memory estimate overflow".into())
 }
 
 /// Resident bytes of the pinned checkpoint on one backend: packed Q8_0
@@ -93,10 +93,10 @@ pub(super) fn resource_plan(backend: BackendKind) -> Result<ModelResourcePlan> {
 /// checkpoint inventory with a worst-case F32 expansion envelope, since the
 /// fixture cannot carry the pinned element counts.
 pub(super) fn synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEstimate> {
-    let overflow = || Error::ModelLoadError("Qwen3.5-MoE fixture memory estimate overflow".into());
+    let overflow = || Error::ModelLoadError("Qwen3.5/3.6-MoE fixture memory estimate overflow".into());
     let Some(inventory) = super::checkpoint_tensor_inventory(model_path)? else {
         return Err(Error::ModelLoadError(
-            "Synthetic Qwen3.5-MoE fixture has no readable tensor inventory".into(),
+            "Synthetic Qwen3.5/3.6-MoE fixture has no readable tensor inventory".into(),
         ));
     };
     let resident_bytes = inventory.total_bytes.checked_mul(4).ok_or_else(overflow)?;

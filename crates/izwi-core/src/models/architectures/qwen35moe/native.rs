@@ -358,7 +358,7 @@ impl Qwen35MoeNativeConfig {
     pub fn load_with_policy(model_dir: &Path, policy: Qwen35MoeGeometryPolicy) -> Result<Self> {
         let raw = std::fs::read(model_dir.join(CONFIG_FILE)).map_err(|err| {
             Error::ModelLoadError(format!(
-                "Failed to read Qwen3.5-MoE config {}: {err}",
+                "Failed to read Qwen3.5/3.6-MoE config {}: {err}",
                 model_dir.join(CONFIG_FILE).display()
             ))
         })?;
@@ -1242,7 +1242,7 @@ impl Qwen35MoeNativeCheckpoint {
             let (scope, canonical) = canonical_text_tensor_name(raw_name)
                 .ok_or_else(|| {
                     Error::ModelLoadError(format!(
-                        "Qwen3.5-MoE checkpoint tensor `{raw_name}` falls outside the known model scopes"
+                        "Qwen3.5/3.6-MoE checkpoint tensor `{raw_name}` falls outside the known model scopes"
                     ))
                 })?;
             match scope {
@@ -1252,7 +1252,7 @@ impl Qwen35MoeNativeCheckpoint {
                         text_tensor_names.insert(canonical.clone(), raw_name.to_string())
                     {
                         return Err(Error::ModelLoadError(format!(
-                            "Qwen3.5-MoE checkpoint declares both `{existing}` and `{raw_name}` for canonical text tensor `{canonical}`"
+                            "Qwen3.5/3.6-MoE checkpoint declares both `{existing}` and `{raw_name}` for canonical text tensor `{canonical}`"
                         )));
                     }
                 }
@@ -1268,7 +1268,7 @@ impl Qwen35MoeNativeCheckpoint {
                 }
                 Qwen35MoeTensorScope::Unknown => {
                     return Err(Error::ModelLoadError(format!(
-                        "Qwen3.5-MoE checkpoint tensor `{raw_name}` has an unknown scope"
+                        "Qwen3.5/3.6-MoE checkpoint tensor `{raw_name}` has an unknown scope"
                     )));
                 }
             }
@@ -1294,7 +1294,7 @@ impl Qwen35MoeNativeCheckpoint {
             };
             if !shape_ok || !dtype_ok {
                 return Err(Error::ModelLoadError(format!(
-                    "Qwen3.5-MoE checkpoint tensor `{name}` contract drift: expected {:?} {:?}, found {:?} {:?}",
+                    "Qwen3.5/3.6-MoE checkpoint tensor `{name}` contract drift: expected {:?} {:?}, found {:?} {:?}",
                     expected.kind, expected.shape, info.dtype, info.shape
                 )));
             }
@@ -1302,7 +1302,7 @@ impl Qwen35MoeNativeCheckpoint {
         if !missing.is_empty() {
             let names: Vec<&str> = missing.iter().map(|name| name.as_str()).take(8).collect();
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5-MoE checkpoint is missing {} required text tensors, including {names:?}",
+                "Qwen3.5/3.6-MoE checkpoint is missing {} required text tensors, including {names:?}",
                 missing.len()
             )));
         }
@@ -1316,7 +1316,7 @@ impl Qwen35MoeNativeCheckpoint {
         if !unexpected.is_empty() {
             let shown: Vec<&str> = unexpected.iter().copied().take(8).collect();
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen35moe tensor plan before loading",
+                "Qwen3.5/3.6-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen35moe tensor plan before loading",
                 unexpected.len()
             )));
         }
@@ -1338,7 +1338,7 @@ impl Qwen35MoeNativeCheckpoint {
             .map(|s| s.as_str())
             .ok_or_else(|| {
                 Error::ModelLoadError(format!(
-                    "Qwen3.5-MoE checkpoint has no text tensor `{canonical}`"
+                    "Qwen3.5/3.6-MoE checkpoint has no text tensor `{canonical}`"
                 ))
             })
     }
