@@ -205,7 +205,7 @@ mod tests {
         );
         assert_eq!(
             validate_managed_state_plan_eligibility(
-                ModelVariant::Qwen35Moe35BA3BFp8,
+                ModelVariant::Qwen36Moe35BA3BFp8,
                 CapabilityKind::Chat,
                 &plan,
             )

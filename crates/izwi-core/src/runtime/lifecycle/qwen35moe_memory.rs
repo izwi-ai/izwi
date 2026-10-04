@@ -1,4 +1,5 @@
-//! Admission inventory for the Qwen3.5-35B-A3B-FP8 persistent representation.
+//! Admission inventory for the qwen3_5_moe persistent representation
+//! (published checkpoint: Qwen3.6-35B-A3B-FP8).
 //!
 //! The numbers derive from the loader's own pinned tensor plan, so admission
 //! can never drift from what the checkpoint actually materializes: CPU packs
@@ -142,7 +143,7 @@ mod tests {
             .fp8_elements
             .checked_add(inventory.dense_elements.checked_mul(2).unwrap())
             .unwrap();
-        let catalog_bytes = ModelVariant::Qwen35Moe35BA3BFp8.estimated_size();
+        let catalog_bytes = ModelVariant::Qwen36Moe35BA3BFp8.estimated_size();
         let deviation = catalog_bytes.abs_diff(source_bytes);
         assert!(
             deviation * 20 < catalog_bytes,

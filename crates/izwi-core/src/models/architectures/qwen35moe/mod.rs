@@ -1,6 +1,6 @@
 //! Qwen3.5 MoE text-chat runtime (`Qwen3_5MoeForConditionalGeneration`).
 //!
-//! The published Qwen3.5-35B-A3B-FP8 checkpoint combines the Qwen3.5 hybrid
+//! The published Qwen3.6-35B-A3B-FP8 checkpoint combines the Qwen3.5 hybrid
 //! backbone (Gated DeltaNet linear attention interleaved 3:1 with gated full
 //! attention) with a sparse mixture-of-experts feed-forward block (256 routed
 //! experts, 8 active per token, plus one always-on shared expert), stored as

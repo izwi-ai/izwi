@@ -696,7 +696,7 @@ fn generate_qwen38_benchmark_fixture() {
 /// downloader bundle gate requires the real pinned artifact revision.
 #[allow(dead_code)]
 pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
-    let model_dir = models_dir.join("Qwen3.5-35B-A3B-FP8");
+    let model_dir = models_dir.join("Qwen3.6-35B-A3B-FP8");
     std::fs::create_dir_all(&model_dir).unwrap();
 
     const HIDDEN: usize = 32;
@@ -1060,9 +1060,12 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
 
     let manifest = ArtifactManifest {
         schema_version: 1,
-        variant: ModelVariant::Qwen35Moe35BA3BFp8,
-        repo_id: ModelVariant::Qwen35Moe35BA3BFp8.repo_id().into(),
-        revision: ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION.into(),
+        variant: ModelVariant::Qwen36Moe35BA3BFp8,
+        repo_id: ModelVariant::Qwen36Moe35BA3BFp8.repo_id().into(),
+        revision: ModelVariant::Qwen36Moe35BA3BFp8
+            .artifact_revision()
+            .expect("Qwen3.6 MoE artifact revision is catalog-pinned")
+            .into(),
         files: vec![
             "chat_template.jinja".into(),
             "config.json".into(),

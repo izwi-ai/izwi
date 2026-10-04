@@ -312,9 +312,9 @@ fn qwen35_moe_bundle_is_complete(model_dir: &Path) -> bool {
     selected_files.dedup();
 
     manifest.schema_version == 1
-        && manifest.variant == ModelVariant::Qwen35Moe35BA3BFp8
-        && manifest.repo_id == ModelVariant::Qwen35Moe35BA3BFp8.repo_id()
-        && manifest.revision == ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION
+        && manifest.variant == ModelVariant::Qwen36Moe35BA3BFp8
+        && manifest.repo_id == ModelVariant::Qwen36Moe35BA3BFp8.repo_id()
+        && manifest.revision == ModelVariant::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION
         && recorded_files == selected_files
 }
 
@@ -1911,14 +1911,14 @@ impl ModelDownloader {
         })
     }
 
-    /// Index-closure file plan for the Qwen3.5-35B-A3B-FP8 bundle: every
+    /// Index-closure file plan for the Qwen3.6-35B-A3B-FP8 bundle: every
     /// safetensors shard named by the index plus the required metadata files.
     async fn get_qwen35_moe_indexed_file_specs(&self) -> Result<Vec<ModelFileSpec>> {
-        let variant = ModelVariant::Qwen35Moe35BA3BFp8;
+        let variant = ModelVariant::Qwen36Moe35BA3BFp8;
         let repo_id = variant.repo_id();
         let revision = variant
             .artifact_revision()
-            .expect("Qwen3.5 MoE artifact revision is catalog-pinned");
+            .expect("Qwen3.6 MoE artifact revision is catalog-pinned");
         let local_index = self
             .model_path(variant)
             .join("model.safetensors.index.json");

@@ -68,7 +68,7 @@ const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen359BGguf,
 ];
 const QWEN38_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3827BFp8];
-const QWEN35_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen35Moe35BA3BFp8];
+const QWEN35_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen36Moe35BA3BFp8];
 const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BInstructGguf,
     ModelVariant::Lfm2512BThinkingGguf,

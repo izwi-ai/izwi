@@ -5078,7 +5078,7 @@ mod tests {
         for variant in [
             ModelVariant::Qwen3827BFp8,
             ModelVariant::Qwen3508BGguf,
-            ModelVariant::Qwen35Moe35BA3BFp8,
+            ModelVariant::Qwen36Moe35BA3BFp8,
             ModelVariant::Lfm2512BInstructGguf,
         ] {
             let metadata = chat_adapter_metadata(variant);

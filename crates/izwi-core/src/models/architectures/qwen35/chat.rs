@@ -1676,9 +1676,9 @@ fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) 
         variant,
         ModelVariant::Qwen354BGguf
             | ModelVariant::Qwen359BGguf
-            // Qwen3.5-35B-A3B ships thinking default-on; the empty think
+            // Qwen3.6-35B-A3B ships thinking default-on; the empty think
             // block is emitted when a request disables it.
-            | ModelVariant::Qwen35Moe35BA3BFp8
+            | ModelVariant::Qwen36Moe35BA3BFp8
     )
 }
 

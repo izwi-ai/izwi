@@ -49,11 +49,11 @@ impl InferenceStateContractProvider for Qwen35MoeChatModel {
 }
 
 impl Qwen35MoeChatModel {
-    /// Load the Qwen3.5-35B-A3B-FP8 family from its native bundle, or from
-    /// a synthetic GGUF fixture when one is present (CI-only; the published
-    /// variant never ships as GGUF).
+    /// Load the Qwen3.6-35B-A3B-FP8 family (qwen3_5_moe architecture) from
+    /// its native bundle, or from a synthetic GGUF fixture when one is
+    /// present (CI-only; the published variant never ships as GGUF).
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        if variant != ModelVariant::Qwen35Moe35BA3BFp8 {
+        if variant != ModelVariant::Qwen36Moe35BA3BFp8 {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.5-MoE chat variant: {variant}"
             )));
@@ -559,7 +559,7 @@ mod tests {
         let dir = fixture_dir(tag);
         write_fixture(&dir);
         let model =
-            Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen35Moe35BA3BFp8, DeviceProfile::cpu())
+            Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, DeviceProfile::cpu())
                 .expect("load qwen35moe fixture");
         (model, dir)
     }
@@ -962,7 +962,7 @@ mod tests {
             let dir = fixture_dir("parity");
             write_fixture(&dir);
             let model =
-                Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen35Moe35BA3BFp8, device.clone())
+                Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, device.clone())
                     .expect("load fixture");
             let messages = vec![ChatMessage {
                 role: ChatRole::User,
