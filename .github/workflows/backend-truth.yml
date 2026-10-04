@@ -263,7 +263,27 @@ jobs:
             . -> target
 
       - name: Run Metal backend validation
-        run: scripts/ci/check-backend-truth.sh ${{ matrix.command }}
+        run: |
+          set -o pipefail
+          if scripts/ci/check-backend-truth.sh "${{ matrix.command }}" 2>&1 | tee "${RUNNER_TEMP}/cargo-metal.log"; then
+            exit 0
+          fi
+          status=$?
+          # TEMPORARY debug aid: surface the failing tail as a check-run
+          # annotation (public via the API) while job logs stay auth-gated.
+          python3 - "${RUNNER_TEMP}/cargo-metal.log" <<'PY'
+          import sys, urllib.parse
+          text = open(sys.argv[1], errors="replace").read()
+          interesting = [
+              line for line in text.splitlines()
+              if line.startswith("error") or line.lstrip().startswith("-->")
+              or "SIGKILL" in line or "signal" in line or "killed" in line
+              or "warning" in line.lower() and "linker" in line.lower()
+          ]
+          payload = "\n".join(interesting[-24:]) or text[-2400:]
+          print("::error title=cargo-metal-errors::" + urllib.parse.quote(payload, safe="")[:3900])
+          PY
+          exit $status
 
   docker-cpu:
     name: Docker Build (CPU)
