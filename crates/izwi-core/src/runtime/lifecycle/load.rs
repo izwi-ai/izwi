@@ -176,7 +176,7 @@ fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_byte
     {
         return configured_reserve_bytes;
     }
-    if variant == ModelVariant::Qwen35Moe35BA3BFp8
+    if variant == ModelVariant::Qwen36Moe35BA3BFp8
         && crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled()
     {
         return configured_reserve_bytes;
@@ -1287,7 +1287,7 @@ impl ModelLifecycleController {
             }
             return Ok(qwen38_resource_plan(backend));
         }
-        if variant == ModelVariant::Qwen35Moe35BA3BFp8 {
+        if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
             if crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled() {
                 // Fixture load (benchmark/CI): price the actual checkpoint
                 // instead of the pinned 35B constants.

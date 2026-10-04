@@ -15,6 +15,7 @@ import type { ModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
+  compareQwenVersionRank,
   getModelProviderLabel,
   MODEL_DETAILS,
   PROVIDER_ORDER,
@@ -197,7 +198,12 @@ export function MyModelsPage({
         return true;
       })
       .sort((a, b) => {
-        // Stable sort independent of status so cards do not jump while downloading/loading.
+        // Stable sort independent of status so cards do not jump while
+        // downloading/loading. Qwen variants follow version number first
+        // (Qwen3 → 3.5 → 3.6 → …) so a smaller newer release does not
+        // leapfrog an older larger one; everything else stays size-ordered.
+        const versionDelta = compareQwenVersionRank(a.variant, b.variant);
+        if (versionDelta !== 0) return versionDelta;
         const sizeA = getModelSizeBytes(a);
         const sizeB = getModelSizeBytes(b);
         if (sizeA !== sizeB) return sizeA - sizeB;

@@ -570,10 +570,10 @@ impl WorkerProcessConfig {
                 if variant != ModelVariant::Lfm2512BInstructGguf
                     && variant != ModelVariant::Qwen3827BFp8
                     && variant != ModelVariant::Qwen3Moe30bA3bGguf
-                    && variant != ModelVariant::Qwen35Moe35BA3BFp8
+                    && variant != ModelVariant::Qwen36Moe35BA3BFp8
                 {
                     bail!(
-                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.5-35B-A3B-FP8 for chat"
+                        "serving worker supports only LFM2.5-1.2B-Instruct-GGUF, Qwen3.8-27B-FP8, Qwen3-30B-A3B-GGUF, and Qwen3.6-35B-A3B-FP8 for chat"
                     );
                 }
                 variant

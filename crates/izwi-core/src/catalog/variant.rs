@@ -126,7 +126,7 @@ impl ModelVariant {
             }
             Qwen3Moe30bA3bGguf => ModelFamily::Qwen3MoeChat,
             Qwen3508BGguf | Qwen352BGguf | Qwen354BGguf | Qwen359BGguf => ModelFamily::Qwen35Chat,
-            Qwen35Moe35BA3BFp8 => ModelFamily::Qwen35MoeChat,
+            Qwen36Moe35BA3BFp8 => ModelFamily::Qwen35MoeChat,
             Qwen3827BFp8 => ModelFamily::Qwen38Chat,
             Lfm2512BInstructGguf | Lfm2512BThinkingGguf => ModelFamily::Lfm2Chat,
             Lfm25Audio15BGguf => ModelFamily::Lfm25Audio,
@@ -551,7 +551,9 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
 fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
     use ModelVariant::*;
 
-    if !normalized.contains("qwen35") {
+    // "qwen36" resolves here too: Qwen3.6-35B-A3B-FP8 shares the qwen3_5_moe
+    // architecture family with the Qwen3.5 chat GGUF variants.
+    if !normalized.contains("qwen35") && !normalized.contains("qwen36") {
         return None;
     }
 
@@ -562,8 +564,20 @@ fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
+    if normalized.contains("qwen36") {
+        // The Qwen3.6 line only ships the 35B-A3B MoE checkpoint.
+        return if normalized.contains("35b") {
+            Some(Qwen36Moe35BA3BFp8)
+        } else {
+            None
+        };
+    }
+
+    // The Qwen3.5-35B-A3B-FP8 variant was replaced by Qwen3.6-35B-A3B-FP8:
+    // legacy 3.5 35B ids must fail to parse rather than silently resolve to
+    // the replacement checkpoint.
     if normalized.contains("35b") {
-        return Some(Qwen35Moe35BA3BFp8);
+        return None;
     }
     if normalized.contains("09b") || normalized.contains("9b") {
         return Some(Qwen359BGguf);
@@ -795,17 +809,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_qwen35_moe_fp8_chat_aliases() {
+    fn parse_qwen36_moe_fp8_chat_aliases() {
         for alias in [
+            "Qwen3.6-35B-A3B-FP8",
+            "Qwen/Qwen3.6-35B-A3B-FP8",
+            "Qwen3.6 35B-A3B FP8",
+            "Qwen3.6-35B-A3B",
+        ] {
+            let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.6 MoE chat alias");
+            assert_eq!(parsed, ModelVariant::Qwen36Moe35BA3BFp8, "alias {alias}");
+            assert_eq!(parsed.family(), ModelFamily::Qwen35MoeChat);
+            assert_eq!(parsed.primary_task(), ModelTask::Chat);
+        }
+    }
+
+    #[test]
+    fn parse_rejected_qwen35_moe_ids_fail_closed() {
+        // Qwen3.5-35B-A3B-FP8 was replaced by the Qwen3.6 checkpoint: its ids
+        // must fail to parse rather than re-resolve to the replacement model.
+        for removed in [
             "Qwen3.5-35B-A3B-FP8",
             "Qwen/Qwen3.5-35B-A3B-FP8",
             "Qwen3.5 35B-A3B FP8",
             "Qwen3.5-35B-A3B",
         ] {
-            let parsed = parse_chat_model_variant(Some(alias)).expect("Qwen3.5 MoE chat alias");
-            assert_eq!(parsed, ModelVariant::Qwen35Moe35BA3BFp8, "alias {alias}");
-            assert_eq!(parsed.family(), ModelFamily::Qwen35MoeChat);
-            assert_eq!(parsed.primary_task(), ModelTask::Chat);
+            assert!(
+                parse_chat_model_variant(Some(removed)).is_err(),
+                "removed id {removed} must not parse"
+            );
         }
     }
 

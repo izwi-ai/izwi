@@ -252,4 +252,48 @@ describe("RouteModelModal", () => {
       screen.getByRole("button", { name: /Download/i }),
     ).toBeInTheDocument();
   });
+
+  it("groups Qwen3.6 under Qwen and orders Qwen chat models by version number", () => {
+    render(
+      <RouteModelModal
+        isOpen
+        onClose={vi.fn()}
+        title="Chat Models"
+        description="Manage chat models."
+        models={[
+          buildModel({ variant: "Qwen3.8-27B-FP8", size_bytes: 30_889_968_808 }),
+          buildModel({
+            variant: "Qwen3.6-35B-A3B-FP8",
+            size_bytes: 37_470_000_000,
+          }),
+          buildModel({ variant: "Qwen3.5-9B", size_bytes: 6_598_688_544 }),
+        ]}
+        loading={false}
+        selectedVariant={null}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onUseModel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/^Qwen$/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Other$/)).not.toBeInTheDocument();
+
+    // Version order wins over size order: the 27B Qwen3.8 renders after the
+    // 35B Qwen3.6, and the Qwen3.5 model stays before both.
+    const orderedRows = [
+      "route-model-row-Qwen3.5-9B",
+      "route-model-row-Qwen3.6-35B-A3B-FP8",
+      "route-model-row-Qwen3.8-27B-FP8",
+    ].map((testId) => screen.getByTestId(testId));
+    for (let index = 0; index + 1 < orderedRows.length; index += 1) {
+      expect(
+        orderedRows[index].compareDocumentPosition(orderedRows[index + 1]) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
+  });
 });

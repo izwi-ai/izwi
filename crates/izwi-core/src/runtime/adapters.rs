@@ -784,7 +784,7 @@ mod tests {
             .require(CapabilityKind::Chat, ModelVariant::Qwen306B)
             .unwrap();
         let qwen35_moe_chat = *registry
-            .require(CapabilityKind::Chat, ModelVariant::Qwen35Moe35BA3BFp8)
+            .require(CapabilityKind::Chat, ModelVariant::Qwen36Moe35BA3BFp8)
             .unwrap();
         let gemma_chat = *registry
             .require(CapabilityKind::Chat, ModelVariant::Gemma34BIt)

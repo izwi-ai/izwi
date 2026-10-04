@@ -1,4 +1,5 @@
-//! Native Hugging Face checkpoint ingestion for Qwen3.5-35B-A3B-FP8.
+//! Native Hugging Face checkpoint ingestion for the qwen3_5_moe architecture
+//! (published checkpoint: Qwen3.6-35B-A3B-FP8).
 //!
 //! The published checkpoint is an indexed Safetensors bundle whose matrix
 //! weights use 128x128 block-scaled `F8_E4M3` (companion `weight_scale_inv`
@@ -43,7 +44,8 @@ pub const ENV_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY: &str =
 
 const CONFIG_FILE: &str = "config.json";
 
-/// Published Qwen3.5-35B-A3B-FP8 geometry. Synthetic fixtures relax every
+/// Published Qwen3.6-35B-A3B-FP8 geometry (identical to the original
+/// Qwen3.5-35B-A3B-FP8 checkpoint). Synthetic fixtures relax every
 /// value; structural invariants stay enforced.
 const PINNED_BLOCK_COUNT: usize = 40;
 const PINNED_FULL_ATTENTION_INTERVAL: usize = 4;

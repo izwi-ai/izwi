@@ -1,6 +1,6 @@
 //! GGUF fixture-path configuration for the qwen35moe family.
 //!
-//! The official Qwen3.5-35B-A3B-FP8 checkpoint is native block-FP8
+//! The official Qwen3.6-35B-A3B-FP8 checkpoint is native block-FP8
 //! safetensors (see [`super::native`]); GGUF support for this family exists
 //! only as the tiny synthetic fixture path that lets CI exercise the hybrid
 //! trunk + sparse-expert mechanics without the 35B download (the DS10

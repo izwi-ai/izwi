@@ -12,12 +12,32 @@ export const PROVIDER_ORDER = [
   "Other",
 ] as const;
 
+/**
+ * Major.minor version carried by a Qwen variant id ("Qwen3.5-4B" → [3, 5],
+ * "Qwen3-TTS-12Hz-..." → [3, 0]), or null for non-versioned ids. Drives both
+ * Qwen provider labeling and version-number ordering so future Qwen3.x
+ * releases classify correctly without touching the prefix lists again.
+ */
+export function getQwenVersionRank(variant: string): [number, number] | null {
+  const match = variant.match(/^Qwen(\d+)(?:\.(\d+))?-/);
+  if (!match) return null;
+  return [Number(match[1]), match[2] ? Number(match[2]) : 0];
+}
+
+/**
+ * Version-number comparison for a pair of Qwen variants. Returns 0 when
+ * either id carries no Qwen version so callers fall through to their own
+ * (size-based) ordering for mixed or non-Qwen sections.
+ */
+export function compareQwenVersionRank(left: string, right: string): number {
+  const leftRank = getQwenVersionRank(left);
+  const rightRank = getQwenVersionRank(right);
+  if (!leftRank || !rightRank) return 0;
+  return leftRank[0] - rightRank[0] || leftRank[1] - rightRank[1];
+}
+
 export function getModelProviderLabel(variant: string): string {
-  if (
-    variant.startsWith("Qwen3-") ||
-    variant.startsWith("Qwen3.5-") ||
-    variant.startsWith("Qwen3.8-")
-  ) {
+  if (/^Qwen\d+(\.\d+)?-/.test(variant)) {
     return "Qwen";
   }
   if (variant.startsWith("Whisper-")) return "OpenAI";
@@ -273,9 +293,9 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "28.74 GiB",
   },
-  "Qwen3.5-35B-A3B-FP8": {
-    shortName: "Qwen3.5 35B-A3B",
-    fullName: "Qwen3.5 35B-A3B (Block FP8 MoE)",
+  "Qwen3.6-35B-A3B-FP8": {
+    shortName: "Qwen3.6 35B-A3B",
+    fullName: "Qwen3.6 35B-A3B (Block FP8 MoE)",
     description:
       "Hybrid linear-attention sparse-MoE checkpoint (256 experts, 8 routed + 1 shared) with block-scaled FP8 weights",
     category: "chat",

@@ -2111,8 +2111,8 @@ mod timing_contract_tests {
             "qwen3.8 has its own sampler without the grammar seam"
         );
         assert!(
-            ensure_response_format_supported(ModelVariant::Qwen35Moe35BA3BFp8, &format).is_ok(),
-            "qwen3.5-moe wires the DS9.2 grammar into its decode states"
+            ensure_response_format_supported(ModelVariant::Qwen36Moe35BA3BFp8, &format).is_ok(),
+            "qwen3.6-moe wires the DS9.2 grammar into its decode states"
         );
     }
 

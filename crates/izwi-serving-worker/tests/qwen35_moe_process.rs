@@ -5,8 +5,9 @@
 //! byte-level ChatML tokenizer) exercises the real RuntimeService loader,
 //! sparse dispatch, composite managed state, scheduler, and decode path
 //! through an actual worker process over HTTP — including the public gateway
-//! surface. Qwen3.5-35B-A3B-FP8 runtime gates: no artifact is downloaded
-//! (ADR 0008; catalog-disabled variant).
+//! surface. Qwen3.6-35B-A3B-FP8 (published qwen3_5_moe checkpoint) runtime
+//! gates: no artifact is downloaded; the synthetic-geometry escape hatch
+//! prices the tiny fixture instead of the pinned 35B representation.
 
 mod common;
 
@@ -44,14 +45,16 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models.path())
-        .env("IZWI_WORKER_MODEL", "Qwen3.5-35B-A3B-FP8")
+        .env("IZWI_WORKER_MODEL", "Qwen3.6-35B-A3B-FP8")
         .env("IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY", "1")
         .env("IZWI_WORKER_DEPLOYMENT_ID", "qwen35-moe-cpu-v1")
         .env("IZWI_WORKER_CREDENTIAL_ID", "qwen35-moe-cpu-credential")
         .env("IZWI_WORKER_BEARER_TOKEN", "qwen35-moe-cpu-secret")
         .env(
             "IZWI_WORKER_ARTIFACT_REVISION",
-            "9d1823d2dee688a6b25e77009dc727688c44936e",
+            ModelVariant::Qwen36Moe35BA3BFp8
+                .artifact_revision()
+                .expect("Qwen3.6 MoE artifact revision is catalog-pinned"),
         )
         .env("IZWI_WORKER_CPU_THREADS", "1")
         .env("IZWI_WORKER_MAX_ACTIVE", "1")
@@ -167,7 +170,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     let remote = RemoteChatExecution::new(
         client,
         RemoteChatExecutionConfig {
-            public_model_variant: ModelVariant::Qwen35Moe35BA3BFp8,
+            public_model_variant: ModelVariant::Qwen36Moe35BA3BFp8,
             expected_worker_incarnation: descriptor.incarnation_id,
             deployment_id: id("qwen35-moe-cpu-v1"),
             expected_model_generation: ModelGeneration::new(1).unwrap(),
@@ -202,7 +205,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
             .header("authorization", "Bearer qwen35-moe-test-api-key")
             .body(Body::from(
                 serde_json::json!({
-                    "model": ModelVariant::Qwen35Moe35BA3BFp8.dir_name(),
+                    "model": ModelVariant::Qwen36Moe35BA3BFp8.dir_name(),
                     "messages": [{"role": "user", "content": "hello"}],
                     "temperature": 0.0,
                     "top_p": 1.0,
@@ -249,7 +252,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         .header("authorization", "Bearer qwen35-moe-test-api-key")
         .body(Body::from(
             serde_json::json!({
-                "model": ModelVariant::Qwen35Moe35BA3BFp8.dir_name(),
+                "model": ModelVariant::Qwen36Moe35BA3BFp8.dir_name(),
                 "messages": [{"role": "user", "content": "hello"}],
                 "temperature": 0.0,
                 "max_tokens": 4,

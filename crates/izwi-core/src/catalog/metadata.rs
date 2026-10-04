@@ -226,17 +226,19 @@ pub enum ModelVariant {
         alias = "Qwen3.8-27B"
     )]
     Qwen3827BFp8,
-    /// Qwen3.5 35B-A3B hybrid sparse-MoE chat model with block-scaled FP8
-    /// Safetensors weights (256 experts, 8 routed + 1 shared). Catalog-disabled
-    /// until real-checkpoint activation evidence exists (ADR 0008 posture,
-    /// mirroring the Qwen3 MoE groundwork variant).
+    /// Qwen3.6 35B-A3B hybrid sparse-MoE chat model with block-scaled FP8
+    /// Safetensors weights (256 experts, 8 routed + 1 shared). Architecture
+    /// twin of the originally served Qwen3.5-35B-A3B-FP8 checkpoint (same
+    /// `Qwen3_5MoeForConditionalGeneration` geometry, tokenizer, and tensor
+    /// map); only post-training differs, so the catalog carries exactly one
+    /// checkpoint for the qwen3_5_moe architecture.
     #[serde(
-        rename = "Qwen3.5-35B-A3B-FP8",
-        alias = "Qwen/Qwen3.5-35B-A3B-FP8",
-        alias = "qwen3.5-35b-a3b-fp8",
-        alias = "Qwen3.5-35B-A3B"
+        rename = "Qwen3.6-35B-A3B-FP8",
+        alias = "Qwen/Qwen3.6-35B-A3B-FP8",
+        alias = "qwen3.6-35b-a3b-fp8",
+        alias = "Qwen3.6-35B-A3B"
     )]
-    Qwen35Moe35BA3BFp8,
+    Qwen36Moe35BA3BFp8,
     /// Gemma 3 4B instruction-tuned chat model
     #[serde(rename = "Gemma-3-4b-it")]
     Gemma34BIt,
@@ -280,10 +282,10 @@ impl ModelVariant {
     /// Revision used for the first supported Qwen3.8-27B-FP8 artifact contract.
     pub const QWEN38_27B_FP8_ARTIFACT_REVISION: &'static str =
         "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a";
-    /// Revision used for the first supported Qwen3.5-35B-A3B-FP8 artifact
+    /// Revision used for the first supported Qwen3.6-35B-A3B-FP8 artifact
     /// contract (HF repo state 2026-04-24).
-    pub const QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION: &'static str =
-        "9d1823d2dee688a6b25e77009dc727688c44936e";
+    pub const QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION: &'static str =
+        "95a723d08a9490559dae23d0cff1d9466213d989";
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
@@ -327,7 +329,7 @@ impl ModelVariant {
     pub fn artifact_revision(self) -> Option<&'static str> {
         match self {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
-            Self::Qwen35Moe35BA3BFp8 => Some(Self::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
+            Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
             _ => None,
         }
@@ -390,7 +392,7 @@ impl ModelVariant {
             Self::Qwen354BGguf => "unsloth/Qwen3.5-4B-GGUF",
             Self::Qwen359BGguf => "unsloth/Qwen3.5-9B-GGUF",
             Self::Qwen3827BFp8 => "Qwen/Qwen3.8-27B-FP8",
-            Self::Qwen35Moe35BA3BFp8 => "Qwen/Qwen3.5-35B-A3B-FP8",
+            Self::Qwen36Moe35BA3BFp8 => "Qwen/Qwen3.6-35B-A3B-FP8",
             Self::Gemma34BIt => "google/gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen/Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "mlx-community/Qwen3-ForcedAligner-0.6B-4bit",
@@ -445,7 +447,7 @@ impl ModelVariant {
             Self::Qwen354BGguf => "Qwen3.5 4B GGUF",
             Self::Qwen359BGguf => "Qwen3.5 9B GGUF",
             Self::Qwen3827BFp8 => "Qwen3.8 27B FP8",
-            Self::Qwen35Moe35BA3BFp8 => "Qwen3.5 35B-A3B FP8",
+            Self::Qwen36Moe35BA3BFp8 => "Qwen3.6 35B-A3B FP8",
             Self::Gemma34BIt => "Gemma 3 4B Instruct",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner 0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner 0.6B 4-bit",
@@ -500,7 +502,7 @@ impl ModelVariant {
             Self::Qwen354BGguf => "Qwen3.5-4B",
             Self::Qwen359BGguf => "Qwen3.5-9B",
             Self::Qwen3827BFp8 => "Qwen3.8-27B-FP8",
-            Self::Qwen35Moe35BA3BFp8 => "Qwen3.5-35B-A3B-FP8",
+            Self::Qwen36Moe35BA3BFp8 => "Qwen3.6-35B-A3B-FP8",
             Self::Gemma34BIt => "Gemma-3-4b-it",
             Self::Qwen3ForcedAligner06B => "Qwen3-ForcedAligner-0.6B",
             Self::Qwen3ForcedAligner06B4Bit => "Qwen3-ForcedAligner-0.6B-4bit",
@@ -555,7 +557,7 @@ impl ModelVariant {
             Self::Qwen354BGguf => 3_413_361_504,        // local GGUF + mmproj + tokenizer assets
             Self::Qwen359BGguf => 6_598_688_544,        // local GGUF + mmproj + tokenizer assets
             Self::Qwen3827BFp8 => 30_889_968_808, // pinned indexed FP8 bundle + chat/tokenizer metadata
-            Self::Qwen35Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
+            Self::Qwen36Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
@@ -614,8 +616,8 @@ impl ModelVariant {
             // Same contract as Qwen38_27B_FP8: backend-specific admission
             // replaces this hint. 140.0 is the worst-case CPU F32 expanded
             // envelope (34.45B FP8 params + 1.5B BF16 params, dequantized);
-            // the Qwen3.5 MoE representation plan replaces it per backend.
-            Self::Qwen35Moe35BA3BFp8 => 140.0,
+            // the qwen3_5_moe representation plan replaces it per backend.
+            Self::Qwen36Moe35BA3BFp8 => 140.0,
             Self::Gemma34BIt => 11.0,
             Self::Qwen3ForcedAligner06B => 2.5,
             Self::Qwen3ForcedAligner06B4Bit => 1.5,
@@ -713,7 +715,7 @@ impl ModelVariant {
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
-            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 | Self::Qwen35Moe35BA3BFp8 => {
+            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 | Self::Qwen36Moe35BA3BFp8 => {
                 Some("Apache-2.0")
             }
             _ => None,
@@ -840,7 +842,7 @@ impl ModelVariant {
             ),
             Self::Qwen3508BGguf | Self::Qwen352BGguf => (false, Vec::new(), false),
             Self::Qwen354BGguf | Self::Qwen359BGguf => (true, Vec::new(), false),
-            Self::Qwen35Moe35BA3BFp8 => (true, Vec::new(), false),
+            Self::Qwen36Moe35BA3BFp8 => (true, Vec::new(), false),
             Self::Lfm2512BThinkingGguf => (true, Vec::new(), false),
             _ => return None,
         };
@@ -938,7 +940,7 @@ impl ModelVariant {
                 | Self::Qwen354BGguf
                 | Self::Qwen359BGguf
                 | Self::Qwen3827BFp8
-                | Self::Qwen35Moe35BA3BFp8
+                | Self::Qwen36Moe35BA3BFp8
                 | Self::Qwen3ForcedAligner06B4Bit
         )
     }
@@ -993,9 +995,11 @@ impl ModelVariant {
         matches!(self, Self::Qwen3827BFp8)
     }
 
-    /// Whether this is the native Qwen3.5 MoE FP8 checkpoint.
+    /// Whether this is the native qwen3_5_moe MoE FP8 checkpoint. The served
+    /// release is Qwen3.6-35B-A3B-FP8 (architecture twin of the original
+    /// Qwen3.5-35B-A3B-FP8 rollout); the name follows the architecture module.
     pub fn is_qwen35_moe_fp8(&self) -> bool {
-        matches!(self, Self::Qwen35Moe35BA3BFp8)
+        matches!(self, Self::Qwen36Moe35BA3BFp8)
     }
 
     /// Whether this is an LFM2.5 chat GGUF variant.
@@ -1031,7 +1035,7 @@ impl ModelVariant {
             // Enabled by product decision (2026-09-30): visible and usable by
             // default. Runtime/performance certification against the real
             // checkpoint remains an exact-SHA hardware handoff gate.
-            | Self::Qwen35Moe35BA3BFp8
+            | Self::Qwen36Moe35BA3BFp8
             | Self::Qwen3827BFp8
             | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice4Bit
@@ -1104,7 +1108,7 @@ impl ModelVariant {
             Self::Qwen354BGguf,
             Self::Qwen359BGguf,
             Self::Qwen3827BFp8,
-            Self::Qwen35Moe35BA3BFp8,
+            Self::Qwen36Moe35BA3BFp8,
             Self::Gemma34BIt,
             Self::Qwen3ForcedAligner06B,
             Self::Qwen3ForcedAligner06B4Bit,
@@ -1362,8 +1366,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_moe_fp8_catalog_contract_is_enabled_moe_family() {
-        let variant = ModelVariant::Qwen35Moe35BA3BFp8;
+    fn qwen36_moe_fp8_catalog_contract_is_enabled_moe_family() {
+        let variant = ModelVariant::Qwen36Moe35BA3BFp8;
 
         // Enabled by product decision (2026-09-30); runtime certification
         // against the real checkpoint stays an exact-SHA hardware gate.
@@ -1375,17 +1379,17 @@ mod tests {
         assert!(!variant.is_qwen38_fp8());
         assert_eq!(variant.family(), crate::catalog::ModelFamily::Qwen35MoeChat);
         assert_eq!(variant.primary_task(), ModelTask::Chat);
-        assert_eq!(variant.repo_id(), "Qwen/Qwen3.5-35B-A3B-FP8");
-        assert_eq!(variant.dir_name(), "Qwen3.5-35B-A3B-FP8");
-        assert_eq!(variant.display_name(), "Qwen3.5 35B-A3B FP8");
+        assert_eq!(variant.repo_id(), "Qwen/Qwen3.6-35B-A3B-FP8");
+        assert_eq!(variant.dir_name(), "Qwen3.6-35B-A3B-FP8");
+        assert_eq!(variant.display_name(), "Qwen3.6 35B-A3B FP8");
         assert_eq!(variant.license_label(), Some("Apache-2.0"));
         assert_eq!(
             variant.artifact_revision(),
-            Some(ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION)
+            Some(ModelVariant::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION)
         );
         let caps = variant
             .chat_capabilities()
-            .expect("qwen3.5 moe chat capabilities");
+            .expect("qwen3.6 moe chat capabilities");
         assert!(caps.supports_thinking);
         assert!(caps.default_thinking_enabled);
         assert!(caps.reasoning_efforts.is_empty());
