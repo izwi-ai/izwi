@@ -1194,6 +1194,13 @@ impl WhisperTurboAsrModel {
         Some(MAX_AUDIO_SECONDS_HINT)
     }
 
+    /// Audio never reaches decoder self-attention — it lives in the encoder
+    /// and the cross-attention domain — so invocation context fitting needs
+    /// no audio-token budget.
+    pub(crate) fn audio_token_rate(&self) -> Option<f32> {
+        None
+    }
+
     pub(crate) fn window_preparation_geometry(
         &self,
         audio: &[f32],

@@ -120,7 +120,7 @@ mod tests {
         let plan = registry
             .plan(CapabilityExecutionRequest::new(
                 CapabilityKind::Chat,
-                ModelVariant::Qwen38BGguf,
+                ModelVariant::Qwen359BGguf,
                 BackendKind::Cpu,
             ))
             .expect("chat plan");
@@ -172,7 +172,7 @@ mod tests {
 
         for (variant, expected_mode) in [
             (ModelVariant::Qwen306B, ExecutionMode::Sequence),
-            (ModelVariant::Qwen306BGguf, ExecutionMode::Sequence),
+            (ModelVariant::Qwen359BGguf, ExecutionMode::Sequence),
             (ModelVariant::Qwen354BGguf, ExecutionMode::Sequence),
             (ModelVariant::Lfm2512BInstructGguf, ExecutionMode::Sequence),
             (ModelVariant::Gemma34BIt, ExecutionMode::Sequence),

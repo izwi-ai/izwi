@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn request_envelope_carries_capability_model_and_routing_controls() {
         let deadline = Instant::now();
-        let envelope = RequestEnvelope::new(CapabilityKind::Chat, ModelVariant::Qwen38BGguf)
+        let envelope = RequestEnvelope::new(CapabilityKind::Chat, ModelVariant::Qwen359BGguf)
             .with_request_id("req-1")
             .with_correlation_id(Some("corr-1".to_string()))
             .with_priority(RequestPriority::Interactive)
@@ -589,7 +589,7 @@ mod tests {
 
         assert_eq!(envelope.request_id, "req-1");
         assert_eq!(envelope.capability, CapabilityKind::Chat);
-        assert_eq!(envelope.model_variant, ModelVariant::Qwen38BGguf);
+        assert_eq!(envelope.model_variant, ModelVariant::Qwen359BGguf);
         assert_eq!(envelope.correlation_id.as_deref(), Some("corr-1"));
         assert_eq!(envelope.priority, RequestPriority::Interactive);
         assert_eq!(envelope.deadline, Some(deadline));
@@ -682,7 +682,7 @@ mod tests {
         };
 
         let runtime_request = ChatRuntimeRequest::from_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             messages,
             params,
             chat_config,
@@ -693,7 +693,7 @@ mod tests {
         .expect("valid chat request");
         let core_request = runtime_request.into_engine_request();
 
-        assert_eq!(core_request.model_variant, Some(ModelVariant::Qwen38BGguf));
+        assert_eq!(core_request.model_variant, Some(ModelVariant::Qwen359BGguf));
         assert_eq!(core_request.params.max_tokens, 12);
         assert_eq!(core_request.prompt_tokens, vec![10, 11]);
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-chat"));
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn chat_runtime_request_rejects_empty_messages() {
         let err = ChatRuntimeRequest::from_messages(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             Vec::new(),
             GenerationParams::default(),
             ChatRequestConfig::default(),

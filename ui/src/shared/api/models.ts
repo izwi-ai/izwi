@@ -55,14 +55,23 @@ export interface ModelInfo {
   size_bytes: number | null;
   download_progress: number | null;
   error_message: string | null;
+  /** Explicitly loaded: survives budget/memory-pressure eviction until unloaded. */
+  pinned?: boolean;
   modalities?: string[];
   route_capabilities?: ModelRouteCapabilities;
   chat_capabilities?: ChatModelCapabilities | null;
   speech_capabilities?: SpeechModelCapabilities | null;
 }
 
+export interface ModelResidencySummary {
+  resident_count: number;
+  max_loaded_models: number | null;
+  model_keep_alive_secs: number;
+}
+
 export interface ModelsResponse {
   models: ModelInfo[];
+  residency?: ModelResidencySummary;
 }
 
 export class ModelApiClient {
@@ -86,9 +95,11 @@ export class ModelApiClient {
 
   async loadModel(
     variant: string,
+    options?: { signal?: AbortSignal },
   ): Promise<{ status: string; message: string }> {
     return this.http.request(`/admin/models/${variant}/load`, {
       method: "POST",
+      signal: options?.signal,
     });
   }
 

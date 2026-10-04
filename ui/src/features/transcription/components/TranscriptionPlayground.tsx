@@ -1181,7 +1181,6 @@ export function TranscriptionPlayground({
 
       if (timestampAlignerModelId && timestampAlignerReady) {
         setIncludeTimestamps(true);
-        setStreamingEnabled(false);
         return;
       }
 
@@ -1197,10 +1196,14 @@ export function TranscriptionPlayground({
 
   const handleStreamingEnabledChange = useCallback((nextValue: boolean) => {
     setStreamingEnabled(nextValue);
-    if (nextValue) {
-      setIncludeTimestamps(false);
-    }
   }, []);
+
+  const streamingUnavailableReason = includeTimestamps
+    ? "Streaming is unavailable while timestamps are enabled. Turn timestamps off to stream."
+    : null;
+  const timestampsUnavailableReason = streamingEnabled
+    ? "Timestamps are unavailable while streaming is enabled. Turn streaming off to add timestamps."
+    : null;
 
   const handleCopy = async () => {
     const exportText = currentOutputExportText;
@@ -1699,7 +1702,8 @@ export function TranscriptionPlayground({
                       handleIncludeTimestampsChange(event.target.checked)
                     }
                     className="app-checkbox h-3.5 w-3.5 disabled:opacity-50"
-                    disabled={isProcessing}
+                    disabled={isProcessing || streamingEnabled}
+                    title={timestampsUnavailableReason ?? undefined}
                   />
                 </label>
                 <label className="flex w-fit items-center gap-2 rounded-full border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-2 text-xs text-[var(--text-muted)] justify-self-end">
@@ -1712,9 +1716,19 @@ export function TranscriptionPlayground({
                       handleStreamingEnabledChange(event.target.checked)
                     }
                     className="app-checkbox w-3.5 h-3.5 disabled:opacity-50 ml-1"
-                    disabled={isProcessing}
+                    disabled={isProcessing || includeTimestamps}
+                    title={streamingUnavailableReason ?? undefined}
                   />
                 </label>
+                {(() => {
+                  const conflictReason =
+                    streamingUnavailableReason ?? timestampsUnavailableReason;
+                  return conflictReason ? (
+                    <p className="col-span-2 text-[11px] leading-4 text-[var(--text-muted)]">
+                      {conflictReason}
+                    </p>
+                  ) : null;
+                })()}
               </div>
             </div>
 

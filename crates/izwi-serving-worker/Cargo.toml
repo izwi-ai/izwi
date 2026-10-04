@@ -1,0 +1,49 @@
+[package]
+name = "izwi-serving-worker"
+description = "Private inference worker HTTP service for Izwi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+accelerate = ["izwi-core/accelerate"]
+cuda = ["izwi-core/cuda"]
+cudnn = ["cuda", "izwi-core/cudnn"]
+flash-attn = ["cuda", "izwi-core/flash-attn"]
+metal = ["izwi-core/metal"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+dirs = { workspace = true }
+futures = { workspace = true }
+izwi-core = { path = "../izwi-core", default-features = false }
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
+izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
+rustls-pemfile = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+candle-core = { workspace = true }
+half = { workspace = true }
+sha2 = { workspace = true }
+izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-hooks = { path = "../izwi-hooks" }
+izwi-server = { path = "../izwi-server" }
+safetensors = { workspace = true }
+tempfile = "3.10"
+tokenizers = { workspace = true }
+tower = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = "0.29"

@@ -1,0 +1,615 @@
+//! Qwen3.5 sparse-expert feed-forward block (Qwen3.5-35B-A3B MoE FFN).
+//!
+//! One block replaces the dense SwiGLU MLP on every layer of the shared
+//! Qwen3.5 hybrid trunk: a dense router produces expert logits, the shared
+//! [`SparseMoeDispatcher`] routes tokens through the top-k routed experts,
+//! and an always-on shared expert is applied to every token and added to
+//! the routed output.
+//!
+//! Routing mode is pinned from the transformers `qwen3_5_moe` modeling
+//! source (checked 2026-09-29): F32 softmax over the router logits, top-k
+//! selection, then the top-k weights are divided by their sum. There is no
+//! sigmoid scoring and no `e_score_correction_bias`, and the config class
+//! exposes no `norm_topk_prob`/`scoring_func` knobs — so the renormalized
+//! softmax here is not configurable for this family.
+//!
+//! The shared expert is `down(silu(gate(x)) * up(x))`, scaled by
+//! `sigmoid(shared_expert_gate(x))` when the checkpoint carries the optional
+//! `[1, hidden]` gate projection, and added to the routed output
+//! unconditionally (same modeling source).
+
+use std::sync::Arc;
+
+use candle_core::quantized::{QMatMul, QTensor};
+use candle_core::{DType, Device, Module, Tensor};
+use candle_nn::ops;
+
+use crate::error::{Error, Result};
+use crate::kernels::try_fused_silu_mul;
+use crate::models::shared::moe::{
+    ExpertActivationCounters, ExpertSet, SparseMoeConfig, SparseMoeDispatcher,
+};
+use crate::models::shared::weights::gguf::GgufLoader;
+
+use crate::models::architectures::qwen35::text::Qwen35MoeFfnGeometry;
+
+/// Persistent form of one projection inside the sparse block. `Quantized`
+/// keeps quantized residency (GGUF tensors, CPU-packed Q8_0 requants);
+/// `Dense` holds an expanded weight for backends without packed kernels.
+#[derive(Clone)]
+pub(crate) enum Qwen35MoeLinear {
+    Dense(Tensor),
+    Quantized(QMatMul),
+}
+
+impl Qwen35MoeLinear {
+    pub(crate) fn from_qtensor(qtensor: QTensor) -> Result<Self> {
+        Ok(Self::Quantized(
+            QMatMul::from_arc(Arc::new(qtensor)).map_err(Error::from)?,
+        ))
+    }
+
+    pub(crate) fn from_dense(weight: Tensor) -> Self {
+        Self::Dense(weight)
+    }
+
+    /// Apply the projection to `[num_tokens, in]`, returning
+    /// `[num_tokens, out]` in the activation's dtype. Quantized matmuls
+    /// compute in F32; dense projections compute in their residency dtype.
+    pub(crate) fn project(&self, x: &Tensor) -> Result<Tensor> {
+        let input_dtype = x.dtype();
+        let output = match self {
+            Self::Quantized(qmatmul) => qmatmul.forward(&x.to_dtype(DType::F32)?)?,
+            Self::Dense(weight) => x.to_dtype(weight.dtype())?.matmul(&weight.t()?)?,
+        };
+        if output.dtype() == input_dtype {
+            Ok(output)
+        } else {
+            output.to_dtype(input_dtype).map_err(Error::from)
+        }
+    }
+}
+
+/// Routed-expert projections: `[out, in]` gate/up/down per expert.
+#[derive(Clone)]
+pub(crate) struct Qwen35MoeExpertWeights {
+    pub gate: Qwen35MoeLinear,
+    pub up: Qwen35MoeLinear,
+    pub down: Qwen35MoeLinear,
+}
+
+/// Always-on shared-expert projections plus the optional sigmoid output
+/// gate (`shared_expert_gate`, `[1, hidden]`).
+#[derive(Clone)]
+pub(crate) struct Qwen35MoeSharedExpertWeights {
+    pub gate: Qwen35MoeLinear,
+    pub up: Qwen35MoeLinear,
+    pub down: Qwen35MoeLinear,
+    pub output_gate: Option<Qwen35MoeLinear>,
+}
+
+struct Qwen35MoeRoutedExperts(Vec<Qwen35MoeExpertWeights>);
+
+impl ExpertSet for Qwen35MoeRoutedExperts {
+    fn num_experts(&self) -> usize {
+        self.0.len()
+    }
+
+    fn apply_expert(&self, expert: usize, tokens: &Tensor) -> Result<Tensor> {
+        let weights = self.0.get(expert).ok_or_else(|| {
+            Error::InferenceError(format!("qwen35moe routed expert {expert} is out of range"))
+        })?;
+        let hidden = swiglu(&weights.gate, &weights.up, tokens)?;
+        weights.down.project(&hidden)
+    }
+}
+
+struct Qwen35MoeSharedExpert(Qwen35MoeSharedExpertWeights);
+
+impl Qwen35MoeSharedExpert {
+    fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
+        let hidden = swiglu(&self.0.gate, &self.0.up, tokens)?;
+        let output = self.0.down.project(&hidden)?;
+        match &self.0.output_gate {
+            None => Ok(output),
+            Some(gate) => {
+                let logits = gate.project(tokens)?;
+                output.broadcast_mul(&ops::sigmoid(&logits)?).map_err(Error::from)
+            }
+        }
+    }
+}
+
+fn swiglu(gate: &Qwen35MoeLinear, up: &Qwen35MoeLinear, tokens: &Tensor) -> Result<Tensor> {
+    let gate_out = gate.project(tokens)?;
+    let up_out = up.project(tokens)?;
+    if let Some(fused) = try_fused_silu_mul(&gate_out, &up_out) {
+        return Ok(fused);
+    }
+    let activated = ops::silu(&gate_out)?;
+    (&activated * &up_out).map_err(Error::from)
+}
+
+/// One layer's sparse-expert feed-forward: dense router → renormalized
+/// softmax top-k routed experts + unconditional shared expert.
+pub(crate) struct Qwen35MoeSparseMlp {
+    dispatcher: SparseMoeDispatcher,
+    router: Qwen35MoeLinear,
+    experts: Qwen35MoeRoutedExperts,
+    shared: Qwen35MoeSharedExpert,
+    counters: Arc<ExpertActivationCounters>,
+}
+
+impl Qwen35MoeSparseMlp {
+    /// Assemble a block from source-materialized weights. Fails closed when
+    /// the routed expert count disagrees with the declared geometry.
+    pub(crate) fn from_weights(
+        router: Qwen35MoeLinear,
+        experts: Vec<Qwen35MoeExpertWeights>,
+        shared: Qwen35MoeSharedExpertWeights,
+        geometry: &Qwen35MoeFfnGeometry,
+    ) -> Result<Self> {
+        if experts.len() != geometry.num_experts {
+            return Err(Error::ModelLoadError(format!(
+                "qwen35moe sparse block declares {} routed experts but geometry expects {}",
+                experts.len(),
+                geometry.num_experts
+            )));
+        }
+        let counters = Arc::new(ExpertActivationCounters::new(geometry.num_experts));
+        let dispatcher = SparseMoeDispatcher::new(SparseMoeConfig {
+            num_experts: geometry.num_experts,
+            num_experts_per_tok: geometry.num_experts_per_tok,
+            // Pinned from transformers qwen3_5_moe: softmax top-k with
+            // in-top-k renormalization; not config-exposed for this family.
+            norm_topk_prob: true,
+        })?
+        .with_counters(counters.clone());
+
+        Ok(Self {
+            dispatcher,
+            router,
+            experts: Qwen35MoeRoutedExperts(experts),
+            shared: Qwen35MoeSharedExpert(shared),
+            counters,
+        })
+    }
+
+    pub(crate) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let (batch, sequence, hidden) = match hidden_states.rank() {
+            3 => hidden_states.dims3()?,
+            2 => {
+                let (tokens, hidden) = hidden_states.dims2()?;
+                (1, tokens, hidden)
+            }
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "qwen35moe sparse block expects rank-2 or rank-3 input, found rank {other}"
+                )))
+            }
+        };
+        let tokens = batch * sequence;
+        let flat = hidden_states.reshape((tokens, hidden))?.contiguous()?;
+
+        let router_logits = self.router.project(&flat)?;
+        let routed = self.dispatcher.dispatch(&flat, &router_logits, &self.experts)?;
+        let shared_output = self.shared.forward(&flat)?;
+        let combined = routed.broadcast_add(&shared_output)?;
+
+        if rank3(hidden_states) {
+            combined.reshape((batch, sequence, hidden)).map_err(Error::from)
+        } else {
+            Ok(combined)
+        }
+    }
+
+    pub(crate) fn counters(&self) -> Arc<ExpertActivationCounters> {
+        self.counters.clone()
+    }
+}
+
+fn rank3(tensor: &Tensor) -> bool {
+    tensor.rank() == 3
+}
+
+/// Build the sparse block from a GGUF fixture checkpoint's fused expert
+/// tensors. The routed experts ride the llama.cpp-style fused layout
+/// (`ffn_gate_exps` / `ffn_up_exps` `[n, ff, hidden]`,
+/// `ffn_down_exps` `[n, hidden, ff]`); the shared expert uses dedicated
+/// `ffn_{gate,up,down}_shexp` tensors and the optional shared-expert output
+/// gate is `ffn_gate_inp_shexp` `[1, hidden]`. Quantized residency is
+/// preserved through the fused-tensor byte split.
+pub(crate) fn load_gguf_sparse_mlp(
+    loader: &GgufLoader,
+    layer: usize,
+    geometry: &Qwen35MoeFfnGeometry,
+    device: &Device,
+) -> Result<Qwen35MoeSparseMlp> {
+    let prefix = format!("blk.{layer}");
+    let router = Qwen35MoeLinear::Quantized(
+        QMatMul::from_arc(Arc::new(
+            loader.load_qtensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?,
+        ))
+        .map_err(Error::from)?,
+    );
+
+    let (ff, hidden) = (geometry.expert_intermediate_size, loader_hidden(loader)?);
+    let gate_experts = split_fused(
+        loader,
+        device,
+        &format!("{prefix}.ffn_gate_exps.weight"),
+        geometry.num_experts,
+        ff,
+        hidden,
+    )?;
+    let up_experts = split_fused(
+        loader,
+        device,
+        &format!("{prefix}.ffn_up_exps.weight"),
+        geometry.num_experts,
+        ff,
+        hidden,
+    )?;
+    let down_experts = split_fused(
+        loader,
+        device,
+        &format!("{prefix}.ffn_down_exps.weight"),
+        geometry.num_experts,
+        hidden,
+        ff,
+    )?;
+    let mut experts = Vec::with_capacity(geometry.num_experts);
+    for ((gate_q, up_q), down_q) in gate_experts.into_iter().zip(up_experts).zip(down_experts) {
+        experts.push(Qwen35MoeExpertWeights {
+            gate: Qwen35MoeLinear::from_qtensor(gate_q)?,
+            up: Qwen35MoeLinear::from_qtensor(up_q)?,
+            down: Qwen35MoeLinear::from_qtensor(down_q)?,
+        });
+    }
+
+    let shared_ff = geometry.shared_expert_intermediate_size;
+    let shared_gate_shape = loader
+        .tensor_shape(&format!("{prefix}.ffn_gate_shexp.weight"))
+        .ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "qwen35moe GGUF fixture is missing `{prefix}.ffn_gate_shexp.weight`"
+            ))
+        })?;
+    let shared_down_shape = loader
+        .tensor_shape(&format!("{prefix}.ffn_down_shexp.weight"))
+        .ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "qwen35moe GGUF fixture is missing `{prefix}.ffn_down_shexp.weight`"
+            ))
+        })?;
+    if shared_gate_shape.first() != Some(&shared_ff) || shared_down_shape.last() != Some(&shared_ff)
+    {
+        return Err(Error::ModelLoadError(format!(
+            "qwen35moe GGUF fixture shared-expert shapes {shared_gate_shape:?}/{shared_down_shape:?} disagree with the declared shared intermediate width {shared_ff}"
+        )));
+    }
+    let shared = Qwen35MoeSharedExpertWeights {
+        gate: gguf_linear(loader, device, &format!("{prefix}.ffn_gate_shexp.weight"))?,
+        up: gguf_linear(loader, device, &format!("{prefix}.ffn_up_shexp.weight"))?,
+        down: gguf_linear(loader, device, &format!("{prefix}.ffn_down_shexp.weight"))?,
+        output_gate: loader
+            .has_tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"))
+            .then(|| gguf_linear(loader, device, &format!("{prefix}.ffn_gate_inp_shexp.weight")))
+            .transpose()?,
+    };
+
+    Qwen35MoeSparseMlp::from_weights(router, experts, shared, geometry)
+}
+
+fn gguf_linear(
+    loader: &GgufLoader,
+    device: &Device,
+    name: &str,
+) -> Result<Qwen35MoeLinear> {
+    Ok(Qwen35MoeLinear::Quantized(
+        QMatMul::from_arc(Arc::new(loader.load_qtensor(name, device)?))
+            .map_err(Error::from)?,
+    ))
+}
+
+fn split_fused(
+    loader: &GgufLoader,
+    device: &Device,
+    name: &str,
+    num_experts: usize,
+    expert_rows: usize,
+    expert_cols: usize,
+) -> Result<Vec<QTensor>> {
+    let fused = loader.load_qtensor(name, device)?;
+    crate::models::shared::weights::gguf::split_fused_expert_qtensor(
+        &fused,
+        num_experts,
+        expert_rows,
+        expert_cols,
+    )
+}
+
+fn loader_hidden(loader: &GgufLoader) -> Result<usize> {
+    // The fused gate-expert tensor pins the hidden width in its last dim.
+    loader
+        .tensor_shape("blk.0.ffn_gate_exps.weight")
+        .and_then(|shape| shape.last().copied())
+        .ok_or_else(|| {
+            Error::ModelLoadError(
+                "qwen35moe GGUF fixture is missing `blk.0.ffn_gate_exps.weight`".into(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    const HIDDEN: usize = 4;
+    const FF: usize = 4;
+    const NUM_EXPERTS: usize = 4;
+    const TOP_K: usize = 2;
+    const TOKENS: usize = 3;
+
+    fn geometry(shared_ff: usize) -> Qwen35MoeFfnGeometry {
+        Qwen35MoeFfnGeometry {
+            num_experts: NUM_EXPERTS,
+            num_experts_per_tok: TOP_K,
+            expert_intermediate_size: FF,
+            shared_expert_intermediate_size: shared_ff,
+        }
+    }
+
+    /// Dense `[out, in]` weight from row-major values.
+    fn dense_weight(rows: usize, cols: usize, values: &[f32]) -> Qwen35MoeLinear {
+        Qwen35MoeLinear::from_dense(
+            Tensor::from_vec(values.to_vec(), (rows, cols), &Device::Cpu).unwrap(),
+        )
+    }
+
+    fn expert(id: usize) -> Qwen35MoeExpertWeights {
+        // expert_out(x) = down · silu(gate · x) * (up · x), all [ff/hidden].
+        // Deterministic pseudo-weights derived from the expert id so every
+        // expert computes a distinct map.
+        let base = (id + 1) as f32 * 0.25;
+        Qwen35MoeExpertWeights {
+            gate: dense_weight(FF, HIDDEN, &(0..FF * HIDDEN).map(|i| base + (i % 3) as f32 * 0.125 - 0.25).collect::<Vec<_>>()),
+            up: dense_weight(FF, HIDDEN, &(0..FF * HIDDEN).map(|i| 0.5 + (i % 5) as f32 * 0.0625).collect::<Vec<_>>()),
+            down: dense_weight(HIDDEN, FF, &(0..HIDDEN * FF).map(|i| -0.125 + (i % 4) as f32 * 0.1875).collect::<Vec<_>>()),
+        }
+    }
+
+    fn shared(with_gate: bool) -> Qwen35MoeSharedExpertWeights {
+        Qwen35MoeSharedExpertWeights {
+            gate: dense_weight(FF, HIDDEN, &(0..FF * HIDDEN).map(|i| 0.375 - (i % 4) as f32 * 0.09375).collect::<Vec<_>>()),
+            up: dense_weight(FF, HIDDEN, &(0..FF * HIDDEN).map(|i| 0.25 + (i % 2) as f32 * 0.5).collect::<Vec<_>>()),
+            down: dense_weight(HIDDEN, FF, &(0..HIDDEN * FF).map(|i| 0.625 - (i % 3) as f32 * 0.15625).collect::<Vec<_>>()),
+            output_gate: with_gate.then(|| dense_weight(1, HIDDEN, &[0.5, -0.25, 0.75, -1.0])),
+        }
+    }
+
+    fn router_weight() -> Vec<f32> {
+        // Fixed `[num_experts, hidden]` table chosen so each test token's
+        // top-2 projection selects a different expert pair (no ranking ties).
+        vec![
+            0.25, -0.5, 1.0, 0.75, //
+            -1.0, 0.875, -0.25, 0.5, //
+            1.5, -0.75, 0.125, -1.25, //
+            0.625, 1.25, -0.875, 0.375,
+        ]
+    }
+
+    fn hidden_states() -> Tensor {
+        Tensor::from_vec(
+            vec![1.0_f32, -2.0, 0.5, 3.0, -1.5, 2.5, 0.125, -0.375, 2.0, 1.0, -1.0, 0.75],
+            (TOKENS, HIDDEN),
+            &Device::Cpu,
+        )
+        .unwrap()
+    }
+
+    fn project_dense(weight: &[f32], rows: usize, cols: usize, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0_f32; x.len() / cols * rows];
+        for (token, x_row) in x.chunks(cols).enumerate() {
+            for (o, w_row) in weight.chunks(cols).enumerate() {
+                out[token * rows + o] = x_row
+                    .iter()
+                    .zip(w_row)
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>();
+            }
+        }
+        out
+    }
+
+    fn reference_expert(weights: &Qwen35MoeExpertWeights, x: &[f32]) -> Vec<f32> {
+        let as_values = |linear: &Qwen35MoeLinear| match linear {
+            Qwen35MoeLinear::Dense(tensor) => tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            Qwen35MoeLinear::Quantized(_) => unreachable!("reference test uses dense weights"),
+        };
+        let gate = as_values(&weights.gate);
+        let up = as_values(&weights.up);
+        let down = as_values(&weights.down);
+        let gate_out = project_dense(&gate, FF, HIDDEN, x);
+        let up_out = project_dense(&up, FF, HIDDEN, x);
+        let hidden: Vec<f32> = gate_out
+            .iter()
+            .zip(&up_out)
+            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        project_dense(&down, HIDDEN, FF, &hidden)
+    }
+
+    fn reference_forward(
+        experts: &[Qwen35MoeExpertWeights],
+        shared: &Qwen35MoeSharedExpertWeights,
+        with_gate: bool,
+    ) -> Vec<f32> {
+        let router_weight = dense_weight(NUM_EXPERTS, HIDDEN, &router_weight());
+        let router_values = match &router_weight {
+            Qwen35MoeLinear::Dense(tensor) => {
+                tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            }
+            _ => unreachable!("reference test uses dense weights"),
+        };
+        let hidden = hidden_states().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut output = vec![0_f32; TOKENS * HIDDEN];
+        for token in 0..TOKENS {
+            let x = &hidden[token * HIDDEN..(token + 1) * HIDDEN];
+            // Router logits are the projection of the token, not raw weights.
+            let token_logits = project_dense(&router_values, NUM_EXPERTS, HIDDEN, x);
+            let max = token_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = token_logits.iter().map(|l| (l - max).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let mut ranked: Vec<(usize, f32)> = exps
+                .iter()
+                .enumerate()
+                .map(|(e, p)| (e, p / sum))
+                .collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let selected = &ranked[..TOP_K];
+            let norm: f32 = selected.iter().map(|(_, w)| *w).sum();
+
+            let mut routed = [0_f32; HIDDEN];
+            for &(expert, weight) in selected {
+                let applied = reference_expert(&experts[expert], x);
+                for (o, value) in applied.iter().enumerate() {
+                    routed[o] += (weight / norm) * value;
+                }
+            }
+
+            let mut shared_out = reference_expert_public(shared, x);
+            if with_gate {
+                let gate_weight = match &shared.output_gate {
+                    Some(Qwen35MoeLinear::Dense(tensor)) => {
+                        tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                let logit: f32 = x.iter().zip(&gate_weight).map(|(a, b)| a * b).sum();
+                shared_out = shared_out.iter().map(|v| v * (1.0 / (1.0 + (-logit).exp()))).collect();
+            }
+
+            for (o, value) in routed.iter().enumerate() {
+                output[token * HIDDEN + o] = value + shared_out[o];
+            }
+        }
+        output
+    }
+
+    fn reference_expert_public(
+        weights: &Qwen35MoeSharedExpertWeights,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let as_values = |linear: &Qwen35MoeLinear| match linear {
+            Qwen35MoeLinear::Dense(tensor) => tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            Qwen35MoeLinear::Quantized(_) => unreachable!(),
+        };
+        let gate_out = project_dense(&as_values(&weights.gate), FF, HIDDEN, x);
+        let up_out = project_dense(&as_values(&weights.up), FF, HIDDEN, x);
+        let hidden: Vec<f32> = gate_out
+            .iter()
+            .zip(&up_out)
+            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        project_dense(&as_values(&weights.down), HIDDEN, FF, &hidden)
+    }
+
+    fn run_block(with_gate: bool) -> Vec<f32> {
+        let experts: Vec<_> = (0..NUM_EXPERTS).map(expert).collect();
+        let shared = shared(with_gate);
+        let block = Qwen35MoeSparseMlp::from_weights(
+            dense_weight(NUM_EXPERTS, HIDDEN, &router_weight()),
+            experts.clone(),
+            Qwen35MoeSharedExpertWeights {
+                gate: shared.gate.clone(),
+                up: shared.up.clone(),
+                down: shared.down.clone(),
+                output_gate: shared.output_gate.clone(),
+            },
+            &geometry(FF),
+        )
+        .unwrap();
+        let output = block.forward(&hidden_states()).unwrap();
+        assert_eq!(output.dims(), [TOKENS, HIDDEN]);
+        output.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    #[test]
+    fn sparse_block_matches_reference_math_with_gated_shared_expert() {
+        let output = run_block(true);
+        let experts: Vec<_> = (0..NUM_EXPERTS).map(expert).collect();
+        let reference = reference_forward(&experts, &shared(true), true);
+        for (actual, expected) in output.iter().zip(&reference) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "{actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_block_matches_reference_math_without_shared_gate() {
+        let output = run_block(false);
+        let experts: Vec<_> = (0..NUM_EXPERTS).map(expert).collect();
+        let reference = reference_forward(&experts, &shared(false), false);
+        for (actual, expected) in output.iter().zip(&reference) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "{actual} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_block_records_full_routing_histogram() {
+        let experts: Vec<_> = (0..NUM_EXPERTS).map(expert).collect();
+        let block = Qwen35MoeSparseMlp::from_weights(
+            dense_weight(NUM_EXPERTS, HIDDEN, &router_weight()),
+            experts,
+            shared(false),
+            &geometry(FF),
+        )
+        .unwrap();
+        block.forward(&hidden_states()).unwrap();
+        // tokens × top-k selections land in the histogram.
+        assert_eq!(block.counters().total_selections(), (TOKENS * TOP_K) as u64);
+        assert_eq!(block.counters().num_experts(), NUM_EXPERTS);
+    }
+
+    #[test]
+    fn sparse_block_rejects_geometry_mismatch() {
+        let experts: Vec<_> = (0..NUM_EXPERTS - 1).map(expert).collect();
+        let error = match Qwen35MoeSparseMlp::from_weights(
+            dense_weight(NUM_EXPERTS, HIDDEN, &router_weight()),
+            experts,
+            shared(false),
+            &geometry(FF),
+        ) {
+            Ok(_) => panic!("routed expert count must fail closed against geometry"),
+            Err(error) => error,
+        };
+        assert!(format!("{error}").contains("geometry expects 4"));
+    }
+
+    #[test]
+    fn sparse_block_accepts_rank3_input() {
+        let experts: Vec<_> = (0..NUM_EXPERTS).map(expert).collect();
+        let block = Qwen35MoeSparseMlp::from_weights(
+            dense_weight(NUM_EXPERTS, HIDDEN, &router_weight()),
+            experts,
+            shared(false),
+            &geometry(FF),
+        )
+        .unwrap();
+        let flat = run_block(false);
+        let rank3_input = hidden_states().reshape((1, TOKENS, HIDDEN)).unwrap();
+        let output = block.forward(&rank3_input).unwrap();
+        assert_eq!(output.dims(), [1, TOKENS, HIDDEN]);
+        let rank3_output = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (actual, expected) in rank3_output.iter().zip(&flat) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+}

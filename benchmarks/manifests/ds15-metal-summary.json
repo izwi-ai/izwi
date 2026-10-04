@@ -1,0 +1,33 @@
+{
+  "cold_counter_deltas": {
+    "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+    "izwi_engine_kv_cache_evictions_total": 37,
+    "izwi_engine_kv_cache_hits_total": 0,
+    "izwi_engine_kv_cache_misses_total": 99,
+    "izwi_engine_kv_cache_reused_tokens_total": 0,
+    "izwi_engine_tensor_snapshot_attaches_total": 0,
+    "izwi_engine_tensor_snapshot_evictions_total": 37,
+    "izwi_engine_tensor_snapshot_publishes_total": 40,
+    "izwi_engine_tensor_snapshot_truncations_total": 0
+  },
+  "lane": "metal",
+  "schema": "izwi.ds15-prefix-summary.v1",
+  "shared_counter_deltas": {
+    "izwi_engine_kv_cache_avoided_prefill_tokens_total": 4672,
+    "izwi_engine_kv_cache_evictions_total": 0,
+    "izwi_engine_kv_cache_hits_total": 73,
+    "izwi_engine_kv_cache_misses_total": 10,
+    "izwi_engine_kv_cache_reused_tokens_total": 4672,
+    "izwi_engine_tensor_snapshot_attaches_total": 36,
+    "izwi_engine_tensor_snapshot_evictions_total": 0,
+    "izwi_engine_tensor_snapshot_publishes_total": 1,
+    "izwi_engine_tensor_snapshot_truncations_total": 1
+  },
+  "ttft_ms": {
+    "cold_p50": 853.9599379873835,
+    "cold_p95": 880.0014222972093,
+    "p50_delta_ms": -351.0593130486086,
+    "shared_p50": 502.90062493877485,
+    "shared_p95": 1200.2189694030665
+  }
+}

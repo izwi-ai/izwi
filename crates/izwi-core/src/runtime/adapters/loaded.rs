@@ -400,16 +400,10 @@ fn loaded_execution_contracts(
         });
         requirements.push(StreamingRequirements::native(true));
     }
-    if metadata.capability == CapabilityKind::Asr
-        && matches!(
-            metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3Asr
-                | crate::catalog::ModelFamily::WhisperAsr
-                | crate::catalog::ModelFamily::VibeVoiceAsr
-                | crate::catalog::ModelFamily::GraniteSpeechAsr
-                | crate::catalog::ModelFamily::Lfm25Audio
-        )
-    {
+    // Every ASR family enumerates its long-form variant: adapters that
+    // implement the atomic graph produce it here, and adapters whose contract
+    // ignores the flag re-seal an identical graph (consistent identities).
+    if metadata.capability == CapabilityKind::Asr {
         let long_form = requirements
             .iter()
             .copied()
@@ -876,8 +870,10 @@ fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
     metadata.capability == CapabilityKind::Chat
         && matches!(
             metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3Chat
+            crate::catalog::ModelFamily::Qwen3MoeChat
+                | crate::catalog::ModelFamily::Qwen3Chat
                 | crate::catalog::ModelFamily::Qwen35Chat
+                | crate::catalog::ModelFamily::Qwen35MoeChat
                 | crate::catalog::ModelFamily::Gemma3Chat
                 | crate::catalog::ModelFamily::Qwen38Chat
                 | crate::catalog::ModelFamily::Lfm2Chat
@@ -3245,6 +3241,12 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
                 metadata.model_variant
             )));
         }
+        // Parakeet does not implement the long-form atomic graph: its
+        // retained predictor state and the scratch atomic workspace must be
+        // published as separate load-sealed publications (parakeet physical
+        // spec), which the single-publication load path does not support yet.
+        // The flag is therefore ignored here and the pipeline's atomic
+        // requirement fails closed at load with a capability error.
         let width = u64::try_from(self.max_batch_size)
             .map_err(|_| Error::Overloaded("Parakeet batch width exceeds u64".into()))?;
         let workspace_per_row =
@@ -5076,6 +5078,7 @@ mod tests {
         for variant in [
             ModelVariant::Qwen3827BFp8,
             ModelVariant::Qwen3508BGguf,
+            ModelVariant::Qwen35Moe35BA3BFp8,
             ModelVariant::Lfm2512BInstructGguf,
         ] {
             let metadata = chat_adapter_metadata(variant);
@@ -7400,6 +7403,43 @@ mod tests {
         assert_eq!(long.stages.len(), 1);
         assert_eq!(long.stages[0].name, "asr.long_form.atomic");
         assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+    }
+
+    #[test]
+    fn parakeet_has_no_long_form_graph_until_publications_split() {
+        // Parakeet's retained predictor state and its scratch atomic
+        // workspace cannot share one load-sealed publication, so the adapter
+        // ignores the long-form flag and the pipeline's atomic requirement
+        // fails closed at load (service-level guard) until publications can
+        // be split per graph.
+        let registry = RuntimeAdapterRegistry::built_in();
+        let metadata = *registry
+            .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
+            .unwrap();
+        let adapter = ParakeetAsrExecutionAdapter::new(
+            ExecutionGroupId::new(1),
+            ModelInstanceId::new(2),
+            metadata,
+            BackendKind::Cpu,
+            4,
+        );
+        let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        assert_eq!(normal.stages[0].name, "asr.encoder.parakeet");
+
+        let long_form_request = adapter
+            .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+            .unwrap();
+        assert_eq!(long_form_request.stages.len(), normal.stages.len());
+        assert_eq!(
+            long_form_request.stages[0].name,
+            normal.stages[0].name,
+            "the flag must be ignored until publications split"
+        );
+        assert!(long_form_request
+            .stages
+            .iter()
+            .all(|stage| !matches!(stage.selector, StageWorkSelector::Atomic)));
     }
 
     #[test]

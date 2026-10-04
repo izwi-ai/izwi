@@ -337,6 +337,9 @@ pub async fn create_thread_message(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        logprobs: None,
+        top_logprobs: None,
+        response_format_json_object: false,
         chat_config,
         correlation_id: Some(ctx.correlation_id),
     };
@@ -416,12 +419,12 @@ async fn create_streaming_thread_message(
                     .unwrap_or_default(),
                     false,
                 ),
-                ChatStreamEvent::Delta(delta) => {
-                    saw_nonempty_delta |= !delta.trim().is_empty();
+                ChatStreamEvent::Delta { text, .. } => {
+                    saw_nonempty_delta |= !text.trim().is_empty();
                     (
                         serde_json::to_string(&ThreadStreamDeltaEvent {
                             event: "delta",
-                            delta,
+                            delta: text,
                         })
                         .unwrap_or_default(),
                         false,

@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
-use crate::catalog::{ModelFamily, ModelTask};
+use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
@@ -83,6 +83,7 @@ use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
     Qwen35SharedStepCheckpoint,
 };
+use crate::models::architectures::qwen35moe::chat::Qwen35MoeChatModel;
 use crate::models::architectures::qwen38::chat::{
     ChatDecodeState as Qwen38ChatDecodeState, Qwen38ChatModel, Qwen38PreparedPrompt,
     Qwen38SharedStepCheckpoint,
@@ -129,9 +130,15 @@ type ChatLoaderFn = fn(
     ModelVariant,
     DeviceProfile,
     &crate::performance::PerformanceConfig,
+    crate::catalog::PrefixReuseMode,
 ) -> Result<NativeChatModel>;
 type DiarizationLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeDiarizationModel>;
-type VoxtralLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralRealtimeModel>;
+type VoxtralLoaderFn = fn(
+    &Path,
+    ModelVariant,
+    DeviceProfile,
+    crate::catalog::PrefixReuseMode,
+) -> Result<VoxtralRealtimeModel>;
 type VoxtralTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VoxtralTtsModel>;
 type VibeVoiceTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<VibeVoiceTtsModel>;
 type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2TtsModel>;
@@ -278,9 +285,30 @@ fn load_qwen_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
-        model_dir, variant, device,
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
+    )?))
+}
+
+fn load_qwen3_moe_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
+) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    Ok(NativeChatModel::Qwen3(Qwen3ChatModel::load(
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
     )?))
 }
 
@@ -289,9 +317,14 @@ fn load_gemma_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Gemma3(Gemma3ChatModel::load(
-        model_dir, variant, device,
+        model_dir,
+        variant,
+        device,
+        prefix_reuse,
     )?))
 }
 
@@ -310,6 +343,7 @@ fn load_lfm2_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Lfm2(Lfm2ChatModel::load(
         model_dir, variant, device,
@@ -321,6 +355,7 @@ fn load_qwen35_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
         model_dir, variant, device,
@@ -332,10 +367,32 @@ fn load_qwen38_chat_model(
     variant: ModelVariant,
     device: DeviceProfile,
     performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
     Ok(NativeChatModel::Qwen38(
-        Qwen38ChatModel::load_with_performance(model_dir, variant, device, performance)?,
+        Qwen38ChatModel::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            performance,
+            prefix_reuse,
+        )?,
     ))
+}
+
+fn load_qwen35_moe_chat_model(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: DeviceProfile,
+    _performance: &crate::performance::PerformanceConfig,
+    _prefix_reuse: PrefixReuseMode,
+) -> Result<NativeChatModel> {
+    // Hybrid-recurrent prefix reuse is unproven for this family (the DS1
+    // catalog cell is excluded), so the mode is deliberately not engaged.
+    Ok(NativeChatModel::Qwen35Moe(Qwen35MoeChatModel::load(
+        model_dir, variant, device,
+    )?))
 }
 
 fn load_lfm25_audio_model(
@@ -350,10 +407,12 @@ fn load_lfm25_audio_model(
 
 fn load_voxtral_model(
     model_dir: &Path,
-    _variant: ModelVariant,
+    variant: ModelVariant,
     device: DeviceProfile,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<VoxtralRealtimeModel> {
-    VoxtralRealtimeModel::load(model_dir, device)
+    let prefix_reuse = prefix_reuse_engages(variant, BackendKind::from(device.kind), prefix_reuse);
+    VoxtralRealtimeModel::load(model_dir, device, prefix_reuse)
 }
 
 fn load_voxtral_tts_model(
@@ -449,6 +508,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         loader: load_qwen_chat_model,
     },
     ChatLoaderRegistration {
+        name: "qwen3_moe_chat",
+        family: ModelFamily::Qwen3MoeChat,
+        loader: load_qwen3_moe_chat_model,
+    },
+    ChatLoaderRegistration {
         name: "qwen35_chat",
         family: ModelFamily::Qwen35Chat,
         loader: load_qwen35_chat_model,
@@ -457,6 +521,11 @@ const CHAT_LOADER_REGISTRY: &[ChatLoaderRegistration] = &[
         name: "qwen38_chat",
         family: ModelFamily::Qwen38Chat,
         loader: load_qwen38_chat_model,
+    },
+    ChatLoaderRegistration {
+        name: "qwen35_moe_chat",
+        family: ModelFamily::Qwen35MoeChat,
+        loader: load_qwen35_moe_chat_model,
     },
     ChatLoaderRegistration {
         name: "gemma_chat",
@@ -2491,6 +2560,21 @@ impl NativeAsrModel {
         }
     }
 
+    /// Decoder-prompt tokens added per second of audio for families whose
+    /// audio is embedded into the autoregressive prompt. `None` means audio
+    /// never reaches decoder self-attention (encoder-only, cross-attention,
+    /// or stateless families), so context fitting needs no audio budget.
+    pub(crate) fn audio_token_rate(&self) -> Option<f32> {
+        match self {
+            Self::Qwen3(model) => Some(model.audio_token_rate()),
+            Self::Parakeet(_) => None,
+            Self::Nemotron(_) => None,
+            Self::WhisperTurbo(_) => None,
+            Self::VibeVoice(model) => Some(model.audio_token_rate()),
+            Self::GraniteSpeech(model) => Some(model.audio_token_rate()),
+        }
+    }
+
     pub(crate) fn incremental_prompt_token_count(
         &self,
         audio: &[f32],
@@ -3613,6 +3697,7 @@ impl NativeDiarizationModel {
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
     Qwen35(Qwen35ChatModel),
+    Qwen35Moe(Qwen35MoeChatModel),
     Qwen38(Qwen38ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
@@ -3626,6 +3711,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.max_context_tokens(),
             Self::Qwen35(model) => model.max_context_tokens(),
+            Self::Qwen35Moe(model) => model.max_context_tokens(),
             Self::Qwen38(model) => model.max_context_tokens(),
             Self::Gemma3(model) => model.max_context_tokens(),
             Self::Lfm2(model) => model.max_context_tokens(),
@@ -3638,6 +3724,7 @@ impl InferenceStateContractProvider for NativeChatModel {
         match self {
             Self::Qwen3(model) => model.inference_state_contract(),
             Self::Qwen35(model) => model.inference_state_contract(),
+            Self::Qwen35Moe(model) => model.inference_state_contract(),
             Self::Qwen38(model) => model.inference_state_contract(),
             Self::Gemma3(model) => model.inference_state_contract(),
             Self::Lfm2(model) => model.inference_state_contract(),
@@ -3779,10 +3866,12 @@ impl ChatModelLease {
     #[cfg(test)]
     pub(crate) fn for_test(model: NativeChatModel) -> Self {
         let uses = Arc::new(ModelUseState::default());
-        Self { inner: TrackedModelLease {
-            model: Arc::new(model),
-            _guard: uses.acquire().expect("fresh test model lease"),
-        } }
+        Self {
+            inner: TrackedModelLease {
+                model: Arc::new(model),
+                _guard: uses.acquire().expect("fresh test model lease"),
+            },
+        }
     }
 
     pub(crate) fn model_arc(&self) -> Arc<NativeChatModel> {
@@ -4269,6 +4358,19 @@ pub enum NativeChatDecodeState {
     Lfm2(Lfm2ChatDecodeState),
 }
 
+impl NativeChatDecodeState {
+    /// DS9.3: take the logprob entries produced by the last decode step.
+    pub(crate) fn drain_pending_logprobs(&mut self) -> Vec<crate::engine::TokenLogprob> {
+        match self {
+            Self::Qwen3(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Qwen35(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Qwen38(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Gemma3(state) => std::mem::take(&mut state.pending_logprobs),
+            Self::Lfm2(state) => std::mem::take(&mut state.pending_logprobs),
+        }
+    }
+}
+
 pub(crate) enum NativeChatDecodeCheckpoint {
     Qwen3(Qwen3ChatDecodeCheckpoint),
     Qwen35(Qwen35SharedStepCheckpoint),
@@ -4280,6 +4382,7 @@ pub(crate) enum NativeChatDecodeCheckpoint {
 #[derive(Debug, Clone)]
 pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
+    Qwen35Moe(Qwen35PreparedPrompt),
     Qwen38(Qwen38PreparedPrompt),
 }
 
@@ -4287,6 +4390,7 @@ impl NativeChatPreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         match self {
             Self::Qwen35(prepared) => prepared.prompt_ids(),
+            Self::Qwen35Moe(prepared) => prepared.prompt_ids(),
             Self::Qwen38(prepared) => prepared.prompt_ids(),
         }
     }
@@ -4294,6 +4398,7 @@ impl NativeChatPreparedPrompt {
     pub fn family(&self) -> ModelFamily {
         match self {
             Self::Qwen35(_) => ModelFamily::Qwen35Chat,
+            Self::Qwen35Moe(_) => ModelFamily::Qwen35MoeChat,
             Self::Qwen38(_) => ModelFamily::Qwen38Chat,
         }
     }
@@ -4301,19 +4406,37 @@ impl NativeChatPreparedPrompt {
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),
-            Self::Qwen38(_) => None,
+            Self::Qwen35Moe(_) | Self::Qwen38(_) => None,
+        }
+    }
+
+    pub(crate) fn as_qwen35_moe(&self) -> Option<&Qwen35PreparedPrompt> {
+        match self {
+            Self::Qwen35Moe(prepared) => Some(prepared),
+            Self::Qwen35(_) | Self::Qwen38(_) => None,
         }
     }
 
     pub(crate) fn as_qwen38(&self) -> Option<&Qwen38PreparedPrompt> {
         match self {
             Self::Qwen38(prepared) => Some(prepared),
-            Self::Qwen35(_) => None,
+            Self::Qwen35(_) | Self::Qwen35Moe(_) => None,
         }
     }
 }
 
 impl NativeChatDecodeState {
+    /// DS1.5: the state's logical prefill cursor, which begins at an
+    /// attached managed prefix cursor for resumable prefill families.
+    pub(crate) fn prefill_progress(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3(state) => Some(state.prefill_progress()),
+            Self::Qwen35(state) => Some(state.prefill_progress()),
+            Self::Qwen38(state) => Some(state.prefill_progress()),
+            Self::Gemma3(state) => Some(state.prefill_progress()),
+            Self::Lfm2(state) => Some(state.prefill_progress()),
+        }
+    }
     pub(crate) fn begin_continuous_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -4530,6 +4653,9 @@ pub struct NativeChatDecodeStep {
     pub tokens_generated: usize,
     pub input_tokens_committed: usize,
     pub finished: bool,
+    /// DS9.3: per-token logprob entries produced by this step. Empty unless
+    /// the request asked for logprobs.
+    pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 impl NativeChatModel {
@@ -4546,6 +4672,13 @@ impl NativeChatModel {
                 Ok((
                     prepared.prompt_ids().to_vec(),
                     Some(NativeChatPreparedPrompt::Qwen35(prepared)),
+                ))
+            }
+            Self::Qwen35Moe(model) => {
+                let prepared = model.prepare_prompt_for_execution(messages, config)?;
+                Ok((
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Qwen35Moe(prepared)),
                 ))
             }
             Self::Qwen38(model) => {
@@ -4571,6 +4704,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.prompt_token_ids(messages),
             Self::Qwen35(model) => model.prompt_token_ids_with_config(messages, config),
+            Self::Qwen35Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
             Self::Lfm2(model) => model.prompt_token_ids(messages),
@@ -4596,6 +4730,9 @@ impl NativeChatModel {
             Self::Qwen3(model) => model.generate(messages, max_new_tokens),
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
+            )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "Qwen3.5-MoE chat requires scheduler-owned physical state".to_string(),
             )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
@@ -4635,6 +4772,9 @@ impl NativeChatModel {
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "Qwen3.5 chat requires scheduler-owned physical state".to_string(),
             )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "Qwen3.5-MoE chat requires scheduler-owned physical state".to_string(),
+            )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "Qwen3.8 chat requires scheduler-owned physical state".to_string(),
             )),
@@ -4655,6 +4795,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_incremental_decode(),
             Self::Qwen35(model) => model.supports_incremental_decode(),
+            Self::Qwen35Moe(model) => model.supports_incremental_decode(),
             Self::Qwen38(model) => model.supports_incremental_decode(),
             Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
@@ -4665,6 +4806,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen35(model) => model.supports_continuous_decode_batch(),
+            Self::Qwen35Moe(model) => model.supports_continuous_decode_batch(),
             Self::Gemma3(model) => model.supports_continuous_decode_batch(),
             Self::Qwen38(model) => model.supports_continuous_decode_batch(),
             Self::Lfm2(model) => model.supports_continuous_decode_batch(),
@@ -4677,7 +4819,12 @@ impl NativeChatModel {
     pub fn supports_resumable_prefill(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Qwen38(_) | Self::Gemma3(_) | Self::Lfm2(_)
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen35Moe(_)
+            | Self::Qwen38(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_)
         )
     }
 
@@ -4687,7 +4834,12 @@ impl NativeChatModel {
     pub fn continuous_decode_is_tensor_batched(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Qwen38(_) | Self::Lfm2(_)
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen35Moe(_)
+            | Self::Gemma3(_)
+            | Self::Qwen38(_)
+            | Self::Lfm2(_)
         )
     }
 
@@ -4695,6 +4847,7 @@ impl NativeChatModel {
         match self {
             Self::Qwen3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen35(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
+            Self::Qwen35Moe(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Gemma3(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Qwen38(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
             Self::Lfm2(model) => model.continuous_decode_batch_workspace_per_row_bytes(),
@@ -4757,6 +4910,58 @@ impl NativeChatModel {
         }
     }
 
+    pub(crate) fn start_qwen35_moe_decode_state_managed(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Qwen35Moe(model) => Ok(NativeChatDecodeState::Qwen35(
+                model.start_decode_state_physical(messages, max_new_tokens, config, prepared, cache)?,
+            )),
+            _ => Err(Error::InvalidInput(
+                "managed Qwen3.5-MoE state was routed to another model family".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn start_lfm2_decode_state_managed(
+        &self,
+        prompt_ids: &[u32],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<NativeChatDecodeState> {
+        match self {
+            Self::Lfm2(model) => {
+                let mut state = model.begin_resumable_prefill_state_managed(
+                    prompt_ids,
+                    max_new_tokens,
+                    config,
+                    cache,
+                )?;
+                let complete = model.continue_resumable_prefill_managed(
+                    &mut state,
+                    prompt_ids,
+                    0,
+                    prompt_ids.len(),
+                )?;
+                if !complete {
+                    return Err(Error::InferenceError(
+                        "LFM2 full managed prefill did not complete".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Lfm2(state))
+            }
+            _ => Err(Error::InvalidInput(
+                "managed LFM2 state was routed to another model family".into(),
+            )),
+        }
+    }
+
     pub(crate) fn start_qwen38_decode_state_managed(
         &self,
         messages: &[ChatMessage],
@@ -4814,6 +5019,29 @@ impl NativeChatModel {
                 if prepared.prompt_ids() != prompt_ids {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_resumable_prefill_state_physical(
+                        prepared,
+                        max_new_tokens,
+                        config,
+                        target_cache,
+                    )?,
+                ))
+            }
+            Self::Qwen35Moe(model) if mtp_cache.is_none() => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5-MoE resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5-MoE prepared artifact disagrees with sealed prompt tokens".into(),
                     ));
                 }
                 Ok(NativeChatDecodeState::Qwen35(
@@ -4909,6 +5137,24 @@ impl NativeChatModel {
                 if prepared.prompt_ids() != prompt_ids {
                     return Err(Error::InvalidInput(
                         "Qwen3.5 prepared artifact disagrees with sealed prompt tokens".into(),
+                    ));
+                }
+                let complete = model
+                    .continue_resumable_prefill_physical(state, prepared, span_start, span_end)?;
+                (complete, state.prefill_progress())
+            }
+            (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5-MoE resumable prefill requires its prepared prompt artifact"
+                                .into(),
+                        )
+                    })?;
+                if prepared.prompt_ids() != prompt_ids {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.5-MoE prepared artifact disagrees with sealed prompt tokens".into(),
                     ));
                 }
                 let complete = model
@@ -5022,6 +5268,9 @@ impl NativeChatModel {
             Self::Qwen35(_) => Err(Error::InvalidInput(
                 "incremental Qwen3.5 chat requires scheduler-owned physical state".into(),
             )),
+            Self::Qwen35Moe(_) => Err(Error::InvalidInput(
+                "incremental Qwen3.5-MoE chat requires scheduler-owned physical state".into(),
+            )),
             Self::Qwen38(_) => Err(Error::InvalidInput(
                 "incremental Qwen3.8 chat requires scheduler-owned physical state".into(),
             )),
@@ -5038,52 +5287,74 @@ impl NativeChatModel {
         match (self, state) {
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: 1,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
+                })
+            }
+            (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) => {
+                let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
+                Ok(NativeChatDecodeStep {
+                    delta: step.delta,
+                    text: step.text,
+                    tokens_generated: step.tokens_generated,
+                    input_tokens_committed: step.input_tokens_committed,
+                    finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: 1,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
                 let step = model.decode_step(state)?;
+                let logprobs = std::mem::take(&mut state.pending_logprobs);
                 Ok(NativeChatDecodeStep {
                     delta: step.delta,
                     text: step.text,
                     tokens_generated: step.tokens_generated,
                     input_tokens_committed: step.input_tokens_committed,
                     finished: step.finished,
+                    logprobs,
                 })
             }
             _ => Err(Error::InvalidInput(
@@ -5099,12 +5370,14 @@ impl NativeChatModel {
     ) -> Result<NativeChatDecodeStep> {
         if let (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) = (self, &mut *state) {
             let step = model.decode_quantum(state, input_budget.max(1))?;
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
             return Ok(NativeChatDecodeStep {
                 delta: step.delta,
                 text: step.text,
                 tokens_generated: step.tokens_generated,
                 input_tokens_committed: step.input_tokens_committed,
                 finished: step.finished,
+                logprobs,
             });
         }
         let mut delta = String::new();
@@ -5112,6 +5385,7 @@ impl NativeChatModel {
         let mut tokens_generated = 0usize;
         let mut input_tokens_committed = 0usize;
         let mut finished = false;
+        let mut logprobs = Vec::new();
         for _ in 0..input_budget.max(1) {
             let step = self.decode_step(state)?;
             delta.push_str(&step.delta);
@@ -5120,6 +5394,7 @@ impl NativeChatModel {
             input_tokens_committed =
                 input_tokens_committed.saturating_add(step.input_tokens_committed);
             finished = step.finished;
+            logprobs.extend(step.logprobs);
             if finished {
                 break;
             }
@@ -5130,25 +5405,53 @@ impl NativeChatModel {
             tokens_generated,
             input_tokens_committed,
             finished,
+            logprobs,
         })
+    }
+
+    /// DS9.4: one shared speculative envelope over continuous rows. Only the
+    /// Qwen3.8 MTP model supports it; other families reject the route.
+    pub(crate) fn decode_speculative_batch(
+        &self,
+        states: &mut [&mut NativeChatDecodeState],
+        input_budget: usize,
+    ) -> Result<Vec<NativeChatDecodeStep>> {
+        let Self::Qwen38(model) = self else {
+            return Err(Error::InvalidInput(
+                "speculative envelopes require the Qwen3.8 MTP model".into(),
+            ));
+        };
+        let mut typed = Vec::with_capacity(states.len());
+        for state in states.iter_mut() {
+            match &mut **state {
+                NativeChatDecodeState::Qwen38(state) => typed.push(state),
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "Qwen3.8 speculative envelope received another model's state".into(),
+                    ))
+                }
+            }
+        }
+        let steps = model.decode_speculative_batch(&mut typed, input_budget)?;
+        let mut out = Vec::with_capacity(steps.len());
+        for (step, state) in steps.into_iter().zip(typed.iter_mut()) {
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
+            out.push(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+                logprobs,
+            });
+        }
+        Ok(out)
     }
 
     pub fn decode_step_batch(
         &self,
         states: &mut [&mut NativeChatDecodeState],
     ) -> Result<Vec<NativeChatDecodeStep>> {
-        let convert = |steps: Vec<crate::models::architectures::qwen3::chat::ChatDecodeStep>| {
-            steps
-                .into_iter()
-                .map(|step| NativeChatDecodeStep {
-                    delta: step.delta,
-                    text: step.text,
-                    tokens_generated: step.tokens_generated,
-                    input_tokens_committed: 1,
-                    finished: step.finished,
-                })
-                .collect()
-        };
         match self {
             Self::Qwen3(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5162,7 +5465,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(convert)
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Gemma3(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5176,18 +5492,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: 1,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Qwen38(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5201,18 +5519,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: 1,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Qwen35(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5226,18 +5546,47 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: step.input_tokens_committed,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
+            }
+            Self::Qwen35Moe(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen35(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.5-MoE continuous batch received another model's state".into(),
+                            ))
+                        }
+                    }
+                }
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
             Self::Lfm2(model) => {
                 let mut typed = Vec::with_capacity(states.len());
@@ -5251,18 +5600,20 @@ impl NativeChatModel {
                         }
                     }
                 }
-                model.decode_step_batch(&mut typed).map(|steps| {
-                    steps
-                        .into_iter()
-                        .map(|step| NativeChatDecodeStep {
-                            delta: step.delta,
-                            text: step.text,
-                            tokens_generated: step.tokens_generated,
-                            input_tokens_committed: step.input_tokens_committed,
-                            finished: step.finished,
-                        })
-                        .collect()
-                })
+                let typed_steps = model.decode_step_batch(&mut typed)?;
+                let mut out = Vec::with_capacity(typed_steps.len());
+                for (step, state) in typed_steps.into_iter().zip(states.iter_mut()) {
+                    let logprobs = state.drain_pending_logprobs();
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
         }
     }
@@ -5271,6 +5622,7 @@ impl NativeChatModel {
 #[derive(Clone)]
 pub struct ModelRegistry {
     performance: crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
@@ -5397,7 +5749,9 @@ fn model_family_name(family: ModelFamily) -> &'static str {
         ModelFamily::GraniteSpeechAsr => "granite_speech_asr",
         ModelFamily::SortformerDiarization => "sortformer_diarization",
         ModelFamily::Qwen3Chat => "qwen3_chat",
+        ModelFamily::Qwen3MoeChat => "qwen3_moe_chat",
         ModelFamily::Qwen35Chat => "qwen35_chat",
+        ModelFamily::Qwen35MoeChat => "qwen35_moe_chat",
         ModelFamily::Qwen38Chat => "qwen38_chat",
         ModelFamily::Lfm2Chat => "lfm2_chat",
         ModelFamily::Lfm25Audio => "lfm25_audio",
@@ -5470,6 +5824,7 @@ fn native_chat_model_kind(model: &NativeChatModel) -> &'static str {
     match model {
         NativeChatModel::Qwen3(_) => "qwen3_chat",
         NativeChatModel::Qwen35(_) => "qwen35_chat",
+        NativeChatModel::Qwen35Moe(_) => "qwen35_moe_chat",
         NativeChatModel::Qwen38(_) => "qwen38_chat",
         NativeChatModel::Gemma3(_) => "gemma3_chat",
         NativeChatModel::Lfm2(_) => "lfm2_chat",
@@ -5490,6 +5845,7 @@ impl ModelRegistry {
     ) -> Self {
         Self {
             performance: performance.snapshot_env(),
+            prefix_reuse: PrefixReuseMode::default(),
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
@@ -5509,6 +5865,14 @@ impl ModelRegistry {
     /// Immutable policy captured for this registry's model loads.
     pub fn performance(&self) -> &crate::performance::PerformanceConfig {
         &self.performance
+    }
+
+    /// Pin the prefix-reuse decision mode for every model this registry
+    /// loads. The registry default is fail-closed; the serving layer resolves
+    /// the catalog-auto default before handing the registry out.
+    pub fn with_prefix_reuse_mode(mut self, prefix_reuse: PrefixReuseMode) -> Self {
+        self.prefix_reuse = prefix_reuse;
+        self
     }
 
     pub(crate) fn publish_effective_context(
@@ -5954,9 +6318,11 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 let performance = self.performance.clone();
+                let prefix_reuse = self.prefix_reuse;
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant, device, &performance)?;
+                        let model =
+                            loader(&model_dir, variant, device, &performance, prefix_reuse)?;
                         Ok::<NativeChatModel, Error>(model)
                     })
                     .await
@@ -6061,11 +6427,14 @@ impl ModelRegistry {
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
                 let loader = registration.loader;
+                let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
-                        .await
-                        .map_err(|e| Error::ModelLoadError(e.to_string()))?
-                        .map(Arc::new)
+                    tokio::task::spawn_blocking(move || {
+                        loader(&model_dir, variant, device, prefix_reuse)
+                    })
+                    .await
+                    .map_err(|e| Error::ModelLoadError(e.to_string()))?
+                    .map(Arc::new)
                 }
             })
             .await?;
@@ -6936,7 +7305,7 @@ mod tests {
     fn loaded_model_diagnostics_entry_reports_backend_family_and_dtype_policy() {
         let diagnostics = loaded_model_diagnostics_entry(
             &DeviceProfile::cpu(),
-            ModelVariant::Qwen306BGguf,
+            ModelVariant::Qwen314BGguf,
             "native_chat",
             "qwen3_chat",
             LoadedModelActualRuntime::default(),
@@ -6945,7 +7314,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(diagnostics.variant_id, "Qwen3-0.6B-GGUF");
+        assert_eq!(diagnostics.variant_id, "Qwen3-14B-GGUF");
         assert_eq!(diagnostics.family, "qwen3_chat");
         assert_eq!(diagnostics.task, "chat");
         assert_eq!(diagnostics.handle_kind, "native_chat");
@@ -6977,7 +7346,7 @@ mod tests {
     fn loaded_model_diagnostics_keeps_observed_runtime_separate_from_policy() {
         let diagnostics = loaded_model_diagnostics_entry(
             &DeviceProfile::cpu(),
-            ModelVariant::Qwen306BGguf,
+            ModelVariant::Qwen314BGguf,
             "native_chat",
             "qwen3_chat",
             LoadedModelActualRuntime::from_values(Some("CUDA"), Some("BF16")),

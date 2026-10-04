@@ -35,4 +35,5 @@ pub use policy::{can_parallelize_requests, default_dtype_for_device, kv_dtype_by
 pub use router::{BackendPlan, BackendRouter};
 pub use types::{
     BackendContext, BackendKind, BackendPreference, BackendSelectionSource, ExecutionBackend,
+    RuntimeDeviceAssignment,
 };

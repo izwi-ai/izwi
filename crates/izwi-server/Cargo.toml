@@ -22,7 +22,9 @@ db-mysql = ["sea-orm/sqlx-mysql"]
 db-postgres = ["sea-orm/sqlx-postgres"]
 
 [dependencies]
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tempfile = "3.10"
+fs2 = "0.4.3"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -39,6 +41,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+rand = { workspace = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -53,6 +57,8 @@ async-trait = "0.1"
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
+izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 
 config = { workspace = true }
 dirs = { workspace = true }
@@ -71,5 +77,20 @@ izwi-core = { path = "../izwi-core", default-features = false, features = ["acce
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 izwi-core = { path = "../izwi-core", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+izwi-serving-client = { path = "../izwi-serving-client", features = ["mock-worker"] }
+reqwest = { workspace = true }
+serde_json = { workspace = true }

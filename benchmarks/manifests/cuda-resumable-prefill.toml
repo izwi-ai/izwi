@@ -31,9 +31,7 @@ max_tokens = 32
 
 [benchmarks.matrix]
 model = [
-  "Qwen3-0.6B-GGUF",
   "Qwen3.5-0.8B",
   "Qwen3.8-27B-FP8",
   "LFM2.5-1.2B-Instruct-GGUF",
-  "Gemma-3-1b-it",
 ]

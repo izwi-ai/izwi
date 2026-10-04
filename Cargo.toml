@@ -9,6 +9,10 @@ members = [
     "crates/izwi-server",
     "crates/izwi-cli",
     "crates/izwi-desktop",
+    "crates/izwi-serving-protocol",
+    "crates/izwi-serving-client",
+    "crates/izwi-serving-supervisor",
+    "crates/izwi-serving-worker",
 ]
 
 [workspace.package]
@@ -78,9 +82,14 @@ reqwest = { version = "0.11", default-features = false, features = [
     "blocking",
     "rustls-tls",
 ] }
+rustls-pemfile = "1.0"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 indicatif = "0.17"
 dirs = "5.0"
 sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+subtle = "2.6"
 memmap2 = "0.9.10"
 
 # Configuration

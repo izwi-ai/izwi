@@ -3,7 +3,9 @@ use axum::{
     http::StatusCode,
 };
 use base64::Engine;
-use izwi_core::audio::{inspect_audio_bytes, AudioInspection};
+use izwi_core::audio::{
+    inspect_audio_bytes, inspect_audio_bytes_canonical, AudioInspection,
+};
 use serde::Serialize;
 use tracing::info;
 
@@ -142,6 +144,15 @@ pub(crate) fn inspect_audio_payload(payload: &AudioPayload) -> Result<AudioInspe
     inspect_audio_payload_bytes(&payload.bytes)
 }
 
+/// Canonical-rate inspection for speech routes: the decoded representation is
+/// the 16 kHz mono buffer every ASR consumer converges on, so long source-rate
+/// audio (e.g. 26 minutes at 44.1 kHz) no longer trips the decoded-byte guard.
+pub(crate) fn inspect_audio_payload_canonical(
+    payload: &AudioPayload,
+) -> Result<AudioInspection, ApiError> {
+    inspect_audio_payload_bytes_canonical(&payload.bytes)
+}
+
 pub(crate) fn inspect_audio_payload_with_diagnostics(
     route: &str,
     payload: &AudioPayload,
@@ -151,8 +162,27 @@ pub(crate) fn inspect_audio_payload_with_diagnostics(
     Ok(inspection)
 }
 
+pub(crate) fn inspect_audio_payload_canonical_with_diagnostics(
+    route: &str,
+    payload: &AudioPayload,
+) -> Result<AudioInspection, ApiError> {
+    let inspection = inspect_audio_payload_canonical(payload)?;
+    AudioIngestDiagnostics::from_payload_resampler(route, payload, &inspection, "fft_16k").emit();
+    Ok(inspection)
+}
+
 pub(crate) fn inspect_audio_payload_bytes(bytes: &[u8]) -> Result<AudioInspection, ApiError> {
     inspect_audio_bytes(bytes).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Invalid audio payload: failed to decode audio metadata: {err}"
+        ))
+    })
+}
+
+pub(crate) fn inspect_audio_payload_bytes_canonical(
+    bytes: &[u8],
+) -> Result<AudioInspection, ApiError> {
+    inspect_audio_bytes_canonical(bytes).map_err(|err| {
         ApiError::bad_request(format!(
             "Invalid audio payload: failed to decode audio metadata: {err}"
         ))
@@ -179,6 +209,15 @@ pub(crate) fn split_data_url_base64(raw: &str) -> (Option<String>, &str) {
 
 impl AudioIngestDiagnostics {
     fn from_payload(route: &str, payload: &AudioPayload, inspection: &AudioInspection) -> Self {
+        Self::from_payload_resampler(route, payload, inspection, "none")
+    }
+
+    fn from_payload_resampler(
+        route: &str,
+        payload: &AudioPayload,
+        inspection: &AudioInspection,
+        resampler: &'static str,
+    ) -> Self {
         Self::from_parts(
             route,
             payload.bytes.len(),
@@ -186,6 +225,7 @@ impl AudioIngestDiagnostics {
             payload.data_url_mime_type.as_deref(),
             payload.filename.as_deref(),
             inspection,
+            resampler,
         )
     }
 
@@ -196,6 +236,7 @@ impl AudioIngestDiagnostics {
         data_url_mime_type: Option<&str>,
         filename: Option<&str>,
         inspection: &AudioInspection,
+        resampler: &'static str,
     ) -> Self {
         let clipped_ratio = if inspection.sample_count == 0 {
             0.0
@@ -217,7 +258,7 @@ impl AudioIngestDiagnostics {
             rms: inspection.rms,
             clipped_samples: inspection.clipped_samples,
             clipped_ratio,
-            resampler: "none",
+            resampler,
         }
     }
 

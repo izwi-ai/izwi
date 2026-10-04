@@ -21,7 +21,7 @@ use tracing::{debug, info};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::request_context::RequestContext;
@@ -498,7 +498,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload_with_diagnostics("openai.audio.transcriptions", &audio_payload)?;
+        inspect_audio_payload_canonical_with_diagnostics("openai.audio.transcriptions", &audio_payload)?;
 
         return Ok(TranscriptionRequest {
             audio: Some(audio_payload),
@@ -538,7 +538,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics(
+                        inspect_audio_payload_canonical_with_diagnostics(
                             "openai.audio.transcriptions",
                             &payload,
                         )?;
@@ -554,7 +554,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics(
+                        inspect_audio_payload_canonical_with_diagnostics(
                             "openai.audio.transcriptions",
                             &payload,
                         )?;
@@ -1322,7 +1322,7 @@ mod tests {
             .expect_err("TTS model should be rejected for transcription");
         assert!(tts.message.contains("Unsupported transcription model"));
 
-        let chat = validate_transcription_model(Some("Qwen3-8B-GGUF"))
+        let chat = validate_transcription_model(Some("Qwen3.5-4B"))
             .expect_err("chat model should be rejected for transcription");
         assert!(chat.message.contains("Unsupported transcription model"));
     }

@@ -28,6 +28,11 @@ until its acceptance gates pass.
 | `IZWI_TTS_MAX_JOURNAL_BYTES` | 8 GiB | Per-job replay journal ceiling; not an aggregate storage reservation. |
 | `IZWI_TTS_TOTAL_SPOOL_BYTES` | 1 GiB | Process-wide concurrent temporary WAV reservation. Increase only with measured disk capacity and concurrency headroom. |
 
+Each PCM replay object is additionally capped at 1 MiB, and one job can retain
+at most 131,072 replay entries. The entry ceiling covers the two-hour
+qualification target at the default 4,800-sample Fish output chunk while keeping
+pathological tiny-chunk journals finite.
+
 Explicit caller `max_tokens` / `max_output_tokens` remains a **whole-job** output
 budget. It is not multiplied by the number of segments. Omit a cap for
 complete-text generation subject to deployment quotas. Exhausting an explicit
@@ -46,11 +51,51 @@ simultaneously. RIFF/WAV has a format-size ceiling; a larger
 storage quota is not permission to create an invalid WAV. Inspect real artifact
 sizes and reservations under concurrent finalization before raising quotas.
 
-Media providers must implement the bounded file publication and streaming read
-interfaces used by long speech. A legacy whole-byte upload/download adapter is
-not sufficient. Test provider failures, quota exhaustion, partial files, cleanup
-and restart recovery using the deployed adapter. Plan storage retention and
-cleanup for replay artifacts and failed jobs as well as successful recordings.
+New durable Fish PCM is written through reserved-write protocol v1 as
+tenant-scoped opaque artifacts. The checkpoint publication marker, opaque media
+row, exact-attempt replay reference, and reservation consumption commit in one
+transaction; runtime replay rows contain no provider key. Reads verify tenant,
+canonical `audio/pcm-f32le`, size, and SHA-256 before decoding. Tombstone-first
+deletion retains a durable cleanup intent across provider failure. Existing
+raw-key replay rows remain supported for local upgrade compatibility. Speech
+history can consume and stream an exact tenant-scoped opaque artifact reference.
+Deletion atomically removes that reference while tombstoning the artifact and
+retaining its cleanup intent. Durable Fish final WAV publication is now
+available behind the default-off `IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED` rollout
+gate: a reserved file write is atomically settled with the opaque media row,
+exact attempt output, Ready history projection, final checkpoint marker, stage,
+job, and reservation consumption. When the gate is disabled, local and durable
+Fish requests keep the legacy provider path. Other speech producers remain on
+their existing path until separately migrated.
+
+The provider contract includes an explicit reserved-file capability for final
+WAV publication. It copies and hashes finalized spools with fixed 64 KiB
+buffers and retains the same write-ID expiry/recovery fence. A provider that
+supports reserved byte writes but not reserved files must keep the final-WAV
+gate disabled; there is no fallback to an unreserved file upload. Enable the
+gate only after the serialized settlement and restart/failure tests pass for
+the selected provider.
+
+Media providers must implement reserved writes plus the bounded file publication
+and streaming read interfaces used by long speech. A legacy whole-byte
+upload/download adapter is not sufficient for new replay entries. Test provider
+failures, quota exhaustion, partial files, cleanup and restart recovery using the
+deployed adapter. Plan storage retention and cleanup for replay artifacts and
+failed jobs as well as successful recordings.
+
+Local speech scratch files live below a lazily created, process-owned directory
+under `IZWI_SPEECH_SPOOL_DIR` (by default the system temporary directory's
+`izwi/speech-spool` child). The root must be a non-symlink directory accessible
+only to its owner. Each process holds an exclusive lock for its UUID-named child;
+first-use cleanup removes a recognized sibling only after acquiring that exact
+lock. It never infers death from a PID, age, or expired lease. Live, malformed,
+symlinked, or scan-limit-exceeding entries are left untouched. Temporary files
+are also atomically capped at 255 per process so every normally produced owner
+directory remains within the recovery scan limit. They remain RAII-owned, so
+success, rejection, cancellation, timeout, and response drop release their
+individual files while the existing aggregate spool-byte budget remains
+authoritative. Unix mode bits and Windows protected DACLs restrict both the
+root and process directory to the current owner.
 
 ## Database migration and model identity
 
@@ -76,6 +121,11 @@ concurrent producers across processes; an unlocked count check would race.
 Quota limits bound queued job storage/work, independently of GPU batch size.
 Terminal jobs stop consuming slots without a separate release counter. Apply the
 same configured limits to every process sharing the database.
+
+Provider-managed schemas must also retain the unique
+`idx_runtime_artifacts_attempt_publication` index over `(stage_id,
+producer_attempt_token, publication_key)`. Startup verifies its uniqueness and
+exact column order because opaque attempt publication relies on that fence.
 
 Fish checkpoints seal a content fingerprint of required configuration, tokenizer,
 codec and weight shard files, together with reference/settings identity. The

@@ -83,6 +83,13 @@ pub struct ChatGenerationConfig {
     pub stop_token_ids: Vec<u32>,
     pub seed: u64,
     pub request: ChatRequestConfig,
+    /// DS9.3: collect per-token logprobs of the raw model distribution.
+    pub logprobs: bool,
+    /// DS9.3: top alternatives per token (0..=20); only read when `logprobs`.
+    pub top_logprobs: usize,
+    /// DS9.2: constrain generation to one valid JSON value
+    /// (`response_format: json_object`). Only honored by samplers that opt in.
+    pub constrain_json_object: bool,
 }
 
 impl Default for ChatGenerationConfig {
@@ -96,6 +103,9 @@ impl Default for ChatGenerationConfig {
             stop_token_ids: Vec::new(),
             seed: 0,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
         }
     }
 }

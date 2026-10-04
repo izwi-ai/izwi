@@ -65,20 +65,20 @@ describe("ChatPlayground", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
-          selectedModel="Qwen3-0.6B-GGUF"
+          selectedModel="Qwen3.5-4B"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
           modelOptions={[
             {
-              value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 0.6B GGUF (Q8_0)",
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
               statusLabel: "Ready",
               isReady: true,
             },
             {
-              value: "Gemma-3-1b-it",
-              label: "Gemma 3 1B",
+              value: "Qwen3.8-27B-FP8",
+              label: "Qwen3.8 27B (FP8)",
               statusLabel: "Not loaded",
               isReady: false,
             },
@@ -93,14 +93,14 @@ describe("ChatPlayground", () => {
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
     fireEvent.click(
-      screen.getByRole("combobox", { name: "Qwen3 0.6B GGUF (Q8_0)" }),
+      screen.getByRole("combobox", { name: "Qwen3.5 4B GGUF (Q4_K_M)" }),
     );
 
-    const gemmaOption = await screen.findByRole("option", {
-      name: /Gemma 3 1B/,
+    const qwen38Option = await screen.findByRole("option", {
+      name: /Qwen3.8 27B/,
     });
-    expect(gemmaOption).toBeInTheDocument();
-    fireEvent.keyDown(document.activeElement ?? gemmaOption, { key: "Escape" });
+    expect(qwen38Option).toBeInTheDocument();
+    fireEvent.keyDown(document.activeElement ?? qwen38Option, { key: "Escape" });
     await waitFor(() =>
       expect(screen.queryByRole("listbox")).not.toBeInTheDocument(),
     );
@@ -124,7 +124,7 @@ describe("ChatPlayground", () => {
     const thread = {
       id: "thread-1",
       title: "Royal families in Europe",
-      model_id: "Qwen3-0.6B-GGUF",
+      model_id: "Qwen3.5-4B",
       created_at: 1,
       updated_at: 2,
       last_message_preview: "How many ruling royal families are there in Europe?",
@@ -159,14 +159,14 @@ describe("ChatPlayground", () => {
     render(
       <MemoryRouter initialEntries={["/chat?threadId=thread-1"]}>
         <ChatPlayground
-          selectedModel="Qwen3-0.6B-GGUF"
+          selectedModel="Qwen3.5-4B"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
           modelOptions={[
             {
-              value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 0.6B GGUF (Q8_0)",
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -185,7 +185,7 @@ describe("ChatPlayground", () => {
     expect(screen.getByText("Royal families in Europe")).toBeInTheDocument();
     expect(screen.queryByText("2 messages")).not.toBeInTheDocument();
     expect(
-      screen.queryByText("Using Qwen3 0.6B GGUF (Q8_0)"),
+      screen.queryByText("Using Qwen3.5 4B GGUF (Q4_K_M)"),
     ).not.toBeInTheDocument();
 
     const sendButton = screen.getByRole("button", { name: "Send message" });
@@ -198,7 +198,7 @@ describe("ChatPlayground", () => {
     const thread = {
       id: "thread-scroll",
       title: "Scrollable thread",
-      model_id: "Gemma-3-1b-it",
+      model_id: "Qwen3.5-0.8B",
       created_at: 1,
       updated_at: 2,
       last_message_preview: "Earlier answer",
@@ -240,14 +240,14 @@ describe("ChatPlayground", () => {
     render(
       <MemoryRouter initialEntries={["/chat?threadId=thread-scroll"]}>
         <ChatPlayground
-          selectedModel="Gemma-3-1b-it"
+          selectedModel="Qwen3.5-0.8B"
           selectedModelReady={true}
           supportsThinking={false}
-          modelLabel="Gemma 3 1B"
+          modelLabel="Qwen3.5 0.8B GGUF (Q4_K_M)"
           modelOptions={[
             {
-              value: "Gemma-3-1b-it",
-              label: "Gemma 3 1B",
+              value: "Qwen3.5-0.8B",
+              label: "Qwen3.5 0.8B GGUF (Q4_K_M)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -297,7 +297,7 @@ describe("ChatPlayground", () => {
     const thread = {
       id: "thread-1",
       title: "Royal families in Europe",
-      model_id: "Qwen3-0.6B-GGUF",
+      model_id: "Qwen3.5-4B",
       created_at: 1,
       updated_at: 2,
       last_message_preview: "How many ruling royal families are there in Europe?",
@@ -310,14 +310,14 @@ describe("ChatPlayground", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
-          selectedModel="Qwen3-0.6B-GGUF"
+          selectedModel="Qwen3.5-4B"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
           modelOptions={[
             {
-              value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 0.6B GGUF (Q8_0)",
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
               statusLabel: "Ready",
               isReady: true,
             },
@@ -384,7 +384,7 @@ describe("ChatPlayground", () => {
     const thread = {
       id: "thread-1",
       title: longTitle,
-      model_id: "Qwen3-0.6B-GGUF",
+      model_id: "Qwen3.5-4B",
       created_at: 1,
       updated_at: 2,
       last_message_preview: "Preview",
@@ -396,14 +396,14 @@ describe("ChatPlayground", () => {
     render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPlayground
-          selectedModel="Qwen3-0.6B-GGUF"
+          selectedModel="Qwen3.5-4B"
           selectedModelReady={true}
           supportsThinking={true}
-          modelLabel="Qwen3 0.6B GGUF (Q8_0)"
+          modelLabel="Qwen3.5 4B GGUF (Q4_K_M)"
           modelOptions={[
             {
-              value: "Qwen3-0.6B-GGUF",
-              label: "Qwen3 0.6B GGUF (Q8_0)",
+              value: "Qwen3.5-4B",
+              label: "Qwen3.5 4B GGUF (Q4_K_M)",
               statusLabel: "Ready",
               isReady: true,
             },

@@ -9,7 +9,7 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRequest
 use crate::runtime::request::ChatRuntimeRequest;
 use crate::runtime::service::{
     media_preparation_resources, retained_chat_preparation_input_bytes, AdmittedEngineRequest,
-    RuntimeService,
+    RuntimeChatInvocation, RuntimeChatInvocationRequest, RuntimeService,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use tracing::warn;
@@ -102,6 +102,37 @@ fn reconcile_streamed_chat_text(
 }
 
 impl RuntimeService {
+    /// Admit one chat request and return its worker-facing execution handle.
+    ///
+    /// Success is authoritative acceptance: coordinator capacity, a pinned
+    /// model generation and an exact Engine session have all been established.
+    pub async fn start_chat_invocation(
+        &self,
+        invocation: RuntimeChatInvocationRequest,
+    ) -> Result<RuntimeChatInvocation> {
+        let RuntimeChatInvocationRequest {
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            runtime_context,
+            streaming,
+        } = invocation;
+        let admitted = self
+            .build_chat_request_with_params_and_config(
+                variant,
+                messages,
+                params,
+                chat_config,
+                correlation_id.as_deref(),
+                runtime_context,
+                streaming,
+            )
+            .await?;
+        self.start_admitted_chat_invocation(admitted).await
+    }
+
     fn prompt_token_config(
         params: &GenerationParams,
         chat_config: &ChatRequestConfig,
@@ -115,6 +146,9 @@ impl RuntimeService {
             stop_token_ids: params.stop_token_ids.clone(),
             seed: 0,
             request: chat_config.clone(),
+            logprobs: params.logprobs || params.top_logprobs > 0,
+            top_logprobs: params.top_logprobs,
+            constrain_json_object: params.constrain_json_object,
         }
     }
 
@@ -345,6 +379,8 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 
@@ -422,6 +458,8 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 
@@ -483,39 +521,16 @@ impl RuntimeService {
             max_tokens: max_new_tokens.max(1),
             ..Default::default()
         };
-        let admitted = self
-            .build_chat_request_with_params_and_config(
-                variant,
-                messages,
-                params,
-                ChatRequestConfig::default(),
-                correlation_id,
-                runtime_context,
-                true,
-            )
-            .await?;
-        let mut streamed_text = String::new();
-        let output = self
-            .run_admitted_streaming_request(admitted, |chunk| {
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
-                    }
-                }
-                std::future::ready(Ok(()))
-            })
-            .await?;
-
-        let text = reconcile_streamed_chat_text(streamed_text, output.text)?;
-        Ok(ChatGeneration {
-            latency_breakdown: output.latency_breakdown,
-            finish_reason: output.finish_reason,
-            text,
-            prompt_tokens: output.token_stats.prompt_tokens,
-            tokens_generated: output.num_tokens,
-            generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
-        })
+        self.chat_generate_streaming_tokens_with_runtime_context(
+            variant,
+            messages,
+            params,
+            ChatRequestConfig::default(),
+            correlation_id,
+            runtime_context,
+            move |delta, _logprobs| on_delta(delta),
+        )
+        .await
     }
 
     pub async fn chat_generate_streaming_with_generation_params<F>(
@@ -594,6 +609,35 @@ impl RuntimeService {
     where
         F: FnMut(String) + Send + 'static,
     {
+        self.chat_generate_streaming_tokens_with_runtime_context(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            runtime_context,
+            move |delta, _logprobs| on_delta(delta),
+        )
+        .await
+    }
+
+    /// DS9.3: streaming chat whose delta callback also carries the per-token
+    /// logprob entries observed for that chunk (empty unless the request
+    /// asked for logprobs).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chat_generate_streaming_tokens_with_runtime_context<F>(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        chat_config: ChatRequestConfig,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        mut on_delta: F,
+    ) -> Result<ChatGeneration>
+    where
+        F: FnMut(String, Vec<crate::engine::TokenLogprob>) + Send + 'static,
+    {
         let admitted = self
             .build_chat_request_with_params_and_config(
                 variant,
@@ -608,10 +652,11 @@ impl RuntimeService {
         let mut streamed_text = String::new();
         let output = self
             .run_admitted_streaming_request(admitted, |chunk| {
-                if let Some(delta) = chunk.text {
+                let crate::engine::StreamingOutput { text, logprobs, .. } = chunk;
+                if let Some(delta) = text {
                     if !delta.is_empty() {
                         streamed_text.push_str(&delta);
-                        on_delta(delta);
+                        on_delta(delta, logprobs);
                     }
                 }
                 std::future::ready(Ok(()))
@@ -626,6 +671,8 @@ impl RuntimeService {
             prompt_tokens: output.token_stats.prompt_tokens,
             tokens_generated: output.num_tokens,
             generation_time_ms: output.generation_time.as_secs_f64() * 1000.0,
+            cached_prompt_tokens: output.token_stats.cached_prefix_tokens.map(u64::from),
+            logprobs: output.logprobs,
         })
     }
 }

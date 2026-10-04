@@ -579,22 +579,55 @@ impl ResourceAuthority {
 
     /// Permanently fail new work after a backend-fatal asynchronous error.
     /// Metal command-buffer OOM can leave queued command/fence bookkeeping in
-    /// an unusable state, so process/device recreation is required.
+    /// an unusable state, so process/device recreation is required — until
+    /// the backend fully drains, which lets [`Self::clear_poison`] restore
+    /// fresh loads.
     pub(crate) fn poison(&self, reason: impl Into<String>) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        state.poisoned.get_or_insert_with(|| reason.into());
+        if state.poisoned.is_some() {
+            return;
+        }
+        let reason = reason.into();
+        state.poisoned = Some(reason.clone());
+        drop(state);
+        // One canonical event for operators and the desktop monitor; the
+        // per-request errors wrap this reason afterwards.
+        tracing::error!(
+            reason = %reason,
+            "backend resource authority poisoned; new physical reservations and model loads are rejected until the backend is recreated or fully drains"
+        );
     }
 
-    #[cfg(test)]
     pub(crate) fn poison_reason(&self) -> Option<String> {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .poisoned
             .clone()
+    }
+
+    /// Clear the poison marker once the backend has been fully drained. With
+    /// no resident models and no active physical work, nothing queued before
+    /// the failure can be misattributed to fresh loads, so the fail-closed
+    /// guard is no longer needed — the in-process equivalent of llama.cpp's
+    /// "recreate the backend to recover". Returns whether a poison cleared.
+    pub(crate) fn clear_poison(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(reason) = state.poisoned.take() else {
+            return false;
+        };
+        drop(state);
+        tracing::info!(
+            reason = %reason,
+            "backend resource authority recovered after the backend fully drained"
+        );
+        true
     }
 
     /// Stable backend planning headroom for load-time sizing. Unlike guarded
@@ -663,6 +696,41 @@ impl ResourceAuthority {
             (_, BackendKind::Cpu) => headroom.host_bytes,
             (_, BackendKind::Metal) => headroom.unified_bytes,
             (_, BackendKind::Cuda) => headroom.device_bytes,
+        })
+    }
+
+    /// Probed live headroom for one Metal pre-load admission decision. Unlike
+    /// planning headroom this deliberately reads the volatile live-available
+    /// sample: a Metal model load allocates its full physical working set at
+    /// the load fence, so starting one while the device has less free memory
+    /// than the new model's static estimate turns an admission question into
+    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
+    /// exists (probe unavailable); callers must treat that as "fall back to
+    /// planning headroom", never as unlimited. CPU keeps planning headroom
+    /// only: host availability is compressed/swapped and must not gate loads.
+    pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
+        if backend != BackendKind::Metal {
+            return Ok(None);
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(reason) = state.poisoned.as_ref() {
+            return Err(Error::InferenceError(format!(
+                "backend resource authority is poisoned and must be recreated: {reason}"
+            )));
+        }
+        let physical = self.normalized_physical_snapshot();
+        if physical.source == CapacitySource::Unavailable {
+            return Ok(None);
+        }
+        let live = physical
+            .available
+            .positive_growth_over(state.pending_resources()?)?;
+        Ok(match live.unified_bytes {
+            ResourceAmount::Known(bytes) => Some(bytes),
+            ResourceAmount::Unknown => None,
         })
     }
 
@@ -1616,6 +1684,136 @@ mod tests {
                 .unwrap(),
             ResourceAmount::Known(15)
         );
+    }
+
+    fn unified_bytes(value: u64) -> ResourceVector {
+        ResourceVector {
+            unified_bytes: ResourceAmount::Known(value),
+            ..ResourceVector::zero()
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnifiedProvider {
+        capacity: u64,
+        available: u64,
+        source: CapacitySource,
+    }
+
+    impl PhysicalCapacityProvider for UnifiedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: unified_bytes(self.capacity),
+                available: unified_bytes(self.available),
+                source: self.source,
+            }
+        }
+    }
+
+    #[test]
+    fn metal_live_preload_headroom_binds_when_allocations_exceed_estimates() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 50,
+                source: CapacitySource::Test,
+            }),
+        ));
+        // The resident model reserved 30 and fully materialized, but the live
+        // probe lost another 20 to allocations no static estimate tracks
+        // (GGUF conversion scratch, pooled buffers): 100 − 30 − 20 = 50 free.
+        let lease = authority
+            .reserve_with_initial_materialized(
+                ReservationOwner::new(ReservationClass::Model, "resident"),
+                unified_bytes(30),
+                unified_bytes(30),
+            )
+            .unwrap();
+
+        // Static planning headroom trusts the ledger: 100 − 30 = 70. The
+        // device reports only 50 free bytes, so the live sample must bind.
+        assert_eq!(
+            authority
+                .planning_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            ResourceAmount::Known(70)
+        );
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            Some(50)
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn metal_live_preload_headroom_excludes_pending_claims() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 90,
+                source: CapacitySource::Test,
+            }),
+        ));
+        // 30 reserved, 20 already materialized: their bytes are inside the
+        // provider's live `available` observation, so only the remaining 10
+        // of pending claim is subtracted: 90 − 10 = 80.
+        let lease = authority
+            .reserve_with_initial_materialized(
+                ReservationOwner::new(ReservationClass::Model, "resident"),
+                unified_bytes(30),
+                unified_bytes(20),
+            )
+            .unwrap();
+
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            Some(80)
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn live_preload_headroom_skips_cpu_and_unavailable_probes() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 50,
+                source: CapacitySource::Unavailable,
+            }),
+        ));
+
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Cpu)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            authority
+                .live_preload_headroom_bytes(BackendKind::Metal)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn live_preload_headroom_fails_closed_when_poisoned() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 50,
+                source: CapacitySource::Test,
+            }),
+        ));
+        authority.poison("simulated backend failure");
+
+        assert!(authority
+            .live_preload_headroom_bytes(BackendKind::Metal)
+            .is_err());
     }
 
     #[test]

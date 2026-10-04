@@ -40,6 +40,9 @@ use crate::models::shared::attention::batched::{
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+use crate::models::shared::moe::{
+    ExpertSet, ExpertActivationCounters, SparseMoeConfig, SparseMoeDispatcher,
+};
 #[cfg(test)]
 use crate::models::shared::attention::paged::{
     append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
@@ -96,6 +99,16 @@ pub struct Qwen3Config {
     pub ada_rms_norm_t_cond: bool,
     #[serde(default)]
     pub ada_rms_norm_t_cond_dim: usize,
+    // Sparse (MoE) feed-forward geometry. Absent/zero on dense checkpoints;
+    // when present, every decoder layer's FFN becomes a sparse expert block.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub norm_topk_prob: Option<bool>,
 }
 
 impl Qwen3Config {
@@ -153,6 +166,40 @@ impl Qwen3Config {
             .then_some(self.sliding_window)
             .flatten()
             .filter(|window| *window > 0)
+    }
+
+    /// Resolved sparse-expert geometry, or `None` for a dense checkpoint.
+    /// `num_experts > 0` opts the whole decoder into sparse FFNs; the remaining
+    /// geometry must then be complete (fail-closed rather than defaulted, so a
+    /// mis-keyed MoE checkpoint cannot load half-configured).
+    pub fn sparse_moe(&self) -> Result<Option<SparseMoeConfig>> {
+        let Some(num_experts) = self.num_experts.filter(|count| *count > 0) else {
+            return Ok(None);
+        };
+        let Some(num_experts_per_tok) = self.num_experts_per_tok else {
+            return Err(Error::ModelLoadError(
+                "Qwen3 MoE checkpoint sets num_experts without num_experts_per_tok".into(),
+            ));
+        };
+        let Some(moe_intermediate_size) = self.moe_intermediate_size else {
+            return Err(Error::ModelLoadError(
+                "Qwen3 MoE checkpoint sets num_experts without moe_intermediate_size".into(),
+            ));
+        };
+        if moe_intermediate_size == 0 {
+            return Err(Error::ModelLoadError(
+                "Qwen3 MoE moe_intermediate_size must be positive".into(),
+            ));
+        }
+        Ok(Some(SparseMoeConfig {
+            num_experts,
+            num_experts_per_tok,
+            norm_topk_prob: self.norm_topk_prob.unwrap_or(true),
+        }))
+    }
+
+    pub fn moe_intermediate_size(&self) -> Option<usize> {
+        self.moe_intermediate_size
     }
 }
 
@@ -932,6 +979,12 @@ impl Qwen3Projection {
             .map_err(Error::from)
     }
 
+    fn from_qtensor(qtensor: QTensor) -> Result<Self> {
+        QMatMul::from_qtensor(qtensor)
+            .map(Self::Quantized)
+            .map_err(Error::from)
+    }
+
     fn packed_quantized(loader: &GgufLoader, device: &Device, names: &[&str]) -> Result<Self> {
         let resolved = names
             .iter()
@@ -1546,6 +1599,10 @@ fn qwen3_canonical_gguf_tensor_name(logical_name: &str) -> Option<String> {
                 "mlp.gate_proj.weight" => "ffn_gate.weight",
                 "mlp.up_proj.weight" => "ffn_up.weight",
                 "mlp.down_proj.weight" => "ffn_down.weight",
+                "mlp.gate.weight" => "ffn_gate_inp.weight",
+                "mlp.ffn_gate_exps.weight" => "ffn_gate_exps.weight",
+                "mlp.ffn_up_exps.weight" => "ffn_up_exps.weight",
+                "mlp.ffn_down_exps.weight" => "ffn_down_exps.weight",
                 _ => return None,
             };
             Some(format!("blk.{layer_index}.{suffix}"))
@@ -2290,11 +2347,235 @@ impl Qwen3Mlp {
     }
 }
 
+/// One routed expert of a sparse Qwen3 feed-forward block. Projection
+/// machinery and dtype policies match the dense MLP exactly, so an expert is
+/// a dense FFN that the router addresses by index.
+struct Qwen3SparseExpert {
+    gate_up_proj: Qwen3GateUpProjection,
+    down_proj: Qwen3Projection,
+}
+
+impl ExpertSet for Vec<Qwen3SparseExpert> {
+    fn num_experts(&self) -> usize {
+        self.len()
+    }
+
+    fn apply_expert(&self, expert: usize, tokens: &Tensor) -> Result<Tensor> {
+        let expert = self.get(expert).ok_or_else(|| {
+            Error::InferenceError(format!("Qwen3 sparse expert {expert} is out of range"))
+        })?;
+        let (gate, up) = expert.gate_up_proj.forward(tokens)?;
+        // Per-expert silu-mul is intentionally not profile-recorded: the
+        // fused-kernel telemetry would multiply by expert count per step.
+        let hidden = match try_fused_silu_mul_with_status(&gate, &up) {
+            Some(fused) => fused.tensor,
+            None => ops::silu(&gate)?.broadcast_mul(&up)?,
+        };
+        expert.down_proj.forward(&hidden).map_err(Error::from)
+    }
+}
+
+/// Sparse Qwen3 feed-forward: router over routed experts, combined by the
+/// shared sparse dispatch seam (`models::shared::moe`). Expert parallelism
+/// would replace the `Vec<Qwen3SparseExpert>` ExpertSet implementation, not
+/// this block.
+struct Qwen3SparseMlp {
+    dispatcher: SparseMoeDispatcher,
+    router: Qwen3Projection,
+    experts: Vec<Qwen3SparseExpert>,
+    /// Per-step routing histogram (EPLB-style balancer input; DS10 A6).
+    activation_counters: Arc<ExpertActivationCounters>,
+}
+
+impl Qwen3SparseMlp {
+    fn counters(&self) -> Arc<ExpertActivationCounters> {
+        self.activation_counters.clone()
+    }
+
+    fn load(cfg: &Qwen3Config, moe: SparseMoeConfig, vb: VarBuilder) -> Result<Self> {
+        let moe_intermediate_size = cfg
+            .moe_intermediate_size()
+            .ok_or_else(|| Error::ModelLoadError("sparse MoE intermediate size missing".into()))?;
+        let counters = Arc::new(ExpertActivationCounters::new(moe.num_experts));
+        let router = Qwen3Projection::dense(cfg.hidden_size, moe.num_experts, vb.pp("gate"))?;
+        let vb_experts = vb.pp("experts");
+        let experts = (0..moe.num_experts)
+            .map(|idx| {
+                let expert_vb = vb_experts.pp(idx);
+                let gate_proj = Qwen3Projection::dense(
+                    cfg.hidden_size,
+                    moe_intermediate_size,
+                    expert_vb.pp("gate_proj"),
+                )?;
+                let up_proj = Qwen3Projection::dense(
+                    cfg.hidden_size,
+                    moe_intermediate_size,
+                    expert_vb.pp("up_proj"),
+                )?;
+                let down_proj = Qwen3Projection::dense(
+                    moe_intermediate_size,
+                    cfg.hidden_size,
+                    expert_vb.pp("down_proj"),
+                )?;
+                Ok(Qwen3SparseExpert {
+                    gate_up_proj: Qwen3GateUpProjection::new_dense(
+                        gate_proj,
+                        up_proj,
+                        vb.device(),
+                    )?,
+                    down_proj,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            dispatcher: SparseMoeDispatcher::new(moe)?
+                .with_counters(counters.clone()),
+            router,
+            experts,
+            activation_counters: counters,
+        })
+    }
+
+    fn load_gguf(
+        cfg: &Qwen3Config,
+        moe: SparseMoeConfig,
+        loader: &GgufLoader,
+        device: &Device,
+        prefix: &str,
+    ) -> Result<Self> {
+        let moe_intermediate_size = cfg
+            .moe_intermediate_size()
+            .ok_or_else(|| Error::ModelLoadError("sparse MoE intermediate size missing".into()))?;
+        let counters = Arc::new(ExpertActivationCounters::new(moe.num_experts));
+        let router = Qwen3Projection::quantized(loader, device, &format!("{prefix}.gate.weight"))?;
+        let gate_experts = fused_expert_qtensors(
+            loader,
+            device,
+            &format!("{prefix}.ffn_gate_exps.weight"),
+            moe.num_experts,
+            moe_intermediate_size,
+            cfg.hidden_size,
+        )?;
+        let up_experts = fused_expert_qtensors(
+            loader,
+            device,
+            &format!("{prefix}.ffn_up_exps.weight"),
+            moe.num_experts,
+            moe_intermediate_size,
+            cfg.hidden_size,
+        )?;
+        let down_experts = fused_expert_qtensors(
+            loader,
+            device,
+            &format!("{prefix}.ffn_down_exps.weight"),
+            moe.num_experts,
+            cfg.hidden_size,
+            moe_intermediate_size,
+        )?;
+        let experts = gate_experts
+            .into_iter()
+            .zip(up_experts)
+            .zip(down_experts)
+            .map(|((gate, up), down)| {
+                Ok(Qwen3SparseExpert {
+                    gate_up_proj: Qwen3GateUpProjection::new_separate(
+                        Qwen3Projection::from_qtensor(gate)?,
+                        Qwen3Projection::from_qtensor(up)?,
+                    ),
+                    down_proj: Qwen3Projection::from_qtensor(down)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            dispatcher: SparseMoeDispatcher::new(moe)?
+                .with_counters(counters.clone()),
+            router,
+            experts,
+            activation_counters: counters,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // The dispatch seam operates on [tokens, hidden]; attention may hand
+        // the FFN [rows, hidden] directly or a [batch, seq, hidden] prefill
+        // block, so flatten and restore around the router.
+        let original_shape = x.shape().clone();
+        let (tokens, hidden_dim) = match x.rank() {
+            2 => x.dims2()?,
+            3 => {
+                let (batch, seq, hidden) = x.dims3()?;
+                (batch * seq, hidden)
+            }
+            rank => {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3 sparse FFN expects rank-2 or rank-3 input, got rank {rank}"
+                )))
+            }
+        };
+        let flat = x.reshape((tokens, hidden_dim))?;
+        let router_logits = self.router.forward(&flat)?;
+        let output = self
+            .dispatcher
+            .dispatch(&flat, &router_logits, &self.experts)?;
+        output.reshape(&original_shape).map_err(Error::from)
+    }
+
+    fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        let expert_diagnostics = self.experts.iter().fold(
+            Qwen3ProjectionDiagnostics::default(),
+            |acc, expert| {
+                acc.add(expert.gate_up_proj.diagnostics())
+                    .add(expert.down_proj.diagnostics())
+            },
+        );
+        self.router.diagnostics().add(expert_diagnostics)
+    }
+}
+
+fn fused_expert_qtensors(
+    loader: &GgufLoader,
+    device: &Device,
+    logical_name: &str,
+    num_experts: usize,
+    expert_rows: usize,
+    expert_cols: usize,
+) -> Result<Vec<QTensor>> {
+    let resolved = qwen3_gguf_tensor_name(loader, logical_name).unwrap_or_else(|| logical_name.to_string());
+    let fused = loader.load_qtensor(&resolved, device)?;
+    crate::models::shared::weights::gguf::split_fused_expert_qtensor(
+        &fused,
+        num_experts,
+        expert_rows,
+        expert_cols,
+    )
+}
+
+enum Qwen3FeedForward {
+    Dense(Qwen3Mlp),
+    Sparse(Qwen3SparseMlp),
+}
+
+impl Qwen3FeedForward {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::Sparse(mlp) => mlp.forward(x),
+        }
+    }
+
+    fn projection_diagnostics(&self) -> Qwen3ProjectionDiagnostics {
+        match self {
+            Self::Dense(mlp) => mlp.projection_diagnostics(),
+            Self::Sparse(mlp) => mlp.projection_diagnostics(),
+        }
+    }
+}
+
 struct Qwen3Layer {
     input_layernorm: RmsNorm,
     self_attn: Qwen3Attention,
     post_attention_layernorm: RmsNorm,
-    mlp: Qwen3Mlp,
+    mlp: Qwen3FeedForward,
 }
 
 impl Qwen3Layer {
@@ -2307,7 +2588,10 @@ impl Qwen3Layer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Qwen3Mlp::load(cfg, vb.pp("mlp"))?;
+        let mlp = match cfg.sparse_moe()? {
+            Some(moe) => Qwen3FeedForward::Sparse(Qwen3SparseMlp::load(cfg, moe, vb.pp("mlp"))?),
+            None => Qwen3FeedForward::Dense(Qwen3Mlp::load(cfg, vb.pp("mlp"))?),
+        };
         Ok(Self {
             input_layernorm,
             self_attn,
@@ -2346,7 +2630,12 @@ impl Qwen3Layer {
             )?,
             cfg.rms_norm_eps,
         );
-        let mlp = Qwen3Mlp::load_gguf(cfg, loader, device, &format!("{prefix}.mlp"))?;
+        let mlp = match cfg.sparse_moe()? {
+            Some(moe) => {
+                Qwen3FeedForward::Sparse(Qwen3SparseMlp::load_gguf(cfg, moe, loader, device, &format!("{prefix}.mlp"))?)
+            }
+            None => Qwen3FeedForward::Dense(Qwen3Mlp::load_gguf(cfg, loader, device, &format!("{prefix}.mlp"))?),
+        };
         Ok(Self {
             input_layernorm,
             self_attn,
@@ -2518,6 +2807,7 @@ impl Qwen3Model {
         domain: StateDomainId,
         storage_dtype: DType,
         preferred_page_tokens: usize,
+        prefix_reuse: bool,
     ) -> Result<InferenceStateContract> {
         let attention = self.cfg.attention_geometry()?;
         let cache_domain = qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
@@ -2531,8 +2821,12 @@ impl Qwen3Model {
             sliding_window: self.cfg.sliding_window(),
             storage_dtype,
             preferred_page_tokens,
-            prefix: PrefixPolicy::CommittedPages {
-                positions: crate::kv::v2::PositionSemantics::Absolute,
+            prefix: if prefix_reuse {
+                PrefixPolicy::CommittedPages {
+                    positions: crate::kv::v2::PositionSemantics::Absolute,
+                }
+            } else {
+                PrefixPolicy::Disabled
             },
         })?;
         let contract = InferenceStateContract {
@@ -2541,7 +2835,7 @@ impl Qwen3Model {
             groups: vec![StateGroupSpec {
                 id: StateGroupId::new(domain.get()),
                 domains: vec![domain],
-                prefix_shareable: true,
+                prefix_shareable: prefix_reuse,
             }],
         };
         contract.validate()?;
@@ -2702,6 +2996,19 @@ impl Qwen3Model {
             .fold(self.lm_head.diagnostics(), |acc, layer| {
                 acc.add(layer.projection_diagnostics())
             })
+    }
+
+    /// Per-layer expert-activation counters of the sparse layers (empty when
+    /// the model is dense). Engine-side telemetry only: protocol exposure is
+    /// deferred to expert-parallel activation (DS10 A6, ADR 0008).
+    pub fn expert_activation_counters(&self) -> Vec<Arc<ExpertActivationCounters>> {
+        self.layers
+            .iter()
+            .filter_map(|layer| match &layer.mlp {
+                Qwen3FeedForward::Sparse(sparse) => Some(sparse.counters()),
+                Qwen3FeedForward::Dense(_) => None,
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -3401,6 +3708,10 @@ mod tests {
             use_sliding_window: false,
             ada_rms_norm_t_cond: false,
             ada_rms_norm_t_cond_dim: 0,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
         }
     }
 
@@ -3579,6 +3890,10 @@ mod tests {
             use_sliding_window: false,
             ada_rms_norm_t_cond: false,
             ada_rms_norm_t_cond_dim: 0,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
         };
         let embeddings = (0..cfg.vocab_size * cfg.hidden_size)
             .map(|idx| ((idx * 5 % 17) as f32 - 8.0) / 16.0)
@@ -3607,13 +3922,13 @@ mod tests {
                 Tensor::ones(4, DType::F32, device).unwrap(),
                 1e-5,
             ),
-            mlp: Qwen3Mlp {
+            mlp: Qwen3FeedForward::Dense(Qwen3Mlp {
                 gate_up_proj: Qwen3GateUpProjection::new_separate(
                     test_projection(8, 4, 5, device),
                     test_projection(8, 4, 6, device),
                 ),
                 down_proj: test_projection(4, 8, 7, device),
-            },
+            }),
         };
         Qwen3Model {
             embed_tokens: Embedding::new(
@@ -3631,6 +3946,105 @@ mod tests {
 
     fn test_cache() -> Qwen3Cache {
         Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None)
+    }
+
+    /// Tiny sparse-MoE twin of [`tiny_qwen3_model`]: identical embeddings,
+    /// attention, norms, and head, with the FFN replaced by `num_experts`
+    /// experts that all share the dense MLP's exact weights. With normalized
+    /// top-k routing the expert mixture is a convex combination, so the sparse
+    /// model must compute the same function as the dense model.
+    pub(super) fn tiny_qwen3_moe_model(device: &Device, num_experts: usize) -> Qwen3Model {
+        let mut cfg = Qwen3Config {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            num_key_value_heads: 1,
+            max_position_embeddings: Some(32),
+            head_dim: Some(2),
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            vocab_size: 8,
+            lm_head_size: None,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            sliding_window: None,
+            use_sliding_window: false,
+            ada_rms_norm_t_cond: false,
+            ada_rms_norm_t_cond_dim: 0,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: None,
+        };
+        cfg.num_experts = Some(num_experts);
+        cfg.num_experts_per_tok = Some(2);
+        cfg.moe_intermediate_size = Some(8);
+        cfg.norm_topk_prob = Some(true);
+
+        let embeddings = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|idx| ((idx * 5 % 17) as f32 - 8.0) / 16.0)
+            .collect::<Vec<_>>();
+        let q_proj = test_projection(4, 4, 1, device);
+        let k_proj = test_projection(2, 4, 2, device);
+        let v_proj = test_projection(2, 4, 3, device);
+        let attention = Qwen3Attention {
+            qkv_proj: Qwen3QkvProjection::new_separate(q_proj, k_proj, v_proj),
+            o_proj: test_projection(4, 4, 4, device),
+            q_norm: None,
+            k_norm: None,
+            qk_norm_weight: None,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 2,
+            use_mrope: false,
+            mrope_section: None,
+            rope_inv_freqs: build_rope_inv_freqs(2, cfg.rope_theta),
+            rope_kernel_enabled: false,
+        };
+        // Every expert reuses the dense MLP's projection seeds (5, 6, 7), so
+        // all experts compute the identical function.
+        let experts = (0..num_experts)
+            .map(|_| Qwen3SparseExpert {
+                gate_up_proj: Qwen3GateUpProjection::new_separate(
+                    test_projection(8, 4, 5, device),
+                    test_projection(8, 4, 6, device),
+                ),
+                down_proj: test_projection(4, 8, 7, device),
+            })
+            .collect::<Vec<_>>();
+        let activation_counters = Arc::new(ExpertActivationCounters::new(num_experts));
+        let sparse = Qwen3SparseMlp {
+            dispatcher: SparseMoeDispatcher::new(
+                cfg.sparse_moe().unwrap().expect("MoE geometry configured"),
+            )
+            .unwrap()
+            .with_counters(activation_counters.clone()),
+            router: test_projection(num_experts, 4, 9, device),
+            experts,
+            activation_counters,
+        };
+        let layer = Qwen3Layer {
+            input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            self_attn: attention,
+            post_attention_layernorm: RmsNorm::new(
+                Tensor::ones(4, DType::F32, device).unwrap(),
+                1e-5,
+            ),
+            mlp: Qwen3FeedForward::Sparse(sparse),
+        };
+        Qwen3Model {
+            embed_tokens: Embedding::new(
+                Tensor::from_vec(embeddings, (cfg.vocab_size, cfg.hidden_size), device).unwrap(),
+                cfg.hidden_size,
+            ),
+            layers: vec![layer],
+            norm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
+            lm_head: test_projection(cfg.vocab_size, cfg.hidden_size, 8, device),
+            device: device.clone(),
+            cfg,
+            use_mrope: false,
+        }
     }
 
     fn test_managed_arena() -> (Arc<dyn KvArena>, Vec<KvLayerBinding>) {
@@ -3786,6 +4200,131 @@ mod tests {
         let decode_completions = managed.take_completed_writes();
         assert_eq!(decode_completions.len(), 1);
         assert_eq!(decode_completions[0].slots_per_layer(), 1);
+    }
+
+    #[test]
+    fn managed_qwen3_sparse_moe_with_identical_experts_matches_dense() {
+        let device = Device::Cpu;
+        let dense = tiny_qwen3_model(&device);
+        let sparse = tiny_qwen3_moe_model(&device, 4);
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        let mut owned = test_cache();
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 5], (1, 4), &device).unwrap();
+
+        // Prefill: the sparse layer's convex combination of identical experts
+        // must reduce to the dense MLP's function.
+        let dense_prefill = dense.forward(&prompt, 0, Some(&mut owned)).unwrap();
+        let sparse_prefill = sparse
+            .forward_managed(&prompt, 0, &mut managed)
+            .unwrap();
+        assert_tensor_close(&dense_prefill, &sparse_prefill);
+        assert_eq!(managed.context_len(), 4);
+
+        // Decode steps continue to agree on fresh tokens; the dense side keeps
+        // its own model-owned cache with the same prefill history.
+        for (owned_position, token) in (managed.context_len()..).zip([3u32, 6]) {
+            let dense_step = dense
+                .forward(
+                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
+                    owned_position,
+                    Some(&mut owned),
+                )
+                .unwrap();
+            let sparse_step = sparse
+                .forward_managed(
+                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
+                    managed.context_len(),
+                    &mut managed,
+                )
+                .unwrap();
+            assert_tensor_close(&dense_step, &sparse_step);
+        }
+    }
+
+    #[test]
+    fn managed_qwen3_moe_records_expert_activation_histograms() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_moe_model(&device, 4);
+        let counters = model.expert_activation_counters();
+        assert_eq!(counters.len(), 1, "one sparse layer exposes one counter set");
+        assert_eq!(counters[0].num_experts(), 4);
+        assert_eq!(counters[0].total_selections(), 0);
+
+        let (arena, bindings) = test_managed_arena();
+        let mut managed = test_managed_cache(arena, bindings, 0);
+        // 4 prompt tokens + 2 decode steps, top-2 routing: 12 selections.
+        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 5], (1, 4), &device).unwrap();
+        model.forward_managed(&prompt, 0, &mut managed).unwrap();
+        for token in [3u32, 6] {
+            model
+                .forward_managed(
+                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
+                    managed.context_len(),
+                    &mut managed,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            counters[0].total_selections(),
+            12,
+            "every routed token selects exactly experts_per_tok entries"
+        );
+        let snapshot = counters[0].snapshot();
+        assert_eq!(snapshot.iter().sum::<u64>(), 12);
+    }
+
+    #[test]
+    fn qwen3_moe_config_resolves_sparse_geometry_fail_closed() {
+        let moe_json = serde_json::json!({
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10_000.0,
+            "vocab_size": 32,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "norm_topk_prob": true,
+        });
+        let config: Qwen3Config = serde_json::from_value(moe_json).unwrap();
+        let moe = config.sparse_moe().unwrap().expect("MoE geometry resolves");
+        assert_eq!(moe.num_experts, 8);
+        assert_eq!(moe.num_experts_per_tok, 2);
+        assert!(moe.norm_topk_prob);
+
+        // Dense defaults: no expert fields, no sparse geometry.
+        let dense_json = serde_json::json!({
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10_000.0,
+            "vocab_size": 32,
+        });
+        let config: Qwen3Config = serde_json::from_value(dense_json).unwrap();
+        assert!(config.sparse_moe().unwrap().is_none());
+
+        // num_experts without its companion geometry fails closed.
+        let incomplete_json = serde_json::json!({
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10_000.0,
+            "vocab_size": 32,
+            "num_experts": 8,
+        });
+        let config: Qwen3Config = serde_json::from_value(incomplete_json).unwrap();
+        let error = config.sparse_moe().unwrap_err();
+        assert!(format!("{error}").contains("num_experts_per_tok"));
     }
 
     #[test]

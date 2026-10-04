@@ -26,6 +26,9 @@
 # Environment
 .env
 .env.local
+opencode.json
+
+.opencode/*
 
 # Test outputs
 # *.wav

@@ -1296,6 +1296,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             crate::engine::YieldReason::QuantumExhausted,
         )
@@ -1328,6 +1329,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         })
         .with_managed_cache_completions(vec![completion]);
         let terminal = executor
@@ -1474,6 +1476,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             crate::engine::YieldReason::QuantumExhausted,
         )
@@ -1509,6 +1512,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             crate::engine::YieldReason::QuantumExhausted,
         )

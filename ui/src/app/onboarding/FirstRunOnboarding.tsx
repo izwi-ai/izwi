@@ -39,10 +39,8 @@ import { APP_ICON_URL } from "@/shared/config/runtime";
 const QUICK_SETUP_VARIANTS = [
   "Parakeet-TDT-0.6B-v3",
   "Kokoro-82M",
-  "Qwen3-1.7B-GGUF",
+  "Qwen3.5-4B",
 ] as const;
-
-const MANUAL_DOWNLOAD_VARIANTS = new Set(["Gemma-3-1b-it"]);
 
 const FEATURE_ITEMS = [
   {
@@ -237,10 +235,7 @@ export function FirstRunOnboarding() {
   }, [modelLookup]);
 
   const quickDownloadTargets = useMemo(() => {
-    return quickModels.filter(
-      (model) =>
-        isDownloadable(model) && !MANUAL_DOWNLOAD_VARIANTS.has(model.variant),
-    );
+    return quickModels.filter((model) => isDownloadable(model));
   }, [quickModels]);
 
   const quickTotalBytes = useMemo(() => {
@@ -286,22 +281,13 @@ export function FirstRunOnboarding() {
   }, [modelLookup, selectedVariants]);
 
   const selectedDownloadTargets = useMemo(() => {
-    return selectedModels.filter(
-      (model) =>
-        isDownloadable(model) && !MANUAL_DOWNLOAD_VARIANTS.has(model.variant),
-    );
+    return selectedModels.filter((model) => isDownloadable(model));
   }, [selectedModels]);
 
   const selectedTotalBytes = useMemo(() => {
     return selectedModels.reduce((total, model) => {
       return total + resolveModelSizeBytes(model);
     }, 0);
-  }, [selectedModels]);
-
-  const selectedManualTargets = useMemo(() => {
-    return selectedModels.filter((model) =>
-      MANUAL_DOWNLOAD_VARIANTS.has(model.variant),
-    );
   }, [selectedModels]);
 
   const activeModelCount =
@@ -408,10 +394,7 @@ export function FirstRunOnboarding() {
     setIsApplying(true);
 
     const chosenModels = setupMode === "quick" ? quickModels : selectedModels;
-    const downloadTargets = chosenModels.filter(
-      (model) =>
-        isDownloadable(model) && !MANUAL_DOWNLOAD_VARIANTS.has(model.variant),
-    );
+    const downloadTargets = chosenModels.filter((model) => isDownloadable(model));
 
     try {
       if (downloadTargets.length > 0) {
@@ -751,10 +734,7 @@ export function FirstRunOnboarding() {
                                     const statusLabel = getModelStatusLabel(
                                       model.status,
                                     );
-                                    const isManual = MANUAL_DOWNLOAD_VARIANTS.has(
-                                      model.variant,
-                                    );
-                                    const isDisabled = isManual || !isDownloadable(model);
+                                    const isDisabled = !isDownloadable(model);
                                     return (
                                       <label
                                         key={model.variant}
@@ -783,9 +763,7 @@ export function FirstRunOnboarding() {
                                             {metadata?.description ?? "Model option"}
                                           </div>
                                           <div className="mt-2 text-xs uppercase tracking-[0.2em] text-[var(--text-subtle)]">
-                                            {isManual
-                                              ? "Manual download"
-                                              : statusLabel}
+                                            {statusLabel}
                                           </div>
                                         </div>
                                       </label>
@@ -876,13 +854,6 @@ export function FirstRunOnboarding() {
                       </div>
                     ) : null}
 
-                    {setupMode === "custom" && selectedManualTargets.length > 0 ? (
-                      <div className="rounded-[var(--radius-sm)] border border-border/70 bg-[var(--bg-surface-2)]/70 px-3 py-2 text-sm text-[var(--text-muted)]">
-                        {selectedManualTargets.length} selected model
-                        {selectedManualTargets.length === 1 ? "" : "s"} require
-                        manual download from the Models page.
-                      </div>
-                    ) : null}
                   </div>
                 </div>
               </div>

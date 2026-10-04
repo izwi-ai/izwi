@@ -1388,7 +1388,7 @@ mod tests {
             model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
             asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
             aligner_model_id: Some("Qwen3-ForcedAligner-0.6B".to_string()),
-            llm_model_id: Some("Qwen3-1.7B-GGUF".to_string()),
+            llm_model_id: Some("Qwen3.5-4B".to_string()),
             processing_status: DiarizationProcessingStatus::Ready,
             processing_error: None,
             min_speakers: Some(1),

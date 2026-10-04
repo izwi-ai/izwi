@@ -9,6 +9,9 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-fleet-stores
+                Run fleet/durable store execution tests against real PostgreSQL
+                (requires IZWI_TEST_FLEET_PG_URL at a disposable database)
   cargo-metal   Require macOS 15+ and run Metal-focused validation
   cargo-metal-fallback
                 Require macOS 12-14 and prove Metal-enabled code falls back to CPU
@@ -363,8 +366,38 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
     cargo test --locked -p izwi-server --lib
+    cargo test --locked -p izwi-server --test fleet_rig
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
+}
+
+run_cargo_fleet_stores() {
+    require_command cargo
+
+    # DS5.1: execute the fleet coordination store and the durable store
+    # against real PostgreSQL. The database must be disposable — every test
+    # drops its tables and re-runs the migrations.
+    if [[ -z "${IZWI_TEST_FLEET_PG_URL:-}" ]]; then
+        echo "IZWI_TEST_FLEET_PG_URL must point at a disposable PostgreSQL database" >&2
+        exit 1
+    fi
+
+    cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
+}
+
+run_fleet_rig_postgres() {
+    require_command cargo
+
+    # DS5.2 PostgreSQL lane: the multi-process gateway rig against a
+    # server-backed coordination database, including the store-outage
+    # degradation leg. The database must be disposable — the rig drops and
+    # re-migrates its schema, and it is briefly closed to new connections.
+    if [[ -z "${IZWI_TEST_FLEET_RIG_PG_URL:-}" ]]; then
+        echo "IZWI_TEST_FLEET_RIG_PG_URL must point at a disposable PostgreSQL database" >&2
+        exit 1
+    fi
+
+    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig
 }
 
 run_cargo_metal() {
@@ -444,8 +477,11 @@ run_hygiene() {
         crates/izwi-core/src/engine/cache/managed_stress.rs \
         crates/izwi-core/examples/kv-cache-bench.rs \
         crates/izwi-core/tests/kv_public_compatibility.rs
+    # The workspace MSRV is 1.88 (the Dockerfile CUDA builder pins it), so
+    # std deprecations like Atomic::fetch_update -> try_update (stable 1.95)
+    # are forward-looking renames the pinned code must not chase yet.
     TAURI_CONFIG="${tauri_check_config}" \
-        cargo clippy --locked --workspace --all-targets -- -D warnings
+        cargo clippy --locked --workspace --all-targets -- -D warnings -A deprecated
     TAURI_CONFIG="${tauri_check_config}" \
         cargo check --locked --workspace --all-targets
     bash -n scripts/ci/*.sh scripts/bench/*.sh
@@ -591,6 +627,12 @@ main() {
             ;;
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-fleet-stores)
+            run_cargo_fleet_stores
+            ;;
+        cargo-fleet-rig-postgres)
+            run_fleet_rig_postgres
             ;;
         cargo-metal)
             run_cargo_metal

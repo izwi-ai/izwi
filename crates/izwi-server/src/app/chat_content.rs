@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn validate_media_inputs_rejects_non_qwen35_variants_including_qwen38() {
-        for variant in [ModelVariant::Qwen34BGguf, ModelVariant::Qwen3827BFp8] {
+        for variant in [ModelVariant::Qwen314BGguf, ModelVariant::Qwen3827BFp8] {
             let err = validate_media_inputs_for_variant(
                 variant,
                 &[ChatMediaInput {

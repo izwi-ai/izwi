@@ -6,21 +6,38 @@ use crate::config::{
     BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionMode,
     PhysicalInFlightLimit,
 };
+use crate::Result;
 
 pub const ENV_HOST: &str = "IZWI_HOST";
 pub const ENV_PORT: &str = "IZWI_PORT";
 pub const ENV_MODELS_DIR: &str = "IZWI_MODELS_DIR";
 pub const ENV_MAX_LOADED_MODELS: &str = "IZWI_MAX_LOADED_MODELS";
+pub const ENV_MODEL_KEEP_ALIVE_SECS: &str = "IZWI_MODEL_KEEP_ALIVE_SECS";
 pub const ENV_BACKEND: &str = "IZWI_BACKEND";
 pub const ENV_MAX_BATCH_SIZE: &str = "IZWI_MAX_BATCH_SIZE";
 pub const ENV_PHYSICAL_EXECUTION_MODE: &str = "IZWI_PHYSICAL_EXECUTION_MODE";
 pub const ENV_MAX_PHYSICAL_IN_FLIGHT: &str = "IZWI_MAX_PHYSICAL_IN_FLIGHT";
 pub const ENV_MAX_SCHEDULER_BATCH_SIZE: &str = "IZWI_MAX_SCHEDULER_BATCH_SIZE";
 pub const ENV_ENABLE_PREFIX_CACHING: &str = "IZWI_ENABLE_PREFIX_CACHING";
+pub const ENV_PREFIX_REUSE_AUTO: &str = "IZWI_PREFIX_REUSE_AUTO";
+/// Shipped serving default (DS1.6): when the operator made no explicit
+/// prefix-caching choice, committed prefix reuse engages per loaded model
+/// where the catalog cell has backend-lane evidence. Encode the choice in
+/// this named constant and preserve the explicit kill switch.
+pub const PREFIX_REUSE_CATALOG_AUTO_DEFAULT: bool = true;
 pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT";
 pub const ENV_MAX_PREFIX_CACHE_PAGES: &str = "IZWI_MAX_PREFIX_CACHE_PAGES";
 pub const ENV_ENABLE_CHUNKED_PREFILL: &str = "IZWI_ENABLE_CHUNKED_PREFILL";
 pub const ENV_CHUNKED_PREFILL_THRESHOLD: &str = "IZWI_CHUNKED_PREFILL_THRESHOLD";
+/// Host KV pool budget for hierarchical offload (DS4). Positive values opt a
+/// worker into demoting committed prefix pages to a bounded host tier.
+pub const ENV_KV_HOST_POOL_BUDGET_BYTES: &str = "IZWI_KV_HOST_POOL_BUDGET_BYTES";
+/// Explicit DS4 kill switch: `false` forces offload off even when a budget is set.
+pub const ENV_KV_HOST_OFFLOAD: &str = "IZWI_KV_HOST_OFFLOAD";
+pub const ENV_KV_OFFLOAD_HIGH_WATERMARK: &str = "IZWI_KV_OFFLOAD_HIGH_WATERMARK";
+pub const ENV_KV_OFFLOAD_LOW_WATERMARK: &str = "IZWI_KV_OFFLOAD_LOW_WATERMARK";
+pub const ENV_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES: &str = "IZWI_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES";
+pub const ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES: &str = "IZWI_KV_OFFLOAD_MAX_PROMOTION_PAGES";
 pub const ENV_MAX_RETAINED_SEQUENCES: &str = "IZWI_MAX_RETAINED_SEQUENCES";
 pub const ENV_MAX_STAGED_TRANSACTIONS: &str = "IZWI_MAX_STAGED_TRANSACTIONS";
 pub const ENV_MAX_QUEUED_REQUESTS: &str = "IZWI_MAX_QUEUED_REQUESTS";
@@ -45,12 +62,16 @@ pub struct ServeRuntimeConfig {
     pub port: u16,
     pub models_dir: PathBuf,
     pub max_loaded_models: usize,
+    /// Idle keep-alive for transient residents in seconds (0 disables the
+    /// reaper). Explicitly loaded (pinned) models are exempt.
+    pub model_keep_alive_secs: u64,
     pub backend: BackendPreference,
     pub max_batch_size: BatchSizePreference,
     pub physical_execution_mode: PhysicalExecutionMode,
     pub max_physical_in_flight: PhysicalInFlightLimit,
     pub max_scheduler_batch_size: usize,
     pub enable_prefix_caching: bool,
+    pub prefix_reuse_catalog_auto: bool,
     pub managed_prefix_cache_salt: Option<String>,
     pub max_prefix_cache_pages: usize,
     pub enable_chunked_prefill: bool,
@@ -75,13 +96,22 @@ impl Default for ServeRuntimeConfig {
             host: default_host(),
             port: default_port(),
             models_dir: default_models_dir(),
-            max_loaded_models: 1,
+            // Fits the shipped multi-model pipeline worst case (diarization
+            // + ASR + forced aligner + LLM refiner resident together). The
+            // count is a residency guardrail only: the per-backend memory
+            // ledger remains the physical admission gate and evicts idle
+            // unpinned models under pressure.
+            max_loaded_models: 4,
+            // Ollama-style idle keep-alive for job auto-loaded models;
+            // explicitly loaded models are pinned and never reaped. 0 = off.
+            model_keep_alive_secs: default_model_keep_alive_secs(),
             backend: default_backend(),
             max_batch_size: default_max_batch_size(),
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_scheduler_batch_size: default_max_scheduler_batch_size(),
             enable_prefix_caching: default_enable_prefix_caching(),
+            prefix_reuse_catalog_auto: PREFIX_REUSE_CATALOG_AUTO_DEFAULT,
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
             enable_chunked_prefill: default_enable_chunked_prefill(),
@@ -129,6 +159,9 @@ impl ServeRuntimeConfig {
         if let Some(max_loaded_models) = overrides.max_loaded_models {
             self.max_loaded_models = max_loaded_models.max(1);
         }
+        if let Some(model_keep_alive_secs) = overrides.model_keep_alive_secs {
+            self.model_keep_alive_secs = model_keep_alive_secs;
+        }
         if let Some(backend) = overrides.backend {
             self.backend = backend;
         }
@@ -146,6 +179,12 @@ impl ServeRuntimeConfig {
         }
         if let Some(enable_prefix_caching) = overrides.enable_prefix_caching {
             self.enable_prefix_caching = enable_prefix_caching;
+            // An explicit prefix-caching choice replaces the catalog-auto
+            // default: true is explicit enablement, false is the kill switch.
+            self.prefix_reuse_catalog_auto = false;
+        }
+        if let Some(prefix_reuse_catalog_auto) = overrides.prefix_reuse_catalog_auto {
+            self.prefix_reuse_catalog_auto = prefix_reuse_catalog_auto;
         }
         if let Some(managed_prefix_cache_salt) = overrides.managed_prefix_cache_salt.as_ref() {
             self.managed_prefix_cache_salt = Some(managed_prefix_cache_salt.clone());
@@ -201,11 +240,13 @@ impl ServeRuntimeConfig {
             performance: self.performance.clone(),
             models_dir: self.models_dir.clone(),
             max_loaded_models: Some(self.max_loaded_models.max(1)),
+            model_keep_alive_secs: self.model_keep_alive_secs,
             max_batch_size: self.max_batch_size,
             physical_execution_mode: self.physical_execution_mode,
             max_physical_in_flight: self.max_physical_in_flight,
             max_scheduler_batch_size: self.max_scheduler_batch_size,
             enable_prefix_caching: self.enable_prefix_caching,
+            prefix_reuse_catalog_auto: self.prefix_reuse_catalog_auto,
             managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.max_prefix_cache_pages,
             enable_chunked_prefill: self.enable_chunked_prefill,
@@ -232,12 +273,14 @@ pub struct ServeRuntimeConfigOverrides {
     pub port: Option<u16>,
     pub models_dir: Option<PathBuf>,
     pub max_loaded_models: Option<usize>,
+    pub model_keep_alive_secs: Option<u64>,
     pub backend: Option<BackendPreference>,
     pub max_batch_size: Option<BatchSizePreference>,
     pub physical_execution_mode: Option<PhysicalExecutionMode>,
     pub max_physical_in_flight: Option<PhysicalInFlightLimit>,
     pub max_scheduler_batch_size: Option<usize>,
     pub enable_prefix_caching: Option<bool>,
+    pub prefix_reuse_catalog_auto: Option<bool>,
     pub managed_prefix_cache_salt: Option<String>,
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: Option<bool>,
@@ -256,6 +299,40 @@ pub struct ServeRuntimeConfigOverrides {
 }
 
 impl ServeRuntimeConfigOverrides {
+    /// Read the serving-relevant section of the existing user TOML: the
+    /// performance policy and residency controls. Other CLI configuration
+    /// sections keep their existing owners and schema. A missing file yields
+    /// the default overrides.
+    pub fn from_user_config(path: Option<&std::path::Path>) -> Result<Self> {
+        let path = path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(crate::performance::default_user_config_path);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => {
+                return Err(crate::Error::ConfigError(format!(
+                    "{}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        let document: toml::Value = toml::from_str(&source).map_err(|error| {
+            crate::Error::ConfigError(format!("{}: {error}", path.display()))
+        })?;
+        Ok(Self {
+            performance: crate::performance::PerformanceConfigOverrides::from_document(
+                &document,
+                &path,
+            )?,
+            max_loaded_models: read_user_usize(&document, &path, "max_loaded_models")?,
+            model_keep_alive_secs: read_user_u64(&document, &path, "model_keep_alive_secs")?,
+            ..Self::default()
+        })
+    }
+
     pub fn from_env() -> Self {
         Self {
             performance: crate::performance::PerformanceConfigOverrides::from_env(),
@@ -263,6 +340,7 @@ impl ServeRuntimeConfigOverrides {
             port: read_env_u16(ENV_PORT, &[]),
             models_dir: read_env_path(ENV_MODELS_DIR, &[]),
             max_loaded_models: read_env_usize(ENV_MAX_LOADED_MODELS, &[]),
+            model_keep_alive_secs: read_env_u64(ENV_MODEL_KEEP_ALIVE_SECS, &[]),
             backend: read_env_backend(ENV_BACKEND, &[]),
             max_batch_size: read_env_batch_size(ENV_MAX_BATCH_SIZE, &[]),
             physical_execution_mode: read_env_physical_execution_mode(
@@ -275,6 +353,7 @@ impl ServeRuntimeConfigOverrides {
             ),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
             enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
+            prefix_reuse_catalog_auto: read_env_bool(ENV_PREFIX_REUSE_AUTO, &[]),
             managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
             max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
             enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
@@ -368,6 +447,12 @@ fn default_request_timeout_secs() -> u64 {
     300
 }
 
+/// Ollama defaults its keep-alive to 5 minutes; 10 minutes is the
+/// conservative desktop choice for job auto-loaded models.
+fn default_model_keep_alive_secs() -> u64 {
+    600
+}
+
 fn default_cors_enabled() -> bool {
     false
 }
@@ -419,6 +504,39 @@ fn read_env_usize(primary: &str, aliases: &[&str]) -> Option<usize> {
     first_non_empty_env(primary, aliases)
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+/// Extract a non-negative integer from the user TOML's `runtime` table.
+/// Absent keys yield `None`; wrong types fail closed with a config error.
+fn read_user_usize(
+    document: &toml::Value,
+    config_path: &std::path::Path,
+    key: &str,
+) -> Result<Option<usize>> {
+    let Some(value) = document.get("runtime").and_then(|runtime| runtime.get(key)) else {
+        return Ok(None);
+    };
+    let parsed = value.as_integer().ok_or_else(|| {
+        crate::Error::ConfigError(format!(
+            "{} runtime.{key} must be a non-negative integer",
+            config_path.display()
+        ))
+    })?;
+    if parsed < 0 {
+        return Err(crate::Error::ConfigError(format!(
+            "{} runtime.{key} must be a non-negative integer",
+            config_path.display()
+        )));
+    }
+    Ok(Some(parsed as usize))
+}
+
+fn read_user_u64(
+    document: &toml::Value,
+    config_path: &std::path::Path,
+    key: &str,
+) -> Result<Option<u64>> {
+    Ok(read_user_usize(document, config_path, key)?.map(|value| value as u64))
 }
 
 fn read_env_batch_size(primary: &str, aliases: &[&str]) -> Option<BatchSizePreference> {
@@ -519,15 +637,22 @@ mod tests {
     }
 
     #[test]
-    fn server_profile_defaults_to_one_resident_model_and_allows_override() {
+    fn server_profile_defaults_to_pipeline_sized_residency_and_allows_override() {
         let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
         clear_env();
 
+        // Frozen default: the desktop diarization pipeline needs diarization
+        // + ASR + aligner + LLM refiner resident together.
         let defaults = ServeRuntimeConfig::default();
-        assert_eq!(defaults.max_loaded_models, 1);
-        assert_eq!(defaults.engine_config().max_loaded_models, Some(1));
+        assert_eq!(defaults.max_loaded_models, 4);
+        assert_eq!(defaults.engine_config().max_loaded_models, Some(4));
+        // Ollama-style idle keep-alive: 10 minutes by default, reaper off
+        // when explicitly zeroed.
+        assert_eq!(defaults.model_keep_alive_secs, 600);
+        assert_eq!(defaults.engine_config().model_keep_alive_secs, 600);
 
         std::env::set_var(ENV_MAX_LOADED_MODELS, "3");
+        std::env::set_var(ENV_MODEL_KEEP_ALIVE_SECS, "0");
         let resolved = ServeRuntimeConfig::from_sources(
             &ServeRuntimeConfigOverrides::default(),
             &ServeRuntimeConfigOverrides::from_env(),
@@ -535,7 +660,53 @@ mod tests {
         );
         assert_eq!(resolved.max_loaded_models, 3);
         assert_eq!(resolved.engine_config().max_loaded_models, Some(3));
+        assert_eq!(resolved.model_keep_alive_secs, 0);
         clear_env();
+    }
+
+    #[test]
+    fn user_config_supplies_residency_and_performance_overrides() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "izwi-serve-runtime-config-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&config_dir).expect("temp config dir");
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[runtime]
+max_loaded_models = 6
+model_keep_alive_secs = 0
+
+[runtime.performance.loading]
+workers = 5
+"#,
+        )
+        .expect("write config");
+
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).expect("parse");
+        assert_eq!(overrides.max_loaded_models, Some(6));
+        assert_eq!(overrides.model_keep_alive_secs, Some(0));
+        assert_eq!(overrides.performance.loading.workers, Some(5));
+
+        // Missing keys and missing files both fall back to defaults.
+        std::fs::write(&config_path, "[ui]\nenabled = false\n").expect("write config");
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).expect("parse");
+        assert_eq!(overrides.max_loaded_models, None);
+        let overrides =
+            ServeRuntimeConfigOverrides::from_user_config(Some(&config_dir.join("missing.toml")))
+                .expect("missing file is not an error");
+        assert_eq!(overrides.max_loaded_models, None);
+
+        // Wrong types fail closed.
+        std::fs::write(&config_path, "[runtime]\nmax_loaded_models = \"many\"\n")
+            .expect("write config");
+        assert!(ServeRuntimeConfigOverrides::from_user_config(Some(&config_path)).is_err());
+
+        std::fs::remove_dir_all(&config_dir).ok();
     }
 
     #[test]
@@ -679,6 +850,60 @@ mod tests {
         assert!(engine.enable_chunked_prefill);
         assert_eq!(engine.chunked_prefill_threshold, 512);
         clear_env();
+    }
+
+    #[test]
+    fn prefix_reuse_auto_is_the_default_and_explicit_choices_replace_it() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+
+        // No explicit choice anywhere: the shipped catalog-auto default.
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(resolved.prefix_reuse_catalog_auto);
+        let engine = resolved.engine_config();
+        assert!(!engine.enable_prefix_caching);
+        assert!(engine.prefix_reuse_catalog_auto);
+
+        // An explicit zero is the kill switch: auto off, flag off.
+        std::env::set_var(ENV_ENABLE_PREFIX_CACHING, "0");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+        assert!(!resolved.engine_config().prefix_reuse_catalog_auto);
+
+        // The auto env can pin the mode explicitly without enabling reuse.
+        std::env::remove_var(ENV_ENABLE_PREFIX_CACHING);
+        std::env::set_var(ENV_PREFIX_REUSE_AUTO, "false");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(!resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+
+        // An explicit true is explicit enablement, not catalog-auto.
+        std::env::set_var(ENV_ENABLE_PREFIX_CACHING, "true");
+        std::env::set_var(ENV_MANAGED_PREFIX_CACHE_SALT, "tenant-a");
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &ServeRuntimeConfigOverrides::default(),
+        );
+        assert!(resolved.enable_prefix_caching);
+        assert!(!resolved.prefix_reuse_catalog_auto);
+        std::env::remove_var(ENV_ENABLE_PREFIX_CACHING);
+        std::env::remove_var(ENV_MANAGED_PREFIX_CACHE_SALT);
+        std::env::remove_var(ENV_PREFIX_REUSE_AUTO);
     }
 
     #[test]

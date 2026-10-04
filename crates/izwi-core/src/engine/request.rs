@@ -1065,6 +1065,12 @@ pub struct EngineCoreRequest {
     pub(super) v2_state_runtime: Option<Arc<crate::kv::v2::CapabilityStateRuntimeV2>>,
     /// Immutable model-level physical KV runtime installed by the engine.
     pub(super) managed_cache_runtime: Option<Arc<super::cache::managed::ManagedKvModelRuntime>>,
+    /// DS1.5: prefill start cursor probed from the managed prefix index at
+    /// admission. Tokens below the cursor are already resident as shared
+    /// pages plus a forked tensor snapshot; the scheduler plans the first
+    /// prefill span from this cursor and the managed prepare re-verifies it
+    /// transactionally before any attach is staged.
+    pub(super) managed_prefix_cursor: Option<u32>,
     /// Request-specific shape/workspace facts produced by the exact loaded
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
@@ -4422,6 +4428,9 @@ impl EngineCoreRequest {
             stop_token_ids: self.params.stop_token_ids.clone(),
             seed: Self::chat_request_seed(&self.id),
             request: self.chat_config.clone(),
+            logprobs: self.params.logprobs || self.params.top_logprobs > 0,
+            top_logprobs: self.params.top_logprobs,
+            constrain_json_object: self.params.constrain_json_object,
         }
     }
 
@@ -4458,6 +4467,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4518,6 +4528,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4578,6 +4589,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4635,6 +4647,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4693,6 +4706,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4751,6 +4765,7 @@ impl EngineCoreRequest {
             v2_state_fingerprint: None,
             v2_state_runtime: None,
             managed_cache_runtime: None,
+            managed_prefix_cursor: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -5096,6 +5111,16 @@ impl EngineCoreRequest {
         }
         self.managed_cache_runtime = Some(runtime);
         Ok(())
+    }
+
+    /// Records the admission-time managed prefix cursor for the first prefill
+    /// span. Must be called before the request enters the scheduler.
+    pub(crate) fn set_managed_prefix_cursor(&mut self, cursor: Option<u32>) {
+        self.managed_prefix_cursor = cursor;
+    }
+
+    pub(crate) fn managed_prefix_cursor(&self) -> Option<u32> {
+        self.managed_prefix_cursor
     }
 
     pub(crate) fn managed_cache_runtime(

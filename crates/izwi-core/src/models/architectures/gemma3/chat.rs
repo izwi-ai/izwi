@@ -49,6 +49,9 @@ pub struct ChatDecodeState {
     stagnant_steps: usize,
     max_new_tokens: usize,
     finished: bool,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -206,15 +209,6 @@ struct GemmaDefaults {
 
 fn defaults_for_variant(variant: ModelVariant) -> GemmaDefaults {
     match variant {
-        ModelVariant::Gemma31BIt => GemmaDefaults {
-            hidden_size: 1152,
-            intermediate_size: 6912,
-            num_attention_heads: 4,
-            num_hidden_layers: 26,
-            num_key_value_heads: 1,
-            head_dim: 256,
-            max_position_embeddings: 32_768,
-        },
         ModelVariant::Gemma34BIt => GemmaDefaults {
             hidden_size: 2560,
             intermediate_size: 10240,
@@ -431,6 +425,8 @@ pub struct Gemma3ChatModel {
     variant: ModelVariant,
     device: DeviceProfile,
     compute_dtype: DType,
+    /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
+    prefix_reuse: bool,
     tokenizer: GemmaTokenizer,
     text_model: Gemma3PhysicalModel,
 }
@@ -442,6 +438,7 @@ impl InferenceStateContractProvider for Gemma3ChatModel {
                 StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
+                self.prefix_reuse,
             )?,
         ))
     }
@@ -458,7 +455,12 @@ impl Gemma3ChatModel {
         Ok(context)
     }
 
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let tokenizer = GemmaTokenizer::load(model_dir)?;
 
         let config_path = model_dir.join("config.json");
@@ -597,6 +599,7 @@ impl Gemma3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 
@@ -646,19 +649,31 @@ impl Gemma3ChatModel {
                 "Gemma resumable prefill requires at least one private prompt token".into(),
             ));
         }
+        // DS1.5: a managed prefix attach starts the logical cursor at the
+        // attached physical cursor.
         let position = cache.context_len();
         Ok(ChatDecodeState {
             cache,
             unconsumed_logits: None,
             position,
             pending_token: None,
-            prefill_progress: 0,
+            prefill_progress: position,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids).with_json_object_constraint(
+                std::sync::Arc::new(self.tokenizer.inner.clone()),
+                vec![
+                    Some(self.tokenizer.specials.end_of_turn),
+                    Some(self.tokenizer.specials.eos),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             assembled: String::new(),
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            pending_logprobs: Vec::new(),
         })
     }
 
@@ -733,8 +748,32 @@ impl Gemma3ChatModel {
         let logits = state.unconsumed_logits.take().ok_or_else(|| {
             Error::InferenceError("Gemma decode quantum has no unconsumed logits".into())
         })?;
-        let next = state.sampler.sample(&logits, self.tokenizer.vocab_size)?;
-        self.apply_sample(state, next)
+        let (next, entry) = self.sample_token(state, &logits)?;
+        self.apply_sample(state, next, entry)
+    }
+
+    /// DS9.3: sample one token, resolving raw logprobs into the public
+    /// payload when the request asked for them. The entry is recorded by
+    /// `apply_sample` only when the token is actually emitted.
+    fn sample_token(
+        &self,
+        state: &mut ChatDecodeState,
+        logits: &Tensor,
+    ) -> Result<(u32, Option<crate::engine::TokenLogprob>)> {
+        state.pending_logprobs.clear();
+        if !state.sampler.wants_logprobs() {
+            let token = state.sampler.sample(logits, self.tokenizer.vocab_size)?;
+            return Ok((token, None));
+        }
+        let (token, raw) = state
+            .sampler
+            .sample_with_logprobs(logits, self.tokenizer.vocab_size)?;
+        let entry = raw
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        Ok((token, entry))
     }
 
     pub fn decode_step_batch(
@@ -780,15 +819,19 @@ impl Gemma3ChatModel {
         }
         let mut steps = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let next = state
-                .sampler
-                .sample(&logits.i(row)?, self.tokenizer.vocab_size)?;
-            steps.push(self.apply_sample(state, next)?);
+            let row_logits = logits.i(row)?;
+            let (next, entry) = self.sample_token(state, &row_logits)?;
+            steps.push(self.apply_sample(state, next, entry)?);
         }
         Ok(steps)
     }
 
-    fn apply_sample(&self, state: &mut ChatDecodeState, next: u32) -> Result<ChatDecodeStep> {
+    fn apply_sample(
+        &self,
+        state: &mut ChatDecodeState,
+        next: u32,
+        logprob_entry: Option<crate::engine::TokenLogprob>,
+    ) -> Result<ChatDecodeStep> {
         if next == self.tokenizer.specials.end_of_turn
             || next == self.tokenizer.specials.eos
             || next == self.tokenizer.specials.start_of_turn
@@ -797,6 +840,9 @@ impl Gemma3ChatModel {
         {
             state.finished = true;
             return Ok(state.step(String::new()));
+        }
+        if let Some(entry) = logprob_entry {
+            state.pending_logprobs.push(entry);
         }
         state.generated_ids.push(next);
         state.pending_token = Some(next);
@@ -1073,12 +1119,9 @@ mod tests {
     #[test]
     fn missing_context_uses_variant_native_limit() {
         let config = r#"{"vocab_size": 262208}"#;
-        let one_b = parse_gemma3_config(config, ModelVariant::Gemma31BIt, 262_208, None)
-            .expect("1B defaults");
         let four_b = parse_gemma3_config(config, ModelVariant::Gemma34BIt, 262_208, None)
             .expect("4B defaults");
 
-        assert_eq!(one_b.max_position_embeddings, 32_768);
         assert_eq!(four_b.max_position_embeddings, 131_072);
     }
 

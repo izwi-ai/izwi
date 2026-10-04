@@ -1,10 +1,10 @@
 //! OpenAI-compatible chat completions endpoints.
 
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Extension, State},
+    extract::{rejection::JsonRejection, Extension, State},
     response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
@@ -16,17 +16,23 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
+    generate_chat, generate_remote_chat, generate_remote_chat_with_execution_and_tenant,
+    parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
+    spawn_remote_chat_stream_with_execution, spawn_remote_chat_stream_with_tenant,
     ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
+use crate::gateway::{
+    GatewayAdmissionGuard, GatewayChatExecution, GatewayState, GatewayStreamMetricsGuard,
+};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
-    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ModelVariant,
+    ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
+    ModelFamily, ModelVariant,
 };
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
@@ -72,6 +78,16 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// DS9.3: include per-token logprobs in the response.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// DS9.3: number of top alternatives per token (0-20).
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
+    /// DS9.2: structured output request. `json_object` constrains generation
+    /// to one valid JSON value on models whose sampler enforces it.
+    #[serde(default)]
+    pub response_format: Option<OpenAiResponseFormat>,
     #[serde(default)]
     pub stop: Option<serde_json::Value>,
     #[serde(default)]
@@ -88,6 +104,15 @@ pub struct ChatCompletionRequest {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
+/// `json_schema` is rejected by `kind` with a documented error, and any
+/// `json_schema` payload key is ignored by deserialization.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,6 +178,9 @@ struct OpenAiChoice {
     index: usize,
     message: OpenAiAssistantMessage,
     finish_reason: &'static str,
+    /// DS9.3: per-token logprobs; absent unless the request asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +197,63 @@ struct OpenAiUsage {
     prompt_tokens: usize,
     completion_tokens: usize,
     total_tokens: usize,
+    /// DS9.1: OpenAI-shape prompt token details. Always present with usage;
+    /// `cached_tokens` is 0 when the serving runtime did not measure prefix
+    /// reuse.
+    prompt_tokens_details: OpenAiPromptTokensDetails,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: u64,
+}
+
+/// DS9.3: OpenAI-shape per-choice logprobs wrapper.
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiChoiceLogprobs {
+    content: Vec<OpenAiTokenLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiTokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+    top_logprobs: Vec<OpenAiTopTokenLogprob>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiTopTokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+}
+
+/// DS9.3: map core logprob entries into the OpenAI response shape. `None`
+/// when the request did not collect logprobs.
+fn openai_logprobs(entries: &[izwi_core::engine::TokenLogprob]) -> Option<OpenAiChoiceLogprobs> {
+    if entries.is_empty() {
+        return None;
+    }
+    Some(OpenAiChoiceLogprobs {
+        content: entries
+            .iter()
+            .map(|entry| OpenAiTokenLogprob {
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                bytes: entry.bytes.clone(),
+                top_logprobs: entry
+                    .top_logprobs
+                    .iter()
+                    .map(|top| OpenAiTopTokenLogprob {
+                        token: top.token.clone(),
+                        logprob: top.logprob,
+                        bytes: top.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +286,9 @@ struct OpenAiDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiDeltaToolCall>>,
+    /// DS9.3: per-token logprobs for this chunk; absent unless requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -598,6 +686,35 @@ fn validate_chat_request_compatibility(
         ));
     }
 
+    if let Some(top_logprobs) = req.top_logprobs {
+        if top_logprobs > 20 {
+            return Err(ApiError::bad_request(
+                "`top_logprobs` must be between 0 and 20",
+            ));
+        }
+        if !req.logprobs.unwrap_or(false) {
+            return Err(ApiError::bad_request(
+                "`top_logprobs` requires `logprobs` to be true",
+            ));
+        }
+    }
+
+    if let Some(response_format) = &req.response_format {
+        match response_format.kind.as_str() {
+            "json_object" => {}
+            "json_schema" => {
+                return Err(ApiError::bad_request(
+                    "`response_format` type `json_schema` is not supported; use `json_object`",
+                ));
+            }
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown `response_format` type `{other}`; supported: `json_object`"
+                )));
+            }
+        }
+    }
+
     if profile.is_strict()
         && req
             .frequency_penalty
@@ -635,8 +752,174 @@ pub async fn completions(
 ) -> Result<Response, ApiError> {
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
+    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
 
+    if req.stream.unwrap_or(false) {
+        let model_id = execution_request.variant.dir_name().to_string();
+        let event_rx = if let Some(remote) = state.remote_chat_execution.as_ref() {
+            spawn_remote_chat_stream_with_execution(
+                remote,
+                state.request_timeout_secs,
+                &ctx,
+                execution_request,
+            )
+            .await?
+        } else {
+            spawn_chat_stream(state, execution_request)
+        };
+        let stream_response =
+            render_chat_stream(req, model_id, event_rx, compat_profile, None, None);
+        return Ok(stream_response.into_response());
+    }
+
+    let generation = if state.remote_chat_execution.is_some() {
+        generate_remote_chat(&state, &ctx, execution_request).await?
+    } else {
+        generate_chat(&state, execution_request).await?
+    };
+
+    Ok(render_completion_response(
+        variant,
+        generation,
+        compat_profile,
+    ))
+}
+
+pub async fn gateway_completions(
+    State(state): State<GatewayState>,
+    Extension(ctx): Extension<RequestContext>,
+    Extension(admission): Extension<GatewayAdmissionGuard>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(req) = payload.map_err(|rejection| {
+        if rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::payload_too_large("Gateway chat request body exceeds the configured limit")
+        } else {
+            ApiError::bad_request("Gateway chat request body is not valid JSON")
+        }
+    })?;
+    let compat_profile = compatibility_profile();
+    validate_chat_request_compatibility(&req, compat_profile)?;
+    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    state
+        .enforce_chat_rate_quota(&ctx, &execution_request)
+        .await?;
+    let tenant_work = state.begin_tenant_work(&ctx)?;
+    if req.stream.unwrap_or(false) {
+        let model_id = execution_request.variant.dir_name().to_string();
+        let dispatch_started = Instant::now();
+        let event_rx = match match &state.chat_execution {
+            GatewayChatExecution::Pinned(remote) => {
+                spawn_remote_chat_stream_with_tenant(
+                    remote,
+                    state.request_timeout_secs,
+                    &ctx,
+                    execution_request,
+                    tenant_work,
+                )
+                .await
+            }
+            GatewayChatExecution::Registry(dispatcher) => {
+                dispatcher
+                    .stream(
+                        state.request_timeout_secs,
+                        &ctx,
+                        execution_request,
+                        tenant_work,
+                    )
+                    .await
+            }
+        } {
+            Ok(event_rx) => {
+                state.record_dispatch_success(dispatch_started.elapsed());
+                event_rx
+            }
+            Err(error) => {
+                state.record_dispatch_failure(dispatch_started.elapsed());
+                return Err(error);
+            }
+        };
+        let stream_observation = state.begin_stream_observation();
+        return Ok(render_chat_stream(
+            req,
+            model_id,
+            event_rx,
+            compat_profile,
+            Some(admission),
+            Some(stream_observation),
+        )
+        .into_response());
+    }
+    let dispatch_started = Instant::now();
+    let generation = match match &state.chat_execution {
+        GatewayChatExecution::Pinned(remote) => {
+            generate_remote_chat_with_execution_and_tenant(
+                remote,
+                state.request_timeout_secs,
+                &ctx,
+                execution_request,
+                tenant_work,
+            )
+            .await
+        }
+        GatewayChatExecution::Registry(dispatcher) => {
+            dispatcher
+                .generate(
+                    state.request_timeout_secs,
+                    &ctx,
+                    execution_request,
+                    tenant_work,
+                )
+                .await
+        }
+    } {
+        Ok(generation) => {
+            state.record_dispatch_success(dispatch_started.elapsed());
+            generation
+        }
+        Err(error) => {
+            state.record_dispatch_failure(dispatch_started.elapsed());
+            return Err(error);
+        }
+    };
+    drop(admission);
+    Ok(render_completion_response(
+        variant,
+        generation,
+        compat_profile,
+    ))
+}
+
+/// DS9.2: models whose sampler enforces the JSON grammar. Others reject
+/// `json_object` rather than silently ignoring the request.
+fn ensure_response_format_supported(
+    variant: ModelVariant,
+    response_format: &OpenAiResponseFormat,
+) -> Result<(), ApiError> {
+    if response_format.kind == "json_object"
+        && !matches!(
+            variant.family(),
+            ModelFamily::Qwen3Chat
+                | ModelFamily::Gemma3Chat
+                | ModelFamily::Lfm2Chat
+                | ModelFamily::Qwen35MoeChat
+        )
+    {
+        return Err(ApiError::bad_request(format!(
+            "constrained decoding (`response_format: json_object`) is not supported for model {variant}; it requires a grammar-aware sampler"
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_execution_request(
+    req: &ChatCompletionRequest,
+    ctx: &RequestContext,
+) -> Result<(ModelVariant, ChatExecutionRequest), ApiError> {
     let variant = parse_chat_model(&req.model)?;
+    if let Some(response_format) = &req.response_format {
+        ensure_response_format_supported(variant, response_format)?;
+    }
     let (messages, media_inputs) = to_core_messages_with_media(
         variant,
         req.messages.clone(),
@@ -658,28 +941,35 @@ pub async fn completions(
         req.tools.clone().unwrap_or_default(),
         media_inputs,
     )?;
-    let execution_request = ChatExecutionRequest {
+    Ok((
         variant,
-        messages,
-        max_completion_tokens: req.max_completion_tokens,
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-        chat_config,
-        correlation_id: Some(ctx.correlation_id),
-    };
+        ChatExecutionRequest {
+            variant,
+            messages,
+            max_completion_tokens: req.max_completion_tokens,
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+            logprobs: req.logprobs,
+            top_logprobs: req.top_logprobs,
+            response_format_json_object: req
+                .response_format
+                .as_ref()
+                .is_some_and(|format| format.kind == "json_object"),
+            chat_config,
+            correlation_id: Some(ctx.correlation_id.clone()),
+        },
+    ))
+}
 
-    if req.stream.unwrap_or(false) {
-        let stream_response =
-            complete_stream(state, req, execution_request, compat_profile).await?;
-        return Ok(stream_response.into_response());
-    }
-
-    let generation = generate_chat(&state, execution_request).await?;
-
+fn render_completion_response(
+    variant: ModelVariant,
+    generation: ChatGeneration,
+    compat_profile: OpenAiCompatibilityProfile,
+) -> Response {
     let completion_id = new_uuid();
     let created = now_unix_secs();
     let completion_tokens = generation.tokens_generated;
@@ -700,11 +990,15 @@ pub async fn completions(
                 tool_calls: assistant_tool_calls,
             },
             finish_reason: measured_finish_reason(finish_reason, generation.finish_reason),
+            logprobs: openai_logprobs(&generation.logprobs),
         }],
         usage: OpenAiUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: OpenAiPromptTokensDetails {
+                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
+            },
         },
         izwi_generation_time_ms: compat_profile
             .is_relaxed()
@@ -715,27 +1009,28 @@ pub async fn completions(
             .flatten(),
     };
 
-    Ok(Json(response).into_response())
+    Json(response).into_response()
 }
 
-async fn complete_stream(
-    state: AppState,
+fn render_chat_stream(
     req: ChatCompletionRequest,
-    execution_request: ChatExecutionRequest,
+    model_id: String,
+    mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    admission: Option<GatewayAdmissionGuard>,
+    stream_observation: Option<GatewayStreamMetricsGuard>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
         .stream_options
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let model_id = execution_request.variant.dir_name().to_string();
-
     let completion_id = new_uuid();
     let created = now_unix_secs();
-    let mut event_rx = spawn_chat_stream(state, execution_request);
 
     let stream = async_stream::stream! {
+        let _admission = admission;
+        let mut stream_observation = stream_observation;
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
@@ -751,6 +1046,7 @@ async fn complete_stream(
                                 role: Some("assistant"),
                                 content: None,
                                 tool_calls: None,
+                                logprobs: None,
                             },
                             finish_reason: None,
                         }],
@@ -761,7 +1057,7 @@ async fn complete_stream(
                     .unwrap_or_default(),
                     false,
                 ),
-                ChatStreamEvent::Delta(delta) => (
+                ChatStreamEvent::Delta { text, logprobs } => (
                     serde_json::to_string(&OpenAiChatChunk {
                         id: completion_id.clone(),
                         object: "chat.completion.chunk",
@@ -771,8 +1067,9 @@ async fn complete_stream(
                             index: 0,
                             delta: OpenAiDelta {
                                 role: None,
-                                content: Some(delta),
+                                content: Some(text),
                                 tool_calls: None,
+                                logprobs: openai_logprobs(&logprobs),
                             },
                             finish_reason: None,
                         }],
@@ -784,6 +1081,9 @@ async fn complete_stream(
                     false,
                 ),
                 ChatStreamEvent::Completed(generation) => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_completion();
+                    }
                     let (_, tool_calls, finish_reason) =
                         build_assistant_response_parts(generation.text);
                     let delta_tool_calls =
@@ -800,6 +1100,7 @@ async fn complete_stream(
                                     role: None,
                                     content: None,
                                     tool_calls: delta_tool_calls,
+                                    logprobs: None,
                                 },
                                 finish_reason: Some(if tool_calls.is_some() {
                                     "tool_calls"
@@ -812,6 +1113,11 @@ async fn complete_stream(
                                 completion_tokens: generation.tokens_generated,
                                 total_tokens: generation.prompt_tokens
                                     + generation.tokens_generated,
+                                prompt_tokens_details: OpenAiPromptTokensDetails {
+                                    cached_tokens: generation
+                                        .cached_prompt_tokens
+                                        .unwrap_or(0),
+                                },
                             }),
                             izwi_generation_time_ms: compat_profile
                                 .is_relaxed()
@@ -823,14 +1129,21 @@ async fn complete_stream(
                         true,
                     )
                 }
-                ChatStreamEvent::Failed(error) => (
-                    openai_chat_stream_error_payload(error),
-                    true,
-                ),
-                ChatStreamEvent::ShuttingDown => (
-                    openai_chat_stream_error_payload("Server is shutting down"),
-                    true,
-                ),
+                ChatStreamEvent::Failed(error) => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_failure();
+                    }
+                    (openai_chat_stream_error_payload(error), true)
+                }
+                ChatStreamEvent::ShuttingDown => {
+                    if let Some(observation) = stream_observation.as_mut() {
+                        observation.record_failure();
+                    }
+                    (
+                        openai_chat_stream_error_payload("Server is shutting down"),
+                        true,
+                    )
+                }
             };
             if terminal {
                 saw_terminal = true;
@@ -841,18 +1154,418 @@ async fn complete_stream(
             }
         }
         if let Some(payload) = openai_chat_stream_interruption_payload(saw_terminal) {
+            if let Some(observation) = stream_observation.as_mut() {
+                observation.record_failure();
+            }
             yield Ok(Event::default().data(payload));
         }
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use izwi_core::{RuntimeService, ServeRuntimeConfig};
+    use izwi_serving_client::{
+        mock::{MockFault, MockWorker, MockWorkerConfig},
+        WorkerClient, WorkerClientConfig,
+    };
+    use izwi_serving_protocol::{
+        CredentialId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
+    };
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tower::Service;
+
+    use crate::api::create_router;
+    use crate::app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
+    use crate::test_support::env_lock;
+
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn remote_chat_app(
+        name: &str,
+        worker_config: MockWorkerConfig,
+        client_credentials: ServiceCredentials,
+        client_config: WorkerClientConfig,
+        generation_override: Option<izwi_serving_protocol::ModelGeneration>,
+    ) -> (Router, MockWorker, TempDirGuard) {
+        let incarnation = worker_config.incarnation_id.clone();
+        let deployment = worker_config.deployment_id.clone();
+        let generation = generation_override.unwrap_or(worker_config.model_generation);
+        let worker = MockWorker::spawn(worker_config)
+            .await
+            .expect("mock worker should start");
+        let client = WorkerClient::new(&worker.endpoint(), client_credentials, client_config)
+            .expect("worker client should initialize");
+        let remote = RemoteChatExecution::new(
+            client,
+            RemoteChatExecutionConfig {
+                public_model_variant: ModelVariant::Qwen354BGguf,
+                expected_worker_incarnation: incarnation,
+                deployment_id: deployment,
+                expected_model_generation: generation,
+                policy_revision: PolicyRevision::new("test-policy-v1")
+                    .expect("static policy revision"),
+                max_queue_wait: Duration::ZERO,
+                max_output_tokens: 128,
+                max_output_bytes: 4096,
+                slow_consumer_timeout: Duration::from_millis(100),
+            },
+        )
+        .expect("remote chat config should be valid");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("izwi-remote-chat-{name}-{nanos}"));
+        let models_dir = temp_dir.join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir should exist");
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            models_dir,
+            ui_enabled: false,
+            request_timeout_secs: 2,
+            ..ServeRuntimeConfig::default()
+        };
+
+        let _env = env_lock();
+        std::env::set_var("IZWI_DB_PATH", temp_dir.join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.join("media"));
+        let runtime =
+            RuntimeService::new(serve_config.engine_config()).expect("runtime should init");
+        let state = AppState::new(runtime, &serve_config)
+            .expect("state should init")
+            .with_remote_chat_execution(remote);
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+
+        (
+            create_router(state, &serve_config),
+            worker,
+            TempDirGuard(temp_dir),
+        )
+    }
+
+    fn valid_client_credentials(config: &MockWorkerConfig) -> ServiceCredentials {
+        config.credentials.clone()
+    }
+
+    fn invalid_client_credentials() -> ServiceCredentials {
+        ServiceCredentials {
+            credential_id: CredentialId::new("wrong-credential").expect("static credential"),
+            bearer_token: ServiceBearerToken::new("wrong-secret").expect("static token"),
+        }
+    }
+
+    fn public_chat_request_for_model(model: ModelVariant) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": false,
+                    "max_tokens": 32
+                })
+                .to_string(),
+            ))
+            .expect("request should build")
+    }
+
+    fn public_chat_request() -> Request<Body> {
+        public_chat_request_for_model(ModelVariant::Qwen354BGguf)
+    }
+
+    async fn send_public_chat(mut app: Router) -> Response {
+        app.as_service::<Body>()
+            .call(public_chat_request())
+            .await
+            .expect("router request should succeed")
+    }
+
+    async fn send_public_streaming_chat(mut app: Router) -> Response {
+        let mut request = public_chat_request();
+        *request.body_mut() = Body::from(
+            json!({
+                "model": ModelVariant::Qwen354BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "max_tokens": 32
+            })
+            .to_string(),
+        );
+        app.as_service::<Body>()
+            .call(request)
+            .await
+            .expect("router request should succeed")
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body should be bounded");
+        serde_json::from_slice(&bytes).expect("response should contain JSON")
+    }
+
+    async fn wait_for_active(worker: &MockWorker, expected: usize) {
+        for _ in 0..100 {
+            if worker.active_invocations() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "mock worker active count was {}, expected {expected}",
+            worker.active_invocations()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_chat_routes_over_real_worker_transport() {
+        let worker_config = MockWorkerConfig {
+            output_text: "remote hello".to_string(),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, _worker, _temp) = remote_chat_app(
+            "success",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "remote hello");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["prompt_tokens"], 1);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn public_streaming_chat_preserves_sse_over_worker_transport() {
+        let worker_config = MockWorkerConfig {
+            output_text: "remote streaming hello".into(),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "streaming",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_streaming_chat(app).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("stream response should remain bounded");
+        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
+        assert!(body.contains("remote streaming hello"));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("data: [DONE]"));
+        assert_eq!(worker.active_invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_public_remote_stream_cancels_without_early_capacity_release() {
+        let worker_config = MockWorkerConfig {
+            fault: MockFault::Hang,
+            cancellation_delay: Duration::from_millis(100),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "stream-disconnect",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_streaming_chat(app).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(worker.active_invocations(), 1);
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            worker.active_invocations(),
+            1,
+            "cancellation acknowledgement is not teardown proof"
+        );
+        wait_for_active(&worker, 0).await;
+    }
+
+    #[tokio::test]
+    async fn public_chat_rejects_incompatible_public_model_without_worker_dispatch() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let (mut app, worker, _temp) = remote_chat_app(
+            "incompatible",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = app
+            .as_service::<Body>()
+            .call(public_chat_request_for_model(ModelVariant::Qwen359BGguf))
+            .await
+            .expect("router request should succeed");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(worker.active_invocations(), 0);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incompatible with remote deployment")));
+    }
+
+    #[tokio::test]
+    async fn public_chat_surfaces_stale_model_generation_without_fallback() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let stale_generation =
+            izwi_serving_protocol::ModelGeneration::new(2).expect("non-zero generation");
+        let (app, _worker, _temp) = remote_chat_app(
+            "generation",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            Some(stale_generation),
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["message"], "model generation changed");
+    }
+
+    #[tokio::test]
+    async fn public_chat_surfaces_authoritative_worker_capacity_rejection() {
+        let worker_config = MockWorkerConfig {
+            output_cadence: Duration::from_millis(150),
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, worker, _temp) = remote_chat_app(
+            "capacity",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let first = tokio::spawn(send_public_chat(app.clone()));
+        wait_for_active(&worker, 1).await;
+        let rejected = send_public_chat(app).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(rejected).await;
+        assert_eq!(body["error"]["message"], "worker capacity is exhausted");
+        assert_eq!(
+            first.await.expect("first request task").status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
+        let worker_config = MockWorkerConfig {
+            output_cadence: Duration::from_millis(1),
+            cancellation_delay: Duration::from_millis(150),
+            fault: MockFault::Hang,
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let client_config = WorkerClientConfig {
+            first_output_timeout: Duration::from_millis(30),
+            progress_timeout: Duration::from_millis(30),
+            ..WorkerClientConfig::default()
+        };
+        let (app, worker, _temp) =
+            remote_chat_app("timeout", worker_config, credentials, client_config, None).await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(worker.active_invocations(), 1);
+        wait_for_active(&worker, 0).await;
+    }
+
+    #[tokio::test]
+    async fn public_chat_maps_worker_service_auth_failure_without_retry() {
+        let worker_config = MockWorkerConfig::default();
+        let (app, _worker, _temp) = remote_chat_app(
+            "auth",
+            worker_config,
+            invalid_client_credentials(),
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
+        let worker_config = MockWorkerConfig {
+            fault: MockFault::AcceptedThenDisconnect,
+            ..MockWorkerConfig::default()
+        };
+        let credentials = valid_client_credentials(&worker_config);
+        let (app, _worker, _temp) = remote_chat_app(
+            "interrupted",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        let response = send_public_chat(app).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_json(response).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("without a terminal event")));
+    }
 
     #[test]
     fn flattens_text_parts_content() {
@@ -1026,7 +1739,7 @@ mod tests {
     #[test]
     fn to_core_messages_collects_multimodal_parts() {
         let (messages, media_inputs) = to_core_messages_with_media(
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen314BGguf,
             vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Parts(vec![
@@ -1054,7 +1767,7 @@ mod tests {
         assert!(messages[0].content.contains("<|image_pad|>"));
         assert_eq!(media_inputs.len(), 1);
         assert!(
-            validate_media_inputs_for_variant(ModelVariant::Qwen38BGguf, &media_inputs)
+            validate_media_inputs_for_variant(ModelVariant::Qwen314BGguf, &media_inputs)
                 .expect_err("non-qwen35 multimodal should fail")
                 .contains("currently supported only for Qwen3.5")
         );
@@ -1063,7 +1776,7 @@ mod tests {
     #[test]
     fn validates_rejects_non_zero_frequency_penalty() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -1080,6 +1793,9 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(0.5),
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format: None,
             stop: None,
             user: None,
             tools: None,
@@ -1098,7 +1814,7 @@ mod tests {
     #[test]
     fn validates_rejects_stop_sequences() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -1115,6 +1831,9 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1133,7 +1852,7 @@ mod tests {
     #[test]
     fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
         let req = ChatCompletionRequest {
-            model: "Qwen3-8B-GGUF".to_string(),
+            model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiInboundContent::Text("hello".to_string())),
@@ -1150,6 +1869,9 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(1.0),
             presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format: None,
             stop: Some(json!(["END"])),
             user: None,
             tools: None,
@@ -1258,6 +1980,7 @@ mod timing_contract_tests {
                 prompt_tokens: 5,
                 completion_tokens: 4,
                 total_tokens: 9,
+                prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 0 },
             },
             izwi_generation_time_ms: Some(90.0),
             izwi_timing: Some(timing.clone()),
@@ -1283,5 +2006,170 @@ mod timing_contract_tests {
         let strict = serde_json::to_value(sse).unwrap();
         assert!(strict.get("izwi_timing").is_none());
         assert!(strict.get("izwi_generation_time_ms").is_none());
+    }
+
+    #[test]
+    fn logprob_requests_validate_openai_bounds() {
+        let req = |logprobs: Option<bool>, top_logprobs: Option<u8>| ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logprobs,
+            top_logprobs,
+            response_format: None,
+            stop: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
+        };
+        assert!(validate_chat_request_compatibility(&req(Some(true), Some(20)), profile()).is_ok());
+        assert!(validate_chat_request_compatibility(&req(Some(true), None), profile()).is_ok());
+        let too_many = validate_chat_request_compatibility(&req(Some(true), Some(21)), profile());
+        assert!(too_many.is_err(), "top_logprobs above 20 must be rejected");
+        let missing_flag = validate_chat_request_compatibility(&req(None, Some(3)), profile());
+        assert!(
+            missing_flag.is_err(),
+            "top_logprobs without logprobs must be rejected"
+        );
+    }
+
+    fn profile() -> OpenAiCompatibilityProfile {
+        OpenAiCompatibilityProfile::Relaxed
+    }
+
+    #[test]
+    fn response_format_types_are_validated() {
+        let req = |kind: &str| ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            n: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logprobs: None,
+            top_logprobs: None,
+            response_format: Some(OpenAiResponseFormat { kind: kind.into() }),
+            stop: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            chat_template_kwargs: None,
+        };
+        assert!(validate_chat_request_compatibility(&req("json_object"), profile()).is_ok());
+        assert!(
+            validate_chat_request_compatibility(&req("json_schema"), profile()).is_err(),
+            "json_schema must be rejected with a documented error"
+        );
+        assert!(
+            validate_chat_request_compatibility(&req("yaml"), profile()).is_err(),
+            "unknown types must be rejected"
+        );
+    }
+
+    #[test]
+    fn response_format_deserialization_ignores_json_schema_payload_keys() {
+        let format: OpenAiResponseFormat = serde_json::from_value(serde_json::json!({
+            "type": "json_object",
+            "json_schema": { "name": "strict-output", "strict": true }
+        }))
+        .expect("the json_schema payload key is ignored, not a parse error");
+        assert_eq!(format.kind, "json_object");
+    }
+
+    #[test]
+    fn json_object_is_rejected_on_models_without_a_grammar_aware_sampler() {
+        let format = OpenAiResponseFormat {
+            kind: "json_object".into(),
+        };
+        assert!(ensure_response_format_supported(ModelVariant::Qwen314BGguf, &format).is_ok());
+        assert!(
+            ensure_response_format_supported(ModelVariant::Qwen3827BFp8, &format).is_err(),
+            "qwen3.8 has its own sampler without the grammar seam"
+        );
+        assert!(
+            ensure_response_format_supported(ModelVariant::Qwen35Moe35BA3BFp8, &format).is_ok(),
+            "qwen3.5-moe wires the DS9.2 grammar into its decode states"
+        );
+    }
+
+    #[test]
+    fn logprob_entries_render_openai_shape() {
+        let entries = vec![izwi_core::engine::TokenLogprob {
+            token: " hello".to_string(),
+            logprob: -0.25,
+            bytes: b" hello".to_vec(),
+            top_logprobs: vec![
+                izwi_core::engine::TopTokenLogprob {
+                    token: " hello".to_string(),
+                    logprob: -0.25,
+                    bytes: b" hello".to_vec(),
+                },
+                izwi_core::engine::TopTokenLogprob {
+                    token: " hi".to_string(),
+                    logprob: -1.5,
+                    bytes: b" hi".to_vec(),
+                },
+            ],
+        }];
+        let rendered = serde_json::to_value(openai_logprobs(&entries).unwrap()).unwrap();
+        let first = &rendered["content"][0];
+        assert_eq!(first["token"], " hello");
+        assert_eq!(first["logprob"], -0.25);
+        assert_eq!(
+            first["bytes"],
+            serde_json::json!([32, 104, 101, 108, 108, 111])
+        );
+        assert_eq!(first["top_logprobs"].as_array().unwrap().len(), 2);
+        assert_eq!(first["top_logprobs"][1]["token"], " hi");
+        assert!(openai_logprobs(&[]).is_none());
+    }
+
+    #[test]
+    fn usage_reports_openai_shaped_cached_tokens() {
+        let measured = serde_json::to_value(OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 7 },
+        })
+        .unwrap();
+        assert_eq!(measured["prompt_tokens"], 10);
+        assert_eq!(measured["prompt_tokens_details"]["cached_tokens"], 7);
+
+        let unmeasured = serde_json::to_value(OpenAiUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_tokens_details: OpenAiPromptTokensDetails { cached_tokens: 0 },
+        })
+        .unwrap();
+        assert_eq!(
+            unmeasured["prompt_tokens_details"]["cached_tokens"], 0,
+            "unmeasured cache must render as an explicit zero, OpenAI parity"
+        );
     }
 }

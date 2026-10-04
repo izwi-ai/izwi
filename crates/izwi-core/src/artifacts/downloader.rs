@@ -26,6 +26,10 @@ use crate::error::{Error, Result};
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
 pub const ARTIFACT_MANIFEST_FILE: &str = "izwi-artifact.json";
+/// On-disk cache of resolved expected download sizes, so cold starts do not
+/// need a Hugging Face round-trip per catalog variant to render the model
+/// list. Keyed by variant dir_name (stable across process restarts).
+const EXPECTED_SIZES_CACHE_FILE: &str = "izwi-expected-sizes.json";
 
 const QWEN38_REQUIRED_METADATA_FILES: &[&str] = &[
     "config.json",
@@ -42,11 +46,8 @@ const QWEN38_REQUIRED_METADATA_FILES: &[&str] = &[
 
 fn qwen_chat_gguf_filename(variant: ModelVariant) -> Option<&'static str> {
     match variant {
-        ModelVariant::Qwen306BGguf => Some("Qwen3-0.6B-Q8_0.gguf"),
-        ModelVariant::Qwen317BGguf => Some("Qwen3-1.7B-Q8_0.gguf"),
-        ModelVariant::Qwen34BGguf => Some("Qwen3-4B-Q4_K_M.gguf"),
-        ModelVariant::Qwen38BGguf => Some("Qwen3-8B-Q4_K_M.gguf"),
         ModelVariant::Qwen314BGguf => Some("Qwen3-14B-Q4_K_M.gguf"),
+        ModelVariant::Qwen3Moe30bA3bGguf => Some("Qwen3-30B-A3B-Q4_K_M.gguf"),
         _ => None,
     }
 }
@@ -262,6 +263,61 @@ fn qwen38_selected_files(index_bytes: &[u8]) -> Result<Vec<String>> {
     Ok(files)
 }
 
+const QWEN35_MOE_REQUIRED_METADATA_FILES: &[&str] = &[
+    "config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "model.safetensors.index.json",
+];
+
+fn qwen35_moe_selected_files(index_bytes: &[u8]) -> Result<Vec<String>> {
+    let mut files = QWEN35_MOE_REQUIRED_METADATA_FILES
+        .iter()
+        .map(|file| (*file).to_string())
+        .collect::<Vec<_>>();
+    files.extend(indexed_safetensor_shards(index_bytes)?);
+    Ok(files)
+}
+
+fn qwen35_moe_bundle_is_complete(model_dir: &Path) -> bool {
+    let index_bytes = match std::fs::read(model_dir.join("model.safetensors.index.json")) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let mut selected_files = match qwen35_moe_selected_files(&index_bytes) {
+        Ok(files) => files,
+        Err(_) => return false,
+    };
+    if !selected_files
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+    {
+        return false;
+    }
+
+    let manifest = match read_artifact_manifest(model_dir) {
+        Ok(Some(manifest)) => manifest,
+        _ => return false,
+    };
+    let mut recorded_files = manifest.files.clone();
+    recorded_files.sort();
+    recorded_files.dedup();
+    selected_files.sort();
+    selected_files.dedup();
+
+    manifest.schema_version == 1
+        && manifest.variant == ModelVariant::Qwen35Moe35BA3BFp8
+        && manifest.repo_id == ModelVariant::Qwen35Moe35BA3BFp8.repo_id()
+        && manifest.revision == ModelVariant::QWEN35_MOE_35B_A3B_FP8_ARTIFACT_REVISION
+        && recorded_files == selected_files
+}
+
 fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
     let index_bytes = match std::fs::read(model_dir.join("model.safetensors.index.json")) {
         Ok(bytes) => bytes,
@@ -375,6 +431,83 @@ pub struct DownloadStateManager {
     state: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadState>>>,
 }
 
+/// In-memory expected-size map backed by a JSON file next to the models dir.
+/// Reads consult memory only; fresh Hugging Face resolutions append to the
+/// file so the next cold start renders sizes without any network round-trip.
+#[derive(Debug, Clone)]
+struct ExpectedSizeStore {
+    path: PathBuf,
+    sizes: Arc<RwLock<HashMap<ModelVariant, u64>>>,
+}
+
+impl ExpectedSizeStore {
+    fn load(models_dir: &Path) -> Self {
+        let path = models_dir.join(EXPECTED_SIZES_CACHE_FILE);
+        let sizes = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<HashMap<String, u64>>(&bytes)
+                    .map_err(|error| {
+                        warn!(
+                            "Ignoring unreadable expected-size cache {}: {}",
+                            path.display(),
+                            error
+                        );
+                        error
+                    })
+                    .ok()
+            })
+            .map(|raw| {
+                raw.into_iter()
+                    .filter_map(|(name, size)| {
+                        crate::catalog::parse_model_variant(&name)
+                            .ok()
+                            .map(|variant| (variant, size))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        Self {
+            path,
+            sizes: Arc::new(RwLock::new(sizes)),
+        }
+    }
+
+    async fn get(&self, variant: ModelVariant) -> Option<u64> {
+        self.sizes.read().await.get(&variant).copied()
+    }
+
+    async fn insert(&self, variant: ModelVariant, size: u64) {
+        let snapshot = {
+            let mut sizes = self.sizes.write().await;
+            if sizes.get(&variant).copied() == Some(size) {
+                return;
+            }
+            sizes.insert(variant, size);
+            sizes
+                .iter()
+                .map(|(variant, size)| (variant.dir_name().to_string(), *size))
+                .collect::<HashMap<_, _>>()
+        };
+        // Best-effort persistence: a cache write failure must never fail a
+        // download or a model-list request.
+        let path = self.path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let bytes = serde_json::to_vec_pretty(&snapshot)?;
+            let partial = path.with_extension("json.part");
+            std::fs::write(&partial, bytes)?;
+            std::fs::rename(&partial, &path)?;
+            std::result::Result::<(), Error>::Ok(())
+        })
+        .await;
+        if let Err(join) = &result {
+            warn!("Expected-size cache write task failed: {join}");
+        } else if let Ok(Err(error)) = result {
+            warn!("Failed to persist expected-size cache: {error}");
+        }
+    }
+}
+
 impl DownloadStateManager {
     pub fn new() -> Self {
         Self::default()
@@ -404,7 +537,11 @@ pub struct ModelDownloader {
     active_downloads: Arc<RwLock<std::collections::HashMap<ModelVariant, ActiveDownload>>>,
     latest_progress: Arc<RwLock<std::collections::HashMap<ModelVariant, DownloadProgress>>>,
     repo_tree_cache: Arc<RwLock<HashMap<String, HashMap<String, u64>>>>,
-    expected_size_cache: Arc<RwLock<HashMap<ModelVariant, u64>>>,
+    expected_sizes: ExpectedSizeStore,
+    /// Cached on-disk size per downloaded variant. Recursive directory scans
+    /// are expensive and run off the async executor; the result is memoized
+    /// until a download, cancellation, or deletion changes the directory.
+    downloaded_sizes: Arc<RwLock<HashMap<ModelVariant, u64>>>,
     multi_progress: MultiProgress,
     state_manager: DownloadStateManager,
 }
@@ -425,6 +562,7 @@ impl ModelDownloader {
 
         let multi_progress = MultiProgress::new();
         multi_progress.set_draw_target(indicatif::ProgressDrawTarget::stderr_with_hz(10));
+        let expected_sizes = ExpectedSizeStore::load(&models_dir);
 
         Ok(Self {
             models_dir,
@@ -432,7 +570,8 @@ impl ModelDownloader {
             active_downloads: Arc::new(RwLock::new(std::collections::HashMap::new())),
             latest_progress: Arc::new(RwLock::new(std::collections::HashMap::new())),
             repo_tree_cache: Arc::new(RwLock::new(HashMap::new())),
-            expected_size_cache: Arc::new(RwLock::new(HashMap::new())),
+            expected_sizes,
+            downloaded_sizes: Arc::new(RwLock::new(HashMap::new())),
             multi_progress,
             state_manager: DownloadStateManager::new(),
         })
@@ -740,6 +879,9 @@ impl ModelDownloader {
         if variant.is_qwen38_fp8() {
             return qwen38_bundle_is_complete(&path);
         }
+        if variant.is_qwen35_moe_fp8() {
+            return qwen35_moe_bundle_is_complete(&path);
+        }
 
         let has_any_safetensors = || {
             std::fs::read_dir(&path)
@@ -819,11 +961,20 @@ impl ModelDownloader {
             ModelFamily::GraniteSpeechAsr => GRANITE_SPEECH_FILES
                 .iter()
                 .all(|file| path.join(file).exists()),
-            ModelFamily::SortformerDiarization => path
-                .join("diar_streaming_sortformer_4spk-v2.1.nemo")
-                .exists(),
+            ModelFamily::SortformerDiarization => {
+                let nemo_file = match variant {
+                    ModelVariant::DiarStreamingSortformer4SpkV21 => {
+                        "diar_streaming_sortformer_4spk-v2.1.nemo"
+                    }
+                    ModelVariant::Nemotron3Diarization => "Nemotron-3-Diarization.nemo",
+                    _ => unreachable!("checked by family"),
+                };
+                path.join(nemo_file).exists()
+            }
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
@@ -1055,6 +1206,8 @@ impl ModelDownloader {
                 .state_manager
                 .set_state(variant, final_state)
                 .await;
+            // The directory contents changed; drop any memoized size.
+            downloader.invalidate_downloaded_size(variant).await;
 
             // Remove finished task from active-downloads registry so UI/handlers
             // stop treating completed downloads as active.
@@ -1087,7 +1240,8 @@ impl ModelDownloader {
             active_downloads: Arc::clone(&self.active_downloads),
             latest_progress: Arc::clone(&self.latest_progress),
             repo_tree_cache: Arc::clone(&self.repo_tree_cache),
-            expected_size_cache: Arc::clone(&self.expected_size_cache),
+            expected_sizes: self.expected_sizes.clone(),
+            downloaded_sizes: Arc::clone(&self.downloaded_sizes),
             multi_progress: MultiProgress::new(), // Each spawned task gets its own multi-progress
             state_manager: self.state_manager.clone(),
         }
@@ -1427,20 +1581,32 @@ impl ModelDownloader {
                 vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
             }
             ModelFamily::GraniteSpeechAsr => granite_speech_files(),
-            ModelFamily::SortformerDiarization => vec![
-                "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
-                "README.md".to_string(),
-                "bias.md".to_string(),
-                "privacy.md".to_string(),
-                "safety.md".to_string(),
-            ],
+            ModelFamily::SortformerDiarization => match variant {
+                ModelVariant::Nemotron3Diarization => {
+                    vec!["Nemotron-3-Diarization.nemo".to_string()]
+                }
+                _ => vec![
+                    "diar_streaming_sortformer_4spk-v2.1.nemo".to_string(),
+                    "README.md".to_string(),
+                    "bias.md".to_string(),
+                    "privacy.md".to_string(),
+                    "safety.md".to_string(),
+                ],
+            },
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
                 if variant.is_qwen38_fp8() {
                     return QWEN38_REQUIRED_METADATA_FILES
+                        .iter()
+                        .map(|file| (*file).to_string())
+                        .collect();
+                } else if variant.is_qwen35_moe_fp8() {
+                    return QWEN35_MOE_REQUIRED_METADATA_FILES
                         .iter()
                         .map(|file| (*file).to_string())
                         .collect();
@@ -1618,10 +1784,6 @@ impl ModelDownloader {
 
         if variant.is_qwen_chat_gguf() {
             let tokenizer_repo = match variant {
-                ModelVariant::Qwen306BGguf => "Qwen/Qwen3-0.6B",
-                ModelVariant::Qwen317BGguf => "Qwen/Qwen3-1.7B",
-                ModelVariant::Qwen34BGguf => "Qwen/Qwen3-4B",
-                ModelVariant::Qwen38BGguf => "Qwen/Qwen3-8B",
                 ModelVariant::Qwen314BGguf => "Qwen/Qwen3-14B",
                 _ => variant.repo_id(),
             };
@@ -1749,6 +1911,37 @@ impl ModelDownloader {
         })
     }
 
+    /// Index-closure file plan for the Qwen3.5-35B-A3B-FP8 bundle: every
+    /// safetensors shard named by the index plus the required metadata files.
+    async fn get_qwen35_moe_indexed_file_specs(&self) -> Result<Vec<ModelFileSpec>> {
+        let variant = ModelVariant::Qwen35Moe35BA3BFp8;
+        let repo_id = variant.repo_id();
+        let revision = variant
+            .artifact_revision()
+            .expect("Qwen3.5 MoE artifact revision is catalog-pinned");
+        let local_index = self
+            .model_path(variant)
+            .join("model.safetensors.index.json");
+        let index_bytes = if local_index.is_file() {
+            tokio::fs::read(&local_index).await?
+        } else {
+            self.get_file_bytes(repo_id, revision, "model.safetensors.index.json")
+                .await?
+        };
+
+        qwen35_moe_selected_files(&index_bytes).map(|files| {
+            files
+                .into_iter()
+                .map(|file| ModelFileSpec {
+                    source_repo: repo_id.to_string(),
+                    source_revision: revision.to_string(),
+                    source_file: file.clone(),
+                    local_file: file,
+                })
+                .collect()
+        })
+    }
+
     /// Get actual file size from HTTP HEAD request
     async fn get_actual_file_size(
         &self,
@@ -1794,11 +1987,13 @@ impl ModelDownloader {
     ) -> Result<Vec<FileDownloadPlan>> {
         let file_specs = if variant.is_qwen38_fp8() {
             self.get_qwen38_indexed_file_specs().await?
+        } else if variant.is_qwen35_moe_fp8() {
+            self.get_qwen35_moe_indexed_file_specs().await?
         } else {
             self.get_model_file_specs(variant)
         };
         let local_dir = self.model_path(variant);
-        let require_exact_bundle = variant.is_qwen38_fp8();
+        let require_exact_bundle = variant.is_qwen38_fp8() || variant.is_qwen35_moe_fp8();
 
         let mut repo_tree_indexes: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         let mut repo_tree_planning_available = true;
@@ -1968,15 +2163,7 @@ impl ModelDownloader {
             150_000_000
         } else if file.ends_with(".gguf") {
             let lower = file.to_ascii_lowercase();
-            if file.contains("Qwen3-0.6B") {
-                1_100_000_000
-            } else if file.contains("Qwen3-1.7B") {
-                2_400_000_000
-            } else if file.contains("Qwen3-4B") {
-                2_500_000_000
-            } else if file.contains("Qwen3-8B") {
-                5_200_000_000
-            } else if file.contains("Qwen3-14B") {
+            if file.contains("Qwen3-14B") {
                 9_200_000_000
             } else if file.contains("Qwen3.5-0.8B") {
                 685_000_000
@@ -2033,16 +2220,11 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
                     ModelVariant::Qwen3ForcedAligner06B4Bit => 703_000_000,
-                    ModelVariant::Qwen306BGguf => 1_100_000_000,
-                    ModelVariant::Qwen317BGguf => 2_400_000_000,
-                    ModelVariant::Qwen34BGguf => 2_500_000_000,
-                    ModelVariant::Qwen38BGguf => 5_200_000_000,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Qwen3508BGguf => 685_000_000,
                     ModelVariant::Qwen352BGguf => 1_850_000_000,
                     ModelVariant::Qwen354BGguf => 3_250_000_000,
                     ModelVariant::Qwen359BGguf => 6_350_000_000,
-                    ModelVariant::Gemma31BIt => 2_100_000_000,
                     ModelVariant::Gemma34BIt => 2_400_000_000,
                     ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
                     _ => 1_500_000_000,
@@ -2059,6 +2241,7 @@ impl ModelDownloader {
                 ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
                 ModelVariant::Nemotron35AsrStreaming06B => 2_370_000_000,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
+                ModelVariant::Nemotron3Diarization => 200_000_000,
                 _ => 4_000_000_000,
             }
         } else if file.contains("tokenizer") && file.contains("safetensors") {
@@ -2086,14 +2269,33 @@ impl ModelDownloader {
             .collect()
     }
 
-    /// Get download size for a model (if available from cache)
-    pub fn get_cached_size(&self, variant: ModelVariant) -> Option<u64> {
-        let path = self.model_path(variant);
-        if path.exists() {
-            Self::dir_size(&path).ok()
-        } else {
-            None
+    /// Get the on-disk size of a downloaded model, computing it off the async
+    /// executor on first use and memoizing the result. Returns `None` when the
+    /// model directory is absent. Callers that mutate the directory must
+    /// invalidate via [`Self::invalidate_downloaded_size`].
+    pub async fn get_cached_size(&self, variant: ModelVariant) -> Option<u64> {
+        if let Some(size) = self.downloaded_sizes.read().await.get(&variant).copied() {
+            return Some(size);
         }
+        let path = self.model_path(variant);
+        if !path.exists() {
+            return None;
+        }
+        let computed = tokio::task::spawn_blocking(move || Self::dir_size(&path).ok())
+            .await
+            .ok()
+            .flatten()?;
+        self.downloaded_sizes
+            .write()
+            .await
+            .insert(variant, computed);
+        Some(computed)
+    }
+
+    /// Drop the memoized on-disk size for a variant after its directory was
+    /// created, modified, or removed.
+    pub(crate) async fn invalidate_downloaded_size(&self, variant: ModelVariant) {
+        self.downloaded_sizes.write().await.remove(&variant);
     }
 
     /// Resolve the expected total download size for a model variant.
@@ -2101,7 +2303,7 @@ impl ModelDownloader {
     /// This uses the same file planning logic as the downloader itself, then caches
     /// results so list APIs do not repeatedly hit Hugging Face.
     pub async fn expected_size_bytes(&self, variant: ModelVariant) -> u64 {
-        if let Some(size) = self.expected_size_cache.read().await.get(&variant).copied() {
+        if let Some(size) = self.expected_sizes.get(variant).await {
             return size;
         }
 
@@ -2116,12 +2318,16 @@ impl ModelDownloader {
             }
         };
 
-        self.expected_size_cache
-            .write()
-            .await
-            .insert(variant, resolved);
+        self.expected_sizes.insert(variant, resolved).await;
 
         resolved
+    }
+
+    /// Non-blocking lookup of a previously resolved expected size. Returns
+    /// `None` when no Hugging Face resolution has completed yet, so the caller
+    /// can fall back to the built-in estimate without any network I/O.
+    pub async fn cached_expected_size_bytes(&self, variant: ModelVariant) -> Option<u64> {
+        self.expected_sizes.get(variant).await
     }
 
     /// Subscribe to progress updates for an active download
@@ -2155,6 +2361,7 @@ impl ModelDownloader {
                 let _ = tokio::fs::remove_dir_all(&model_path).await;
             }
             self.clear_latest_progress(variant).await;
+            self.invalidate_downloaded_size(variant).await;
             // Update state
             self.state_manager
                 .set_state(variant, DownloadState::NotDownloaded)
@@ -2372,6 +2579,27 @@ mod tests {
             files,
             vec!["nemotron-3.5-asr-streaming-0.6b.nemo".to_string()]
         );
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron3_diarization_model_files_only_include_nemo_checkpoint() {
+        let (downloader, temp_dir) = test_downloader();
+        let files = downloader.get_model_files(ModelVariant::Nemotron3Diarization);
+        assert_eq!(files, vec!["Nemotron-3-Diarization.nemo".to_string()]);
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn nemotron3_diarization_is_downloaded_when_nemo_checkpoint_exists() {
+        let (downloader, temp_dir) = test_downloader();
+        let variant = ModelVariant::Nemotron3Diarization;
+        let model_dir = downloader.model_path(variant);
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        assert!(!downloader.is_downloaded(variant));
+        std::fs::write(model_dir.join("Nemotron-3-Diarization.nemo"), [0u8])
+            .expect("nemo");
+        assert!(downloader.is_downloaded(variant));
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

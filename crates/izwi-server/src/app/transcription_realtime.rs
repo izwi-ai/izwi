@@ -22,13 +22,13 @@ use crate::app::realtime_protocol::{
 };
 use crate::state::AppState;
 
-const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
-const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
+pub(crate) const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
+pub(crate) const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
 
-const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
-const WS_BIN_VERSION: u8 = 1;
-const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
-const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
+pub(crate) const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
+pub(crate) const WS_BIN_VERSION: u8 = 1;
+pub(crate) const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
+pub(crate) const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
 
 const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
@@ -248,7 +248,7 @@ impl OutboundMailbox {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ClientEvent {
+pub(crate) enum ClientEvent {
     SessionStart {
         #[serde(default)]
         model_id: Option<String>,
@@ -269,7 +269,7 @@ enum ClientEvent {
 }
 
 #[derive(Debug)]
-enum BinaryMessageKind {
+pub(crate) enum BinaryMessageKind {
     ClientPcm16Frame {
         frame_seq: u32,
         sample_rate: u32,
@@ -298,7 +298,7 @@ enum WorkerCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptionWireProtocol {
+pub(crate) enum TranscriptionWireProtocol {
     LegacyV2,
     TypedV3,
 }
@@ -730,7 +730,7 @@ fn handle_text_message(
     }
 }
 
-fn negotiate_transcription_protocol(
+pub(crate) fn negotiate_transcription_protocol(
     protocol: Option<&str>,
     version: Option<u16>,
     resume_from_event_id: Option<u64>,
@@ -2026,7 +2026,7 @@ fn normalize_word(token: &str) -> String {
         .to_lowercase()
 }
 
-fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
+pub(crate) fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
     if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
         return Err("Unexpected binary message (missing transcription frame header)".to_string());
     }

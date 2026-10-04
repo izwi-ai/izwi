@@ -679,7 +679,11 @@ impl InferenceCoordinator {
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
-            poisoned: self.execution.poison_reason().is_some(),
+            // The shared resource authority poisons alongside the execution
+            // guard on backend-fatal errors (Metal command-buffer OOM at a
+            // load fence); probes and the desktop must see both.
+            poisoned: self.execution.poison_reason().is_some()
+                || self.resources.poison_reason().is_some(),
         }
     }
 
@@ -2462,12 +2466,21 @@ struct DeviceCapacityProbe {
     backend: BackendKind,
     device: Option<DeviceProfile>,
     configured_cap: Option<u64>,
+    configured_host_cap: Option<u64>,
     test_capacity: Option<u64>,
 }
 
 impl DeviceCapacityProbe {
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
-        match self.configured_cap {
+        Self::apply_optional_cap(self.configured_cap, total, available)
+    }
+
+    fn apply_host_cap(&self, total: u64, available: u64) -> (u64, u64) {
+        Self::apply_optional_cap(self.configured_host_cap, total, available)
+    }
+
+    fn apply_optional_cap(cap: Option<u64>, total: u64, available: u64) -> (u64, u64) {
+        match cap {
             Some(cap) => {
                 let effective_total = total.min(cap);
                 let used = total.saturating_sub(available.min(total));
@@ -2488,11 +2501,16 @@ impl DeviceCapacityProbe {
     }
 
     fn unavailable_snapshot(&self) -> PhysicalCapacitySnapshot {
-        PhysicalCapacitySnapshot {
+        let mut snapshot = PhysicalCapacitySnapshot {
             capacity: self.vector(ResourceAmount::Unknown),
             available: self.vector(ResourceAmount::Unknown),
             source: CapacitySource::Unavailable,
+        };
+        if self.backend == BackendKind::Cuda {
+            snapshot.capacity.host_bytes = ResourceAmount::Unknown;
+            snapshot.available.host_bytes = ResourceAmount::Unknown;
         }
+        snapshot
     }
 
     fn observed_capacity(&self) -> Option<(u64, u64, CapacitySource)> {
@@ -2518,6 +2536,7 @@ impl DeviceCapacityProbe {
                 Some(capacity) => (capacity, capacity),
                 None => host_memory_snapshot()?,
             };
+            let (host_total, host_available) = self.apply_host_cap(host_total, host_available);
             capacity_vector.host_bytes = ResourceAmount::Known(host_total);
             available_vector.host_bytes = ResourceAmount::Known(host_available);
         }
@@ -2559,10 +2578,45 @@ impl DeviceCapacityProvider {
                 )))
             }
         };
+        // Without an explicit budget the Metal advisory ledger used to admit
+        // against u64::MAX, so a model too large for the device surfaced only
+        // as a command-buffer OOM at the load fence (which poisons the
+        // resource authority). Fall back to a hardware-aware budget derived
+        // from the probed working set; an explicit operator budget always
+        // wins unchanged.
+        let configured_cap = configured_cap.or_else(|| {
+            (backend == BackendKind::Metal)
+                .then(|| derive_default_metal_budget(&device))
+                .flatten()
+        });
+        let configured_host_cap = if backend == BackendKind::Cuda {
+            match std::env::var("IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES") {
+                Ok(raw) => Some(
+                    raw.parse::<u64>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            Error::ConfigError(
+                                "IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES must be a positive integer"
+                                    .into(),
+                            )
+                        })?,
+                ),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(err) => {
+                    return Err(Error::ConfigError(format!(
+                        "failed to read IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES: {err}"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
         let probe = DeviceCapacityProbe {
             backend,
             device: Some(device),
             configured_cap,
+            configured_host_cap,
             test_capacity: cfg!(test).then_some(1024 * 1024 * 1024 * 1024),
         };
         Self::from_probe(probe)
@@ -2574,6 +2628,7 @@ impl DeviceCapacityProvider {
             backend,
             device: None,
             configured_cap: None,
+            configured_host_cap: None,
             test_capacity: Some(64 * 1024 * 1024 * 1024),
         };
         Self::from_probe(probe).expect("fixed test capacity must initialize")
@@ -2785,6 +2840,32 @@ fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
 
 #[cfg(not(feature = "metal"))]
 fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    None
+}
+
+/// Default Metal advisory-ledger budget as a fraction of the probed working
+/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset. The remaining fraction
+/// absorbs command buffers, staging copies, and allocator metadata that no
+/// per-model static estimate tracks.
+const METAL_DEFAULT_BUDGET_NUMERATOR: u64 = 9;
+const METAL_DEFAULT_BUDGET_DENOMINATOR: u64 = 10;
+
+fn metal_default_budget_from_working_set(recommended_max_working_set: u64) -> u64 {
+    recommended_max_working_set
+        .checked_div(METAL_DEFAULT_BUDGET_DENOMINATOR)
+        .unwrap_or(0)
+        .saturating_mul(METAL_DEFAULT_BUDGET_NUMERATOR)
+}
+
+#[cfg(feature = "metal")]
+fn derive_default_metal_budget(device: &DeviceProfile) -> Option<u64> {
+    let metal = device.device.as_metal_device().ok()?.metal_device();
+    let working_set = u64::try_from(metal.recommended_max_working_set_size()).ok()?;
+    Some(metal_default_budget_from_working_set(working_set))
+}
+
+#[cfg(not(feature = "metal"))]
+fn derive_default_metal_budget(_device: &DeviceProfile) -> Option<u64> {
     None
 }
 
@@ -3508,6 +3589,7 @@ Pages free: 10.\n";
                 backend: BackendKind::Cpu,
                 device: None,
                 configured_cap: None,
+                configured_host_cap: None,
                 test_capacity: None,
             },
             cache,
@@ -3541,12 +3623,15 @@ Pages free: 10.\n";
             backend: BackendKind::Cuda,
             device: None,
             configured_cap: Some(80),
+            configured_host_cap: Some(60),
             test_capacity: None,
         };
 
         assert_eq!(probe.apply_cap(100, 70), (80, 50));
         assert_eq!(probe.apply_cap(100, 10), (80, 0));
         assert_eq!(probe.apply_cap(64, 40), (64, 40));
+        assert_eq!(probe.apply_host_cap(100, 70), (60, 30));
+        assert_eq!(probe.apply_host_cap(100, 10), (60, 0));
     }
 
     #[test]
@@ -3574,6 +3659,44 @@ Pages free: 10.\n";
     fn metal_capacity_is_bounded_by_working_set_pressure() {
         assert_eq!(combine_metal_memory_snapshot(100, 90, 200, 150), (100, 10));
         assert_eq!(combine_metal_memory_snapshot(100, 120, 200, 150), (100, 0));
+    }
+
+    #[test]
+    fn metal_default_budget_is_a_fraction_of_the_working_set() {
+        assert_eq!(metal_default_budget_from_working_set(1000), 900);
+        assert_eq!(metal_default_budget_from_working_set(7), 0);
+        assert_eq!(
+            metal_default_budget_from_working_set(u64::MAX),
+            u64::MAX / 10 * 9
+        );
+    }
+
+    #[test]
+    fn metal_default_budget_caps_the_admitted_capacity_snapshot() {
+        let probe = DeviceCapacityProbe {
+            backend: BackendKind::Metal,
+            device: None,
+            configured_cap: Some(metal_default_budget_from_working_set(1000)),
+            configured_host_cap: None,
+            test_capacity: Some(10_000),
+        };
+
+        let snapshot = probe.sample().expect("metal sample");
+        assert_eq!(snapshot.capacity.unified_bytes, ResourceAmount::Known(900));
+        assert_eq!(
+            snapshot.available.unified_bytes,
+            ResourceAmount::Known(900)
+        );
+    }
+
+    #[test]
+    fn coordinator_snapshot_poisoned_includes_the_resource_authority() {
+        let coordinator = InferenceCoordinator::new(BackendKind::Cpu, 2, 2);
+        assert!(!coordinator.snapshot().poisoned);
+        coordinator.resources.poison("simulated authority poison");
+        assert!(coordinator.snapshot().poisoned);
+        coordinator.resources.clear_poison();
+        assert!(!coordinator.snapshot().poisoned);
     }
 
     #[test]

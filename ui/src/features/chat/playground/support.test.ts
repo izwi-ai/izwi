@@ -44,7 +44,7 @@ describe("chat playground support", () => {
   });
 
   it("uses variant-aware thinking defaults for supported chat models", () => {
-    expect(defaultThinkingEnabledForModel("Qwen3-4B-GGUF")).toBe(true);
+    expect(defaultThinkingEnabledForModel("Qwen3-14B-GGUF")).toBe(true);
     expect(defaultThinkingEnabledForModel("Qwen3.5-0.8B")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-2B")).toBe(false);
     expect(defaultThinkingEnabledForModel("Qwen3.5-4B")).toBe(true);
@@ -75,7 +75,7 @@ describe("chat playground support", () => {
 
   it("recognizes Qwen3.5 as the image-capable chat family", () => {
     expect(supportsImageAttachmentsForModel("Qwen3.5-4B")).toBe(true);
-    expect(supportsImageAttachmentsForModel("Qwen3-4B-GGUF")).toBe(false);
+    expect(supportsImageAttachmentsForModel("Qwen3-14B-GGUF")).toBe(false);
   });
 
   it("builds multimodal request content with image parts", () => {

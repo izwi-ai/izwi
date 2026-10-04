@@ -72,6 +72,51 @@ impl From<BackendKind> for BackendPreference {
     }
 }
 
+/// An execution device assigned to a production worker by its supervisor.
+///
+/// Unlike [`BackendPreference`], an assignment is strict: selecting any other
+/// backend or physical accelerator is an error rather than a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeDeviceAssignment {
+    Cpu,
+    Metal {
+        process_local_device_index: usize,
+        expected_device_id: String,
+    },
+    Cuda {
+        process_local_device_index: usize,
+        expected_device_uuid: String,
+    },
+}
+
+impl RuntimeDeviceAssignment {
+    pub const fn backend_kind(&self) -> BackendKind {
+        match self {
+            Self::Cpu => BackendKind::Cpu,
+            Self::Metal { .. } => BackendKind::Metal,
+            Self::Cuda { .. } => BackendKind::Cuda,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Metal {
+                expected_device_id, ..
+            } if expected_device_id.trim().is_empty() => {
+                Err("Metal assignment requires a non-empty stable device ID")
+            }
+            Self::Cuda {
+                expected_device_uuid,
+                ..
+            } if expected_device_uuid.trim().is_empty() => {
+                Err("CUDA assignment requires a non-empty stable device UUID")
+            }
+            Self::Metal { .. } | Self::Cuda { .. } => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSelectionSource {
     Default,
@@ -220,5 +265,25 @@ mod tests {
             BackendPreference::from(BackendKind::Cuda),
             BackendPreference::Cuda
         );
+    }
+
+    #[test]
+    fn runtime_assignments_are_strict_and_require_accelerator_identity() {
+        assert_eq!(
+            RuntimeDeviceAssignment::Cpu.backend_kind(),
+            BackendKind::Cpu
+        );
+        assert!(RuntimeDeviceAssignment::Metal {
+            process_local_device_index: 0,
+            expected_device_id: " ".into(),
+        }
+        .validate()
+        .is_err());
+        assert!(RuntimeDeviceAssignment::Cuda {
+            process_local_device_index: 0,
+            expected_device_uuid: "GPU-0123".into(),
+        }
+        .validate()
+        .is_ok());
     }
 }

@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 runner="${repo_root}/scripts/bench/run-cuda-model-load-evidence.sh"
 manifest="${repo_root}/benchmarks/manifests/cuda-family-load.txt"
+expected_models=$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "${manifest}")
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -13,11 +14,11 @@ grep -q -- '--dry-run' <<<"${help}"
 grep -q 'actual_device_kind=cuda' <<<"${help}"
 
 ${runner} --manifest "${manifest}" --output "${tmp_dir}/dry" --dry-run >/dev/null
-jq -e '
+jq -e --argjson expected_models "${expected_models}" '
     .schema == "izwi.cuda-model-load-evidence.v1" and
     .status == "unsupported" and
     .reason == "dry_run" and
-    (.models | length) == 21 and
+    (.models | length) == $expected_models and
     ([.models[].model] | length == (unique | length)) and
     ([.models[].model] | index("Qwen3.8-27B-FP8") != null) and
     ([.models[].model] | index("Qwen3-ForcedAligner-0.6B") != null) and

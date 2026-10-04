@@ -318,7 +318,7 @@ mod tests {
     fn broker_shadow_observes_and_validates_engine_requests() {
         let broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
         let (adapters, backend_router) = route_test_fixture();
-        let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Qwen38BGguf);
+        let request = EngineCoreRequest::chat(vec![]).with_model_variant(ModelVariant::Qwen359BGguf);
 
         let observation = broker
             .observe_engine_request(&request, &adapters, &backend_router)

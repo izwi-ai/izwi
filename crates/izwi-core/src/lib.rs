@@ -103,15 +103,17 @@ pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase, AudioChunk,
     CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot, GenerationConfig,
     InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions, PipelineRuntimeTelemetrySnapshot,
-    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeLatencyStats,
-    RuntimeObservabilityTelemetrySnapshot, RuntimeObservationContext, RuntimeReplayRecord,
-    RuntimeRequestContext, RuntimeService, RuntimeStageObservation, RuntimeStageOutcome,
-    RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetrySnapshot, RuntimeTraceContract,
-    RuntimeTracePhase, RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration,
-    VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION,
-    RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND,
-    TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE,
-    TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
+    ReplayRedaction, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
+    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardown,
+    RuntimeChatTeardownDisposition, RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot,
+    RuntimeObservationContext, RuntimeReplayRecord, RuntimeRequestContext, RuntimeService,
+    RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
+    RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
+    RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration, VoiceRuntimeTelemetrySnapshot,
+    VoiceSession, VoiceSessionPhase, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
+    TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
+    TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
+    TRACE_STREAMING_MODE,
 };
 pub use runtime::{
     AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
@@ -127,10 +129,11 @@ pub use artifacts::{
 };
 pub use catalog::{
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, resolve_diarization_model_variant, ChatModelCapabilities,
-    CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind,
-    CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,
-    CudaSupportLevel, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    resolve_asr_model_variant, resolve_diarization_model_variant,
+    resolve_diarization_model_variant_strict, ChatModelCapabilities, CudaEvidenceLevel,
+    CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind, CudaProviderClass,
+    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
+    ModelFamily, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,

@@ -22,7 +22,9 @@ impl ModelLifecycleController {
             | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::SortformerDiarization
             | ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat

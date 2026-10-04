@@ -29,7 +29,7 @@ use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen35_composite_cache_contract;
-use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
+use super::text::{Qwen35MoeFfnGeometry, Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
@@ -137,6 +137,12 @@ pub struct ChatDecodeState {
     prefill_vision_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each sample.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+    /// DS9.2: per-request constrained-decoding runtime, present only when
+    /// the request asked for `response_format: json_object`.
+    grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
 }
 
 impl ChatDecodeState {
@@ -289,6 +295,9 @@ pub struct Qwen35TextConfig {
     pub ssm_time_step_rank: usize,
     pub ssm_inner_size: usize,
     pub full_attention_interval: usize,
+    /// Sparse-expert geometry; `None` for the dense GGUF family, `Some`
+    /// when every layer's feed-forward is the sparse MoE block.
+    pub moe_ffn: Option<Qwen35MoeFfnGeometry>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +327,7 @@ struct AddedToken {
     content: String,
 }
 
-struct Qwen35Tokenizer {
+pub(crate) struct Qwen35Tokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
@@ -339,7 +348,11 @@ struct GgufTokenizerMetadata {
 }
 
 impl Qwen35Tokenizer {
-    fn load(model_dir: &Path, variant: ModelVariant, loader: &GgufLoader) -> Result<Self> {
+    pub(crate) fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        loader: &GgufLoader,
+    ) -> Result<Self> {
         let gguf_meta = parse_gguf_tokenizer_metadata(loader)?;
         let config = load_tokenizer_config_file(model_dir)?;
         let mut inner = match Tokenizer::from_path(model_dir) {
@@ -432,6 +445,78 @@ impl Qwen35Tokenizer {
         })
     }
 
+    /// HF-native load path for checkpoints without a GGUF tokenizer
+    /// (the qwen35moe FP8 safetensors bundle): `tokenizer.json` supplies
+    /// the vocabulary and `tokenizer_config.json` the specials/template.
+    pub(crate) fn load_hf(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
+        let config = load_tokenizer_config_file(model_dir)?;
+        let inner = Tokenizer::from_path(model_dir)?;
+        let vocab_size = inner.vocab_size();
+
+        let id_for = |token: &str| inner.token_to_id(token);
+        let im_start = id_for("<|im_start|>")
+            .ok_or_else(|| Error::TokenizationError("Missing <|im_start|> token id".to_string()))?;
+        let im_end = id_for("<|im_end|>")
+            .ok_or_else(|| Error::TokenizationError("Missing <|im_end|> token id".to_string()))?;
+        let image_pad = id_for("<|image_pad|>").ok_or_else(|| {
+            Error::TokenizationError("Missing <|image_pad|> token id".to_string())
+        })?;
+        let video_pad = id_for("<|video_pad|>").ok_or_else(|| {
+            Error::TokenizationError("Missing <|video_pad|> token id".to_string())
+        })?;
+
+        let eos = config
+            .as_ref()
+            .and_then(|cfg| cfg.eos_token.as_deref())
+            .and_then(id_for)
+            .unwrap_or(im_end);
+        let eos_alt = id_for("<|endoftext|>");
+
+        let chat_template = config
+            .as_ref()
+            .and_then(|cfg| cfg.chat_template.clone())
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Missing tokenizer chat template: no tokenizer_config.json chat_template"
+                        .to_string(),
+                )
+            })?;
+        let default_enable_thinking = resolve_default_enable_thinking(&chat_template, variant);
+
+        let mut literal_special_tokens: Vec<(String, u32)> = config
+            .as_ref()
+            .map(|cfg| {
+                cfg.added_tokens_decoder
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        id.parse::<u32>().ok().map(|id| (entry.content.clone(), id))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        literal_special_tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        literal_special_tokens.dedup_by(|(left, _), (right, _)| left == right);
+
+        Ok(Self {
+            inner,
+            vocab_size,
+            specials: SpecialTokenIds {
+                im_start,
+                im_end,
+                image_pad,
+                video_pad,
+                eos,
+                eos_alt,
+            },
+            literal_special_tokens,
+            chat_template,
+            default_enable_thinking,
+            bos_token: config.and_then(|cfg| cfg.bos_token),
+        })
+    }
+
     fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         if self.literal_special_tokens.is_empty() {
             return self.inner.encode(text);
@@ -489,101 +574,35 @@ impl Qwen35Tokenizer {
     }
 }
 
+/// Checkpoint-format-agnostic execution core shared by the dense
+/// `Qwen35ChatModel` and the `qwen35moe` family: tokenizer, hybrid trunk
+/// configuration, and the decode-state machinery both wrappers drive. The
+/// dense wrapper adds vision encoding on top; the MoE wrapper is text-only.
+pub(crate) struct Qwen35ChatExec {
+    pub(crate) variant: ModelVariant,
+    pub(crate) tokenizer: Qwen35Tokenizer,
+    pub(crate) text_config: Qwen35TextConfig,
+    pub(crate) text_model: Qwen35TextModel,
+}
+
 pub struct Qwen35ChatModel {
     device_kind: BackendKind,
-    variant: ModelVariant,
-    tokenizer: Qwen35Tokenizer,
-    text_config: Qwen35TextConfig,
+    exec: Qwen35ChatExec,
     text_checkpoint: GgufModelInfo,
     projector_checkpoint: GgufModelInfo,
-    text_model: Qwen35TextModel,
     vision_model: Qwen35VisionModel,
 }
 
-impl InferenceStateContractProvider for Qwen35ChatModel {
-    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
-        let dtype = match self.device_kind {
-            BackendKind::Cuda => DType::F16,
-            BackendKind::Cpu | BackendKind::Metal => DType::F32,
-        };
-        Ok(InferenceStateCapability::Managed(
-            self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
-        ))
-    }
-}
-
-impl Qwen35ChatModel {
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
-        let mmproj_path = model_dir.join("mmproj-F16.gguf");
-
-        if !gguf_path.exists() {
-            return Err(Error::ModelLoadError(format!(
-                "Qwen3.5 GGUF checkpoint not found: {}",
-                gguf_path.display()
-            )));
-        }
-        if !mmproj_path.exists() {
-            return Err(Error::ModelLoadError(format!(
-                "Qwen3.5 projector checkpoint not found: {}",
-                mmproj_path.display()
-            )));
-        }
-
-        let backend = BackendKind::from(device.kind);
-        let text_loader = GgufLoader::from_path_with_backend(&gguf_path, backend)?;
-        let text_checkpoint = text_loader.get_model_info();
-        let architecture = text_checkpoint
-            .architecture
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        if architecture != "qwen35" {
-            return Err(Error::ModelLoadError(format!(
-                "Expected general.architecture=qwen35 for {}, found {}",
-                gguf_path.display(),
-                architecture
-            )));
-        }
-
-        let text_config = parse_text_config(&text_loader)?;
-        debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
-        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
-        let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
-
-        let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
-        let projector_checkpoint = projector_loader.get_model_info();
-        let vision_model =
-            Qwen35VisionModel::load(&projector_loader, &device.device, text_model.hidden_size())?;
-
-        info!(
-            "Loaded Qwen3.5 chat assets for {} on {:?} ({} text tensors, {} projector tensors)",
-            variant.display_name(),
-            device.kind,
-            text_loader.tensor_count(),
-            projector_loader.tensor_count()
-        );
-
-        Ok(Self {
-            device_kind: backend,
-            variant,
-            tokenizer,
-            text_config,
-            text_checkpoint,
-            projector_checkpoint,
-            text_model,
-            vision_model,
-        })
-    }
-
-    pub fn variant(&self) -> ModelVariant {
+impl Qwen35ChatExec {
+    pub(crate) fn variant(&self) -> ModelVariant {
         self.variant
     }
 
-    pub fn text_config(&self) -> &Qwen35TextConfig {
+    pub(crate) fn text_config(&self) -> &Qwen35TextConfig {
         &self.text_config
     }
 
-    pub fn max_context_tokens(&self) -> Result<usize> {
+    pub(crate) fn max_context_tokens(&self) -> Result<usize> {
         if self.text_config.context_length == 0 {
             return Err(Error::ModelLoadError(
                 "Qwen3.5 checkpoint has a zero context length".into(),
@@ -602,53 +621,64 @@ impl Qwen35ChatModel {
         qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
     }
 
-    pub fn chat_template(&self) -> &str {
+    pub(crate) fn chat_template(&self) -> &str {
         &self.tokenizer.chat_template
     }
 
-    pub fn default_enable_thinking(&self) -> bool {
+    pub(crate) fn default_enable_thinking(&self) -> bool {
         self.tokenizer.default_enable_thinking
     }
 
-    pub fn text_checkpoint(&self) -> &GgufModelInfo {
-        &self.text_checkpoint
-    }
-
-    pub fn projector_checkpoint(&self) -> &GgufModelInfo {
-        &self.projector_checkpoint
-    }
-
-    pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+    pub(crate) fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.prompt_token_ids_with_config(messages, &ChatGenerationConfig::default())
     }
 
-    pub fn prompt_token_ids_with_config(
+    pub(crate) fn prompt_token_ids_with_config(
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
     ) -> Result<Vec<u32>> {
-        Ok(self
-            .prepare_prompt_for_execution(messages, config)?
-            .prompt_ids)
+        Ok(self.prepare_text_prompt(messages, config)?.prompt_ids)
     }
 
-    pub fn prepare_prompt_for_execution(
+    /// Text-only prompt preparation: ChatML render with the thinking
+    /// contract, byte-safe encoding, and uniform per-token text positions.
+    /// Callers that accept media must reject it before invoking this.
+    pub(crate) fn prepare_text_prompt(
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
     ) -> Result<Qwen35PreparedPrompt> {
-        self.prepare_prompt(messages, config)
+        let prompt = render_prompt(messages, config, self.default_enable_thinking())?;
+        if prompt.contains(VIDEO_PAD_PLACEHOLDER) {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 video inputs are not implemented yet".to_string(),
+            ));
+        }
+        if prompt.contains(IMAGE_PAD_PLACEHOLDER) {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 image placeholders require paired media inputs".to_string(),
+            ));
+        }
+        let prompt_ids = self.tokenizer.encode_text(&prompt)?;
+        let prompt_positions = build_text_positions(prompt_ids.len());
+        Ok(Qwen35PreparedPrompt {
+            next_text_position: prompt_positions.len(),
+            prompt_ids,
+            prompt_positions,
+            vision_inputs: None,
+        })
     }
 
-    pub fn supports_incremental_decode(&self) -> bool {
+    pub(crate) fn supports_incremental_decode(&self) -> bool {
         true
     }
 
-    pub fn supports_continuous_decode_batch(&self) -> bool {
+    pub(crate) fn supports_continuous_decode_batch(&self) -> bool {
         true
     }
 
-    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+    pub(crate) fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
         let cfg = &self.text_config;
         let hidden = u64::try_from(cfg.embedding_length).ok();
         let ff = u64::try_from(cfg.feed_forward_length).ok();
@@ -677,30 +707,6 @@ impl Qwen35ChatModel {
             .ok_or_else(|| {
                 Error::InvalidInput("Qwen3.5 continuous decode workspace overflow".into())
             })
-    }
-
-    pub fn device_kind(&self) -> BackendKind {
-        self.device_kind
-    }
-
-    pub(crate) fn start_decode_state_physical(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
-        cache: PhysicalPagedKvCache,
-    ) -> Result<ChatDecodeState> {
-        let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
-        let mut state =
-            self.begin_resumable_prefill_state_physical(&prepared, max_new_tokens, config, cache)?;
-        self.continue_resumable_prefill_physical(
-            &mut state,
-            &prepared,
-            0,
-            prepared.prompt_ids.len(),
-        )?;
-        Ok(state)
     }
 
     pub(crate) fn begin_resumable_prefill_state_physical(
@@ -737,10 +743,35 @@ impl Qwen35ChatModel {
             finished: false,
             next_text_position: prepared.next_text_position,
             prefill_progress: 0,
+            pending_logprobs: Vec::new(),
             prefill_vision_progress: 0,
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
+            grammar: self.grammar_runtime(config),
         })
+    }
+
+    /// DS9.2 grammar runtime for this request, or `None` when the request
+    /// did not ask for constrained decoding. Always-sampleable ids mirror
+    /// `is_stop_token` so the decode loop can still finish inside the mask.
+    fn grammar_runtime(
+        &self,
+        config: &ChatGenerationConfig,
+    ) -> Option<crate::models::shared::sampling::GrammarRuntime> {
+        if !config.constrain_json_object {
+            return None;
+        }
+        Some(crate::models::shared::sampling::GrammarRuntime::new(
+            std::sync::Arc::new(self.tokenizer.inner.clone()),
+            [
+                Some(self.tokenizer.specials.im_end),
+                Some(self.tokenizer.specials.eos),
+                self.tokenizer.specials.eos_alt,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        ))
     }
 
     pub(crate) fn continue_resumable_prefill_physical(
@@ -835,7 +866,7 @@ impl Qwen35ChatModel {
         Ok(complete)
     }
 
-    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+    pub(crate) fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -866,13 +897,41 @@ impl Qwen35ChatModel {
         } else {
             &[]
         };
-        let next = take_quantum_sample(
-            &mut state.unconsumed_output,
-            self.tokenizer.vocab_size,
-            &state.config,
-            history,
-            &mut state.rng,
-        )?;
+        state.pending_logprobs.clear();
+        let next = {
+            let output = state.unconsumed_output.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
+                )
+            })?;
+            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
+                grammar.sample_token(
+                    &output,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            } else {
+                sample_next_token_with_logprobs(
+                    &output,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            };
+            if let Some(raw) = raw_logprobs {
+                let entry = crate::models::shared::sampling::resolve_token_logprob(
+                    &self.tokenizer.inner,
+                    &raw,
+                )?;
+                if !self.is_stop_token(token, &state.config) {
+                    state.pending_logprobs.push(entry);
+                }
+            }
+            token
+        };
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -916,7 +975,7 @@ impl Qwen35ChatModel {
         })
     }
 
-    pub fn decode_step_batch(
+    pub(crate) fn decode_step_batch(
         &self,
         states: &mut [&mut ChatDecodeState],
     ) -> Result<Vec<ChatDecodeStep>> {
@@ -963,18 +1022,44 @@ impl Qwen35ChatModel {
             } else {
                 &[]
             };
-            sampled.push(sample_next_token(
-                &logits.i((row, 0))?,
-                self.tokenizer.vocab_size,
-                &state.config,
-                history,
-                &mut state.rng,
-            )?);
+            state.pending_logprobs.clear();
+            let row_logits = logits.i((row, 0))?;
+            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
+                grammar.sample_token(
+                    &row_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            } else {
+                sample_next_token_with_logprobs(
+                    &row_logits,
+                    self.tokenizer.vocab_size,
+                    &state.config,
+                    history,
+                    &mut state.rng,
+                )?
+            };
+            let entry = raw_logprobs
+                .map(|raw| {
+                    crate::models::shared::sampling::resolve_token_logprob(
+                        &self.tokenizer.inner,
+                        &raw,
+                    )
+                })
+                .transpose()?;
+            sampled.push((token, entry));
             state.next_text_position = state.next_text_position.saturating_add(1);
         }
         let mut steps = Vec::with_capacity(states.len());
-        for (state, next) in states.iter_mut().zip(sampled) {
+        for (state, (next, logprob_entry)) in states.iter_mut().zip(sampled) {
             let is_stop = self.is_stop_token(next, &state.config);
+            if let Some(entry) = logprob_entry {
+                if !is_stop {
+                    state.pending_logprobs.push(entry);
+                }
+            }
             if state.track_history && !is_stop {
                 state.history_ids.push(next);
             }
@@ -1024,6 +1109,218 @@ impl Qwen35ChatModel {
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
     }
+}
+
+impl InferenceStateContractProvider for Qwen35ChatModel {
+    fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        let dtype = match self.device_kind {
+            BackendKind::Cuda => DType::F16,
+            BackendKind::Cpu | BackendKind::Metal => DType::F32,
+        };
+        Ok(InferenceStateCapability::Managed(
+            self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
+        ))
+    }
+}
+
+impl Qwen35ChatModel {
+    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
+        let mmproj_path = model_dir.join("mmproj-F16.gguf");
+
+        if !gguf_path.exists() {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3.5 GGUF checkpoint not found: {}",
+                gguf_path.display()
+            )));
+        }
+        if !mmproj_path.exists() {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3.5 projector checkpoint not found: {}",
+                mmproj_path.display()
+            )));
+        }
+
+        let backend = BackendKind::from(device.kind);
+        let text_loader = GgufLoader::from_path_with_backend(&gguf_path, backend)?;
+        let text_checkpoint = text_loader.get_model_info();
+        let architecture = text_checkpoint
+            .architecture
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        if architecture != "qwen35" {
+            return Err(Error::ModelLoadError(format!(
+                "Expected general.architecture=qwen35 for {}, found {}",
+                gguf_path.display(),
+                architecture
+            )));
+        }
+
+        let text_config = parse_text_config(&text_loader)?;
+        debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
+        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
+        let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
+
+        let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
+        let projector_checkpoint = projector_loader.get_model_info();
+        let vision_model =
+            Qwen35VisionModel::load(&projector_loader, &device.device, text_model.hidden_size())?;
+
+        info!(
+            "Loaded Qwen3.5 chat assets for {} on {:?} ({} text tensors, {} projector tensors)",
+            variant.display_name(),
+            device.kind,
+            text_loader.tensor_count(),
+            projector_loader.tensor_count()
+        );
+
+        Ok(Self {
+            device_kind: backend,
+            exec: Qwen35ChatExec {
+                variant,
+                tokenizer,
+                text_config,
+                text_model,
+            },
+            text_checkpoint,
+            projector_checkpoint,
+            vision_model,
+        })
+    }
+
+    pub fn variant(&self) -> ModelVariant {
+        self.exec.variant()
+    }
+
+    pub fn text_config(&self) -> &Qwen35TextConfig {
+        self.exec.text_config()
+    }
+
+    pub fn max_context_tokens(&self) -> Result<usize> {
+        self.exec.max_context_tokens()
+    }
+
+    /// Hybrid retained-state contract shared by loading, scheduling, and the
+    /// native model adapter.
+    pub(crate) fn managed_composite_cache_contract(
+        &self,
+        attention_dtype: DType,
+        preferred_page_tokens: usize,
+    ) -> Result<InferenceStateContract> {
+        self.exec
+            .managed_composite_cache_contract(attention_dtype, preferred_page_tokens)
+    }
+
+    pub fn chat_template(&self) -> &str {
+        self.exec.chat_template()
+    }
+
+    pub fn default_enable_thinking(&self) -> bool {
+        self.exec.default_enable_thinking()
+    }
+
+    pub fn text_checkpoint(&self) -> &GgufModelInfo {
+        &self.text_checkpoint
+    }
+
+    pub fn projector_checkpoint(&self) -> &GgufModelInfo {
+        &self.projector_checkpoint
+    }
+
+    pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+        self.prompt_token_ids_with_config(messages, &ChatGenerationConfig::default())
+    }
+
+    pub fn prompt_token_ids_with_config(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<Vec<u32>> {
+        Ok(self
+            .prepare_prompt_for_execution(messages, config)?
+            .prompt_ids)
+    }
+
+    pub fn prepare_prompt_for_execution(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatGenerationConfig,
+    ) -> Result<Qwen35PreparedPrompt> {
+        self.prepare_prompt(messages, config)
+    }
+
+    pub fn supports_incremental_decode(&self) -> bool {
+        self.exec.supports_incremental_decode()
+    }
+
+    pub fn supports_continuous_decode_batch(&self) -> bool {
+        self.exec.supports_continuous_decode_batch()
+    }
+
+    pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
+        self.exec.continuous_decode_batch_workspace_per_row_bytes()
+    }
+
+    pub fn device_kind(&self) -> BackendKind {
+        self.device_kind
+    }
+
+    pub(crate) fn start_decode_state_physical(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        let prepared = resolve_prepared_prompt(prepared, || self.prepare_prompt(messages, config))?;
+        let mut state = self.exec.begin_resumable_prefill_state_physical(
+            &prepared,
+            max_new_tokens,
+            config,
+            cache,
+        )?;
+        self.exec.continue_resumable_prefill_physical(
+            &mut state,
+            &prepared,
+            0,
+            prepared.prompt_ids.len(),
+        )?;
+        Ok(state)
+    }
+
+    pub(crate) fn begin_resumable_prefill_state_physical(
+        &self,
+        prepared: &Qwen35PreparedPrompt,
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        self.exec
+            .begin_resumable_prefill_state_physical(prepared, max_new_tokens, config, cache)
+    }
+
+    pub(crate) fn continue_resumable_prefill_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        self.exec
+            .continue_resumable_prefill_physical(state, prepared, span_start, span_end)
+    }
+
+    pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        self.exec.decode_step(state)
+    }
+
+    pub fn decode_step_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+    ) -> Result<Vec<ChatDecodeStep>> {
+        self.exec.decode_step_batch(states)
+    }
 
     fn prepare_prompt(
         &self,
@@ -1043,19 +1340,7 @@ impl Qwen35ChatModel {
             .vision_model
             .encode_media(&config.request.media_inputs)?
         else {
-            if image_placeholders > 0 {
-                return Err(Error::InvalidInput(
-                    "Qwen3.5 image placeholders require paired media inputs".to_string(),
-                ));
-            }
-            let prompt_ids = self.tokenizer.encode_text(&prompt)?;
-            let prompt_positions = build_text_positions(prompt_ids.len());
-            return Ok(Qwen35PreparedPrompt {
-                next_text_position: prompt_positions.len(),
-                prompt_ids,
-                prompt_positions,
-                vision_inputs: None,
-            });
+            return self.exec.prepare_text_prompt(messages, config);
         };
 
         if image_placeholders == 0 {
@@ -1072,12 +1357,12 @@ impl Qwen35ChatModel {
         }
 
         let expanded_prompt = expand_image_placeholders(&prompt, &vision_inputs.token_counts)?;
-        let prompt_ids = self.tokenizer.encode_text(&expanded_prompt)?;
+        let prompt_ids = self.exec.tokenizer.encode_text(&expanded_prompt)?;
         let (prompt_positions, next_text_position) = build_prompt_positions(
             &prompt_ids,
             &vision_inputs,
-            self.tokenizer.specials.image_pad,
-            self.tokenizer.specials.video_pad,
+            self.exec.tokenizer.specials.image_pad,
+            self.exec.tokenizer.specials.video_pad,
             self.vision_model.spatial_merge_size(),
         )?;
         Ok(Qwen35PreparedPrompt {
@@ -1389,7 +1674,11 @@ fn qwen35_gguf_filename(variant: ModelVariant) -> Result<&'static str> {
 fn resolve_default_enable_thinking(_chat_template: &str, variant: ModelVariant) -> bool {
     matches!(
         variant,
-        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf
+        ModelVariant::Qwen354BGguf
+            | ModelVariant::Qwen359BGguf
+            // Qwen3.5-35B-A3B ships thinking default-on; the empty think
+            // block is emitted when a request disables it.
+            | ModelVariant::Qwen35Moe35BA3BFp8
     )
 }
 
@@ -1448,17 +1737,18 @@ fn parse_text_config(loader: &GgufLoader) -> Result<Qwen35TextConfig> {
         ssm_time_step_rank: required_usize(loader, "qwen35.ssm.time_step_rank")?,
         ssm_inner_size: required_usize(loader, "qwen35.ssm.inner_size")?,
         full_attention_interval: required_usize(loader, "qwen35.full_attention_interval")?,
+        moe_ffn: None,
     })
 }
 
-fn required_usize(loader: &GgufLoader, key: &str) -> Result<usize> {
+pub(crate) fn required_usize(loader: &GgufLoader, key: &str) -> Result<usize> {
     loader
         .get_metadata_u64(key)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))
 }
 
-fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
+pub(crate) fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
     let value = loader
         .metadata_value(key)
         .and_then(gguf_to_f64)
@@ -1466,7 +1756,7 @@ fn required_f64(loader: &GgufLoader, key: &str) -> Result<f64> {
     Ok(value)
 }
 
-fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
+pub(crate) fn required_usize_array(loader: &GgufLoader, key: &str) -> Result<Vec<usize>> {
     let value = loader
         .metadata_value(key)
         .ok_or_else(|| Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}")))?;
@@ -1586,6 +1876,52 @@ fn take_quantum_sample(
         Error::InferenceError("Qwen3.5 decode quantum has no unconsumed model output".to_string())
     })?;
     sample_next_token(&output, vocab_size, config, history, rng)
+}
+
+/// DS9.3: sample a token and, when the request asked for logprobs, resolve
+/// the raw-distribution stats on host. Sampling math is unchanged.
+fn sample_next_token_with_logprobs(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: &[u32],
+    rng: &mut SimpleRng,
+) -> Result<(
+    u32,
+    Option<crate::models::shared::sampling::RawTokenLogprobs>,
+)> {
+    if !config.logprobs {
+        let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+        return Ok((token, None));
+    }
+    let raw_values = logits_to_vec(logits)?;
+    let mut values = raw_values.clone();
+    truncate_logits_to_vocab(&mut values, vocab_size);
+    if values.is_empty() {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 sampler received no in-vocabulary logits".to_string(),
+        ));
+    }
+    let (logsumexp, top) =
+        crate::models::shared::sampling::raw_logprobs_stats(&values, config.top_logprobs)?;
+    let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+    let chosen_raw = raw_values
+        .get(token as usize)
+        .copied()
+        .ok_or_else(|| Error::InferenceError("sampled token outside raw row".into()))?;
+    if !chosen_raw.is_finite() {
+        return Err(Error::InferenceError(
+            "sampled token has a non-finite raw logit".into(),
+        ));
+    }
+    Ok((
+        token,
+        Some(crate::models::shared::sampling::RawTokenLogprobs {
+            token,
+            logprob: chosen_raw - logsumexp,
+            top,
+        }),
+    ))
 }
 
 fn sample_next_token(
@@ -1933,6 +2269,12 @@ impl SimpleRng {
 
     fn next_f32(&mut self) -> f32 {
         (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
+impl crate::models::shared::sampling::GrammarRng for SimpleRng {
+    fn draw_unit(&mut self) -> f32 {
+        self.next_f32()
     }
 }
 
@@ -2340,6 +2682,9 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
         let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
@@ -2363,6 +2708,9 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 17,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
         };
         let history = [1u32];
         let mut direct_rng = SimpleRng::new(17);
@@ -2393,6 +2741,9 @@ mod tests {
             stop_token_ids: Vec::new(),
             seed: 7,
             request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
         let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
@@ -2418,6 +2769,9 @@ mod tests {
                 stop_token_ids: Vec::new(),
                 seed: 7,
                 request: ChatRequestConfig::default(),
+                logprobs: false,
+                top_logprobs: 0,
+                constrain_json_object: false,
             };
             let mut rng = SimpleRng::new(7);
             let error = sample_next_token(&logits, 3, &config, &[], &mut rng)

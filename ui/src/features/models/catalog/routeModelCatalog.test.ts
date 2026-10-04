@@ -8,6 +8,7 @@ import {
   SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   VOICE_CLONING_PREFERRED_MODELS,
+  diarizationSpeakerUpperBound,
   getChatRouteModelLabel,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
@@ -16,7 +17,7 @@ import { getModelProviderLabel, MODEL_DETAILS } from "./modelMetadata";
 describe("route model catalog", () => {
   it("keeps Qwen3.8 discoverable without making the 27B model the default", () => {
     expect(CHAT_PREFERRED_MODELS).toContain("Qwen3.8-27B-FP8");
-    expect(CHAT_PREFERRED_MODELS[0]).toBe("Qwen3-8B-GGUF");
+    expect(CHAT_PREFERRED_MODELS[0]).toBe("Qwen3.5-4B");
   });
 
   it("describes Qwen3.8 as a text-only Qwen chat model", () => {
@@ -33,11 +34,11 @@ describe("route model catalog", () => {
     );
   });
 
-  it("prioritizes Qwen3-8B as the default chat pick", () => {
+  it("prefers a downloaded higher preference only when no preferred model is ready", () => {
     const selected = resolvePreferredRouteModel({
       models: [
-        { variant: "Qwen3-8B-GGUF", status: "downloaded" },
-        { variant: "Qwen3-4B-GGUF", status: "ready" },
+        { variant: "Qwen3.5-9B", status: "downloaded" },
+        { variant: "Qwen3.5-4B", status: "ready" },
         { variant: "Gemma-3-4b-it", status: "downloaded" },
       ],
       selectedModel: null,
@@ -45,27 +46,27 @@ describe("route model catalog", () => {
       preferAnyPreferredBeforeReadyAny: true,
     });
 
-    expect(selected).toBe("Qwen3-4B-GGUF");
+    expect(selected).toBe("Qwen3.5-4B");
   });
 
   it("keeps an explicitly selected model when it is present", () => {
     const selected = resolvePreferredRouteModel({
       models: [
-        { variant: "Qwen3-1.7B-GGUF", status: "downloaded" },
-        { variant: "Qwen3-4B-GGUF", status: "ready" },
+        { variant: "Qwen3.5-9B", status: "downloaded" },
+        { variant: "Qwen3.5-4B", status: "ready" },
       ],
-      selectedModel: "Qwen3-1.7B-GGUF",
+      selectedModel: "Qwen3.5-9B",
       preferredVariants: CHAT_PREFERRED_MODELS,
       preferAnyPreferredBeforeReadyAny: true,
     });
 
-    expect(selected).toBe("Qwen3-1.7B-GGUF");
+    expect(selected).toBe("Qwen3.5-9B");
   });
 
   it("picks a ready Qwen3.5 model before an unloaded older preference", () => {
     const selected = resolvePreferredRouteModel({
       models: [
-        { variant: "Qwen3-8B-GGUF", status: "downloaded" },
+        { variant: "Qwen3.8-27B-FP8", status: "downloaded" },
         { variant: "Qwen3.5-4B", status: "ready" },
       ],
       selectedModel: null,
@@ -88,6 +89,20 @@ describe("route model catalog", () => {
     });
 
     expect(selected).toBe("diar_streaming_sortformer_4spk-v2.1");
+  });
+
+  it("bounds the speaker draft by the selected checkpoint's channel count", () => {
+    expect(diarizationSpeakerUpperBound("diar_streaming_sortformer_4spk-v2.1")).toBe(4);
+    expect(diarizationSpeakerUpperBound("Nemotron-3-Diarization")).toBe(8);
+    expect(diarizationSpeakerUpperBound(null)).toBe(4);
+    expect(diarizationSpeakerUpperBound(undefined)).toBe(4);
+    // The Nemotron-3 metadata row carries the 8-speaker capability pin.
+    expect(MODEL_DETAILS["Nemotron-3-Diarization"].capabilities).toContain(
+      "Up to 8 speakers",
+    );
+    expect(MODEL_DETAILS["Nemotron-3-Diarization"] && getModelProviderLabel("Nemotron-3-Diarization")).toBe(
+      "NVIDIA",
+    );
   });
 
   it("falls back to the ready diarization summary model when it is available", () => {
@@ -143,14 +158,11 @@ describe("route model catalog", () => {
   });
 
   it("uses Qwen chat-route labels without injecting chat into the model name", () => {
-    expect(getChatRouteModelLabel("Qwen3-0.6B-GGUF")).toBe(
-      "Qwen3 0.6B GGUF (Q8_0)",
-    );
-    expect(getChatRouteModelLabel("Qwen3-8B-GGUF")).toBe(
-      "Qwen3 8B GGUF (Q4_K_M)",
-    );
     expect(getChatRouteModelLabel("Qwen3.5-4B")).toBe(
       "Qwen3.5 4B GGUF (Q4_K_M)",
+    );
+    expect(getChatRouteModelLabel("Qwen3.5-9B")).toBe(
+      "Qwen3.5 9B GGUF (Q4_K_M)",
     );
     expect(getChatRouteModelLabel("Qwen3.8-27B-FP8")).toBe(
       "Qwen3.8 27B (FP8)",

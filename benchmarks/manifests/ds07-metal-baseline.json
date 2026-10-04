@@ -1,0 +1,36 @@
+{
+  "completed": 120,
+  "concurrency": 4,
+  "failed": 0,
+  "failures": {},
+  "latency_ms": {
+    "max": 13944.023457996082,
+    "p50": 231.76381248049438,
+    "p95": 247.44231874356046,
+    "p99": 11251.167008263905
+  },
+  "max_tokens": 16,
+  "metadata": {
+    "backend": "metal",
+    "build": "debug",
+    "gateway_tenant_max_concurrent": 32,
+    "gateway_worker_approval": "standalone pinned",
+    "host": "apple-silicon-macOS-27",
+    "metal_device_id": "metal:4294969884",
+    "model": "LFM2.5-1.2B-Instruct-GGUF tiny synthetic 2-layer fixture (not the 1.2B artifact)",
+    "note": "DS0.7 first real Metal inference execution; not a production capacity claim",
+    "profile": "ds07-metal-baseline",
+    "worker_max_active": 8
+  },
+  "rejected": 0,
+  "requests": 120,
+  "route": "POST /v1/chat/completions",
+  "stream": true,
+  "throughput_req_per_s": 8.543000010175613,
+  "ttft_ms": {
+    "p50": 231.7569164733868,
+    "p95": 247.4362771055894,
+    "p99": 11251.160405486038
+  },
+  "wall_secs": 14.046587832970545
+}

@@ -33,7 +33,7 @@ izwi pull Qwen3-TTS-12Hz-0.6B-Base
 izwi pull Qwen3-ASR-0.6B-GGUF
 
 # Chat
-izwi pull Qwen3-8B-GGUF
+izwi pull Qwen3.5-4B
 
 # Optional unified speech model
 izwi pull LFM2.5-Audio-1.5B-GGUF

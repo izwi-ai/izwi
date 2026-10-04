@@ -1,5 +1,7 @@
 //! Application state management with high-concurrency optimizations
 
+use crate::app::chat::RemoteChatExecution;
+use crate::artifact_store::{ArtifactStore, ArtifactStoreLimits};
 use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
@@ -274,6 +276,10 @@ pub struct StoredResponseRecord {
     #[serde(default)]
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// DS9.1: cached subset of `input_tokens` measured by the serving
+    /// runtime; 0 when prefix reuse was unavailable or not measured.
+    #[serde(default)]
+    pub input_cached_tokens: u64,
     pub error: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -316,7 +322,7 @@ pub struct ServerLifecycle {
 }
 
 impl ServerLifecycle {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let now = now_unix_secs();
         Self {
             inner: Arc::new(std::sync::RwLock::new(LifecycleInner {
@@ -382,6 +388,9 @@ impl ServerLifecycle {
 pub struct AppState {
     /// Runtime service reference - using Arc for cheap clones
     pub runtime: Arc<RuntimeService>,
+    /// Optional Phase 1 remote boundary for plain non-streaming chat.
+    /// Local mode leaves this unset and retains the existing execution path.
+    pub remote_chat_execution: Option<RemoteChatExecution>,
     /// Enterprise integration hooks. Community builds use no-op hooks.
     pub enterprise_hooks: EnterpriseHooks,
     /// Startup-resolved persistence providers. Older unit helpers may omit this.
@@ -427,6 +436,8 @@ pub struct AppState {
     pub voice_observation_store: Arc<VoiceObservationStore>,
     /// Durable batch runtime store for media/text assets, jobs, stages, and artifacts.
     pub batch_runtime_store: Arc<BatchRuntimeStore>,
+    /// Tenant-scoped opaque artifacts plus durable physical-deletion recovery.
+    pub artifact_store: Arc<ArtifactStore>,
     /// Shared strict media validation, canonicalization, storage, and asset registration service.
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
@@ -458,18 +469,28 @@ impl AppState {
         let chat_store = Arc::new(ChatStore::initialize()?);
         let transcription_store = Arc::new(TranscriptionStore::initialize()?);
         let diarization_store = Arc::new(DiarizationStore::initialize()?);
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize()?);
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize()?);
         let studio_store = Arc::new(StudioProjectStore::initialize()?);
         let voice_store = Arc::new(VoiceStore::initialize()?);
         let voice_observation_store = Arc::new(VoiceObservationStore::initialize()?);
         let onboarding_store = Arc::new(OnboardingStore::initialize()?);
+        let store_database = StoreDatabase::from_default_path()?;
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::from_default_path()?,
+            store_database.clone(),
         ));
         let media_storage: Arc<dyn MediaStorageProvider> = Arc::new(
             LocalMediaStorageProvider::new(storage_layout::resolve_media_root()),
         );
+        let artifact_store = Arc::new(ArtifactStore::new(
+            batch_runtime_store.clone(),
+            media_storage.clone(),
+            ArtifactStoreLimits::default(),
+        )?);
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
+            store_database,
+            media_storage.clone(),
+            artifact_store.clone(),
+        ));
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -478,6 +499,7 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
+            remote_chat_execution: None,
             enterprise_hooks,
             persistence: None,
             lifecycle: ServerLifecycle::new(),
@@ -501,6 +523,7 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            artifact_store,
             media_ingest,
             batch_worker_health,
         })
@@ -534,10 +557,6 @@ impl AppState {
             store_database.clone(),
             media_storage.clone(),
         ));
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
             media_storage.clone(),
@@ -555,6 +574,16 @@ impl AppState {
         let batch_runtime_store = Arc::new(BatchRuntimeStore::initialize_with_database(
             store_database.clone(),
         ));
+        let artifact_store = Arc::new(ArtifactStore::new(
+            batch_runtime_store.clone(),
+            media_storage.clone(),
+            ArtifactStoreLimits::default(),
+        )?);
+        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
+            store_database.clone(),
+            media_storage.clone(),
+            artifact_store.clone(),
+        ));
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -563,6 +592,7 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
+            remote_chat_execution: None,
             enterprise_hooks,
             persistence: Some(persistence),
             lifecycle: ServerLifecycle::new(),
@@ -586,9 +616,16 @@ impl AppState {
             voice_store,
             voice_observation_store,
             batch_runtime_store,
+            artifact_store,
             media_ingest,
             batch_worker_health,
         })
+    }
+
+    #[allow(dead_code)] // Wired by the gateway-role configuration in the next slice.
+    pub fn with_remote_chat_execution(mut self, execution: RemoteChatExecution) -> Self {
+        self.remote_chat_execution = Some(execution);
+        self
     }
 
     /// Acquire a permit for a specific workload class.
@@ -752,6 +789,7 @@ mod tests {
                 output_text: Some("old".to_string()),
                 input_tokens: 1,
                 output_tokens: 1,
+                input_cached_tokens: 1,
                 error: None,
                 metadata: None,
             },
@@ -767,6 +805,7 @@ mod tests {
                 output_text: Some("new".to_string()),
                 input_tokens: 1,
                 output_tokens: 1,
+                input_cached_tokens: 1,
                 error: None,
                 metadata: None,
             },
@@ -1021,6 +1060,7 @@ mod tests {
             output_text: Some(id.to_string()),
             input_tokens: 1,
             output_tokens: 1,
+            input_cached_tokens: 1,
             error: None,
             metadata: None,
         }

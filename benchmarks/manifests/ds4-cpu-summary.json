@@ -1,0 +1,111 @@
+{
+  "lane": "cpu",
+  "off_worker_counter_deltas": {
+    "counters_after": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2496,
+      "izwi_engine_kv_cache_demotions_total": 0,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 39,
+      "izwi_engine_kv_cache_host_pages": 0,
+      "izwi_engine_kv_cache_misses_total": 13,
+      "izwi_engine_kv_cache_promotions_total": 0,
+      "izwi_engine_kv_cache_reused_tokens_total": 2496,
+      "izwi_engine_tensor_snapshot_attaches_total": 17,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 1,
+      "izwi_engine_tensor_snapshot_truncations_total": 5
+    },
+    "counters_before": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+      "izwi_engine_kv_cache_demotions_total": 0,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 0,
+      "izwi_engine_kv_cache_host_pages": 0,
+      "izwi_engine_kv_cache_misses_total": 6,
+      "izwi_engine_kv_cache_promotions_total": 0,
+      "izwi_engine_kv_cache_reused_tokens_total": 0,
+      "izwi_engine_tensor_snapshot_attaches_total": 0,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 0,
+      "izwi_engine_tensor_snapshot_truncations_total": 0
+    },
+    "counters_delta": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2496,
+      "izwi_engine_kv_cache_demotions_total": 0,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 39,
+      "izwi_engine_kv_cache_host_pages": 0,
+      "izwi_engine_kv_cache_misses_total": 7,
+      "izwi_engine_kv_cache_promotions_total": 0,
+      "izwi_engine_kv_cache_reused_tokens_total": 2496,
+      "izwi_engine_tensor_snapshot_attaches_total": 17,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 1,
+      "izwi_engine_tensor_snapshot_truncations_total": 5
+    }
+  },
+  "offload_counter_deltas": {
+    "off": {
+      "demotions": 0,
+      "host_pages_end": 0,
+      "promotions": 0
+    },
+    "on": {
+      "demotions": 10,
+      "host_pages_end": 2,
+      "promotions": 8
+    }
+  },
+  "on_worker_counter_deltas": {
+    "counters_after": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 1536,
+      "izwi_engine_kv_cache_demotions_total": 10,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 24,
+      "izwi_engine_kv_cache_host_pages": 2,
+      "izwi_engine_kv_cache_misses_total": 30,
+      "izwi_engine_kv_cache_promotions_total": 8,
+      "izwi_engine_kv_cache_reused_tokens_total": 1536,
+      "izwi_engine_tensor_snapshot_attaches_total": 17,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 1,
+      "izwi_engine_tensor_snapshot_truncations_total": 6
+    },
+    "counters_before": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+      "izwi_engine_kv_cache_demotions_total": 0,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 0,
+      "izwi_engine_kv_cache_host_pages": 0,
+      "izwi_engine_kv_cache_misses_total": 6,
+      "izwi_engine_kv_cache_promotions_total": 0,
+      "izwi_engine_kv_cache_reused_tokens_total": 0,
+      "izwi_engine_tensor_snapshot_attaches_total": 0,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 0,
+      "izwi_engine_tensor_snapshot_truncations_total": 0
+    },
+    "counters_delta": {
+      "izwi_engine_kv_cache_avoided_prefill_tokens_total": 1536,
+      "izwi_engine_kv_cache_demotions_total": 10,
+      "izwi_engine_kv_cache_evictions_total": 0,
+      "izwi_engine_kv_cache_hits_total": 24,
+      "izwi_engine_kv_cache_host_pages": 2,
+      "izwi_engine_kv_cache_misses_total": 24,
+      "izwi_engine_kv_cache_promotions_total": 8,
+      "izwi_engine_kv_cache_reused_tokens_total": 1536,
+      "izwi_engine_tensor_snapshot_attaches_total": 17,
+      "izwi_engine_tensor_snapshot_evictions_total": 0,
+      "izwi_engine_tensor_snapshot_publishes_total": 1,
+      "izwi_engine_tensor_snapshot_truncations_total": 6
+    }
+  },
+  "schema": "izwi.ds4-offload-summary.v1",
+  "ttft_ms": {
+    "off_p50": 376.2069380027242,
+    "off_p95": 805.2546255057678,
+    "on_p50": 392.2635625349358,
+    "on_p95": 681.4003642066382,
+    "p50_delta_ms": 16.056624532211572
+  }
+}

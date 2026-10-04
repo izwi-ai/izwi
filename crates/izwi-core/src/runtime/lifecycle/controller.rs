@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(test)]
 use tokio::sync::Barrier;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -135,10 +135,18 @@ pub(crate) struct ModelLifecycleController {
     pub(super) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(super) realtime_asr_sequence_capacity: u32,
     pub(super) model_last_used: Mutex<HashMap<ModelVariant, u64>>,
+    /// Explicitly loaded residents (LM Studio-style pins): excluded from
+    /// budget/pressure eviction and idle-TTL reaping until explicitly
+    /// unloaded. Session-scoped.
+    pub(super) pinned_variants: Mutex<HashSet<ModelVariant>>,
     pub(super) mutation_gate: Mutex<()>,
     state: StdMutex<LifecycleState>,
     #[cfg(test)]
     load_test_panics: AtomicUsize,
+    #[cfg(test)]
+    pub(super) load_test_metal_oom_failures: AtomicUsize,
+    #[cfg(test)]
+    pub(super) load_test_metal_oom_ladder: AtomicBool,
     #[cfg(test)]
     unload_test_barriers: StdMutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     #[cfg(test)]
@@ -173,10 +181,15 @@ impl ModelLifecycleController {
             loaded_tts_variant,
             realtime_asr_sequence_capacity,
             model_last_used: Mutex::new(HashMap::new()),
+            pinned_variants: Mutex::new(HashSet::new()),
             mutation_gate: Mutex::new(()),
             state: StdMutex::new(LifecycleState::default()),
             #[cfg(test)]
             load_test_panics: AtomicUsize::new(0),
+            #[cfg(test)]
+            load_test_metal_oom_failures: AtomicUsize::new(0),
+            #[cfg(test)]
+            load_test_metal_oom_ladder: AtomicBool::new(false),
             #[cfg(test)]
             unload_test_barriers: StdMutex::new(None),
             #[cfg(test)]
@@ -663,6 +676,33 @@ impl ModelLifecycleController {
         {
             panic!("injected model load panic");
         }
+    }
+
+    /// Arm the Metal command-buffer OOM ladder for CPU test harnesses and
+    /// queue `count` injected OOM failures at the start of each load attempt.
+    #[cfg(test)]
+    pub(super) fn set_load_test_metal_ooms(&self, count: usize) {
+        self.load_test_metal_oom_failures
+            .store(count, Ordering::Release);
+        self.load_test_metal_oom_ladder
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn maybe_fail_load_with_metal_oom(&self) -> crate::error::Result<()> {
+        if self
+            .load_test_metal_oom_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(crate::error::Error::InferenceError(
+                "Metal error Command buffer had following error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]

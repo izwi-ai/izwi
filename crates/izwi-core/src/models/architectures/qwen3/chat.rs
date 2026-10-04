@@ -55,6 +55,9 @@ pub struct ChatDecodeState {
     assembled: String,
     max_new_tokens: usize,
     finished: bool,
+    /// DS9.3: logprob entries produced by the current decode step, drained
+    /// by the registry right after the step. Cleared at each step entry.
+    pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -233,6 +236,8 @@ pub struct Qwen3ChatModel {
     compute_dtype: DType,
     tokenizer: ChatTokenizer,
     text_model: Qwen3Model,
+    /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
+    prefix_reuse: bool,
 }
 
 impl InferenceStateContractProvider for Qwen3ChatModel {
@@ -248,6 +253,7 @@ impl InferenceStateContractProvider for Qwen3ChatModel {
                 StateDomainId::new(1),
                 self.compute_dtype,
                 default_kv_page_size(),
+                self.prefix_reuse,
             )?,
         ))
     }
@@ -262,14 +268,23 @@ impl Qwen3ChatModel {
         })
     }
 
-    pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         if variant.is_qwen_chat_gguf() {
-            return Self::load_gguf(model_dir, variant, device);
+            return Self::load_gguf(model_dir, variant, device, prefix_reuse);
         }
-        Self::load_safetensors(model_dir, device)
+        Self::load_safetensors(model_dir, device, prefix_reuse)
     }
 
-    fn load_safetensors(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
+    fn load_safetensors(
+        model_dir: &Path,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_str = fs::read_to_string(config_path)?;
         let config = parse_qwen3_config(&config_str)?;
@@ -319,16 +334,19 @@ impl Qwen3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 
-    fn load_gguf(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+    fn load_gguf(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+    ) -> Result<Self> {
         let gguf_name = match variant {
-            ModelVariant::Qwen306BGguf => "Qwen3-0.6B-Q8_0.gguf",
-            ModelVariant::Qwen317BGguf => "Qwen3-1.7B-Q8_0.gguf",
-            ModelVariant::Qwen34BGguf => "Qwen3-4B-Q4_K_M.gguf",
-            ModelVariant::Qwen38BGguf => "Qwen3-8B-Q4_K_M.gguf",
             ModelVariant::Qwen314BGguf => "Qwen3-14B-Q4_K_M.gguf",
+            ModelVariant::Qwen3Moe30bA3bGguf => "Qwen3-30B-A3B-Q4_K_M.gguf",
             _ => {
                 return Err(Error::ModelLoadError(format!(
                     "Unsupported GGUF chat variant: {variant}"
@@ -365,6 +383,7 @@ impl Qwen3ChatModel {
             compute_dtype: dtype,
             tokenizer,
             text_model,
+            prefix_reuse,
         })
     }
 
@@ -425,18 +444,31 @@ impl Qwen3ChatModel {
                 "Qwen3 resumable prefill requires at least one private prompt token".into(),
             ));
         }
+        // DS1.5: a managed prefix attach starts the logical cursor at the
+        // attached physical cursor.
         let pos = cache.context_len();
         Ok(ChatDecodeState {
             cache,
             unconsumed_output: None,
             pos,
             pending_token: None,
-            prefill_progress: 0,
+            prefill_progress: pos,
             generated_ids: Vec::new(),
-            sampler: ChatSampler::new(config.clone(), prompt_ids),
+            sampler: ChatSampler::new(config.clone(), prompt_ids).with_json_object_constraint(
+                std::sync::Arc::new(self.tokenizer.inner.clone()),
+                vec![
+                    Some(self.tokenizer.specials.im_end),
+                    Some(self.tokenizer.specials.eos),
+                    self.tokenizer.specials.eos_alt,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            ),
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            pending_logprobs: Vec::new(),
         })
     }
 
@@ -504,6 +536,36 @@ impl Qwen3ChatModel {
         Ok(complete)
     }
 
+    /// DS9.3: sample one token, resolving raw logprobs into the public
+    /// payload when the request asked for them. The caller records the
+    /// entry only when the token is actually emitted.
+    fn sample_token(
+        &self,
+        state: &mut ChatDecodeState,
+        logits: &Tensor,
+    ) -> Result<(u32, Option<crate::engine::TokenLogprob>)> {
+        state.pending_logprobs.clear();
+        if !state.sampler.wants_logprobs() {
+            let token = state.sampler.sample(logits, self.tokenizer.vocab_size)?;
+            return Ok((token, None));
+        }
+        let (token, raw) = state
+            .sampler
+            .sample_with_logprobs(logits, self.tokenizer.vocab_size)?;
+        let entry = raw
+            .map(|raw| {
+                crate::models::shared::sampling::resolve_token_logprob(&self.tokenizer.inner, &raw)
+            })
+            .transpose()?;
+        Ok((token, entry))
+    }
+
+    fn record_logprob(state: &mut ChatDecodeState, entry: Option<crate::engine::TokenLogprob>) {
+        if let Some(entry) = entry {
+            state.pending_logprobs.push(entry);
+        }
+    }
+
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         let text_model = &self.text_model;
 
@@ -527,7 +589,7 @@ impl Qwen3ChatModel {
         let output = state.unconsumed_output.take().ok_or_else(|| {
             Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
         })?;
-        let next = state.sampler.sample(&output, self.tokenizer.vocab_size)?;
+        let (next, logprob_entry) = self.sample_token(state, &output)?;
 
         if next == self.tokenizer.specials.im_end
             || next == self.tokenizer.specials.eos
@@ -543,6 +605,7 @@ impl Qwen3ChatModel {
             });
         }
 
+        Self::record_logprob(state, logprob_entry);
         state.generated_ids.push(next);
         state.pending_token = Some(next);
         let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
@@ -610,9 +673,7 @@ impl Qwen3ChatModel {
             }
 
             let row_output = next_logits.i(row)?.unsqueeze(0)?;
-            let next = state
-                .sampler
-                .sample(&row_output, self.tokenizer.vocab_size)?;
+            let (next, logprob_entry) = self.sample_token(state, &row_output)?;
             if next == self.tokenizer.specials.im_end
                 || next == self.tokenizer.specials.eos
                 || self.tokenizer.specials.eos_alt == Some(next)
@@ -628,6 +689,7 @@ impl Qwen3ChatModel {
                 continue;
             }
 
+            Self::record_logprob(state, logprob_entry);
             state.generated_ids.push(next);
             state.pending_token = Some(next);
             let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
@@ -756,18 +818,34 @@ fn parse_qwen3_config(config_str: &str) -> Result<Qwen3Config> {
 }
 
 fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
+    // Qwen3-MoE checkpoints carry the "qwen3moe" architecture id with MoE
+    // expert keys; dense checkpoints use "qwen3". Accept both prefixes so one
+    // parser serves the family.
+    let arch = ["qwen3moe", "qwen3"]
+        .into_iter()
+        .find(|arch| loader.get_metadata_u64(&format!("{arch}.block_count")).is_some())
+        .ok_or_else(|| {
+            Error::ModelLoadError("Missing or invalid GGUF metadata: qwen3.block_count".to_string())
+        })?;
     let required_usize = |key: &str| {
         loader
-            .get_metadata_u64(key)
+            .get_metadata_u64(&format!("{arch}.{key}"))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| {
-                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
+                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {arch}.{key}"))
             })
     };
+    let optional_usize = |key: &str| {
+        loader
+            .get_metadata_u64(&format!("{arch}.{key}"))
+            .and_then(|value| usize::try_from(value).ok())
+    };
     let required_f64 = |key: &str| {
-        loader.get_metadata_f64(key).ok_or_else(|| {
-            Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {key}"))
-        })
+        loader
+            .get_metadata_f64(&format!("{arch}.{key}"))
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!("Missing or invalid GGUF metadata: {arch}.{key}"))
+            })
     };
     let vocab_size = loader
         .get_metadata_array_len("tokenizer.ggml.tokens")
@@ -777,18 +855,25 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
             )
         })?;
 
+    let num_experts = optional_usize("expert_count");
+    let num_experts_per_tok = optional_usize("expert_used_count");
+    let moe_intermediate_size = optional_usize("expert_feed_forward_length");
+    let norm_topk_prob = loader
+        .get_metadata_f64(&format!("{arch}.norm_topk_prob"))
+        .map(|value| value != 0.0);
+
     Ok(Qwen3Config {
-        hidden_size: required_usize("qwen3.embedding_length")?,
-        intermediate_size: required_usize("qwen3.feed_forward_length")?,
-        num_attention_heads: required_usize("qwen3.attention.head_count")?,
-        num_hidden_layers: required_usize("qwen3.block_count")?,
-        num_key_value_heads: required_usize("qwen3.attention.head_count_kv")?,
-        max_position_embeddings: Some(required_usize("qwen3.context_length")?),
+        hidden_size: required_usize("embedding_length")?,
+        intermediate_size: required_usize("feed_forward_length")?,
+        num_attention_heads: required_usize("attention.head_count")?,
+        num_hidden_layers: required_usize("block_count")?,
+        num_key_value_heads: required_usize("attention.head_count_kv")?,
+        max_position_embeddings: Some(required_usize("context_length")?),
         head_dim: loader
-            .get_metadata_u64("qwen3.attention.key_length")
+            .get_metadata_u64(&format!("{arch}.attention.key_length"))
             .and_then(|value| usize::try_from(value).ok()),
-        rms_norm_eps: required_f64("qwen3.attention.layer_norm_rms_epsilon")?,
-        rope_theta: required_f64("qwen3.rope.freq_base")?,
+        rms_norm_eps: required_f64("attention.layer_norm_rms_epsilon")?,
+        rope_theta: required_f64("rope.freq_base")?,
         vocab_size,
         lm_head_size: None,
         tie_word_embeddings: !loader.has_tensor("output.weight"),
@@ -797,6 +882,10 @@ fn parse_qwen3_gguf_config(loader: &GgufLoader) -> Result<Qwen3Config> {
         use_sliding_window: false,
         ada_rms_norm_t_cond: false,
         ada_rms_norm_t_cond_dim: 0,
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        norm_topk_prob,
     })
 }
 

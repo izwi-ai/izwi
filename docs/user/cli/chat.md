@@ -30,7 +30,7 @@ Starts an interactive chat session with a loaded chat model. Type messages and r
 | `-v, --voice <VOICE>` | Voice for spoken responses | — |
 
 `qwen3-0.6b-4bit` remains the CLI default for backward compatibility.
-For new setups, use an enabled catalog ID from `izwi list` (for example `Qwen3-8B-GGUF`, `Qwen3.5-4B`, or `Qwen3.8-27B-FP8`). Model IDs are accepted as free-form strings, so no CLI upgrade-specific enum is required when a new server catalog model is added.
+For new setups, use an enabled catalog ID from `izwi list` (for example `Qwen3.5-4B`, `Qwen3.5-9B`, or `Qwen3.8-27B-FP8`). Model IDs are accepted as free-form strings, so no CLI upgrade-specific enum is required when a new server catalog model is added.
 The CLI forwards `Qwen3.8-27B-FP8` unchanged; the server routes it through the
 separate `Qwen38Chat` family rather than Qwen3.5.
 
@@ -53,11 +53,10 @@ izwi chat --system "You are a helpful coding assistant"
 ### With specific model
 
 ```bash
-izwi chat --model Qwen3-8B-GGUF
+izwi chat --model Qwen3.5-4B
 izwi chat --model Qwen3.5-4B
 izwi chat --model Qwen3.8-27B-FP8
 izwi chat --model LFM2.5-1.2B-Instruct-GGUF
-izwi chat --model Gemma-3-1b-it
 ```
 
 ### With voice responses

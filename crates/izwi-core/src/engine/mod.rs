@@ -155,8 +155,9 @@ pub use metrics::{
     ENGINE_KV_CACHE_EVICTIONS_TOTAL, ENGINE_KV_CACHE_FREE_BLOCKS,
     ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS, ENGINE_KV_CACHE_HITS_TOTAL,
     ENGINE_KV_CACHE_MEMORY_CAPACITY_BYTES, ENGINE_KV_CACHE_MEMORY_USED_BYTES,
-    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_METRIC_CATALOG,
-    ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
+    ENGINE_KV_CACHE_MISSES_TOTAL, ENGINE_KV_CACHE_UTILIZATION_RATIO, ENGINE_KV_DEMOTIONS_TOTAL,
+    ENGINE_KV_HOST_PAGES, ENGINE_KV_PROMOTIONS_TOTAL, ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS,
+    ENGINE_METRIC_CATALOG, ENGINE_SCHEDULER_INCREMENTAL_PREFILL_QUANTA_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_INCREMENTAL_PREFILL_TOKENS_COMMITTED_TOTAL,
     ENGINE_SCHEDULER_MULTISPAN_PREFILL_REQUESTS_TOTAL, ENGINE_SCHEDULER_QUEUE_DEPTH,
     ENGINE_SCHEDULER_RUNNING_REQUESTS, ENGINE_SCHEDULER_STEP_TOKENS_TOTAL,
@@ -179,7 +180,7 @@ pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, LatencyBreakdown, Priority,
-    RequestId, SequenceId, TaskType, TokenId,
+    RequestId, SequenceId, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
 };
 
 use crate::error::{Error, Result};
@@ -2225,7 +2226,14 @@ impl Engine {
         let mut processed = self.retain_incremental_model_identity(processed).await?;
         let request_id = processed.id.clone();
         let model_variant = processed.model_variant;
-        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Runtime-owned invocation handles install their cancellation signal
+        // before Engine admission so transport cancellation never needs this
+        // core write lock. Preserve that exact signal across preprocessing;
+        // direct Engine callers still receive a fresh engine-owned signal.
+        let cancellation = processed
+            .cancellation
+            .clone()
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         processed.set_cancellation_signal(cancellation.clone());
 
         // Add to engine core. The core write lock also makes binding a pending
@@ -3386,6 +3394,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                 })
@@ -3472,6 +3481,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                     .with_dispatch(dispatch)
@@ -3597,6 +3607,7 @@ mod tests {
                             text: Some("fast-progress".to_string()),
                             stats: None,
                             asr_progress: None,
+                            logprobs: Vec::new(),
                         },
                         request.stream_policy,
                     )
@@ -3680,6 +3691,7 @@ mod tests {
                     text: Some("first delta".to_string()),
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 },
                 request.stream_policy,
             )?;
@@ -3712,6 +3724,7 @@ mod tests {
                     text: None,
                     stats: None,
                     asr_progress: None,
+                    logprobs: Vec::new(),
                 },
                 request.stream_policy,
             )?;
@@ -3728,6 +3741,7 @@ mod tests {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
+                    logprobs: Vec::new(),
                 },
             );
             result.staged_stream_outputs = request.take_staged_stream_outputs()?;
@@ -3811,6 +3825,7 @@ mod tests {
                             phase_timing_override: None,
                             asr_diagnostics: None,
                             error: None,
+                            logprobs: Vec::new(),
                         },
                     )
                 })
@@ -3910,6 +3925,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
         context.enqueue_audio_delivery(
@@ -3937,6 +3953,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -3999,6 +4016,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         context.enqueue_audio_delivery(
             session.clone(),
@@ -4024,6 +4042,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -4086,6 +4105,7 @@ mod tests {
             text: None,
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
         context.enqueue_audio_delivery(
@@ -4112,6 +4132,7 @@ mod tests {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             session.epoch,
             Duration::from_millis(1),
@@ -4212,6 +4233,7 @@ mod tests {
             text: Some("committed".into()),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         })
         .await
         .unwrap();
@@ -4224,6 +4246,7 @@ mod tests {
             text: Some(" tail".into()),
             stats: None,
             asr_progress: None,
+            logprobs: Vec::new(),
         })
         .await
         .expect("concurrent drain must free the bounded channel");
@@ -5172,5 +5195,29 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_preserves_a_preinstalled_cancellation_signal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = Engine::new(EngineCoreConfig::default()).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::tts("worker-owned cancellation");
+        request.id = "worker-owned-cancellation".into();
+        request.set_cancellation_signal(cancellation.clone());
+
+        let session = engine.add_request_with_session(request).await.unwrap();
+        let installed = engine
+            .request_controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())[&session.request_id]
+            .cancellation
+            .clone();
+        assert!(Arc::ptr_eq(&installed, &cancellation));
+
+        cancellation.store(true, Ordering::Release);
+        assert!(installed.load(Ordering::Acquire));
+        engine.abort_request_session(&session).await.unwrap();
     }
 }

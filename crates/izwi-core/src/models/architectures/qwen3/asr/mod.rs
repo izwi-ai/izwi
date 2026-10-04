@@ -526,6 +526,8 @@ impl Qwen3AsrModel {
             crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
             default_kv_page_size(),
+            // Managed prefix reuse is chat-task-gated; ASR never shares.
+            false,
         )?;
         let max_sequence = self.text_context_tokens.ok_or_else(|| {
             Error::ModelLoadError(
@@ -1783,6 +1785,14 @@ impl Qwen3AsrModel {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
         }
         None
+    }
+
+    /// Decoder-prompt tokens added per second of audio: the audio tower emits
+    /// 13 tokens per 100 mel frames (16 kHz at the configured hop → 160 fps).
+    pub(crate) fn audio_token_rate(&self) -> f32 {
+        let frames_per_sec =
+            QWEN3_ASR_SAMPLE_RATE as f32 / self.mel.config().hop_length.max(1) as f32;
+        13.0 * frames_per_sec / 100.0
     }
 
     /// Resolve the exact text-decoder input span before scheduler admission.
@@ -3335,6 +3345,10 @@ fn parse_qwen3_asr_config_from_gguf(
         use_sliding_window: false,
         ada_rms_norm_t_cond: false,
         ada_rms_norm_t_cond_dim: 0,
+        num_experts: None,
+        num_experts_per_tok: None,
+        moe_intermediate_size: None,
+        norm_topk_prob: None,
     };
 
     let audio_config = config::AudioConfig {

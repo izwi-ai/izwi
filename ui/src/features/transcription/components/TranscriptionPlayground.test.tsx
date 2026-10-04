@@ -663,7 +663,7 @@ describe("TranscriptionPlayground history", () => {
     ).toBeGreaterThan(0);
   });
 
-  it("keeps streaming and timestamps mutually exclusive", async () => {
+  it("gates streaming and timestamps behind an explicit conflict explanation", async () => {
     apiMocks.listTranscriptionRecords.mockResolvedValue([]);
 
     render(
@@ -699,14 +699,27 @@ describe("TranscriptionPlayground history", () => {
     expect(streamToggle.checked).toBe(true);
     expect(timestampToggle.checked).toBe(false);
 
-    fireEvent.click(timestampToggle);
+    // Streaming is on, so the timestamps toggle is disabled with an
+    // explanation instead of being silently allowed and flipping streaming.
+    expect(timestampToggle.disabled).toBe(true);
+    expect(
+      screen.getByText(
+        /Timestamps are unavailable while streaming is enabled/i,
+      ),
+    ).toBeInTheDocument();
 
-    expect(timestampToggle.checked).toBe(true);
-    expect(streamToggle.checked).toBe(false);
-
+    // Turning streaming off enables timestamps, which then disables the
+    // stream toggle with its own explanation — never a silent downgrade.
     fireEvent.click(streamToggle);
+    expect(streamToggle.checked).toBe(false);
+    expect(timestampToggle.disabled).toBe(false);
 
-    expect(streamToggle.checked).toBe(true);
-    expect(timestampToggle.checked).toBe(false);
+    fireEvent.click(timestampToggle);
+    expect(timestampToggle.checked).toBe(true);
+    expect(streamToggle.disabled).toBe(true);
+    expect(
+      screen.getByText(/Streaming is unavailable while timestamps are enabled/i),
+    ).toBeInTheDocument();
+    expect(streamToggle.checked).toBe(false);
   });
 });

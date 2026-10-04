@@ -1239,10 +1239,20 @@ pub struct ExecutionProfile {
     /// a soft scheduling SLA. This never relaxes hard deadlines or peer fairness.
     #[serde(default)]
     pub sustained_decode_quantum: bool,
+    /// DS9.4: the loaded model can run shared speculative envelopes for
+    /// multi-token quanta inside continuous batches (not just solo rows).
+    #[serde(default)]
+    pub speculative_decode_batch: bool,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
     pub cache_namespace: Option<String>,
+    /// DS1.2b: declared `CommittedSnapshots` interval of a hybrid managed
+    /// contract. The scheduler aligns the first prefill chunk of such a
+    /// request to this boundary so the committed tensor state can be published
+    /// for cross-request fork. `None` keeps scheduling unchanged.
+    #[serde(default)]
+    pub managed_snapshot_prefill_interval: Option<u32>,
 }
 
 impl ExecutionProfile {
@@ -1276,10 +1286,12 @@ impl ExecutionProfile {
             max_batch_size: 1,
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
+            speculative_decode_batch: false,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),
             cache_namespace: None,
+            managed_snapshot_prefill_interval: None,
         }
     }
 

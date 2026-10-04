@@ -48,8 +48,34 @@ pub fn decode_and_inspect_audio_bytes(audio_bytes: &[u8]) -> Result<DecodedAudio
     })
 }
 
+/// Strictly decode into the canonical 16 kHz mono speech representation while
+/// preserving the true source metadata. `mono_samples` and `inspection` are at
+/// the canonical rate; `source` still describes the stored bytes. Speech-route
+/// boundary API — TTS reference audio and generated-output inspection keep the
+/// native-rate decoder so recorded metadata matches stored bytes.
+pub fn decode_and_inspect_audio_bytes_canonical(audio_bytes: &[u8]) -> Result<DecodedAudio> {
+    let (mono_samples, source) =
+        crate::runtime::audio_io::decode_audio_bytes_canonical_with_metadata(
+            audio_bytes,
+            crate::runtime::audio_io::DecodeErrorMode::Strict,
+        )?;
+    let inspection = AudioInspection::from_mono_samples(
+        &mono_samples,
+        crate::runtime::audio_io::CANONICAL_SPEECH_SAMPLE_RATE,
+    );
+    Ok(DecodedAudio {
+        source,
+        mono_samples,
+        inspection,
+    })
+}
+
 pub fn inspect_audio_bytes(audio_bytes: &[u8]) -> Result<AudioInspection> {
     decode_and_inspect_audio_bytes(audio_bytes).map(|decoded| decoded.inspection)
+}
+
+pub fn inspect_audio_bytes_canonical(audio_bytes: &[u8]) -> Result<AudioInspection> {
+    decode_and_inspect_audio_bytes_canonical(audio_bytes).map(|decoded| decoded.inspection)
 }
 
 pub fn decode_audio_bytes_to_mono(audio_bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
@@ -210,5 +236,29 @@ mod tests {
             .expect_err("invalid audio must fail strict decoding");
 
         assert!(error.to_string().contains("Failed to decode audio"));
+    }
+
+    #[test]
+    fn canonical_inspection_reports_canonical_rate_with_source_truth() {
+        let interleaved: Vec<i16> = (0..2_205).flat_map(|_| [0_i16, 1_638]).collect();
+        let wav = wav_bytes(2, 22_050, &interleaved);
+
+        let decoded = decode_and_inspect_audio_bytes_canonical(&wav)
+            .expect("canonical inspection should decode");
+
+        assert_eq!(decoded.source.sample_rate, 22_050, "source metadata keeps the stored bytes' rate");
+        assert_eq!(decoded.source.channel_count, 2);
+        assert_eq!(
+            decoded.inspection.sample_rate,
+            crate::runtime::audio_io::CANONICAL_SPEECH_SAMPLE_RATE
+        );
+        let expected = crate::audio::target_sample_count(
+            2_205,
+            22_050,
+            crate::runtime::audio_io::CANONICAL_SPEECH_SAMPLE_RATE,
+        );
+        assert_eq!(decoded.mono_samples.len(), expected);
+        assert_eq!(decoded.mono_samples.len(), decoded.inspection.sample_count);
+        assert!((decoded.inspection.duration_secs - 0.1).abs() < 0.01);
     }
 }

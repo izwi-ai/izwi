@@ -5,6 +5,7 @@ import {
   type DiarizationRecord,
   type DiarizationRecordRerunRequest,
   type ModelInfo,
+  type ModelResidencySummary,
 } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import { Button } from "@/components/ui/button";
@@ -23,10 +24,11 @@ import { RouteModelModal } from "@/features/models/components/RouteModelModal";
 import {
   collectManagedModels,
   filterAndSortModels,
-  isDiarizationPipelineAlignerVariant,
-  isDiarizationPipelineAsrVariant,
-  isDiarizationPipelineLlmVariant,
-  isDiarizationVariant,
+  isDiarizationPipelineAlignerModel,
+  isDiarizationPipelineAsrModel,
+  isDiarizationPipelineLlmModel,
+  isDiarizationModel,
+  resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 import { useDiarizationHistory } from "@/features/diarization/hooks/useDiarizationHistory";
 import { useDiarizationRecord } from "@/features/diarization/hooks/useDiarizationRecord";
@@ -39,6 +41,7 @@ interface DiarizationPageProps {
   selectedModel: string | null;
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
+  residencySummary?: ModelResidencySummary | null;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -61,6 +64,7 @@ export function DiarizationPage({
   selectedModel,
   loading,
   downloadProgress,
+  residencySummary,
   onDownload,
   onCancelDownload,
   onLoad,
@@ -96,22 +100,22 @@ export function DiarizationPage({
   );
 
   const diarizationModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationVariant),
+    () => filterAndSortModels(models, isDiarizationModel),
     [models],
   );
 
   const asrPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAsrVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAsrModel),
     [models],
   );
 
   const alignerPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineAlignerVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineAlignerModel),
     [models],
   );
 
   const llmPipelineModels = useMemo(
-    () => filterAndSortModels(models, isDiarizationPipelineLlmVariant),
+    () => filterAndSortModels(models, isDiarizationPipelineLlmModel),
     [models],
   );
 
@@ -153,11 +157,10 @@ export function DiarizationPage({
 
   const resolvedSelectedModel = useMemo(
     () =>
-      resolvePreferredRouteModel({
+      resolveDiarizationRouteModel({
         models: diarizationModels,
         selectedModel,
         preferredVariants: DIARIZATION_PREFERRED_MODELS,
-        preferAnyPreferredBeforeReadyAny: true,
       }),
     [diarizationModels, selectedModel],
   );
@@ -276,12 +279,6 @@ export function DiarizationPage({
   const readyManagedModelCount = managedModels.filter(
     (model) => model.status === "ready",
   ).length;
-  const canLoadAnyManagedModels = managedModels.some(
-    (model) =>
-      model.status === "downloaded" ||
-      model.status === "not_downloaded" ||
-      model.status === "error",
-  );
   const canUnloadAnyManagedModels = managedModels.some(
     (model) => model.status === "ready",
   );
@@ -416,19 +413,6 @@ export function DiarizationPage({
   const handleOpenModels = useCallback(() => {
     openModelManager();
   }, [openModelManager]);
-
-  const handleLoadAllManagedModels = useCallback(() => {
-    for (const model of managedModels) {
-      if (model.status === "downloaded") {
-        onLoad(model.variant);
-      } else if (
-        model.status === "not_downloaded" ||
-        model.status === "error"
-      ) {
-        onDownload(model.variant);
-      }
-    }
-  }, [managedModels, onDownload, onLoad]);
 
   const handleUnloadAllManagedModels = useCallback(() => {
     for (const model of managedModels) {
@@ -618,6 +602,8 @@ export function DiarizationPage({
             pipelineMode={pipelineMode}
             selectedModel={resolvedSelectedModel}
             selectedModelReady={selectedModelReady}
+            diarizationModels={diarizationModels}
+            onSelectModel={onSelect}
             pipelineAsrModelId={resolvedAsrModel}
             pipelineAlignerModelId={resolvedAlignerModel}
             pipelineLlmModelId={resolvedLlmModel}
@@ -634,11 +620,9 @@ export function DiarizationPage({
             }}
             managedModelCount={managedModels.length}
             readyManagedModelCount={readyManagedModelCount}
-            canLoadAnyManagedModels={canLoadAnyManagedModels}
             canUnloadAnyManagedModels={canUnloadAnyManagedModels}
             isManagedModelActionBusy={isManagedModelActionBusy}
             onOpenModelManager={openModelManager}
-            onLoadAllManagedModels={handleLoadAllManagedModels}
             onUnloadAllManagedModels={handleUnloadAllManagedModels}
             onCreated={handleCreatedRecord}
           />
@@ -665,6 +649,7 @@ export function DiarizationPage({
         onUseModel={onSelect}
         emptyMessage="No diarization pipeline models available for this route."
         zIndexClassName={isNewDiarizationModalOpen ? "z-[70]" : "z-50"}
+        residencySummary={residencySummary}
       />
     </PageShell>
   );

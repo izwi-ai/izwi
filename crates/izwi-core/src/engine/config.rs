@@ -146,6 +146,35 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
 
+    /// Host KV pool budget in bytes for hierarchical offload (DS4). Zero (the
+    /// default) keeps the feature fully dormant.
+    #[serde(default)]
+    pub kv_host_pool_budget_bytes: u64,
+
+    /// Device-arena pressure ratio at which demotion steps start.
+    #[serde(default = "default_kv_offload_high_watermark")]
+    pub kv_offload_high_watermark: f32,
+
+    /// Pressure ratio demotion steps drain toward before stopping.
+    #[serde(default = "default_kv_offload_low_watermark")]
+    pub kv_offload_low_watermark: f32,
+
+    /// Maximum pages with a demotion copy in flight at once.
+    #[serde(default = "default_kv_offload_max_in_flight_pages")]
+    pub kv_offload_max_in_flight_pages: usize,
+
+    /// Maximum host-resident pages promoted back in one prepare.
+    #[serde(default = "default_kv_offload_max_promotion_pages")]
+    pub kv_offload_max_promotion_pages: usize,
+
+    /// Catalog-gated prefix-reuse default (DS1.6). Honored once when the
+    /// engine core is constructed: catalog-auto mode engages the managed
+    /// prefix namespace with the operator's salt or a generated per-process
+    /// one, and per-model engagement is then gated by the catalog cell for
+    /// the loaded family on the active backend.
+    #[serde(default)]
+    pub prefix_reuse_catalog_auto: bool,
+
     /// Enable chunked prefill for long prompts
     #[serde(default = "default_chunked_prefill")]
     pub enable_chunked_prefill: bool,
@@ -373,6 +402,22 @@ fn default_enable_prefix_caching() -> bool {
 fn default_managed_prefix_cache_salt() -> Option<String> {
     None
 }
+fn default_kv_offload_high_watermark() -> f32 {
+    0.85
+}
+
+fn default_kv_offload_low_watermark() -> f32 {
+    0.70
+}
+
+fn default_kv_offload_max_in_flight_pages() -> usize {
+    8
+}
+
+fn default_kv_offload_max_promotion_pages() -> usize {
+    64
+}
+
 fn default_max_prefix_cache_pages() -> usize {
     128
 }
@@ -400,6 +445,12 @@ impl Default for EngineCoreConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            kv_host_pool_budget_bytes: 0,
+            kv_offload_high_watermark: default_kv_offload_high_watermark(),
+            kv_offload_low_watermark: default_kv_offload_low_watermark(),
+            kv_offload_max_in_flight_pages: default_kv_offload_max_in_flight_pages(),
+            kv_offload_max_promotion_pages: default_kv_offload_max_promotion_pages(),
+            prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_chunked_prefill(),
             enable_cuda_incremental_chat: default_cuda_incremental_chat(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
@@ -471,7 +522,32 @@ impl EngineCoreConfig {
             self.max_prefix_cache_pages,
             self.max_blocks,
             self.max_seq_len,
+            // Catalog-auto reuse degrades instead of failing startup when the
+            // safe page budget is zero; explicit enablement stays fail-closed.
+            self.prefix_reuse_catalog_auto,
         )
+    }
+
+    /// Resolve prefix-reuse engagement once, in place. Explicit operator
+    /// enablement keeps the fail-closed salt contract (a missing namespace
+    /// stays absent so the policy resolver rejects the configuration);
+    /// catalog-auto mode engages with the operator namespace or a generated
+    /// per-process one. Call before `resolved_kv_cache_policy` so both agree
+    /// on one namespace.
+    pub fn apply_prefix_engagement(&mut self) {
+        let (engaged, namespace) = crate::config::resolve_prefix_engagement(
+            self.enable_prefix_caching,
+            self.prefix_reuse_catalog_auto,
+            self.managed_prefix_cache_salt.as_deref(),
+        );
+        if engaged {
+            self.enable_prefix_caching = true;
+            if let Some(namespace) = namespace {
+                self.managed_prefix_cache_salt = Some(namespace);
+            }
+        }
+        // The auto flag stays set for catalog-auto engagements so the policy
+        // resolver can degrade instead of failing startup on a zero budget.
     }
 
     /// Create config for Qwen3-TTS model
@@ -541,6 +617,56 @@ mod managed_kv_default_tests {
         assert_eq!(policy.effective.page_size, 64);
         assert_eq!(policy.effective.dtype, KvCacheDtype::Float16);
         assert_eq!(policy.effective.prefix, PrefixCachePolicy::Disabled);
+    }
+
+    #[test]
+    fn prefix_engagement_applies_once_and_preserves_explicit_fail_closed() {
+        // Catalog-auto engages with the operator namespace when present and
+        // clears the auto flag so the engine never generates a second one.
+        let mut config = EngineCoreConfig {
+            prefix_reuse_catalog_auto: true,
+            managed_prefix_cache_salt: Some("tenant-a".to_string()),
+            ..EngineCoreConfig::default()
+        };
+        config.apply_prefix_engagement();
+        assert!(config.enable_prefix_caching);
+        assert_eq!(
+            config.managed_prefix_cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            config.resolved_kv_cache_policy().unwrap().effective.prefix,
+            PrefixCachePolicy::Namespaced {
+                namespace: "tenant-a".to_string(),
+                max_pages: 128
+            }
+        );
+
+        // Catalog-auto without a namespace generates one per process.
+        let mut config = EngineCoreConfig {
+            prefix_reuse_catalog_auto: true,
+            ..EngineCoreConfig::default()
+        };
+        config.apply_prefix_engagement();
+        assert!(config.enable_prefix_caching);
+        let generated = config.managed_prefix_cache_salt.clone().expect("generated");
+        assert!(!generated.is_empty());
+
+        // Explicit enablement without a namespace stays fail-closed.
+        let mut config = EngineCoreConfig {
+            enable_prefix_caching: true,
+            ..EngineCoreConfig::default()
+        };
+        config.apply_prefix_engagement();
+        assert!(config.enable_prefix_caching);
+        assert!(config.managed_prefix_cache_salt.is_none());
+        assert!(config.resolved_kv_cache_policy().is_err());
+
+        // Disabled stays disabled.
+        let mut config = EngineCoreConfig::default();
+        config.apply_prefix_engagement();
+        assert!(!config.enable_prefix_caching);
+        assert!(config.managed_prefix_cache_salt.is_none());
     }
 
     #[test]

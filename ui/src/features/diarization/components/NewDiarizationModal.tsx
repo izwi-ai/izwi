@@ -8,7 +8,7 @@ import {
   Upload,
 } from "lucide-react";
 
-import { api, type DiarizationRecord } from "@/api";
+import { api, type DiarizationRecord, type ModelInfo } from "@/api";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -28,6 +28,7 @@ import {
 } from "@/shared/audioUpload";
 import type { UploadProgressInfo } from "@/shared/api/audio";
 import { isAbortError } from "@/shared/api/http";
+import { diarizationSpeakerUpperBound, getModelStatusLabel } from "@/features/models/catalog/routeModelCatalog";
 import { SpeechTextModeSwitch } from "@/features/speech-text/components/SpeechTextModeSwitch";
 import { SpeechTextUploadProgress } from "@/features/speech-text/components/SpeechTextUploadProgress";
 import type { SpeechTextCreationMode } from "@/features/speech-text/creationMode";
@@ -47,6 +48,8 @@ interface NewDiarizationModalProps {
   pipelineMode?: "classic" | "granite";
   selectedModel: string | null;
   selectedModelReady: boolean;
+  diarizationModels: ModelInfo[];
+  onSelectModel: (variant: string) => void;
   pipelineAsrModelId?: string | null;
   pipelineAlignerModelId?: string | null;
   pipelineLlmModelId?: string | null;
@@ -55,11 +58,9 @@ interface NewDiarizationModalProps {
   onPipelineModelsRequired: () => void;
   managedModelCount?: number;
   readyManagedModelCount?: number;
-  canLoadAnyManagedModels?: boolean;
   canUnloadAnyManagedModels?: boolean;
   isManagedModelActionBusy?: boolean;
   onOpenModelManager: () => void;
-  onLoadAllManagedModels: () => void;
   onUnloadAllManagedModels: () => void;
   onCreated: (record: DiarizationRecord) => Promise<void> | void;
 }
@@ -94,6 +95,8 @@ export function NewDiarizationModal({
   pipelineMode = "classic",
   selectedModel,
   selectedModelReady,
+  diarizationModels,
+  onSelectModel,
   pipelineAsrModelId = null,
   pipelineAlignerModelId = null,
   pipelineLlmModelId = null,
@@ -102,11 +105,9 @@ export function NewDiarizationModal({
   onPipelineModelsRequired,
   managedModelCount = 0,
   readyManagedModelCount = 0,
-  canLoadAnyManagedModels = false,
   canUnloadAnyManagedModels = false,
   isManagedModelActionBusy = false,
   onOpenModelManager,
-  onLoadAllManagedModels,
   onUnloadAllManagedModels,
   onCreated,
 }: NewDiarizationModalProps) {
@@ -248,8 +249,14 @@ export function NewDiarizationModal({
   }, [isGranitePipeline, pipelineModelsReady, selectedModelReady]);
 
   const normalizeSettings = useCallback(() => {
-    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, 4);
-    const nextMaxSpeakers = clampIntegerDraft(maxSpeakers, 4, 1, 4);
+    const speakerUpperBound = diarizationSpeakerUpperBound(selectedModel);
+    let nextMinSpeakers = clampIntegerDraft(minSpeakers, 1, 1, speakerUpperBound);
+    const nextMaxSpeakers = clampIntegerDraft(
+      maxSpeakers,
+      speakerUpperBound,
+      1,
+      speakerUpperBound,
+    );
     const nextMinSpeechMs = clampIntegerDraft(minSpeechMs, 240, 40, 5000);
     const nextMinSilenceMs = clampIntegerDraft(minSilenceMs, 200, 40, 5000);
 
@@ -268,7 +275,7 @@ export function NewDiarizationModal({
       minSpeechMs: nextMinSpeechMs,
       minSilenceMs: nextMinSilenceMs,
     };
-  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs]);
+  }, [maxSpeakers, minSilenceMs, minSpeakers, minSpeechMs, selectedModel]);
 
   const submitAudio = useCallback(
     async (audioBlob: Blob, options: SubmitAudioOptions = {}) => {
@@ -548,19 +555,24 @@ export function NewDiarizationModal({
       ? "Loading"
       : "Not loaded";
   const readinessTone = allManagedModelsReady ? "success" : "warning";
-  const readinessActionIsUnload = allManagedModelsReady;
-  const readinessActionLabel = isManagedModelActionBusy
-    ? "Loading models..."
-    : readinessActionIsUnload
-      ? "Unload Models"
-      : "Load Models";
-  const readinessActionClass = readinessActionIsUnload
-    ? "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]"
-    : "mt-3 h-9 w-full gap-2";
   const readinessLabel = "Diarization stack";
-  const canRunReadinessAction = readinessActionIsUnload
-    ? canUnloadAnyManagedModels
-    : canLoadAnyManagedModels;
+  const readinessUnloadClass =
+    "mt-3 h-9 w-full gap-2 border-[var(--danger-border)] bg-[var(--danger-bg)] text-[var(--danger-text)] hover:bg-[var(--danger-bg-hover)] hover:text-[var(--danger-text)]";
+  const selectedModelInCatalog =
+    selectedModel != null &&
+    diarizationModels.some((model) => model.variant === selectedModel);
+  const pickerOptions = selectedModel != null && !selectedModelInCatalog
+    ? [
+        { variant: selectedModel, label: `${selectedModel} (not in catalog)` },
+        ...diarizationModels.map((model) => ({
+          variant: model.variant,
+          label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
+        })),
+      ]
+    : diarizationModels.map((model) => ({
+        variant: model.variant,
+        label: `${model.variant} — ${getModelStatusLabel(model.status)}`,
+      }));
   const submissionStatusLabel =
     uploadState?.phase === "preparing"
       ? "Preparing"
@@ -797,7 +809,24 @@ export function NewDiarizationModal({
                 </div>
 
                 <div className="mt-2.5 rounded-2xl border border-[var(--border-muted)] bg-[var(--bg-surface-0)] p-3">
-                  <div className="flex items-center justify-between gap-3">
+                  <label className="space-y-2 text-xs font-medium text-[var(--text-muted)]">
+                    <span>Diarization model</span>
+                    <select
+                      aria-label="Diarization model"
+                      value={selectedModel ?? ""}
+                      onChange={(event) => onSelectModel(event.target.value)}
+                      disabled={isSubmitting || isRecording}
+                      className="flex h-10 w-full rounded-lg border border-[var(--border-muted)] bg-[var(--bg-surface-0)] px-3 py-1 text-sm text-[var(--text-primary)]"
+                    >
+                      {pickerOptions.map((option) => (
+                        <option key={option.variant} value={option.variant}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <div className="mt-2.5 flex items-center justify-between gap-3">
                     <span className="text-xs text-[var(--text-muted)]">
                       {readinessLabel}
                     </span>
@@ -806,28 +835,26 @@ export function NewDiarizationModal({
                     </StatusBadge>
                   </div>
 
-                  <Button
-                    type="button"
-                    variant={readinessActionIsUnload ? "outline" : "default"}
-                    size="sm"
-                    className={readinessActionClass}
-                    onClick={
-                      readinessActionIsUnload
-                        ? onUnloadAllManagedModels
-                        : onLoadAllManagedModels
-                    }
-                    disabled={
-                      isSubmitting ||
-                      isRecording ||
-                      isManagedModelActionBusy ||
-                      !canRunReadinessAction
-                    }
-                  >
-                    {isManagedModelActionBusy ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : null}
-                    {readinessActionLabel}
-                  </Button>
+                  {allManagedModelsReady ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className={readinessUnloadClass}
+                      onClick={onUnloadAllManagedModels}
+                      disabled={
+                        isSubmitting ||
+                        isRecording ||
+                        isManagedModelActionBusy ||
+                        !canUnloadAnyManagedModels
+                      }
+                    >
+                      {isManagedModelActionBusy ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : null}
+                      Unload Models
+                    </Button>
+                  ) : null}
 
                   <Button
                     type="button"

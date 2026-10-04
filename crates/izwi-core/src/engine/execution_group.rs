@@ -1575,6 +1575,7 @@ mod tests {
                             text: Some("fast-progress".to_string()),
                             stats: None,
                             asr_progress: None,
+                            logprobs: Vec::new(),
                         },
                         request.stream_policy,
                     )

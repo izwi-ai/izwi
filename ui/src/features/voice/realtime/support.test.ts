@@ -42,7 +42,7 @@ describe("voice realtime support", () => {
 
   it("detects the unified lfm25 audio variant", () => {
     expect(isUnifiedAudioChatVariant("LFM2.5-Audio-1.5B-GGUF")).toBe(true);
-    expect(isUnifiedAudioChatVariant("Qwen3-1.7B-GGUF")).toBe(false);
+    expect(isUnifiedAudioChatVariant("Qwen3.5-4B")).toBe(false);
   });
 
   it("keeps Voxtral out of modular voice ASR until native realtime support lands", () => {

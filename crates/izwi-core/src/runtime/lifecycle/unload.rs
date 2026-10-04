@@ -10,7 +10,12 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
+use crate::runtime::lifecycle::load::now_unix_millis;
 use crate::runtime::service::RuntimeService;
+use tracing::{debug, info};
+
+/// How often the idle keep-alive reaper scans residents.
+const IDLE_MODEL_REAP_INTERVAL_SECS: u64 = 30;
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -58,7 +63,9 @@ impl ModelLifecycleController {
                 self.model_registry.unload_diarization(variant).await;
             }
             ModelFamily::Qwen3Chat
+            | ModelFamily::Qwen3MoeChat
             | ModelFamily::Qwen35Chat
+            | ModelFamily::Qwen35MoeChat
             | ModelFamily::Qwen38Chat
             | ModelFamily::Lfm2Chat
             | ModelFamily::Gemma3Chat => {
@@ -130,6 +137,7 @@ impl ModelLifecycleController {
         self.remove_registry_and_auxiliary_state(variant).await;
         self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
+        self.maybe_recover_poisoned_authority().await;
         Ok(())
     }
 
@@ -210,7 +218,62 @@ impl ModelLifecycleController {
         // sample taken while the model was still resident.
         self.release_resident_slot_and_refresh_capacity(variant);
         self.forget_model_usage(variant).await;
+        self.unpin_model(variant).await;
+        self.maybe_recover_poisoned_authority().await;
         Ok(())
+    }
+
+    /// A poisoned authority recovers once the backend fully drains: no
+    /// authoritative residents, no manager projections, and no active engine
+    /// work means nothing queued before the failure can be misattributed to
+    /// fresh loads. Called after every unload; pinned residents keep the
+    /// device from draining, which is what makes the desktop recreate
+    /// backstop meaningful.
+    pub(super) async fn maybe_recover_poisoned_authority(&self) {
+        let authority = self.coordinator.resource_authority();
+        if authority.poison_reason().is_none() {
+            return;
+        }
+        if !self.authoritative_resident_variants().is_empty()
+            || !self.model_manager.resident_variants().await.is_empty()
+            || !self.core_engine.active_model_variants().await.is_empty()
+        {
+            return;
+        }
+        // The last unload flushed the pool only on the authoritative path;
+        // flush again so recovery starts from a clean scratch slate.
+        MetalPoolManager::global().clear_all();
+        authority.clear_poison();
+    }
+
+    /// Best-effort drain of unpinned, idle residents after the authority has
+    /// been poisoned. Ollama expires idle runners for the same reason: a
+    /// poisoned device rejects every new reservation, so keeping idle
+    /// residents loaded only delays recovery. Pinned residents and models
+    /// with active work keep their LM-Studio-style protection.
+    pub(super) async fn drain_unpinned_residents_for_recovery(&self) {
+        let pinned = self.pinned_variants.lock().await.clone();
+        let active = self.core_engine.active_model_variants().await;
+        for resident in self.authoritative_resident_variants() {
+            if pinned.contains(&resident) || active.contains(&resident) {
+                continue;
+            }
+            if self.model_manager.active_residency_leases(resident) > 0 {
+                continue;
+            }
+            info!(
+                model = %resident,
+                "Unloading an unpinned resident to drain the poisoned authority"
+            );
+            if let Err(error) = self.unload_model_locked(resident).await {
+                tracing::error!(
+                    model = %resident,
+                    %error,
+                    "Failed to unload a resident while draining the poisoned authority"
+                );
+            }
+        }
+        self.maybe_recover_poisoned_authority().await;
     }
 
     async fn run_unload(self: Arc<Self>, variant: ModelVariant) -> Result<()> {
@@ -330,6 +393,81 @@ impl RuntimeService {
     /// Unload every authoritatively resident model from memory.
     pub async fn unload_all_models(&self) -> Result<usize> {
         self.model_lifecycle.unload_all_models_detached().await
+    }
+
+    /// Spawn the idle keep-alive reaper: transient (job auto-loaded)
+    /// residents idle longer than `model_keep_alive_secs` are unloaded.
+    /// Pinned residents, models with active leases, and models with
+    /// in-flight engine work are never reaped. A no-op when the keep-alive
+    /// is disabled (0).
+    pub fn spawn_idle_model_reaper(self: &Arc<Self>) {
+        if self.config.model_keep_alive_secs == 0 {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                IDLE_MODEL_REAP_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                for variant in service.reap_idle_models().await {
+                    info!(model = %variant, "Reaped idle model past its keep-alive");
+                }
+            }
+        });
+    }
+
+    /// Unload every transient resident whose idle time exceeds the
+    /// configured keep-alive, returning the reaped variants. A no-op when
+    /// the keep-alive is disabled (0).
+    pub(crate) async fn reap_idle_models(&self) -> Vec<ModelVariant> {
+        let keep_alive_secs = self.config.model_keep_alive_secs;
+        if keep_alive_secs == 0 {
+            return Vec::new();
+        }
+        let keep_alive_millis = keep_alive_secs.saturating_mul(1000);
+        let now = now_unix_millis();
+        let pinned = self.model_lifecycle.pinned_model_variants().await;
+        let active = self.core_engine.active_model_variants().await;
+        let last_used = self.model_lifecycle.model_last_used.lock().await.clone();
+        let mut candidates = Vec::new();
+        for variant in self.model_manager.resident_variants().await {
+            if pinned.contains(&variant) || active.contains(&variant) {
+                continue;
+            }
+            if self.model_manager.active_residency_leases(variant) > 0 {
+                continue;
+            }
+            // Never touch a model that is still loading or unloading.
+            if !self.model_manager.is_ready(variant).await {
+                continue;
+            }
+            // Usage records start at load time; a resident without one is
+            // treated as fresh rather than arbitrarily idle.
+            let Some(idle_since) = last_used.get(&variant) else {
+                continue;
+            };
+            if now.saturating_sub(*idle_since) >= keep_alive_millis {
+                candidates.push(variant);
+            }
+        }
+        let mut reaped = Vec::with_capacity(candidates.len());
+        for variant in candidates {
+            match self.unload_model(variant).await {
+                Ok(()) => reaped.push(variant),
+                Err(error) => {
+                    debug!(model = %variant, %error, "Idle reaper unload skipped");
+                }
+            }
+        }
+        reaped
+    }
+
+    /// Variants currently tracked as resident (loading or ready).
+    pub async fn resident_model_variants(&self) -> Vec<ModelVariant> {
+        self.model_manager.resident_variants().await
     }
 }
 

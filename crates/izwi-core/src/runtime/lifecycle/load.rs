@@ -26,6 +26,8 @@ use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
 use crate::models::registry::NativeAsrModel;
+use crate::models::shared::memory::metal::MetalPoolManager;
+use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedExecutionContract, LoadedModelBundleDraft, LoadedStatePublication,
 };
@@ -34,10 +36,12 @@ use crate::runtime::lifecycle::controller::{
 };
 use crate::runtime::service::RuntimeService;
 
+#[path = "qwen35moe_memory.rs"]
+mod qwen35moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
 
-fn now_unix_millis() -> u64 {
+pub(super) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -56,12 +60,17 @@ fn select_lru_eviction_candidate(
     resident_variants: &[ModelVariant],
     requested_variant: ModelVariant,
     active_variants: &HashSet<ModelVariant>,
+    pinned_variants: &HashSet<ModelVariant>,
     last_used: &HashMap<ModelVariant, u64>,
 ) -> Option<ModelVariant> {
     resident_variants
         .iter()
         .copied()
-        .filter(|variant| *variant != requested_variant && !active_variants.contains(variant))
+        .filter(|variant| {
+            *variant != requested_variant
+                && !active_variants.contains(variant)
+                && !pinned_variants.contains(variant)
+        })
         .min_by(|left, right| {
             last_used
                 .get(left)
@@ -155,27 +164,23 @@ fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> 
     available_bytes / remaining_groups.max(1)
 }
 
-fn portable_context_ceiling(
-    variant: ModelVariant,
-    preference: ContextLengthPreference,
-    maximum: u64,
-) -> u64 {
-    if preference.explicit_tokens().is_some() {
-        return maximum;
-    }
-    match variant {
-        ModelVariant::Lfm25Audio15BGguf => maximum.min(4_096),
-        ModelVariant::VibeVoice15BTts => maximum.min(1_024),
-        ModelVariant::Qwen3Asr06BGguf
-        | ModelVariant::Qwen3Asr17BGguf
-        | ModelVariant::GraniteSpeech412BPlus => maximum.min(1_024),
-        _ => maximum,
-    }
-}
-
 fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_bytes: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    // Synthetic fixture loads must not inherit the pinned 27B catalog
+    // inference size: their actual residency is tiny, so subtracting it from
+    // the 80 GiB catalog value would reserve an absurd request-scoped budget
+    // and collapse the portable context fit.
+    if variant == ModelVariant::Qwen3827BFp8
+        && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+    {
+        return configured_reserve_bytes;
+    }
+    if variant == ModelVariant::Qwen35Moe35BA3BFp8
+        && crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled()
+    {
+        return configured_reserve_bytes;
+    }
     let total_inference_bytes = (variant.memory_required_gb() as f64 * GIB as f64).ceil() as u64;
     let resident_bytes = model_memory_estimate(variant).resident_bytes;
     configured_reserve_bytes.saturating_add(total_inference_bytes.saturating_sub(resident_bytes))
@@ -335,13 +340,12 @@ fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>)
     Ok(())
 }
 
-fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
+fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
     let mut files = Vec::new();
     collect_checkpoint_files(path, 3, &mut files)?;
-    let mut total = 0_u64;
-    let mut largest = 0_u64;
     let mut found = false;
     let mut container_fallback = 0_u64;
+    let mut aggregate = TensorStorageInventory::default();
     for file in files {
         let extension = file.extension().and_then(|value| value.to_str());
         let inventory = match extension {
@@ -354,17 +358,24 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
                 // the parsed tensor views returned below.
                 let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(&file) }?;
                 Some(tensors.tensors().into_iter().try_fold(
-                    (0_u64, 0_u64),
-                    |(sum, max), (_, tensor)| {
+                    TensorStorageInventory::default(),
+                    |inv, (_, tensor)| {
                         let bytes = u64::try_from(tensor.data().len()).map_err(|_| {
                             Error::ModelLoadError("safetensors tensor size exceeds u64".into())
                         })?;
-                        Ok::<_, Error>((
-                            sum.checked_add(bytes).ok_or_else(|| {
-                                Error::ModelLoadError("safetensors inventory overflow".into())
-                            })?,
-                            max.max(bytes),
-                        ))
+                        let elements = u64::try_from(
+                            tensor
+                                .shape()
+                                .iter()
+                                .try_fold(1_usize, |acc: usize, &dim| acc.checked_mul(dim))
+                                .unwrap_or(usize::MAX),
+                        )
+                        .map_err(|_| {
+                            Error::ModelLoadError(
+                                "safetensors tensor element count exceeds u64".into(),
+                            )
+                        })?;
+                        Ok::<_, Error>(inv.push(bytes, elements))
                     },
                 )?)
             }
@@ -372,12 +383,15 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
                 let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
                     .ok()
                     .map(|infos| {
-                        infos.into_iter().fold((0_u64, 0_u64), |(sum, max), info| {
-                            let bytes = u64::try_from(info.layout.shape().elem_count())
-                                .unwrap_or(u64::MAX)
-                                .saturating_mul(info.dtype.size_in_bytes() as u64);
-                            (sum.saturating_add(bytes), max.max(bytes))
-                        })
+                        infos
+                            .into_iter()
+                            .fold(TensorStorageInventory::default(), |inv, info| {
+                                let elements = u64::try_from(info.layout.shape().elem_count())
+                                    .unwrap_or(u64::MAX);
+                                let bytes =
+                                    elements.saturating_mul(info.dtype.size_in_bytes() as u64);
+                                inv.push(bytes, elements)
+                            })
                     });
                 if parsed.is_none() {
                     container_fallback = container_fallback.max(file.metadata()?.len());
@@ -393,37 +407,71 @@ fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<(u64, u64)>> {
             }
             _ => None,
         };
-        if let Some((file_total, file_largest)) = inventory {
+        if let Some(file_inventory) = inventory {
             found = true;
-            total = total.checked_add(file_total).ok_or_else(|| {
-                Error::ModelLoadError("checkpoint tensor inventory overflow".into())
-            })?;
-            largest = largest.max(file_largest);
+            aggregate = aggregate.merge(file_inventory);
         }
     }
     if !found && container_fallback > 0 {
-        return Ok(Some((container_fallback, container_fallback)));
+        return Ok(Some(TensorStorageInventory {
+            total_bytes: container_fallback,
+            largest_tensor_bytes: container_fallback,
+            largest_tensor_elements: 0,
+            tensor_count: 1,
+        }));
     }
-    Ok(found.then_some((total, largest)))
+    Ok(found.then_some(aggregate))
 }
+
+/// Per-tensor instantiation slack: device buffer page rounding, storage
+/// headers, and allocator slack for every materialized weight tensor. Only
+/// becomes material at MoE scale (thousands of same-sized expert tensors);
+/// negligible for the few hundred tensors of a dense checkpoint.
+const PER_TENSOR_INSTANTIATION_SLACK_BYTES: u64 = 32 * 1024;
+/// Worst-case load-time destination expansion of one tensor: a quantized
+/// source dequantizes to F32 (4 bytes/element) and the source bytes stay
+/// alive while the destination is built.
+const SINGLE_TENSOR_F32_DESTINATION_BYTES_PER_ELEMENT: u64 = 4;
 
 fn estimate_from_tensor_inventory(
     catalog: ModelMemoryEstimate,
-    inventory: Option<(u64, u64)>,
+    inventory: Option<TensorStorageInventory>,
 ) -> Result<ModelMemoryEstimate> {
-    let Some((resident_bytes, largest_tensor_bytes)) = inventory else {
+    let Some(inventory) = inventory else {
         return Ok(catalog);
     };
-    let load_peak_bytes = resident_bytes
-        .checked_add(
-            largest_tensor_bytes
-                .checked_next_power_of_two()
-                .unwrap_or(largest_tensor_bytes),
-        )
+    if inventory.total_bytes == 0 {
+        return Ok(catalog);
+    }
+    // Size-class bound for one tensor's working copy (the historic term).
+    let single_tensor_working_copy = inventory
+        .largest_tensor_bytes
+        .checked_next_power_of_two()
+        .unwrap_or(inventory.largest_tensor_bytes);
+    // Conversion bound for a dequantizing loader: source bytes plus the F32
+    // destination of the largest tensor. Dominates the size-class bound only
+    // when the source is sub-F32 (quantized or half-precision checkpoints).
+    let single_tensor_conversion_bound = inventory.largest_tensor_bytes.saturating_add(
+        inventory
+            .largest_tensor_elements
+            .saturating_mul(SINGLE_TENSOR_F32_DESTINATION_BYTES_PER_ELEMENT),
+    );
+    // Allocation-count bound: instantiation overhead of the whole checkpoint.
+    // A MoE-shaped checkpoint (many same-sized expert tensors) collapses the
+    // largest-tensor terms; this term keeps its load scratch reserved.
+    let whole_checkpoint_instantiation = inventory
+        .tensor_count
+        .saturating_mul(PER_TENSOR_INSTANTIATION_SLACK_BYTES);
+    let load_scratch_bytes = single_tensor_working_copy
+        .max(single_tensor_conversion_bound)
+        .max(whole_checkpoint_instantiation);
+    let load_peak_bytes = inventory
+        .total_bytes
+        .checked_add(load_scratch_bytes)
         .ok_or_else(|| Error::ModelLoadError("portable model load estimate overflow".into()))?;
     Ok(ModelMemoryEstimate {
         load_peak_bytes,
-        resident_bytes,
+        resident_bytes: inventory.total_bytes,
     })
 }
 
@@ -490,6 +538,31 @@ fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
             ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES);
     }
     plan
+}
+
+/// Fixture-mode qwen38 estimate (synthetic geometry opt-in): derived from the
+/// actual checkpoint inventory instead of the pinned 27B constants, while
+/// reserving the same portable conversion scratch the pinned estimate carries.
+fn qwen38_synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEstimate> {
+    let overflow = || Error::ModelLoadError("Qwen3.8 fixture memory estimate overflow".into());
+    let Some(inventory) = checkpoint_tensor_inventory(model_path)? else {
+        return Err(Error::ModelLoadError(
+            "Synthetic Qwen3.8 fixture has no readable tensor inventory".into(),
+        ));
+    };
+    // The portable load path materializes expanded F32 projections from the
+    // FP8/BF16 source bytes; a 4x envelope covers the resident expansion and
+    // the portable conversion scratch bounds the load peak like the pinned
+    // estimate does.
+    let resident_bytes = inventory.total_bytes.checked_mul(4).ok_or_else(overflow)?;
+    let load_peak_bytes = resident_bytes
+        .checked_add(QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
+        .and_then(|bytes| bytes.checked_add(inventory.largest_tensor_bytes.next_power_of_two()))
+        .ok_or_else(overflow)?;
+    Ok(ModelMemoryEstimate {
+        load_peak_bytes,
+        resident_bytes,
+    })
 }
 
 fn fish_s2_resource_plan(
@@ -966,7 +1039,8 @@ impl ModelLifecycleController {
             }
             return Ok(());
         };
-        let maximum = portable_context_ceiling(variant, self.config.max_sequence_length, maximum);
+        // The invocation context ceiling is the model-authored maximum; the
+        // memory-budgeted binary search below decides how much of it fits.
         let intent = portable_invocation_context_intent(
             self.config.max_sequence_length,
             self.model_registry.effective_context(variant),
@@ -1101,6 +1175,24 @@ impl ModelLifecycleController {
         last_used.insert(variant, now_unix_millis());
     }
 
+    /// Mark an explicitly loaded resident as pinned: it survives budget and
+    /// memory-pressure eviction (and the idle-TTL reaper) until an explicit
+    /// unload. Job auto-loads never call this.
+    pub(super) async fn pin_model(&self, variant: ModelVariant) {
+        let mut pinned = self.pinned_variants.lock().await;
+        if pinned.insert(variant) {
+            info!(model = %variant, "Pinning explicitly loaded model against eviction");
+        }
+    }
+
+    pub(super) async fn unpin_model(&self, variant: ModelVariant) {
+        self.pinned_variants.lock().await.remove(&variant);
+    }
+
+    pub(super) async fn pinned_model_variants(&self) -> HashSet<ModelVariant> {
+        self.pinned_variants.lock().await.clone()
+    }
+
     pub(super) async fn forget_model_usage(&self, variant: ModelVariant) {
         let mut last_used = self.model_last_used.lock().await;
         last_used.remove(&variant);
@@ -1150,14 +1242,16 @@ impl ModelLifecycleController {
                 }
             }
             let last_used = self.model_last_used.lock().await.clone();
+            let pinned_variants = self.pinned_variants.lock().await.clone();
             let Some(victim) = select_lru_eviction_candidate(
                 &ready_variants,
                 requested_variant,
                 &active_variants,
+                &pinned_variants,
                 &last_used,
             ) else {
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and ready for eviction"
+                    "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and available for eviction; unload a model to make room"
                 )));
             };
 
@@ -1185,7 +1279,22 @@ impl ModelLifecycleController {
                     &self.config.performance,
                 );
             }
+            if crate::models::architectures::qwen38::native::synthetic_geometry_enabled() {
+                // Fixture load (benchmark/CI): price the actual checkpoint
+                // instead of the pinned 27B constants.
+                let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
+                return Ok(model_resource_plan(backend, estimate));
+            }
             return Ok(qwen38_resource_plan(backend));
+        }
+        if variant == ModelVariant::Qwen35Moe35BA3BFp8 {
+            if crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled() {
+                // Fixture load (benchmark/CI): price the actual checkpoint
+                // instead of the pinned 35B constants.
+                let estimate = qwen35moe_memory::synthetic_fixture_estimate(model_path)?;
+                return Ok(model_resource_plan(backend, estimate));
+            }
+            return qwen35moe_memory::resource_plan(backend);
         }
         if variant == ModelVariant::FishAudioS2Pro {
             let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
@@ -1211,14 +1320,27 @@ impl ModelLifecycleController {
         if backend == BackendKind::Cuda {
             return Ok(());
         }
+        let mut pooled_scratch_flushed = false;
         loop {
-            let ResourceAmount::Known(headroom) = self
+            let ResourceAmount::Known(planning_headroom) = self
                 .coordinator
                 .resource_authority()
                 .planning_headroom_bytes(backend)?
             else {
                 return Ok(());
             };
+            // Metal loads allocate the full working set at the load fence, so
+            // the pre-load check must also respect probed live availability —
+            // static ledger estimates alone under-count GGUF materialization
+            // and pooled scratch. An unavailable live probe never blocks a
+            // load; planning headroom remains the contract then.
+            let live_headroom = self
+                .coordinator
+                .resource_authority()
+                .live_preload_headroom_bytes(backend)?;
+            let headroom = live_headroom
+                .map(|live| planning_headroom.min(live))
+                .unwrap_or(planning_headroom);
             if required_bytes <= headroom {
                 return Ok(());
             }
@@ -1231,14 +1353,36 @@ impl ModelLifecycleController {
                     .filter(|variant| self.model_manager.active_residency_leases(*variant) > 0),
             );
             let last_used = self.model_last_used.lock().await.clone();
+            let pinned_variants = self.pinned_variants.lock().await.clone();
             let Some(victim) = select_lru_eviction_candidate(
                 &resident_variants,
                 requested_variant,
                 &active_variants,
+                &pinned_variants,
                 &last_used,
             ) else {
+                if backend == BackendKind::Metal && !pooled_scratch_flushed {
+                    // The pool retains released activation scratch until the
+                    // last model unloads, which can hide gigabytes of
+                    // reclaimable headroom from the live sample. Flushing it
+                    // is safe (only unchecked-out buffers are dropped) and
+                    // beats failing a load that would fit. One flush per
+                    // admission decision; persistent shortage still errors.
+                    pooled_scratch_flushed = true;
+                    info!(
+                        requested_variant = %requested_variant,
+                        planning_headroom,
+                        live_headroom,
+                        "Reclaiming pooled Metal scratch before rejecting the load"
+                    );
+                    MetalPoolManager::global().clear_all();
+                    self.coordinator
+                        .resource_authority()
+                        .refresh_physical_capacity_after_release();
+                    continue;
+                }
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={headroom}, backend={backend:?}; no idle resident model is available for eviction"
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
                 )));
             };
             info!(
@@ -1279,14 +1423,16 @@ impl ModelLifecycleController {
                         }
                     }
                     let last_used = self.model_last_used.lock().await.clone();
+                    let pinned_variants = self.pinned_variants.lock().await.clone();
                     let Some(victim) = select_lru_eviction_candidate(
                         &ready_variants,
                         requested_variant,
                         &active_variants,
+                        &pinned_variants,
                         &last_used,
                     ) else {
                         return Err(Error::ModelLoadError(format!(
-                            "Cannot reserve memory for {requested_variant}: {resource_error}"
+                            "Cannot reserve memory for {requested_variant}: {resource_error}; no idle resident model is available for eviction; unload a model to make room"
                         )));
                     };
                     info!(
@@ -1301,7 +1447,102 @@ impl ModelLifecycleController {
         }
     }
 
+    /// Whether a load failure must trigger the Metal command-buffer OOM
+    /// ladder (pooled-scratch flush and one retry before poisoning). Real
+    /// Metal backends classify by backend kind; CPU test harnesses opt in
+    /// through the injection flag so the ladder stays regression-tested
+    /// without a Metal device.
+    fn load_failure_is_metal_command_buffer_oom(&self, error: &Error) -> bool {
+        if !is_metal_command_buffer_oom(error) {
+            return false;
+        }
+        if self.backend_router.context().backend_kind == BackendKind::Metal {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            if self.load_test_metal_oom_ladder.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn run_load_transaction_locked(
+        &self,
+        variant: ModelVariant,
+        max_loaded_models: Option<usize>,
+        generation: u64,
+    ) -> Result<()> {
+        let outcome = self
+            .run_load_attempt_locked(variant, max_loaded_models, generation)
+            .await;
+        let Err(error) = outcome else {
+            return Ok(());
+        };
+        if !self.load_failure_is_metal_command_buffer_oom(&error) {
+            return Err(error);
+        }
+        if self.coordinator.resource_authority().poison_reason().is_some() {
+            // The failed attempt could not roll back cleanly; retrying over
+            // dirty residency state would compound the damage. Fail closed.
+            return Err(error);
+        }
+        MetalPoolManager::global().clear_all();
+
+        // A retry only makes sense if the flush actually freed enough pooled
+        // scratch to fit the model's load peak. Re-probe live headroom after
+        // the flush; when it is still clearly below the model's static load
+        // peak, a second full load is guaranteed to hit the same command-buffer
+        // OOM and would burn another GGUF read + F16 materialization + fence
+        // (tens of seconds) before poisoning. Skip straight to the poison.
+        let backend = self.backend_router.context().backend_kind;
+        let required_bytes = model_memory_estimate(variant).load_peak_bytes;
+        self.coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        let retry_futile = match self
+            .coordinator
+            .resource_authority()
+            .live_preload_headroom_bytes(backend)
+        {
+            Ok(Some(live_headroom)) => live_headroom < required_bytes,
+            // No trustworthy live sample: preserve the original single-retry
+            // behavior rather than treating the unknown as unlimited.
+            Ok(None) | Err(_) => false,
+        };
+        if retry_futile {
+            self.coordinator.resource_authority().poison(format!(
+                "Metal command-buffer OOM while loading {variant}: live device headroom after a pooled-scratch flush is still below the model's load peak (load_peak_bytes={required_bytes}); not retrying a doomed load: {error}"
+            ));
+            self.drain_unpinned_residents_for_recovery().await;
+            return Err(error);
+        }
+
+        info!(
+            model = %variant,
+            %error,
+            "Metal command-buffer OOM while loading; flushed pooled Metal scratch and retrying the load once"
+        );
+        let retry = self
+            .run_load_attempt_locked(variant, max_loaded_models, generation)
+            .await;
+        if let Err(retry_error) = &retry {
+            if self.load_failure_is_metal_command_buffer_oom(retry_error) {
+                self.coordinator.resource_authority().poison(format!(
+                    "Metal command-buffer OOM while loading {variant} persisted after a pooled-scratch flush and one retry: {retry_error}"
+                ));
+                // The authority now rejects every new reservation. Evicting
+                // unpinned idle residents lets the device drain so the
+                // poison clears without operator action; pinned residents
+                // keep their protection and hold the poison until unloaded.
+                self.drain_unpinned_residents_for_recovery().await;
+            }
+        }
+        retry
+    }
+
+    async fn run_load_attempt_locked(
         &self,
         variant: ModelVariant,
         max_loaded_models: Option<usize>,
@@ -1314,6 +1555,8 @@ impl ModelLifecycleController {
         }
         #[cfg(test)]
         self.maybe_panic_during_load();
+        #[cfg(test)]
+        self.maybe_fail_load_with_metal_oom()?;
 
         let load_started = Instant::now();
         let resolved = self.resolve_model_load(variant).await?;
@@ -1585,20 +1828,6 @@ impl ModelLifecycleController {
                                     "Granite Speech retained decoder has no context bound".into(),
                                 )
                             })?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "Granite Speech retained context exceeds u64".into(),
-                                )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "Granite Speech retained context exceeds usize".into(),
-                            )
-                        })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -1720,20 +1949,7 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "Qwen3 ASR retained context exceeds u64".into(),
-                                )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "Qwen3 ASR retained context exceeds usize".into(),
-                            )
-                        })?;
+                        let retained_max_tokens = physical_spec.retained_max_tokens;
                         let physical = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2164,20 +2380,7 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     if capability == CapabilityKind::Asr {
                         let physical_spec = model.retained_asr_state_spec(&stage_graphs)?;
-                        let retained_max_tokens = usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            u64::try_from(physical_spec.retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "LFM2.5 Audio retained context exceeds u64".into(),
-                                )
-                            })?,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "LFM2.5 Audio retained context exceeds usize".into(),
-                            )
-                        })?;
+                        let retained_max_tokens = physical_spec.retained_max_tokens;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2437,26 +2640,7 @@ impl ModelLifecycleController {
                         "VibeVoice TTS normal graph did not publish retained state".into(),
                     )
                 })?;
-                let retained_max_tokens = physical_spec
-                    .retained_max_tokens
-                    .map(|maximum| {
-                        let maximum = u64::try_from(maximum).map_err(|_| {
-                            Error::ModelLoadError(
-                                "VibeVoice retained context exceeds u64".into(),
-                            )
-                        })?;
-                        usize::try_from(portable_context_ceiling(
-                            variant,
-                            self.config.max_sequence_length,
-                            maximum,
-                        ))
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "VibeVoice retained context exceeds usize".into(),
-                            )
-                        })
-                    })
-                    .transpose()?;
+                let retained_max_tokens = physical_spec.retained_max_tokens;
                 let retained = self
                     .core_engine
                     .load_managed_model_state(
@@ -2649,13 +2833,7 @@ impl ModelLifecycleController {
         .await;
 
         if let Err(error) = publication {
-            if self.backend_router.context().backend_kind == BackendKind::Metal
-                && is_metal_command_buffer_oom(&error)
-            {
-                self.coordinator.resource_authority().poison(format!(
-                    "Metal command-buffer OOM while loading {variant}: {error}"
-                ));
-            }
+            let metal_oom = self.load_failure_is_metal_command_buffer_oom(&error);
             if let Err(rollback_error) = self.rollback_model_locked(variant).await {
                 self.mark_slot_cleanup_required(variant);
                 tracing::error!(
@@ -2663,6 +2841,14 @@ impl ModelLifecycleController {
                     error = %rollback_error,
                     "Model load rollback failed"
                 );
+                if metal_oom {
+                    // Dirty residency state after a device-fatal OOM: new
+                    // physical work must fail closed until recreation, so a
+                    // later attempt cannot be blamed for earlier queued work.
+                    self.coordinator.resource_authority().poison(format!(
+                        "Metal command-buffer OOM while loading {variant} and rollback failed: {error}"
+                    ));
+                }
             }
             return Err(error);
         }
@@ -2756,10 +2942,20 @@ impl RuntimeService {
         }
     }
 
-    /// Load a model without retaining an inference pin.
+    /// Load a model without retaining an inference pin. The explicit load
+    /// entry (admin API, preload list) marks the resident as pinned so it
+    /// survives budget and memory-pressure eviction until explicitly
+    /// unloaded; job auto-loads use `load_model_for_inference` directly and
+    /// stay transient.
     pub async fn load_model(&self, variant: ModelVariant) -> Result<()> {
         drop(self.load_model_for_inference(variant).await?);
+        self.model_lifecycle.pin_model(variant).await;
         Ok(())
+    }
+
+    /// Variants explicitly loaded (pinned) in this server session.
+    pub async fn pinned_model_variants(&self) -> std::collections::HashSet<ModelVariant> {
+        self.model_lifecycle.pinned_model_variants().await
     }
 
     async fn ensure_model_budget_before_load(&self, requested_variant: ModelVariant) -> Result<()> {
@@ -2774,10 +2970,10 @@ impl RuntimeService {
 mod tests {
     use super::{
         automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
-        is_metal_command_buffer_oom, kokoro_effective_context_tokens,
+        is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, portable_context_ceiling,
-        portable_context_reserve_bytes, portable_invocation_context_intent,
+        model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
+        portable_invocation_context_intent,
         qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
         select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
@@ -2808,6 +3004,7 @@ mod tests {
     };
     use crate::model::ModelVariant;
     use crate::models::architectures::fish_s2::weights::FishS2ModelMemory;
+    use crate::models::shared::weights::gguf::TensorStorageInventory;
     use crate::runtime::adapters::{
         CapabilityKind, LoadedExecutionContract, RuntimeAdapterRegistry,
     };
@@ -2972,14 +3169,83 @@ mod tests {
             load_peak_bytes: 12 * 1024 * 1024 * 1024,
             resident_bytes: 12 * 1024 * 1024 * 1024,
         };
-        let estimate =
-            estimate_from_tensor_inventory(catalog, Some((2_400_000_000, 160_000_000))).unwrap();
+        // F32-shaped largest tensor: 160 MB storage over 40M elements.
+        let estimate = estimate_from_tensor_inventory(
+            catalog,
+            Some(TensorStorageInventory {
+                total_bytes: 2_400_000_000,
+                largest_tensor_bytes: 160_000_000,
+                largest_tensor_elements: 40_000_000,
+                tensor_count: 400,
+            }),
+        )
+        .unwrap();
         assert_eq!(estimate.resident_bytes, 2_400_000_000);
-        assert_eq!(estimate.load_peak_bytes, 2_668_435_456);
+        // Scratch = max(next_pow2(160M) = 268,435,456; 160M + 40M*4 = 320M;
+        // 400 * 32 KiB = 13,107,200) = 320,000,000: the F32 conversion bound
+        // of the largest tensor exceeds the historic size-class proxy.
+        assert_eq!(estimate.load_peak_bytes, 2_720_000_000);
         assert_eq!(
             estimate_from_tensor_inventory(catalog, None).unwrap(),
             catalog
         );
+        assert_eq!(
+            estimate_from_tensor_inventory(catalog, Some(TensorStorageInventory::default()),)
+                .unwrap(),
+            catalog
+        );
+    }
+
+    #[test]
+    fn moe_shaped_inventory_reserves_whole_checkpoint_instantiation_scratch() {
+        let catalog = ModelMemoryEstimate {
+            load_peak_bytes: 40 * 1024 * 1024 * 1024,
+            resident_bytes: 40 * 1024 * 1024 * 1024,
+        };
+        // MoE shape: tens of thousands of same-sized expert tensors collapse
+        // the largest-tensor terms; only the allocation-count term keeps the
+        // instantiation scratch reserved.
+        let inventory = TensorStorageInventory {
+            total_bytes: 30_000_000_000,
+            largest_tensor_bytes: 20_971_520,
+            largest_tensor_elements: 5_242_880,
+            tensor_count: 18_432,
+        };
+        let estimate = estimate_from_tensor_inventory(catalog, Some(inventory)).unwrap();
+        assert_eq!(estimate.resident_bytes, 30_000_000_000);
+        assert_eq!(estimate.load_peak_bytes, 30_603_979_776);
+        // The historic formula would have reserved only the size-class proxy
+        // of one expert tensor (30,033,554,432) — under-reserving by the
+        // whole-checkpoint instantiation term the fix exists for.
+        let historic_load_peak = inventory.total_bytes
+            + inventory
+                .largest_tensor_bytes
+                .checked_next_power_of_two()
+                .unwrap();
+        assert_eq!(historic_load_peak, 30_033_554_432);
+        assert!(estimate.load_peak_bytes > historic_load_peak);
+    }
+
+    #[test]
+    fn quantized_largest_tensor_reserves_f32_conversion_scratch() {
+        let catalog = ModelMemoryEstimate {
+            load_peak_bytes: 1024 * 1024 * 1024,
+            resident_bytes: 1024 * 1024 * 1024,
+        };
+        // Q4_0-shaped largest tensor: 1M elements over 562.5 KB of storage.
+        // A dequantizing loader holds the source while building the F32
+        // destination (4 MB), which the size-class proxy under-covers.
+        let estimate = estimate_from_tensor_inventory(
+            catalog,
+            Some(TensorStorageInventory {
+                total_bytes: 5_000_000,
+                largest_tensor_bytes: 562_500,
+                largest_tensor_elements: 1_000_000,
+                tensor_count: 10,
+            }),
+        )
+        .unwrap();
+        assert_eq!(estimate.load_peak_bytes, 9_562_500);
     }
 
     #[test]
@@ -3421,14 +3687,15 @@ mod tests {
     fn select_lru_eviction_candidate_skips_requested_and_active_models() {
         let resident_variants = vec![
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             ModelVariant::Kokoro82M,
         ];
         let requested_variant = ModelVariant::Kokoro82M;
-        let active_variants = HashSet::from([ModelVariant::Qwen38BGguf]);
+        let active_variants = HashSet::from([ModelVariant::Qwen359BGguf]);
+        let pinned_variants = HashSet::new();
         let last_used = HashMap::from([
             (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
-            (ModelVariant::Qwen38BGguf, 5_u64),
+            (ModelVariant::Qwen359BGguf, 5_u64),
             (ModelVariant::Kokoro82M, 20_u64),
         ]);
 
@@ -3436,10 +3703,54 @@ mod tests {
             &resident_variants,
             requested_variant,
             &active_variants,
+            &pinned_variants,
             &last_used,
         );
 
         assert_eq!(candidate, Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+    }
+
+    #[test]
+    fn select_lru_eviction_candidate_skips_pinned_models() {
+        let resident_variants = vec![
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ModelVariant::Qwen359BGguf,
+        ];
+        let requested_variant = ModelVariant::Kokoro82M;
+        let active_variants = HashSet::new();
+        let pinned_variants = HashSet::from([ModelVariant::Qwen359BGguf]);
+        // The pinned model is older than the unpinned one but must not be
+        // selected.
+        let last_used = HashMap::from([
+            (ModelVariant::Qwen3Tts12Hz06BCustomVoice, 10_u64),
+            (ModelVariant::Qwen359BGguf, 5_u64),
+        ]);
+
+        let candidate = select_lru_eviction_candidate(
+            &resident_variants,
+            requested_variant,
+            &active_variants,
+            &pinned_variants,
+            &last_used,
+        );
+
+        assert_eq!(candidate, Some(ModelVariant::Qwen3Tts12Hz06BCustomVoice));
+
+        // When every resident is pinned there is no candidate.
+        let all_pinned = HashSet::from([
+            ModelVariant::Qwen359BGguf,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ]);
+        assert_eq!(
+            select_lru_eviction_candidate(
+                &resident_variants,
+                requested_variant,
+                &active_variants,
+                &all_pinned,
+                &last_used,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3448,7 +3759,7 @@ mod tests {
 
         assert!(!residency_budget_has_capacity(
             &resident_variants,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             1,
         ));
         assert!(residency_budget_has_capacity(
@@ -3458,7 +3769,7 @@ mod tests {
         ));
         assert!(residency_budget_has_capacity(
             &resident_variants,
-            ModelVariant::Qwen38BGguf,
+            ModelVariant::Qwen359BGguf,
             2,
         ));
     }
@@ -3766,60 +4077,6 @@ mod tests {
     }
 
     #[test]
-    fn portable_automatic_context_uses_validated_model_ceilings() {
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Lfm25Audio15BGguf,
-                ContextLengthPreference::Auto,
-                128_000
-            ),
-            4_096
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Lfm25Audio15BGguf,
-                ContextLengthPreference::explicit(8_192).unwrap(),
-                128_000
-            ),
-            128_000
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::Kokoro82M,
-                ContextLengthPreference::Auto,
-                128_000
-            ),
-            128_000
-        );
-        assert_eq!(
-            portable_context_ceiling(
-                ModelVariant::VibeVoice15BTts,
-                ContextLengthPreference::Auto,
-                65_536
-            ),
-            1_024
-        );
-        for variant in [
-            ModelVariant::Qwen3Asr06BGguf,
-            ModelVariant::Qwen3Asr17BGguf,
-            ModelVariant::GraniteSpeech412BPlus,
-        ] {
-            assert_eq!(
-                portable_context_ceiling(variant, ContextLengthPreference::Auto, 65_536),
-                1_024
-            );
-            assert_eq!(
-                portable_context_ceiling(
-                    variant,
-                    ContextLengthPreference::explicit(8_192).unwrap(),
-                    65_536
-                ),
-                65_536
-            );
-        }
-    }
-
-    #[test]
     fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         let explicit = ContextLengthPreference::explicit(32_768).unwrap();
         assert_eq!(
@@ -4090,7 +4347,7 @@ mod tests {
             ..EngineConfig::default()
         })
         .unwrap();
-        let variants = [ModelVariant::Kokoro82M, ModelVariant::Qwen38BGguf];
+        let variants = [ModelVariant::Kokoro82M, ModelVariant::Qwen359BGguf];
         let mut registrations = Vec::new();
         for variant in variants {
             let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
@@ -4235,6 +4492,197 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    /// The resource-authority registry is process-global: the Metal OOM
+    /// ladder tests serialize against each other and restore the authority
+    /// on exit so concurrent cases never observe their poison.
+    static METAL_OOM_LADDER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct ClearAuthorityPoisonOnDrop(Arc<ResourceAuthority>);
+
+    impl Drop for ClearAuthorityPoisonOnDrop {
+        fn drop(&mut self) {
+            self.0.clear_poison();
+        }
+    }
+
+    // The ladder lock deliberately spans every await in these tests: it
+    // serializes the process-global resource authority against the other
+    // Metal OOM ladder cases, not shared state inside this runtime.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metal_oom_load_is_flushed_and_retried_once_before_poisoning() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-oom-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        runtime.model_lifecycle.set_load_test_metal_ooms(1);
+
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let _load_task = runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader.expect("load leader"),
+        );
+        // The first attempt fails with the injected command-buffer OOM; the
+        // wrapper must flush pooled scratch and retry once. The retry is not
+        // injected, so it fails with an ordinary missing-model error instead
+        // of the OOM — proving the attempt actually re-ran.
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+            .await
+            .expect("retry outcome timed out")
+            .expect_err("missing model artifacts must fail");
+        assert!(
+            !format!("{error}").contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the retried attempt must not surface the injected OOM: {error}"
+        );
+        assert!(
+            runtime
+                .coordinator
+                .resource_authority()
+                .poison_reason()
+                .is_none(),
+            "a single OOM must not poison the authority"
+        );
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persisted_metal_oom_after_the_retry_poisons_the_authority() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-load-oom2-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        runtime.model_lifecycle.set_load_test_metal_ooms(2);
+        // A resident blocks the recovery drain, so the poison is observable
+        // after the failed load. Unpinned residents would be evicted and the
+        // authority would recover before the outcome lands.
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+
+        let (waiter, leader) = runtime.model_lifecycle.join_or_start_load(variant);
+        let _load_task = runtime.model_lifecycle.spawn_load_transaction(
+            variant,
+            runtime.max_loaded_models,
+            leader.expect("load leader"),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter.wait())
+            .await
+            .expect("poison outcome timed out")
+            .expect_err("persisted OOM must fail");
+        assert!(
+            format!("{error}").contains("kIOGPUCommandBufferCallbackErrorOutOfMemory"),
+            "the injected OOM must surface after the retry: {error}"
+        );
+        let reason = runtime
+            .coordinator
+            .resource_authority()
+            .poison_reason()
+            .expect("persisted OOM must poison the authority");
+        assert!(
+            reason.contains("persisted after a pooled-scratch flush and one retry"),
+            "unexpected poison reason: {reason}"
+        );
+        drop(ClearAuthorityPoisonOnDrop(
+            runtime.coordinator.resource_authority(),
+        ));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_authority_recovers_when_the_device_fully_drains() {
+        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-poison-recover-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 1,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let authority = runtime.coordinator.resource_authority();
+        authority.poison("simulated backend-fatal error");
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::GraniteSpeech412BPlus,
+                now_unix_millis().saturating_sub(10_000),
+            );
+
+        // The unpinned resident is the only thing keeping the device from
+        // draining; reaping it via the standard unload path must clear the
+        // poison.
+        let reaped = runtime.reap_idle_models().await;
+        assert_eq!(reaped, vec![ModelVariant::GraniteSpeech412BPlus]);
+        assert!(
+            authority.poison_reason().is_none(),
+            "a fully drained device must recover from poison"
+        );
+
+        // A pinned resident blocks the drain, so the poison persists.
+        authority.poison("simulated backend-fatal error");
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::WhisperLargeV3Turbo,
+                now_unix_millis().saturating_sub(10_000),
+            );
+        assert!(runtime.reap_idle_models().await.is_empty());
+        assert!(
+            authority.poison_reason().is_some(),
+            "a pinned resident must keep the poison until it is unloaded"
+        );
+        drop(ClearAuthorityPoisonOnDrop(authority));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_load_panic_rolls_back_before_publishing_failure() {
         let models_dir =
@@ -4285,6 +4733,119 @@ mod tests {
         }
         assert!(cleanup_waiter.wait().await.is_err());
 
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-reap-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 1,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::WhisperLargeV3Turbo)
+            .await;
+
+        let stale = now_unix_millis().saturating_sub(10_000);
+        {
+            let mut last_used = runtime.model_lifecycle.model_last_used.lock().await;
+            last_used.insert(ModelVariant::GraniteSpeech412BPlus, stale);
+            last_used.insert(ModelVariant::WhisperLargeV3Turbo, stale);
+        }
+
+        let reaped = runtime.reap_idle_models().await;
+        assert_eq!(reaped, vec![ModelVariant::GraniteSpeech412BPlus]);
+
+        let residents = runtime.model_manager.resident_variants().await;
+        assert!(!residents.contains(&ModelVariant::GraniteSpeech412BPlus));
+        assert!(residents.contains(&ModelVariant::WhisperLargeV3Turbo));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_is_disabled_without_keep_alive() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-reap-off-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            model_keep_alive_secs: 0,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .model_last_used
+            .lock()
+            .await
+            .insert(
+                ModelVariant::GraniteSpeech412BPlus,
+                now_unix_millis().saturating_sub(10_000),
+            );
+
+        assert!(runtime.reap_idle_models().await.is_empty());
+        assert!(runtime
+            .model_manager
+            .resident_variants()
+            .await
+            .contains(&ModelVariant::GraniteSpeech412BPlus));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn residency_budget_preserves_pinned_residents_and_reports_make_room() {        let models_dir =
+            std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            max_loaded_models: Some(1),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        runtime
+            .model_manager
+            .mark_loaded(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+        runtime
+            .model_lifecycle
+            .pin_model(ModelVariant::GraniteSpeech412BPlus)
+            .await;
+
+        let error = runtime
+            .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
+            .await
+            .expect_err("a pinned resident must not be silently evicted");
+        assert!(
+            error.to_string().contains("unload a model to make room"),
+            "unexpected error: {error}"
+        );
+
+        assert!(runtime
+            .model_manager
+            .resident_variants()
+            .await
+            .contains(&ModelVariant::GraniteSpeech412BPlus));
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 

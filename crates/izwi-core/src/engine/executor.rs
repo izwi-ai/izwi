@@ -69,6 +69,7 @@ use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
     BackendSelectionSource,
 };
+use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
 use crate::kv::{CacheDomainId, KvArenaId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
@@ -1129,6 +1130,10 @@ pub struct ExecutorOutput {
     pub asr_diagnostics: Option<serde_json::Value>,
     /// Error if any
     pub error: Option<String>,
+    /// DS9.3: per-token logprob entries carried by terminal chat outputs.
+    /// Empty unless the request asked for logprobs and this output is the
+    /// request's terminal quantum.
+    pub logprobs: Vec<crate::engine::types::TokenLogprob>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1177,6 +1182,7 @@ impl ExecutorOutput {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: Some(error.into()),
+            logprobs: Vec::new(),
         }
     }
 
@@ -1198,6 +1204,7 @@ impl ExecutorOutput {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         }
     }
 }
@@ -1295,6 +1302,7 @@ impl ModelSessionResult {
                 phase_timing_override: None,
                 asr_diagnostics: None,
                 error: None,
+                logprobs: Vec::new(),
             },
             disposition: ExecutionDisposition::RestartSequence(reason),
             safe_point: true,
@@ -3355,20 +3363,29 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
-            let (preferred_decode_tokens, sustained_decode_quantum) = request
-                .prepared_chat_model_for_executor()
-                .ok()
-                .and_then(|model| match model.as_ref() {
-                    NativeChatModel::Qwen38(model) => Some((
-                        model.preferred_decode_tokens(),
-                        model.sustained_cuda_mtp_quantum(),
-                    )),
-                    _ => None,
-                })
-                .unwrap_or((1, false));
+            let (preferred_decode_tokens, sustained_decode_quantum, speculative_decode_batch) =
+                request
+                    .prepared_chat_model_for_executor()
+                    .ok()
+                    .and_then(|model| match model.as_ref() {
+                        NativeChatModel::Qwen38(model) => Some((
+                            model.preferred_decode_tokens(),
+                            model.sustained_cuda_mtp_quantum(),
+                            model.mtp_in_continuous_enabled(),
+                        )),
+                        _ => None,
+                    })
+                    .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
+            profile.speculative_decode_batch = speculative_decode_batch;
         }
+        // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
+        // their first prefill chunk aligned to the declared interval by the
+        // scheduler so the fresh commit cursor can publish a snapshot.
+        profile.managed_snapshot_prefill_interval = request
+            .v2_state_descriptor()
+            .and_then(declared_snapshot_prefill_interval);
         Some(profile)
     }
 
@@ -6339,6 +6356,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         });
         assert_eq!(
             sequence.disposition,
@@ -6357,6 +6375,7 @@ mod tests {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         });
         assert!(matches!(
             atomic.disposition,

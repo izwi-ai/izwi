@@ -188,6 +188,7 @@ impl NativeExecutor {
             phase_timing_override: None,
             asr_diagnostics: None,
             error: None,
+            logprobs: Vec::new(),
         }))
     }
 }

@@ -1,0 +1,159 @@
+{
+  "attaches_total": {
+    "off": 11,
+    "on": 20
+  },
+  "lane": "metal",
+  "off_worker_counter_deltas": {
+    "worker-a": {
+      "counters_after": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 832,
+        "izwi_engine_kv_cache_evictions_total": 18,
+        "izwi_engine_kv_cache_hits_total": 10,
+        "izwi_engine_kv_cache_misses_total": 30,
+        "izwi_engine_kv_cache_reused_tokens_total": 832,
+        "izwi_engine_tensor_snapshot_attaches_total": 5,
+        "izwi_engine_tensor_snapshot_evictions_total": 7,
+        "izwi_engine_tensor_snapshot_publishes_total": 11,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      },
+      "counters_before": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+        "izwi_engine_kv_cache_evictions_total": 0,
+        "izwi_engine_kv_cache_hits_total": 0,
+        "izwi_engine_kv_cache_misses_total": 6,
+        "izwi_engine_kv_cache_reused_tokens_total": 0,
+        "izwi_engine_tensor_snapshot_attaches_total": 0,
+        "izwi_engine_tensor_snapshot_evictions_total": 0,
+        "izwi_engine_tensor_snapshot_publishes_total": 0,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      },
+      "counters_delta": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 832,
+        "izwi_engine_kv_cache_evictions_total": 18,
+        "izwi_engine_kv_cache_hits_total": 10,
+        "izwi_engine_kv_cache_misses_total": 24,
+        "izwi_engine_kv_cache_reused_tokens_total": 832,
+        "izwi_engine_tensor_snapshot_attaches_total": 5,
+        "izwi_engine_tensor_snapshot_evictions_total": 7,
+        "izwi_engine_tensor_snapshot_publishes_total": 11,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      }
+    },
+    "worker-b": {
+      "counters_after": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 1728,
+        "izwi_engine_kv_cache_evictions_total": 16,
+        "izwi_engine_kv_cache_hits_total": 14,
+        "izwi_engine_kv_cache_misses_total": 23,
+        "izwi_engine_kv_cache_reused_tokens_total": 1728,
+        "izwi_engine_tensor_snapshot_attaches_total": 6,
+        "izwi_engine_tensor_snapshot_evictions_total": 5,
+        "izwi_engine_tensor_snapshot_publishes_total": 9,
+        "izwi_engine_tensor_snapshot_truncations_total": 2
+      },
+      "counters_before": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+        "izwi_engine_kv_cache_evictions_total": 0,
+        "izwi_engine_kv_cache_hits_total": 0,
+        "izwi_engine_kv_cache_misses_total": 2,
+        "izwi_engine_kv_cache_reused_tokens_total": 0,
+        "izwi_engine_tensor_snapshot_attaches_total": 0,
+        "izwi_engine_tensor_snapshot_evictions_total": 0,
+        "izwi_engine_tensor_snapshot_publishes_total": 0,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      },
+      "counters_delta": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 1728,
+        "izwi_engine_kv_cache_evictions_total": 16,
+        "izwi_engine_kv_cache_hits_total": 14,
+        "izwi_engine_kv_cache_misses_total": 21,
+        "izwi_engine_kv_cache_reused_tokens_total": 1728,
+        "izwi_engine_tensor_snapshot_attaches_total": 6,
+        "izwi_engine_tensor_snapshot_evictions_total": 5,
+        "izwi_engine_tensor_snapshot_publishes_total": 9,
+        "izwi_engine_tensor_snapshot_truncations_total": 2
+      }
+    }
+  },
+  "on_worker_counter_deltas": {
+    "worker-a": {
+      "counters_after": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2368,
+        "izwi_engine_kv_cache_evictions_total": 19,
+        "izwi_engine_kv_cache_hits_total": 26,
+        "izwi_engine_kv_cache_misses_total": 22,
+        "izwi_engine_kv_cache_reused_tokens_total": 2368,
+        "izwi_engine_tensor_snapshot_attaches_total": 10,
+        "izwi_engine_tensor_snapshot_evictions_total": 5,
+        "izwi_engine_tensor_snapshot_publishes_total": 9,
+        "izwi_engine_tensor_snapshot_truncations_total": 6
+      },
+      "counters_before": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+        "izwi_engine_kv_cache_evictions_total": 0,
+        "izwi_engine_kv_cache_hits_total": 0,
+        "izwi_engine_kv_cache_misses_total": 6,
+        "izwi_engine_kv_cache_reused_tokens_total": 0,
+        "izwi_engine_tensor_snapshot_attaches_total": 0,
+        "izwi_engine_tensor_snapshot_evictions_total": 0,
+        "izwi_engine_tensor_snapshot_publishes_total": 0,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      },
+      "counters_delta": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2368,
+        "izwi_engine_kv_cache_evictions_total": 19,
+        "izwi_engine_kv_cache_hits_total": 26,
+        "izwi_engine_kv_cache_misses_total": 16,
+        "izwi_engine_kv_cache_reused_tokens_total": 2368,
+        "izwi_engine_tensor_snapshot_attaches_total": 10,
+        "izwi_engine_tensor_snapshot_evictions_total": 5,
+        "izwi_engine_tensor_snapshot_publishes_total": 9,
+        "izwi_engine_tensor_snapshot_truncations_total": 6
+      }
+    },
+    "worker-b": {
+      "counters_after": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2176,
+        "izwi_engine_kv_cache_evictions_total": 13,
+        "izwi_engine_kv_cache_hits_total": 22,
+        "izwi_engine_kv_cache_misses_total": 13,
+        "izwi_engine_kv_cache_reused_tokens_total": 2176,
+        "izwi_engine_tensor_snapshot_attaches_total": 10,
+        "izwi_engine_tensor_snapshot_evictions_total": 2,
+        "izwi_engine_tensor_snapshot_publishes_total": 6,
+        "izwi_engine_tensor_snapshot_truncations_total": 2
+      },
+      "counters_before": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 0,
+        "izwi_engine_kv_cache_evictions_total": 0,
+        "izwi_engine_kv_cache_hits_total": 0,
+        "izwi_engine_kv_cache_misses_total": 2,
+        "izwi_engine_kv_cache_reused_tokens_total": 0,
+        "izwi_engine_tensor_snapshot_attaches_total": 0,
+        "izwi_engine_tensor_snapshot_evictions_total": 0,
+        "izwi_engine_tensor_snapshot_publishes_total": 0,
+        "izwi_engine_tensor_snapshot_truncations_total": 0
+      },
+      "counters_delta": {
+        "izwi_engine_kv_cache_avoided_prefill_tokens_total": 2176,
+        "izwi_engine_kv_cache_evictions_total": 13,
+        "izwi_engine_kv_cache_hits_total": 22,
+        "izwi_engine_kv_cache_misses_total": 11,
+        "izwi_engine_kv_cache_reused_tokens_total": 2176,
+        "izwi_engine_tensor_snapshot_attaches_total": 10,
+        "izwi_engine_tensor_snapshot_evictions_total": 2,
+        "izwi_engine_tensor_snapshot_publishes_total": 6,
+        "izwi_engine_tensor_snapshot_truncations_total": 2
+      }
+    }
+  },
+  "schema": "izwi.ds2-routing-summary.v1",
+  "ttft_ms": {
+    "off_p50": 327.1250419784337,
+    "off_p95": 485.1344419817906,
+    "on_p50": 309.52475045342,
+    "on_p95": 532.2326831286773,
+    "p50_delta_ms": -17.600291525013745
+  }
+}

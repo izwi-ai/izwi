@@ -14,25 +14,37 @@
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
 
 mod api;
 mod app;
 pub use app::realtime_protocol;
+pub mod artifact_store;
 pub mod batch_runtime;
 mod chat_store;
 mod db;
 mod diarization_store;
 mod entity;
 mod error;
+mod gateway;
+mod gateway_deployments;
+mod gateway_fleet;
+mod gateway_principal_keys;
+mod gateway_rate_quota;
+mod gateway_security;
+mod gateway_shared_approvals;
+mod gateway_tenant_concurrency;
+mod gateway_worker_tls;
 mod ids;
 mod logging;
 pub mod media_ingest;
@@ -41,6 +53,7 @@ mod persistence;
 mod saved_voice_store;
 mod speech_history_store;
 mod speech_resource_budget;
+mod speech_spool;
 mod state;
 mod storage_layout;
 mod studio_project_store;
@@ -51,7 +64,9 @@ mod voice_defaults;
 mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
+pub mod worker_registry;
 
+use batch_runtime::store::DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT;
 use batch_runtime::types::{
     DeviceClass, QueueClass, ResourceTarget, RuntimeBackendClass, WorkerResourceCapacity,
 };
@@ -63,9 +78,34 @@ use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use izwi_hooks::EnterpriseHooks;
+use izwi_serving_client::{WorkerClient, WorkerClientConfig};
+use izwi_serving_protocol::{
+    render_approvals_text, CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration,
+    ModelReadiness, NdjsonLimits, NodeId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
+    TaskKind, WorkerDescriptor, WorkerId, WorkerStatus, MAX_REMAINING_TIME_MS,
+};
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
+
+pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
+pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
+pub use gateway::{create_gateway_router, GatewayState};
+pub use gateway_fleet::{FleetPartition, FleetPartitionError};
+pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
+pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
+pub use gateway_tenant_concurrency::{
+    GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError,
+};
+
+const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
+const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_GATEWAY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GATEWAY_STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
+const GATEWAY_NDJSON_MAX_LINE_BYTES: usize = 1024 * 1024;
+const GATEWAY_NDJSON_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const GATEWAY_NDJSON_MAX_EVENTS: usize = 8192;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +117,10 @@ struct ServerArgs {
     /// Configuration file (defaults to the shared Izwi user config.toml).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Process role: local inference server or hardware-independent gateway.
+    #[arg(long, value_enum, env = "IZWI_SERVER_ROLE", default_value = "local")]
+    role: ServerRole,
 
     /// Override a performance setting, e.g. cuda.mode=off; repeat for siblings.
     #[arg(long = "performance", value_name = "KEY=VALUE", value_parser = parse_performance_override)]
@@ -117,6 +161,204 @@ struct ServerArgs {
     /// Override Granite ASR dtype after backend selection (`f32`, `f16`, `bf16`).
     #[arg(long, value_name = "DTYPE")]
     granite_speech_dtype: Option<String>,
+
+    /// Private worker base URL required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_ENDPOINT")]
+    worker_endpoint: Option<String>,
+
+    /// Worker-network policy (`standalone` or `fleet-one-gateway`).
+    #[arg(
+        long,
+        value_enum,
+        env = "IZWI_GATEWAY_TOPOLOGY",
+        default_value = "standalone"
+    )]
+    gateway_topology: GatewayTopology,
+
+    /// Approved private worker URLs for registry-backed routing. Repeat this
+    /// option (or use a comma-separated environment value) to add capacity.
+    #[arg(
+        long = "gateway-worker-endpoint",
+        env = "IZWI_GATEWAY_WORKER_ENDPOINTS",
+        value_delimiter = ',',
+        value_name = "URL"
+    )]
+    gateway_worker_endpoints: Vec<String>,
+
+    /// Statically approved worker routing entries. Repeat this option (or use
+    /// a comma-separated environment value) with the standalone five-field
+    /// form or v1|URL|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|
+    /// MODEL_GENERATION for fleet mode. This cannot be combined with the
+    /// legacy gateway worker endpoint list.
+    #[arg(
+        long = "gateway-worker-approval",
+        env = "IZWI_GATEWAY_WORKER_APPROVALS",
+        value_delimiter = ',',
+        value_name = "APPROVAL"
+    )]
+    gateway_worker_approvals: Vec<gateway_deployments::GatewayWorkerApproval>,
+
+    /// Rotatable private worker credential identifier required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_CREDENTIAL_ID")]
+    worker_credential_id: Option<String>,
+
+    /// Private worker bearer token required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_BEARER_TOKEN")]
+    worker_bearer_token: Option<String>,
+
+    /// Expected worker process incarnation required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_INCARNATION")]
+    worker_incarnation: Option<String>,
+
+    /// Pinned worker deployment identifier required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_DEPLOYMENT")]
+    worker_deployment: Option<String>,
+
+    /// Public model served by the pinned worker deployment.
+    #[arg(long, env = "IZWI_GATEWAY_PUBLIC_MODEL")]
+    public_model: Option<String>,
+
+    /// Expected non-zero model generation required by gateway mode.
+    #[arg(long, env = "IZWI_GATEWAY_MODEL_GENERATION")]
+    worker_model_generation: Option<u64>,
+
+    /// Policy revision attested on private worker requests.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_POLICY_REVISION",
+        default_value = "local-policy-v1"
+    )]
+    gateway_policy_revision: String,
+
+    /// Maximum gateway requests concurrently in flight to the pinned worker.
+    #[arg(long, env = "IZWI_GATEWAY_MAX_IN_FLIGHT", default_value_t = 32)]
+    gateway_max_in_flight: usize,
+
+    /// Maximum time the selected worker may spend establishing runtime ownership.
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_QUEUE_WAIT_MS", default_value_t = 250)]
+    gateway_worker_queue_wait_ms: u64,
+
+    /// Maximum wait for private invocation response headers and admission.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_ADMISSION_TIMEOUT_MS",
+        default_value_t = 10_000
+    )]
+    gateway_worker_admission_timeout_ms: u64,
+
+    /// Maximum wait after admission for the first useful worker output.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_FIRST_OUTPUT_TIMEOUT_MS",
+        default_value_t = 60_000
+    )]
+    gateway_worker_first_output_timeout_ms: u64,
+
+    /// Maximum idle time between useful worker output events.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_PROGRESS_IDLE_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    gateway_worker_progress_idle_timeout_ms: u64,
+
+    /// Maximum wait while relaying an event to a connected slow consumer.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_SLOW_CONSUMER_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    gateway_slow_consumer_timeout_ms: u64,
+
+    /// Receiver-clock lifetime of a worker status observation.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_STATUS_TTL_MS",
+        default_value_t = 10_000
+    )]
+    gateway_worker_status_ttl_ms: u64,
+
+    /// Status refresh interval for each configured registry worker.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_STATUS_POLL_MS",
+        default_value_t = 2_000
+    )]
+    gateway_worker_status_poll_ms: u64,
+
+    /// Cache-affinity routing (DS2.3): prefer workers whose same-deployment
+    /// prefix-hit ratio and KV headroom exceed the thresholds below. Off by
+    /// default until measured evidence (DS2.5) supports the default flip.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_AFFINITY",
+        default_value = "off"
+    )]
+    gateway_router_cache_affinity: String,
+
+    /// Minimum prefix hit ratio for a worker to count as warm (0.0-1.0).
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_MIN_HIT_RATIO",
+        default_value_t = 0.25
+    )]
+    gateway_router_cache_min_hit_ratio: f64,
+
+    /// Maximum managed-KV utilization percent still considered headroom (0-100].
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_CACHE_MAX_KV_USAGE_PCT",
+        default_value_t = 85.0
+    )]
+    gateway_router_cache_max_kv_usage_pct: f64,
+
+    /// Conversation pinning (DS2.4): route a conversation's turns to the
+    /// worker that served its earlier turns. Off by default until measured
+    /// evidence (DS2.5) supports the default flip.
+    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN", default_value = "off")]
+    gateway_session_pin: String,
+
+    /// Bounded size of the conversation pin table.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_SESSION_PIN_MAX_ENTRIES",
+        default_value_t = 4_096
+    )]
+    gateway_session_pin_max_entries: usize,
+
+    /// Lifetime of a conversation pin.
+    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN_TTL_SECS", default_value_t = 600)]
+    gateway_session_pin_ttl_secs: u64,
+
+    /// Realtime relay (DS3.6): expose /v1/realtime/ws and forward
+    /// izwi-realtime-v1 sessions to eligible speech_to_text workers.
+    /// `off` keeps the gateway byte-identical to the pre-realtime shape.
+    #[arg(long, env = "IZWI_GATEWAY_REALTIME", default_value = "off")]
+    gateway_realtime: String,
+
+    /// Bounded concurrent realtime sessions through the relay.
+    #[arg(long, env = "IZWI_GATEWAY_REALTIME_MAX_SESSIONS", default_value_t = 64)]
+    gateway_realtime_max_sessions: usize,
+
+    /// End-to-end budget minted into each relayed worker session (ms).
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_REALTIME_SESSION_BUDGET_MS",
+        default_value_t = 600_000
+    )]
+    gateway_realtime_session_budget_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ServerRole {
+    Local,
+    Gateway,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GatewayTopology {
+    Standalone,
+    FleetOneGateway,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -150,7 +392,11 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 }
 
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    validate_role_topology(args.role, args.gateway_topology)?;
     let serve_config = resolve_serve_runtime_config(&args)?;
+    if args.role == ServerRole::Gateway {
+        return run_gateway(args, serve_config, enterprise_hooks).await;
+    }
     maybe_delegate_to_private_cuda_runtime(&serve_config)?;
 
     logging::init_tracing(args.log_format);
@@ -199,10 +445,15 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         enterprise_hooks,
         persistence,
     )?;
+    state.runtime.spawn_idle_model_reaper();
+    // Resolve precise Hugging Face download sizes off the request path so the
+    // model-list endpoint stays instant on cold starts; the UI picks refined
+    // sizes up on its next refresh.
+    state.runtime.model_manager().spawn_expected_size_resolution();
     let mut startup_warnings = Vec::new();
     if let Err(err) = state
         .batch_runtime_store
-        .reconcile_inconsistent_states()
+        .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
         .await
     {
         startup_warnings.push(format!(
@@ -220,6 +471,23 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         Ok(_) => {}
         Err(err) => startup_warnings.push(format!(
             "Failed to reconcile speech history records during startup: {err}"
+        )),
+    }
+    match state
+        .artifact_store
+        .cleanup_due(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+        .await
+    {
+        Ok(report) if report.completed > 0 => {
+            info!(
+                completed = report.completed,
+                deferred = report.deferred,
+                "Reconciled orphaned provider write reservations and artifact cleanup intents"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to reconcile orphaned artifact cleanup state during startup: {err}"
         )),
     }
     startup_warnings.extend(preload_configured_models(&state).await);
@@ -276,7 +544,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         );
     }
     shutdown_worker_then_cleanup(
-        batch_worker_supervisor.shutdown(),
+        batch_worker_supervisor.shutdown_for_process(),
         cleanup_runtime_for_shutdown(&state),
     )
     .await?;
@@ -285,6 +553,1349 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     }
 
     Ok(())
+}
+
+fn validate_role_topology(role: ServerRole, topology: GatewayTopology) -> anyhow::Result<()> {
+    if role == ServerRole::Local && topology != GatewayTopology::Standalone {
+        anyhow::bail!("non-standalone gateway topology requires --role gateway");
+    }
+    Ok(())
+}
+
+/// Apply a fleet partition to the per-gateway quota budgets.
+///
+/// When `partition` is `Some`, each per-tenant rate and concurrency limit is
+/// divided by the fleet size (floored to 1), so N gateways each own a strict
+/// non-overlapping slice of the total configured budget. No shared atomic
+/// counter or coordination service is required. A crashed gateway releases
+/// its partition immediately; the other gateways' partitions are unaffected.
+fn apply_fleet_partition(
+    rate_quota: GatewayRateQuotaConfig,
+    tenant_concurrency: GatewayTenantConcurrencyConfig,
+    partition: Option<crate::gateway_fleet::FleetPartition>,
+) -> (GatewayRateQuotaConfig, GatewayTenantConcurrencyConfig) {
+    let Some(partition) = partition else {
+        return (rate_quota, tenant_concurrency);
+    };
+    let requests = partition.partition_limit(rate_quota.requests_per_minute());
+    let burst = partition.partition_limit(rate_quota.burst_requests());
+    let tracked = rate_quota.max_tracked_tenants();
+    let rate_quota = GatewayRateQuotaConfig::new(requests, burst, tracked)
+        .expect("partitioned rate-quota must remain valid");
+    let per_tenant = u32::try_from(tenant_concurrency.max_active_per_tenant())
+        .ok()
+        .map(|value| partition.partition_concurrency(value))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1);
+    let owned = u32::try_from(tenant_concurrency.max_owned_work())
+        .ok()
+        .map(|value| partition.partition_concurrency(value))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1);
+    let tenant_concurrency =
+        GatewayTenantConcurrencyConfig::new(per_tenant.max(1).min(owned.max(1)), owned.max(1))
+            .expect("partitioned tenant concurrency must remain valid");
+    (rate_quota, tenant_concurrency)
+}
+
+async fn run_gateway(
+    args: ServerArgs,
+    serve_config: ServeRuntimeConfig,
+    enterprise_hooks: EnterpriseHooks,
+) -> anyhow::Result<()> {
+    logging::init_tracing(args.log_format);
+    let perimeter = GatewayPerimeterConfig::from_env()?;
+    let fleet_partition = crate::gateway_fleet::FleetPartition::from_env()?;
+    if let Some(partition) = fleet_partition {
+        info!(
+            service = SERVICE_NAME,
+            version = SERVICE_VERSION,
+            partition = partition.index(),
+            fleet_size = partition.size(),
+            "Gateway fleet partition active: per-tenant budgets are divided across gateways (explicit quota fallback; the worker stays the atomic admission arbiter)"
+        );
+    }
+    if let Ok(Some(shared)) = crate::gateway_shared_approvals::SharedApprovalsConfig::from_env() {
+        match crate::gateway_shared_approvals::SharedApprovalsView::load(shared) {
+            Ok(view) => info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                approvals = view.approvals().len(),
+                "Shared fleet approvals loaded: all gateways reading this file approve the same worker set"
+            ),
+            Err(error) => warn!(error = %error, "Shared fleet approvals file could not be loaded at startup"),
+        }
+    }
+    let rate_quota = GatewayRateQuotaConfig::from_env()?;
+    let tenant_concurrency = GatewayTenantConcurrencyConfig::from_env(args.gateway_max_in_flight)?;
+    let (rate_quota, tenant_concurrency) =
+        apply_fleet_partition(rate_quota, tenant_concurrency, fleet_partition);
+    perimeter.validate_public_ingress(&serve_config)?;
+    // DS0.5 scoped credentials: the manifest is the only activation switch.
+    // Unset keeps the durable store untouched and authentication byte-identical.
+    let principal_keys = match crate::gateway_principal_keys::manifest_path_from_env()? {
+        Some(manifest_path) => {
+            let store = crate::db::sqlite::StoreDatabase::from_default_path()?;
+            let directory = crate::gateway_principal_keys::GatewayPrincipalDirectory::bootstrap(
+                &store,
+                &manifest_path,
+                &perimeter,
+            )
+            .await?;
+            info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                principals = directory.len(),
+                "Gateway scoped principal keys loaded from the durable store"
+            );
+            directory
+        }
+        None => crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
+    };
+    let (state, _status_poller) =
+        gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
+    let state = state
+        .with_rate_quota_config(rate_quota)
+        .with_tenant_concurrency_config(tenant_concurrency)
+        .with_principal_keys(principal_keys);
+    state.lifecycle.mark_ready();
+
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        "Starting Izwi public API gateway"
+    );
+    let app = gateway::create_gateway_router(state.clone(), &serve_config);
+    let addr = format!("{}:{}", serve_config.host, serve_config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("Gateway listening on http://{}", addr);
+
+    let shutdown_state = state.clone();
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(gateway_shutdown_signal(shutdown_state, shutdown_started_tx));
+    let http_shutdown_grace = http_shutdown_grace_timeout();
+    let server_result = await_http_server_shutdown(
+        async move { server.await },
+        shutdown_started_rx,
+        http_shutdown_grace,
+    )
+    .await;
+    if server_result.is_none() {
+        warn!(
+            grace_secs = http_shutdown_grace.as_secs(),
+            "Gateway HTTP graceful shutdown timed out; dropping remaining connections"
+        );
+    }
+    if let Some(server_result) = server_result {
+        server_result?;
+    }
+    Ok(())
+}
+
+struct GatewayWorkerStatusPoller {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Boot-time poller count. Runtime adoption mutates the live poller pool;
+    /// this snapshot pins the boot-sized pool for diagnostics and tests.
+    poller_count: usize,
+}
+
+#[derive(Clone)]
+struct GatewayWorkerExpectation {
+    endpoint: String,
+    client: WorkerClient,
+    worker_id: WorkerId,
+    node_id: NodeId,
+    deployment: worker_registry::ApprovedDeployment,
+    validated_capacity: u32,
+}
+
+impl Drop for GatewayWorkerStatusPoller {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic per-worker poll cadence: ±10% of the configured interval,
+/// drawn from the worker identity so co-configured pollers de-synchronize
+/// (serving plan §5.2 "status every 2 seconds with jitter") while the exact
+/// cadence stays reproducible under test.
+fn jittered_poll_interval(base: Duration, seed: u64) -> Duration {
+    let mut state = seed | 1;
+    let draw = splitmix64(&mut state);
+    let per_mille = 90 + (draw % 21);
+    let millis = base.as_millis().saturating_mul(u128::from(per_mille)) / 100;
+    Duration::from_millis(millis as u64).max(Duration::from_millis(1))
+}
+
+fn poll_jitter_seed(worker_id: &WorkerId, node_id: &NodeId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worker_id.hash(&mut hasher);
+    node_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The widest jittered cadence (110% of the poll interval) must stay below the
+/// freshness TTL, or a healthy worker would flap expired between observations.
+fn validate_status_cadence(ttl: Duration, poll: Duration) -> anyhow::Result<()> {
+    if poll.is_zero() {
+        anyhow::bail!("--gateway-worker-status-poll-ms must be non-zero");
+    }
+    let widest = poll.as_millis().saturating_mul(11) / 10;
+    if widest >= ttl.as_millis() {
+        anyhow::bail!(
+            "--gateway-worker-status-poll-ms must be at least 10% below the status TTL to leave room for poll jitter"
+        );
+    }
+    Ok(())
+}
+
+async fn gateway_state(
+    args: &ServerArgs,
+    serve_config: &ServeRuntimeConfig,
+    enterprise_hooks: EnterpriseHooks,
+    perimeter: GatewayPerimeterConfig,
+) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
+    validate_gateway_topology_source(args)?;
+    // The shared approvals file is a registry-mode approval source on its
+    // own (the DS6 rollout channel), so its presence disables pinned mode.
+    let shared_approvals_configured =
+        gateway_shared_approvals::SharedApprovalsConfig::from_env()?.is_some();
+    if args.gateway_worker_endpoints.is_empty()
+        && args.gateway_worker_approvals.is_empty()
+        && !shared_approvals_configured
+    {
+        if args.gateway_realtime == "on" {
+            anyhow::bail!(
+                "--gateway-realtime requires registry-based worker routing (approvals or endpoints); pinned single-worker mode does not support it"
+            );
+        }
+        let remote = gateway_remote_execution(args, serve_config)?;
+        return Ok((
+            gateway::GatewayState::new(
+                remote,
+                enterprise_hooks,
+                perimeter,
+                serve_config.request_timeout_secs,
+                args.gateway_max_in_flight,
+            ),
+            None,
+        ));
+    }
+
+    if args.worker_endpoint.is_some() {
+        anyhow::bail!(
+            "--worker-endpoint cannot be combined with registry worker endpoints or approvals; use it only for pinned compatibility"
+        );
+    }
+    if args.worker_incarnation.is_some() {
+        anyhow::bail!(
+            "--worker-incarnation applies only to pinned --worker-endpoint mode; registry routing validates each discovered incarnation"
+        );
+    }
+
+    validate_gateway_limits(args)?;
+    let public_model_variant = parse_model_variant(required_gateway_value(
+        &args.public_model,
+        "--public-model",
+    )?)?;
+    let public_model = ModelAlias::new(public_model_variant.dir_name())?;
+    let (cli_approvals, worker_approvals, shared_approvals_view) =
+        configured_gateway_worker_approvals(args, &public_model)?;
+    let credentials = gateway_worker_credentials(args)?;
+    // With a shared approvals file, runtime view adoption (DS6) can add
+    // workers beyond the boot view; the registry capacity follows the
+    // approvals ceiling. Without one, the boot view is the exact capacity.
+    let shared_capacity = shared_approvals_view.is_some();
+    let registry_config = worker_registry::WorkerRegistryConfig {
+        max_workers: if shared_capacity {
+            worker_approvals
+                .len()
+                .max(izwi_serving_protocol::MAX_APPROVALS_FILE_ENTRIES)
+        } else {
+            worker_approvals.len()
+        },
+        max_deployments_per_worker: 32,
+        max_local_dispatches: args.gateway_max_in_flight,
+        status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
+        cache_affinity: worker_registry::CacheAffinityConfig {
+            enabled: args.gateway_router_cache_affinity == "on",
+            min_prefix_hit_ratio: args.gateway_router_cache_min_hit_ratio,
+            max_kv_usage_pct: args.gateway_router_cache_max_kv_usage_pct,
+        },
+        ..worker_registry::WorkerRegistryConfig::default()
+    };
+    let registry = worker_registry::WorkerRegistry::new(registry_config)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
+    validate_gateway_topology_policy(args.gateway_topology, &worker_approvals, &worker_tls)?;
+    let client_config = gateway_worker_client_config(args, worker_tls);
+
+    // DS6: the approval view defines the pool/generation structure before any
+    // worker is validated, so a rollout window in the approvals reaches
+    // selection and the replica path accepts both window generations. The
+    // table is shared: the approvals refresh adopts changed views and the
+    // poller completes pending cutovers at runtime.
+    let rendered_view = render_approvals_text(&worker_approvals);
+    let deployment_table = {
+        let mut table = gateway_deployments::GatewayDeploymentTable::default();
+        table
+            .apply_view(&worker_approvals)
+            .map_err(|error| anyhow::anyhow!("configured approvals view: {error}"))?;
+        Arc::new(std::sync::Mutex::new(table))
+    };
+    registry.set_generation_gate({
+        let deployment_table = Arc::clone(&deployment_table);
+        Arc::new(move |task, public_model| {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table.eligible_generation(task, public_model)
+        })
+    });
+
+    let mut endpoints = BTreeSet::new();
+    for approval in &worker_approvals {
+        let endpoint = approval.endpoint.trim();
+        if endpoint.is_empty() {
+            anyhow::bail!("configured gateway worker endpoints must not be empty");
+        }
+        if !endpoints.insert(endpoint.to_string()) {
+            anyhow::bail!("duplicate configured gateway worker endpoint: {endpoint}");
+        }
+    }
+
+    let mut approved_worker_ids = BTreeSet::new();
+    let mut polling_workers = Vec::with_capacity(worker_approvals.len());
+    for approval in &worker_approvals {
+        let expectation = adopt_gateway_worker(
+            &registry,
+            &deployment_table,
+            approval,
+            &credentials,
+            &client_config,
+            args.gateway_topology,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to adopt approved worker {}",
+                approval.endpoint.trim()
+            )
+        })?;
+        if !approved_worker_ids.insert(expectation.worker_id.clone()) {
+            anyhow::bail!(
+                "configured gateway endpoints must identify distinct logical workers; duplicate {}",
+                expectation.worker_id
+            );
+        }
+        polling_workers.push(expectation);
+    }
+
+    let chat_deployment = {
+        let table = deployment_table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        table
+            .select(TaskKind::Chat, &public_model)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured gateway worker approvals do not include chat model {}",
+                    public_model
+                )
+            })?
+            .deployment_id()
+            .clone()
+    };
+
+    let dispatcher = app::remote_chat_dispatch::RemoteChatDispatcher::new(
+        registry.clone(),
+        app::remote_chat_dispatch::RemoteChatDispatchConfig {
+            public_model_variant,
+            deployment_id: chat_deployment.clone(),
+            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+            backend_policy: gateway_backend_policy(args.backend.as_ref()),
+            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
+            max_output_tokens: 4096,
+            max_output_bytes: 512 * 1024,
+            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
+            session_pin: session_pin_config(args),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error.message))?;
+
+    // Multi-gateway fleets share worker observations and capacity claims
+    // through one coordination database — a SQLite file by default, or a
+    // server-backed database URL for shared fleets (DS5). Unset means
+    // single-gateway operation with purely process-local state. When the
+    // coordination database is set, the shared-atomic claim path is the
+    // default selection posture: the worker remains the atomic admission
+    // arbiter, and 1/N partitioning stays the explicitly-chosen quota
+    // fallback (`IZWI_GATEWAY_FLEET_PARTITION`/`_SIZE`).
+    let fleet_claim_ttl = crate::gateway_fleet::fleet_claim_ttl_from_env()?;
+    let mut fleet_maintenance: Option<tokio::task::JoinHandle<()>> = None;
+    let fleet = match crate::gateway_fleet::fleet_database_from_env()? {
+        Some(fleet_database) => {
+            let store_database = match fleet_database {
+                crate::gateway_fleet::FleetDatabase::Path(path) => {
+                    crate::db::StoreDatabase::new(path)
+                }
+                crate::gateway_fleet::FleetDatabase::Url(url) => {
+                    crate::db::StoreDatabase::from_url(url)
+                }
+            };
+            let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
+                store_database,
+            );
+            // Two fleet gateways booting simultaneously race the SQLite
+            // journal-mode setup before the busy timeout is in play, so the
+            // first open retries briefly before failing closed.
+            let mut opened = Err(anyhow::anyhow!("fleet coordination database never opened"));
+            for _ in 0..10 {
+                match store.connection().await {
+                    Ok(_) => {
+                        opened = Ok(());
+                        break;
+                    }
+                    Err(error) => opened = Err(error),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            opened.context("Failed to open fleet coordination database")?;
+            let coordinator = Arc::new(
+                app::fleet_coordinator::FleetCoordinator::new(
+                    store,
+                    crate::gateway_fleet::gateway_identity(),
+                )
+                .with_claim_ttl(fleet_claim_ttl),
+            );
+            let released = coordinator.release_own_claims().await;
+            info!(
+                service = SERVICE_NAME,
+                version = SERVICE_VERSION,
+                gateway_id = coordinator.gateway_id(),
+                released_own_claims = released,
+                claim_ttl_ms = fleet_claim_ttl.as_millis() as u64,
+                selection_mode = "shared_atomic_claims",
+                // Parsed once already in run_gateway; re-read here so the
+                // posture log names the effective quota mode.
+                quota_mode = if crate::gateway_fleet::FleetPartition::from_env()?.is_some() {
+                    "partitioned_1_of_n"
+                } else {
+                    "worker_authoritative"
+                },
+                "Fleet coordination enabled: worker observations and capacity claims are shared"
+            );
+            let maintenance_coordinator = coordinator.clone();
+            fleet_maintenance = Some(tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(app::fleet_coordinator::FLEET_MAINTENANCE_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The first tick fires immediately; the boot path just
+                // released this gateway's own claims, so sweep on the cadence.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let (reaped, pruned) = maintenance_coordinator.maintenance_sweep().await;
+                    if reaped > 0 || pruned > 0 {
+                        debug!(
+                            service = SERVICE_NAME,
+                            reaped_claims = reaped,
+                            pruned_observations = pruned,
+                            "Fleet coordination maintenance sweep"
+                        );
+                    }
+                }
+            }));
+            Some(coordinator)
+        }
+        None => None,
+    };
+    let mut dispatcher = dispatcher;
+    if let Some(coordinator) = fleet.clone() {
+        dispatcher = dispatcher.with_fleet_coordinator(coordinator);
+    }
+    let polling_interval = Duration::from_millis(args.gateway_worker_status_poll_ms);
+    // Poller handles live in the adoption map below; they terminate with
+    // the gateway runtime. `tasks` collects the maintenance and approvals
+    // refresh tasks that GatewayWorkerStatusPoller aborts on drop.
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut poller_handles: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+    for expected in polling_workers {
+        let handle = spawn_gateway_worker_poller(
+            expected.clone(),
+            registry.clone(),
+            Arc::clone(&deployment_table),
+            fleet.clone(),
+            polling_interval,
+        );
+        poller_handles.insert(expected.endpoint.clone(), handle);
+    }
+    let boot_poller_count = poller_handles.len();
+    if let Some(maintenance) = fleet_maintenance {
+        tasks.push(maintenance);
+    }
+
+    // Multi-gateway fleets: keep a locally cached fresh view of the shared
+    // approvals file and adopt changed views at runtime (DS6). The rollout
+    // coordinator drives generation transitions through atomic file writes;
+    // adoption applies the DINV-07 eligibility rule in one table mutation,
+    // and workers approved by the view are adopted (or retried) into the
+    // registry and poller set. A rejected view retains the previous
+    // approval state fail-closed.
+    if let Some(view) = shared_approvals_view {
+        let ttl = view.ttl();
+        let watched = std::sync::Arc::new(tokio::sync::Mutex::new(view));
+        let refresh_table = Arc::clone(&deployment_table);
+        let refresh_cli_approvals = cli_approvals.clone();
+        let refresh_registry = registry.clone();
+        let refresh_credentials = credentials.clone();
+        let refresh_client_config = client_config.clone();
+        let refresh_topology = args.gateway_topology;
+        let refresh_polling_interval = polling_interval;
+        let refresh_fleet = fleet.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ttl);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            let mut last_applied = Some(rendered_view);
+            loop {
+                ticker.tick().await;
+                let mut guard = watched.lock().await;
+                if let Err(error) = guard.refresh_if_due() {
+                    warn!(error = %error, "Shared fleet approvals refresh failed; retaining previous view");
+                    continue;
+                }
+                let mut effective = refresh_cli_approvals.clone();
+                effective.extend(guard.approvals().iter().cloned());
+                let rendered = render_approvals_text(&effective);
+                if last_applied.as_deref() != Some(rendered.as_str()) {
+                    match refresh_table
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .apply_view(&effective)
+                    {
+                        Ok(outcome) => {
+                            last_applied = Some(rendered);
+                            info!(
+                                service = SERVICE_NAME,
+                                version = SERVICE_VERSION,
+                                approvals = effective.len(),
+                                added_generations = outcome.added.len(),
+                                removed_generations = outcome.removed.len(),
+                                "Shared fleet approvals adopted: deployment pool generations updated"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "Shared fleet approvals view rejected; retaining previous approval state");
+                        }
+                    }
+                }
+                // Reconcile worker adoption with the effective view: approve
+                // (or retry) workers the view adds, stop pollers for workers
+                // it removes. Registry records of removed workers lapse
+                // naturally; the eligibility gate already excludes them.
+                let live_endpoints: BTreeSet<String> = poller_handles
+                    .keys()
+                    .cloned()
+                    .collect();
+                for approval in &effective {
+                    let endpoint = approval.endpoint.trim().to_string();
+                    if endpoint.is_empty() || live_endpoints.contains(&endpoint) {
+                        continue;
+                    }
+                    match adopt_gateway_worker(
+                        &refresh_registry,
+                        &refresh_table,
+                        approval,
+                        &refresh_credentials,
+                        &refresh_client_config,
+                        refresh_topology,
+                    )
+                    .await
+                    {
+                        Ok(expected) => {
+                            info!(
+                                worker_id = %expected.worker_id,
+                                endpoint = %endpoint,
+                                generation = expected.deployment.model_generation.get(),
+                                "Shared fleet approvals adopted a worker"
+                            );
+                            let handle = spawn_gateway_worker_poller(
+                                expected,
+                                refresh_registry.clone(),
+                                Arc::clone(&refresh_table),
+                                refresh_fleet.clone(),
+                                refresh_polling_interval,
+                            );
+                            poller_handles.insert(endpoint, handle);
+                        }
+                        Err(error) => {
+                            debug!(
+                                endpoint = %endpoint,
+                                error = %error,
+                                "Shared fleet approval adoption not complete yet; will retry"
+                            );
+                        }
+                    }
+                }
+                let view_endpoints: BTreeSet<String> = effective
+                    .iter()
+                    .map(|approval| approval.endpoint.trim().to_string())
+                    .collect();
+                let removed: Vec<String> = poller_handles
+                    .keys()
+                    .filter(|endpoint| !view_endpoints.contains(*endpoint))
+                    .cloned()
+                    .collect();
+                for endpoint in removed {
+                    if let Some(handle) = poller_handles.remove(&endpoint) {
+                        handle.abort();
+                        info!(endpoint = %endpoint, "Removed approval poller stopped");
+                    }
+                }
+            }
+        }));
+    }
+
+    let state = gateway::GatewayState::with_dispatcher(
+        dispatcher,
+        enterprise_hooks,
+        perimeter,
+        serve_config.request_timeout_secs,
+        args.gateway_max_in_flight,
+    );
+    let state = if args.gateway_realtime == "on" {
+        // Stage pools resolve per approved task for the public model; boot
+        // fails closed only when no realtime stage can be served at all. A
+        // missing individual stage refuses its admits with a policy close at
+        // session time.
+        let asr_deployment_id = {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .select(TaskKind::SpeechToText, &public_model)
+                .map(|deployment| deployment.deployment_id().clone())
+        };
+        let tts_deployment_id = {
+            let table = deployment_table
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            table
+                .select(TaskKind::TextToSpeech, &public_model)
+                .map(|deployment| deployment.deployment_id().clone())
+        };
+        if asr_deployment_id.is_none() && tts_deployment_id.is_none() {
+            return Err(anyhow::anyhow!(
+                "--gateway-realtime is on but no approved worker advertises a realtime speech_to_text or text_to_speech model {public_model}"
+            ));
+        }
+        let relay = app::realtime_relay::GatewayRealtimeRelay::new(
+            registry,
+            app::realtime_relay::RealtimeRelayConfig {
+                deployment_id: asr_deployment_id,
+                tts_deployment_id,
+                public_model: public_model.clone(),
+                policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+                backend_policy: gateway_backend_policy(args.backend.as_ref()),
+                max_sessions: args.gateway_realtime_max_sessions,
+                session_budget: Duration::from_millis(args.gateway_realtime_session_budget_ms),
+            },
+            credentials,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        info!(
+            service = SERVICE_NAME,
+            version = SERVICE_VERSION,
+            asr_stage = relay.config().deployment_id.is_some(),
+            tts_stage = relay.config().tts_deployment_id.is_some(),
+            max_sessions = args.gateway_realtime_max_sessions,
+            "Gateway realtime relay enabled for izwi-realtime-v1 sessions"
+        );
+        state.with_realtime_relay(relay)
+    } else {
+        state
+    };
+    let poller = GatewayWorkerStatusPoller {
+        poller_count: boot_poller_count,
+        tasks,
+    };
+    info!(
+        service = SERVICE_NAME,
+        version = SERVICE_VERSION,
+        pollers = poller.poller_count,
+        interval_ms = polling_interval.as_millis() as u64,
+        "Gateway worker status polling started"
+    );
+    Ok((state, Some(poller)))
+}
+
+fn initial_gateway_worker_expectation(
+    client: WorkerClient,
+    descriptor: &WorkerDescriptor,
+    status: &WorkerStatus,
+    approval: &gateway_deployments::GatewayWorkerApproval,
+) -> anyhow::Result<GatewayWorkerExpectation> {
+    if let Some((node_id, worker_id)) = approval.pinned_identity() {
+        if descriptor.node_id != *node_id || descriptor.worker_id != *worker_id {
+            anyhow::bail!(
+                "worker descriptor does not match its operator-approved node and worker identity"
+            );
+        }
+    }
+    if status.worker_id != descriptor.worker_id
+        || status.node_id != descriptor.node_id
+        || status.incarnation_id != descriptor.incarnation_id
+    {
+        anyhow::bail!("initial worker descriptor and status identity do not match");
+    }
+    let selected_deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == approval.deployment_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "worker {} does not advertise configured deployment {}",
+                descriptor.worker_id,
+                approval.deployment_id
+            )
+        })?;
+    if selected_deployment.public_model != approval.public_model
+        || selected_deployment.model_generation != approval.model_generation
+        || selected_deployment.task != approval.task
+    {
+        anyhow::bail!(
+            "worker {} deployment {} does not match its configured task/model/generation",
+            descriptor.worker_id,
+            approval.deployment_id
+        );
+    }
+    let validated_capacity = configured_worker_capacity(status)?;
+    Ok(GatewayWorkerExpectation {
+        endpoint: approval.endpoint.trim().to_string(),
+        client,
+        worker_id: descriptor.worker_id.clone(),
+        node_id: descriptor.node_id.clone(),
+        deployment: worker_registry::ApprovedDeployment::from_loaded(selected_deployment),
+        validated_capacity,
+    })
+}
+
+fn configured_gateway_worker_approvals(
+    args: &ServerArgs,
+    legacy_public_model: &ModelAlias,
+) -> anyhow::Result<(
+    Vec<gateway_deployments::GatewayWorkerApproval>,
+    Vec<gateway_deployments::GatewayWorkerApproval>,
+    Option<gateway_shared_approvals::SharedApprovalsView>,
+)> {
+    // Returns (CLI-only approvals, effective merged view, shared file view).
+    let mut merged = if !args.gateway_worker_approvals.is_empty() {
+        if !args.gateway_worker_endpoints.is_empty() {
+            anyhow::bail!(
+                "--gateway-worker-approval cannot be combined with --gateway-worker-endpoint"
+            );
+        }
+        if args.worker_deployment.is_some() || args.worker_model_generation.is_some() {
+            anyhow::bail!(
+                "--worker-deployment and --worker-model-generation apply only to legacy --gateway-worker-endpoint configuration"
+            );
+        }
+        args.gateway_worker_approvals.clone()
+    } else if !args.gateway_worker_endpoints.is_empty() {
+        let deployment_id = DeploymentId::new(required_gateway_value(
+            &args.worker_deployment,
+            "--worker-deployment",
+        )?)?;
+        let model_generation =
+            ModelGeneration::new(args.worker_model_generation.ok_or_else(|| {
+                anyhow::anyhow!("gateway mode requires --worker-model-generation")
+            })?)?;
+        args.gateway_worker_endpoints
+            .iter()
+            .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
+                endpoint: endpoint.clone(),
+                identity: gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
+                task: TaskKind::Chat,
+                public_model: legacy_public_model.clone(),
+                deployment_id: deployment_id.clone(),
+                model_generation,
+            })
+            .collect()
+    } else {
+        // No CLI approvals and no legacy endpoints: the shared approvals
+        // file (the DS6 rollout channel) may be the sole approval source.
+        Vec::new()
+    };
+
+    // Multi-gateway fleets keep one authoritative approvals file that every
+    // gateway reads, so all gateways approve the same worker set. Shared
+    // entries augment (never replace) explicit CLI approvals; the existing
+    // duplicate-endpoint check below rejects any conflict fail-closed.
+    let cli_only = merged.clone();
+    let shared_view = match gateway_shared_approvals::SharedApprovalsConfig::from_env() {
+        Ok(Some(config)) => {
+            let view = gateway_shared_approvals::SharedApprovalsView::load(config)
+                .map_err(|error| anyhow::anyhow!("shared fleet approvals: {error}"))?;
+            merged.extend(view.approvals().iter().cloned());
+            Some(view)
+        }
+        Ok(None) => None,
+        Err(error) => anyhow::bail!("shared fleet approvals: {error}"),
+    };
+    Ok((cli_only, merged, shared_view))
+}
+
+fn validate_gateway_topology_policy(
+    topology: GatewayTopology,
+    approvals: &[gateway_deployments::GatewayWorkerApproval],
+    tls: &izwi_serving_client::WorkerClientTlsConfig,
+) -> anyhow::Result<()> {
+    let mut pinned_worker_ids = BTreeSet::new();
+    for approval in approvals {
+        if let Some((_node_id, worker_id)) = approval.pinned_identity() {
+            if !pinned_worker_ids.insert(worker_id.clone()) {
+                anyhow::bail!("duplicate operator-approved logical worker identity: {worker_id}");
+            }
+        }
+    }
+    if topology == GatewayTopology::Standalone {
+        return Ok(());
+    }
+    if approvals.is_empty() {
+        anyhow::bail!("fleet-one-gateway topology requires at least one worker approval");
+    }
+    if !tls.has_client_identity() {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires a client certificate and private key for mutual TLS"
+        );
+    }
+    if approvals
+        .iter()
+        .any(|approval| approval.pinned_identity().is_none())
+    {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires versioned v1 approvals with pinned node and worker identities"
+        );
+    }
+    Ok(())
+}
+
+fn validate_gateway_topology_source(args: &ServerArgs) -> anyhow::Result<()> {
+    if args.gateway_topology == GatewayTopology::FleetOneGateway
+        && args.gateway_worker_approvals.is_empty()
+    {
+        anyhow::bail!(
+            "fleet-one-gateway topology requires versioned --gateway-worker-approval entries; pinned and legacy endpoint modes are standalone-only"
+        );
+    }
+    Ok(())
+}
+
+fn validate_gateway_worker_endpoint_policy(
+    topology: GatewayTopology,
+    uses_https: bool,
+    uses_numeric_loopback_http: bool,
+) -> anyhow::Result<()> {
+    match topology {
+        GatewayTopology::Standalone if !uses_numeric_loopback_http => {
+            anyhow::bail!("standalone worker endpoints must use numeric-loopback HTTP")
+        }
+        GatewayTopology::FleetOneGateway if !uses_https => {
+            anyhow::bail!("fleet-one-gateway worker endpoints must use HTTPS")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
+    status
+        .capacity
+        .max_active_invocations
+        .checked_add(status.capacity.max_queued_invocations)
+        .filter(|capacity| *capacity > 0)
+        .ok_or_else(|| anyhow::anyhow!("worker has invalid configured capacity"))
+}
+
+fn validate_gateway_worker_observation(
+    expected: &GatewayWorkerExpectation,
+    descriptor: &WorkerDescriptor,
+    status: WorkerStatus,
+) -> anyhow::Result<WorkerStatus> {
+    if descriptor.worker_id != expected.worker_id || descriptor.node_id != expected.node_id {
+        anyhow::bail!("restarted worker changed its approved logical worker or node identity");
+    }
+    if status.incarnation_id != descriptor.incarnation_id {
+        anyhow::bail!("restarted worker descriptor and status identity do not match");
+    }
+    validate_gateway_worker_status(expected, status)
+}
+
+fn validate_gateway_worker_status(
+    expected: &GatewayWorkerExpectation,
+    mut status: WorkerStatus,
+) -> anyhow::Result<WorkerStatus> {
+    if status.worker_id != expected.worker_id || status.node_id != expected.node_id {
+        anyhow::bail!("worker status changed its approved logical worker or node identity");
+    }
+    if configured_worker_capacity(&status)? != expected.validated_capacity {
+        anyhow::bail!("restarted worker changed its validated capacity");
+    }
+    let deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == expected.deployment.deployment_id)
+        .ok_or_else(|| anyhow::anyhow!("restarted worker omitted its approved deployment"))?;
+    if worker_registry::ApprovedDeployment::from_loaded(deployment) != expected.deployment {
+        anyhow::bail!("restarted worker changed its approved deployment contract");
+    }
+
+    // Retain only the configured deployment in the local routing view. Other
+    // worker-local deployments are neither approved nor selectable merely
+    // because an authenticated endpoint advertised them.
+    status
+        .deployments
+        .retain(|deployment| deployment.deployment_id == expected.deployment.deployment_id);
+    Ok(status)
+}
+
+fn approve_gateway_worker(
+    registry: &worker_registry::WorkerRegistry,
+    expected: &GatewayWorkerExpectation,
+    descriptor: WorkerDescriptor,
+    status: WorkerStatus,
+) -> anyhow::Result<()> {
+    let status = validate_gateway_worker_observation(expected, &descriptor, status)?;
+    registry
+        .approve(worker_registry::ApprovedWorker {
+            descriptor,
+            client: expected.client.clone(),
+            approved_deployments: BTreeMap::from([(
+                expected.deployment.deployment_id.clone(),
+                expected.deployment.clone(),
+            )]),
+            validated_capacity: expected.validated_capacity,
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    registry
+        .observe_status(status)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+/// Adopts one approved worker into the running gateway: builds its
+/// authenticated client, validates the live worker against the approval's
+/// exact deployment contract, approves the replica into the deployment
+/// table (filling the generation's learned contract), registers and
+/// observes it in the registry, and completes a pending rollout cutover
+/// when the adoption observes the successor Ready. Used at boot and at
+/// runtime by the shared-approvals adoption path.
+async fn adopt_gateway_worker(
+    registry: &worker_registry::WorkerRegistry,
+    deployment_table: &Arc<std::sync::Mutex<gateway_deployments::GatewayDeploymentTable>>,
+    approval: &gateway_deployments::GatewayWorkerApproval,
+    credentials: &ServiceCredentials,
+    client_config: &WorkerClientConfig,
+    topology: GatewayTopology,
+) -> anyhow::Result<GatewayWorkerExpectation> {
+    let endpoint = approval.endpoint.trim();
+    let client = WorkerClient::new(endpoint, credentials.clone(), client_config.clone())?;
+    validate_gateway_worker_endpoint_policy(
+        topology,
+        client.uses_https(),
+        client.uses_numeric_loopback_http(),
+    )?;
+    let descriptor = client
+        .descriptor()
+        .await
+        .with_context(|| format!("failed to read approved worker descriptor from {endpoint}"))?;
+    let status = client
+        .status()
+        .await
+        .with_context(|| format!("failed to read initial worker status from {endpoint}"))?;
+    let expectation = initial_gateway_worker_expectation(client, &descriptor, &status, approval)?;
+    // Register first: a failed registry approval must never mutate the
+    // deployment table (a premature cutover could strand admission with no
+    // eligible generation).
+    approve_gateway_worker(registry, &expectation, descriptor, status.clone())?;
+    let cutover_completed = {
+        let mut table = deployment_table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        table
+            .approve_replica(expectation.deployment.clone())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        status
+            .deployments
+            .iter()
+            .find(|deployment| {
+                deployment.deployment_id == expectation.deployment.deployment_id
+                    && deployment.readiness == ModelReadiness::Ready
+            })
+            .is_some_and(|deployment| {
+                table.observe_generation_ready(
+                    expectation.deployment.task,
+                    &expectation.deployment.public_model,
+                    &expectation.deployment.deployment_id,
+                    deployment.model_generation,
+                )
+            })
+    };
+    if cutover_completed {
+        info!(
+            worker_id = %expectation.worker_id,
+            deployment = %expectation.deployment.deployment_id,
+            generation = expectation.deployment.model_generation.get(),
+            "Rollout cutover completed: successor generation is admission-eligible"
+        );
+    }
+    Ok(expectation)
+}
+
+/// Spawns the bounded status poller for one adopted worker expectation.
+fn spawn_gateway_worker_poller(
+    expected: GatewayWorkerExpectation,
+    registry: worker_registry::WorkerRegistry,
+    deployment_table: Arc<std::sync::Mutex<gateway_deployments::GatewayDeploymentTable>>,
+    fleet: Option<std::sync::Arc<app::fleet_coordinator::FleetCoordinator>>,
+    polling_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let cadence = jittered_poll_interval(
+        polling_interval,
+        poll_jitter_seed(&expected.worker_id, &expected.node_id),
+    );
+    debug!(
+        worker_id = %expected.worker_id,
+        configured_poll_ms = polling_interval.as_millis() as u64,
+        jittered_poll_ms = cadence.as_millis() as u64,
+        "Worker status poller cadence"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The adopting observation was recorded synchronously.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match refresh_gateway_worker_status(&registry, &expected, fleet.as_deref()).await {
+                Ok(status) => {
+                    // DS6: a Ready observation of a pending rollout
+                    // successor completes the cutover atomically in
+                    // the deployment table (DINV-07).
+                    let cutover = status.deployments.iter().find(|deployment| {
+                        deployment.deployment_id == expected.deployment.deployment_id
+                            && deployment.readiness == ModelReadiness::Ready
+                    });
+                    let completed = cutover.is_some_and(|deployment| {
+                        let mut table = deployment_table
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        table.observe_generation_ready(
+                            deployment.task,
+                            &deployment.public_model,
+                            &deployment.deployment_id,
+                            deployment.model_generation,
+                        )
+                    });
+                    if completed {
+                        info!(
+                            worker_id = %expected.worker_id,
+                            deployment = %expected.deployment.deployment_id,
+                            generation = expected.deployment.model_generation.get(),
+                            "Rollout cutover completed: successor generation is admission-eligible"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        worker_id = %expected.worker_id,
+                        error = %error,
+                        "Worker status refresh failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+async fn refresh_gateway_worker_status(
+    registry: &worker_registry::WorkerRegistry,
+    expected: &GatewayWorkerExpectation,
+    fleet: Option<&app::fleet_coordinator::FleetCoordinator>,
+) -> anyhow::Result<WorkerStatus> {
+    let status = validate_gateway_worker_status(expected, expected.client.status().await?)?;
+    if let Some(coordinator) = fleet {
+        coordinator.publish_and_refresh(&status).await;
+    }
+    match registry.observe_status(status.clone()) {
+        Ok(()) => Ok(status),
+        Err(worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation) => {
+            let descriptor = expected.client.descriptor().await?;
+            approve_gateway_worker(registry, expected, descriptor, status.clone())?;
+            Ok(status)
+        }
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+    }
+}
+
+fn required_gateway_value<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("gateway mode requires {name}"))
+}
+
+fn gateway_worker_credentials(args: &ServerArgs) -> anyhow::Result<ServiceCredentials> {
+    Ok(ServiceCredentials {
+        credential_id: CredentialId::new(required_gateway_value(
+            &args.worker_credential_id,
+            "--worker-credential-id",
+        )?)?,
+        bearer_token: ServiceBearerToken::new(required_gateway_value(
+            &args.worker_bearer_token,
+            "--worker-bearer-token or IZWI_GATEWAY_WORKER_BEARER_TOKEN",
+        )?)?,
+    })
+}
+
+fn gateway_backend_policy(backend: Option<&BackendArg>) -> worker_registry::BackendPolicy {
+    match backend {
+        Some(BackendArg::Cpu) => worker_registry::BackendPolicy::CPU_ONLY,
+        Some(BackendArg::Metal) => worker_registry::BackendPolicy::METAL_ONLY,
+        Some(BackendArg::Cuda) => worker_registry::BackendPolicy::CUDA_ONLY,
+        Some(BackendArg::Auto) | None => worker_registry::BackendPolicy::ANY,
+    }
+}
+
+fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
+    if args.gateway_max_in_flight == 0
+        || args.gateway_max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        anyhow::bail!(
+            "--gateway-max-in-flight must be between 1 and {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+    if args.gateway_worker_queue_wait_ms == 0 {
+        anyhow::bail!("--gateway-worker-queue-wait-ms must be non-zero");
+    }
+    let admission_timeout = Duration::from_millis(args.gateway_worker_admission_timeout_ms);
+    if admission_timeout.is_zero() || admission_timeout > MAX_GATEWAY_ADMISSION_TIMEOUT {
+        anyhow::bail!(
+            "--gateway-worker-admission-timeout-ms must be between 1 and {}",
+            MAX_GATEWAY_ADMISSION_TIMEOUT.as_millis()
+        );
+    }
+    if Duration::from_millis(args.gateway_worker_queue_wait_ms) > admission_timeout {
+        anyhow::bail!(
+            "--gateway-worker-queue-wait-ms must not exceed the worker admission timeout"
+        );
+    }
+    for (name, value) in [
+        (
+            "--gateway-worker-first-output-timeout-ms",
+            args.gateway_worker_first_output_timeout_ms,
+        ),
+        (
+            "--gateway-worker-progress-idle-timeout-ms",
+            args.gateway_worker_progress_idle_timeout_ms,
+        ),
+    ] {
+        let timeout = Duration::from_millis(value);
+        if timeout.is_zero() || timeout > MAX_GATEWAY_STREAM_PHASE_TIMEOUT {
+            anyhow::bail!(
+                "{name} must be between 1 and {}",
+                MAX_GATEWAY_STREAM_PHASE_TIMEOUT.as_millis()
+            );
+        }
+    }
+    let slow_consumer_timeout = Duration::from_millis(args.gateway_slow_consumer_timeout_ms);
+    if slow_consumer_timeout.is_zero() || slow_consumer_timeout > MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT
+    {
+        anyhow::bail!(
+            "--gateway-slow-consumer-timeout-ms must be between 1 and {}",
+            MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT.as_millis()
+        );
+    }
+    let configured_workers = args
+        .gateway_worker_endpoints
+        .len()
+        .checked_add(args.gateway_worker_approvals.len())
+        .ok_or_else(|| anyhow::anyhow!("configured gateway worker count overflowed"))?;
+    if configured_workers > MAX_CONFIGURED_GATEWAY_WORKERS {
+        anyhow::bail!(
+            "at most {MAX_CONFIGURED_GATEWAY_WORKERS} gateway worker endpoints or approvals are supported"
+        );
+    }
+    let ttl = Duration::from_millis(args.gateway_worker_status_ttl_ms);
+    let poll = Duration::from_millis(args.gateway_worker_status_poll_ms);
+    if ttl.is_zero() || ttl > MAX_GATEWAY_STATUS_TTL {
+        anyhow::bail!("--gateway-worker-status-ttl-ms is outside the supported range");
+    }
+    validate_status_cadence(ttl, poll)?;
+    validate_router_cache_affinity_args(args)?;
+    validate_session_pin_args(args)?;
+    validate_realtime_relay_args(args)?;
+    Ok(())
+}
+
+/// Parses and bounds-checks the cache-affinity routing knobs. Fail-closed on
+/// any out-of-range or non-`on|off` value so typos never silently disable or
+/// enable locality routing.
+fn validate_router_cache_affinity_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_router_cache_affinity.as_str() {
+        "on" | "off" => {}
+        other => {
+            anyhow::bail!("--gateway-router-cache-affinity must be `on` or `off`, got `{other}`")
+        }
+    }
+    let ratio = args.gateway_router_cache_min_hit_ratio;
+    if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
+        anyhow::bail!("--gateway-router-cache-min-hit-ratio must be between 0.0 and 1.0");
+    }
+    let usage = args.gateway_router_cache_max_kv_usage_pct;
+    if usage.is_nan() || !(0.0..=100.0).contains(&usage) || usage == 0.0 {
+        anyhow::bail!("--gateway-router-cache-max-kv-usage-pct must be between 0 and 100");
+    }
+    Ok(())
+}
+
+/// Parses and bounds-checks the conversation-pinning knobs, mirroring the
+/// dispatcher-side `SessionPinConfig` bounds.
+fn validate_session_pin_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_session_pin.as_str() {
+        "on" | "off" => {}
+        other => anyhow::bail!("--gateway-session-pin must be `on` or `off`, got `{other}`"),
+    }
+    if args.gateway_session_pin_max_entries == 0
+        || args.gateway_session_pin_max_entries > app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
+    {
+        anyhow::bail!(
+            "--gateway-session-pin-max-entries must be between 1 and {}",
+            app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
+        );
+    }
+    let ttl = Duration::from_secs(args.gateway_session_pin_ttl_secs);
+    if ttl.is_zero() || ttl > app::remote_chat_dispatch::MAX_SESSION_PIN_TTL {
+        anyhow::bail!("--gateway-session-pin-ttl-secs is outside the supported range");
+    }
+    Ok(())
+}
+
+/// Parses and bounds-checks the realtime relay knobs (DS3.6).
+fn validate_realtime_relay_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_realtime.as_str() {
+        "on" | "off" => {}
+        other => anyhow::bail!("--gateway-realtime must be `on` or `off`, got `{other}`"),
+    }
+    if args.gateway_realtime == "off" {
+        return Ok(());
+    }
+    if args.gateway_realtime_max_sessions == 0
+        || args.gateway_realtime_max_sessions > app::realtime_relay::MAX_RELAY_SESSIONS
+    {
+        anyhow::bail!(
+            "--gateway-realtime-max-sessions must be between 1 and {}",
+            app::realtime_relay::MAX_RELAY_SESSIONS
+        );
+    }
+    let budget = Duration::from_millis(args.gateway_realtime_session_budget_ms);
+    if budget.is_zero() || budget > Duration::from_millis(MAX_REMAINING_TIME_MS) {
+        anyhow::bail!(
+            "--gateway-realtime-session-budget-ms must be between 1 and {MAX_REMAINING_TIME_MS}"
+        );
+    }
+    Ok(())
+}
+
+fn session_pin_config(args: &ServerArgs) -> Option<app::remote_chat_dispatch::SessionPinConfig> {
+    (args.gateway_session_pin == "on").then_some(app::remote_chat_dispatch::SessionPinConfig {
+        max_entries: args.gateway_session_pin_max_entries,
+        ttl: Duration::from_secs(args.gateway_session_pin_ttl_secs),
+    })
+}
+
+fn gateway_worker_client_config(
+    args: &ServerArgs,
+    tls: izwi_serving_client::WorkerClientTlsConfig,
+) -> WorkerClientConfig {
+    WorkerClientConfig {
+        max_in_flight: args.gateway_max_in_flight,
+        request_timeout: Duration::from_millis(args.gateway_worker_admission_timeout_ms),
+        first_output_timeout: Duration::from_millis(args.gateway_worker_first_output_timeout_ms),
+        progress_timeout: Duration::from_millis(args.gateway_worker_progress_idle_timeout_ms),
+        ndjson_limits: NdjsonLimits {
+            max_line_bytes: GATEWAY_NDJSON_MAX_LINE_BYTES,
+            max_total_bytes: GATEWAY_NDJSON_MAX_TOTAL_BYTES,
+            max_events: GATEWAY_NDJSON_MAX_EVENTS,
+            ..NdjsonLimits::default()
+        },
+        tls,
+        ..WorkerClientConfig::default()
+    }
+}
+
+fn gateway_remote_execution(
+    args: &ServerArgs,
+    _serve_config: &ServeRuntimeConfig,
+) -> anyhow::Result<app::chat::RemoteChatExecution> {
+    validate_gateway_limits(args)?;
+    let model_generation = ModelGeneration::new(
+        args.worker_model_generation
+            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
+    )?;
+    let model = parse_model_variant(required_gateway_value(
+        &args.public_model,
+        "--public-model",
+    )?)?;
+    let credentials = gateway_worker_credentials(args)?;
+    let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
+    let client = WorkerClient::new(
+        required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
+        credentials,
+        gateway_worker_client_config(args, worker_tls),
+    )?;
+    validate_gateway_worker_endpoint_policy(
+        args.gateway_topology,
+        client.uses_https(),
+        client.uses_numeric_loopback_http(),
+    )?;
+    app::chat::RemoteChatExecution::new(
+        client,
+        app::chat::RemoteChatExecutionConfig {
+            public_model_variant: model,
+            expected_worker_incarnation: IncarnationId::new(required_gateway_value(
+                &args.worker_incarnation,
+                "--worker-incarnation",
+            )?)?,
+            deployment_id: DeploymentId::new(required_gateway_value(
+                &args.worker_deployment,
+                "--worker-deployment",
+            )?)?,
+            expected_model_generation: model_generation,
+            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
+            max_output_tokens: 4096,
+            // Leave room for the private event envelope within the worker's
+            // default one-MiB encoded-event bound.
+            max_output_bytes: 512 * 1024,
+            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
@@ -325,6 +1936,7 @@ fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
         state.batch_worker_health.clone(),
     )
     .with_runtime_observer(state.runtime.clone())
+    .with_artifact_store(state.artifact_store.clone())
     .spawn()
 }
 
@@ -556,12 +2168,7 @@ fn resolve_serve_runtime_config_with_env(
         max_sequence_length: args.max_sequence_length,
         ..ServeRuntimeConfigOverrides::default()
     };
-    let file = ServeRuntimeConfigOverrides {
-        performance: izwi_core::PerformanceConfigOverrides::from_user_config(
-            args.config.as_deref(),
-        )?,
-        ..Default::default()
-    };
+    let file = ServeRuntimeConfigOverrides::from_user_config(args.config.as_deref())?;
     let mut runtime = ServeRuntimeConfig::from_sources(&file, env, &cli);
     for performance in &args.performance {
         runtime.performance.apply_overrides(performance);
@@ -771,6 +2378,37 @@ async fn shutdown_signal(
     drop(state);
 }
 
+async fn gateway_shutdown_signal(
+    state: gateway::GatewayState,
+    shutdown_started: oneshot::Sender<()>,
+) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down gateway..."),
+        _ = terminate => info!("Received SIGTERM, shutting down gateway..."),
+        _ = desktop_owner_exit_signal() => info!("Desktop owner pipe closed, shutting down gateway..."),
+    }
+
+    state.begin_drain();
+    let _ = shutdown_started.send(());
+}
+
 async fn desktop_owner_exit_signal() {
     if std::env::var_os(DESKTOP_OWNER_PIPE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
         std::future::pending::<()>().await;
@@ -854,17 +2492,79 @@ where
     W: std::future::Future<Output = anyhow::Result<()>>,
     C: std::future::Future<Output = ()>,
 {
-    let worker_result = worker_shutdown.await;
+    worker_shutdown.await?;
     cleanup.await;
-    worker_result
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+    use izwi_core::ModelVariant;
+    use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
+    use izwi_serving_protocol::{
+        IncarnationId, ModelAlias, NodeId, WorkerDescriptor, WorkerId, WorkerStatus,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn jittered_poll_interval_is_deterministic_and_bounded() {
+        let base = Duration::from_millis(2_000);
+        for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX, 123_456_789] {
+            let first = jittered_poll_interval(base, seed);
+            let second = jittered_poll_interval(base, seed);
+            assert_eq!(first, second, "seed {seed} must be deterministic");
+            assert!(
+                first >= Duration::from_millis(1_800) && first <= Duration::from_millis(2_200),
+                "seed {seed} cadence {first:?} outside ±10% of the configured interval"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_poll_interval_never_collapses_and_desynchronizes_workers() {
+        assert_eq!(
+            jittered_poll_interval(Duration::from_millis(1), 7),
+            Duration::from_millis(1),
+            "sub-millisecond jittered cadences must clamp to 1ms, not a zero tokio interval"
+        );
+        let cadences: Vec<u64> = (0u64..16)
+            .map(|seed| {
+                let worker_id =
+                    WorkerId::new(format!("worker-{seed}").as_str()).expect("static worker id");
+                let node_id = NodeId::new("node-a").expect("static node id");
+                jittered_poll_interval(
+                    Duration::from_millis(2_000),
+                    poll_jitter_seed(&worker_id, &node_id),
+                )
+                .as_millis() as u64
+            })
+            .collect();
+        let distinct: std::collections::BTreeSet<u64> = cadences.iter().copied().collect();
+        assert!(
+            distinct.len() >= 3,
+            "co-configured workers must spread across at least 3 distinct cadences, got {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn status_cadence_validation_leaves_room_for_jitter() {
+        validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(2_000))
+            .expect("production defaults leave ample jitter headroom");
+        validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(9_090))
+            .expect("widest jittered cadence 9999ms stays below the 10s TTL");
+        assert!(
+            validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(0))
+                .is_err()
+        );
+        assert!(
+            validate_status_cadence(Duration::from_millis(10_000), Duration::from_millis(9_500))
+                .is_err(),
+            "a jittered 10450ms cadence would flap a 10s TTL expired"
+        );
+    }
 
     #[test]
     fn durable_worker_concurrency_tracks_runtime_and_operator_ceiling() {
@@ -881,7 +2581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_shutdown_failure_still_runs_runtime_cleanup() {
+    async fn unconfirmed_worker_shutdown_skips_runtime_cleanup() {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleanup_flag = cleaned.clone();
         let result = shutdown_worker_then_cleanup(
@@ -897,6 +2597,19 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert!(!cleaned.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn confirmed_worker_shutdown_runs_runtime_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        shutdown_worker_then_cleanup(async { Ok(()) }, async move {
+            cleanup_flag.store(true, Ordering::Release);
+        })
+        .await
+        .expect("confirmed worker shutdown");
+
         assert!(cleaned.load(Ordering::Acquire));
     }
 
@@ -934,6 +2647,9 @@ mod tests {
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
         std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CA_REFS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF");
         assert_eq!(batch_stage_execution_timeout(), None);
         assert_eq!(batch_worker_drain_timeout(), Duration::from_secs(20));
         assert_eq!(http_shutdown_grace_timeout(), Duration::from_secs(20));
@@ -1010,6 +2726,10 @@ mod tests {
         std::env::remove_var("IZWI_BATCH_STAGE_TIMEOUT_SECS");
         std::env::remove_var("IZWI_BATCH_WORKER_DRAIN_TIMEOUT_SECS");
         std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_ADMISSION_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_FIRST_OUTPUT_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_WORKER_PROGRESS_IDLE_TIMEOUT_MS");
+        std::env::remove_var("IZWI_GATEWAY_SLOW_CONSUMER_TIMEOUT_MS");
     }
 
     fn parse(args: &[&str]) -> ServerArgs {
@@ -1021,6 +2741,472 @@ mod tests {
             parsed.config = Some(tempfile::tempdir().unwrap().path().join("absent.toml"));
         }
         parsed
+    }
+
+    #[test]
+    fn local_server_role_remains_the_default() {
+        let args = parse(&["izwi-server"]);
+        assert_eq!(args.role, ServerRole::Local);
+        assert_eq!(args.gateway_topology, GatewayTopology::Standalone);
+        validate_role_topology(args.role, args.gateway_topology).expect("local standalone role");
+        assert!(
+            validate_role_topology(ServerRole::Local, GatewayTopology::FleetOneGateway)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --role gateway")
+        );
+    }
+
+    #[test]
+    fn fleet_topology_requires_versioned_identity_mtls_and_https() {
+        const TEST_CERT_PEM: &[u8] =
+            b"-----BEGIN CERTIFICATE-----\nMAECAQ==\n-----END CERTIFICATE-----\n";
+        const TEST_KEY_PEM: &[u8] =
+            b"-----BEGIN PRIVATE KEY-----\nMAECAQ==\n-----END PRIVATE KEY-----\n";
+        let fleet: gateway_deployments::GatewayWorkerApproval =
+            "v1|https://worker.example.test:9470|node-a|worker-a|chat|chat-model|chat-prod|7"
+                .parse()
+                .expect("versioned fleet approval");
+        let legacy: gateway_deployments::GatewayWorkerApproval =
+            "http://127.0.0.1:9470|chat|chat-model|chat-prod|7"
+                .parse()
+                .expect("standalone compatibility approval");
+        let empty_tls = izwi_serving_client::WorkerClientTlsConfig::default();
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &empty_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mutual TLS"));
+        let ca_only_tls = izwi_serving_client::WorkerClientTlsConfig::from_pem(
+            vec![TEST_CERT_PEM.to_vec()],
+            None,
+            None,
+        )
+        .expect("bounded test CA");
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &ca_only_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("mutual TLS"));
+
+        let identity_tls = izwi_serving_client::WorkerClientTlsConfig::from_pem(
+            Vec::new(),
+            Some(TEST_CERT_PEM.to_vec()),
+            Some(TEST_KEY_PEM.to_vec()),
+        )
+        .expect("bounded test identity");
+        validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&fleet),
+            &identity_tls,
+        )
+        .expect("versioned fleet policy");
+        let mut duplicate = fleet.clone();
+        duplicate.endpoint = "https://worker-b.example.test:9470".to_string();
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            &[fleet.clone(), duplicate],
+            &identity_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate operator-approved"));
+        assert!(validate_gateway_topology_policy(
+            GatewayTopology::FleetOneGateway,
+            std::slice::from_ref(&legacy),
+            &identity_tls,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("versioned v1 approvals"));
+        validate_gateway_worker_endpoint_policy(GatewayTopology::FleetOneGateway, true, false)
+            .expect("HTTPS fleet endpoint");
+        assert!(validate_gateway_worker_endpoint_policy(
+            GatewayTopology::FleetOneGateway,
+            false,
+            true,
+        )
+        .is_err());
+        validate_gateway_worker_endpoint_policy(GatewayTopology::Standalone, false, true)
+            .expect("standalone loopback compatibility");
+        assert!(
+            validate_gateway_worker_endpoint_policy(GatewayTopology::Standalone, true, false,)
+                .is_err()
+        );
+
+        let pinned_fleet = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-topology",
+            "fleet-one-gateway",
+            "--worker-endpoint",
+            "https://worker.example.test:9470",
+        ]);
+        assert!(validate_gateway_topology_source(&pinned_fleet)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned and legacy"));
+    }
+
+    #[test]
+    fn gateway_topology_parses_from_cli_and_environment() {
+        let cli = parse(&["izwi-server", "--gateway-topology", "fleet-one-gateway"]);
+        assert_eq!(cli.gateway_topology, GatewayTopology::FleetOneGateway);
+
+        let _guard = env_lock();
+        std::env::set_var("IZWI_GATEWAY_TOPOLOGY", "fleet-one-gateway");
+        let from_env = parse(&["izwi-server"]);
+        std::env::remove_var("IZWI_GATEWAY_TOPOLOGY");
+        assert_eq!(from_env.gateway_topology, GatewayTopology::FleetOneGateway);
+    }
+
+    #[test]
+    fn gateway_configuration_builds_without_a_runtime_service() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-endpoint",
+            "http://127.0.0.1:19091",
+            "--worker-credential-id",
+            "gateway-test-credential",
+            "--worker-bearer-token",
+            "gateway-test-secret",
+            "--worker-incarnation",
+            "worker-incarnation-1",
+            "--worker-deployment",
+            "qwen3-chat-v1",
+            "--public-model",
+            ModelVariant::Qwen354BGguf.dir_name(),
+            "--worker-model-generation",
+            "7",
+        ]);
+        let serve_config =
+            resolve_serve_runtime_config_with_env(&args, &ServeRuntimeConfigOverrides::default())
+                .expect("serve configuration should resolve");
+
+        let remote = gateway_remote_execution(&args, &serve_config)
+            .expect("gateway transport configuration should build");
+        assert_eq!(args.role, ServerRole::Gateway);
+        assert_eq!(
+            remote.config().public_model_variant,
+            ModelVariant::Qwen354BGguf
+        );
+        assert_eq!(remote.config().expected_model_generation.get(), 7);
+        assert_eq!(remote.config().max_queue_wait, Duration::from_millis(250));
+        assert_eq!(
+            remote.config().slow_consumer_timeout,
+            Duration::from_secs(5)
+        );
+
+        let client_config = gateway_worker_client_config(
+            &args,
+            izwi_serving_client::WorkerClientTlsConfig::default(),
+        );
+        assert_eq!(client_config.request_timeout, Duration::from_secs(10));
+        assert_eq!(client_config.first_output_timeout, Duration::from_secs(60));
+        assert_eq!(client_config.progress_timeout, Duration::from_secs(30));
+        assert_eq!(
+            client_config.ndjson_limits,
+            NdjsonLimits {
+                max_line_bytes: 1024 * 1024,
+                max_total_bytes: 16 * 1024 * 1024,
+                max_events: 8192,
+                ..NdjsonLimits::default()
+            }
+        );
+    }
+
+    #[test]
+    fn gateway_stream_deadlines_are_configurable_and_bounded() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-queue-wait-ms",
+            "500",
+            "--gateway-worker-admission-timeout-ms",
+            "1500",
+            "--gateway-worker-first-output-timeout-ms",
+            "2500",
+            "--gateway-worker-progress-idle-timeout-ms",
+            "1200",
+            "--gateway-slow-consumer-timeout-ms",
+            "750",
+        ]);
+        validate_gateway_limits(&args).expect("bounded stream deadlines should validate");
+        let config = gateway_worker_client_config(
+            &args,
+            izwi_serving_client::WorkerClientTlsConfig::default(),
+        );
+        assert_eq!(config.request_timeout, Duration::from_millis(1500));
+        assert_eq!(config.first_output_timeout, Duration::from_millis(2500));
+        assert_eq!(config.progress_timeout, Duration::from_millis(1200));
+
+        for (flag, value) in [
+            ("--gateway-worker-admission-timeout-ms", "60001"),
+            ("--gateway-worker-first-output-timeout-ms", "3600001"),
+            ("--gateway-worker-progress-idle-timeout-ms", "3600001"),
+            ("--gateway-slow-consumer-timeout-ms", "60001"),
+        ] {
+            let invalid = parse(&["izwi-server", "--role", "gateway", flag, value]);
+            assert!(
+                validate_gateway_limits(&invalid).is_err(),
+                "{flag} must be bounded"
+            );
+        }
+
+        let invalid_queue = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-queue-wait-ms",
+            "10001",
+            "--gateway-worker-admission-timeout-ms",
+            "10000",
+        ]);
+        assert!(validate_gateway_limits(&invalid_queue).is_err());
+    }
+
+    #[test]
+    fn gateway_configuration_rejects_missing_private_credentials() {
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-endpoint",
+            "http://127.0.0.1:19091",
+        ]);
+        let error = gateway_remote_execution(&args, &ServeRuntimeConfig::default())
+            .expect_err("gateway configuration must be complete");
+        assert!(error.to_string().contains("--worker-model-generation"));
+    }
+
+    #[test]
+    fn registry_gateway_endpoint_list_is_bounded() {
+        let parsed = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--gateway-worker-endpoint",
+            "http://127.0.0.1:19091",
+            "--gateway-worker-endpoint",
+            "http://127.0.0.1:19092",
+        ]);
+        assert_eq!(
+            parsed.gateway_worker_endpoints,
+            vec![
+                "http://127.0.0.1:19091".to_string(),
+                "http://127.0.0.1:19092".to_string()
+            ]
+        );
+
+        let mut args = parse(&["izwi-server", "--role", "gateway"]);
+        args.gateway_worker_endpoints = (0..=MAX_CONFIGURED_GATEWAY_WORKERS)
+            .map(|index| format!("http://127.0.0.1:{}", 20_000 + index))
+            .collect();
+
+        let error = validate_gateway_limits(&args).expect_err("worker list must be bounded");
+        assert!(error
+            .to_string()
+            .contains("gateway worker endpoints or approvals"));
+    }
+
+    #[tokio::test]
+    async fn registry_gateway_configuration_approves_worker_without_runtime() {
+        let model = ModelVariant::Qwen354BGguf;
+        let public_model = ModelAlias::new(model.dir_name()).expect("static model alias");
+        let first = MockWorker::spawn(MockWorkerConfig {
+            worker_id: WorkerId::new("gateway-worker-a").expect("static worker id"),
+            node_id: NodeId::new("gateway-node-a").expect("static node id"),
+            incarnation_id: IncarnationId::new("gateway-incarnation-a")
+                .expect("static incarnation"),
+            public_model: public_model.clone(),
+            ..MockWorkerConfig::default()
+        })
+        .await
+        .expect("mock worker should bind");
+        let credentials = first.config().credentials.clone();
+        let mut args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-credential-id",
+            credentials.credential_id.as_str(),
+            "--worker-bearer-token",
+            credentials.bearer_token.expose_secret(),
+            "--worker-deployment",
+            first.config().deployment_id.as_str(),
+            "--public-model",
+            model.dir_name(),
+            "--worker-model-generation",
+            "1",
+        ]);
+        args.gateway_worker_endpoints = vec![first.endpoint()];
+
+        let (state, poller) = gateway_state(
+            &args,
+            &ServeRuntimeConfig::default(),
+            EnterpriseHooks::noop(),
+            GatewayPerimeterConfig::new_for_test("registry-test-api-key", 1024 * 1024)
+                .expect("test perimeter should be valid"),
+        )
+        .await
+        .expect("registry gateway configuration should build");
+        assert!(matches!(
+            &state.chat_execution,
+            gateway::GatewayChatExecution::Registry(_)
+        ));
+        let poller = poller.expect("registry mode should retain status pollers");
+        assert_eq!(poller.poller_count, 1);
+        assert!(state.chat_execution.readiness_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_reapproval_pins_stable_identity_and_deployment() {
+        let model = ModelVariant::Qwen354BGguf;
+        let worker = MockWorker::spawn(MockWorkerConfig {
+            worker_id: WorkerId::new("restart-worker").expect("static worker id"),
+            node_id: NodeId::new("restart-node").expect("static node id"),
+            incarnation_id: IncarnationId::new("restart-incarnation-1")
+                .expect("static incarnation"),
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            ..MockWorkerConfig::default()
+        })
+        .await
+        .expect("mock worker should bind");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("client should initialize");
+        let descriptor = client.descriptor().await.expect("descriptor should load");
+        let status = client.status().await.expect("status should load");
+        let deployment_id = worker.config().deployment_id.clone();
+        let approval = gateway_deployments::GatewayWorkerApproval {
+            endpoint: worker.endpoint(),
+            identity: gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+                node_id: worker.config().node_id.clone(),
+                worker_id: worker.config().worker_id.clone(),
+            },
+            task: TaskKind::Chat,
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            deployment_id,
+            model_generation: worker.config().model_generation,
+        };
+        let mut wrong_identity = approval.clone();
+        wrong_identity.identity = gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+            node_id: NodeId::new("unapproved-node").expect("static node id"),
+            worker_id: worker.config().worker_id.clone(),
+        };
+        assert!(initial_gateway_worker_expectation(
+            client.clone(),
+            &descriptor,
+            &status,
+            &wrong_identity,
+        )
+        .err()
+        .expect("unapproved node must fail")
+        .to_string()
+        .contains("operator-approved"));
+        wrong_identity.identity = gateway_deployments::GatewayWorkerApprovalIdentity::V1 {
+            node_id: worker.config().node_id.clone(),
+            worker_id: WorkerId::new("unapproved-worker").expect("static worker id"),
+        };
+        assert!(initial_gateway_worker_expectation(
+            client.clone(),
+            &descriptor,
+            &status,
+            &wrong_identity,
+        )
+        .err()
+        .expect("unapproved worker must fail")
+        .to_string()
+        .contains("operator-approved"));
+        let expected = initial_gateway_worker_expectation(client, &descriptor, &status, &approval)
+            .expect("initial worker should match configuration");
+        let registry =
+            worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
+                .expect("registry should initialize");
+        approve_gateway_worker(&registry, &expected, descriptor, status.clone())
+            .expect("initial worker should be approved");
+
+        let next_incarnation =
+            IncarnationId::new("restart-incarnation-2").expect("static replacement incarnation");
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id = next_incarnation.clone();
+        let mut restarted_status = status.clone();
+        restarted_status.incarnation_id = next_incarnation;
+        restarted_status.status_sequence = 1;
+        approve_gateway_worker(
+            &registry,
+            &expected,
+            descriptor.clone(),
+            restarted_status.clone(),
+        )
+        .expect("matching replacement incarnation should be approved");
+        assert_eq!(
+            registry
+                .observe_status(status)
+                .expect_err("old incarnation must be fenced"),
+            worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation
+        );
+
+        descriptor.node_id = NodeId::new("unapproved-node").expect("static node id");
+        restarted_status.node_id = descriptor.node_id.clone();
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, restarted_status)
+                .expect_err("replacement node identity must stay pinned")
+                .to_string()
+                .contains("logical worker or node identity")
+        );
+
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id =
+            IncarnationId::new("restart-incarnation-3").expect("static replacement incarnation");
+        let mut changed_capacity = expected.client.status().await.expect("status should load");
+        changed_capacity.incarnation_id = descriptor.incarnation_id.clone();
+        changed_capacity.capacity.max_active_invocations += 1;
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, changed_capacity)
+                .expect_err("replacement capacity must stay pinned")
+                .to_string()
+                .contains("validated capacity")
+        );
+
+        let mut descriptor = expected
+            .client
+            .descriptor()
+            .await
+            .expect("descriptor should load");
+        descriptor.incarnation_id =
+            IncarnationId::new("restart-incarnation-4").expect("static replacement incarnation");
+        let mut changed_deployment = expected.client.status().await.expect("status should load");
+        changed_deployment.incarnation_id = descriptor.incarnation_id.clone();
+        changed_deployment.deployments[0].model_generation =
+            ModelGeneration::new(2).expect("non-zero changed generation");
+        assert!(
+            approve_gateway_worker(&registry, &expected, descriptor, changed_deployment)
+                .expect_err("replacement deployment must stay pinned")
+                .to_string()
+                .contains("deployment contract")
+        );
     }
 
     #[test]
@@ -1385,6 +3571,99 @@ mod tests {
             izwi_core::PerformanceConfigOverrides::from_user_config(Some(&missing))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    async fn reconnect_expectation(
+        config: izwi_serving_client::mock::MockWorkerConfig,
+    ) -> (
+        izwi_serving_client::mock::MockWorker,
+        GatewayWorkerExpectation,
+        WorkerDescriptor,
+        WorkerStatus,
+    ) {
+        use izwi_serving_client::{WorkerClient, WorkerClientConfig};
+
+        let worker = MockWorker::spawn(config).await.expect("mock binds");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+            WorkerClientConfig::default(),
+        )
+        .expect("client initializes");
+        let descriptor = client.descriptor().await.expect("descriptor");
+        let status = client.status().await.expect("status");
+        let deployment = worker_registry::ApprovedDeployment::from_loaded(
+            status.deployments.first().expect("deployment"),
+        );
+        let validated_capacity = configured_worker_capacity(&status).expect("valid capacity");
+        let expected = GatewayWorkerExpectation {
+            endpoint: worker.endpoint(),
+            client,
+            worker_id: descriptor.worker_id.clone(),
+            node_id: descriptor.node_id.clone(),
+            deployment,
+            validated_capacity,
+        };
+        (worker, expected, descriptor, status)
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_reconnects_with_same_generation_and_fails_closed_on_drift() {
+        use izwi_serving_client::mock::MockWorkerConfig;
+        use izwi_serving_protocol::{IncarnationId, ModelGeneration, WorkerId};
+
+        let registry =
+            worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
+                .expect("registry initializes");
+        let base = MockWorkerConfig {
+            worker_id: WorkerId::new("mock-worker-1").expect("test id"),
+            node_id: NodeId::new("mock-node-1").expect("test id"),
+            ..MockWorkerConfig::default()
+        };
+
+        // Generation 1, incarnation 1: initial approval.
+        let (worker_a, expected_a, descriptor_a, status_a) =
+            reconnect_expectation(MockWorkerConfig {
+                incarnation_id: IncarnationId::new("mock-incarnation-1").expect("test id"),
+                ..base.clone()
+            })
+            .await;
+        approve_gateway_worker(&registry, &expected_a, descriptor_a, status_a.clone())
+            .expect("initial approval");
+
+        // The worker restarts with the same generation but a new incarnation.
+        // The poller's refresh path re-approves it without operator action.
+        drop(worker_a);
+        let (_worker_b, expected_b, _, _) = reconnect_expectation(MockWorkerConfig {
+            incarnation_id: IncarnationId::new("mock-incarnation-2").expect("test id"),
+            ..base.clone()
+        })
+        .await;
+        refresh_gateway_worker_status(&registry, &expected_b, None)
+            .await
+            .expect("same-generation restart must reconnect");
+        let expected_b_deployment = expected_b.deployment.clone();
+        assert!(
+            registry.observe_status(status_a).is_err(),
+            "the dead incarnation's late statuses must stay fenced after replacement"
+        );
+
+        // A restart that changes the model generation fails closed: the
+        // expectation pins the operator-approved generation, so a worker
+        // advertising a new generation is never silently adopted.
+        let (_worker_c, mut expected_c, _, _) = reconnect_expectation(MockWorkerConfig {
+            incarnation_id: IncarnationId::new("mock-incarnation-3").expect("test id"),
+            model_generation: ModelGeneration::new(2).expect("non-zero"),
+            ..base
+        })
+        .await;
+        expected_c.deployment = expected_b_deployment;
+        assert!(
+            refresh_gateway_worker_status(&registry, &expected_c, None)
+                .await
+                .is_err(),
+            "generation drift must fail closed instead of silently adopting"
         );
     }
 }

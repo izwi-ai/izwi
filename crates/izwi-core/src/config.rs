@@ -499,6 +499,7 @@ pub(crate) fn resolve_kv_cache_policy(
     max_prefix_cache_pages: usize,
     total_capacity_pages: usize,
     max_sequence_length: usize,
+    prefix_lenient_zero_budget: bool,
 ) -> Result<ResolvedKvCachePolicy> {
     if page_size == 0 {
         return Err(Error::ConfigError(
@@ -552,6 +553,21 @@ pub(crate) fn resolve_kv_cache_policy(
         } => {
             let effective_pages = (*max_pages).min(prefix_capacity);
             if effective_pages == 0 {
+                // Catalog-auto degrades to Disabled with a recorded reason;
+                // explicit operator enablement keeps the fail-closed error.
+                if prefix_lenient_zero_budget {
+                    return Ok(ResolvedKvCachePolicy {
+                        requested,
+                        fallback_reason: Some(format!(
+                            "catalog-auto prefix cache has no safe page budget: capacity_pages={total_capacity_pages}, reserved_request_pages={request_reserve_pages}; reuse disabled"
+                        )),
+                        effective: EffectiveKvCachePolicy {
+                            page_size,
+                            dtype,
+                            prefix: PrefixCachePolicy::Disabled,
+                        },
+                    });
+                }
                 return Err(Error::ConfigError(format!(
                     "prefix cache has no safe page budget: capacity_pages={total_capacity_pages}, reserved_request_pages={request_reserve_pages}"
                 )));
@@ -582,6 +598,40 @@ pub(crate) fn resolve_kv_cache_policy(
     })
 }
 
+/// Ephemeral per-process namespace for catalog-auto prefix reuse. The value
+/// only has to be stable within one process (the managed cache is in-memory),
+/// and it is never serialized to health or diagnostics output.
+pub(crate) fn generate_prefix_namespace_salt() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Resolve prefix-reuse engagement for a configuration boundary.
+///
+/// Returns `(engaged, namespace)`. Explicit operator enablement keeps the
+/// fail-closed contract: a missing namespace yields `(true, None)` so the
+/// policy resolver rejects the configuration. Catalog-auto mode engages with
+/// the operator's namespace or a generated per-process one.
+pub(crate) fn resolve_prefix_engagement(
+    enable_prefix_caching: bool,
+    prefix_reuse_catalog_auto: bool,
+    prefix_namespace: Option<&str>,
+) -> (bool, Option<String>) {
+    if enable_prefix_caching {
+        (true, prefix_namespace.map(str::to_string))
+    } else if prefix_reuse_catalog_auto {
+        (
+            true,
+            Some(
+                prefix_namespace
+                    .map(str::to_string)
+                    .unwrap_or_else(generate_prefix_namespace_salt),
+            ),
+        )
+    } else {
+        (false, None)
+    }
+}
+
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -597,6 +647,13 @@ pub struct EngineConfig {
     /// explicit value.
     #[serde(default)]
     pub max_loaded_models: Option<usize>,
+
+    /// Idle keep-alive for transient (job auto-loaded) residents, in
+    /// seconds: models idle longer than this are reaped. Pinned residents
+    /// and models with active leases are never reaped. `0` disables reaping
+    /// (embedded runtimes default off; server profiles resolve 10 minutes).
+    #[serde(default)]
+    pub model_keep_alive_secs: u64,
 
     /// Automatic or explicitly fixed physical tensor batch width.
     #[serde(default)]
@@ -670,6 +727,15 @@ pub struct EngineConfig {
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
 
+    /// Catalog-gated prefix-reuse default (DS1.6). When `enable_prefix_caching`
+    /// is false and this is true, the serving layer engages committed prefix
+    /// reuse per loaded model only where the catalog cell has backend-lane
+    /// evidence, with a generated per-process namespace when the operator did
+    /// not name one. Library defaults keep this false; product serving
+    /// surfaces resolve it to the shipped default.
+    #[serde(default)]
+    pub prefix_reuse_catalog_auto: bool,
+
     /// Enable scheduler-level chunked prefill so long prompts are admitted in
     /// bounded token quanta instead of one monolithic prefill transaction.
     #[serde(default = "default_enable_chunked_prefill")]
@@ -678,6 +744,30 @@ pub struct EngineConfig {
     /// Prompt length (tokens) above which chunked prefill applies.
     #[serde(default = "default_chunked_prefill_threshold")]
     pub chunked_prefill_threshold: usize,
+
+    /// Host KV pool budget in bytes for hierarchical offload (DS4). A positive
+    /// budget opts this engine into demoting committed prefix pages to a host
+    /// tier bounded by this pool; zero (the default) keeps the feature fully
+    /// dormant. The pool is charged to the same node memory ledger as the
+    /// device arenas (DINV-05).
+    #[serde(default)]
+    pub kv_host_pool_budget_bytes: u64,
+
+    /// Device-arena pressure ratio at which demotion steps start.
+    #[serde(default = "default_kv_offload_high_watermark")]
+    pub kv_offload_high_watermark: f32,
+
+    /// Pressure ratio demotion steps drain toward before stopping.
+    #[serde(default = "default_kv_offload_low_watermark")]
+    pub kv_offload_low_watermark: f32,
+
+    /// Maximum pages with a demotion copy in flight at once.
+    #[serde(default = "default_kv_offload_max_in_flight_pages")]
+    pub kv_offload_max_in_flight_pages: usize,
+
+    /// Maximum host-resident pages promoted back in one prepare.
+    #[serde(default = "default_kv_offload_max_promotion_pages")]
+    pub kv_offload_max_promotion_pages: usize,
 }
 
 impl Default for EngineConfig {
@@ -686,6 +776,7 @@ impl Default for EngineConfig {
             performance: Default::default(),
             models_dir: default_models_dir(),
             max_loaded_models: None,
+            model_keep_alive_secs: 0,
             max_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
@@ -703,8 +794,14 @@ impl Default for EngineConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            kv_host_pool_budget_bytes: 0,
+            kv_offload_high_watermark: default_kv_offload_high_watermark(),
+            kv_offload_low_watermark: default_kv_offload_low_watermark(),
+            kv_offload_max_in_flight_pages: default_kv_offload_max_in_flight_pages(),
+            kv_offload_max_promotion_pages: default_kv_offload_max_promotion_pages(),
         }
     }
 }
@@ -727,6 +824,22 @@ fn default_enable_chunked_prefill() -> bool {
 
 fn default_chunked_prefill_threshold() -> usize {
     192
+}
+
+fn default_kv_offload_high_watermark() -> f32 {
+    0.85
+}
+
+fn default_kv_offload_low_watermark() -> f32 {
+    0.70
+}
+
+fn default_kv_offload_max_in_flight_pages() -> usize {
+    8
+}
+
+fn default_kv_offload_max_promotion_pages() -> usize {
+    64
 }
 
 fn default_models_dir() -> PathBuf {
@@ -772,7 +885,11 @@ fn default_kv_cache_dtype() -> String {
 }
 
 fn default_kv_page_size() -> usize {
-    64
+    // One env-resolved source of truth shared with the model-contract side
+    // (`models::shared::attention::paged::default_kv_page_size`), so the
+    // engine's page hint and a contract's declared snapshot interval can never
+    // disagree about the configured page grid.
+    crate::models::shared::attention::paged::default_kv_page_size()
 }
 
 impl EngineConfig {
@@ -804,6 +921,9 @@ impl EngineConfig {
             // Portable automatic context is resolved during model loading. Keep
             // the historical reserve until that effective value is available.
             self.portable_context_ceiling(),
+            // Catalog-auto reuse degrades instead of failing startup when the
+            // safe page budget is zero; explicit enablement stays fail-closed.
+            self.prefix_reuse_catalog_auto,
         )
     }
 }
@@ -984,8 +1104,8 @@ fn get_num_cpus() -> usize {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        BatchSizePreference, ContextLengthPreference, EngineConfig, KvCacheDtype,
-        PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
+        resolve_prefix_engagement, BatchSizePreference, ContextLengthPreference, EngineConfig,
+        KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::backends::BackendKind;
 
@@ -1095,6 +1215,42 @@ mod managed_kv_default_tests {
             let error = config.resolved_kv_cache_policy(1024).unwrap_err();
             assert!(error.to_string().contains("not production-ready"));
         }
+    }
+
+    #[test]
+    fn prefix_engagement_resolution_keeps_explicit_fail_closed_and_generates_auto_namespaces() {
+        // Explicit enablement without a namespace stays engaged-with-none so
+        // the policy resolver rejects it.
+        let (engaged, namespace) = resolve_prefix_engagement(true, false, None);
+        assert!(engaged);
+        assert!(namespace.is_none());
+
+        // Explicit enablement with a namespace keeps it verbatim.
+        let (engaged, namespace) = resolve_prefix_engagement(true, false, Some("tenant-a"));
+        assert!(engaged);
+        assert_eq!(namespace.as_deref(), Some("tenant-a"));
+
+        // Catalog-auto engages with the operator namespace when present.
+        let (engaged, namespace) = resolve_prefix_engagement(false, true, Some("tenant-a"));
+        assert!(engaged);
+        assert_eq!(namespace.as_deref(), Some("tenant-a"));
+
+        // Catalog-auto generates a per-process namespace otherwise.
+        let (engaged, first) = resolve_prefix_engagement(false, true, None);
+        assert!(engaged);
+        let generated_first = first.expect("auto generates a namespace");
+        assert!(!generated_first.is_empty());
+        let (_, second) = resolve_prefix_engagement(false, true, None);
+        assert_ne!(
+            generated_first,
+            second.expect("auto generates a namespace"),
+            "generated namespaces must be process-unique"
+        );
+
+        // Disabled keeps reuse off.
+        let (engaged, namespace) = resolve_prefix_engagement(false, false, Some("tenant-a"));
+        assert!(!engaged);
+        assert!(namespace.is_none());
     }
 
     #[test]

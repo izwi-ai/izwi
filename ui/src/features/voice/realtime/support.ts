@@ -320,7 +320,7 @@ export const UNIFIED_VOICE_PIPELINE_LABEL = "Unified LFM2.5 Audio";
 
 export const MODULAR_STACK_VARIANTS = {
   asr: "Parakeet-TDT-0.6B-v3",
-  text: "Qwen3-1.7B-GGUF",
+  text: "Qwen3.5-4B",
   tts: "Kokoro-82M",
 } as const;
 
@@ -389,9 +389,7 @@ export function formatModelVariantLabel(variant: string): string {
   }
 
   if (normalized.startsWith("Gemma-3-")) {
-    return normalized
-      .replace("Gemma-3-1b-it", "Gemma 3 1B Instruct")
-      .replace("Gemma-3-4b-it", "Gemma 3 4B Instruct");
+    return normalized.replace("Gemma-3-4b-it", "Gemma 3 4B Instruct");
   }
 
   if (normalized === "LFM2.5-Audio-1.5B-GGUF") {

@@ -33,6 +33,8 @@ pub(super) struct SuspendedChatDecode {
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) streamed_text: String,
+    /// DS9.3: logprob entries accumulated across committed quanta.
+    pub(super) logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(super) struct ActiveChatDecode {
@@ -44,6 +46,9 @@ pub(super) struct ActiveChatDecode {
     /// Tokenizer decoders may normalize or rewrite their cumulative terminal
     /// string, but an SSE delta cannot be retracted after publication.
     pub(super) streamed_text: String,
+    /// DS9.3: logprob entries accumulated across committed quanta, published
+    /// with the terminal output.
+    pub(super) logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
 pub(super) struct ActiveAsrDecode {

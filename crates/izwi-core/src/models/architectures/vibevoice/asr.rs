@@ -1528,6 +1528,13 @@ impl VibeVoiceAsrModel {
         Some(vibevoice_asr_max_audio_seconds_hint(self.device.kind))
     }
 
+    /// Decoder-prompt tokens added per second of audio: one placeholder token
+    /// per `speech_tok_compress_ratio` samples at the target sample rate.
+    pub(crate) fn audio_token_rate(&self) -> f32 {
+        let ratio = self.preprocessor.speech_tok_compress_ratio.max(1) as f32;
+        self.preprocessor.target_sample_rate() as f32 / ratio
+    }
+
     fn transcribe_internal(
         &self,
         audio: &[f32],

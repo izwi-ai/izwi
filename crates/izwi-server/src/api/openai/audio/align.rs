@@ -13,7 +13,7 @@ use utoipa::ToSchema;
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
+    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
@@ -160,7 +160,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
             .await
             .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?;
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload_with_diagnostics("openai.audio.align", &audio_payload)?;
+        inspect_audio_payload_canonical_with_diagnostics("openai.audio.align", &audio_payload)?;
 
         return Ok(AlignmentRequest {
             audio: Some(audio_payload),
@@ -194,7 +194,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics("openai.audio.align", &payload)?;
+                        inspect_audio_payload_canonical_with_diagnostics("openai.audio.align", &payload)?;
                         out.audio = Some(payload);
                     }
                 }
@@ -207,7 +207,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
                     )
                     .await?
                     {
-                        inspect_audio_payload_with_diagnostics("openai.audio.align", &payload)?;
+                        inspect_audio_payload_canonical_with_diagnostics("openai.audio.align", &payload)?;
                         out.audio = Some(payload);
                     }
                 }

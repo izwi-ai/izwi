@@ -1,4 +1,4 @@
-import type { ModelInfo } from "@/api";
+import type { ModelInfo, ModelResidencySummary } from "@/api";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 
 export interface SharedPageProps {
@@ -6,6 +6,7 @@ export interface SharedPageProps {
   selectedModel: string | null;
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
+  residencySummary?: ModelResidencySummary | null;
   onDownload: (variant: string) => void;
   onCancelDownload?: (variant: string) => void;
   onLoad: (variant: string) => void;
@@ -13,7 +14,7 @@ export interface SharedPageProps {
   onDelete: (variant: string) => void;
   onSelect: (variant: string) => void;
   onError: (message: string) => void;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
 }
 
 export interface VoiceRouteProps {
@@ -37,5 +38,5 @@ export interface ModelsRouteProps {
   onLoad: (variant: string) => void;
   onUnload: (variant: string) => void;
   onDelete: (variant: string) => void;
-  onRefresh: () => Promise<void>;
+  onRefresh: () => Promise<boolean>;
 }

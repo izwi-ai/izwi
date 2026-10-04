@@ -52,18 +52,15 @@ const VIBEVOICE_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoiceAsr];
 const NEMOTRON_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::Nemotron35AsrStreaming06B];
 const GRANITE_SPEECH_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::GraniteSpeech412BPlus];
 const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
-    &[ModelVariant::DiarStreamingSortformer4SpkV21];
+    &[ModelVariant::DiarStreamingSortformer4SpkV21, ModelVariant::Nemotron3Diarization];
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen306B,
     ModelVariant::Qwen306B4Bit,
-    ModelVariant::Qwen306BGguf,
     ModelVariant::Qwen317B,
     ModelVariant::Qwen317B4Bit,
-    ModelVariant::Qwen317BGguf,
-    ModelVariant::Qwen34BGguf,
-    ModelVariant::Qwen38BGguf,
     ModelVariant::Qwen314BGguf,
 ];
+const QWEN3_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3Moe30bA3bGguf];
 const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3508BGguf,
     ModelVariant::Qwen352BGguf,
@@ -71,12 +68,13 @@ const QWEN35_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen359BGguf,
 ];
 const QWEN38_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen3827BFp8];
+const QWEN35_MOE_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Qwen35Moe35BA3BFp8];
 const LFM2_CHAT_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Lfm2512BInstructGguf,
     ModelVariant::Lfm2512BThinkingGguf,
 ];
 const LFM25_AUDIO_VARIANTS: &[ModelVariant] = &[ModelVariant::Lfm25Audio15BGguf];
-const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma31BIt, ModelVariant::Gemma34BIt];
+const GEMMA3_CHAT_VARIANTS: &[ModelVariant] = &[ModelVariant::Gemma34BIt];
 const QWEN3_FORCED_ALIGNER_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3ForcedAligner06B,
     ModelVariant::Qwen3ForcedAligner06B4Bit,
@@ -210,6 +208,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         fixture_ids: CHAT_FIXTURES,
     },
     FamilyRegistration {
+        family: ModelFamily::Qwen3MoeChat,
+        module_path: "crate::models::architectures::qwen3::chat",
+        variants: QWEN3_MOE_CHAT_VARIANTS,
+        capabilities: CHAT_CAPABILITIES,
+        fixture_ids: CHAT_FIXTURES,
+    },
+    FamilyRegistration {
         family: ModelFamily::Qwen35Chat,
         module_path: "crate::models::architectures::qwen35::chat",
         variants: QWEN35_CHAT_VARIANTS,
@@ -220,6 +225,13 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
         family: ModelFamily::Qwen38Chat,
         module_path: "crate::models::architectures::qwen38::chat",
         variants: QWEN38_CHAT_VARIANTS,
+        capabilities: CHAT_CAPABILITIES,
+        fixture_ids: CHAT_FIXTURES,
+    },
+    FamilyRegistration {
+        family: ModelFamily::Qwen35MoeChat,
+        module_path: "crate::models::architectures::qwen35moe::chat",
+        variants: QWEN35_MOE_CHAT_VARIANTS,
         capabilities: CHAT_CAPABILITIES,
         fixture_ids: CHAT_FIXTURES,
     },

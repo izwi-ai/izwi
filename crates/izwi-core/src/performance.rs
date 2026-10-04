@@ -69,6 +69,9 @@ pub struct CudaPerformanceConfig {
     #[serde(deserialize_with = "deserialize_mtp_draft_tokens")]
     pub mtp_draft_tokens: usize,
     pub mtp_adaptive: bool,
+    /// DS9.4: allow shared speculative MTP envelopes inside continuous
+    /// batches (not just isolated solo rows). `Off` is the kill switch.
+    pub mtp_in_continuous: OptimizationMode,
 }
 impl Default for CudaPerformanceConfig {
     fn default() -> Self {
@@ -83,6 +86,7 @@ impl Default for CudaPerformanceConfig {
             mtp_quantum: OptimizationMode::Auto,
             mtp_draft_tokens: 1,
             mtp_adaptive: true,
+            mtp_in_continuous: OptimizationMode::Auto,
         }
     }
 }
@@ -163,6 +167,8 @@ pub struct CudaPerformanceConfigOverrides {
     pub mtp_draft_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtp_adaptive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_in_continuous: Option<OptimizationMode>,
 }
 impl CudaPerformanceConfigOverrides {
     pub fn is_empty(&self) -> bool {
@@ -176,6 +182,7 @@ impl CudaPerformanceConfigOverrides {
             && self.mtp_quantum.is_none()
             && self.mtp_draft_tokens.is_none()
             && self.mtp_adaptive.is_none()
+            && self.mtp_in_continuous.is_none()
     }
 }
 
@@ -255,6 +262,7 @@ impl PerformanceConfig {
             self.cuda.decode_graphs = OptimizationMode::Off;
             self.cuda.mtp = OptimizationMode::Off;
             self.cuda.mtp_quantum = OptimizationMode::Off;
+            self.cuda.mtp_in_continuous = OptimizationMode::Off;
         }
         if !self.loading.enabled() {
             self.loading.derived_weight_cache = OptimizationMode::Off;
@@ -294,6 +302,9 @@ impl PerformanceConfig {
         }
         if let Some(value) = overrides.cuda.mtp_adaptive {
             self.cuda.mtp_adaptive = value;
+        }
+        if let Some(value) = overrides.cuda.mtp_in_continuous {
+            self.cuda.mtp_in_continuous = value;
         }
         if let Some(value) = overrides.loading.mode {
             self.loading.mode = value;
@@ -342,6 +353,7 @@ impl From<&PerformanceConfig> for PerformanceConfigOverrides {
                 mtp_quantum: Some(config.cuda.mtp_quantum),
                 mtp_draft_tokens: Some(config.cuda.mtp_draft_tokens),
                 mtp_adaptive: Some(config.cuda.mtp_adaptive),
+                mtp_in_continuous: Some(config.cuda.mtp_in_continuous),
             },
             loading: LoadingPerformanceConfigOverrides {
                 mode: Some(config.loading.mode),
@@ -524,6 +536,13 @@ impl PerformanceConfigOverrides {
                     )?)?)
             }
             "cuda.mtp_adaptive" => self.cuda.mtp_adaptive = Some(parse_bool(value)?),
+            "cuda.mtp_in_continuous" => {
+                self.cuda.mtp_in_continuous = Some(
+                    value
+                        .parse::<OptimizationMode>()
+                        .map_err(|error| Error::ConfigError(format!("{key}: {error}")))?,
+                )
+            }
             "loading.mode" => {
                 self.loading.mode = Some(
                     value
@@ -756,6 +775,15 @@ pub const ENVIRONMENT_BINDINGS: &[PerformanceEnvironmentBinding] = &[
         mode: false,
     },
     PerformanceEnvironmentBinding {
+        key: "cuda.mtp_in_continuous",
+        canonical: "IZWI_CUDA_MTP_IN_CONTINUOUS",
+        aliases: &[
+            "IZWI_PERFORMANCE_CUDA_MTP_IN_CONTINUOUS",
+            "IZWI_QWEN38_MTP_IN_CONTINUOUS",
+        ],
+        mode: true,
+    },
+    PerformanceEnvironmentBinding {
         key: "loading.mode",
         canonical: "IZWI_LOADING_MODE",
         aliases: &["IZWI_PERFORMANCE_LOADING_MODE", "IZWI_QWEN38_LOADING_MODE"],
@@ -858,13 +886,23 @@ impl PerformanceConfigOverrides {
         };
         let document: toml::Value = toml::from_str(&source)
             .map_err(|error| Error::ConfigError(format!("{}: {error}", path.display())))?;
+        Self::from_document(&document, &path)
+    }
+
+    /// Extract the typed performance section from an already-parsed user
+    /// TOML document, so callers reading other `runtime` keys from the same
+    /// file do not need a second parse.
+    pub fn from_document(
+        document: &toml::Value,
+        config_path: &std::path::Path,
+    ) -> Result<Self> {
         if document
             .get("runtime")
             .is_some_and(|runtime| !runtime.is_table())
         {
             return Err(Error::ConfigError(format!(
                 "{} runtime must be a TOML table",
-                path.display()
+                config_path.display()
             )));
         }
         match document
@@ -872,7 +910,10 @@ impl PerformanceConfigOverrides {
             .and_then(|runtime| runtime.get("performance"))
         {
             Some(value) => value.clone().try_into().map_err(|error| {
-                Error::ConfigError(format!("{} runtime.performance: {error}", path.display()))
+                Error::ConfigError(format!(
+                    "{} runtime.performance: {error}",
+                    config_path.display()
+                ))
             }),
             None => Ok(Self::default()),
         }

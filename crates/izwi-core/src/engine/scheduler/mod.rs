@@ -13,6 +13,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use super::config::EngineCoreConfig;
 use super::execution::{
     CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
@@ -538,6 +539,15 @@ struct RequestMetadata {
     capacity_blocked_on: Option<SessionKey>,
     /// Retained per-session bound after a pre-execution workspace rejection.
     workspace_prefill_token_cap: Option<usize>,
+    /// DS1.2b: declared `CommittedSnapshots` interval of the loaded contract.
+    /// The first prefill chunk is aligned to this boundary so the committed
+    /// tensor state can publish a snapshot for cross-request fork.
+    managed_snapshot_prefill_interval: Option<u32>,
+    /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
+    /// are already resident (shared pages plus a forked tensor snapshot), so
+    /// the first prefill span starts here instead of zero. `None` means a
+    /// conventional zero-start prefill.
+    managed_prefix_cursor: Option<u32>,
 }
 
 impl RequestMetadata {
@@ -556,6 +566,10 @@ struct RequestCachePolicy {
     cache_release_safe: bool,
     preferred_decode_tokens: usize,
     sustained_decode_quantum: bool,
+    /// DS9.4: the loaded model can run shared speculative envelopes, so
+    /// multi-token quanta are granted inside continuous batches (not only
+    /// solo) subject to the fairness gates.
+    speculative_decode_batch: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -570,6 +584,7 @@ impl Default for RequestCachePolicy {
             cache_release_safe: false,
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
+            speculative_decode_batch: false,
         }
     }
 }
@@ -720,6 +735,10 @@ impl Scheduler {
                     .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
                     .min()
             }),
+            managed_snapshot_prefill_interval: request
+                .v2_state_descriptor()
+                .and_then(declared_snapshot_prefill_interval),
+            managed_prefix_cursor: request.managed_prefix_cursor(),
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -781,6 +800,10 @@ impl Scheduler {
                             .min()
                     },
                 ),
+                managed_snapshot_prefill_interval: request
+                    .v2_state_descriptor()
+                    .and_then(declared_snapshot_prefill_interval),
+                managed_prefix_cursor: request.managed_prefix_cursor(),
             },
         );
         self.running.insert(
@@ -935,8 +958,37 @@ impl Scheduler {
             cache_release_safe: profile.cache_release_safe,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
+            speculative_decode_batch: profile.speculative_decode_batch,
         };
+        metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
+    }
+
+    /// DS1.2b: align the first prefill chunk of a snapshot-sharing contract to
+    /// the declared snapshot interval, so its commit cursor is a boundary the
+    /// manager can publish a committed tensor snapshot at. Later chunks and
+    /// non-incremental modes keep their exact targets.
+    fn align_first_prefill_chunk(
+        metadata: &RequestMetadata,
+        num_computed: usize,
+        target_tokens: usize,
+    ) -> usize {
+        let Some(interval) = metadata.managed_snapshot_prefill_interval else {
+            return target_tokens;
+        };
+        if num_computed != 0 || metadata.cache_policy.prefill != PrefillMode::Incremental {
+            return target_tokens;
+        }
+        let interval = usize::try_from(interval).unwrap_or(0);
+        if interval < 2 {
+            return target_tokens;
+        }
+        let boundary = target_tokens - target_tokens % interval;
+        if boundary >= interval && boundary < target_tokens {
+            boundary
+        } else {
+            target_tokens
+        }
     }
 
     /// Schedule requests for the next step.
@@ -1230,6 +1282,7 @@ impl Scheduler {
                     metadata.cache_policy.decode_batch == NativeBatchMode::Continuous,
                     metadata.cache_policy.preferred_decode_tokens,
                     metadata.cache_policy.sustained_decode_quantum,
+                    metadata.cache_policy.speculative_decode_batch,
                 ))
             })
             .collect();
@@ -1317,6 +1370,7 @@ impl Scheduler {
             continuous_decode,
             preferred_decode_tokens,
             sustained_decode_quantum,
+            speculative_decode_batch,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1346,6 +1400,7 @@ impl Scheduler {
                 preferred_decode_tokens,
                 continuous_decode,
                 sustained_decode_quantum,
+                speculative_decode_batch,
             );
             if num_tokens == 0 {
                 continue;
@@ -1532,6 +1587,8 @@ impl Scheduler {
                 continue;
             }
 
+            let target_tokens =
+                Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
@@ -1596,7 +1653,9 @@ impl Scheduler {
                 continue;
             }
 
-            // Calculate tokens for this prefill.
+            // Calculate tokens for this prefill. A probed managed prefix
+            // cursor makes the shared-prefix span start above zero; the
+            // chunk budget then applies to the residual tokens.
             let full_prefill = metadata.cache_policy.prefill == PrefillMode::Full;
             if force_full_prefill_service && !full_prefill {
                 deferred_waiting.push(request_id);
@@ -1610,7 +1669,12 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
-            let mut target_tokens = metadata.prefill_tokens();
+            let prefix_start = metadata
+                .managed_prefix_cursor
+                .map(|cursor| cursor as usize)
+                .unwrap_or(0)
+                .min(metadata.prefill_tokens().saturating_sub(1));
+            let mut target_tokens = metadata.prefill_tokens().saturating_sub(prefix_start);
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
@@ -1639,15 +1703,20 @@ impl Scheduler {
                 break;
             }
 
+            let target_tokens =
+                Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
+            let span_end = prefix_start.saturating_add(num_tokens);
             self.record_prefill_backoff(original_target_tokens, num_tokens);
 
-            // Create running state
+            // Create running state. A jumped request counts its shared
+            // prefix as already-committed progress so prefill completion
+            // still lands at the full prompt length.
             let running = RunningRequest {
                 request_id: request_id.clone(),
                 sequence_id: metadata.sequence_id,
-                num_tokens_processed: 0,
+                num_tokens_processed: prefix_start,
                 num_tokens_generated: 0,
                 // Scheduling is not a commit. A failed/retryable prefill must
                 // remain a prefill until update_after_step confirms that the
@@ -1674,12 +1743,12 @@ impl Scheduler {
                 sequence_id: metadata.sequence_id,
                 num_tokens,
                 is_prefill: true,
-                num_computed_tokens: 0,
+                num_computed_tokens: prefix_start,
                 work: WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
                     input: InputRange {
-                        start: 0,
-                        end: num_tokens,
+                        start: prefix_start,
+                        end: span_end,
                     },
                     max_output_steps: num_tokens.max(1),
                     auxiliary_state: None,
@@ -2243,6 +2312,36 @@ impl Scheduler {
         true
     }
 
+    /// DS9.1: the managed prefix depth this request is executing with.
+    /// `None` when no prefix was probed, the probe was lost before prepare,
+    /// or the request is no longer tracked — callers must treat absence as
+    /// "no cached-prefix measurement", never as a zero measurement.
+    pub(crate) fn managed_prefix_cursor(&self, request_id: &RequestId) -> Option<u32> {
+        self.requests
+            .get(request_id)
+            .and_then(|metadata| metadata.managed_prefix_cursor)
+    }
+
+    /// DS1.5: a probed managed prefix cursor could not be honored (pages or
+    /// the tensor snapshot were evicted between admission and prepare).
+    /// Clear the cursor and reset prefill progress so the request replans as
+    /// a conventional zero-start prefill.
+    pub(crate) fn reset_managed_prefix_cursor(&mut self, request_id: &RequestId) -> bool {
+        let Some(metadata) = self.requests.get_mut(request_id) else {
+            return false;
+        };
+        if metadata.managed_prefix_cursor.is_none() {
+            return false;
+        }
+        metadata.managed_prefix_cursor = None;
+        if let Some(running) = self.running.get_mut(request_id) {
+            running.num_tokens_processed = 0;
+            running.prefill_complete = false;
+            running.prefill_in_flight = false;
+        }
+        true
+    }
+
     /// Defer the next execution quantum for an exact session. This clears an
     /// uncommitted prefill marker without changing committed progress.
     pub(crate) fn defer_execution_retry(
@@ -2292,6 +2391,9 @@ impl Scheduler {
             return false;
         }
         metadata.replay_prompt_tokens = Some(replay_tokens.max(metadata.total_prompt_tokens));
+        // A replay rebuilds from a fresh context-0 reservation; a probed
+        // cursor must not survive into the replayed spans.
+        metadata.managed_prefix_cursor = None;
         metadata.capacity_blocked_on = Some(survivor);
         running.num_tokens_processed = 0;
         running.prefill_complete = false;
@@ -2376,6 +2478,13 @@ impl Scheduler {
         if running.sequence_id != session.epoch {
             return false;
         }
+        // A restart rebuilds its first generation span from zero (a semantic
+        // restart requires an exact context-0 physical cache); drop any
+        // probed prefix cursor.
+        self.requests
+            .get_mut(&session.request_id)
+            .expect("request existed above")
+            .managed_prefix_cursor = None;
 
         running.num_tokens_processed = 0;
         running.incremental_prefill_quanta_committed = 0;
@@ -3053,21 +3162,30 @@ impl Scheduler {
         preferred_decode_tokens: usize,
         continuous_decode: bool,
         sustained_decode_quantum: bool,
+        speculative_decode_batch: bool,
     ) -> usize {
         let base = remaining_decode_budget.min(remaining_request_tokens).max(1);
         let preferred_decode_tokens = preferred_decode_tokens.max(1);
         if continuous_decode {
-            let exact_solo = self.running.len() == 1
-                && self
-                    .running
-                    .values()
-                    .filter(|request| request.prefill_complete)
-                    .count()
-                    == 1
-                && !has_waiting_work
-                && (overdue_ms <= 0.0 || sustained_decode_quantum);
-            if exact_solo && preferred_decode_tokens > 1 {
-                return preferred_decode_tokens.min(base).max(1);
+            if preferred_decode_tokens > 1 {
+                // DS9.4: MTP-eligible rows keep their speculative quanta in
+                // continuous batches only when the loaded model opted in; the
+                // fairness gates still collapse them to one token while work
+                // is waiting or the row is overdue. Without the opt-in the
+                // quanta remain exact-solo.
+                let fairness_clear =
+                    !has_waiting_work && (overdue_ms <= 0.0 || sustained_decode_quantum);
+                let exact_solo = self.running.len() == 1
+                    && self
+                        .running
+                        .values()
+                        .filter(|request| request.prefill_complete)
+                        .count()
+                        == 1;
+                if fairness_clear && (speculative_decode_batch || exact_solo) {
+                    return preferred_decode_tokens.min(base).max(1);
+                }
+                return 1.min(base);
             }
             return 1.min(base);
         }
@@ -3370,6 +3488,63 @@ mod tests {
     use crate::engine::ExecutionMode;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use std::time::Duration;
+
+    fn snapshot_metadata(interval: Option<u32>, prefill: PrefillMode) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new(),
+            sequence_id: 1,
+            task_type: TaskType::Chat,
+            model_variant: None,
+            priority: Priority::Normal,
+            workload_class: WorkloadClass::default(),
+            tenant_key: None,
+            arrival_time: std::time::Instant::now(),
+            deadline_at: std::time::Instant::now() + Duration::from_secs(60),
+            hard_deadline: None,
+            total_prompt_tokens: 0,
+            max_tokens: usize::MAX,
+            cache_policy: RequestCachePolicy {
+                mode: None,
+                prefill,
+                decode_batch: NativeBatchMode::None,
+                recompute_safe: false,
+                cache_release_safe: false,
+                preferred_decode_tokens: 1,
+                sustained_decode_quantum: false,
+                speculative_decode_batch: false,
+            },
+            retry_not_before: None,
+            replay_prompt_tokens: None,
+            capacity_blocked_on: None,
+            workspace_prefill_token_cap: None,
+            managed_snapshot_prefill_interval: interval,
+            managed_prefix_cursor: None,
+        }
+    }
+
+    #[test]
+    fn first_prefill_chunk_aligns_to_the_declared_snapshot_interval() {
+        let metadata = snapshot_metadata(Some(32), PrefillMode::Incremental);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&metadata, 0, 65), 64);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&metadata, 0, 64), 64);
+        assert_eq!(
+            Scheduler::align_first_prefill_chunk(&metadata, 0, 31),
+            31,
+            "targets below one interval keep their exact span"
+        );
+        assert_eq!(
+            Scheduler::align_first_prefill_chunk(&metadata, 32, 65),
+            65,
+            "continuation chunks keep their exact span"
+        );
+
+        // Without a declared interval or without incremental prefill, the
+        // scheduler changes nothing.
+        let unshared = snapshot_metadata(None, PrefillMode::Incremental);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&unshared, 0, 65), 65);
+        let full = snapshot_metadata(Some(32), PrefillMode::Full);
+        assert_eq!(Scheduler::align_first_prefill_chunk(&full, 0, 65), 65);
+    }
 
     fn small_scheduler() -> Scheduler {
         let config = SchedulerConfig {
@@ -5225,6 +5400,56 @@ mod tests {
         let decode = scheduler.schedule();
         assert_eq!(decode.decode_requests.len(), 1);
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
+    }
+
+    #[test]
+    fn speculative_quanta_survive_continuous_batches_only_when_opted_in() {
+        // DS9.4: two concurrent decodable rows that cannot claim exact-solo
+        // keep their MTP quanta in a continuous batch only when the loaded
+        // model opted in via its execution profile; otherwise the fairness
+        // gates collapse every shared row to one token.
+        for (speculative_decode_batch, expected) in [(true, 4usize), (false, 1usize)] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 2,
+                max_tokens_per_step: 8,
+                min_tokens_per_step: 1,
+                enable_adaptive_batching: false,
+                enable_decode_quanta: false,
+                ..Default::default()
+            });
+            for name in ["spec-quanta-a", "spec-quanta-b"] {
+                let request_id = name.to_string();
+                let mut request = EngineCoreRequest::tts("hello");
+                request.id = request_id.clone();
+                request.prompt_tokens = vec![1];
+                assert!(scheduler.add_request(&request));
+                allow_incremental_prefill(&mut scheduler, &request_id);
+                let epoch = scheduler.get_sequence_id(&request_id).expect("epoch");
+                let mut profile =
+                    ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.preferred_decode_tokens = 4;
+                profile.speculative_decode_batch = speculative_decode_batch;
+                assert!(scheduler
+                    .update_execution_profile(&SessionKey::new(request_id.clone(), epoch), &profile));
+            }
+
+            let first = scheduler.schedule();
+            assert_eq!(first.prefill_requests.len(), 2);
+            for name in ["spec-quanta-a", "spec-quanta-b"] {
+                scheduler.update_after_step(&name.to_string(), 1, 1, 1.0);
+            }
+
+            let decode = scheduler.schedule();
+            assert_eq!(decode.decode_requests.len(), 2);
+            assert!(
+                decode
+                    .decode_requests
+                    .iter()
+                    .all(|request| request.num_tokens == expected),
+                "opted-in={speculative_decode_batch}: expected every shared row to be granted {expected} tokens"
+            );
+        }
     }
 
     #[test]

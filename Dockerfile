@@ -38,8 +38,8 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build CPU release binary (server only for Docker)
-RUN cargo build --release --locked --bin izwi-server
+# Build CPU release binaries (server, supervisor, worker)
+RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker
 
 # -----------------------------------------------------------------------------
 # Stage 3: Build the Rust backend (CUDA)
@@ -72,8 +72,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build CUDA release binary (server only for Docker)
-RUN cargo build --release --locked --bin izwi-server --features "${IZWI_CUDA_FEATURES}"
+# Build CUDA release binaries (server, supervisor, worker)
+RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features "${IZWI_CUDA_FEATURES}"
 
 # -----------------------------------------------------------------------------
 # Stage 4: Production runtime (CPU)
@@ -102,8 +102,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi
 
-# Copy Rust binary
+# Copy Rust binaries
 COPY --from=rust-builder-cpu /app/target/release/izwi-server /usr/local/bin/izwi-server
+COPY --from=rust-builder-cpu /app/target/release/izwi-serving-supervisor /usr/local/bin/izwi-serving-supervisor
+COPY --from=rust-builder-cpu /app/target/release/izwi-serving-worker /usr/local/bin/izwi-serving-worker
 
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
@@ -162,8 +164,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 izwi
 
-# Copy Rust binary
+# Copy Rust binaries
 COPY --from=rust-builder-cuda /app/target/release/izwi-server /usr/local/bin/izwi-server
+COPY --from=rust-builder-cuda /app/target/release/izwi-serving-supervisor /usr/local/bin/izwi-serving-supervisor
+COPY --from=rust-builder-cuda /app/target/release/izwi-serving-worker /usr/local/bin/izwi-serving-worker
 
 # Copy built UI
 COPY --from=ui-builder /app/ui/dist /app/ui/dist
