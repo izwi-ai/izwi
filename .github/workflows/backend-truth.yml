@@ -73,7 +73,23 @@ jobs:
       - name: Run repository hygiene gates
         run: |
           set -o pipefail
-          scripts/ci/check-backend-truth.sh hygiene 2>&1 | tee "${RUNNER_TEMP}/hygiene.log"
+          if scripts/ci/check-backend-truth.sh hygiene 2>&1 | tee "${RUNNER_TEMP}/hygiene.log"; then
+            exit 0
+          fi
+          status=$?
+          # TEMPORARY debug aid: surface the failing tail as a check-run
+          # annotation (public via the API) while job logs stay auth-gated.
+          python3 - "${RUNNER_TEMP}/hygiene.log" <<'PY'
+          import sys, urllib.parse
+          text = open(sys.argv[1], errors="replace").read()
+          interesting = [
+              line for line in text.splitlines()
+              if line.startswith("error") or line.lstrip().startswith("-->")
+          ]
+          payload = "\n".join(interesting[-24:]) or text[-2400:]
+          print("::error title=hygiene-errors::" + urllib.parse.quote(payload, safe="")[:3900])
+          PY
+          exit $status
 
       # TEMPORARY debug aid: surface the lane output as an artifact while the
       # auth-gated job logs are unavailable; remove once hygiene is green.
