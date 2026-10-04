@@ -63,3 +63,27 @@
   than any compile error. When one lane dies instantly while identical code
   compiles green elsewhere, diff the three environments (runner / container
   with checkout / Dockerfile without config) before reading code.
+- "Linux-only" CI failures with no log access may be TOOLCHAIN drift: CI's
+  floating `stable` can be several releases ahead of a stale local rustup.
+  Install the CI version locally as a secondary toolchain
+  (`rustup toolchain install <ver>` + `cargo +<ver> clippy ...`) before
+  assuming platform-specific code. Corollary: `clippy::incompatible_msrv`
+  guards both directions — never adopt renamed std APIs (fetch_update ->
+  try_update, stable 1.95) while the workspace MSRV and the Dockerfile
+  builder pin an older toolchain (1.88); exempt the deprecation group in the
+  gate instead (-A deprecated, with the MSRV justification in a comment).
+- A green CI lane can be a CACHE-SKIP FALSE GREEN: cargo caches lint
+  results, so a restored cache can skip re-linting unchanged-but-dirty
+  crates (run 194 hygiene passed in 3m01s right after failing 3 runs in a
+  row). After lint-affecting changes, trust only runs that actually
+  re-linted (check the step duration against a cold baseline) or force it
+  locally with touch/clean.
+- When CI logs are auth-gated but the repo is public, check-run ANNOTATIONS
+  are still readable via the API — and a workflow can write arbitrary
+  content into them with `::error title=...::<url-encoded payload>` steps.
+  Tee the failing lane's output and re-emit its error lines as annotations;
+  each push iteration costs ~4 minutes.
+- A docker mirror of a CI lane needs `rustup component add clippy` when the
+  toolchain is installed with `--profile minimal`, and the workspace
+  `.cargo/config.toml` travels with the checkout — a python3 rustc-wrapper
+  requires python3 in any minimal container image (see the run-191 CUDA fix).

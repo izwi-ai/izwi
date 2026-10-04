@@ -20414,3 +20414,38 @@ from public check-run metadata + local reproduction.
   point where CI died in <1s. Full-lane compile evidence lands via CI
   (docker-cuda's existing green already proves 1.88.0 + cuda-base,cudnn-base
   compiles this lock natively).
+
+### Round 2 — the failures were a toolchain drift, not Linux-only code (2026-10-04)
+
+Run 195 (db2d716f) went fully green (8/8 actionable lanes), but runs 192-194
+taught the real lesson: CI's `dtolnay/stable` had moved to rust 1.99.0
+(2026-09-28) while local toolchains sat on 1.93 — the "Linux-only" hygiene
+failure was new-lint failure invisible locally, and the moving cpu/metal
+failures were the same class. Evidence chain: docker mirror of the lane on
+ubuntu-24.04 printed `rust-clippy/rust-1.99.0` URLs; installing 1.99.0
+locally reproduced everything.
+
+- db2d716f fix(lint): clippy 1.99.0 cleanups — async-trait 0.1.89 -> 0.1.92
+  (upstream PR #303 "Resolve double_must_use clippy lint" fixes ~30 macro
+  generated fires in agent/hooks/server/worker), needless `&mut id_for`
+  borrows, explicit_counter_loop in the qwen3 decode parity test,
+  chunks_exact -> as_chunks::<2> in the realtime PCM path (stable exactly at
+  the 1.88 MSRV). `fetch_update` KEPT: its `try_update` rename is stable
+  since 1.95, past the workspace MSRV the Dockerfile CUDA builder pins —
+  the hygiene gate gains `-A deprecated` with that justification instead.
+- 09de801f/16564950 ci: temporary tee-to-annotation debug aids (job logs are
+  auth-gated; check-run annotations are public) added per lane, then removed
+  once everything was green.
+
+Verification for round 2: clippy 1.99.0 (installed locally as a secondary
+toolchain) green over --workspace --all-targets; metal-feature check green
+under 1.99.0; izwi-core check green under the pinned 1.88.0 toolchain;
+Backend Truth run 195 green on all lanes; final probe-free run triggered by
+16564950.
+
+Watch-items: (1) clippy/stable drift will recur every ~6 weeks — update the
+local toolchain before pushing lint-sensitive changes; (2) run 194's hygiene
+"pass" at 3m01s was a cache-skip false green — a fresh-cache clippy run is
+the only trustworthy one after lint-affecting changes; (3) run 194's
+cpu/metal 101s did not recur after the 1.99 fixes; if a mid-compile 101
+ever recurs on a runner, suspect runner resources before code.
