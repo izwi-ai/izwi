@@ -273,9 +273,9 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "28.74 GiB",
   },
-  "Qwen3.5-35B-A3B-FP8": {
-    shortName: "Qwen3.5 35B-A3B",
-    fullName: "Qwen3.5 35B-A3B (Block FP8 MoE)",
+  "Qwen3.6-35B-A3B-FP8": {
+    shortName: "Qwen3.6 35B-A3B",
+    fullName: "Qwen3.6 35B-A3B (Block FP8 MoE)",
     description:
       "Hybrid linear-attention sparse-MoE checkpoint (256 experts, 8 routed + 1 shared) with block-scaled FP8 weights",
     category: "chat",

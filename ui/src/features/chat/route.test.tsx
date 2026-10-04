@@ -69,10 +69,10 @@ describe("ChatPage route model list", () => {
     HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
-  it("lists the Qwen3.5-35B-A3B-FP8 MoE chat model in the Chat Models modal", async () => {
+  it("lists the Qwen3.6-35B-A3B-FP8 MoE chat model in the Chat Models modal", async () => {
     renderChatPage([
       routeModel("LFM2.5-1.2B-Instruct-GGUF", "downloaded"),
-      routeModel("Qwen3.5-35B-A3B-FP8", "not_downloaded"),
+      routeModel("Qwen3.6-35B-A3B-FP8", "not_downloaded"),
     ]);
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
@@ -81,18 +81,18 @@ describe("ChatPage route model list", () => {
     const modal = await screen.findByRole("dialog");
     expect(modal).toHaveTextContent("Chat Models");
     expect(
-      screen.getByText("Qwen3.5 35B-A3B (FP8 MoE)"),
+      screen.getByText("Qwen3.6 35B-A3B (FP8 MoE)"),
     ).toBeInTheDocument();
   });
 
-  it("offers the Qwen3.5-35B-A3B-FP8 model in the composer model dropdown", async () => {
-    renderChatPage([routeModel("Qwen3.5-35B-A3B-FP8", "not_downloaded")]);
+  it("offers the Qwen3.6-35B-A3B-FP8 model in the composer model dropdown", async () => {
+    renderChatPage([routeModel("Qwen3.6-35B-A3B-FP8", "not_downloaded")]);
     await waitFor(() => expect(apiMocks.listChatThreads).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("combobox"));
 
     const option = await screen.findByRole("option", {
-      name: /Qwen3\.5 35B-A3B \(FP8 MoE\)/,
+      name: /Qwen3\.6 35B-A3B \(FP8 MoE\)/,
     });
     expect(option).toBeInTheDocument();
   });
