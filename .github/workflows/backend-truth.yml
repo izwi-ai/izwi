@@ -71,36 +71,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run repository hygiene gates
-        run: |
-          set -o pipefail
-          if scripts/ci/check-backend-truth.sh hygiene 2>&1 | tee "${RUNNER_TEMP}/hygiene.log"; then
-            exit 0
-          fi
-          status=$?
-          # TEMPORARY debug aid: surface the failing tail as a check-run
-          # annotation (public via the API) while job logs stay auth-gated.
-          python3 - "${RUNNER_TEMP}/hygiene.log" <<'PY'
-          import sys, urllib.parse
-          text = open(sys.argv[1], errors="replace").read()
-          interesting = [
-              line for line in text.splitlines()
-              if line.startswith("error") or line.lstrip().startswith("-->")
-          ]
-          payload = "\n".join(interesting[-24:]) or text[-2400:]
-          print("::error title=hygiene-errors::" + urllib.parse.quote(payload, safe="")[:3900])
-          PY
-          exit $status
-
-      # TEMPORARY debug aid: surface the lane output as an artifact while the
-      # auth-gated job logs are unavailable; remove once hygiene is green.
-      - name: Upload hygiene log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hygiene-log-${{ github.run_number }}
-          path: ${{ runner.temp }}/hygiene.log
-          if-no-files-found: ignore
-          retention-days: 3
+        run: scripts/ci/check-backend-truth.sh hygiene
 
   cargo-cpu:
     name: Cargo Validation (CPU)
@@ -128,25 +99,7 @@ jobs:
             . -> target
 
       - name: Run CPU backend validation
-        run: |
-          set -o pipefail
-          if scripts/ci/check-backend-truth.sh cargo-cpu 2>&1 | tee "${RUNNER_TEMP}/cargo-cpu.log"; then
-            exit 0
-          fi
-          status=$?
-          # TEMPORARY debug aid (remove with the hygiene one once flakes are named).
-          python3 - "${RUNNER_TEMP}/cargo-cpu.log" <<'PY'
-          import sys, urllib.parse
-          text = open(sys.argv[1], errors="replace").read()
-          interesting = [
-              line for line in text.splitlines()
-              if line.startswith("error") or line.lstrip().startswith("-->")
-              or "SIGKILL" in line or "signal" in line or "killed" in line
-          ]
-          payload = "\n".join(interesting[-24:]) or text[-2400:]
-          print("::error title=cargo-cpu-errors::" + urllib.parse.quote(payload, safe="")[:3900])
-          PY
-          exit $status
+        run: scripts/ci/check-backend-truth.sh cargo-cpu
 
   fleet-stores:
     name: Fleet Store Validation (PostgreSQL)
@@ -310,25 +263,7 @@ jobs:
             . -> target
 
       - name: Run Metal backend validation
-        run: |
-          set -o pipefail
-          if scripts/ci/check-backend-truth.sh "${{ matrix.command }}" 2>&1 | tee "${RUNNER_TEMP}/cargo-metal.log"; then
-            exit 0
-          fi
-          status=$?
-          # TEMPORARY debug aid (remove with the others once flakes are named).
-          python3 - "${RUNNER_TEMP}/cargo-metal.log" <<'PY'
-          import sys, urllib.parse
-          text = open(sys.argv[1], errors="replace").read()
-          interesting = [
-              line for line in text.splitlines()
-              if line.startswith("error") or line.lstrip().startswith("-->")
-              or "SIGKILL" in line or "signal" in line or "killed" in line
-          ]
-          payload = "\n".join(interesting[-24:]) or text[-2400:]
-          print("::error title=cargo-metal-errors::" + urllib.parse.quote(payload, safe="")[:3900])
-          PY
-          exit $status
+        run: scripts/ci/check-backend-truth.sh ${{ matrix.command }}
 
   docker-cpu:
     name: Docker Build (CPU)
