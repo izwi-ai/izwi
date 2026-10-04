@@ -20365,3 +20365,52 @@ Full plan: docs/dev/QWEN35_35B_A3B_FP8_SUPPORT_PLAN.md. New family `Qwen35MoeCha
 - Evidence totals at close: izwi-core lib 2714, izwi-server lib 738, qwen35moe fixture
   module 21 (incl. thinking/json/logprobs), qwen35 module 45, worker process proof
   (qwen35_moe_process) green with a complete synthetic native FP8 bundle.
+
+## Run 191 CI triage + fixes (implementation 2026-10-04, session 11)
+
+Backend Truth run 37144386674 (head b852896c, PR #216) left two failures after
+the F1-F6 work: Repository Hygiene (exit 101, 2m01s) and CUDA Compile
+(Driverless) (exit 101, <1s). Logs stayed auth-gated, so both were root-caused
+from public check-run metadata + local reproduction.
+
+### Root causes
+- Hygiene: the lane's bash gates had ALWAYS exited first (run 190 died at the
+  rg metal-ctor gate in <1s), so run 191 was the first time CI ever reached
+  `cargo clippy --locked --workspace --all-targets -- -D warnings` — and it
+  found ~50 latent violations across supervisor/core/server, mostly in test
+  targets no other lane compiles. The F-review warning that this leg had
+  never run was correct.
+- CUDA compile: cargo died at startup, before any compilation. The workspace
+  `.cargo/config.toml` sets `rustc-wrapper = scripts/ci/macos-rustc-align-wrapper`
+  (a python3 script) and `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04` ships no
+  python interpreter (verified: `command -v python3` -> NO-PYTHON3). Runners
+  have python3 and the Dockerfile CUDA builder never copies `.cargo/`, which
+  is why every other lane was green while this one died instantly. The lane
+  also floated `stable` while the Dockerfile pins 1.88.0 for CUDA builds.
+
+### Fixes
+- a7e29935 fix(lint): full clippy -D warnings backlog cleared — mechanical
+  fixes via `cargo clippy --fix`, plus hand fixes: if-let grammar guards in
+  qwen35 chat, dead usize::try_from wrappers (load.rs x3), supervisor
+  match-unit->if-let-Err, identical-if fixture collapse, struct-init test
+  configs, iterator loops in kv_transfer_rig, break-with-value + from_ref in
+  fleet_rig, map_while(Result::ok) stderr readers, targeted dead_code allows
+  on shared test helpers; documented #[allow]s for await_holding_lock (3
+  METAL_OOM_LADDER tests), too_many_arguments (execute_rollout,
+  run_invocation), large_enum_variant (DurableTextTtsAcceptanceOutcome).
+- 6af2eb92 fix(ci): both container lanes (backend-truth cargo-cuda +
+  cuda-flash-attn) gain python3 and pin --default-toolchain 1.88.0 to match
+  the Dockerfile CUDA builder.
+
+### Verification
+- `scripts/ci/check-backend-truth.sh hygiene` exit 0 locally end-to-end.
+- Forced fresh clippy -D warnings workspace-wide (touch + re-lint each round
+  to defeat clippy's --fix cache reuse) — three onion layers of latent
+  failures surfaced and cleared before the green.
+- cargo test -p izwi-core --lib: 2758/0; cargo test -p izwi-server --lib:
+  743/0.
+- CUDA mirror (docker amd64, python3 + 1.88.0): lane passes require_command,
+  feature mapping, and cargo startup into "Updating crates.io index" — the
+  point where CI died in <1s. Full-lane compile evidence lands via CI
+  (docker-cuda's existing green already proves 1.88.0 + cuda-base,cudnn-base
+  compiles this lock natively).

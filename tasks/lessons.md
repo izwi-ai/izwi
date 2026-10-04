@@ -49,3 +49,17 @@
   uncertified in the handoff doc. When a dedicated-family plan chooses
   default-off visibility, surface that tradeoff to the user explicitly at
   ship time instead of assuming the earlier gating decision carries over.
+- A CI gate whose legs have never all executed is an UNVERIFIED gate: earlier
+  failing gates masked hygiene's clippy leg for the branch's entire life, and
+  when the gate finally reached clippy it failed on ~50 latent violations.
+  Before pushing, run the ENTIRE lane locally (or mirror it), not just the
+  legs you changed. Also: `cargo clippy --fix` records lint results in
+  cargo's cache WITHOUT -D warnings, so a follow-up `cargo clippy -- -D
+  warnings` can reuse them and hide remaining errors — touch sources (or
+  clean) between fix passes and verification runs.
+- Container-image CI lanes that check out the whole repo inherit workspace
+  `.cargo/config.toml` (here: a python3 rustc-wrapper) — a minimal image
+  without the interpreter kills every cargo invocation at startup, faster
+  than any compile error. When one lane dies instantly while identical code
+  compiles green elsewhere, diff the three environments (runner / container
+  with checkout / Dockerfile without config) before reading code.
