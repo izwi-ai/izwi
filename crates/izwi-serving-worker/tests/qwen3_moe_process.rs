@@ -54,7 +54,7 @@ async fn separate_cpu_worker_executes_tiny_qwen3_moe_over_real_http() {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let child = ChildGuard(child);
+    let _child = ChildGuard(child);
 
     let credentials = ServiceCredentials {
         credential_id: id("moe-cpu-credential"),

@@ -841,6 +841,7 @@ fn with_reserved_write_lock<T>(
     let lock_path = lock_root.join(format!("{:02x}.lock", write_uuid.as_bytes()[0]));
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;

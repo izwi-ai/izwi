@@ -710,7 +710,7 @@ impl Candidate {
         } else if candidate_score > incumbent_score {
             false
         } else if randomized {
-            uuid::Uuid::new_v4().as_bytes()[0] % 2 == 0
+            uuid::Uuid::new_v4().as_bytes()[0].is_multiple_of(2)
         } else {
             self.key < incumbent.key
         }
@@ -1206,11 +1206,11 @@ fn circuit_allows_selection(
     }
 }
 
-fn fresh_observation<'a>(
-    record: &'a WorkerRecord,
+fn fresh_observation(
+    record: &WorkerRecord,
     now: Instant,
     ttl: Duration,
-) -> Option<&'a StatusObservation> {
+) -> Option<&StatusObservation> {
     let observation = record.observation.as_ref()?;
     let age = now.checked_duration_since(observation.received_at)?;
     (age < ttl).then_some(observation)
@@ -1514,15 +1514,19 @@ mod tests {
 
     #[test]
     fn config_and_registration_limits_are_fail_closed() {
-        let mut config = WorkerRegistryConfig::default();
-        config.max_workers = 0;
+        let config = WorkerRegistryConfig {
+            max_workers: 0,
+            ..WorkerRegistryConfig::default()
+        };
         assert_eq!(
             WorkerRegistry::new(config).unwrap_err(),
             WorkerRegistryError::InvalidConfig("max_workers is outside the supported range")
         );
 
-        let mut config = WorkerRegistryConfig::default();
-        config.circuit_failure_threshold = 0;
+        let config = WorkerRegistryConfig {
+            circuit_failure_threshold: 0,
+            ..WorkerRegistryConfig::default()
+        };
         assert_eq!(
             WorkerRegistry::new(config).unwrap_err(),
             WorkerRegistryError::InvalidConfig(
@@ -1530,8 +1534,10 @@ mod tests {
             )
         );
 
-        let mut config = WorkerRegistryConfig::default();
-        config.circuit_open_duration = MAX_CIRCUIT_OPEN_DURATION + Duration::from_secs(1);
+        let config = WorkerRegistryConfig {
+            circuit_open_duration: MAX_CIRCUIT_OPEN_DURATION + Duration::from_secs(1),
+            ..WorkerRegistryConfig::default()
+        };
         assert_eq!(
             WorkerRegistry::new(config).unwrap_err(),
             WorkerRegistryError::InvalidConfig(

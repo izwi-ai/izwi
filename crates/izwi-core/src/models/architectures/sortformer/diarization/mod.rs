@@ -252,13 +252,13 @@ impl SortformerStreamingConfig {
             || self.chunk_len == 0
             || self.spkcache_update_period == 0
             || self.output_frames_per_encoded_frame == 0
-            || self.subsampling_factor % self.output_frames_per_encoded_frame != 0
+            || !self.subsampling_factor.is_multiple_of(self.output_frames_per_encoded_frame)
         {
             return Err(Error::ModelLoadError(
                 "Sortformer streaming config contains zero-valued required fields".to_string(),
             ));
         }
-        if self.spkcache_len % self.num_speakers != 0 {
+        if !self.spkcache_len.is_multiple_of(self.num_speakers) {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer spkcache_len {} is not divisible by {} speaker channels",
                 self.spkcache_len, self.num_speakers
@@ -3318,7 +3318,7 @@ impl SortformerRopeEncoder {
         let stacking_factor = proj_in / feature_bins;
         let d_model = proj_out;
         let num_heads = NEMOTRON3_ROPE_HEADS;
-        if d_model % num_heads != 0 || (d_model / num_heads) % 2 != 0 {
+        if d_model % num_heads != 0 || !(d_model / num_heads).is_multiple_of(2) {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer rope hidden size {d_model} does not split into even {num_heads} heads"
             )));
@@ -4355,7 +4355,7 @@ mod tests {
                 terms: vec![],
             },
         };
-        let mut owner = InvocationTensorPoolOwner::new(
+        let owner = InvocationTensorPoolOwner::new(
             &contract,
             plan,
             workspace_domain,
@@ -5232,7 +5232,7 @@ mod tests {
         let mut row1 = (4..6usize)
             .flat_map(|t| (0..16usize).map(move |f| (t * 100 + f) as f32))
             .collect::<Vec<_>>();
-        row1.extend(std::iter::repeat(0.0).take(32));
+        row1.extend(std::iter::repeat_n(0.0, 32));
         assert_eq!(values[..64], row0[..]);
         assert_eq!(values[64..], row1[..]);
     }

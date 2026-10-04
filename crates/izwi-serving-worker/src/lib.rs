@@ -1575,6 +1575,9 @@ async fn invoke<E: InvocationExecutor>(
         .expect("static worker response")
 }
 
+// Streaming invocation handler: every parameter is a distinct admitted-run
+// handle; grouping them would only add indirection in the hot serving path.
+#[allow(clippy::too_many_arguments)]
 async fn run_invocation<E: InvocationExecutor>(
     state: Arc<WorkerState<E>>,
     request: InvocationRequest,

@@ -7,6 +7,9 @@ use candle_core::{DType, Device, Tensor};
 use izwi_core::{artifacts::ArtifactManifest, ModelVariant};
 use std::path::{Path, PathBuf};
 
+// Shared helpers: each integration binary links this module whole, so any
+// helper it does not use locally is dead code in that one binary only.
+#[allow(dead_code)]
 pub fn id<T: TryFrom<&'static str>>(value: &'static str) -> T
 where
     T::Error: std::fmt::Debug,
@@ -140,6 +143,7 @@ pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
 /// `qwen3moe.*` metadata prefix, and the im_start/im_end chat tokenizer. This
 /// exercises the real sparse-expert load and dispatch path (DS10 groundwork)
 /// without downloading the 30.5B artifact.
+#[allow(dead_code)]
 pub fn write_tiny_qwen3_moe_fixture(models_dir: &Path) -> PathBuf {
     let model_dir = models_dir.join("Qwen3-30B-A3B-GGUF");
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -176,7 +180,7 @@ pub fn write_tiny_qwen3_moe_fixture(models_dir: &Path) -> PathBuf {
     let n_experts = 2_usize;
     let n_ff = 4_usize;
     let fixture_vocab = ["<|pad|>", "<|im_start|>", "<|im_end|>", "a", "b", "Ã", "©"];
-    let mut metadata = vec![
+    let metadata = vec![
         ("general.architecture", Value::String("qwen3moe".into())),
         ("qwen3moe.block_count", Value::U32(1)),
         ("qwen3moe.context_length", Value::U32(32)),
@@ -690,6 +694,7 @@ fn generate_qwen38_benchmark_fixture() {
 /// decode emits a plain-letter token deterministically. The geometry requires
 /// `IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY=1` in the loading process; the
 /// downloader bundle gate requires the real pinned artifact revision.
+#[allow(dead_code)]
 pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     let model_dir = models_dir.join("Qwen3.5-35B-A3B-FP8");
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -697,7 +702,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     const HIDDEN: usize = 32;
     const VOCAB: usize = 32;
     const QUERY_WIDTH: usize = 2 * 16; // 2 attention heads × head_dim 16
-    const KV_WIDTH: usize = 1 * 16; // 1 kv head × head_dim 16
+    const KV_WIDTH: usize = 16; // 1 kv head × head_dim 16
     const MOE_INTERMEDIATE: usize = 32;
     const SHARED_INTERMEDIATE: usize = 32;
     const NUM_EXPERTS: usize = 2;
@@ -769,7 +774,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     }
 
     let dense = |name: String, shape: &[usize], value: f32| Qwen35MoeFixtureTensor {
-        name: name.into(),
+        name,
         dtype: safetensors::Dtype::BF16,
         shape: shape.to_vec(),
         data: bf16_bytes(&vec![value; shape.iter().product::<usize>()]),
@@ -778,7 +783,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     // Block-FP8 projection: an all-ones (0x38 = 1.0 in E4M3) weight with a
     // unit `weight_scale_inv` companion at [ceil(rows/block), ceil(cols/block)].
     let fp8_projection = |name: String, rows: usize, cols: usize| {
-        let name: String = name.into();
+        let name: String = name;
         let (scale_rows, scale_cols) = (rows.div_ceil(BLOCK[0]), cols.div_ceil(BLOCK[1]));
         vec![
             Qwen35MoeFixtureTensor {

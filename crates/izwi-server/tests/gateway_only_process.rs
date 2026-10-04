@@ -54,7 +54,7 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
             .expect("probe listener binds");
         probe.local_addr().expect("probe addr").port()
     };
-    let endpoint = format!("http://127.0.0.1:{port}");
+    let _endpoint = format!("http://127.0.0.1:{port}");
 
     // Standalone compatibility approval: URL|TASK|PUBLIC_MODEL|DEPLOYMENT|GEN.
     // The mock's static deployment identity is mock-chat-v1 @ generation 1.
@@ -222,11 +222,9 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
     let manifest_path = storage.path().join("principals.json");
     std::fs::write(
         &manifest_path,
-        format!(
-            r#"{{"version":1,"principals":[
-                {{"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_PROCESS_SCOPED_A"}},
-                {{"principal_id":"ops","roles":["metrics","admin"],"key_ref":"env:IZWI_TEST_PROCESS_SCOPED_B"}}]}}"#
-        ),
+        r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_PROCESS_SCOPED_A"},
+                {"principal_id":"ops","roles":["metrics","admin"],"key_ref":"env:IZWI_TEST_PROCESS_SCOPED_B"}]}"#,
     )
     .expect("manifest write");
 
@@ -479,7 +477,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     if let Some(stderr) = gateway.stderr.take() {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().flatten() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Ok(mut collected) = stderr_store.lock() {
                     collected.push_str(&line);
                     collected.push('\n');
@@ -672,7 +670,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     use futures::{SinkExt, StreamExt};
     use izwi_serving_protocol::{
         decode_realtime_audio_frame, AttemptId, CallerId, GatewayAttestedCallerContext,
-        InvocationEventKind, ModelGeneration, PermittedAction, PolicyRevision, RealtimeAudioCodec,
+        InvocationEventKind, ModelGeneration, PermittedAction, PolicyRevision,
         RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeStageInput,
         RequestId, ServiceClass, SessionId, TaskKind, TenantId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
     };
@@ -752,7 +750,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     if let Some(stderr) = gateway.stderr.take() {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().flatten() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Ok(mut collected) = stderr_store.lock() {
                     collected.push_str(&line);
                     collected.push('\n');
@@ -1058,7 +1056,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     if let Some(stderr) = gateway.stderr.take() {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().flatten() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Ok(mut collected) = stderr_store.lock() {
                     collected.push_str(&line);
                     collected.push('\n');
@@ -1293,7 +1291,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     if let Some(stderr) = gateway.stderr.take() {
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().flatten() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                 if let Ok(mut collected) = stderr_store.lock() {
                     collected.push_str(&line);
                     collected.push('\n');

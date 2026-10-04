@@ -409,14 +409,3 @@ async fn rollout_views_cut_over_generations_with_zero_dropped_requests() {
 
     gateway.kill();
 }
-
-async fn wait_for(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        if condition() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    condition()
-}

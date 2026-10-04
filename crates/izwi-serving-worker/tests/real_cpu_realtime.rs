@@ -237,7 +237,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
     ));
 
     // Push 100 ms frames of real audio, then finish.
-    let bytes_per_frame = usize::try_from(sample_rate).unwrap() as usize * 2 / 10;
+    let bytes_per_frame = usize::try_from(sample_rate).unwrap() * 2 / 10;
     let mut frames = 0usize;
     for chunk in pcm.chunks(bytes_per_frame) {
         session

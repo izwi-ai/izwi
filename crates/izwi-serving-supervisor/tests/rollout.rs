@@ -10,7 +10,6 @@
 //! real processes.
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,7 +17,7 @@ use std::time::{Duration, Instant};
 use izwi_serving_protocol::{
     BackendKind, CancellationBehavior, Capability, CapacitySnapshot, DeploymentId,
     DeviceAssignment, IncarnationId, InputFormat, LoadedDeployment, ModelAlias, ModelGeneration,
-    ModelReadiness, NodeId, OutputFormat, SchemaVersion, TaskKind, WorkerDescriptor, WorkerFeature,
+    ModelReadiness, NodeId, OutputFormat, TaskKind, WorkerDescriptor, WorkerFeature,
     WorkerId, WorkerProcessState, WorkerStatus, PROTOCOL_V1,
 };
 
@@ -152,7 +151,7 @@ impl Rig {
         // Current config: only the old worker. Target config: only the
         // replacement, at the new generation.
         let mut manifest = serde_json::Map::new();
-        for (worker, port, token) in workers {
+        for (worker, _port, _token) in workers {
             let assignment = DeviceAssignment::Cpu {
                 thread_budget: 1,
                 affinity: vec![0],
@@ -538,7 +537,7 @@ fn resume_after_crash_commits_and_fresh_start_fails_closed() {
 
     // A fresh start without the plan must fail closed on the non-terminal
     // state.
-    let mut refuse = rig.spawn_supervisor_captured(&[]);
+    let refuse = rig.spawn_supervisor_captured(&[]);
     let output = refuse.wait_with_output().unwrap();
     assert!(
         !output.status.success(),
@@ -591,13 +590,13 @@ fn rollout_status_and_abort_commands_manage_persisted_state() {
     )
     .unwrap();
 
-    let mut status = rig.spawn_supervisor_captured(&["--rollout-status"]);
+    let status = rig.spawn_supervisor_captured(&["--rollout-status"]);
     let output = status.wait_with_output().unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("rollout_state=window_open"), "{stderr}");
 
-    let mut abort = rig.spawn_supervisor_captured(&["--rollout-abort"]);
+    let abort = rig.spawn_supervisor_captured(&["--rollout-abort"]);
     let output = abort.wait_with_output().unwrap();
     assert!(output.status.success(), "abort must succeed");
     assert_eq!(
@@ -613,7 +612,7 @@ fn rollout_status_and_abort_commands_manage_persisted_state() {
         "abort clears the backup"
     );
 
-    let mut repeat = rig.spawn_supervisor_captured(&["--rollout-abort"]);
+    let repeat = rig.spawn_supervisor_captured(&["--rollout-abort"]);
     let output = repeat.wait_with_output().unwrap();
     assert!(
         !output.status.success(),

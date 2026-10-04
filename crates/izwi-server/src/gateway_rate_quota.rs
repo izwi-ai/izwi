@@ -112,7 +112,7 @@ where
             && value.bytes().all(|byte| byte.is_ascii_digit())
     });
     raw.and_then(|value| value.parse().ok())
-        .ok_or_else(|| match name {
+        .ok_or(match name {
             REQUESTS_PER_MINUTE_ENV => GatewayRateQuotaConfigError::RequestsPerMinute,
             BURST_REQUESTS_ENV => GatewayRateQuotaConfigError::BurstRequests,
             _ => GatewayRateQuotaConfigError::TrackedTenants,

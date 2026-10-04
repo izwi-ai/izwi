@@ -29,7 +29,7 @@ const MAX_FLEET_DEPLOYMENTS_JSON_BYTES: usize = 64 * 1024;
 const MAX_FLEET_BATCH: usize = 512;
 
 fn bounded_maintenance_batch(limit: usize) -> usize {
-    limit.min(MAX_FLEET_BATCH).max(1)
+    limit.clamp(1, MAX_FLEET_BATCH)
 }
 
 fn validate_fleet_id(name: &str, value: &str) -> anyhow::Result<()> {
@@ -207,7 +207,7 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to prune fleet worker observations")?;
-        Ok(u64::try_from(deleted.rows_affected())?)
+        Ok(deleted.rows_affected())
     }
 
     /// Atomically claim one unit of cluster capacity for a worker when fewer
@@ -327,7 +327,7 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to release gateway fleet claims")?;
-        Ok(u64::try_from(deleted.rows_affected())?)
+        Ok(deleted.rows_affected())
     }
 
     /// Count live (unexpired) claims for one worker.
@@ -363,7 +363,7 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to reap expired fleet capacity claims")?;
-        Ok(u64::try_from(deleted.rows_affected())?)
+        Ok(deleted.rows_affected())
     }
 }
 

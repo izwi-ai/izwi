@@ -289,7 +289,7 @@ impl GatewayPerimeterConfig {
 /// without comparing it to any expectation. The token charset is restricted
 /// exactly as [`authenticate_bearer`] so downstream hash comparisons operate
 /// on the same accepted language.
-pub(crate) fn bearer_token<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
     let value = authorization_values
         .next()

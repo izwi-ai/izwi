@@ -65,7 +65,7 @@ async fn collect_lane_outputs(
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let mut child = ChildGuard(child);
+    let child = ChildGuard(child);
 
     let credentials = ServiceCredentials {
         credential_id: id("parity-credential"),

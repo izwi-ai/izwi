@@ -1828,12 +1828,6 @@ impl ModelLifecycleController {
                                     "Granite Speech retained decoder has no context bound".into(),
                                 )
                             })?;
-                        let retained_max_tokens =
-                            usize::try_from(retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "Granite Speech retained context exceeds usize".into(),
-                                )
-                            })?;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -1955,12 +1949,7 @@ impl ModelLifecycleController {
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
                         let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
-                        let retained_max_tokens =
-                            usize::try_from(physical_spec.retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "Qwen3 ASR retained context exceeds usize".into(),
-                                )
-                            })?;
+                        let retained_max_tokens = physical_spec.retained_max_tokens;
                         let physical = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2391,12 +2380,7 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     if capability == CapabilityKind::Asr {
                         let physical_spec = model.retained_asr_state_spec(&stage_graphs)?;
-                        let retained_max_tokens =
-                            usize::try_from(physical_spec.retained_max_tokens).map_err(|_| {
-                                Error::ModelLoadError(
-                                    "LFM2.5 Audio retained context exceeds usize".into(),
-                                )
-                            })?;
+                        let retained_max_tokens = physical_spec.retained_max_tokens;
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -4521,6 +4505,10 @@ mod tests {
         }
     }
 
+    // The ladder lock deliberately spans every await in these tests: it
+    // serializes the process-global resource authority against the other
+    // Metal OOM ladder cases, not shared state inside this runtime.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metal_oom_load_is_flushed_and_retried_once_before_poisoning() {
         let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
@@ -4567,6 +4555,7 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persisted_metal_oom_after_the_retry_poisons_the_authority() {
         let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
@@ -4624,6 +4613,7 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poisoned_authority_recovers_when_the_device_fully_drains() {
         let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK

@@ -1401,7 +1401,7 @@ mod tests {
         ] {
             let mut config = cpu_config(directory.path());
             let mut autoscaling = autoscaling_config("deployment-1", 1, 1);
-            mutate(&mut autoscaling.deployments.get_mut("deployment-1").unwrap());
+            mutate(autoscaling.deployments.get_mut("deployment-1").unwrap());
             config.autoscaling = Some(autoscaling);
             assert!(
                 matches!(

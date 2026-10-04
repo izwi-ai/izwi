@@ -3778,6 +3778,24 @@ impl SimpleRng {
     }
 }
 
+/// DS9.4: reborrows the given rows out of the envelope for a sub-batch call.
+/// Row ids must be strictly increasing. The walk advances one row per take,
+/// so each split happens at `id - taken_count` rows into the shrinking rest.
+fn take_state_subset<'a>(
+    states: &'a mut [&mut ChatDecodeState],
+    ids: &[usize],
+) -> Vec<&'a mut ChatDecodeState> {
+    let mut rest: &mut [&mut ChatDecodeState] = states;
+    let mut out = Vec::with_capacity(ids.len());
+    for (position, &id) in ids.iter().enumerate() {
+        let (_skipped, tail) = rest.split_at_mut(id - position);
+        let (taken, remainder) = tail.split_at_mut(1);
+        out.push(&mut *taken[0]);
+        rest = remainder;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::models::shared::chat::ChatRequestConfig;
@@ -4268,22 +4286,4 @@ mod tests {
         assert!(!prompt.contains("reasoning first"));
         assert!(prompt.contains("Final answer<|im_end|>"));
     }
-}
-
-/// DS9.4: reborrows the given rows out of the envelope for a sub-batch call.
-/// Row ids must be strictly increasing. The walk advances one row per take,
-/// so each split happens at `id - taken_count` rows into the shrinking rest.
-fn take_state_subset<'a>(
-    states: &'a mut [&mut ChatDecodeState],
-    ids: &[usize],
-) -> Vec<&'a mut ChatDecodeState> {
-    let mut rest: &mut [&mut ChatDecodeState] = states;
-    let mut out = Vec::with_capacity(ids.len());
-    for (position, &id) in ids.iter().enumerate() {
-        let (_skipped, tail) = rest.split_at_mut(id - position);
-        let (taken, remainder) = tail.split_at_mut(1);
-        out.push(&mut *taken[0]);
-        rest = remainder;
-    }
-    out
 }

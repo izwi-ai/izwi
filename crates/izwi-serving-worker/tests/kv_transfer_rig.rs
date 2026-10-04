@@ -199,11 +199,11 @@ fn loopback_page_transfer_preserves_pages_and_enforces_digest_chain() {
         // Re-key: scatter the received page into the consumer's own backing
         // through the same restore codec the arenas use.
         let mut offset = 0_usize;
-        for index in 0..backing.len() {
-            let destination = consumer_backing[index].take().unwrap();
+        for slot in consumer_backing.iter_mut() {
+            let destination = slot.take().unwrap();
             let consumed = restore_block(&destination, page, &payload[offset..]).unwrap();
             offset += consumed;
-            consumer_backing[index] = Some(destination);
+            *slot = Some(destination);
         }
         assert_eq!(offset, payload.len(), "payload must be fully consumed");
     }
@@ -211,7 +211,7 @@ fn loopback_page_transfer_preserves_pages_and_enforces_digest_chain() {
 
     // Bitwise proof: recapturing the re-keyed consumer pages must reproduce
     // the producer payloads byte-for-byte.
-    for page in 0..capacity_pages {
+    for (page, payload) in received_payloads.iter().enumerate() {
         assert_eq!(
             page_payload(
                 &consumer_backing
@@ -222,7 +222,7 @@ fn loopback_page_transfer_preserves_pages_and_enforces_digest_chain() {
                 page_tokens,
                 page,
             ),
-            received_payloads[page],
+            payload.as_slice(),
             "consumer page {page} must be bit-identical to the producer's"
         );
     }
@@ -240,7 +240,7 @@ fn tampered_page_payload_is_rejected_by_digest_chain() {
         4,
         &geometry,
         0,
-        &vec![0.5_f32.to_le_bytes(), 1.5_f32.to_le_bytes()].concat(),
+        &[0.5_f32.to_le_bytes(), 1.5_f32.to_le_bytes()].concat(),
     );
     // Flip one payload byte at the very end of the frame.
     let last = framed.len() - 1;

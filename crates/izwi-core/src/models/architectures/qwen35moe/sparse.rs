@@ -471,7 +471,7 @@ mod tests {
             let selected = &ranked[..TOP_K];
             let norm: f32 = selected.iter().map(|(_, w)| *w).sum();
 
-            let mut routed = vec![0_f32; HIDDEN];
+            let mut routed = [0_f32; HIDDEN];
             for &(expert, weight) in selected {
                 let applied = reference_expert(&experts[expert], x);
                 for (o, value) in applied.iter().enumerate() {

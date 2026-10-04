@@ -584,6 +584,10 @@ fn reconcile_fresh_start_state(
     Ok(())
 }
 
+// Single-call-site orchestrator: every parameter is a distinct handle the
+// rollout state machine needs in place, so grouping them would only add
+// indirection without reducing real coupling.
+#[allow(clippy::too_many_arguments)]
 async fn execute_rollout(
     prepared: &mut PreparedRollout,
     node: &ValidatedNodeConfig,
@@ -679,19 +683,16 @@ async fn execute_rollout(
     // Open (or re-open on resume) the window: both generations are approved,
     // the gateway cuts over atomically when the successor first observes
     // Ready. The old generation never stops serving during the window.
-    let window_view =
-        match rollout::build_window_view(&prepared.classified, &prepared.spec, &prepared.target)
+    if let Err(error) =
+        rollout::build_window_view(&prepared.classified, &prepared.spec, &prepared.target)
             .and_then(|view| {
                 rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
                 Ok(view)
-            }) {
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("rollout window view failed to write: {error}; nothing changed");
-                return RolloutOutcome::DegradedAbort;
-            }
-        };
-    let _ = window_view;
+            })
+    {
+        eprintln!("rollout window view failed to write: {error}; nothing changed");
+        return RolloutOutcome::DegradedAbort;
+    }
     let deadline_ms = prepared
         .state
         .window_deadline_ms
@@ -776,21 +777,18 @@ async fn execute_rollout(
     eprintln!(
         "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
     );
-    let commit_view =
-        match rollout::build_commit_view(&prepared.classified, &prepared.spec, &prepared.target)
+    if let Err(error) =
+        rollout::build_commit_view(&prepared.classified, &prepared.spec, &prepared.target)
             .and_then(|view| {
                 rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
                 Ok(view)
-            }) {
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!(
-                    "rollout commit view failed to write: {error}; the window view stays in place"
-                );
-                return RolloutOutcome::DegradedAbort;
-            }
-        };
-    let _ = commit_view;
+            })
+    {
+        eprintln!(
+            "rollout commit view failed to write: {error}; the window view stays in place"
+        );
+        return RolloutOutcome::DegradedAbort;
+    }
     drain_selected(
         current_slots,
         |slot| prepared.spec.is_old_worker(slot.worker_id.as_str()),

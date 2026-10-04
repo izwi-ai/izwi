@@ -252,7 +252,7 @@ pub struct Qwen35MoeTextConfig {
 
 impl Qwen35MoeTextConfig {
     pub fn is_full_attention_layer(&self, layer: usize) -> bool {
-        (layer + 1) % self.full_attention_interval == 0
+        (layer + 1).is_multiple_of(self.full_attention_interval)
     }
 
     /// Widths of the fused DeltaNet input projections.

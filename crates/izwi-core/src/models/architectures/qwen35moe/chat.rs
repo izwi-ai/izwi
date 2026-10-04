@@ -251,7 +251,7 @@ impl Qwen35MoeChatModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::kv::{KvArenaConfig, KvLayerConfig};
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
     use crate::models::shared::chat::ChatRole;

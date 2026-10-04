@@ -11,7 +11,6 @@ use crate::engine::cache::coordinator::{
 use crate::engine::cache::prefix::{
     CoordinatedPrefixIndex, KvPrefixNamespace, KvPrefixPageKey, KvPrefixPublication,
 };
-use crate::engine::execution::PlanId;
 use crate::engine::EngineCoreConfig;
 use crate::engine::{ModelInstanceId, SessionKey};
 use crate::kv::{CacheBlockRef, CacheDomainId, KvArenaId, KvGroupId, KvPlanFingerprint};
@@ -141,7 +140,7 @@ fn demotion_moves_the_lru_subtree_to_the_host_pool() {
     let physical = arena();
     let mut coordinator = KvCacheCoordinator::new(arena_id(), 4);
     let mut index = CoordinatedPrefixIndex::new(8);
-    let (keys, blocks, seeds, snapshot) =
+    let (keys, _blocks, seeds, snapshot) =
         publish_seeded_prefix(&mut coordinator, &mut index, &physical);
     assert_eq!(coordinator.stats().prefix_refs, 2);
 
@@ -424,7 +423,7 @@ fn promotion_restores_host_bytes_into_fresh_device_pages() {
     let blocks = prepared.provisional_groups[0].blocks.clone();
     assert_eq!(blocks.len(), 3);
 
-    let mut tail = lookup_longest_with_host(
+    let tail = lookup_longest_with_host(
         &mut index,
         &mut offload.chain,
         &namespace(),

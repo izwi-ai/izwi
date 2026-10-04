@@ -1344,7 +1344,7 @@ mod tests {
         let endpoint = worker.endpoint();
         let bootstrapping = |endpoint: &str| {
             let client = WorkerClient::new(
-                &endpoint,
+                endpoint,
                 credentials.clone(),
                 WorkerClientConfig::default(),
             )

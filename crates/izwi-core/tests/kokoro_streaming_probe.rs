@@ -17,8 +17,10 @@ use std::time::Duration;
 async fn kokoro_generate_streaming_emits_pcm_and_a_final_chunk() {
     let models_root = std::env::var("IZWI_REAL_TTS_MODELS_DIR")
         .expect("set IZWI_REAL_TTS_MODELS_DIR to the local models root");
-    let mut engine = izwi_core::EngineConfig::default();
-    engine.models_dir = std::path::PathBuf::from(&models_root);
+    let engine = izwi_core::EngineConfig {
+        models_dir: std::path::PathBuf::from(&models_root),
+        ..Default::default()
+    };
     let runtime =
         RuntimeService::new_assigned(engine, izwi_core::backends::RuntimeDeviceAssignment::Cpu)
             .expect("runtime constructs");
@@ -43,8 +45,7 @@ async fn kokoro_generate_streaming_emits_pcm_and_a_final_chunk() {
         samples += chunk.samples.len();
         saw_final = saw_final || chunk.is_final;
     }
-    let result = generation.await.unwrap().expect("generation succeeds");
-    let _ = result;
+    generation.await.unwrap().expect("generation succeeds");
     assert!(saw_final, "the stream carries a final-flagged chunk");
     assert!(samples > 0, "the stream carries synthesized PCM");
 }

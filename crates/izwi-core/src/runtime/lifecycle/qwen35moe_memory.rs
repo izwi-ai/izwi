@@ -124,7 +124,7 @@ mod tests {
         // gate-fused [8192, 2048] q_proj on 10 full-attention layers, dense
         // DeltaNet in_proj on 30 GDN layers, and the 248,320-row embeddings.
         assert_eq!(inventory.fp8_elements, 32_862_371_840);
-        assert!(inventory.fp8_elements % Q8_0_BLOCK_ELEMENTS == 0);
+        assert!(inventory.fp8_elements.is_multiple_of(Q8_0_BLOCK_ELEMENTS));
         assert_eq!(inventory.dense_elements, 1_798_238_848);
         // MoE scale: weights plus scale companions exceed 50k tensors, so the
         // per-tensor instantiation slack is a load-peak term, not noise.

@@ -235,6 +235,10 @@ pub struct DurableTextTtsAcceptance {
     pub input_artifact: RuntimeArtifact,
 }
 
+// The committed payload is the common case and flows straight into the
+// durable acceptance record; boxing it would heap-allocate every commit to
+// slim the exceptional no-data variant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum DurableTextTtsAcceptanceOutcome {
     Committed(DurableTextTtsAcceptance),

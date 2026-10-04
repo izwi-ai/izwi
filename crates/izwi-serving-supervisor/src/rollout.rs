@@ -770,11 +770,8 @@ mod tests {
         } else {
             "[\"encoded_audio\"]"
         };
-        let output = if task == "chat" {
-            "[\"text\"]"
-        } else {
-            "[\"text\"]"
-        };
+        // Both fixture tasks emit text only.
+        let output = "[\"text\"]";
         format!(
             "[[workers]]\nworker_id = \"{worker_id}\"\nbind = \"{bind}\"\nbinary = \"cpu\"\ncredential_id = \"cred-a\"\nbearer_token_env = \"{token}\"\n\n[workers.assignment]\nbackend = \"cpu\"\nthread_budget = 1\naffinity = [0]\nhost_memory_limit_bytes = 1024\n\n[workers.deployment]\ndeployment_id = \"{deployment_id}\"\npublic_model = \"{public_model}\"\nartifact_revision = \"rev-1\"\nmodel_generation = {generation}\ntask = \"{task}\"\nbackend = \"cpu\"\nprecision = \"f32\"\nexecution_representation = \"gguf\"\nmodels_directory = \"/tmp/izwi-models/chat\"\n\n[workers.deployment.capability]\nstreaming = true\nrealtime = false\ncancellation = \"cooperative\"\naccepted_input_formats = {formats}\noutput_formats = {output}\nmax_input_bytes = 1048576\nmax_context_tokens = 32\nmax_output_tokens = 32\n"
         )
@@ -1065,10 +1062,7 @@ mod tests {
         };
         persist_state(dir.path(), &state).unwrap();
         assert_eq!(load_state(dir.path()).unwrap().as_ref(), Some(&state));
-        assert!(matches!(
-            state_path(dir.path()).extension(),
-            Some(_) // .json
-        ));
+        assert!(state_path(dir.path()).extension().is_some());
         clear_state(dir.path()).unwrap();
         assert_eq!(load_state(dir.path()).unwrap(), None);
         clear_state(dir.path()).unwrap(); // idempotent

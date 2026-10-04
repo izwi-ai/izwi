@@ -904,8 +904,7 @@ impl Qwen35ChatExec {
                     "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
                 )
             })?;
-            let (token, raw_logprobs) = if state.grammar.is_some() {
-                let grammar = state.grammar.as_mut().expect("grammar checked above");
+            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
                 grammar.sample_token(
                     &output,
                     self.tokenizer.vocab_size,
@@ -1025,8 +1024,7 @@ impl Qwen35ChatExec {
             };
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
-            let (token, raw_logprobs) = if state.grammar.is_some() {
-                let grammar = state.grammar.as_mut().expect("grammar checked above");
+            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
                 grammar.sample_token(
                     &row_logits,
                     self.tokenizer.vocab_size,

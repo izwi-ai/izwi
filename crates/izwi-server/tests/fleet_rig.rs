@@ -29,7 +29,6 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 
 use izwi_core::ModelVariant;
 use izwi_server::batch_runtime::store::BatchRuntimeStore;
@@ -245,7 +244,7 @@ async fn fleet_gateways_share_atomic_admission_across_processes() {
     let gateway_a = spawn_gateway(
         "gateway-a",
         fleet_db.to_str().expect("fleet db path"),
-        &[approval.clone()],
+        std::slice::from_ref(&approval),
         Vec::new(),
     )
     .await;
@@ -348,7 +347,7 @@ async fn fleet_partition_keeps_combined_quota_within_the_configured_budget() {
     let gateway_a = spawn_gateway(
         "gateway-a",
         fleet_db.to_str().expect("fleet db path"),
-        &[approval.clone()],
+        std::slice::from_ref(&approval),
         {
             let mut env = budget_env.clone();
             env.push(("IZWI_GATEWAY_FLEET_PARTITION", "0".to_string()));
@@ -477,21 +476,20 @@ async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
     // publishers. Publishing is poller-cadence asynchronous, so wait for
     // both workers to appear before comparing samples.
     let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
-    let mut first = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        first = claims
+    let first = loop {
+        let view = claims
             .read_fresh_fleet_workers(60_000)
             .await
             .expect("fresh view");
         let complete = [WORKER_ONE_ID, WORKER_TWO_ID]
             .iter()
-            .all(|worker_id| first.iter().any(|view| view.worker_id == *worker_id));
+            .all(|worker_id| view.iter().any(|candidate| candidate.worker_id == *worker_id));
         if complete || Instant::now() >= deadline {
-            break;
+            break view;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     for worker_id in [WORKER_ONE_ID, WORKER_TWO_ID] {
         assert!(
             first.iter().any(|view| view.worker_id == worker_id),

@@ -285,7 +285,6 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
         let (canonical, shape, _kind) = self.resolve("token_embd.weight")?;
         self.checkpoint
             .materialize_dense(&canonical, &shape, device, self.dense_target)
-            .map_err(Error::from)
     }
 }
 
