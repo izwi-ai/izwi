@@ -30,7 +30,7 @@ use safetensors::Dtype as SafeDType;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen38::native::{
-    BlockFp8Config, IndexedSafetensors, ProjectionMaterialization,
+    BlockFp8Config, IndexedSafetensors, ProjectionMaterialization, RawBlockFp8Projection,
 };
 
 /// Opt a process into accepting synthetic (non-published) Qwen3.5-MoE
@@ -39,8 +39,8 @@ use crate::models::architectures::qwen38::native::{
 /// this variable. Structural invariants (layer-type pattern, mrope coverage,
 /// SSM width products, FP8 quantization routing) stay enforced under both
 /// policies.
-pub const ENV_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY: &str =
-    "IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY";
+pub const ENV_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY: &str =
+    "IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY";
 
 const CONFIG_FILE: &str = "config.json";
 
@@ -125,10 +125,10 @@ pub(crate) fn pinned_config_json() -> serde_json::Value {
 }
 
 /// The pinned 35B config, constructible without a checkpoint on disk.
-pub(crate) fn pinned_native_config() -> Qwen35MoeNativeConfig {
-    Qwen35MoeNativeConfig::from_json_with_policy(
+pub(crate) fn pinned_native_config() -> Qwen36MoeNativeConfig {
+    Qwen36MoeNativeConfig::from_json_with_policy(
         &serde_json::to_vec(&pinned_config_json()).expect("pinned config serializes"),
-        Qwen35MoeGeometryPolicy::Pinned35B,
+        Qwen36MoeGeometryPolicy::Pinned35B,
     )
     .expect("pinned config constants pass validation")
 }
@@ -141,6 +141,14 @@ pub(crate) struct PinnedRepresentationInventory {
     pub fp8_elements: u64,
     pub dense_elements: u64,
     pub tensor_count: u64,
+    /// Host bytes of the F32-decoded `weight_scale_inv` companions (each
+    /// block-FP8 tensor of `[rows, cols]` carries
+    /// `[ceil(rows/128), ceil(cols/128)]` F32 scales).
+    pub fp8_scale_bytes: u64,
+    /// Elements of block-FP8 tensors whose geometry the CUDA fp8 projection
+    /// kernel cannot execute (`n % 64 != 0 || k % 128 != 0`); under the
+    /// native-FP8 residency these fall back to packed Q8_0.
+    pub fp8_incompatible_elements: u64,
 }
 
 pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
@@ -149,6 +157,8 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         .expect("pinned config produces the validated tensor plan");
     let mut fp8_elements = 0u64;
     let mut dense_elements = 0u64;
+    let mut fp8_scale_bytes = 0u64;
+    let mut fp8_incompatible_elements = 0u64;
     for expected in plan.values() {
         let count = expected
             .shape
@@ -158,7 +168,16 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
             })
             .unwrap_or(u64::MAX);
         match expected.kind {
-            BlockFp8 => fp8_elements = fp8_elements.saturating_add(count),
+            BlockFp8 => {
+                fp8_elements = fp8_elements.saturating_add(count);
+                let (rows, cols) = (expected.shape[0], expected.shape[1]);
+                let scale_entries =
+                    rows.div_ceil(128).saturating_mul(cols.div_ceil(128)) as u64;
+                fp8_scale_bytes = fp8_scale_bytes.saturating_add(scale_entries.saturating_mul(4));
+                if rows % 64 != 0 || cols % 128 != 0 {
+                    fp8_incompatible_elements = fp8_incompatible_elements.saturating_add(count);
+                }
+            }
             Dense | OptionalDense => dense_elements = dense_elements.saturating_add(count),
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
@@ -170,12 +189,14 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         fp8_elements,
         dense_elements,
         tensor_count: plan.len() as u64,
+        fp8_scale_bytes,
+        fp8_incompatible_elements,
     }
 }
 
 /// Geometry-validation policy for a checkpoint open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35MoeGeometryPolicy {
+pub enum Qwen36MoeGeometryPolicy {
     /// Every configuration field is pinned to the published 35B-A3B checkpoint.
     Pinned35B,
     /// Benchmark/CI fixture geometry: values are free, structure is checked.
@@ -183,11 +204,11 @@ pub enum Qwen35MoeGeometryPolicy {
 }
 
 pub fn synthetic_geometry_enabled() -> bool {
-    std::env::var(ENV_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY)
+    std::env::var(ENV_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY)
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
 }
 
-impl Qwen35MoeGeometryPolicy {
+impl Qwen36MoeGeometryPolicy {
     fn from_env() -> Self {
         if synthetic_geometry_enabled() {
             Self::Synthetic
@@ -198,12 +219,12 @@ impl Qwen35MoeGeometryPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35MoeLayerType {
+pub enum Qwen36MoeLayerType {
     LinearAttention,
     FullAttention,
 }
 
-impl Qwen35MoeLayerType {
+impl Qwen36MoeLayerType {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "linear_attention" => Some(Self::LinearAttention),
@@ -215,15 +236,15 @@ impl Qwen35MoeLayerType {
 
 /// Validated Qwen3.5-MoE text configuration.
 #[derive(Debug, Clone)]
-pub struct Qwen35MoeNativeConfig {
-    pub text: Qwen35MoeTextConfig,
-    pub layer_types: Vec<Qwen35MoeLayerType>,
+pub struct Qwen36MoeNativeConfig {
+    pub text: Qwen36MoeTextConfig,
+    pub layer_types: Vec<Qwen36MoeLayerType>,
     pub block_fp8: BlockFp8Config,
 }
 
 /// Text-tower geometry the loader and execution module agree on.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Qwen35MoeTextConfig {
+pub struct Qwen36MoeTextConfig {
     pub block_count: usize,
     pub full_attention_interval: usize,
     pub hidden_size: usize,
@@ -252,7 +273,7 @@ pub struct Qwen35MoeTextConfig {
     pub tie_word_embeddings: bool,
 }
 
-impl Qwen35MoeTextConfig {
+impl Qwen36MoeTextConfig {
     pub fn is_full_attention_layer(&self, layer: usize) -> bool {
         (layer + 1).is_multiple_of(self.full_attention_interval)
     }
@@ -324,9 +345,9 @@ fn require_eq_usize(
     field: &str,
     actual: usize,
     expected: usize,
-    policy: Qwen35MoeGeometryPolicy,
+    policy: Qwen36MoeGeometryPolicy,
 ) -> Result<()> {
-    if policy == Qwen35MoeGeometryPolicy::Pinned35B && actual != expected {
+    if policy == Qwen36MoeGeometryPolicy::Pinned35B && actual != expected {
         return Err(config_error(
             field,
             format!("pinned checkpoint expects {expected}, found {actual}"),
@@ -339,9 +360,9 @@ fn require_eq_f64(
     field: &str,
     actual: f64,
     expected: f64,
-    policy: Qwen35MoeGeometryPolicy,
+    policy: Qwen36MoeGeometryPolicy,
 ) -> Result<()> {
-    if policy == Qwen35MoeGeometryPolicy::Pinned35B && (actual - expected).abs() > f64::EPSILON {
+    if policy == Qwen36MoeGeometryPolicy::Pinned35B && (actual - expected).abs() > f64::EPSILON {
         return Err(config_error(
             field,
             format!("pinned checkpoint expects {expected}, found {actual}"),
@@ -350,12 +371,12 @@ fn require_eq_f64(
     Ok(())
 }
 
-impl Qwen35MoeNativeConfig {
+impl Qwen36MoeNativeConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        Self::load_with_policy(model_dir, Qwen35MoeGeometryPolicy::from_env())
+        Self::load_with_policy(model_dir, Qwen36MoeGeometryPolicy::from_env())
     }
 
-    pub fn load_with_policy(model_dir: &Path, policy: Qwen35MoeGeometryPolicy) -> Result<Self> {
+    pub fn load_with_policy(model_dir: &Path, policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
         let raw = std::fs::read(model_dir.join(CONFIG_FILE)).map_err(|err| {
             Error::ModelLoadError(format!(
                 "Failed to read Qwen3.5/3.6-MoE config {}: {err}",
@@ -366,10 +387,10 @@ impl Qwen35MoeNativeConfig {
     }
 
     pub fn from_json(raw: &[u8]) -> Result<Self> {
-        Self::from_json_with_policy(raw, Qwen35MoeGeometryPolicy::from_env())
+        Self::from_json_with_policy(raw, Qwen36MoeGeometryPolicy::from_env())
     }
 
-    pub fn from_json_with_policy(raw: &[u8], policy: Qwen35MoeGeometryPolicy) -> Result<Self> {
+    pub fn from_json_with_policy(raw: &[u8], policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
         let root: serde_json::Value = serde_json::from_slice(raw)
             .map_err(|err| config_error("root", format!("invalid JSON: {err}")))?;
 
@@ -431,7 +452,7 @@ impl Qwen35MoeNativeConfig {
         let layer_types = layer_types
             .iter()
             .map(|value| {
-                Qwen35MoeLayerType::parse(req_str(value, "text_config.layer_types[*]")?).ok_or_else(
+                Qwen36MoeLayerType::parse(req_str(value, "text_config.layer_types[*]")?).ok_or_else(
                     || {
                         config_error(
                             "text_config.layer_types[*]",
@@ -443,7 +464,7 @@ impl Qwen35MoeNativeConfig {
             .collect::<Result<Vec<_>>>()?;
         for (layer, kind) in layer_types.iter().enumerate() {
             let expected_full = (layer + 1) % interval == 0;
-            let actual_full = *kind == Qwen35MoeLayerType::FullAttention;
+            let actual_full = *kind == Qwen36MoeLayerType::FullAttention;
             if expected_full != actual_full {
                 return Err(config_error(
                     "text_config.layer_types",
@@ -830,7 +851,7 @@ impl Qwen35MoeNativeConfig {
             policy,
         )?;
 
-        let text = Qwen35MoeTextConfig {
+        let text = Qwen36MoeTextConfig {
             block_count,
             full_attention_interval: interval,
             hidden_size,
@@ -889,7 +910,7 @@ impl Qwen35MoeNativeConfig {
 
 /// Canonical tensor scope after language-layout normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35MoeTensorScope {
+pub enum Qwen36MoeTensorScope {
     /// Language-model tensor, canonicalized to the `model.` / `lm_head.` form.
     Text,
     /// Vision-tower tensor; accounted, not loaded (text-only scope).
@@ -903,33 +924,33 @@ pub enum Qwen35MoeTensorScope {
 /// Normalize an index tensor name to its canonical text form.
 ///
 /// Returns `None` for scopes that are not loaded (vision, MTP).
-pub fn canonical_text_tensor_name(name: &str) -> Option<(Qwen35MoeTensorScope, Option<String>)> {
+pub fn canonical_text_tensor_name(name: &str) -> Option<(Qwen36MoeTensorScope, Option<String>)> {
     if name == "lm_head.weight" {
-        return Some((Qwen35MoeTensorScope::Text, Some(name.to_string())));
+        return Some((Qwen36MoeTensorScope::Text, Some(name.to_string())));
     }
     if name.starts_with("mtp.") {
-        return Some((Qwen35MoeTensorScope::Mtp, None));
+        return Some((Qwen36MoeTensorScope::Mtp, None));
     }
     let stripped = name.strip_prefix("model.")?;
     if stripped.starts_with("visual.") {
-        return Some((Qwen35MoeTensorScope::Vision, None));
+        return Some((Qwen36MoeTensorScope::Vision, None));
     }
     if stripped.starts_with("mtp.") {
-        return Some((Qwen35MoeTensorScope::Mtp, None));
+        return Some((Qwen36MoeTensorScope::Mtp, None));
     }
     if let Some(composite) = stripped.strip_prefix("language_model.") {
         if composite.starts_with("visual.") {
-            return Some((Qwen35MoeTensorScope::Vision, None));
+            return Some((Qwen36MoeTensorScope::Vision, None));
         }
         if composite.starts_with("mtp.") {
-            return Some((Qwen35MoeTensorScope::Mtp, None));
+            return Some((Qwen36MoeTensorScope::Mtp, None));
         }
         return Some((
-            Qwen35MoeTensorScope::Text,
+            Qwen36MoeTensorScope::Text,
             Some(format!("model.{composite}")),
         ));
     }
-    Some((Qwen35MoeTensorScope::Text, Some(name.to_string())))
+    Some((Qwen36MoeTensorScope::Text, Some(name.to_string())))
 }
 
 /// The expected checkpoint contract for one canonical text tensor.
@@ -982,7 +1003,7 @@ fn insert_fp8_projection(
 
 /// Build the required canonical text tensor plan for a validated config.
 pub fn expected_text_tensor_plan(
-    config: &Qwen35MoeNativeConfig,
+    config: &Qwen36MoeNativeConfig,
 ) -> Result<BTreeMap<String, ExpectedTensor>> {
     let text = &config.text;
     let hidden = text.hidden_size;
@@ -1184,7 +1205,7 @@ pub fn expected_text_tensor_plan(
     Ok(plan)
 }
 
-fn expert_projection_shapes(text: &Qwen35MoeTextConfig) -> [(&'static str, Vec<usize>); 3] {
+fn expert_projection_shapes(text: &Qwen36MoeTextConfig) -> [(&'static str, Vec<usize>); 3] {
     [
         (
             "gate_proj.weight",
@@ -1210,29 +1231,29 @@ pub struct SkippedScopeInventory {
 }
 
 /// Opened and validated Qwen3.5-MoE native checkpoint.
-pub struct Qwen35MoeNativeCheckpoint {
-    pub config: Qwen35MoeNativeConfig,
+pub struct Qwen36MoeNativeCheckpoint {
+    pub config: Qwen36MoeNativeConfig,
     pub tensors: IndexedSafetensors,
     /// Canonical text tensor name -> raw index name (layout normalization).
     text_tensor_names: BTreeMap<String, String>,
     pub skipped: SkippedScopeInventory,
 }
 
-impl Qwen35MoeNativeCheckpoint {
+impl Qwen36MoeNativeCheckpoint {
     pub fn open(model_dir: &Path) -> Result<Self> {
-        Self::open_with_policy(model_dir, Qwen35MoeGeometryPolicy::from_env())
+        Self::open_with_policy(model_dir, Qwen36MoeGeometryPolicy::from_env())
     }
 
     /// Open with an explicit geometry policy. Production callers use
     /// `open`; synthetic-fixture tests pass `Synthetic` directly so
     /// parallel tests never mutate the process environment.
-    pub fn open_with_policy(model_dir: &Path, policy: Qwen35MoeGeometryPolicy) -> Result<Self> {
-        let config = Qwen35MoeNativeConfig::load_with_policy(model_dir, policy)?;
+    pub fn open_with_policy(model_dir: &Path, policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
+        let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, policy)?;
         let tensors = IndexedSafetensors::open(model_dir)?;
         Self::validate(config, tensors)
     }
 
-    pub fn validate(config: Qwen35MoeNativeConfig, tensors: IndexedSafetensors) -> Result<Self> {
+    pub fn validate(config: Qwen36MoeNativeConfig, tensors: IndexedSafetensors) -> Result<Self> {
         let plan = expected_text_tensor_plan(&config)?;
         let mut text_tensor_names = BTreeMap::new();
         let mut skipped = SkippedScopeInventory::default();
@@ -1246,7 +1267,7 @@ impl Qwen35MoeNativeCheckpoint {
                     ))
                 })?;
             match scope {
-                Qwen35MoeTensorScope::Text => {
+                Qwen36MoeTensorScope::Text => {
                     let canonical = canonical.expect("text scope always canonicalizes");
                     if let Some(existing) =
                         text_tensor_names.insert(canonical.clone(), raw_name.to_string())
@@ -1256,17 +1277,17 @@ impl Qwen35MoeNativeCheckpoint {
                         )));
                     }
                 }
-                Qwen35MoeTensorScope::Vision => {
+                Qwen36MoeTensorScope::Vision => {
                     skipped.vision_tensors += 1;
                 }
-                Qwen35MoeTensorScope::Mtp => {
+                Qwen36MoeTensorScope::Mtp => {
                     skipped.mtp_tensors += 1;
                     mtp_payload_bytes += tensors
                         .tensor_info(raw_name)
                         .map(|info| info.storage_bytes as u64)
                         .unwrap_or(0);
                 }
-                Qwen35MoeTensorScope::Unknown => {
+                Qwen36MoeTensorScope::Unknown => {
                     return Err(Error::ModelLoadError(format!(
                         "Qwen3.5/3.6-MoE checkpoint tensor `{raw_name}` has an unknown scope"
                     )));
@@ -1316,7 +1337,7 @@ impl Qwen35MoeNativeCheckpoint {
         if !unexpected.is_empty() {
             let shown: Vec<&str> = unexpected.iter().copied().take(8).collect();
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5/3.6-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen35moe tensor plan before loading",
+                "Qwen3.5/3.6-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen36moe tensor plan before loading",
                 unexpected.len()
             )));
         }
@@ -1351,13 +1372,15 @@ impl Qwen35MoeNativeCheckpoint {
     ///
     /// CPU packs requantized Q8_0 projections (the F32 expanded envelope for
     /// a 35B checkpoint is impractical and the Q8_0 path keeps Candle CPU
-    /// QMatMul residency), Metal expands to F16, CUDA expands to BF16 with a
-    /// CC-gated F16 fallback decided by the caller.
-    pub fn projection_residency_policy(device: &DeviceProfile) -> Qwen35MoeProjectionResidency {
+    /// QMatMul residency), Metal expands to F16 (Apple GPUs have no FP8
+    /// path), CUDA keeps the checkpoint's raw block-FP8 bytes resident and
+    /// decodes per GEMM inside the fp8 projection kernel, falling back per
+    /// tensor to packed Q8_0 where the kernel contract cannot execute.
+    pub fn projection_residency_policy(device: &DeviceProfile) -> Qwen36MoeProjectionResidency {
         match BackendKind::from(device.kind) {
-            BackendKind::Cpu => Qwen35MoeProjectionResidency::PackedQ8_0,
-            BackendKind::Metal => Qwen35MoeProjectionResidency::ExpandedF16,
-            BackendKind::Cuda => Qwen35MoeProjectionResidency::ExpandedBf16,
+            BackendKind::Cpu => Qwen36MoeProjectionResidency::PackedQ8_0,
+            BackendKind::Metal => Qwen36MoeProjectionResidency::ExpandedF16,
+            BackendKind::Cuda => Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback,
         }
     }
 
@@ -1367,12 +1390,12 @@ impl Qwen35MoeNativeCheckpoint {
         canonical_name: &str,
         expected_shape: [usize; 2],
         device: &candle_core::Device,
-        residency: Qwen35MoeProjectionResidency,
-    ) -> Result<Qwen35MoeProjection> {
+        residency: Qwen36MoeProjectionResidency,
+    ) -> Result<Qwen36MoeProjection> {
         let raw_name = self.raw_tensor_name(canonical_name)?;
         let block_shape = self.config.block_fp8.block_shape;
         match residency {
-            Qwen35MoeProjectionResidency::PackedQ8_0 => Ok(Qwen35MoeProjection::Packed(
+            Qwen36MoeProjectionResidency::PackedQ8_0 => Ok(Qwen36MoeProjection::Packed(
                 self.tensors.materialize_q8_projection(
                     raw_name,
                     expected_shape,
@@ -1380,7 +1403,7 @@ impl Qwen35MoeNativeCheckpoint {
                     device,
                 )?,
             )),
-            Qwen35MoeProjectionResidency::ExpandedF16 => Ok(Qwen35MoeProjection::Dense(
+            Qwen36MoeProjectionResidency::ExpandedF16 => Ok(Qwen36MoeProjection::Dense(
                 self.tensors.materialize_projection(
                     raw_name,
                     expected_shape,
@@ -1389,7 +1412,7 @@ impl Qwen35MoeNativeCheckpoint {
                     device,
                 )?,
             )),
-            Qwen35MoeProjectionResidency::ExpandedBf16 => Ok(Qwen35MoeProjection::Dense(
+            Qwen36MoeProjectionResidency::ExpandedBf16 => Ok(Qwen36MoeProjection::Dense(
                 self.tensors.materialize_projection(
                     raw_name,
                     expected_shape,
@@ -1398,7 +1421,7 @@ impl Qwen35MoeNativeCheckpoint {
                     device,
                 )?,
             )),
-            Qwen35MoeProjectionResidency::ExpandedF32 => Ok(Qwen35MoeProjection::Dense(
+            Qwen36MoeProjectionResidency::ExpandedF32 => Ok(Qwen36MoeProjection::Dense(
                 self.tensors.materialize_projection(
                     raw_name,
                     expected_shape,
@@ -1407,7 +1430,55 @@ impl Qwen35MoeNativeCheckpoint {
                     device,
                 )?,
             )),
+            Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback => {
+                if Self::compact_block_fp8_supported(device, expected_shape, block_shape) {
+                    Ok(Qwen36MoeProjection::CompactFp8(
+                        self.materialize_compact_projection(raw_name, expected_shape, device)?,
+                    ))
+                } else {
+                    Ok(Qwen36MoeProjection::Packed(
+                        self.tensors.materialize_q8_projection(
+                            raw_name,
+                            expected_shape,
+                            block_shape,
+                            device,
+                        )?,
+                    ))
+                }
+            }
         }
+    }
+
+    /// Kernel contract of `kernels::cuda::fp8::block_fp8_projection`: 128x128
+    /// block scales with weights `[n, k]` where `n % 64 == 0` and `k % 128 == 0`,
+    /// executed on a CUDA device of compute capability >= 8. Outside the
+    /// contract the native-FP8 residency falls back to packed Q8_0 per tensor.
+    fn compact_block_fp8_supported(
+        device: &candle_core::Device,
+        expected_shape: [usize; 2],
+        block_shape: [usize; 2],
+    ) -> bool {
+        block_shape == [128, 128]
+            && crate::kernels::cuda::fp8::provider_supported(
+                device,
+                candle_core::DType::BF16,
+                expected_shape[0],
+                expected_shape[1],
+            )
+    }
+
+    fn materialize_compact_projection(
+        &self,
+        raw_name: &str,
+        expected_shape: [usize; 2],
+        device: &candle_core::Device,
+    ) -> Result<RawBlockFp8Projection> {
+        self.tensors.materialize_block_fp8_raw(
+            raw_name,
+            expected_shape,
+            self.config.block_fp8.block_shape,
+            device,
+        )
     }
 
     /// Materialize a dense (non-block-FP8) tensor such as norms, DeltaNet
@@ -1451,18 +1522,25 @@ impl Qwen35MoeNativeCheckpoint {
 
 /// Persistent residency form of a block-FP8 projection.
 #[derive(Clone)]
-pub enum Qwen35MoeProjection {
+pub enum Qwen36MoeProjection {
     Dense(candle_core::Tensor),
     Packed(candle_core::quantized::QMatMul),
+    /// Raw checkpoint residency: E4M3FN weight bytes plus F32 block scales
+    /// stay resident and decode per GEMM inside the CUDA fp8 projection
+    /// kernel. No expanded persistent weight tensor is created.
+    CompactFp8(RawBlockFp8Projection),
 }
 
 /// Backend residency selection for Qwen3.5-MoE projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35MoeProjectionResidency {
+pub enum Qwen36MoeProjectionResidency {
     PackedQ8_0,
     ExpandedF16,
     ExpandedBf16,
     ExpandedF32,
+    /// Raw block-FP8 residency with a per-tensor packed-Q8_0 fallback for
+    /// tensors whose geometry the fp8 projection kernel cannot execute.
+    NativeFp8WithQ8Fallback,
 }
 
 #[cfg(test)]
@@ -1474,15 +1552,15 @@ mod tests {
         pinned_config_json()
     }
 
-    fn pinned_config() -> Qwen35MoeNativeConfig {
-        Qwen35MoeNativeConfig::from_json_with_policy(
+    fn pinned_config() -> Qwen36MoeNativeConfig {
+        Qwen36MoeNativeConfig::from_json_with_policy(
             &serde_json::to_vec(&pinned_text_config_value()).unwrap(),
-            Qwen35MoeGeometryPolicy::Pinned35B,
+            Qwen36MoeGeometryPolicy::Pinned35B,
         )
         .unwrap()
     }
 
-    fn synthetic_config() -> Qwen35MoeNativeConfig {
+    fn synthetic_config() -> Qwen36MoeNativeConfig {
         let mut value = pinned_text_config_value();
         value["text_config"]["num_hidden_layers"] = json!(8);
         value["text_config"]["vocab_size"] = json!(64);
@@ -1498,9 +1576,9 @@ mod tests {
             }
         }
         value["text_config"]["layer_types"] = json!(layer_types);
-        Qwen35MoeNativeConfig::from_json_with_policy(
+        Qwen36MoeNativeConfig::from_json_with_policy(
             &serde_json::to_vec(&value).unwrap(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap()
     }
@@ -1511,8 +1589,8 @@ mod tests {
     /// V-head-repeat path requires value heads to be a multiple of key
     /// heads, and CPU Q8_0 requant needs every packed inner dimension
     /// divisible by 32 (hidden 32, query width 2×16=32, MoE width 32).
-    fn forward_config() -> Qwen35MoeNativeConfig {
-        Qwen35MoeNativeConfig::from_json_with_policy(
+    fn forward_config() -> Qwen36MoeNativeConfig {
+        Qwen36MoeNativeConfig::from_json_with_policy(
             r#"{
                 "architectures": ["Qwen3_5MoeForConditionalGeneration"],
                 "text_config": {
@@ -1552,7 +1630,7 @@ mod tests {
                 }
             }"#
             .as_bytes(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap()
     }
@@ -1562,16 +1640,16 @@ mod tests {
         use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen35moe::native_model::load_text_model_native;
+        use crate::models::architectures::qwen36moe::native_model::load_text_model_native;
         use crate::models::shared::attention::physical::PhysicalPagedKvCache;
         use std::sync::Arc;
 
         let config = forward_config();
         let dir = TestDir::new("trunk-forward");
         write_tiny_checkpoint(&config, dir.0.as_path());
-        let checkpoint = Qwen35MoeNativeCheckpoint::open_with_policy(
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
             dir.0.as_path(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap();
 
@@ -1691,7 +1769,7 @@ mod tests {
             config
                 .layer_types
                 .iter()
-                .filter(|kind| **kind == Qwen35MoeLayerType::FullAttention)
+                .filter(|kind| **kind == Qwen36MoeLayerType::FullAttention)
                 .count(),
             10
         );
@@ -1703,9 +1781,9 @@ mod tests {
     fn rejects_layer_pattern_drift_with_field_specific_error() {
         let mut value = pinned_text_config_value();
         value["text_config"]["layer_types"][0] = json!("full_attention");
-        let error = Qwen35MoeNativeConfig::from_json_with_policy(
+        let error = Qwen36MoeNativeConfig::from_json_with_policy(
             &serde_json::to_vec(&value).unwrap(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap_err()
         .to_string();
@@ -1717,7 +1795,7 @@ mod tests {
     fn rejects_pinned_geometry_drift() {
         let mut value = pinned_text_config_value();
         value["text_config"]["num_experts"] = json!(128);
-        let error = Qwen35MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
+        let error = Qwen36MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .to_string();
         assert!(error.contains("text_config.num_experts"), "{error}");
@@ -1728,9 +1806,9 @@ mod tests {
     fn rejects_non_interleaved_mrope() {
         let mut value = pinned_text_config_value();
         value["text_config"]["rope_parameters"]["mrope_interleaved"] = json!(false);
-        let error = Qwen35MoeNativeConfig::from_json_with_policy(
+        let error = Qwen36MoeNativeConfig::from_json_with_policy(
             &serde_json::to_vec(&value).unwrap(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap_err()
         .to_string();
@@ -1741,7 +1819,7 @@ mod tests {
     fn rejects_quantization_contract_drift() {
         let mut value = pinned_text_config_value();
         value["quantization_config"]["activation_scheme"] = json!("static");
-        let error = Qwen35MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
+        let error = Qwen36MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1754,7 +1832,7 @@ mod tests {
     fn rejects_architecture_drift() {
         let mut value = pinned_text_config_value();
         value["architectures"] = json!(["Qwen3MoeForCausalLM"]);
-        let error = Qwen35MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
+        let error = Qwen36MoeNativeConfig::from_json(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .to_string();
         assert!(error.contains("architectures[0]"), "{error}");
@@ -1765,7 +1843,7 @@ mod tests {
         let (scope, canonical) =
             canonical_text_tensor_name("model.layers.0.input_layernorm.weight")
                 .expect("plain layout");
-        assert_eq!(scope, Qwen35MoeTensorScope::Text);
+        assert_eq!(scope, Qwen36MoeTensorScope::Text);
         assert_eq!(
             canonical.as_deref(),
             Some("model.layers.0.input_layernorm.weight")
@@ -1774,21 +1852,21 @@ mod tests {
         let (scope, canonical) =
             canonical_text_tensor_name("model.language_model.layers.0.mlp.gate.weight")
                 .expect("composite layout");
-        assert_eq!(scope, Qwen35MoeTensorScope::Text);
+        assert_eq!(scope, Qwen36MoeTensorScope::Text);
         assert_eq!(canonical.as_deref(), Some("model.layers.0.mlp.gate.weight"));
 
         let (scope, canonical) = canonical_text_tensor_name("lm_head.weight").expect("lm head");
-        assert_eq!(scope, Qwen35MoeTensorScope::Text);
+        assert_eq!(scope, Qwen36MoeTensorScope::Text);
         assert_eq!(canonical.as_deref(), Some("lm_head.weight"));
 
         let (scope, canonical) =
             canonical_text_tensor_name("model.visual.blocks.0.attn.qkv.weight").expect("vision");
-        assert_eq!(scope, Qwen35MoeTensorScope::Vision);
+        assert_eq!(scope, Qwen36MoeTensorScope::Vision);
         assert!(canonical.is_none());
 
         let (scope, canonical) =
             canonical_text_tensor_name("mtp.layers.0.self_attn.q_proj.weight").expect("mtp");
-        assert_eq!(scope, Qwen35MoeTensorScope::Mtp);
+        assert_eq!(scope, Qwen36MoeTensorScope::Mtp);
         assert!(canonical.is_none());
     }
 
@@ -2174,8 +2252,8 @@ mod tests {
     fn projection_residency_policy_matches_backend_envelopes() {
         let cpu = DeviceProfile::cpu();
         assert_eq!(
-            Qwen35MoeNativeCheckpoint::projection_residency_policy(&cpu),
-            Qwen35MoeProjectionResidency::PackedQ8_0
+            Qwen36MoeNativeCheckpoint::projection_residency_policy(&cpu),
+            Qwen36MoeProjectionResidency::PackedQ8_0
         );
     }
 
@@ -2190,7 +2268,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen35moe-native-{label}-{}-{nonce}",
+                "izwi-qwen36moe-native-{label}-{}-{nonce}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&path).unwrap();
@@ -2236,7 +2314,7 @@ mod tests {
     /// Fully coherent tiny geometry: hidden 32, 3 DeltaNet + 1 full-attention
     /// layer, 2 experts of intermediate 8 plus a shared expert, 2 rotary
     /// pairs, FP8 block shape [4, 4].
-    fn tiny_config() -> Qwen35MoeNativeConfig {
+    fn tiny_config() -> Qwen36MoeNativeConfig {
         let mut value = pinned_text_config_value();
         value["text_config"]["num_hidden_layers"] = json!(4);
         value["text_config"]["hidden_size"] = json!(32);
@@ -2263,9 +2341,9 @@ mod tests {
         value["text_config"]["rope_parameters"]["mrope_section"] = json!([1, 1, 0]);
         value["text_config"]["rope_parameters"]["partial_rotary_factor"] = json!(0.5);
         value["quantization_config"]["weight_block_size"] = json!([4, 4]);
-        Qwen35MoeNativeConfig::from_json_with_policy(
+        Qwen36MoeNativeConfig::from_json_with_policy(
             &serde_json::to_vec(&value).unwrap(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap()
     }
@@ -2283,7 +2361,7 @@ mod tests {
 
     fn push_fp8_proj(
         tensors: &mut Vec<RawTensor>,
-        config: &Qwen35MoeNativeConfig,
+        config: &Qwen36MoeNativeConfig,
         name: String,
         rows: usize,
         cols: usize,
@@ -2308,7 +2386,7 @@ mod tests {
         ));
     }
 
-    fn tiny_checkpoint_tensors(config: &Qwen35MoeNativeConfig) -> Vec<RawTensor> {
+    fn tiny_checkpoint_tensors(config: &Qwen36MoeNativeConfig) -> Vec<RawTensor> {
         let text = &config.text;
         let hidden = text.hidden_size;
         let mut tensors: Vec<RawTensor> = Vec::new();
@@ -2499,7 +2577,15 @@ mod tests {
         tensors
     }
 
-    fn write_tiny_checkpoint(config: &Qwen35MoeNativeConfig, dir: &Path) {
+    fn write_tiny_checkpoint(config: &Qwen36MoeNativeConfig, dir: &Path) {
+        write_tiny_checkpoint_tensors(config, dir, tiny_checkpoint_tensors(config));
+    }
+
+    fn write_tiny_checkpoint_tensors(
+        config: &Qwen36MoeNativeConfig,
+        dir: &Path,
+        tensors: Vec<RawTensor>,
+    ) {
         std::fs::write(
             dir.join(CONFIG_FILE),
             json!({
@@ -2528,8 +2614,8 @@ mod tests {
                         .layer_types
                         .iter()
                         .map(|kind| match kind {
-                            Qwen35MoeLayerType::LinearAttention => "linear_attention",
-                            Qwen35MoeLayerType::FullAttention => "full_attention",
+                            Qwen36MoeLayerType::LinearAttention => "linear_attention",
+                            Qwen36MoeLayerType::FullAttention => "full_attention",
                         })
                         .collect::<Vec<_>>(),
                     "rope_parameters": {
@@ -2551,7 +2637,6 @@ mod tests {
         )
         .unwrap();
 
-        let tensors = tiny_checkpoint_tensors(config);
         let mut weight_map = serde_json::Map::new();
         let tensor_refs: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = tensors
             .iter()
@@ -2578,9 +2663,9 @@ mod tests {
         let dir = TestDir::new("open-ok");
         write_tiny_checkpoint(&config, dir.0.as_path());
 
-        let checkpoint = Qwen35MoeNativeCheckpoint::open_with_policy(
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
             dir.0.as_path(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .unwrap();
         let text = &checkpoint.config.text;
@@ -2600,6 +2685,88 @@ mod tests {
         );
         let raw_lm = checkpoint.raw_tensor_name("lm_head.weight").unwrap();
         assert_eq!(raw_lm, "lm_head.weight");
+    }
+
+    #[test]
+    fn native_fp8_residency_falls_back_to_packed_q8_off_cuda() {
+        let config = tiny_config();
+        let dir = TestDir::new("native-fp8-fallback");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        let projection = checkpoint
+            .materialize_projection(
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                [8, 32],
+                &candle_core::Device::Cpu,
+                Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback,
+            )
+            .unwrap();
+        assert!(matches!(projection, Qwen36MoeProjection::Packed(_)));
+    }
+
+    #[test]
+    fn compact_fp8_residency_keeps_raw_bytes_and_decodes_block_scales() {
+        use crate::models::architectures::qwen35::text::Qwen35Projection;
+
+        let mut config = tiny_config();
+        // The fp8 projection kernel contract pins 128x128 block scales; the
+        // tiny geometry still produces a [1, 1] scale grid, and the CPU
+        // kernel path executes any geometry so the decode stays testable
+        // without CUDA hardware.
+        config.block_fp8.block_shape = [128, 128];
+        let dir = TestDir::new("compact-fp8-raw");
+        let mut tensors = tiny_checkpoint_tensors(&config);
+        let scale_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv";
+        let scale = tensors
+            .iter_mut()
+            .find(|(name, ..)| name == scale_name)
+            .unwrap();
+        assert_eq!(scale.2, vec![1, 1]);
+        scale.3 = bf16_bytes(&[2.0]);
+        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
+
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let canonical = "model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expected_shape = [8, 32];
+        let raw_name = checkpoint.raw_tensor_name(canonical).unwrap();
+        let compact = checkpoint
+            .materialize_compact_projection(raw_name, expected_shape, &candle_core::Device::Cpu)
+            .unwrap();
+        assert_eq!(compact.weights.dims(), &[8, 32]);
+        assert_eq!(compact.weights.dtype(), candle_core::DType::U8);
+        assert_eq!(compact.scales.dims(), &[1, 1]);
+        assert_eq!(
+            compact
+                .scales
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            [2.0]
+        );
+
+        // One-hot activation at column 5: every weight decodes to 1.0, so the
+        // projection output is the block scale itself.
+        let mut input = vec![0f32; 32];
+        input[5] = 1.0;
+        let x = candle_core::Tensor::from_vec(input, (1, 32), &candle_core::Device::Cpu).unwrap();
+        let y = Qwen35Projection::CompactFp8 {
+            weights: compact.weights,
+            scales: compact.scales,
+        }
+        .forward(&x)
+        .unwrap();
+        assert_eq!(y.dims(), &[1, 8]);
+        assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
     }
 
     #[test]
@@ -2628,9 +2795,9 @@ mod tests {
         }
         write_index(dir.0.as_path(), serde_json::Value::Object(weight_map));
 
-        let error = Qwen35MoeNativeCheckpoint::open_with_policy(
+        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
             dir.0.as_path(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .err()
         .expect("unexpected tensor must fail closed")
@@ -2662,9 +2829,9 @@ mod tests {
             dir_missing.0.as_path(),
             serde_json::Value::Object(missing_map),
         );
-        let error = Qwen35MoeNativeCheckpoint::open_with_policy(
+        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
             dir_missing.0.as_path(),
-            Qwen35MoeGeometryPolicy::Synthetic,
+            Qwen36MoeGeometryPolicy::Synthetic,
         )
         .err()
         .expect("missing tensor must fail closed")

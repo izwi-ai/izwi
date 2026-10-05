@@ -372,10 +372,14 @@ struct AuthorityState {
 
 /// A fixed-size diagnostic: reservation keys can contain caller-controlled
 /// identifiers and must never be included in capacity rejection summaries.
+/// The per-class `reserved`/`materialized` splits exist so a rejection names
+/// which residency actually holds the device, not just unmaterialized work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingClassSummary {
     class: ReservationClass,
     reservations: usize,
+    reserved: ResourceVector,
+    materialized: ResourceVector,
     pending: ResourceVector,
 }
 
@@ -437,6 +441,8 @@ impl AuthorityState {
         .map(|class| PendingClassSummary {
             class,
             reservations: 0,
+            reserved: ResourceVector::zero(),
+            materialized: ResourceVector::zero(),
             pending: ResourceVector::zero(),
         });
         for (id, resources) in &self.ledger.reservations {
@@ -459,6 +465,10 @@ impl AuthorityState {
                 .copied()
                 .unwrap_or_else(ResourceVector::zero);
             summaries[index].reservations += 1;
+            summaries[index].reserved = summaries[index].reserved.checked_add(*resources)?;
+            summaries[index].materialized = summaries[index]
+                .materialized
+                .checked_add(materialized)?;
             summaries[index].pending = summaries[index]
                 .pending
                 .checked_add(resources.positive_growth_over(materialized)?)?;
@@ -856,7 +866,7 @@ impl ResourceAuthority {
                 let live_claim = existing_pending.checked_add(pending)?;
                 if !live_claim.fits_within(physical.available) {
                     return Err(Error::Overloaded(format!(
-                        "insufficient live physical capacity for {:?}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, existing_pending_by_class={:?}",
+                        "insufficient live physical capacity for {:?}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, live_by_class={:?}",
                         owner.class, physical.available, physical.capacity, state.pending_by_class(None)?
                     )));
                 }
@@ -925,7 +935,7 @@ impl ResourceAuthority {
             state.ledger.update_capacity(physical.capacity);
             if !live_claim.fits_within(physical.available) {
                 return Err(Error::Overloaded(format!(
-                    "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, other_pending_by_class={:?}",
+                    "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, other_live_by_class={:?}",
                     physical.available, physical.capacity, state.pending_by_class(Some(id))?
                 )));
             }
@@ -1538,6 +1548,11 @@ mod tests {
             assert_eq!(summaries[1].pending, slots(100));
             assert_eq!(summaries[2].reservations, 1);
             assert_eq!(summaries[2].pending, slots(20));
+            // The per-class summary names which residency holds the device:
+            // the cache lease reserved 100 slots, materialized 80, and still
+            // owes 20 pending.
+            assert_eq!(summaries[2].reserved, slots(100));
+            assert_eq!(summaries[2].materialized, slots(80));
             let total = summaries
                 .iter()
                 .fold(ResourceVector::zero(), |sum, summary| {
@@ -1547,6 +1562,7 @@ mod tests {
             let excluded = state.pending_by_class(cache.id).unwrap();
             assert_eq!(excluded[2].reservations, 0);
             assert_eq!(excluded[2].pending, slots(0));
+            assert_eq!(excluded[2].reserved, slots(0));
         }
         let before = authority.snapshot();
         let message = authority
@@ -1556,16 +1572,16 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(message.contains("existing_pending_by_class="));
+        assert!(message.contains("live_by_class="));
         assert!(message.contains("BatchWorkspace"));
         assert!(!message.contains("private-"));
-        assert!(message.len() < 3000);
+        assert!(message.len() < 4500);
         assert_eq!(authority.snapshot(), before);
         let growth_message = authority
             .resize(cache.id.unwrap(), slots(600))
             .unwrap_err()
             .to_string();
-        assert!(growth_message.contains("other_pending_by_class="));
+        assert!(growth_message.contains("other_live_by_class="));
         assert!(!growth_message.contains("private-"));
         assert_eq!(authority.snapshot(), before);
         drop((cache, requests));

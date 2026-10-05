@@ -27,16 +27,16 @@ use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::models::shared::moe::ExpertActivationCounters;
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use super::gguf::{parse_fixture_gguf_config, QWEN35_MOE_FIXTURE_GGUF_FILENAME};
-use super::native::Qwen35MoeNativeCheckpoint;
+use super::gguf::{parse_fixture_gguf_config, QWEN36_MOE_FIXTURE_GGUF_FILENAME};
+use super::native::Qwen36MoeNativeCheckpoint;
 use super::native_model::load_text_model_native;
 
-pub struct Qwen35MoeChatModel {
+pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
     exec: Qwen35ChatExec,
 }
 
-impl InferenceStateContractProvider for Qwen35MoeChatModel {
+impl InferenceStateContractProvider for Qwen36MoeChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         let dtype = match self.device_kind {
             BackendKind::Cuda => DType::F16,
@@ -48,7 +48,7 @@ impl InferenceStateContractProvider for Qwen35MoeChatModel {
     }
 }
 
-impl Qwen35MoeChatModel {
+impl Qwen36MoeChatModel {
     /// Load the Qwen3.6-35B-A3B-FP8 family (qwen3_5_moe architecture) from
     /// its native bundle, or from a synthetic GGUF fixture when one is
     /// present (CI-only; the published variant never ships as GGUF).
@@ -59,7 +59,7 @@ impl Qwen35MoeChatModel {
             )));
         }
         let device_kind = BackendKind::from(device.kind);
-        let fixture_path = model_dir.join(QWEN35_MOE_FIXTURE_GGUF_FILENAME);
+        let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let exec = if fixture_path.exists() {
             Self::load_fixture_gguf(model_dir, &fixture_path, variant, &device)?
         } else {
@@ -96,7 +96,7 @@ impl Qwen35MoeChatModel {
         variant: ModelVariant,
         device: &DeviceProfile,
     ) -> Result<Qwen35ChatExec> {
-        let checkpoint = Qwen35MoeNativeCheckpoint::open(model_dir)?;
+        let checkpoint = Qwen36MoeNativeCheckpoint::open(model_dir)?;
         let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model) =
             load_text_model_native(&checkpoint, device, &device.device)?;
@@ -472,59 +472,59 @@ mod tests {
         let metadata: Vec<(&str, gguf_file::Value)> = vec![
             (
                 "general.architecture",
-                gguf_file::Value::String("qwen35moe".into()),
+                gguf_file::Value::String("qwen36moe".into()),
             ),
-            ("qwen35moe.block_count", gguf_file::Value::U64(4)),
-            ("qwen35moe.context_length", gguf_file::Value::U64(64)),
+            ("qwen36moe.block_count", gguf_file::Value::U64(4)),
+            ("qwen36moe.context_length", gguf_file::Value::U64(64)),
             (
-                "qwen35moe.embedding_length",
+                "qwen36moe.embedding_length",
                 gguf_file::Value::U64(hidden as u64),
             ),
             (
-                "qwen35moe.feed_forward_length",
+                "qwen36moe.feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_EXPERT_FF as u64),
             ),
-            ("qwen35moe.attention.head_count", gguf_file::Value::U64(4)),
+            ("qwen36moe.attention.head_count", gguf_file::Value::U64(4)),
             (
-                "qwen35moe.attention.head_count_kv",
+                "qwen36moe.attention.head_count_kv",
                 gguf_file::Value::U64(2),
             ),
-            ("qwen35moe.attention.key_length", gguf_file::Value::U64(8)),
-            ("qwen35moe.attention.value_length", gguf_file::Value::U64(8)),
+            ("qwen36moe.attention.key_length", gguf_file::Value::U64(8)),
+            ("qwen36moe.attention.value_length", gguf_file::Value::U64(8)),
             (
-                "qwen35moe.attention.layer_norm_rms_epsilon",
+                "qwen36moe.attention.layer_norm_rms_epsilon",
                 gguf_file::Value::F64(1e-5),
             ),
             (
-                "qwen35moe.rope.dimension_sections",
+                "qwen36moe.rope.dimension_sections",
                 gguf_file::Value::Array(vec![
                     gguf_file::Value::U64(2),
                     gguf_file::Value::U64(2),
                     gguf_file::Value::U64(2),
                 ]),
             ),
-            ("qwen35moe.rope.dimension_count", gguf_file::Value::U64(8)),
-            ("qwen35moe.rope.freq_base", gguf_file::Value::F64(10_000.0)),
-            ("qwen35moe.ssm.conv_kernel", gguf_file::Value::U64(4)),
-            ("qwen35moe.ssm.state_size", gguf_file::Value::U64(8)),
-            ("qwen35moe.ssm.group_count", gguf_file::Value::U64(2)),
-            ("qwen35moe.ssm.time_step_rank", gguf_file::Value::U64(4)),
-            ("qwen35moe.ssm.inner_size", gguf_file::Value::U64(32)),
+            ("qwen36moe.rope.dimension_count", gguf_file::Value::U64(8)),
+            ("qwen36moe.rope.freq_base", gguf_file::Value::F64(10_000.0)),
+            ("qwen36moe.ssm.conv_kernel", gguf_file::Value::U64(4)),
+            ("qwen36moe.ssm.state_size", gguf_file::Value::U64(8)),
+            ("qwen36moe.ssm.group_count", gguf_file::Value::U64(2)),
+            ("qwen36moe.ssm.time_step_rank", gguf_file::Value::U64(4)),
+            ("qwen36moe.ssm.inner_size", gguf_file::Value::U64(32)),
             (
-                "qwen35moe.full_attention_interval",
+                "qwen36moe.full_attention_interval",
                 gguf_file::Value::U64(2),
             ),
             (
-                "qwen35moe.expert_count",
+                "qwen36moe.expert_count",
                 gguf_file::Value::U64(FIXTURE_EXPERTS as u64),
             ),
-            ("qwen35moe.expert_used_count", gguf_file::Value::U64(2)),
+            ("qwen36moe.expert_used_count", gguf_file::Value::U64(2)),
             (
-                "qwen35moe.expert_feed_forward_length",
+                "qwen36moe.expert_feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_EXPERT_FF as u64),
             ),
             (
-                "qwen35moe.expert_shared_feed_forward_length",
+                "qwen36moe.expert_shared_feed_forward_length",
                 gguf_file::Value::U64(FIXTURE_SHARED_FF as u64),
             ),
             ("tokenizer.ggml.tokens", tokenizer_values[0].clone()),
@@ -535,7 +535,7 @@ mod tests {
             ("tokenizer.ggml.eos_token_id", tokenizer_values[5].clone()),
         ];
 
-        let path = dir.join(QWEN35_MOE_FIXTURE_GGUF_FILENAME);
+        let path = dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let mut file = std::fs::File::create(&path).expect("create fixture gguf");
         let weight_refs: Vec<(&str, &QTensor)> = tensors
             .iter()
@@ -550,21 +550,21 @@ mod tests {
     }
 
     fn fixture_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("izwi-qwen35moe-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("izwi-qwen36moe-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn load_fixture(tag: &str) -> (Qwen35MoeChatModel, PathBuf) {
+    fn load_fixture(tag: &str) -> (Qwen36MoeChatModel, PathBuf) {
         let dir = fixture_dir(tag);
         write_fixture(&dir);
         let model =
-            Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, DeviceProfile::cpu())
-                .expect("load qwen35moe fixture");
+            Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, DeviceProfile::cpu())
+                .expect("load qwen36moe fixture");
         (model, dir)
     }
 
-    fn physical_cache(model: &Qwen35MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
+    fn physical_cache(model: &Qwen36MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};
@@ -962,7 +962,7 @@ mod tests {
             let dir = fixture_dir("parity");
             write_fixture(&dir);
             let model =
-                Qwen35MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, device.clone())
+                Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, device.clone())
                     .expect("load fixture");
             let messages = vec![ChatMessage {
                 role: ChatRole::User,

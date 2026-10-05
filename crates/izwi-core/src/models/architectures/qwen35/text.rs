@@ -30,14 +30,14 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
-use crate::models::architectures::qwen35moe::sparse::Qwen35MoeSparseMlp;
+use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
 pub struct Qwen35TextModel {
     device: Device,
     token_embeddings: Embedding,
     layers: Vec<Qwen35Layer>,
     output_norm: RmsNorm,
-    output: QMatMul,
+    output: Qwen35Projection,
     finite_diagnostics_enabled: bool,
 }
 
@@ -288,16 +288,16 @@ enum Qwen35Mixer {
 }
 
 struct Qwen35Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: Qwen35Projection,
+    up: Qwen35Projection,
+    down: Qwen35Projection,
 }
 
 struct Qwen35FullAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: Qwen35Projection,
+    k_proj: Qwen35Projection,
+    v_proj: Qwen35Projection,
+    o_proj: Qwen35Projection,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -311,16 +311,16 @@ struct Qwen35FullAttention {
 }
 
 struct Qwen35LinearAttention {
-    qkv_proj: QMatMul,
-    gate_proj: QMatMul,
-    beta_proj: QMatMul,
-    alpha_proj: QMatMul,
+    qkv_proj: Qwen35Projection,
+    gate_proj: Qwen35Projection,
+    beta_proj: Qwen35Projection,
+    alpha_proj: Qwen35Projection,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
     conv_kernel_slices: Vec<Tensor>,
     norm: Qwen35GatedRmsNorm,
-    out_proj: QMatMul,
+    out_proj: Qwen35Projection,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -348,17 +348,40 @@ pub struct Qwen35MoeFfnGeometry {
 }
 
 /// Checkpoint-format seam for the shared Qwen3.5 hybrid trunk. The dense
-/// GGUF family and the qwen35moe loaders (native block-FP8 safetensors and
+/// GGUF family and the qwen36moe loaders (native block-FP8 safetensors and
 /// the synthetic GGUF fixture) build the identical model through this
 /// interface; only tensor naming, residency, and MoE weight layout differ.
 ///
 /// Names handed to the source are the logical GGUF-style names
 /// (`token_embd.weight`, `blk.{i}.attn_q.weight`, ...); implementations
 /// translate to their own checkpoint layout internally.
+/// Persistent residency form of one trunk projection. `Quantized` keeps
+/// candle quantized-matmul residency (GGUF tensors, packed Q8_0 requants,
+/// expanded F16/BF16); `CompactFp8` keeps the checkpoint's raw block-FP8
+/// bytes plus F32 block scales resident and decodes per GEMM inside the CUDA
+/// fp8 projection kernel — no expanded persistent weight tensor exists.
+#[derive(Clone)]
+pub(crate) enum Qwen35Projection {
+    Quantized(QMatMul),
+    CompactFp8 { weights: Tensor, scales: Tensor },
+}
+
+impl Qwen35Projection {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Quantized(qmatmul) => Ok(qmatmul.forward(x)?),
+            Self::CompactFp8 { weights, scales } => {
+                crate::kernels::cuda::fp8::block_fp8_projection(x, weights, scales)
+                    .map_err(Error::from)
+            }
+        }
+    }
+}
+
 pub(crate) trait Qwen35WeightSource {
     fn has(&self, name: &str) -> bool;
 
-    fn qmatmul(&self, name: &str, device: &Device) -> Result<QMatMul>;
+    fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection>;
 
     fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm>;
 
@@ -372,13 +395,13 @@ pub(crate) trait Qwen35WeightSource {
         layer: usize,
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
-    ) -> Result<Qwen35MoeSparseMlp>;
+    ) -> Result<Qwen36MoeSparseMlp>;
 
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
 }
 
-/// GGUF-backed source for the dense Qwen3.5 family and the qwen35moe
+/// GGUF-backed source for the dense Qwen3.5 family and the qwen36moe
 /// synthetic fixture checkpoints (fused `ffn_*_exps` expert tensors).
 pub(crate) struct GgufSource<'a> {
     loader: &'a GgufLoader,
@@ -395,8 +418,10 @@ impl Qwen35WeightSource for GgufSource<'_> {
         self.loader.has_tensor(name)
     }
 
-    fn qmatmul(&self, name: &str, device: &Device) -> Result<QMatMul> {
-        load_qmatmul(self.loader, device, name)
+    fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection> {
+        Ok(Qwen35Projection::Quantized(load_qmatmul(
+            self.loader, device, name,
+        )?))
     }
 
     fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
@@ -412,8 +437,8 @@ impl Qwen35WeightSource for GgufSource<'_> {
         layer: usize,
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
-    ) -> Result<Qwen35MoeSparseMlp> {
-        crate::models::architectures::qwen35moe::sparse::load_gguf_sparse_mlp(
+    ) -> Result<Qwen36MoeSparseMlp> {
+        crate::models::architectures::qwen36moe::sparse::load_gguf_sparse_mlp(
             self.loader,
             layer,
             geometry,
@@ -433,7 +458,7 @@ impl Qwen35WeightSource for GgufSource<'_> {
 /// expert block. Mirrors `Qwen3FeedForward` on the qwen3 family.
 enum Qwen35FeedForward {
     Dense(Qwen35Mlp),
-    Sparse(Qwen35MoeSparseMlp),
+    Sparse(Qwen36MoeSparseMlp),
 }
 
 impl Qwen35FeedForward {
@@ -482,9 +507,9 @@ impl Qwen35TextModel {
         let token_embeddings = Embedding::new(embedding_weights, hidden_size);
         let output_norm = source.rms_norm("output_norm.weight", cfg.attention_layer_norm_rms_epsilon, device)?;
         let output = if source.has("output.weight") {
-            source.qmatmul("output.weight", device)?
+            source.projection("output.weight", device)?
         } else {
-            source.qmatmul("token_embd.weight", device)?
+            source.projection("token_embd.weight", device)?
         };
         let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
 
@@ -1028,9 +1053,9 @@ impl Qwen35Mlp {
         prefix: &str,
     ) -> Result<Self> {
         Ok(Self {
-            gate: source.qmatmul(&format!("{prefix}.ffn_gate.weight"), device)?,
-            up: source.qmatmul(&format!("{prefix}.ffn_up.weight"), device)?,
-            down: source.qmatmul(&format!("{prefix}.ffn_down.weight"), device)?,
+            gate: source.projection(&format!("{prefix}.ffn_gate.weight"), device)?,
+            up: source.projection(&format!("{prefix}.ffn_up.weight"), device)?,
+            down: source.projection(&format!("{prefix}.ffn_down.weight"), device)?,
         })
     }
 
@@ -1046,7 +1071,7 @@ impl Qwen35Mlp {
             (&gate * &up_proj_out)?
         };
 
-        self.down.forward(&hidden).map_err(Error::from)
+        self.down.forward(&hidden)
     }
 }
 
@@ -1058,10 +1083,10 @@ impl Qwen35FullAttention {
         cfg: &Qwen35TextConfig,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: source.qmatmul(&format!("{prefix}.attn_q.weight"), device)?,
-            k_proj: source.qmatmul(&format!("{prefix}.attn_k.weight"), device)?,
-            v_proj: source.qmatmul(&format!("{prefix}.attn_v.weight"), device)?,
-            o_proj: source.qmatmul(&format!("{prefix}.attn_output.weight"), device)?,
+            q_proj: source.projection(&format!("{prefix}.attn_q.weight"), device)?,
+            k_proj: source.projection(&format!("{prefix}.attn_k.weight"), device)?,
+            v_proj: source.projection(&format!("{prefix}.attn_v.weight"), device)?,
+            o_proj: source.projection(&format!("{prefix}.attn_output.weight"), device)?,
             q_norm: source.rms_norm(
                 &format!("{prefix}.attn_q_norm.weight"),
                 cfg.attention_layer_norm_rms_epsilon,
@@ -1166,7 +1191,7 @@ impl Qwen35FullAttention {
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     fn forward_physical_decode_batch(
@@ -1283,7 +1308,7 @@ impl Qwen35FullAttention {
             self.num_heads * self.head_dim,
         ))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     fn apply_rope(
@@ -1498,16 +1523,16 @@ impl Qwen35LinearAttention {
         };
 
         Ok(Self {
-            qkv_proj: source.qmatmul(&format!("{prefix}.attn_qkv.weight"), device)?,
-            gate_proj: source.qmatmul(&format!("{prefix}.attn_gate.weight"), device)?,
-            beta_proj: source.qmatmul(&format!("{prefix}.ssm_beta.weight"), device)?,
-            alpha_proj: source.qmatmul(&format!("{prefix}.ssm_alpha.weight"), device)?,
+            qkv_proj: source.projection(&format!("{prefix}.attn_qkv.weight"), device)?,
+            gate_proj: source.projection(&format!("{prefix}.attn_gate.weight"), device)?,
+            beta_proj: source.projection(&format!("{prefix}.ssm_beta.weight"), device)?,
+            alpha_proj: source.projection(&format!("{prefix}.ssm_alpha.weight"), device)?,
             dt_bias,
             a,
             conv_kernel,
             conv_kernel_slices,
             norm,
-            out_proj: source.qmatmul(&format!("{prefix}.ssm_out.weight"), device)?,
+            out_proj: source.projection(&format!("{prefix}.ssm_out.weight"), device)?,
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -1597,7 +1622,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_decode_batch(
@@ -1691,7 +1716,7 @@ impl Qwen35LinearAttention {
             1,
             self.num_v_heads * self.head_v_dim,
         ))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_sequence(
@@ -1823,7 +1848,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn depthwise_conv_sequence(
@@ -2395,7 +2420,7 @@ mod tests {
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
         softplus, ConvRingState, Qwen35GatedRmsNorm, Qwen35LayerRuntimeState,
-        Qwen35LinearAttention, Qwen35TextRuntimeState,
+        Qwen35LinearAttention, Qwen35Projection, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2430,7 +2455,7 @@ mod tests {
             )
             .unwrap();
             let weights = QTensor::quantize(&weights, GgmlDType::F32).unwrap();
-            QMatMul::from_arc(Arc::new(weights)).unwrap()
+            Qwen35Projection::Quantized(QMatMul::from_arc(Arc::new(weights)).unwrap())
         };
         let conv_kernel = Tensor::from_vec(
             (0..24)

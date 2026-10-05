@@ -3,14 +3,17 @@
 //!
 //! The numbers derive from the loader's own pinned tensor plan, so admission
 //! can never drift from what the checkpoint actually materializes: CPU packs
-//! projections as Q8_0 and keeps dense tensors in F32, Metal expands F16,
-//! CUDA expands BF16 (`projection_residency_policy`). Scale companions and
-//! MTP/vision tensors never become resident text-trunk state.
+//! projections as Q8_0 and keeps dense tensors in F32, Metal expands F16
+//! (Apple GPUs have no FP8 path), and CUDA keeps the checkpoint's raw
+//! block-FP8 bytes resident with per-tensor packed-Q8_0 fallback for tensors
+//! the fp8 projection kernel cannot execute (`projection_residency_policy`).
+//! Scale companions and MTP/vision tensors never become resident text-trunk
+//! state.
 use super::{ModelMemoryEstimate, ModelResourcePlan};
 use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen35moe::native::pinned_representation_inventory;
+use crate::models::architectures::qwen36moe::native::pinned_representation_inventory;
 use std::path::Path;
 
 const PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
@@ -25,7 +28,9 @@ fn overflow() -> Error {
 }
 
 /// Resident bytes of the pinned checkpoint on one backend: packed Q8_0
-/// projections plus F32 dense state on CPU, expanded F16/BF16 elsewhere.
+/// projections plus F32 dense state on CPU, expanded F16 on Metal, and raw
+/// block-FP8 bytes plus F32 block scales on CUDA (with packed-Q8_0 fallback
+/// for kernel-incompatible tensors).
 fn resident_bytes(backend: BackendKind) -> Result<u64> {
     let inventory = pinned_representation_inventory();
     let q8_bytes = inventory
@@ -34,21 +39,45 @@ fn resident_bytes(backend: BackendKind) -> Result<u64> {
         .ok_or_else(overflow)?
         / Q8_0_BLOCK_ELEMENTS
         * Q8_0_BLOCK_BYTES;
+    let dense_bytes = |scale: u64| {
+        inventory
+            .dense_elements
+            .checked_mul(scale)
+            .ok_or_else(overflow)
+    };
     match backend {
         BackendKind::Cpu => q8_bytes
-            .checked_add(
-                inventory
-                    .dense_elements
-                    .checked_mul(4)
-                    .ok_or_else(overflow)?,
-            )
+            .checked_add(dense_bytes(4)?)
             .ok_or_else(overflow),
-        BackendKind::Metal | BackendKind::Cuda => (inventory
+        BackendKind::Metal => (inventory
             .fp8_elements
             .checked_add(inventory.dense_elements)
             .ok_or_else(overflow)?)
         .checked_mul(2)
         .ok_or_else(overflow),
+        BackendKind::Cuda => {
+            // Native block-FP8 residency: conforming tensors keep raw E4M3FN
+            // bytes (1 B/element) plus their F32 block scales; the remainder
+            // materializes as packed Q8_0. The runtime reconciles the lease
+            // against materialized usage at publication, so any drift between
+            // this estimate and the assembled representation fails loudly.
+            let compatible = inventory
+                .fp8_elements
+                .saturating_sub(inventory.fp8_incompatible_elements);
+            let fallback_q8_bytes = inventory
+                .fp8_incompatible_elements
+                .checked_add(Q8_0_BLOCK_ELEMENTS - 1)
+                .ok_or_else(overflow)?
+                / Q8_0_BLOCK_ELEMENTS
+                * Q8_0_BLOCK_BYTES;
+            compatible
+                .checked_add(inventory.fp8_scale_bytes)
+                .ok_or_else(overflow)?
+                .checked_add(fallback_q8_bytes)
+                .ok_or_else(overflow)?
+                .checked_add(dense_bytes(2)?)
+                .ok_or_else(overflow)
+        }
     }
 }
 
@@ -82,8 +111,8 @@ pub(super) fn resource_plan(backend: BackendKind) -> Result<ModelResourcePlan> {
     let estimate = representation_memory_estimate(backend)?;
     let mut plan = super::model_resource_plan(backend, estimate);
     if backend == BackendKind::Cuda {
-        // Host memory only holds the shard/dequantization staging window; the
-        // expanded BF16 representation materializes directly on the device.
+        // Host memory only holds the shard/staging window; the raw block-FP8
+        // representation uploads directly to the device.
         plan.load_authorization.host_bytes = ResourceAmount::Known(CUDA_HOST_STAGING_BYTES);
     }
     Ok(plan)
@@ -128,6 +157,11 @@ mod tests {
         assert_eq!(inventory.fp8_elements, 33_617_346_560);
         assert!(inventory.fp8_elements.is_multiple_of(Q8_0_BLOCK_ELEMENTS));
         assert_eq!(inventory.dense_elements, 1_043_264_128);
+        // The published projection geometry satisfies the CUDA fp8 kernel
+        // contract (n % 64 == 0, k % 128 == 0), so the native-FP8 residency
+        // estimate covers the whole FP8 bucket with no Q8_0 fallback.
+        assert_eq!(inventory.fp8_incompatible_elements, 0);
+        assert!(inventory.fp8_scale_bytes > 0);
         // MoE scale: weights plus scale companions exceed 50k tensors, so the
         // per-tensor instantiation slack is a load-peak term, not noise.
         assert!(inventory.tensor_count > 50_000);
@@ -171,13 +205,27 @@ mod tests {
         );
         assert!(cpu.load_peak_bytes > cpu.resident_bytes);
 
-        for estimate in [metal, cuda] {
-            let expected = (inventory.fp8_elements + inventory.dense_elements) * 2;
-            assert_eq!(estimate.resident_bytes, expected);
-            assert!(estimate.load_peak_bytes > estimate.resident_bytes);
-        }
-        // Metal F16/CUDA BF16 expansion stays below CPU Q8_0 + F32 dense here
-        // because the dense bucket is small relative to the FP8 projections.
+        let expected_metal = (inventory.fp8_elements + inventory.dense_elements) * 2;
+        assert_eq!(metal.resident_bytes, expected_metal);
+        assert!(metal.load_peak_bytes > metal.resident_bytes);
+
+        // CUDA native-FP8 residency: raw E4M3FN bytes (1 B/element) plus F32
+        // block scales for the kernel-conforming projections (all of them in
+        // the pinned census), plus BF16 dense companions.
+        let expected_cuda = inventory.fp8_elements
+            + inventory.fp8_scale_bytes
+            + inventory.dense_elements * 2;
+        assert_eq!(cuda.resident_bytes, expected_cuda);
+        assert!(cuda.load_peak_bytes > cuda.resident_bytes);
+        // The compact residency holds ~half of the Metal F16 expansion and
+        // stays below even the CPU Q8_0 + F32-dense envelope.
+        assert!(
+            cuda.resident_bytes < metal.resident_bytes && cuda.resident_bytes < cpu.resident_bytes,
+            "CUDA {} vs metal {} vs cpu {}",
+            cuda.resident_bytes,
+            metal.resident_bytes,
+            cpu.resident_bytes
+        );
     }
 
     #[test]
@@ -189,7 +237,7 @@ mod tests {
         );
         assert!(matches!(
             plan.load_authorization.device_bytes,
-            ResourceAmount::Known(bytes) if bytes > 60 * GIB
+            ResourceAmount::Known(bytes) if bytes > 30 * GIB && bytes < 40 * GIB
         ));
         let cpu_plan = resource_plan(BackendKind::Cpu).unwrap();
         assert!(matches!(

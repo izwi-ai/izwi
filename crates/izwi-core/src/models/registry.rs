@@ -83,7 +83,7 @@ use crate::models::architectures::qwen35::chat::{
     ChatDecodeState as Qwen35ChatDecodeState, Qwen35ChatModel, Qwen35PreparedPrompt,
     Qwen35SharedStepCheckpoint,
 };
-use crate::models::architectures::qwen35moe::chat::Qwen35MoeChatModel;
+use crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel;
 use crate::models::architectures::qwen38::chat::{
     ChatDecodeState as Qwen38ChatDecodeState, Qwen38ChatModel, Qwen38PreparedPrompt,
     Qwen38SharedStepCheckpoint,
@@ -390,7 +390,7 @@ fn load_qwen35_moe_chat_model(
 ) -> Result<NativeChatModel> {
     // Hybrid-recurrent prefix reuse is unproven for this family (the DS1
     // catalog cell is excluded), so the mode is deliberately not engaged.
-    Ok(NativeChatModel::Qwen35Moe(Qwen35MoeChatModel::load(
+    Ok(NativeChatModel::Qwen35Moe(Qwen36MoeChatModel::load(
         model_dir, variant, device,
     )?))
 }
@@ -3697,7 +3697,7 @@ impl NativeDiarizationModel {
 pub enum NativeChatModel {
     Qwen3(Qwen3ChatModel),
     Qwen35(Qwen35ChatModel),
-    Qwen35Moe(Qwen35MoeChatModel),
+    Qwen35Moe(Qwen36MoeChatModel),
     Qwen38(Qwen38ChatModel),
     Gemma3(Gemma3ChatModel),
     Lfm2(Lfm2ChatModel),
