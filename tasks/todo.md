@@ -20461,3 +20461,63 @@ code. Evidence cycle: annotation probes re-added per failing lane
 Final probe-free validation run: 54045e55. If a random lane 101 recurs,
 re-run before diagnosing code; probes pattern is in the round-2 commits'
 history (tee + `::error::` annotation, ~4 min per iteration).
+
+---
+
+# Plan — Qwen3.6 native-FP8 CUDA residency + arena fitting (impl) — 2026-10-05
+
+Implements tasks/qwen36-cuda-capacity-research-2026-10-05.md (rev 2) on branch
+`qwen36-native-fp8` (base: main @ b658ac2f, includes the #218 FP8 contract fix).
+P3 (H100 perf certification / Auto flip) is hardware-gated — NOT in this branch.
+P0 (deployed-config unblock) is a deployment action, not a repo commit.
+
+- [x] C1 `refactor(qwen35)`: trunk projection seam — `Qwen35Projection` enum
+      (Quantized | CompactFp8) + `Qwen35WeightSource::qmatmul` → `projection`
+      rename + trunk fields/call sites + GGUF source wrap. No behavior change.
+- [x] C2 `feat(qwen35moe)`: native block-FP8 compact materialization —
+      `Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback`,
+      `Qwen35MoeProjection::CompactFp8(RawBlockFp8Projection)` via the shared
+      `IndexedSafetensors::materialize_block_fp8_raw`, per-tensor Q8_0
+      fallback when the fp8 kernel geometry/CC gate fails
+      (`kernels::cuda::fp8::provider_supported`), `Qwen35MoeLinear::CompactFp8`
+      expert arm. Not yet the default.
+- [x] C3 `feat(qwen35moe)`: flip CUDA policy to NativeFp8WithQ8Fallback +
+      qwen35moe_memory admission math (CUDA resident = fp8 bytes + F32 scales +
+      dense×2 ≈ 33.25 GiB) + pinned test updates.
+- [x] C4 `feat(lifecycle)`: extend `fit_cuda_resident_context` to
+      `ModelFamily::Qwen35MoeChat` (arena fits resident headroom) + test pin
+      updates + guarded-authority fitted-state test.
+- [x] C5 `feat(resources)`: live-claim breakdown (reserved/materialized per
+      class, no owner keys per the documented privacy constraint) in the
+      guarded rejection payload.
+- [x] Verify: CPU lane (cli/server checks, core 2762+7+3, server 743,
+      kv-cache matrix, kv soak), metal lane (2811+7+3), workspace clippy
+      -D warnings. CUDA compile left to CI (no local nvcc).
+
+## Review (2026-10-05)
+
+Commits on `qwen36-native-fp8` (base main @ b658ac2f):
+1. 4e1c6ace refactor(qwen35): trunk projection seam (Qwen35Projection enum,
+   trait qmatmul -> projection; no behavior change).
+2. 3048fb2d feat(qwen35moe): native block-FP8 compact materialization +
+   per-tensor Q8_0 fallback + CPU end-to-end tests.
+3. 136f2567 feat(qwen35moe): CUDA policy flip + admission re-derivation
+   (fp8 bytes + F32 scales + Q8 fallback + BF16 dense = ~33.3 GiB resident,
+   down from 64.6 GiB expanded).
+4. 48f942ea feat(lifecycle): fit_cuda_resident_context extended to
+   Qwen35MoeChat (arena fits post-weights headroom; no more hard 503).
+5. c692bbb8 feat(resources): live_by_class (reserved/materialized/pending
+   per class, no owner keys) in guarded rejection payloads.
+6. c9b058ad chore(qwen35): clippy fallout (redundant map_err at the six
+   seam call sites + needless borrow).
+
+Deliberate deviations: P4a (state-arena floor inside the load
+authorization) intentionally dropped — the C4 fitting makes the arena fit
+by construction, and the Guarded authority reconciles materialized usage
+at publication so any estimate drift fails loudly anyway. P3 (H100
+benchmark + provider_auto_preferred flip) remains hardware-gated.
+
+Risks for the H100 handoff: (1) the fp8 kernel perf is unmeasured (that
+is P3); (2) CUDA-compile lane must run in CI before merge; (3) a real
+checkpoint load must be re-verified end-to-end (contract fix + compact
+residency + fitted arena) with the representation diagnostics logged.
