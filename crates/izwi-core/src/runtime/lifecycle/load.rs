@@ -3019,11 +3019,17 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use uuid::Uuid;
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
         use crate::models::architectures::fish_s2::{fish_s2_physical_state_spec, FishS2TtsModel};
         use crate::runtime::adapters::LoadedModelBundleDraft;
         use crate::runtime::adapters::StreamingRequirements;
+        // Serialize against the OOM-ladder poison window on the process-
+        // global resource authority (see METAL_OOM_LADDER_TEST_LOCK).
+        let _authority_ladder = METAL_OOM_LADDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let directory =
             std::env::temp_dir().join(format!("izwi-fish-state-publication-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -4494,7 +4500,10 @@ mod tests {
 
     /// The resource-authority registry is process-global: the Metal OOM
     /// ladder tests serialize against each other and restore the authority
-    /// on exit so concurrent cases never observe their poison.
+    /// on exit. The poisoned window between the injected failure and the
+    /// on-drop restore is observable by any concurrent reader of the global
+    /// authority, so tests whose load path consults it (the fish_s2
+    /// publication test) must hold this lock too.
     static METAL_OOM_LADDER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct ClearAuthorityPoisonOnDrop(Arc<ResourceAuthority>);

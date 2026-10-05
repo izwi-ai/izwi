@@ -4381,6 +4381,10 @@ mod tests {
 
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_arena_device() {
+        // resolve_streaming_config reads the profile env var on every call;
+        // hold the lock so a concurrent profile test cannot flip this
+        // default-profile resolution into an override-rejection error.
+        let _env = env_lock().lock().unwrap();
         let cases = [
             ("v2.1", streaming_cfg_for_test()),
             (
@@ -4417,6 +4421,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_metal_arena_device() {
+        let _env = env_lock().lock().unwrap();
         let Some(device) = crate::backends::metal_device_if_available(0) else {
             // No Metal device on this host: the CPU test above still covers
             // the device-routing contract.
@@ -4449,6 +4454,7 @@ mod tests {
     #[ignore = "requires CUDA hardware"]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_cuda_arena_device() {
+        let _env = env_lock().lock().unwrap();
         let device = Device::new_cuda(0).unwrap();
         let cfg = resolve_streaming_config(
             ModelVariant::Nemotron3Diarization,
@@ -4765,6 +4771,10 @@ mod tests {
 
     #[test]
     fn resolve_streaming_config_nemotron3_uses_checkpoint_values_and_rejects_overrides() {
+        // Both resolutions read the profile env var; one lock must span
+        // them so a concurrent profile test cannot flip the default-profile
+        // case into the override-rejection error.
+        let _env = env_lock().lock().unwrap();
         let modules_cfg = SortformerModulesConfig {
             fc_d_model: Some(512),
             subsampling_factor: Some(8),
@@ -4791,7 +4801,6 @@ mod tests {
         assert_eq!(cfg.spkcache_update_period, 264);
         assert_eq!(cfg.fifo_len, 0);
 
-        let _env = env_lock().lock().unwrap();
         let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
         let previous = std::env::var(key).ok();
         std::env::set_var(key, "high");

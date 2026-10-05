@@ -954,7 +954,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fixture_generation_matches_between_cpu_and_metal() {
-        let Some(metal_device) = crate::backends::metal_device_if_available(0) else {
+        let Some(_metal_device) = crate::backends::metal_device_if_available(0) else {
             eprintln!("metal device unavailable; parity leg not run");
             return;
         };
