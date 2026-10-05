@@ -686,7 +686,7 @@ fn generate_qwen38_benchmark_fixture() {
     let dir = write_tiny_qwen38_hybrid_fixture(std::path::Path::new(&root));
     println!("fixture model dir: {}", dir.display());
 }
-/// Tiny synthetic native block-FP8 Qwen3.5-MoE checkpoint: a forward-capable
+/// Tiny synthetic native block-FP8 Qwen3.5/3.6-MoE checkpoint: a forward-capable
 /// 4-layer hybrid trunk (3 DeltaNet + 1 gated full attention, interval 4) with
 /// 2 routed experts (top-1) plus a shared expert. Values mirror the in-process
 /// `qwen35moe::native` recovery fixtures exactly: all-ones weights, 0x38
@@ -915,25 +915,26 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
                 1.0,
             ));
         } else {
-            // Gated DeltaNet: fused input projections are dense, out_proj is
-            // a block-FP8 pair — the checkpoint contract.
-            tensors.push(dense(
+            // Gated DeltaNet: in_proj_qkv/in_proj_z and out_proj are
+            // block-FP8 pairs, the per-head tensors stay dense — the
+            // checkpoint contract.
+            tensors.extend(fp8_projection(
                 format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                &[SSM_CONV_CHANNELS, HIDDEN],
-                1.0,
+                SSM_CONV_CHANNELS,
+                HIDDEN,
             ));
-            tensors.push(dense(
+            tensors.extend(fp8_projection(
                 format!("{prefix}.linear_attn.in_proj_z.weight"),
-                &[SSM_V_WIDTH, HIDDEN],
-                1.0,
+                SSM_V_WIDTH,
+                HIDDEN,
             ));
             tensors.push(dense(
-                format!("{prefix}.linear_attn.b_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_b.weight"),
                 &[SSM_TIME_STEP_RANK, HIDDEN],
                 1.0,
             ));
             tensors.push(dense(
-                format!("{prefix}.linear_attn.a_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_a.weight"),
                 &[SSM_TIME_STEP_RANK, HIDDEN],
                 1.0,
             ));

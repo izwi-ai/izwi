@@ -21,7 +21,7 @@ const Q8_0_BLOCK_ELEMENTS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
 
 fn overflow() -> Error {
-    Error::ModelLoadError("Qwen3.5-MoE memory estimate overflow".into())
+    Error::ModelLoadError("Qwen3.5/3.6-MoE memory estimate overflow".into())
 }
 
 /// Resident bytes of the pinned checkpoint on one backend: packed Q8_0
@@ -93,10 +93,10 @@ pub(super) fn resource_plan(backend: BackendKind) -> Result<ModelResourcePlan> {
 /// checkpoint inventory with a worst-case F32 expansion envelope, since the
 /// fixture cannot carry the pinned element counts.
 pub(super) fn synthetic_fixture_estimate(model_path: &Path) -> Result<ModelMemoryEstimate> {
-    let overflow = || Error::ModelLoadError("Qwen3.5-MoE fixture memory estimate overflow".into());
+    let overflow = || Error::ModelLoadError("Qwen3.5/3.6-MoE fixture memory estimate overflow".into());
     let Some(inventory) = super::checkpoint_tensor_inventory(model_path)? else {
         return Err(Error::ModelLoadError(
-            "Synthetic Qwen3.5-MoE fixture has no readable tensor inventory".into(),
+            "Synthetic Qwen3.5/3.6-MoE fixture has no readable tensor inventory".into(),
         ));
     };
     let resident_bytes = inventory.total_bytes.checked_mul(4).ok_or_else(overflow)?;
@@ -122,11 +122,12 @@ mod tests {
         let inventory = pinned_representation_inventory();
         // Exact element counts derived from the pinned geometry: 40 layers ×
         // (256 experts + shared) of [512, 2048]/[2048, 512] projections, the
-        // gate-fused [8192, 2048] q_proj on 10 full-attention layers, dense
-        // DeltaNet in_proj on 30 GDN layers, and the 248,320-row embeddings.
-        assert_eq!(inventory.fp8_elements, 32_862_371_840);
+        // gate-fused [8192, 2048] q_proj on 10 full-attention layers, the
+        // block-FP8 DeltaNet in_proj_qkv/in_proj_z on 30 GDN layers, and the
+        // 248,320-row embeddings.
+        assert_eq!(inventory.fp8_elements, 33_617_346_560);
         assert!(inventory.fp8_elements.is_multiple_of(Q8_0_BLOCK_ELEMENTS));
-        assert_eq!(inventory.dense_elements, 1_798_238_848);
+        assert_eq!(inventory.dense_elements, 1_043_264_128);
         // MoE scale: weights plus scale companions exceed 50k tensors, so the
         // per-tensor instantiation slack is a load-peak term, not noise.
         assert!(inventory.tensor_count > 50_000);

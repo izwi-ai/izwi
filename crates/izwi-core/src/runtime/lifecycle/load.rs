@@ -3019,11 +3019,17 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use uuid::Uuid;
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fish_s2_load_publishes_and_seals_both_tts_capabilities() {
         use crate::models::architectures::fish_s2::{fish_s2_physical_state_spec, FishS2TtsModel};
         use crate::runtime::adapters::LoadedModelBundleDraft;
         use crate::runtime::adapters::StreamingRequirements;
+        // Serialize against OOM-ladder poison windows and load-transaction
+        // reservations on the process-global resource authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let directory =
             std::env::temp_dir().join(format!("izwi-fish-state-publication-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -4253,8 +4259,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explicit_unload_supersedes_registered_load_before_spawn() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-pre-gate-load-unload-test-{}",
             Uuid::new_v4()
@@ -4334,8 +4346,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unload_all_supersedes_every_registered_load_before_spawn() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority (the GGUF variant alone claims ~2.25 GiB).
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-pre-gate-load-unload-all-test-{}",
             Uuid::new_v4()
@@ -4389,8 +4407,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_outcome_is_published_before_explicit_unload_enters_the_gate() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-load-publication-race-test-{}",
             Uuid::new_v4()
@@ -4492,10 +4516,9 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
-    /// The resource-authority registry is process-global: the Metal OOM
-    /// ladder tests serialize against each other and restore the authority
-    /// on exit so concurrent cases never observe their poison.
-    static METAL_OOM_LADDER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+    // The OOM-ladder cases and every other test that reserves against the
+    // process-global authority serialize on the shared
+    // crate::engine::resources::test_support::authority_test_lock().
 
     struct ClearAuthorityPoisonOnDrop(Arc<ResourceAuthority>);
 
@@ -4511,7 +4534,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metal_oom_load_is_flushed_and_retried_once_before_poisoning() {
-        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+        let _ladder_lock = crate::engine::resources::test_support::authority_test_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
@@ -4558,7 +4581,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persisted_metal_oom_after_the_retry_poisons_the_authority() {
-        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+        let _ladder_lock = crate::engine::resources::test_support::authority_test_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
@@ -4616,7 +4639,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poisoned_authority_recovers_when_the_device_fully_drains() {
-        let _ladder_lock = METAL_OOM_LADDER_TEST_LOCK
+        let _ladder_lock = crate::engine::resources::test_support::authority_test_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
@@ -4683,8 +4706,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_load_panic_rolls_back_before_publishing_failure() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-load-panic-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -4875,8 +4904,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cold_model_load_is_rejected_before_artifact_work_during_drain() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-load-drain-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -4899,8 +4934,14 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cancelled_waiter_keeps_shared_load_accounted_and_visible_to_drain() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-cancelled-load-test-{}",
             Uuid::new_v4()

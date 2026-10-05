@@ -358,7 +358,7 @@ impl Qwen35MoeNativeConfig {
     pub fn load_with_policy(model_dir: &Path, policy: Qwen35MoeGeometryPolicy) -> Result<Self> {
         let raw = std::fs::read(model_dir.join(CONFIG_FILE)).map_err(|err| {
             Error::ModelLoadError(format!(
-                "Failed to read Qwen3.5-MoE config {}: {err}",
+                "Failed to read Qwen3.5/3.6-MoE config {}: {err}",
                 model_dir.join(CONFIG_FILE).display()
             ))
         })?;
@@ -1114,29 +1114,33 @@ pub fn expected_text_tensor_plan(
                 ExpectedTensorKind::Dense,
             );
         } else {
-            // DeltaNet in_proj and conv tensors stay dense per the published
-            // `modules_to_not_convert` contract; only out_proj is block FP8.
-            insert(
+            // The published FP8 checkpoints quantize the two wide DeltaNet
+            // input projections as 128x128 block FP8; the per-head tensors
+            // (in_proj_a/b, A_log, dt_bias, conv1d, norm) stay dense alongside
+            // the block-FP8 out_proj.
+            insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                vec![text.ssm_conv_channels(), hidden],
-                ExpectedTensorKind::Dense,
+                text.ssm_conv_channels(),
+                hidden,
+                block_shape,
             );
-            insert(
+            insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.linear_attn.in_proj_z.weight"),
-                vec![text.ssm_v_width(), hidden],
-                ExpectedTensorKind::Dense,
+                text.ssm_v_width(),
+                hidden,
+                block_shape,
             );
             insert(
                 &mut plan,
-                format!("{prefix}.linear_attn.b_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_b.weight"),
                 vec![text.ssm_time_step_rank, hidden],
                 ExpectedTensorKind::Dense,
             );
             insert(
                 &mut plan,
-                format!("{prefix}.linear_attn.a_proj.weight"),
+                format!("{prefix}.linear_attn.in_proj_a.weight"),
                 vec![text.ssm_time_step_rank, hidden],
                 ExpectedTensorKind::Dense,
             );
@@ -1238,7 +1242,7 @@ impl Qwen35MoeNativeCheckpoint {
             let (scope, canonical) = canonical_text_tensor_name(raw_name)
                 .ok_or_else(|| {
                     Error::ModelLoadError(format!(
-                        "Qwen3.5-MoE checkpoint tensor `{raw_name}` falls outside the known model scopes"
+                        "Qwen3.5/3.6-MoE checkpoint tensor `{raw_name}` falls outside the known model scopes"
                     ))
                 })?;
             match scope {
@@ -1248,7 +1252,7 @@ impl Qwen35MoeNativeCheckpoint {
                         text_tensor_names.insert(canonical.clone(), raw_name.to_string())
                     {
                         return Err(Error::ModelLoadError(format!(
-                            "Qwen3.5-MoE checkpoint declares both `{existing}` and `{raw_name}` for canonical text tensor `{canonical}`"
+                            "Qwen3.5/3.6-MoE checkpoint declares both `{existing}` and `{raw_name}` for canonical text tensor `{canonical}`"
                         )));
                     }
                 }
@@ -1264,7 +1268,7 @@ impl Qwen35MoeNativeCheckpoint {
                 }
                 Qwen35MoeTensorScope::Unknown => {
                     return Err(Error::ModelLoadError(format!(
-                        "Qwen3.5-MoE checkpoint tensor `{raw_name}` has an unknown scope"
+                        "Qwen3.5/3.6-MoE checkpoint tensor `{raw_name}` has an unknown scope"
                     )));
                 }
             }
@@ -1290,7 +1294,7 @@ impl Qwen35MoeNativeCheckpoint {
             };
             if !shape_ok || !dtype_ok {
                 return Err(Error::ModelLoadError(format!(
-                    "Qwen3.5-MoE checkpoint tensor `{name}` contract drift: expected {:?} {:?}, found {:?} {:?}",
+                    "Qwen3.5/3.6-MoE checkpoint tensor `{name}` contract drift: expected {:?} {:?}, found {:?} {:?}",
                     expected.kind, expected.shape, info.dtype, info.shape
                 )));
             }
@@ -1298,7 +1302,7 @@ impl Qwen35MoeNativeCheckpoint {
         if !missing.is_empty() {
             let names: Vec<&str> = missing.iter().map(|name| name.as_str()).take(8).collect();
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5-MoE checkpoint is missing {} required text tensors, including {names:?}",
+                "Qwen3.5/3.6-MoE checkpoint is missing {} required text tensors, including {names:?}",
                 missing.len()
             )));
         }
@@ -1312,7 +1316,7 @@ impl Qwen35MoeNativeCheckpoint {
         if !unexpected.is_empty() {
             let shown: Vec<&str> = unexpected.iter().copied().take(8).collect();
             return Err(Error::ModelLoadError(format!(
-                "Qwen3.5-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen35moe tensor plan before loading",
+                "Qwen3.5/3.6-MoE checkpoint declares {} text tensors outside the validated plan, including {shown:?}; update the qwen35moe tensor plan before loading",
                 unexpected.len()
             )));
         }
@@ -1334,7 +1338,7 @@ impl Qwen35MoeNativeCheckpoint {
             .map(|s| s.as_str())
             .ok_or_else(|| {
                 Error::ModelLoadError(format!(
-                    "Qwen3.5-MoE checkpoint has no text tensor `{canonical}`"
+                    "Qwen3.5/3.6-MoE checkpoint has no text tensor `{canonical}`"
                 ))
             })
     }
@@ -1796,18 +1800,18 @@ mod tests {
         // 3 shared (embed + lm_head + final norm) + per layer: 2 norms +
         // router + 256 experts x 3 + shared expert x 3 + optional gate +
         // attention-role tensors (6 full, 9 linear) + one BF16 scale
-        // companion per block-FP8 projection (775 full, 772 linear).
+        // companion per block-FP8 projection (775 full, 774 linear).
         let shared = 3usize;
         let per_layer_common = 2 + 1 + 256 * 3 + 3 + 1;
         let full_count = 10usize;
         let linear_count = 30usize;
         let full_scales = 256 * 3 + 3 + 4;
-        let linear_scales = 256 * 3 + 3 + 1;
+        let linear_scales = 256 * 3 + 3 + 3;
         let expected_count = shared
             + full_count * (per_layer_common + 6 + full_scales)
             + linear_count * (per_layer_common + 9 + linear_scales);
         assert_eq!(plan.len(), expected_count);
-        assert_eq!(plan.len(), 62_243);
+        assert_eq!(plan.len(), 62_303);
 
         let expert0 = plan
             .get("model.layers.0.mlp.experts.0.gate_proj.weight")
@@ -1835,8 +1839,26 @@ mod tests {
         let linear_in_proj = plan
             .get("model.layers.0.linear_attn.in_proj_qkv.weight")
             .expect("linear in_proj in plan");
-        assert_eq!(linear_in_proj.kind, ExpectedTensorKind::Dense);
+        assert_eq!(linear_in_proj.kind, ExpectedTensorKind::BlockFp8);
         assert_eq!(linear_in_proj.shape, vec![8_192, 2_048]);
+
+        let linear_in_proj_scale = plan
+            .get("model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv")
+            .expect("linear in_proj scale in plan");
+        assert_eq!(linear_in_proj_scale.kind, ExpectedTensorKind::BlockFp8Scale);
+        assert_eq!(linear_in_proj_scale.shape, vec![64, 16]);
+
+        let linear_in_proj_z = plan
+            .get("model.layers.0.linear_attn.in_proj_z.weight")
+            .expect("linear in_proj_z in plan");
+        assert_eq!(linear_in_proj_z.kind, ExpectedTensorKind::BlockFp8);
+        assert_eq!(linear_in_proj_z.shape, vec![4_096, 2_048]);
+
+        let linear_beta = plan
+            .get("model.layers.0.linear_attn.in_proj_b.weight")
+            .expect("linear beta projection in plan");
+        assert_eq!(linear_beta.kind, ExpectedTensorKind::Dense);
+        assert_eq!(linear_beta.shape, vec![32, 2_048]);
 
         let out_proj = plan
             .get("model.layers.0.linear_attn.out_proj.weight")
@@ -1850,6 +1872,302 @@ mod tests {
         assert_eq!(q_proj.kind, ExpectedTensorKind::BlockFp8);
         // Fused query + sigmoid gate: 16 heads × 256 dim × 2 halves.
         assert_eq!(q_proj.shape, vec![8_192, 2_048]);
+    }
+
+    #[test]
+    fn plan_matches_the_published_checkpoint_census() {
+        let config = pinned_config();
+        let plan = expected_text_tensor_plan(&config).unwrap();
+
+        // Fold the per-index plan into name-pattern rows: every digit run in
+        // a canonical name (layer, expert, even the `1` in conv1d) becomes
+        // `{}`. All entries sharing a pattern must agree on kind and shape.
+        fn pattern(name: &str) -> String {
+            let mut out = String::with_capacity(name.len());
+            let mut chars = name.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    out.push_str("{}");
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let mut rows: BTreeMap<String, (ExpectedTensorKind, Vec<usize>, usize)> = BTreeMap::new();
+        for (name, expected) in &plan {
+            let entry = rows
+                .entry(pattern(name))
+                .or_insert_with(|| (expected.kind, expected.shape.clone(), 0));
+            assert_eq!(entry.0, expected.kind, "pattern kind drift at {name}");
+            assert_eq!(entry.1, expected.shape, "pattern shape drift at {name}");
+            entry.2 += 1;
+        }
+
+        // Frozen census of the published Qwen/Qwen3.6-35B-A3B-FP8 safetensors
+        // headers (fetched 2026-10-04): 62,303 text-scope tensors, every
+        // F8_E4M3 weight carrying a BF16 `weight_scale_inv` companion at
+        // [ceil(rows/128), ceil(cols/128)]. The 3.5 checkpoint matches every
+        // row except linear_attn.A_log and linear_attn.norm.weight (F32
+        // there; both accepted by Dense). Fixtures derived from the plan
+        // cannot catch plan-vs-published drift, so the observed census is
+        // pinned here as executable contract.
+        let published: &[(&str, ExpectedTensorKind, &[usize], usize)] = &[
+            (
+                "lm_head.weight",
+                ExpectedTensorKind::Dense,
+                &[248_320, 2_048],
+                1,
+            ),
+            (
+                "model.embed_tokens.weight",
+                ExpectedTensorKind::Dense,
+                &[248_320, 2_048],
+                1,
+            ),
+            ("model.norm.weight", ExpectedTensorKind::Dense, &[2_048], 1),
+            (
+                "model.layers.{}.input_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.post_attention_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.gate.weight",
+                ExpectedTensorKind::Dense,
+                &[256, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert_gate.weight",
+                ExpectedTensorKind::OptionalDense,
+                &[1, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.shared_expert.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                40,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10_240,
+            ),
+            (
+                "model.layers.{}.mlp.experts.{}.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10_240,
+            ),
+            (
+                "model.layers.{}.self_attn.k_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.k_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.k_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.q_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.v_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.v_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.o_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                10,
+            ),
+            (
+                "model.layers.{}.self_attn.o_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                10,
+            ),
+            (
+                "model.layers.{}.linear_attn.A_log",
+                ExpectedTensorKind::Dense,
+                &[32],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.conv{}d.weight",
+                ExpectedTensorKind::Dense,
+                &[8_192, 1, 4],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.dt_bias",
+                ExpectedTensorKind::Dense,
+                &[32],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_a.weight",
+                ExpectedTensorKind::Dense,
+                &[32, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_b.weight",
+                ExpectedTensorKind::Dense,
+                &[32, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_qkv.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_qkv.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_z.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[4_096, 2_048],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.in_proj_z.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[32, 16],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.norm.weight",
+                ExpectedTensorKind::Dense,
+                &[128],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.out_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                30,
+            ),
+            (
+                "model.layers.{}.linear_attn.out_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                30,
+            ),
+        ];
+        assert_eq!(rows.len(), published.len(), "pattern-set size");
+        for (name, kind, shape, count) in published {
+            let row = rows
+                .get(*name)
+                .unwrap_or_else(|| panic!("plan has no row for published pattern {name}"));
+            assert_eq!(row.0, *kind, "{name}");
+            assert_eq!(row.1, *shape, "{name}");
+            assert_eq!(row.2, *count, "{name}");
+        }
     }
 
     #[test]
@@ -2113,24 +2431,28 @@ mod tests {
                     vec![text.attention_key_length],
                 );
             } else {
-                push_dense(
+                push_fp8_proj(
                     &mut tensors,
+                    config,
                     format!("{prefix}.linear_attn.in_proj_qkv.weight"),
-                    vec![text.ssm_conv_channels(), hidden],
+                    text.ssm_conv_channels(),
+                    hidden,
                 );
-                push_dense(
+                push_fp8_proj(
                     &mut tensors,
+                    config,
                     format!("{prefix}.linear_attn.in_proj_z.weight"),
-                    vec![text.ssm_v_width(), hidden],
+                    text.ssm_v_width(),
+                    hidden,
                 );
                 push_dense(
                     &mut tensors,
-                    format!("{prefix}.linear_attn.b_proj.weight"),
+                    format!("{prefix}.linear_attn.in_proj_b.weight"),
                     vec![text.ssm_time_step_rank, hidden],
                 );
                 push_dense(
                     &mut tensors,
-                    format!("{prefix}.linear_attn.a_proj.weight"),
+                    format!("{prefix}.linear_attn.in_proj_a.weight"),
                     vec![text.ssm_time_step_rank, hidden],
                 );
                 push_dense(

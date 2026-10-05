@@ -533,7 +533,7 @@ impl ModelVariant {
         if self.is_qwen35_moe_fp8() {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
-                "Qwen3.5 MoE stores 128x128 block-scaled FP8 Safetensors weights; CUDA follows the same scale-aware Q8_0 compressed-projection fallback contract as Qwen3.8 FP8, not native FP8 execution",
+                "Qwen3.5/3.6 MoE stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv at load and expands projections to resident BF16, not native FP8 execution",
             );
         }
 
