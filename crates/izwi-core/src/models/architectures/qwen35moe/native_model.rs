@@ -17,7 +17,7 @@ use candle_transformers::quantized_nn::RmsNorm;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen35::text::{
-    Qwen35MoeFfnGeometry, Qwen35TextModel, Qwen35WeightSource,
+    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35TextModel, Qwen35WeightSource,
 };
 use crate::models::architectures::qwen38::native::ProjectionMaterialization;
 use crate::models::architectures::qwen35moe::native::{
@@ -136,7 +136,10 @@ impl<'a> Qwen35MoeNativeSource<'a> {
         Ok(tensor)
     }
 
-    fn wrap_dense_qmatmul(tensor: Tensor, residency: Qwen35MoeProjectionResidency) -> Result<QMatMul> {
+    fn wrap_dense_projection(
+        tensor: Tensor,
+        residency: Qwen35MoeProjectionResidency,
+    ) -> Result<Qwen35Projection> {
         let ggml_dtype = match residency {
             Qwen35MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
             Qwen35MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
@@ -144,7 +147,9 @@ impl<'a> Qwen35MoeNativeSource<'a> {
             Qwen35MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
         };
         let quantized = QTensor::quantize(&tensor, ggml_dtype).map_err(Error::from)?;
-        QMatMul::from_arc(Arc::new(quantized)).map_err(Error::from)
+        Ok(Qwen35Projection::Quantized(
+            QMatMul::from_arc(Arc::new(quantized)).map_err(Error::from)?,
+        ))
     }
 }
 
@@ -163,7 +168,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             .is_some()
     }
 
-    fn qmatmul(&self, name: &str, device: &Device) -> Result<QMatMul> {
+    fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection> {
         let (canonical, shape, kind) = self.resolve(name)?;
         let expected: [usize; 2] = match shape.as_slice() {
             [rows, cols] => [*rows, *cols],
@@ -184,7 +189,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
                 device,
                 self.dense_target,
             )?;
-            return Self::wrap_dense_qmatmul(tensor, self.residency);
+            return Self::wrap_dense_projection(tensor, self.residency);
         }
         match self.checkpoint.materialize_projection(
             &canonical,
@@ -192,9 +197,9 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             device,
             self.residency,
         )? {
-            Qwen35MoeProjection::Packed(qmatmul) => Ok(qmatmul),
+            Qwen35MoeProjection::Packed(qmatmul) => Ok(Qwen35Projection::Quantized(qmatmul)),
             Qwen35MoeProjection::Dense(tensor) => {
-                Self::wrap_dense_qmatmul(tensor, self.residency)
+                Self::wrap_dense_projection(tensor, self.residency)
             }
         }
     }
