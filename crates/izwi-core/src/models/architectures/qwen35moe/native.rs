@@ -30,7 +30,7 @@ use safetensors::Dtype as SafeDType;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen38::native::{
-    BlockFp8Config, IndexedSafetensors, ProjectionMaterialization,
+    BlockFp8Config, IndexedSafetensors, ProjectionMaterialization, RawBlockFp8Projection,
 };
 
 /// Opt a process into accepting synthetic (non-published) Qwen3.5-MoE
@@ -1407,7 +1407,55 @@ impl Qwen35MoeNativeCheckpoint {
                     device,
                 )?,
             )),
+            Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback => {
+                if Self::compact_block_fp8_supported(device, expected_shape, block_shape) {
+                    Ok(Qwen35MoeProjection::CompactFp8(
+                        self.materialize_compact_projection(raw_name, expected_shape, device)?,
+                    ))
+                } else {
+                    Ok(Qwen35MoeProjection::Packed(
+                        self.tensors.materialize_q8_projection(
+                            raw_name,
+                            expected_shape,
+                            block_shape,
+                            device,
+                        )?,
+                    ))
+                }
+            }
         }
+    }
+
+    /// Kernel contract of `kernels::cuda::fp8::block_fp8_projection`: 128x128
+    /// block scales with weights `[n, k]` where `n % 64 == 0` and `k % 128 == 0`,
+    /// executed on a CUDA device of compute capability >= 8. Outside the
+    /// contract the native-FP8 residency falls back to packed Q8_0 per tensor.
+    fn compact_block_fp8_supported(
+        device: &candle_core::Device,
+        expected_shape: [usize; 2],
+        block_shape: [usize; 2],
+    ) -> bool {
+        block_shape == [128, 128]
+            && crate::kernels::cuda::fp8::provider_supported(
+                device,
+                candle_core::DType::BF16,
+                expected_shape[0],
+                expected_shape[1],
+            )
+    }
+
+    fn materialize_compact_projection(
+        &self,
+        raw_name: &str,
+        expected_shape: [usize; 2],
+        device: &candle_core::Device,
+    ) -> Result<RawBlockFp8Projection> {
+        self.tensors.materialize_block_fp8_raw(
+            raw_name,
+            expected_shape,
+            self.config.block_fp8.block_shape,
+            device,
+        )
     }
 
     /// Materialize a dense (non-block-FP8) tensor such as norms, DeltaNet
@@ -1454,6 +1502,10 @@ impl Qwen35MoeNativeCheckpoint {
 pub enum Qwen35MoeProjection {
     Dense(candle_core::Tensor),
     Packed(candle_core::quantized::QMatMul),
+    /// Raw checkpoint residency: E4M3FN weight bytes plus F32 block scales
+    /// stay resident and decode per GEMM inside the CUDA fp8 projection
+    /// kernel. No expanded persistent weight tensor is created.
+    CompactFp8(RawBlockFp8Projection),
 }
 
 /// Backend residency selection for Qwen3.5-MoE projections.
@@ -1463,6 +1515,9 @@ pub enum Qwen35MoeProjectionResidency {
     ExpandedF16,
     ExpandedBf16,
     ExpandedF32,
+    /// Raw block-FP8 residency with a per-tensor packed-Q8_0 fallback for
+    /// tensors whose geometry the fp8 projection kernel cannot execute.
+    NativeFp8WithQ8Fallback,
 }
 
 #[cfg(test)]
@@ -2500,6 +2555,14 @@ mod tests {
     }
 
     fn write_tiny_checkpoint(config: &Qwen35MoeNativeConfig, dir: &Path) {
+        write_tiny_checkpoint_tensors(config, dir, tiny_checkpoint_tensors(config));
+    }
+
+    fn write_tiny_checkpoint_tensors(
+        config: &Qwen35MoeNativeConfig,
+        dir: &Path,
+        tensors: Vec<RawTensor>,
+    ) {
         std::fs::write(
             dir.join(CONFIG_FILE),
             json!({
@@ -2551,7 +2614,6 @@ mod tests {
         )
         .unwrap();
 
-        let tensors = tiny_checkpoint_tensors(config);
         let mut weight_map = serde_json::Map::new();
         let tensor_refs: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = tensors
             .iter()
@@ -2600,6 +2662,88 @@ mod tests {
         );
         let raw_lm = checkpoint.raw_tensor_name("lm_head.weight").unwrap();
         assert_eq!(raw_lm, "lm_head.weight");
+    }
+
+    #[test]
+    fn native_fp8_residency_falls_back_to_packed_q8_off_cuda() {
+        let config = tiny_config();
+        let dir = TestDir::new("native-fp8-fallback");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen35MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen35MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        let projection = checkpoint
+            .materialize_projection(
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                [8, 32],
+                &candle_core::Device::Cpu,
+                Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback,
+            )
+            .unwrap();
+        assert!(matches!(projection, Qwen35MoeProjection::Packed(_)));
+    }
+
+    #[test]
+    fn compact_fp8_residency_keeps_raw_bytes_and_decodes_block_scales() {
+        use crate::models::architectures::qwen35::text::Qwen35Projection;
+
+        let mut config = tiny_config();
+        // The fp8 projection kernel contract pins 128x128 block scales; the
+        // tiny geometry still produces a [1, 1] scale grid, and the CPU
+        // kernel path executes any geometry so the decode stays testable
+        // without CUDA hardware.
+        config.block_fp8.block_shape = [128, 128];
+        let dir = TestDir::new("compact-fp8-raw");
+        let mut tensors = tiny_checkpoint_tensors(&config);
+        let scale_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv";
+        let scale = tensors
+            .iter_mut()
+            .find(|(name, ..)| name == scale_name)
+            .unwrap();
+        assert_eq!(scale.2, vec![1, 1]);
+        scale.3 = bf16_bytes(&[2.0]);
+        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
+
+        let checkpoint = Qwen35MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen35MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let canonical = "model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expected_shape = [8, 32];
+        let raw_name = checkpoint.raw_tensor_name(canonical).unwrap();
+        let compact = checkpoint
+            .materialize_compact_projection(&raw_name, expected_shape, &candle_core::Device::Cpu)
+            .unwrap();
+        assert_eq!(compact.weights.dims(), &[8, 32]);
+        assert_eq!(compact.weights.dtype(), candle_core::DType::U8);
+        assert_eq!(compact.scales.dims(), &[1, 1]);
+        assert_eq!(
+            compact
+                .scales
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            [2.0]
+        );
+
+        // One-hot activation at column 5: every weight decodes to 1.0, so the
+        // projection output is the block scale itself.
+        let mut input = vec![0f32; 32];
+        input[5] = 1.0;
+        let x = candle_core::Tensor::from_vec(input, (1, 32), &candle_core::Device::Cpu).unwrap();
+        let y = Qwen35Projection::CompactFp8 {
+            weights: compact.weights,
+            scales: compact.scales,
+        }
+        .forward(&x)
+        .unwrap();
+        assert_eq!(y.dims(), &[1, 8]);
+        assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
     }
 
     #[test]

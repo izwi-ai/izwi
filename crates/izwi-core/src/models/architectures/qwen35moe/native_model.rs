@@ -143,7 +143,9 @@ impl<'a> Qwen35MoeNativeSource<'a> {
         let ggml_dtype = match residency {
             Qwen35MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
             Qwen35MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
-            Qwen35MoeProjectionResidency::ExpandedBf16 => GgmlDType::BF16,
+            Qwen35MoeProjectionResidency::ExpandedBf16 | Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback => {
+                GgmlDType::BF16
+            }
             Qwen35MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
         };
         let quantized = QTensor::quantize(&tensor, ggml_dtype).map_err(Error::from)?;
@@ -201,6 +203,10 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             Qwen35MoeProjection::Dense(tensor) => {
                 Self::wrap_dense_projection(tensor, self.residency)
             }
+            Qwen35MoeProjection::CompactFp8(raw) => Ok(Qwen35Projection::CompactFp8 {
+                weights: raw.weights,
+                scales: raw.scales,
+            }),
         }
     }
 
@@ -315,6 +321,10 @@ impl Qwen35MoeNativeSource<'_> {
         {
             Qwen35MoeProjection::Packed(qmatmul) => Ok(Qwen35MoeLinear::Quantized(qmatmul)),
             Qwen35MoeProjection::Dense(tensor) => Ok(Qwen35MoeLinear::from_dense(tensor)),
+            Qwen35MoeProjection::CompactFp8(raw) => Ok(Qwen35MoeLinear::CompactFp8 {
+                weights: raw.weights,
+                scales: raw.scales,
+            }),
         }
     }
 }

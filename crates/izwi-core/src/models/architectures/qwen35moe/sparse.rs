@@ -35,11 +35,15 @@ use crate::models::architectures::qwen35::text::Qwen35MoeFfnGeometry;
 
 /// Persistent form of one projection inside the sparse block. `Quantized`
 /// keeps quantized residency (GGUF tensors, CPU-packed Q8_0 requants);
-/// `Dense` holds an expanded weight for backends without packed kernels.
+/// `Dense` holds an expanded weight for backends without packed kernels;
+/// `CompactFp8` keeps the checkpoint's raw block-FP8 bytes plus F32 block
+/// scales resident and decodes per GEMM inside the CUDA fp8 projection
+/// kernel.
 #[derive(Clone)]
 pub(crate) enum Qwen35MoeLinear {
     Dense(Tensor),
     Quantized(QMatMul),
+    CompactFp8 { weights: Tensor, scales: Tensor },
 }
 
 impl Qwen35MoeLinear {
@@ -55,12 +59,16 @@ impl Qwen35MoeLinear {
 
     /// Apply the projection to `[num_tokens, in]`, returning
     /// `[num_tokens, out]` in the activation's dtype. Quantized matmuls
-    /// compute in F32; dense projections compute in their residency dtype.
+    /// compute in F32; dense projections compute in their residency dtype;
+    /// compact FP8 decodes to the activation's dtype inside the kernel.
     pub(crate) fn project(&self, x: &Tensor) -> Result<Tensor> {
         let input_dtype = x.dtype();
         let output = match self {
             Self::Quantized(qmatmul) => qmatmul.forward(&x.to_dtype(DType::F32)?)?,
             Self::Dense(weight) => x.to_dtype(weight.dtype())?.matmul(&weight.t()?)?,
+            Self::CompactFp8 { weights, scales } => {
+                crate::kernels::cuda::fp8::block_fp8_projection(x, weights, scales)?
+            }
         };
         if output.dtype() == input_dtype {
             Ok(output)
@@ -427,6 +435,7 @@ mod tests {
         let as_values = |linear: &Qwen35MoeLinear| match linear {
             Qwen35MoeLinear::Dense(tensor) => tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             Qwen35MoeLinear::Quantized(_) => unreachable!("reference test uses dense weights"),
+            Qwen35MoeLinear::CompactFp8 { .. } => unreachable!("reference test uses dense weights"),
         };
         let gate = as_values(&weights.gate);
         let up = as_values(&weights.up);
@@ -505,6 +514,7 @@ mod tests {
         let as_values = |linear: &Qwen35MoeLinear| match linear {
             Qwen35MoeLinear::Dense(tensor) => tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             Qwen35MoeLinear::Quantized(_) => unreachable!(),
+            Qwen35MoeLinear::CompactFp8 { .. } => unreachable!(),
         };
         let gate_out = project_dense(&as_values(&weights.gate), FF, HIDDEN, x);
         let up_out = project_dense(&as_values(&weights.up), FF, HIDDEN, x);
