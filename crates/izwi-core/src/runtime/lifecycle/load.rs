@@ -36,8 +36,8 @@ use crate::runtime::lifecycle::controller::{
 };
 use crate::runtime::service::RuntimeService;
 
-#[path = "qwen35moe_memory.rs"]
-mod qwen35moe_memory;
+#[path = "qwen36moe_memory.rs"]
+mod qwen36moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
 
@@ -177,7 +177,7 @@ fn portable_context_reserve_bytes(variant: ModelVariant, configured_reserve_byte
         return configured_reserve_bytes;
     }
     if variant == ModelVariant::Qwen36Moe35BA3BFp8
-        && crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled()
+        && crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled()
     {
         return configured_reserve_bytes;
     }
@@ -1291,13 +1291,13 @@ impl ModelLifecycleController {
             return Ok(qwen38_resource_plan(backend));
         }
         if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
-            if crate::models::architectures::qwen35moe::native::synthetic_geometry_enabled() {
+            if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
                 // Fixture load (benchmark/CI): price the actual checkpoint
                 // instead of the pinned 35B constants.
-                let estimate = qwen35moe_memory::synthetic_fixture_estimate(model_path)?;
+                let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
                 return Ok(model_resource_plan(backend, estimate));
             }
-            return qwen35moe_memory::resource_plan(backend);
+            return qwen36moe_memory::resource_plan(backend);
         }
         if variant == ModelVariant::FishAudioS2Pro {
             let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(

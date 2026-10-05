@@ -230,7 +230,7 @@ pub const MODEL_FAMILY_REGISTRATIONS: &[FamilyRegistration] = &[
     },
     FamilyRegistration {
         family: ModelFamily::Qwen35MoeChat,
-        module_path: "crate::models::architectures::qwen35moe::chat",
+        module_path: "crate::models::architectures::qwen36moe::chat",
         variants: QWEN35_MOE_CHAT_VARIANTS,
         capabilities: CHAT_CAPABILITIES,
         fixture_ids: CHAT_FIXTURES,

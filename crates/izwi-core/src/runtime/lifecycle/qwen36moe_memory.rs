@@ -13,7 +13,7 @@ use super::{ModelMemoryEstimate, ModelResourcePlan};
 use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen35moe::native::pinned_representation_inventory;
+use crate::models::architectures::qwen36moe::native::pinned_representation_inventory;
 use std::path::Path;
 
 const PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;

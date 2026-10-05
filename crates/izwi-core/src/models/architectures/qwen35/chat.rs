@@ -446,7 +446,7 @@ impl Qwen35Tokenizer {
     }
 
     /// HF-native load path for checkpoints without a GGUF tokenizer
-    /// (the qwen35moe FP8 safetensors bundle): `tokenizer.json` supplies
+    /// (the qwen36moe FP8 safetensors bundle): `tokenizer.json` supplies
     /// the vocabulary and `tokenizer_config.json` the specials/template.
     pub(crate) fn load_hf(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
         let config = load_tokenizer_config_file(model_dir)?;
@@ -575,7 +575,7 @@ impl Qwen35Tokenizer {
 }
 
 /// Checkpoint-format-agnostic execution core shared by the dense
-/// `Qwen35ChatModel` and the `qwen35moe` family: tokenizer, hybrid trunk
+/// `Qwen35ChatModel` and the `qwen36moe` family: tokenizer, hybrid trunk
 /// configuration, and the decode-state machinery both wrappers drive. The
 /// dense wrapper adds vision encoding on top; the MoE wrapper is text-only.
 pub(crate) struct Qwen35ChatExec {

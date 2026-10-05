@@ -689,10 +689,10 @@ fn generate_qwen38_benchmark_fixture() {
 /// Tiny synthetic native block-FP8 Qwen3.5/3.6-MoE checkpoint: a forward-capable
 /// 4-layer hybrid trunk (3 DeltaNet + 1 gated full attention, interval 4) with
 /// 2 routed experts (top-1) plus a shared expert. Values mirror the in-process
-/// `qwen35moe::native` recovery fixtures exactly: all-ones weights, 0x38
+/// `qwen36moe::native` recovery fixtures exactly: all-ones weights, 0x38
 /// E4M3 bytes (= 1.0), unit block scales, and an lm_head row bias so greedy
 /// decode emits a plain-letter token deterministically. The geometry requires
-/// `IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY=1` in the loading process; the
+/// `IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY=1` in the loading process; the
 /// downloader bundle gate requires the real pinned artifact revision.
 #[allow(dead_code)]
 pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
@@ -766,14 +766,14 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
             .collect()
     }
 
-    struct Qwen35MoeFixtureTensor {
+    struct Qwen36MoeFixtureTensor {
         name: String,
         dtype: safetensors::Dtype,
         shape: Vec<usize>,
         data: Vec<u8>,
     }
 
-    let dense = |name: String, shape: &[usize], value: f32| Qwen35MoeFixtureTensor {
+    let dense = |name: String, shape: &[usize], value: f32| Qwen36MoeFixtureTensor {
         name,
         dtype: safetensors::Dtype::BF16,
         shape: shape.to_vec(),
@@ -786,13 +786,13 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
         let name: String = name;
         let (scale_rows, scale_cols) = (rows.div_ceil(BLOCK[0]), cols.div_ceil(BLOCK[1]));
         vec![
-            Qwen35MoeFixtureTensor {
+            Qwen36MoeFixtureTensor {
                 name: name.clone(),
                 dtype: safetensors::Dtype::F8_E4M3,
                 shape: vec![rows, cols],
                 data: vec![0x38; rows * cols],
             },
-            Qwen35MoeFixtureTensor {
+            Qwen36MoeFixtureTensor {
                 name: format!("{}.weight_scale_inv", name.strip_suffix(".weight").unwrap()),
                 dtype: safetensors::Dtype::BF16,
                 shape: vec![scale_rows, scale_cols],
@@ -801,7 +801,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
         ]
     };
 
-    let mut tensors: Vec<Qwen35MoeFixtureTensor> = Vec::new();
+    let mut tensors: Vec<Qwen36MoeFixtureTensor> = Vec::new();
     // Embeddings and lm_head are FP8-excluded dense tensors. lm_head row 7
     // ("c" in the fixture tokenizer) carries a larger value so greedy decode
     // deterministically emits a plain-letter token instead of a special.
@@ -809,13 +809,13 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     for column in 0..HIDDEN {
         lm_head[7 * HIDDEN + column] = 4.0;
     }
-    tensors.push(Qwen35MoeFixtureTensor {
+    tensors.push(Qwen36MoeFixtureTensor {
         name: "model.language_model.embed_tokens.weight".into(),
         dtype: safetensors::Dtype::BF16,
         shape: vec![VOCAB, HIDDEN],
         data: bf16_bytes(&vec![1.0; VOCAB * HIDDEN]),
     });
-    tensors.push(Qwen35MoeFixtureTensor {
+    tensors.push(Qwen36MoeFixtureTensor {
         name: "lm_head.weight".into(),
         dtype: safetensors::Dtype::BF16,
         shape: vec![VOCAB, HIDDEN],
@@ -973,7 +973,7 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     ));
     tensors.push(dense("mtp.norm.weight".to_string(), &[HIDDEN], 1.0));
 
-    let write_shard = |path: &Path, tensors: &[Qwen35MoeFixtureTensor]| {
+    let write_shard = |path: &Path, tensors: &[Qwen36MoeFixtureTensor]| {
         let views = tensors
             .iter()
             .map(|tensor| {

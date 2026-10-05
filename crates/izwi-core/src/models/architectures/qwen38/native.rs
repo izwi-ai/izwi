@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::performance::LoadingPerformanceConfig;
 
 mod cache;
-// Crate-internal so sibling native families (qwen35moe) can reuse the narrow
+// Crate-internal so sibling native families (qwen36moe) can reuse the narrow
 // stable ingestion primitives on `IndexedSafetensors`; execution graphs stay
 // family-owned.
 pub(crate) mod loading;

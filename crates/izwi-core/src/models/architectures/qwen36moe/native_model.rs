@@ -1,6 +1,6 @@
 //! Native block-FP8 checkpoint → Qwen3.5 hybrid trunk construction.
 //!
-//! Bridges [`Qwen35MoeNativeCheckpoint`] (config contract, tensor plan, and
+//! Bridges [`Qwen36MoeNativeCheckpoint`] (config contract, tensor plan, and
 //! per-backend FP8 materialization from Phase 1) into the shared
 //! `Qwen35TextModel` trunk: the GGUF-style logical tensor names the trunk
 //! requests are translated to the canonical HF layout
@@ -20,12 +20,12 @@ use crate::models::architectures::qwen35::text::{
     Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35TextModel, Qwen35WeightSource,
 };
 use crate::models::architectures::qwen38::native::ProjectionMaterialization;
-use crate::models::architectures::qwen35moe::native::{
-    ExpectedTensorKind, Qwen35MoeNativeCheckpoint, Qwen35MoeProjection,
-    Qwen35MoeProjectionResidency,
+use crate::models::architectures::qwen36moe::native::{
+    ExpectedTensorKind, Qwen36MoeNativeCheckpoint, Qwen36MoeProjection,
+    Qwen36MoeProjectionResidency,
 };
-use crate::models::architectures::qwen35moe::sparse::{
-    Qwen35MoeExpertWeights, Qwen35MoeLinear, Qwen35MoeSharedExpertWeights, Qwen35MoeSparseMlp,
+use crate::models::architectures::qwen36moe::sparse::{
+    Qwen36MoeExpertWeights, Qwen36MoeLinear, Qwen36MoeSharedExpertWeights, Qwen36MoeSparseMlp,
 };
 
 /// Map a logical GGUF-style trunk tensor name to its canonical checkpoint
@@ -72,19 +72,19 @@ fn canonical_name(logical: &str) -> Option<String> {
 }
 
 /// Native-checkpoint-backed [`Qwen35WeightSource`].
-pub(crate) struct Qwen35MoeNativeSource<'a> {
-    checkpoint: &'a Qwen35MoeNativeCheckpoint,
-    residency: Qwen35MoeProjectionResidency,
+pub(crate) struct Qwen36MoeNativeSource<'a> {
+    checkpoint: &'a Qwen36MoeNativeCheckpoint,
+    residency: Qwen36MoeProjectionResidency,
     dense_target: ProjectionMaterialization,
 }
 
-impl<'a> Qwen35MoeNativeSource<'a> {
+impl<'a> Qwen36MoeNativeSource<'a> {
     pub(crate) fn new(
-        checkpoint: &'a Qwen35MoeNativeCheckpoint,
+        checkpoint: &'a Qwen36MoeNativeCheckpoint,
         device_profile: &DeviceProfile,
     ) -> Self {
         let residency =
-            Qwen35MoeNativeCheckpoint::projection_residency_policy(device_profile);
+            Qwen36MoeNativeCheckpoint::projection_residency_policy(device_profile);
         let dense_target = match BackendKind::from(device_profile.kind) {
             BackendKind::Cpu => ProjectionMaterialization::F32,
             BackendKind::Metal => ProjectionMaterialization::F16,
@@ -100,7 +100,7 @@ impl<'a> Qwen35MoeNativeSource<'a> {
     fn resolve(&self, logical: &str) -> Result<(String, Vec<usize>, ExpectedTensorKind)> {
         let canonical = canonical_name(logical).ok_or_else(|| {
             Error::ModelLoadError(format!(
-                "qwen35moe native checkpoint has no mapping for trunk tensor `{logical}`"
+                "qwen36moe native checkpoint has no mapping for trunk tensor `{logical}`"
             ))
         })?;
         let raw = self.checkpoint.raw_tensor_name(&canonical)?;
@@ -138,15 +138,15 @@ impl<'a> Qwen35MoeNativeSource<'a> {
 
     fn wrap_dense_projection(
         tensor: Tensor,
-        residency: Qwen35MoeProjectionResidency,
+        residency: Qwen36MoeProjectionResidency,
     ) -> Result<Qwen35Projection> {
         let ggml_dtype = match residency {
-            Qwen35MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
-            Qwen35MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
-            Qwen35MoeProjectionResidency::ExpandedBf16 | Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback => {
+            Qwen36MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
+            Qwen36MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
+            Qwen36MoeProjectionResidency::ExpandedBf16 | Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback => {
                 GgmlDType::BF16
             }
-            Qwen35MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
+            Qwen36MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
         };
         let quantized = QTensor::quantize(&tensor, ggml_dtype).map_err(Error::from)?;
         Ok(Qwen35Projection::Quantized(
@@ -163,7 +163,7 @@ fn tensor_kind(dtype: &safetensors::Dtype) -> ExpectedTensorKind {
     }
 }
 
-impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
+impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
     fn has(&self, name: &str) -> bool {
         canonical_name(name)
             .and_then(|canonical| self.checkpoint.raw_tensor_name(&canonical).ok())
@@ -176,7 +176,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             [rows, cols] => [*rows, *cols],
             other => {
                 return Err(Error::ModelLoadError(format!(
-                    "qwen35moe native projection `{canonical}` has rank-{} shape {other:?}; expected a 2-D projection",
+                    "qwen36moe native projection `{canonical}` has rank-{} shape {other:?}; expected a 2-D projection",
                     other.len()
                 )))
             }
@@ -199,11 +199,11 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             device,
             self.residency,
         )? {
-            Qwen35MoeProjection::Packed(qmatmul) => Ok(Qwen35Projection::Quantized(qmatmul)),
-            Qwen35MoeProjection::Dense(tensor) => {
+            Qwen36MoeProjection::Packed(qmatmul) => Ok(Qwen35Projection::Quantized(qmatmul)),
+            Qwen36MoeProjection::Dense(tensor) => {
                 Self::wrap_dense_projection(tensor, self.residency)
             }
-            Qwen35MoeProjection::CompactFp8(raw) => Ok(Qwen35Projection::CompactFp8 {
+            Qwen36MoeProjection::CompactFp8(raw) => Ok(Qwen35Projection::CompactFp8 {
                 weights: raw.weights,
                 scales: raw.scales,
             }),
@@ -227,7 +227,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
         layer: usize,
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
-    ) -> Result<Qwen35MoeSparseMlp> {
+    ) -> Result<Qwen36MoeSparseMlp> {
         let prefix = format!("model.layers.{layer}.mlp");
 
         // Router: `mlp.gate.weight` is FP8-excluded (BF16 dense) in the
@@ -240,7 +240,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             .tensor_info(router_raw)?
             .shape
             .clone();
-        let router = Qwen35MoeLinear::from_dense(self.checkpoint.materialize_dense(
+        let router = Qwen36MoeLinear::from_dense(self.checkpoint.materialize_dense(
             &router_canonical,
             &router_shape,
             device,
@@ -249,7 +249,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
 
         let mut experts = Vec::with_capacity(geometry.num_experts);
         for expert in 0..geometry.num_experts {
-            experts.push(Qwen35MoeExpertWeights {
+            experts.push(Qwen36MoeExpertWeights {
                 gate: self.materialize_expert_projection(
                     &format!("{prefix}.experts.{expert}.gate_proj.weight"),
                     device,
@@ -265,7 +265,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
             });
         }
 
-        let shared = Qwen35MoeSharedExpertWeights {
+        let shared = Qwen36MoeSharedExpertWeights {
             gate: self.materialize_expert_projection(&format!("{prefix}.shared_expert.gate_proj.weight"), device)?,
             up: self.materialize_expert_projection(&format!("{prefix}.shared_expert.up_proj.weight"), device)?,
             down: self.materialize_expert_projection(&format!("{prefix}.shared_expert.down_proj.weight"), device)?,
@@ -273,11 +273,11 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
                 .checkpoint
                 .raw_tensor_name(&format!("{prefix}.shared_expert_gate.weight"))
                 .is_ok()
-                .then(|| -> Result<Qwen35MoeLinear> {
+                .then(|| -> Result<Qwen36MoeLinear> {
                     let gate_canonical = format!("{prefix}.shared_expert_gate.weight");
                     let raw = self.checkpoint.raw_tensor_name(&gate_canonical)?;
                     let shape = self.checkpoint.tensors.tensor_info(raw)?.shape.clone();
-                    Ok(Qwen35MoeLinear::from_dense(
+                    Ok(Qwen36MoeLinear::from_dense(
                         self.checkpoint.materialize_dense(
                             &gate_canonical,
                             &shape,
@@ -289,7 +289,7 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
                 .transpose()?,
         };
 
-        Qwen35MoeSparseMlp::from_weights(router, experts, shared, geometry)
+        Qwen36MoeSparseMlp::from_weights(router, experts, shared, geometry)
     }
 
     fn token_embeddings(&self, device: &Device) -> Result<Tensor> {
@@ -299,19 +299,19 @@ impl Qwen35WeightSource for Qwen35MoeNativeSource<'_> {
     }
 }
 
-impl Qwen35MoeNativeSource<'_> {
+impl Qwen36MoeNativeSource<'_> {
     fn materialize_expert_projection(
         &self,
         canonical: &str,
         device: &Device,
-    ) -> Result<Qwen35MoeLinear> {
+    ) -> Result<Qwen36MoeLinear> {
         let raw = self.checkpoint.raw_tensor_name(canonical)?;
         let shape = self.checkpoint.tensors.tensor_info(raw)?.shape.clone();
         let expected: [usize; 2] = match shape.as_slice() {
             [rows, cols] => [*rows, *cols],
             other => {
                 return Err(Error::ModelLoadError(format!(
-                    "qwen35moe native expert projection `{canonical}` has shape {other:?}; expected a 2-D projection"
+                    "qwen36moe native expert projection `{canonical}` has shape {other:?}; expected a 2-D projection"
                 )))
             }
         };
@@ -319,9 +319,9 @@ impl Qwen35MoeNativeSource<'_> {
             .checkpoint
             .materialize_projection(canonical, expected, device, self.residency)?
         {
-            Qwen35MoeProjection::Packed(qmatmul) => Ok(Qwen35MoeLinear::Quantized(qmatmul)),
-            Qwen35MoeProjection::Dense(tensor) => Ok(Qwen35MoeLinear::from_dense(tensor)),
-            Qwen35MoeProjection::CompactFp8(raw) => Ok(Qwen35MoeLinear::CompactFp8 {
+            Qwen36MoeProjection::Packed(qmatmul) => Ok(Qwen36MoeLinear::Quantized(qmatmul)),
+            Qwen36MoeProjection::Dense(tensor) => Ok(Qwen36MoeLinear::from_dense(tensor)),
+            Qwen36MoeProjection::CompactFp8(raw) => Ok(Qwen36MoeLinear::CompactFp8 {
                 weights: raw.weights,
                 scales: raw.scales,
             }),
@@ -331,11 +331,11 @@ impl Qwen35MoeNativeSource<'_> {
 
 /// Map the validated native text geometry onto the shared trunk config.
 pub(crate) fn qwen35_text_config_from_native(
-    native: &crate::models::architectures::qwen35moe::native::Qwen35MoeTextConfig,
+    native: &crate::models::architectures::qwen36moe::native::Qwen36MoeTextConfig,
 ) -> crate::models::architectures::qwen35::chat::Qwen35TextConfig {
     let inner_size = native.ssm_time_step_rank * native.ssm_value_head_dim;
     crate::models::architectures::qwen35::chat::Qwen35TextConfig {
-        architecture: "qwen35moe".to_string(),
+        architecture: "qwen36moe".to_string(),
         block_count: native.block_count,
         context_length: native.context_tokens,
         embedding_length: native.hidden_size,
@@ -365,12 +365,12 @@ pub(crate) fn qwen35_text_config_from_native(
 
 /// Build the shared hybrid trunk from an opened native FP8 checkpoint.
 pub(crate) fn load_text_model_native(
-    checkpoint: &Qwen35MoeNativeCheckpoint,
+    checkpoint: &Qwen36MoeNativeCheckpoint,
     device_profile: &DeviceProfile,
     device: &Device,
 ) -> Result<(crate::models::architectures::qwen35::chat::Qwen35TextConfig, Qwen35TextModel)> {
     let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-    let source = Qwen35MoeNativeSource::new(checkpoint, device_profile);
+    let source = Qwen36MoeNativeSource::new(checkpoint, device_profile);
     let model = Qwen35TextModel::load_with_source(&source, &text_config, device)?;
     Ok((text_config, model))
 }

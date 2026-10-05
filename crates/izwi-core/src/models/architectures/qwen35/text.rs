@@ -30,7 +30,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
-use crate::models::architectures::qwen35moe::sparse::Qwen35MoeSparseMlp;
+use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
 pub struct Qwen35TextModel {
     device: Device,
@@ -348,7 +348,7 @@ pub struct Qwen35MoeFfnGeometry {
 }
 
 /// Checkpoint-format seam for the shared Qwen3.5 hybrid trunk. The dense
-/// GGUF family and the qwen35moe loaders (native block-FP8 safetensors and
+/// GGUF family and the qwen36moe loaders (native block-FP8 safetensors and
 /// the synthetic GGUF fixture) build the identical model through this
 /// interface; only tensor naming, residency, and MoE weight layout differ.
 ///
@@ -395,13 +395,13 @@ pub(crate) trait Qwen35WeightSource {
         layer: usize,
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
-    ) -> Result<Qwen35MoeSparseMlp>;
+    ) -> Result<Qwen36MoeSparseMlp>;
 
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
 }
 
-/// GGUF-backed source for the dense Qwen3.5 family and the qwen35moe
+/// GGUF-backed source for the dense Qwen3.5 family and the qwen36moe
 /// synthetic fixture checkpoints (fused `ffn_*_exps` expert tensors).
 pub(crate) struct GgufSource<'a> {
     loader: &'a GgufLoader,
@@ -437,8 +437,8 @@ impl Qwen35WeightSource for GgufSource<'_> {
         layer: usize,
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
-    ) -> Result<Qwen35MoeSparseMlp> {
-        crate::models::architectures::qwen35moe::sparse::load_gguf_sparse_mlp(
+    ) -> Result<Qwen36MoeSparseMlp> {
+        crate::models::architectures::qwen36moe::sparse::load_gguf_sparse_mlp(
             self.loader,
             layer,
             geometry,
@@ -458,7 +458,7 @@ impl Qwen35WeightSource for GgufSource<'_> {
 /// expert block. Mirrors `Qwen3FeedForward` on the qwen3 family.
 enum Qwen35FeedForward {
     Dense(Qwen35Mlp),
-    Sparse(Qwen35MoeSparseMlp),
+    Sparse(Qwen36MoeSparseMlp),
 }
 
 impl Qwen35FeedForward {
