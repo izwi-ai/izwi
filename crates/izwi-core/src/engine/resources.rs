@@ -2303,3 +2303,22 @@ mod tests {
         assert_eq!(authority.snapshot().reservations, 1);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex as StdMutex;
+
+    /// Serializes every test that reserves against the process-global
+    /// [`ResourceAuthority`] registry: coordinator authorities are shared
+    /// across `RuntimeService` instances, load transactions hold their
+    /// variant's full residency estimate (multi-GiB for GGUF families), and
+    /// the injected-OOM ladder tests temporarily poison the authority. Two
+    /// such tests overlapping can reject an unrelated concurrent admission
+    /// with `Overloaded` on capacity-constrained runners. Tests whose
+    /// admission or load path consults the global authority must hold this
+    /// lock for their whole body.
+    pub(crate) fn authority_test_lock() -> &'static StdMutex<()> {
+        static LOCK: StdMutex<()> = StdMutex::new(());
+        &LOCK
+    }
+}

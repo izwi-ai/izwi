@@ -2487,9 +2487,15 @@ mod tests {
         assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn diarization_admitted_copy_yields_between_bounded_quanta() {
         use std::sync::atomic::{AtomicBool, Ordering};
+        // The max-pipeline admission below competes with load-transaction
+        // residency reservations on the process-global authority; serialize.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
 
         let runtime = RuntimeService::new(crate::config::EngineConfig::default()).expect("runtime");
         let input = vec![11_u8; 2 * 1024 * 1024 + 17];
@@ -2518,8 +2524,13 @@ mod tests {
         peer.await.expect("peer task");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn diarization_admitted_copy_stops_at_absolute_deadline() {
+        // Same max-pipeline admission reservation as the yielding test.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(crate::config::EngineConfig::default()).expect("runtime");
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
         let job =
