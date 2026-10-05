@@ -2739,7 +2739,7 @@ mod tests {
         let expected_shape = [8, 32];
         let raw_name = checkpoint.raw_tensor_name(canonical).unwrap();
         let compact = checkpoint
-            .materialize_compact_projection(&raw_name, expected_shape, &candle_core::Device::Cpu)
+            .materialize_compact_projection(raw_name, expected_shape, &candle_core::Device::Cpu)
             .unwrap();
         assert_eq!(compact.weights.dims(), &[8, 32]);
         assert_eq!(compact.weights.dtype(), candle_core::DType::U8);

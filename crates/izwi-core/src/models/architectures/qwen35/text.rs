@@ -1071,7 +1071,7 @@ impl Qwen35Mlp {
             (&gate * &up_proj_out)?
         };
 
-        self.down.forward(&hidden).map_err(Error::from)
+        self.down.forward(&hidden)
     }
 }
 
@@ -1191,7 +1191,7 @@ impl Qwen35FullAttention {
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     fn forward_physical_decode_batch(
@@ -1308,7 +1308,7 @@ impl Qwen35FullAttention {
             self.num_heads * self.head_dim,
         ))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     fn apply_rope(
@@ -1622,7 +1622,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_decode_batch(
@@ -1716,7 +1716,7 @@ impl Qwen35LinearAttention {
             1,
             self.num_v_heads * self.head_v_dim,
         ))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_sequence(
@@ -1848,7 +1848,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn depthwise_conv_sequence(
