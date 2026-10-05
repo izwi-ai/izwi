@@ -6,7 +6,7 @@
 //! requests are translated to the canonical HF layout
 //! (`model.layers.{i}...`), and every projection materializes in the
 //! backend's persistent residency (CPU packed Q8_0, Metal expanded F16,
-//! CUDA expanded BF16).
+//! CUDA raw block-FP8 with per-tensor Q8_0 fallback).
 
 use std::sync::Arc;
 

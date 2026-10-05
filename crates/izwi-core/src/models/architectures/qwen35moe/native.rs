@@ -141,6 +141,14 @@ pub(crate) struct PinnedRepresentationInventory {
     pub fp8_elements: u64,
     pub dense_elements: u64,
     pub tensor_count: u64,
+    /// Host bytes of the F32-decoded `weight_scale_inv` companions (each
+    /// block-FP8 tensor of `[rows, cols]` carries
+    /// `[ceil(rows/128), ceil(cols/128)]` F32 scales).
+    pub fp8_scale_bytes: u64,
+    /// Elements of block-FP8 tensors whose geometry the CUDA fp8 projection
+    /// kernel cannot execute (`n % 64 != 0 || k % 128 != 0`); under the
+    /// native-FP8 residency these fall back to packed Q8_0.
+    pub fp8_incompatible_elements: u64,
 }
 
 pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
@@ -149,6 +157,8 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         .expect("pinned config produces the validated tensor plan");
     let mut fp8_elements = 0u64;
     let mut dense_elements = 0u64;
+    let mut fp8_scale_bytes = 0u64;
+    let mut fp8_incompatible_elements = 0u64;
     for expected in plan.values() {
         let count = expected
             .shape
@@ -158,7 +168,16 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
             })
             .unwrap_or(u64::MAX);
         match expected.kind {
-            BlockFp8 => fp8_elements = fp8_elements.saturating_add(count),
+            BlockFp8 => {
+                fp8_elements = fp8_elements.saturating_add(count);
+                let (rows, cols) = (expected.shape[0], expected.shape[1]);
+                let scale_entries =
+                    rows.div_ceil(128).saturating_mul(cols.div_ceil(128)) as u64;
+                fp8_scale_bytes = fp8_scale_bytes.saturating_add(scale_entries.saturating_mul(4));
+                if rows % 64 != 0 || cols % 128 != 0 {
+                    fp8_incompatible_elements = fp8_incompatible_elements.saturating_add(count);
+                }
+            }
             Dense | OptionalDense => dense_elements = dense_elements.saturating_add(count),
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
@@ -170,6 +189,8 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         fp8_elements,
         dense_elements,
         tensor_count: plan.len() as u64,
+        fp8_scale_bytes,
+        fp8_incompatible_elements,
     }
 }
 
@@ -1351,13 +1372,15 @@ impl Qwen35MoeNativeCheckpoint {
     ///
     /// CPU packs requantized Q8_0 projections (the F32 expanded envelope for
     /// a 35B checkpoint is impractical and the Q8_0 path keeps Candle CPU
-    /// QMatMul residency), Metal expands to F16, CUDA expands to BF16 with a
-    /// CC-gated F16 fallback decided by the caller.
+    /// QMatMul residency), Metal expands to F16 (Apple GPUs have no FP8
+    /// path), CUDA keeps the checkpoint's raw block-FP8 bytes resident and
+    /// decodes per GEMM inside the fp8 projection kernel, falling back per
+    /// tensor to packed Q8_0 where the kernel contract cannot execute.
     pub fn projection_residency_policy(device: &DeviceProfile) -> Qwen35MoeProjectionResidency {
         match BackendKind::from(device.kind) {
             BackendKind::Cpu => Qwen35MoeProjectionResidency::PackedQ8_0,
             BackendKind::Metal => Qwen35MoeProjectionResidency::ExpandedF16,
-            BackendKind::Cuda => Qwen35MoeProjectionResidency::ExpandedBf16,
+            BackendKind::Cuda => Qwen35MoeProjectionResidency::NativeFp8WithQ8Fallback,
         }
     }
 
