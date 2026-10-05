@@ -191,8 +191,8 @@ struct ManagedChatCapacityPolicy {
     /// `None` delegates staged transaction width to the engine-wide
     /// `max_staged_transactions` setting.
     staged_transaction_rows: Option<u32>,
-    /// CUDA Qwen3.8 still fits logical context against resident device
-    /// headroom; this is independent of staged transaction width.
+    /// CUDA Qwen3.8 and Qwen3.5/3.6-MoE fit logical context against resident
+    /// device headroom; this is independent of staged transaction width.
     fit_cuda_resident_context: bool,
 }
 
@@ -200,10 +200,13 @@ fn managed_chat_capacity_policy(
     variant: ModelVariant,
     backend: BackendKind,
 ) -> ManagedChatCapacityPolicy {
+    let family = variant.family();
     ManagedChatCapacityPolicy {
         staged_transaction_rows: None,
-        fit_cuda_resident_context: variant.family() == crate::catalog::ModelFamily::Qwen38Chat
-            && backend == BackendKind::Cuda,
+        fit_cuda_resident_context: matches!(
+            family,
+            crate::catalog::ModelFamily::Qwen38Chat | crate::catalog::ModelFamily::Qwen35MoeChat
+        ) && backend == BackendKind::Cuda,
     }
 }
 
@@ -3311,6 +3314,19 @@ mod tests {
             managed_chat_capacity_policy(ModelVariant::Qwen359BGguf, BackendKind::Cuda);
         assert_eq!(cuda_qwen35.staged_transaction_rows, None);
         assert!(!cuda_qwen35.fit_cuda_resident_context);
+
+        // The Qwen3.5/3.6 MoE family fits its invocation-state arena against
+        // CUDA resident headroom like Qwen3.8: its authored-context arena
+        // otherwise cannot coexist with the resident representation on an
+        // 80 GB device.
+        let cuda_qwen36_moe =
+            managed_chat_capacity_policy(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Cuda);
+        assert_eq!(cuda_qwen36_moe.staged_transaction_rows, None);
+        assert!(cuda_qwen36_moe.fit_cuda_resident_context);
+
+        let metal_qwen36_moe =
+            managed_chat_capacity_policy(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Metal);
+        assert!(!metal_qwen36_moe.fit_cuda_resident_context);
     }
 
     #[test]
