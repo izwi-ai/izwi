@@ -4,7 +4,7 @@ use super::*;
 use crate::backends::DeviceProfile;
 use crate::engine::{ExecutionAdapterBinding, ExecutionGroupId, InputRange, ModelInstanceId};
 use crate::models::architectures::lfm2::chat::Lfm2ChatModel;
-use crate::models::registry::ChatModelLease;
+use crate::models::registry::{ChatModelLease, NativeChatModel};
 use crate::runtime::LoadedModelBundleDraft;
 use crate::runtime::{CapabilityKind, RuntimeAdapterRegistry};
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};

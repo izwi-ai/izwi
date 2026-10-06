@@ -3717,6 +3717,27 @@ impl NativeChatModel {
             Self::Lfm2(model) => model.max_context_tokens(),
         }
     }
+
+    /// Executor scheduler profile for multi-token decode quanta:
+    /// `(preferred_decode_tokens, sustained_decode_quantum,
+    /// speculative_decode_batch)`. Families whose decode step always consumes
+    /// exactly one token per row return the scalar default; a family opts
+    /// into wider quanta (e.g. MTP speculative decoding) by overriding these
+    /// values.
+    pub fn speculative_decode_profile(&self) -> (usize, bool, bool) {
+        match self {
+            Self::Qwen38(model) => (
+                model.preferred_decode_tokens(),
+                model.sustained_cuda_mtp_quantum(),
+                model.mtp_in_continuous_enabled(),
+            ),
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen35Moe(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_) => (1, false, false),
+        }
+    }
 }
 
 impl InferenceStateContractProvider for NativeChatModel {
