@@ -40,6 +40,13 @@ pub struct Qwen35TextModel {
     finite_diagnostics_enabled: bool,
 }
 
+/// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
+/// pair rebuild consumes them) plus the optional final-row logits.
+pub(crate) struct Qwen35PrefillSpanOutput {
+    pub hidden_states: Tensor,
+    pub logits: Option<Tensor>,
+}
+
 #[derive(Clone)]
 pub struct Qwen35TextRuntimeState {
     layers: Vec<Qwen35LayerRuntimeState>,
@@ -817,6 +824,45 @@ impl Qwen35TextModel {
         let hidden =
             self.forward_hidden_physical(input_embedding, &[position_ids], state, cache)?;
         self.forward_hidden_to_logits(&hidden)
+    }
+
+    /// Prefill one span and return every row's PRE-`output_norm` hidden plus,
+    /// when requested, the final row's logits. Replay spans rebuild the MTP
+    /// draft domain from the hidden rows; ordinary prefill ignores them.
+    pub(crate) fn prefill_token_ids_with_hidden_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        compute_logits: bool,
+    ) -> Result<Qwen35PrefillSpanOutput> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 replay prefill requires a non-empty span".into(),
+            ));
+        }
+        if token_ids.len() != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 replay prefill span mismatch: {} token ids for {} position ids",
+                token_ids.len(),
+                position_ids.len()
+            )));
+        }
+        record_prefill_sequence_span(token_ids.len());
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden_states = self.forward_hidden_physical(&hidden, position_ids, state, cache)?;
+        let logits = if compute_logits {
+            let last = hidden_states.narrow(1, token_ids.len() - 1, 1)?;
+            Some(self.forward_hidden_to_logits(&last)?)
+        } else {
+            None
+        };
+        Ok(Qwen35PrefillSpanOutput {
+            hidden_states,
+            logits,
+        })
     }
 
     pub(crate) fn prefill_input_embeddings_physical(

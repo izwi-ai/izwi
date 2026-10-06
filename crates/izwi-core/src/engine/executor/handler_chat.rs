@@ -217,10 +217,15 @@ impl NativeExecutor {
         let Some(super::ExecutorStateSlot::Ready { state, .. }) = states.get(session) else {
             return Ok(None);
         };
-        let NativeChatDecodeState::Qwen38(model_state) = &state.state else {
-            return Ok(None);
+        let checkpoint = match &state.state {
+            NativeChatDecodeState::Qwen38(model_state) => {
+                super::state::SuspendedReplayCheckpoint::Qwen38(model_state.replay_checkpoint()?)
+            }
+            NativeChatDecodeState::Qwen35(model_state) => {
+                super::state::SuspendedReplayCheckpoint::Qwen35Moe(model_state.replay_checkpoint()?)
+            }
+            _ => return Ok(None),
         };
-        let checkpoint = model_state.replay_checkpoint()?;
         let tokens = checkpoint.replay_tokens();
         let mut suspended = self
             .suspended_chat_states
@@ -458,19 +463,31 @@ impl NativeExecutor {
                         "invalid chat replay restart boundary".into(),
                     ));
                 }
-                let NativeChatModel::Qwen38(qwen) = model.as_ref() else {
-                    return Err(Error::InferenceError(
-                        "replay model does not match session".into(),
-                    ));
-                };
                 let cache = managed_cache
                     .take()
                     .ok_or_else(|| Error::InferenceError("replay lost target cache".into()))?;
-                let mut state = NativeChatDecodeState::Qwen38(qwen.begin_replay_state_physical(
-                    &saved.checkpoint,
-                    cache,
-                    mtp_cache.take(),
-                )?);
+                let mut state = match (model.as_ref(), &saved.checkpoint) {
+                    (NativeChatModel::Qwen38(qwen), super::state::SuspendedReplayCheckpoint::Qwen38(checkpoint)) => {
+                        NativeChatDecodeState::Qwen38(qwen.begin_replay_state_physical(
+                            checkpoint,
+                            cache,
+                            mtp_cache.take(),
+                        )?)
+                    }
+                    (
+                        NativeChatModel::Qwen35Moe(moe),
+                        super::state::SuspendedReplayCheckpoint::Qwen35Moe(checkpoint),
+                    ) => NativeChatDecodeState::Qwen35(moe.begin_replay_state_physical(
+                        checkpoint,
+                        cache,
+                        mtp_cache.take(),
+                    )?),
+                    _ => {
+                        return Err(Error::InferenceError(
+                            "replay model does not match session".into(),
+                        ))
+                    }
+                };
                 if let Some(reservation) = tensor_reservation.as_ref() {
                     state.bind_hybrid_tensor_sequence(reservation.sequence)?;
                 }
@@ -660,6 +677,7 @@ impl NativeExecutor {
         let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
         let replay_tokens = state_lease.state().and_then(|active| match &active.state {
             NativeChatDecodeState::Qwen38(state) => state.replay_tokens(),
+            NativeChatDecodeState::Qwen35(state) => state.replay_tokens(),
             _ => None,
         });
         let resumable_span = resumable_prefill_quantum
@@ -681,14 +699,22 @@ impl NativeExecutor {
                     prefill = scheduled.is_prefill, "LFM2 quantum diagnostic context");
             }
             let step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
-                let (NativeChatModel::Qwen38(qwen), NativeChatDecodeState::Qwen38(state)) =
-                    (model.as_ref(), &mut active_state.state)
-                else {
-                    return Err(Error::InferenceError(
-                        "chat replay crossed model family".into(),
-                    ));
-                };
-                Self::run_blocking(|| qwen.continue_replay_physical(state, start, end))?;
+                match (model.as_ref(), &mut active_state.state) {
+                    (NativeChatModel::Qwen38(qwen), NativeChatDecodeState::Qwen38(state)) => {
+                        Self::run_blocking(|| qwen.continue_replay_physical(state, start, end))?;
+                    }
+                    (
+                        NativeChatModel::Qwen35Moe(moe),
+                        NativeChatDecodeState::Qwen35(state),
+                    ) => {
+                        Self::run_blocking(|| moe.continue_replay_physical(state, start, end))?;
+                    }
+                    _ => {
+                        return Err(Error::InferenceError(
+                            "chat replay crossed model family".into(),
+                        ));
+                    }
+                }
                 crate::engine::metrics::record_capacity_replay(end - start);
                 NativeChatDecodeStep {
                     delta: String::new(),

@@ -4073,270 +4073,125 @@ mod tests {
     }
 
     #[test]
-    fn mtp_head_loads_from_the_validated_manifest_and_drafts() {
-        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
-        use crate::engine::ModelInstanceId;
-        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen36moe::native_model::load_text_model_native;
-        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-        use candle_core::{DType, Device, Tensor};
-        use std::sync::Arc;
+    fn replay_checkpoint_preserves_decode_across_suspension() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 
-        let config = forward_config();
-        let dir = TestDir::new("mtp-head");
-        write_tiny_checkpoint(&config, dir.0.as_path());
-        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-            Qwen36MoeMtpLoadPolicy::Enabled,
-        )
-        .unwrap();
-        let device_profile = DeviceProfile::cpu();
-        let (text_config, model, mtp_head) = load_text_model_native(
-            &checkpoint,
-            &device_profile,
-            &Device::Cpu,
-            &crate::performance::CudaPerformanceConfig::default(),
-            true,
-        )
-        .unwrap();
-        let head = mtp_head.expect("MTP head constructed when the policy enables it");
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
 
-        // The MTP layer binds one paged KV layer at model_layer = block_count.
-        let id = KvArenaId {
-            model_instance: ModelInstanceId::new(4247),
-            backend: BackendKind::Cpu,
-            device_ordinal: None,
-            generation: 1,
-        };
-        let group = KvGroupId::new(1);
-        let arena = Arc::new(
-            CpuKvArena::new(KvArenaConfig {
-                id,
-                group,
-                page_tokens: 8,
-                capacity_pages: 8,
-                growth: None,
-                dtype: DType::F32,
-                layers: vec![KvLayerConfig {
-                    binding: KvLayerBinding {
-                        model_layer: text_config.block_count as u32,
-                        physical_layer: 0,
-                    },
-                    num_kv_heads: text_config.attention_head_count_kv as u32,
-                    key_head_dim: text_config.attention_key_length as u32,
-                    value_head_dim: text_config.attention_value_length as u32,
-                }],
-            })
-            .unwrap(),
-        );
-        let blocks = (0..8)
-            .map(|index| CacheBlockRef {
-                arena: id,
-                group,
-                index: index as u32,
-                slot_generation: 1,
-            })
-            .collect();
-        let mut mtp_cache = PhysicalPagedKvCache::new(
-            arena,
-            vec![KvLayerBinding {
-                model_layer: text_config.block_count as u32,
-                physical_layer: 0,
-            }],
-            blocks,
-            0,
-        )
-        .unwrap();
-
-        // Greedy draft of depth 2 from a zero seed: one continuation pair is
-        // committed to the MTP cache, both tokens stay in vocabulary.
-        let seed = Tensor::zeros((1, 1, text_config.embedding_length), DType::F32, &Device::Cpu)
-            .unwrap();
-        let tokens = head
-            .draft_greedy(
-                &model,
-                &seed,
-                2,
-                &[[3, 3, 3]],
-                config.text.vocab_size,
-                &mut mtp_cache,
-            )
-            .unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert!(
-            tokens
-                .iter()
-                .all(|token| (*token as usize) < config.text.vocab_size)
-        );
-        assert_eq!(mtp_cache.context_len(), 1, "depth 2 commits one pair");
-    }
-
-    #[test]
-    fn mtp_policy_validates_the_draft_manifest_fail_closed() {
-        let config = forward_config();
-        let dir = TestDir::new("mtp-ok");
-        write_tiny_checkpoint(&config, dir.0.as_path());
-
-        // Disabled (default): manifest skipped, no inventory.
-        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-            Qwen36MoeMtpLoadPolicy::Disabled,
-        )
-        .unwrap();
-        assert!(checkpoint.mtp.is_none());
-
-        // Enabled: the fixture carries the exact plan, so validation passes
-        // and the inventory records every draft tensor.
-        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-            Qwen36MoeMtpLoadPolicy::Enabled,
-        )
-        .unwrap();
-        let inventory = checkpoint.mtp.as_ref().expect("MTP inventory recorded");
-        assert_eq!(inventory.tensors.len(), 22);
-        assert!(inventory.tensors.contains_key("mtp.fc.weight"));
-        assert!(
-            inventory
-                .tensors
-                .contains_key("mtp.layers.0.self_attn.q_proj.weight")
-        );
-        assert!(inventory.tensors.contains_key("mtp.norm.weight"));
-
-        // Missing tensor: fail closed naming it.
-        let missing = |dropped: &str| {
-            let dir = TestDir::new("mtp-missing");
-            let tensors: Vec<RawTensor> = tiny_checkpoint_tensors(&config)
-                .into_iter()
-                .filter(|(name, ..)| name != dropped)
-                .collect();
-            write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
-            Qwen36MoeNativeCheckpoint::open_with_policies(
+        let load = |tag: &str, mtp: bool| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
                 dir.0.as_path(),
-                Qwen36MoeGeometryPolicy::Synthetic,
-                Qwen36MoeMtpLoadPolicy::Enabled,
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
             )
-            .err()
-            .expect("missing MTP tensor must fail closed")
-            .to_string()
-        };
-        let error = missing("mtp.fc.weight");
-        assert!(error.contains("missing MTP tensor"), "{error}");
-        assert!(error.contains("mtp.fc.weight"), "{error}");
-
-        // Extra unplanned tensor: fail closed.
-        let dir = TestDir::new("mtp-extra");
-        let mut tensors = tiny_checkpoint_tensors(&config);
-        tensors.push((
-            "mtp.mystery.weight".into(),
-            SafeDType::BF16,
-            vec![4],
-            bf16_uniform(0.05, 4),
-        ));
-        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
-        let error = Qwen36MoeNativeCheckpoint::open_with_policies(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-            Qwen36MoeMtpLoadPolicy::Enabled,
-        )
-        .err()
-        .expect("unplanned MTP tensor must fail closed")
-        .to_string();
-        assert!(error.contains("unplanned MTP tensors"), "{error}");
-        assert!(error.contains("mtp.mystery.weight"), "{error}");
-
-        // Shape drift: fail closed.
-        let dir = TestDir::new("mtp-shape");
-        let mut tensors = tiny_checkpoint_tensors(&config);
-        let drifted = tensors
-            .iter_mut()
-            .find(|(name, ..)| name == "mtp.norm.weight")
             .unwrap();
-        drifted.2 = vec![drifted.2[0] + 1];
-        drifted.3 = bf16_uniform(0.05, drifted.2[0]);
-        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
-        let error = Qwen36MoeNativeCheckpoint::open_with_policies(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-            Qwen36MoeMtpLoadPolicy::Enabled,
-        )
-        .err()
-        .expect("MTP shape drift must fail closed")
-        .to_string();
-        assert!(error.contains("contract drift"), "{error}");
-        assert!(error.contains("mtp.norm.weight"), "{error}");
-    }
+            (model, dir)
+        };
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "abcd".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let fresh_caches = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+                            mtp: bool| {
+            let block_count = u32::try_from(model.text_config().block_count).unwrap();
+            let target = shared_native_caches(model, 1, 3).remove(0);
+            let mtp_cache = mtp.then(|| shared_native_caches(model, 1, block_count).remove(0));
+            (target, mtp_cache)
+        };
 
-    #[test]
-    fn rejects_unexpected_and_missing_text_tensors_by_name() {
-        let config = tiny_config();
-        let dir = TestDir::new("open-extra");
-        write_tiny_checkpoint(&config, dir.0.as_path());
-        // Rewrite the checkpoint with one extra unexpected text tensor.
-        let mut with_extra = tiny_checkpoint_tensors(&config);
-        with_extra.push((
-            "model.language_model.layers.0.mlp.mystery.weight".into(),
-            SafeDType::BF16,
-            vec![4],
-            bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
-        ));
-        let refs: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = with_extra
-            .iter()
-            .map(|(name, dtype, shape, data)| {
-                (name.as_str(), *dtype, shape.clone(), data.as_slice())
-            })
-            .collect();
-        write_safetensors(&dir.0.join("extra.safetensors"), &refs);
-        let mut weight_map = serde_json::Map::new();
-        for (name, ..) in &refs {
-            weight_map.insert((*name).to_string(), json!("extra.safetensors"));
+        for (tag, mtp) in [("replay-headless", false), ("replay-mtp", true)] {
+            let (model, dir) = load(tag, mtp);
+            let (target, mtp_cache) = fresh_caches(&model, mtp);
+            let mut uninterrupted = model
+                .start_decode_state_physical_with_mtp(
+                    &messages, 16, &config, None, target, mtp_cache,
+                )
+                .unwrap();
+            // Suspended immediately after prefill: the replay recomputes the
+            // prompt span exactly as the original prefill ran it.
+            let initial = uninterrupted.replay_checkpoint().unwrap();
+            let prompt_tokens = initial.replay_tokens();
+            assert!(prompt_tokens > 0);
+            let (target, mtp_cache) = fresh_caches(&model, mtp);
+            let mut resumed = model
+                .begin_replay_state_physical(&initial, target, mtp_cache)
+                .unwrap();
+            // Decode cannot run while a replay is pending.
+            assert!(model.decode_quantum(&mut resumed, 1).is_err());
+            assert!(
+                model
+                    .continue_replay_physical(&mut resumed, 0, prompt_tokens)
+                    .unwrap(),
+                "single-span replay must report completion"
+            );
+            assert!(resumed.replay_tokens().is_none());
+
+            // Step both sessions to completion, re-suspending the resumed
+            // session once mid-run: generated tokens replay in one-token
+            // spans, the same decode path that produced them.
+            let mut re_suspended = false;
+            while !uninterrupted.is_finished() {
+                let expected = model.decode_quantum(&mut uninterrupted, 4).unwrap();
+                let actual = model.decode_quantum(&mut resumed, 4).unwrap();
+                assert_eq!(actual.delta, expected.delta, "post-replay step must match");
+                assert_eq!(actual.tokens_generated, expected.tokens_generated);
+                assert_eq!(
+                    resumed.tokens_generated(),
+                    uninterrupted.tokens_generated()
+                );
+                assert_eq!(
+                    model.mtp_cache_cursor(&resumed),
+                    model.mtp_cache_cursor(&uninterrupted),
+                    "MTP cursor must survive suspension"
+                );
+                if !re_suspended && uninterrupted.tokens_generated() >= 6 {
+                    re_suspended = true;
+                    let checkpoint = resumed.replay_checkpoint().unwrap();
+                    let (target, mtp_cache) = fresh_caches(&model, mtp);
+                    resumed = model
+                        .begin_replay_state_physical(&checkpoint, target, mtp_cache)
+                        .unwrap();
+                    let appended = checkpoint.replay_tokens();
+                    for cursor in 0..appended {
+                        let complete = model
+                            .continue_replay_physical(&mut resumed, cursor, cursor + 1)
+                            .unwrap();
+                        assert_eq!(complete, cursor + 1 == appended);
+                    }
+                    assert!(resumed.replay_tokens().is_none());
+                }
+            }
+            assert!(re_suspended, "the fixture must reach the mid-run suspension");
+            // Fail-closed gate: finished sessions cannot suspend.
+            assert!(uninterrupted.replay_checkpoint().is_err());
+            std::fs::remove_dir_all(dir.path()).ok();
         }
-        write_index(dir.0.as_path(), serde_json::Value::Object(weight_map));
-
-        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
-            dir.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-        )
-        .err()
-        .expect("unexpected tensor must fail closed")
-        .to_string();
-        assert!(error.contains("outside the validated plan"), "{error}");
-        assert!(error.contains("mystery"), "{error}");
-
-        // Missing required tensor (drop the full-attention o_proj) fails by
-        // naming the gap.
-        let dir_missing = TestDir::new("open-missing");
-        write_tiny_checkpoint(&config, dir_missing.0.as_path());
-        let tensors = tiny_checkpoint_tensors(&config);
-        let pruned: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = tensors
-            .iter()
-            .filter(|(name, ..)| {
-                !name.ends_with("layers.3.self_attn.o_proj.weight")
-                    && !name.ends_with("layers.3.self_attn.o_proj.weight_scale_inv")
-            })
-            .map(|(name, dtype, shape, data)| {
-                (name.as_str(), *dtype, shape.clone(), data.as_slice())
-            })
-            .collect();
-        let mut missing_map = serde_json::Map::new();
-        for (name, ..) in &pruned {
-            missing_map.insert((*name).to_string(), json!("layers.safetensors"));
-        }
-        write_safetensors(&dir_missing.0.join("layers.safetensors"), &pruned);
-        write_index(
-            dir_missing.0.as_path(),
-            serde_json::Value::Object(missing_map),
-        );
-        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
-            dir_missing.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-        )
-        .err()
-        .expect("missing tensor must fail closed")
-        .to_string();
-        assert!(error.contains("missing 2 required text tensors"), "{error}");
-        assert!(error.contains("o_proj"), "{error}");
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
     }
 }

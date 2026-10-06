@@ -527,6 +527,29 @@ impl Qwen36MoeChatModel {
     ) -> Result<Vec<ChatDecodeStep>> {
         self.exec.decode_speculative_batch(states, input_budget)
     }
+
+    /// Rebuild a suspended session over fresh cache reservations; the
+    /// appended KV rows and the MTP draft domain are recomputed by replay
+    /// spans before decode resumes.
+    pub(crate) fn begin_replay_state_physical(
+        &self,
+        saved: &crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
+        self.exec.begin_replay_state_physical(saved, cache, mtp_cache)
+    }
+
+    /// Rebuild one scheduler span without emitting output; returns true when
+    /// the replay finished and decode may resume.
+    pub(crate) fn continue_replay_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        self.exec.continue_replay_physical(state, span_start, span_end)
+    }
 }
 
 #[cfg(test)]
