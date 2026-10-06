@@ -607,6 +607,8 @@ pub(crate) struct Qwen35ChatExec {
     /// Speculative rounds actually executed — telemetry and test evidence
     /// that the draft/verify path ran rather than the scalar fallback.
     pub(crate) mtp_speculative_rounds: std::sync::atomic::AtomicU64,
+    /// Persistent KV storage dtype — the MTP cache arena follows it.
+    pub(crate) kv_storage_dtype: DType,
 }
 
 pub struct Qwen35ChatModel {
@@ -1213,7 +1215,7 @@ impl Qwen35ChatExec {
             page_tokens: page_tokens as u32,
             capacity_pages: (cfg.context_length.max(1) as u32).div_ceil(page_tokens as u32),
             growth: None,
-            dtype: DType::F32,
+            dtype: self.kv_storage_dtype,
             layers: vec![KvLayerConfig {
                 binding: KvLayerBinding {
                     model_layer,
@@ -1636,6 +1638,7 @@ impl Qwen35ChatModel {
                 text_model,
                 mtp_head: None,
                 mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+                kv_storage_dtype: DType::F32,
             },
             text_checkpoint,
             projector_checkpoint,

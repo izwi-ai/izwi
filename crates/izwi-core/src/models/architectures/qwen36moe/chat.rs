@@ -187,7 +187,13 @@ impl Qwen36MoeChatModel {
         let _ = mtp_policy;
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let exec = if fixture_path.exists() {
-            Self::load_fixture_gguf(model_dir, &fixture_path, variant, &device)?
+            Self::load_fixture_gguf(
+                model_dir,
+                &fixture_path,
+                variant,
+                &device,
+                kv_storage_provider,
+            )?
         } else {
             Self::load_native(
                 model_dir,
@@ -195,6 +201,7 @@ impl Qwen36MoeChatModel {
                 &device,
                 &performance.cuda,
                 mtp_enabled,
+                kv_storage_provider,
             )?
         };
         Ok(Self {
@@ -210,6 +217,7 @@ impl Qwen36MoeChatModel {
         fixture_path: &Path,
         variant: ModelVariant,
         device: &DeviceProfile,
+        kv_storage_provider: Qwen36MoeKvStorageProvider,
     ) -> Result<Qwen35ChatExec> {
         let loader =
             GgufLoader::from_path_with_backend(fixture_path, BackendKind::from(device.kind))?;
@@ -227,6 +235,7 @@ impl Qwen36MoeChatModel {
             text_model,
             mtp_head: None,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+            kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
 
@@ -236,6 +245,7 @@ impl Qwen36MoeChatModel {
         device: &DeviceProfile,
         performance: &crate::performance::CudaPerformanceConfig,
         mtp_enabled: bool,
+        kv_storage_provider: Qwen36MoeKvStorageProvider,
     ) -> Result<Qwen35ChatExec> {
         let mtp_policy = if mtp_enabled {
             Qwen36MoeMtpLoadPolicy::Enabled
@@ -262,6 +272,7 @@ impl Qwen36MoeChatModel {
             text_model,
             mtp_head,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+            kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
 
@@ -406,6 +417,32 @@ impl Qwen36MoeChatModel {
             .as_ref()
             .map(|head| head.draft_depth() + 1)
             .unwrap_or(1)
+    }
+
+    /// Serving diagnostics for the admin model API: KV storage, performance
+    /// policy, and the MTP draft state.
+    pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "family": "qwen35_moe_chat",
+            "kv_storage": {
+                "provider": self.kv_storage_provider.as_str(),
+                "dtype": format!("{:?}", self.kv_storage_provider.dtype()),
+            },
+            "performance": {
+                "cuda_mode": format!("{:?}", self.performance.mode),
+                "projection_backend": format!("{:?}", self.performance.projection_backend),
+                "mtp_enabled": self.performance.mtp.enabled(),
+            },
+            "mtp": {
+                "head_loaded": self.exec.mtp_head.is_some(),
+                "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
+                "speculative_rounds": self
+                    .exec
+                    .mtp_speculative_rounds
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "scope": "solo_quantum",
+            },
+        })
     }
 
     /// Speculative rounds executed by this model instance — test and

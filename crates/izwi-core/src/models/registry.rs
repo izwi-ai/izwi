@@ -6054,6 +6054,7 @@ impl ModelRegistry {
                     None,
                     match model.as_ref() {
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
+                        NativeChatModel::Qwen35Moe(model) => Some(model.runtime_diagnostics()),
                         _ => None,
                     },
                 ));
