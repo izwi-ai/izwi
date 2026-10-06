@@ -20521,3 +20521,80 @@ Risks for the H100 handoff: (1) the fp8 kernel perf is unmeasured (that
 is P3); (2) CUDA-compile lane must run in CI before merge; (3) a real
 checkpoint load must be re-verified end-to-end (contract fix + compact
 residency + fitted arena) with the representation diagnostics logged.
+
+# Plan — qwen3.8→qwen3.6-MoE port remainder (3d/3e/3f/5/6) — session 2026-10-06 (part 2)
+
+Continued tasks/qwen36-moe-qwen38-feature-port-research-2026-10-06.md from tip c19d50d5.
+
+## Plan
+- [x] Phase 3d — batched speculative envelope (commit f9874703)
+  - [x] `Qwen35MtpHead::forward_steps_batch`: one MTP pair per row in a single op over a
+        shared arena (shared slot lowering, common write-completion fence); sequential
+        per-row fallback when standalone arenas differ
+  - [x] `Qwen35ChatExec::decode_speculative_batch`: per-row depths (solo rule), per-row MTP
+        logical checkpoints, batched draft advance, per-row verify/commit via
+        `mtp_verify_and_commit` extracted from `mtp_speculative_round` (solo and batch share
+        semantics by construction); ineligible requests (grammar/logprobs/penalties/temp —
+        pre-3f) collapse to scalar rounds; anchor-less rows ride scalar tails
+  - [x] Registry dispatch arm + `speculative_batch_enabled` profile opt-in + executor gate
+  - [x] Envelope rounds counter + diagnostics; 3-way parity test (envelope == solo
+        speculative == scalar greedy) over one shared target arena + one shared MTP arena
+  - Gotcha: rows sharing one arena are required by the batched advance — the DS9.4
+    shared-slot lowering needs one `lower_slots` call; managed-domain rows qualify,
+    standalone per-session arenas degrade to the sequential advance
+- [x] Phase 3e — adaptive depth + round timing (commit 73ad24c2)
+  - [x] `AdaptiveMtp` ported unchanged; state fields `adaptive_mtp` + `mtp_timings`
+  - [x] Solo: CUDA-event `RoundTimer` pending queue (bounded 4) drained at quantum
+        boundaries; envelope: host `Instant` observations; CPU/Metal keep fixed depth
+  - [x] Controller rides the quantum checkpoint with the stronger-numerical-latch restore;
+        solo remaining slices became output-cap aware (same emissions, fewer wasted drafts)
+  - [x] Envelope non-finite draft → disable latch + scalar round; `draft_argmax` split
+  - [x] 5 ported bandit unit tests
+- [x] Phase 3f — stochastic rejection sampling (commit 193ded65)
+  - [x] `mtp_active` relaxed to grammar/logprobs-only exclusions; sampled requests draft via
+        `propose_speculative_draft` and verify via `verify_speculative_proposals`
+  - [x] `DraftBlock` (Greedy ids | Stochastic distributions); head `draft_recurrently` with a
+        caller selection policy; greedy fast path untouched
+  - [x] `SimpleRng::fork` + `rand::RngCore`; forked draft stream, transactional per round,
+        riding the quantum checkpoint
+  - [x] Fixed latent rank-3 bug: MTP bootstrap sampled stored prefill logits raw —
+        `logits_last_row` normalization added; `decode_step`'s inline sample journaled
+  - [x] Stochastic test: per-seed determinism solo+envelope, completion, cursor invariants
+        (sampled stop token holds a pair without counting), mixed per-row configs
+- [x] Phase 5 — graph islands spike (commit 3dd1bb3f)
+  - [x] Executable hardware-gated spike: block-FP8 projection captured via
+        `TensorIsland::run_multi`, expects 1 capture + 2 replays + 0 negative fallbacks
+  - [x] Static verdict evidence: kernel's only allocation is its output (stream path), and
+        it is the identical kernel qwen38 production islands capture
+  - [ ] Island port into the qwen3.5 trunk — GATED on the spike passing at H100 handoff +
+        a scoping decision for sparse-model regions (routed experts ≠ dense MLP analogy)
+- [x] Phase 6 — replay checkpoints (commit cf6c9dbc)
+  - [x] `Qwen35PromptJournal` + `Qwen35ReplayCheckpoint` (CPU-only) + state journal fields
+  - [x] `publish_token` = single journal choke point (bootstrap refactored through it;
+        `decode_step`'s inline publish journals — the batch always did)
+  - [x] `begin_replay_state_physical` + `continue_replay_physical` span recompute: prompt
+        rows via prefill path, generated rows one token per span, MTP pairs rebuilt for
+        decode rows only (qwen35 prefill writes none), final pair seeds the anchor
+  - [x] Fail-closed: finished/vision/grammar cannot suspend; decode during replay errors;
+        checkpoint-during-replay retains the original journal
+  - [x] Executor suspend/resume/span-drive for Qwen35Moe via `SuspendedReplayCheckpoint`
+  - [x] Replay test: headless+MTP legs, step-exact continuation, mid-run re-suspension,
+        MTP-cursor preservation
+
+## Verification (2026-10-06, session part 2)
+- Full izwi-core lib CPU: 2776 passed / 0 failed after every commit
+- Metal lane (`--features metal --lib`): green (2826 passed)
+- `cargo clippy -p izwi-core --all-targets`: clean after every commit
+- Branch: 22 commits vs main (tip 3dd1bb3f), unpushed; CUDA-compile + H100 evidence remain
+  the hardware handoff (MTP manifest census, spike verdict, acceptance rates)
+
+## Review (2026-10-06, session part 2)
+All remaining plan items except the hardware-gated Phase 5 island port are implemented and
+proven at the model level. Key semantic decisions: (1) envelope rounds reuse the extracted
+solo verify/commit so solo/batch parity is structural, not tested-by-accident; (2) stochastic
+token streams are NOT compared across solo/envelope because rejection sampling preserves the
+distribution, not a fixed sequence, and the batched MTP advance differs by float noise —
+greedy token-identity remains the pinned invariant; (3) replay pair rebuild covers decode
+rows only, matching a qwen35 prefill that writes no MTP pairs (unlike qwen38's
+shifted-pair prefill); (4) sampled stop tokens hold an MTP pair without counting as a
+generated token — the cursor invariant is cursor == tokens_generated - 1, or == on finish.
