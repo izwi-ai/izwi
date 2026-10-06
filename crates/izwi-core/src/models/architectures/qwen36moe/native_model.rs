@@ -8,16 +8,14 @@
 //! backend's persistent residency (CPU packed Q8_0, Metal expanded F16,
 //! CUDA raw block-FP8 with per-tensor Q8_0 fallback).
 
-use std::sync::Arc;
+use candle_core::quantized::QMatMul;
 
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen35::text::{
-    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35TextModel, Qwen35WeightSource,
+    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
 };
 use crate::models::architectures::qwen38::native::ProjectionMaterialization;
 use crate::models::architectures::qwen36moe::native::{
@@ -79,6 +77,24 @@ pub(crate) struct Qwen36MoeNativeSource<'a> {
 }
 
 impl<'a> Qwen36MoeNativeSource<'a> {
+    /// Test seam: build the source under an explicit residency/dense plan so
+    /// a backend's dtype plan (CUDA, Metal) can be executed end-to-end on the
+    /// CPU device, where candle's dtype checks are identical to — and louder
+    /// than — the accelerator backends'. The production constructor derives
+    /// both fields from the device profile instead.
+    #[cfg(test)]
+    pub(crate) fn for_plan_tests(
+        checkpoint: &'a Qwen36MoeNativeCheckpoint,
+        residency: Qwen36MoeProjectionResidency,
+        dense_target: ProjectionMaterialization,
+    ) -> Self {
+        Self {
+            checkpoint,
+            residency,
+            dense_target,
+        }
+    }
+
     pub(crate) fn new(
         checkpoint: &'a Qwen36MoeNativeCheckpoint,
         device_profile: &DeviceProfile,
@@ -136,22 +152,15 @@ impl<'a> Qwen36MoeNativeSource<'a> {
         Ok(tensor)
     }
 
-    fn wrap_dense_projection(
-        tensor: Tensor,
-        residency: Qwen36MoeProjectionResidency,
-    ) -> Result<Qwen35Projection> {
-        let ggml_dtype = match residency {
-            Qwen36MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
-            Qwen36MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
-            Qwen36MoeProjectionResidency::ExpandedBf16 | Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback => {
-                GgmlDType::BF16
-            }
-            Qwen36MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
-        };
-        let quantized = QTensor::quantize(&tensor, ggml_dtype).map_err(Error::from)?;
-        Ok(Qwen35Projection::Quantized(
-            QMatMul::from_arc(Arc::new(quantized)).map_err(Error::from)?,
-        ))
+    fn wrap_dense_projection(tensor: Tensor) -> Result<Qwen35Projection> {
+        // The materialized tensor already carries the plan's dtype (F32 CPU,
+        // F16 Metal, BF16 CUDA). A quantized-nn-style QTensor round-trip
+        // would silently upcast it: candle's QTensor::dequantize is F32-only
+        // for every GGML dtype, so the BF16/F16 residencies turned into F32
+        // weights and broke the non-F32 activation graphs at the first
+        // matmul. Keep the tensor directly; QMatMul's Tensor branch matmuls
+        // in the weight's dtype, which matches the plan's activations.
+        Ok(Qwen35Projection::Quantized(QMatMul::Tensor(tensor)))
     }
 }
 
@@ -191,7 +200,7 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
                 device,
                 self.dense_target,
             )?;
-            return Self::wrap_dense_projection(tensor, self.residency);
+            return Self::wrap_dense_projection(tensor);
         }
         match self.checkpoint.materialize_projection(
             &canonical,
@@ -200,9 +209,7 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
             self.residency,
         )? {
             Qwen36MoeProjection::Packed(qmatmul) => Ok(Qwen35Projection::Quantized(qmatmul)),
-            Qwen36MoeProjection::Dense(tensor) => {
-                Self::wrap_dense_projection(tensor, self.residency)
-            }
+            Qwen36MoeProjection::Dense(tensor) => Self::wrap_dense_projection(tensor),
             Qwen36MoeProjection::CompactFp8(raw) => Ok(Qwen35Projection::CompactFp8 {
                 weights: raw.weights,
                 scales: raw.scales,
@@ -210,10 +217,19 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         }
     }
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
-        let tensor = self.materialize_dense_weight(name, device)?;
-        let quantized = QTensor::quantize(&tensor, GgmlDType::F32).map_err(Error::from)?;
-        RmsNorm::from_qtensor(quantized, eps).map_err(Error::from)
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm> {
+        // Candle's rmsnorm op requires x and weight in the same dtype on
+        // every backend, and the trunk's activations carry the dense
+        // target's dtype (BF16 CUDA, F16 Metal, F32 CPU). quantized_nn's
+        // RmsNorm always dequantizes its weight to F32, so a BF16/F16
+        // activation plan would die at the first norm — on CUDA through
+        // Map2's "dtype mismatch in binary op". Keep the materialized
+        // activation-dtype tensor instead; the checkpoint stores these
+        // weights in that same dtype, so nothing is requantized.
+        Ok(Qwen35RmsNorm::new(
+            self.materialize_dense_weight(name, device)?,
+            eps,
+        ))
     }
 
     fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {

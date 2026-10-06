@@ -3,7 +3,6 @@ use std::sync::Arc;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
 use candle_core::quantized::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -36,7 +35,7 @@ pub struct Qwen35TextModel {
     device: Device,
     token_embeddings: Embedding,
     layers: Vec<Qwen35Layer>,
-    output_norm: RmsNorm,
+    output_norm: Qwen35RmsNorm,
     output: Qwen35Projection,
     finite_diagnostics_enabled: bool,
 }
@@ -287,9 +286,9 @@ enum Qwen35LayerRuntimeState {
 }
 
 struct Qwen35Layer {
-    attn_norm: RmsNorm,
+    attn_norm: Qwen35RmsNorm,
     mixer: Qwen35Mixer,
-    post_attention_norm: RmsNorm,
+    post_attention_norm: Qwen35RmsNorm,
     ffn: Qwen35FeedForward,
 }
 
@@ -309,8 +308,8 @@ struct Qwen35FullAttention {
     k_proj: Qwen35Projection,
     v_proj: Qwen35Projection,
     o_proj: Qwen35Projection,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: Qwen35RmsNorm,
+    k_norm: Qwen35RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -345,6 +344,32 @@ struct Qwen35LinearAttention {
 struct Qwen35GatedRmsNorm {
     weight: Tensor,
     eps: f64,
+}
+
+/// RMS norm over the shared trunk's own weight tensor.
+///
+/// `quantized_nn::RmsNorm` always dequantizes its weight to F32, which
+/// breaks every plan whose activations are not F32: candle's rmsnorm op
+/// requires x and weight in the same dtype on all backends, and a mixed
+/// pair dies inside the op (on CUDA through Map2's "dtype mismatch in
+/// binary op"). Sources therefore hand over the weight already materialized
+/// in the plan's activation dtype (BF16 CUDA, F16 Metal, F32 CPU/GGUF).
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen35RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl Qwen35RmsNorm {
+    pub(crate) fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+}
+
+impl Module for Qwen35RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+    }
 }
 
 /// Sparse-expert feed-forward geometry shared by every layer of a
@@ -394,7 +419,7 @@ pub(crate) trait Qwen35WeightSource {
 
     fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection>;
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm>;
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm>;
 
     /// Dense tensor, coerced to `dtype` when requested (always F32 when
     /// `Some(F32)`).
@@ -435,7 +460,7 @@ impl Qwen35WeightSource for GgufSource<'_> {
         )?))
     }
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm> {
         load_rms_norm(self.loader, device, name, eps)
     }
 
@@ -2039,8 +2064,14 @@ fn load_rms_norm(
     device: &Device,
     name: &str,
     eps: f64,
-) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(loader.load_qtensor(name, device)?, eps).map_err(Error::from)
+) -> Result<Qwen35RmsNorm> {
+    Ok(Qwen35RmsNorm::new(
+        loader
+            .load_qtensor(name, device)?
+            .dequantize(device)
+            .map_err(Error::from)?,
+        eps,
+    ))
 }
 
 fn load_dense(
