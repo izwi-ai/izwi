@@ -99,8 +99,22 @@ impl<'a> Qwen36MoeNativeSource<'a> {
         checkpoint: &'a Qwen36MoeNativeCheckpoint,
         device_profile: &DeviceProfile,
     ) -> Self {
-        let residency =
-            Qwen36MoeNativeCheckpoint::projection_residency_policy(device_profile);
+        Self::new_with_performance(
+            checkpoint,
+            device_profile,
+            &crate::performance::CudaPerformanceConfig::default(),
+        )
+    }
+
+    pub(crate) fn new_with_performance(
+        checkpoint: &'a Qwen36MoeNativeCheckpoint,
+        device_profile: &DeviceProfile,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Self {
+        let residency = Qwen36MoeNativeCheckpoint::projection_residency_policy_with_performance(
+            BackendKind::from(device_profile.kind),
+            performance,
+        );
         let dense_target = match BackendKind::from(device_profile.kind) {
             BackendKind::Cpu => ProjectionMaterialization::F32,
             BackendKind::Metal => ProjectionMaterialization::F16,
@@ -394,9 +408,10 @@ pub(crate) fn load_text_model_native(
     checkpoint: &Qwen36MoeNativeCheckpoint,
     device_profile: &DeviceProfile,
     device: &Device,
+    performance: &crate::performance::CudaPerformanceConfig,
 ) -> Result<(crate::models::architectures::qwen35::chat::Qwen35TextConfig, Qwen35TextModel)> {
     let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-    let source = Qwen36MoeNativeSource::new(checkpoint, device_profile);
+    let source = Qwen36MoeNativeSource::new_with_performance(checkpoint, device_profile, performance);
     let model = Qwen35TextModel::load_with_source(&source, &text_config, device)?;
     Ok((text_config, model))
 }

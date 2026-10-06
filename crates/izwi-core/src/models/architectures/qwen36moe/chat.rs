@@ -112,6 +112,7 @@ impl Qwen36MoeKvStorageProvider {
 pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
     kv_storage_provider: Qwen36MoeKvStorageProvider,
+    performance: crate::performance::CudaPerformanceConfig,
     exec: Qwen35ChatExec,
 }
 
@@ -129,6 +130,23 @@ impl Qwen36MoeChatModel {
     /// its native bundle, or from a synthetic GGUF fixture when one is
     /// present (CI-only; the published variant never ships as GGUF).
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        Self::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            &crate::performance::PerformanceConfig::default(),
+            false,
+        )
+    }
+
+    pub fn load_with_performance(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        performance: &crate::performance::PerformanceConfig,
+        _prefix_reuse: bool,
+    ) -> Result<Self> {
+        performance.validate()?;
         if variant != ModelVariant::Qwen36Moe35BA3BFp8 {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.5/3.6-MoE chat variant: {variant}"
@@ -147,15 +165,21 @@ impl Qwen36MoeChatModel {
         if let Some(reason) = kv_storage_provider.fallback_reason() {
             tracing::warn!(reason, "Qwen3.6-MoE KV storage fell back");
         }
+        tracing::info!(
+            cuda_mode = ?performance.cuda.mode,
+            projection_backend = ?performance.cuda.projection_backend,
+            "Qwen3.6-MoE performance policy"
+        );
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let exec = if fixture_path.exists() {
             Self::load_fixture_gguf(model_dir, &fixture_path, variant, &device)?
         } else {
-            Self::load_native(model_dir, variant, &device)?
+            Self::load_native(model_dir, variant, &device, &performance.cuda)?
         };
         Ok(Self {
             device_kind,
             kv_storage_provider,
+            performance: performance.cuda.clone(),
             exec,
         })
     }
@@ -187,11 +211,12 @@ impl Qwen36MoeChatModel {
         model_dir: &Path,
         variant: ModelVariant,
         device: &DeviceProfile,
+        performance: &crate::performance::CudaPerformanceConfig,
     ) -> Result<Qwen35ChatExec> {
         let checkpoint = Qwen36MoeNativeCheckpoint::open(model_dir)?;
         let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model) =
-            load_text_model_native(&checkpoint, device, &device.device)?;
+            load_text_model_native(&checkpoint, device, &device.device, performance)?;
         Ok(Qwen35ChatExec {
             variant,
             tokenizer,

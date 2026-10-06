@@ -1377,10 +1377,32 @@ impl Qwen36MoeNativeCheckpoint {
     /// decodes per GEMM inside the fp8 projection kernel, falling back per
     /// tensor to packed Q8_0 where the kernel contract cannot execute.
     pub fn projection_residency_policy(device: &DeviceProfile) -> Qwen36MoeProjectionResidency {
-        match BackendKind::from(device.kind) {
+        Self::projection_residency_policy_with_performance(
+            BackendKind::from(device.kind),
+            &crate::performance::CudaPerformanceConfig::default(),
+        )
+    }
+
+    /// Performance-config-aware residency: the qwen3.6 CUDA deployment
+    /// defaults to raw block-FP8 residency (the pinned census is fully
+    /// kernel-compatible), with `projection_backend = "q8"` — or the master
+    /// CUDA switch — as the escape hatch back to expanded BF16 weights.
+    /// This deliberately diverges from qwen3.8, whose Auto retains packed Q8.
+    pub fn projection_residency_policy_with_performance(
+        backend: BackendKind,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Qwen36MoeProjectionResidency {
+        match backend {
             BackendKind::Cpu => Qwen36MoeProjectionResidency::PackedQ8_0,
             BackendKind::Metal => Qwen36MoeProjectionResidency::ExpandedF16,
-            BackendKind::Cuda => Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback,
+            BackendKind::Cuda
+                if performance.enabled()
+                    && performance.projection_backend
+                        != crate::performance::CudaProjectionBackend::Q8 =>
+            {
+                Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback
+            }
+            BackendKind::Cuda => Qwen36MoeProjectionResidency::ExpandedBf16,
         }
     }
 
@@ -1655,7 +1677,12 @@ mod tests {
 
         let device_profile = DeviceProfile::cpu();
         let (text_config, model) =
-            load_text_model_native(&checkpoint, &device_profile, &candle_core::Device::Cpu)
+            load_text_model_native(
+                    &checkpoint,
+                    &device_profile,
+                    &candle_core::Device::Cpu,
+                    &crate::performance::CudaPerformanceConfig::default(),
+                )
                 .unwrap();
         assert_eq!(text_config.block_count, 4);
         let moe = text_config
@@ -1747,6 +1774,43 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn residency_policy_follows_the_projection_backend_knob() {
+        use crate::performance::{CudaPerformanceConfig, CudaProjectionBackend, OptimizationMode};
+        let policy = Qwen36MoeNativeCheckpoint::projection_residency_policy_with_performance;
+        // Portable backends are performance-independent.
+        assert_eq!(
+            policy(BackendKind::Cpu, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::PackedQ8_0
+        );
+        assert_eq!(
+            policy(BackendKind::Metal, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::ExpandedF16
+        );
+        // CUDA default: raw block-FP8 residency (the deployment posture).
+        assert_eq!(
+            policy(BackendKind::Cuda, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback
+        );
+        // Explicit Q8 (or the master CUDA switch) escapes to expanded BF16.
+        let q8 = CudaPerformanceConfig {
+            projection_backend: CudaProjectionBackend::Q8,
+            ..CudaPerformanceConfig::default()
+        };
+        assert_eq!(
+            policy(BackendKind::Cuda, &q8),
+            Qwen36MoeProjectionResidency::ExpandedBf16
+        );
+        let master_off = CudaPerformanceConfig {
+            mode: OptimizationMode::Off,
+            ..CudaPerformanceConfig::default()
+        };
+        assert_eq!(
+            policy(BackendKind::Cuda, &master_off),
+            Qwen36MoeProjectionResidency::ExpandedBf16
+        );
     }
 
     #[test]

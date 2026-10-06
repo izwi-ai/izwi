@@ -385,14 +385,21 @@ fn load_qwen35_moe_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
-    _performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     // Hybrid-recurrent prefix reuse is unproven for this family (the DS1
     // catalog cell is excluded), so the mode is deliberately not engaged.
-    Ok(NativeChatModel::Qwen35Moe(Qwen36MoeChatModel::load(
-        model_dir, variant, device,
-    )?))
+    let backend = BackendKind::from(device.kind);
+    Ok(NativeChatModel::Qwen35Moe(
+        Qwen36MoeChatModel::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            performance,
+            prefix_reuse_engages(variant, backend, prefix_reuse),
+        )?,
+    ))
 }
 
 fn load_lfm25_audio_model(
