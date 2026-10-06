@@ -673,6 +673,224 @@ mod tests {
         ChatGenerationConfig::default()
     }
 
+    /// Per-row cache windows over ONE shared arena: the continuous decode
+    /// batch requires every row to reference the same arena instance.
+    fn shared_physical_caches(
+        model: &Qwen36MoeChatModel,
+        device: &DeviceProfile,
+        rows: usize,
+    ) -> Vec<PhysicalPagedKvCache> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::{CpuKvArena, KvArena};
+        use candle_core::DeviceLocation;
+        let contract = match model.inference_state_contract().expect("contract") {
+            InferenceStateCapability::Managed(contract) => contract,
+            other => panic!("expected managed contract, got {other:?}"),
+        };
+        let kv_heads = model.text_config().attention_head_count_kv;
+        let head_dim = model.text_config().attention_key_length;
+        let device_ordinal = match device.device.location() {
+            DeviceLocation::Cpu => None,
+            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+            DeviceLocation::Metal { gpu_id } => {
+                let id = gpu_id as u64;
+                Some((id ^ (id >> 32)) as u32)
+            }
+        };
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4244),
+            backend: BackendKind::from(device.kind),
+            device_ordinal,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let pages_per_row = 16usize;
+        let arena_config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: 8,
+            capacity_pages: (rows * pages_per_row) as u32,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 1,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                },
+                KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 3,
+                        physical_layer: 1,
+                    },
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                },
+            ],
+        };
+        let is_accelerator = BackendKind::from(device.kind) != BackendKind::Cpu;
+        let arena: std::sync::Arc<dyn KvArena> = if is_accelerator {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            {
+                std::sync::Arc::new(
+                    CandleAcceleratorKvArena::new_mutation_only(arena_config, device.device.clone())
+                        .unwrap(),
+                )
+            }
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            {
+                let _ = arena_config;
+                panic!("accelerator KV arenas require the cuda or metal feature")
+            }
+        } else {
+            std::sync::Arc::new(CpuKvArena::new(arena_config).unwrap())
+        };
+        let bindings = vec![
+            KvLayerBinding {
+                model_layer: 1,
+                physical_layer: 0,
+            },
+            KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 1,
+            },
+        ];
+        let blocks: Vec<CacheBlockRef> = (0..rows * pages_per_row)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index: index as u32,
+                slot_generation: 1,
+            })
+            .collect();
+        let _ = contract;
+        (0..rows)
+            .map(|row| {
+                PhysicalPagedKvCache::new(
+                    arena.clone(),
+                    bindings.clone(),
+                    blocks[row * pages_per_row..(row + 1) * pages_per_row].to_vec(),
+                    0,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fixture_decodes_two_rows_in_one_continuous_batch() {
+        let (model, dir) = load_fixture("batch");
+        let messages_for = |content: &str| {
+            vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+            }]
+        };
+
+        // Two concurrent sessions over one shared arena: different prompt
+        // lengths, independent GDN/conv state, one batched decode step for
+        // both rows at a time. Row b samples with its own seed/temperature
+        // so the batch carries rows with different sampling configurations
+        // (the fixture's greedy path converges both rows onto identical
+        // tokens otherwise).
+        let mut caches = shared_physical_caches(&model, &DeviceProfile::cpu(), 2);
+        let mut state_a = model
+            .start_decode_state_physical(
+                &messages_for("ab"),
+                8,
+                &generation_config(),
+                None,
+                caches.remove(0),
+            )
+            .expect("row a decode state");
+        let mut sampled = generation_config();
+        sampled.seed = 0x5EED_0002;
+        sampled.temperature = 1.0;
+        let mut state_b = model
+            .start_decode_state_physical(
+                &messages_for("abcd"),
+                8,
+                &sampled,
+                None,
+                caches.remove(0),
+            )
+            .expect("row b decode state");
+
+        // The first token of every session is the scalar prefill quantum
+        // (it samples the stored prefill logits without a forward) — rows
+        // join the continuous batch only after it. Deltas may be empty
+        // (incremental UTF-8 buffering); parity is asserted below.
+        let first_a = model
+            .decode_step(&mut state_a)
+            .expect("row a scalar first token")
+            .delta;
+        let first_b = model
+            .decode_step(&mut state_b)
+            .expect("row b scalar first token")
+            .delta;
+
+        let mut batched_a = Vec::new();
+        let mut batched_b = Vec::new();
+        for step_index in 0..4 {
+            let steps = {
+                let mut rows = [&mut state_a, &mut state_b];
+                model.decode_step_batch(&mut rows).expect("batched decode step")
+            };
+            assert_eq!(steps.len(), 2, "one step per row");
+            assert!(!steps[0].finished && !steps[1].finished);
+            // tokens_generated is cumulative: scalar first token + one per
+            // batched step.
+            let expected_count = 2 + step_index;
+            assert_eq!(steps[0].tokens_generated, expected_count);
+            assert_eq!(steps[1].tokens_generated, expected_count);
+            batched_a.push(steps[0].delta.clone());
+            batched_b.push(steps[1].delta.clone());
+        }
+
+        // Batched continuations must agree token-for-token with solo decode
+        // of the same prompts (greedy, deterministic fixture).
+        let solo = |content: &str, config: &ChatGenerationConfig| -> Vec<String> {
+            let cache = physical_cache(&model, &DeviceProfile::cpu());
+            let mut state = model
+                .start_decode_state_physical(
+                    &messages_for(content),
+                    8,
+                    config,
+                    None,
+                    cache,
+                )
+                .expect("solo decode state");
+            let mut deltas = Vec::new();
+            for _ in 0..5 {
+                let step = model.decode_step(&mut state).expect("solo decode step");
+                deltas.push(step.delta);
+                if step.finished {
+                    break;
+                }
+            }
+            deltas
+        };
+        let solo_a = solo("ab", &generation_config());
+        let solo_b = solo("abcd", &sampled);
+        assert_eq!(first_a, solo_a[0], "row a first token must match solo");
+        assert_eq!(first_b, solo_b[0], "row b first token must match solo");
+        assert_eq!(
+            batched_a, solo_a[1..],
+            "row a batched continuations must match solo"
+        );
+        assert_eq!(
+            batched_b, solo_b[1..],
+            "row b batched continuations must match solo"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn fixture_loads_with_sparse_geometry_and_generates_deterministically() {
         let (model, dir) = load_fixture("e2e");

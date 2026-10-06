@@ -982,18 +982,33 @@ impl Qwen35ChatExec {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        for state in states.iter() {
+        for (row, state) in states.iter().enumerate() {
             let expected_physical_cursor =
                 expected_physical_decode_cursor(state.prefill_progress, state.tokens_generated);
-            if state.finished
-                || state.tokens_generated >= state.max_new_tokens
-                || state.unconsumed_output.is_some()
-                || state.pending_token.is_none()
-                || state.physical_kv.context_len() != expected_physical_cursor
-            {
-                return Err(Error::InvalidInput(
-                    "continuous chat batch contains a non-decodable Qwen3.5 state".into(),
+            let mut reasons: Vec<String> = Vec::new();
+            if state.finished {
+                reasons.push("finished".into());
+            }
+            if state.tokens_generated >= state.max_new_tokens {
+                reasons.push("max_new_tokens reached".into());
+            }
+            if state.unconsumed_output.is_some() {
+                reasons.push("unconsumed prefill output".into());
+            }
+            if state.pending_token.is_none() {
+                reasons.push("no pending token".into());
+            }
+            if state.physical_kv.context_len() != expected_physical_cursor {
+                reasons.push(format!(
+                    "physical cursor {} != expected {expected_physical_cursor}",
+                    state.physical_kv.context_len()
                 ));
+            }
+            if !reasons.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "continuous chat batch row {row} is not decodable: {}",
+                    reasons.join("; ")
+                )));
             }
         }
         let mut token_ids = Vec::with_capacity(states.len());
