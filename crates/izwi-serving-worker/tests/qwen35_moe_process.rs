@@ -46,7 +46,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models.path())
         .env("IZWI_WORKER_MODEL", "Qwen3.6-35B-A3B-FP8")
-        .env("IZWI_ALLOW_SYNTHETIC_QWEN35_MOE_GEOMETRY", "1")
+        .env("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1")
         .env("IZWI_WORKER_DEPLOYMENT_ID", "qwen35-moe-cpu-v1")
         .env("IZWI_WORKER_CREDENTIAL_ID", "qwen35-moe-cpu-credential")
         .env("IZWI_WORKER_BEARER_TOKEN", "qwen35-moe-cpu-secret")
