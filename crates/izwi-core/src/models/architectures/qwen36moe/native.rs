@@ -3645,6 +3645,256 @@ mod tests {
         std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
     }
 
+    /// Per-row caches over ONE shared arena with disjoint block windows —
+    /// the continuous-batch geometry. `model_layer` selects the target
+    /// full-attention row (3) or the MTP draft row (block_count).
+    fn shared_native_caches(
+        model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+        rows: usize,
+        model_layer: u32,
+    ) -> Vec<crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use std::sync::Arc;
+        let kv_heads = model.text_config().attention_head_count_kv;
+        let head_dim = model.text_config().attention_key_length;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4248 + u64::from(model_layer)),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let pages_per_row = 16u32;
+        let binding = KvLayerBinding {
+            model_layer,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: pages_per_row * rows as u32,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                }],
+            })
+            .unwrap(),
+        );
+        (0..rows)
+            .map(|row| {
+                let blocks = (0..pages_per_row)
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index: index + row as u32 * pages_per_row,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn speculative_envelope_matches_solo_and_scalar_decode() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+
+        let greedy_config = || ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str, mtp: bool| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            (model, dir)
+        };
+        let messages_for = |content: &str| {
+            vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+            }]
+        };
+        let run_to_completion = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+                                 state: &mut crate::models::architectures::qwen35::chat::ChatDecodeState|
+         -> String {
+            let mut text = String::new();
+            for _ in 0..64 {
+                let step = model.decode_quantum(state, 4).unwrap();
+                text.push_str(&step.delta);
+                if step.finished {
+                    break;
+                }
+            }
+            text
+        };
+
+        let prompts = ["ab", "abcd"];
+        let config = greedy_config();
+
+        // Scalar reference (MTP off).
+        let (scalar_model, dir_scalar) = load("envelope-parity-scalar", false);
+        let scalar_text: Vec<String> = prompts
+            .iter()
+            .map(|prompt| {
+                let cache = native_physical_cache(&scalar_model);
+                let mut state = scalar_model
+                    .start_decode_state_physical(
+                        &messages_for(prompt),
+                        20,
+                        &config,
+                        None,
+                        cache,
+                    )
+                    .unwrap();
+                run_to_completion(&scalar_model, &mut state)
+            })
+            .collect();
+        drop(scalar_model);
+        std::fs::remove_dir_all(dir_scalar.path()).ok();
+
+        // Solo MTP reference: each row decodes speculative quanta alone.
+        let (mtp_model, dir_solo) = load("envelope-parity-solo", true);
+        let solo_text: Vec<String> = prompts
+            .iter()
+            .map(|prompt| {
+                let cache = native_physical_cache(&mtp_model);
+                let mtp_cache = shared_native_caches(&mtp_model, 1, 4).remove(0);
+                let mut state = mtp_model
+                    .start_decode_state_physical_with_mtp(
+                        &messages_for(prompt),
+                        20,
+                        &config,
+                        None,
+                        cache,
+                        Some(mtp_cache),
+                    )
+                    .unwrap();
+                run_to_completion(&mtp_model, &mut state)
+            })
+            .collect();
+
+        // Envelope: both rows decode through decode_speculative_batch after
+        // their scalar bootstrap quanta, sharing one target arena and one
+        // MTP arena through disjoint windows. A dedicated instance keeps the
+        // round counters attributable to this leg alone.
+        let (envelope_model, dir_envelope) = load("envelope-parity-batch", true);
+        let block_count = u32::try_from(envelope_model.text_config().block_count).unwrap();
+        let mut caches = shared_native_caches(&envelope_model, 2, 3);
+        let mut mtp_caches = shared_native_caches(&envelope_model, 2, block_count);
+        let mut state_a = envelope_model
+            .start_decode_state_physical_with_mtp(
+                &messages_for(prompts[0]),
+                20,
+                &config,
+                None,
+                caches.remove(0),
+                Some(mtp_caches.remove(0)),
+            )
+            .unwrap();
+        let mut state_b = envelope_model
+            .start_decode_state_physical_with_mtp(
+                &messages_for(prompts[1]),
+                20,
+                &config,
+                None,
+                caches.remove(0),
+                Some(mtp_caches.remove(0)),
+            )
+            .unwrap();
+        // The prefill bootstrap is the scalar prefill quantum exactly as the
+        // executor dispatches it: one budget-1 decode_quantum per row. Its
+        // text joins the row's stream like the solo reference's bootstrap.
+        let mut envelope_text = [String::new(), String::new()];
+        envelope_text[0].push_str(&envelope_model.decode_quantum(&mut state_a, 1).unwrap().delta);
+        envelope_text[1].push_str(&envelope_model.decode_quantum(&mut state_b, 1).unwrap().delta);
+        let mut last_generated = [0usize, 0];
+        for _ in 0..64 {
+            let mut rows = [&mut state_a, &mut state_b];
+            let steps = envelope_model
+                .decode_speculative_batch(&mut rows, 4)
+                .expect("speculative envelope round");
+            for (row, step) in steps.iter().enumerate() {
+                envelope_text[row].push_str(&step.delta);
+                last_generated[row] = step.tokens_generated;
+            }
+            if steps.iter().all(|step| step.finished) {
+                break;
+            }
+        }
+        assert!(
+            envelope_model.envelope_rounds() > 0,
+            "the envelope must run batched speculative rounds"
+        );
+        assert_eq!(
+            envelope_model.speculative_rounds(),
+            0,
+            "the envelope must not route rounds through the solo quantum"
+        );
+        for (row, state) in [&mut state_a, &mut state_b].into_iter().enumerate() {
+            assert_eq!(
+                envelope_model.mtp_cache_cursor(state),
+                Some(last_generated[row] - 1),
+                "envelope row {row} MTP cursor must track committed tokens"
+            );
+        }
+        assert_eq!(
+            envelope_text[0], solo_text[0],
+            "row a envelope decode must match its solo speculative decode"
+        );
+        assert_eq!(
+            envelope_text[1], solo_text[1],
+            "row b envelope decode must match its solo speculative decode"
+        );
+        assert_eq!(
+            envelope_text[0], scalar_text[0],
+            "row a envelope decode must match scalar greedy decode"
+        );
+        assert_eq!(
+            envelope_text[1], scalar_text[1],
+            "row b envelope decode must match scalar greedy decode"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::fs::remove_dir_all(dir_solo.path()).ok();
+        std::fs::remove_dir_all(dir_envelope.path()).ok();
+    }
+
     #[test]
     fn mtp_head_loads_from_the_validated_manifest_and_drafts() {
         use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};

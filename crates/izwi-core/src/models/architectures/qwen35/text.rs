@@ -1353,7 +1353,7 @@ impl Qwen35FullAttention {
         self.o_proj.forward(&output)
     }
 
-    fn forward_physical_decode_batch(
+    pub(crate) fn forward_physical_decode_batch(
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],

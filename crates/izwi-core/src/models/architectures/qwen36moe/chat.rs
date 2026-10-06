@@ -235,6 +235,7 @@ impl Qwen36MoeChatModel {
             text_model,
             mtp_head: None,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
@@ -272,6 +273,7 @@ impl Qwen36MoeChatModel {
             text_model,
             mtp_head,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
@@ -455,7 +457,11 @@ impl Qwen36MoeChatModel {
                     .exec
                     .mtp_speculative_rounds
                     .load(std::sync::atomic::Ordering::Relaxed),
-                "scope": "solo_quantum",
+                "envelope_rounds": self
+                    .exec
+                    .mtp_envelope_rounds
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "scope": "solo_quantum+continuous_envelope",
             },
         })
     }
@@ -465,6 +471,14 @@ impl Qwen36MoeChatModel {
     pub(crate) fn speculative_rounds(&self) -> u64 {
         self.exec
             .mtp_speculative_rounds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Continuous speculative-envelope rounds executed by this instance —
+    /// evidence the DS9.4 batched path engaged under co-batching.
+    pub(crate) fn envelope_rounds(&self) -> u64 {
+        self.exec
+            .mtp_envelope_rounds
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -491,6 +505,24 @@ impl Qwen36MoeChatModel {
         states: &mut [&mut ChatDecodeState],
     ) -> Result<Vec<ChatDecodeStep>> {
         self.exec.decode_step_batch(states)
+    }
+
+    /// Whether the continuous speculative envelope may engage for this
+    /// instance: the DS9.4 profile flag is only meaningful with a loaded
+    /// draft head.
+    pub fn speculative_batch_enabled(&self) -> bool {
+        self.exec.has_mtp_head()
+    }
+
+    /// One shared speculative envelope over continuous rows (DS9.4). Rows
+    /// draft together through the MTP head and verify per row on their own
+    /// caches; ineligible requests collapse to scalar rounds.
+    pub fn decode_speculative_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+        input_budget: usize,
+    ) -> Result<Vec<ChatDecodeStep>> {
+        self.exec.decode_speculative_batch(states, input_budget)
     }
 }
 

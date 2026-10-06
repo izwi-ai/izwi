@@ -1038,9 +1038,12 @@ impl NativeExecutor {
         let live_width = state_refs.len();
         let steps = match speculative_width {
             Some(budget) => {
-                if !matches!(model.as_ref(), NativeChatModel::Qwen38(_)) {
+                if !matches!(
+                    model.as_ref(),
+                    NativeChatModel::Qwen38(_) | NativeChatModel::Qwen35Moe(_)
+                ) {
                     return Err(Error::InvalidInput(
-                        "speculative envelopes require the Qwen3.8 MTP model".to_string(),
+                        "speculative envelopes require an MTP speculative model".to_string(),
                     ));
                 }
                 Self::run_blocking(|| {

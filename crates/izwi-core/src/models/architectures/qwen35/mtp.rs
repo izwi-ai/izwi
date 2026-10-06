@@ -14,13 +14,16 @@
 
 use candle_core::{Device, Module, Tensor, D};
 
+use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
+use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen35::chat::Qwen35TextConfig;
 use crate::models::architectures::qwen35::text::{
     Qwen35FullAttention, Qwen35Mlp, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel,
     Qwen35WeightSource,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use std::sync::Arc;
 
 /// The MTP layer occupies one virtual layer id past the last trunk layer —
 /// the id the MTP KV domain binds in the state contract.
@@ -136,6 +139,106 @@ impl Qwen35MtpHead {
         }
     }
 
+    /// Advance one MTP pair for each independently retained decode row while
+    /// sharing the projection, attention, and MLP tensor dimensions. The rows'
+    /// MTP caches must share one arena — the shared slot lowering and the
+    /// common write-completion fence are what make the step one batch op.
+    /// Returns one post-`mtp.norm` hidden per row.
+    pub(crate) fn forward_steps_batch(
+        &self,
+        token_embeddings: &Tensor,
+        predecessor_hidden: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<Tensor> {
+        let (batch_size, token_count, hidden) = token_embeddings.dims3().map_err(|_| {
+            Error::InvalidInput(
+                "Qwen3.5 MTP batch embeddings must have shape [batch,1,hidden]".into(),
+            )
+        })?;
+        if batch_size == 0
+            || token_count != 1
+            || hidden != self.hidden_size
+            || predecessor_hidden.dims3()? != (batch_size, 1, hidden)
+            || position_ids.len() != batch_size
+            || caches.len() != batch_size
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 MTP decode batch rows do not match".into(),
+            ));
+        }
+        let start_positions = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let first = &*caches[0];
+        let slots = caches
+            .iter()
+            .enumerate()
+            .map(|(row, cache)| {
+                cache
+                    .slots_for_append(start_positions[row], 1)
+                    .map(|slots| slots[0])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lowered = first.arena().lower_slots(&slots)?;
+        if lowered.arena_id() != first.arena().id() || lowered.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 MTP batch produced an incompatible slot map".into(),
+            ));
+        }
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .enumerate()
+                .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
+
+        let execution = (|| -> Result<Tensor> {
+            let embedding = self.pre_fc_norm_embedding.forward(token_embeddings)?;
+            let predecessor = self.pre_fc_norm_hidden.forward(predecessor_hidden)?;
+            let fused = Tensor::cat(&[&embedding, &predecessor], D::Minus1)?;
+            let hidden_states = self.fc.forward(&fused)?;
+            let residual = hidden_states.clone();
+            let normalized = self.input_layernorm.forward(&hidden_states)?;
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let attended = self.attention.forward_physical_decode_batch(
+                &normalized,
+                position_ids,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                0,
+            )?;
+            let hidden_states = (&residual + &attended)?;
+            let residual = hidden_states.clone();
+            let normalized = self.post_attention_norm.forward(&hidden_states)?;
+            let mlp = self.mlp.forward(&normalized)?;
+            let hidden_states = (&residual + &mlp)?;
+            self.norm.forward(&hidden_states).map_err(Error::from)
+        })();
+        let hidden_states = match execution {
+            Ok(hidden) => hidden,
+            Err(error) => {
+                return match completions.drain() {
+                    Ok(()) => Err(error),
+                    Err(drain) => Err(Error::InferenceError(format!(
+                        "Qwen3.5 MTP batch failed: {error}; write-fence drain also failed: {drain}"
+                    ))),
+                }
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
+        }
+        Ok(hidden_states)
+    }
+
     /// Greedy recurrent draft: project the current head output through the
     /// target's raw LM head, take the argmax token, and feed
     /// `(embedding(token), head output)` back through the layer at the next
@@ -191,7 +294,7 @@ impl Qwen35MtpHead {
 /// Argmax over `[1, 1, vocab]` (or `[vocab]`) draft logits, clamped to the
 /// tokenizer vocabulary. Greedy draft selection mirrors the target's greedy
 /// sampler: first-index-wins on ties, non-finite logits are a hard error.
-fn greedy_argmax(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+pub(crate) fn greedy_argmax(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
             "Qwen3.5 MTP draft received vocab_size=0".to_string(),
