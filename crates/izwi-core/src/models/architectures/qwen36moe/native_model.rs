@@ -216,10 +216,20 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         RmsNorm::from_qtensor(quantized, eps).map_err(Error::from)
     }
 
-    fn dense(&self, name: &str, _dtype: Option<DType>, device: &Device) -> Result<Tensor> {
-        // Native dense math tensors (norms, DeltaNet in-proj/conv, dt_bias,
-        // A_log) always materialize through the per-backend dense target.
-        self.materialize_dense_weight(name, device)
+    fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {
+        // Native dense math tensors (DeltaNet dt_bias/conv/A_log, ssm norm)
+        // materialize through the per-backend dense target, then honor the
+        // trunk's requested dtype: the DeltaNet math is pinned to F32 so it
+        // matches the F32 state arena under every residency plan (the
+        // per-backend targets otherwise hand back BF16 on CUDA and F16 on
+        // Metal).
+        let tensor = self.materialize_dense_weight(name, device)?;
+        match dtype {
+            Some(target) if tensor.dtype() != target => {
+                tensor.to_dtype(target).map_err(Error::from)
+            }
+            _ => Ok(tensor),
+        }
     }
 
     fn moe_ffn(

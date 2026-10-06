@@ -1750,6 +1750,58 @@ mod tests {
     }
 
     #[test]
+    fn native_dense_source_honors_the_trunks_requested_dtype() {
+        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
+
+        let config = forward_config();
+        let dir = TestDir::new("dense-dtype");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The CUDA plan is the case that matters: dense_target is BF16, but
+        // the trunk requests F32 for the DeltaNet math tensors so they match
+        // the F32 state arena. The source must honor the request instead of
+        // silently returning the per-backend target dtype.
+        let cuda_plan_on_cpu = DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind: crate::backends::DeviceKind::Cuda,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        let source = Qwen36MoeNativeSource::new(&checkpoint, &cuda_plan_on_cpu);
+        let device = candle_core::Device::Cpu;
+
+        let dt_bias = source
+            .dense("blk.0.ssm_dt.bias", Some(candle_core::DType::F32), &device)
+            .unwrap();
+        assert_eq!(dt_bias.dtype(), candle_core::DType::F32);
+        let conv_kernel = source
+            .dense(
+                "blk.0.ssm_conv1d.weight",
+                Some(candle_core::DType::F32),
+                &device,
+            )
+            .unwrap();
+        assert_eq!(conv_kernel.dtype(), candle_core::DType::F32);
+        // A_log is transformed to F32 at materialization regardless.
+        let a = source
+            .dense("blk.0.ssm_a", Some(candle_core::DType::F32), &device)
+            .unwrap();
+        assert_eq!(a.dtype(), candle_core::DType::F32);
+
+        // Without a request the per-backend target still applies.
+        let unconstrained = source
+            .dense("blk.0.ssm_dt.bias", None, &device)
+            .unwrap();
+        assert_eq!(unconstrained.dtype(), candle_core::DType::BF16);
+    }
+
+    #[test]
     fn parses_the_pinned_qwen35_moe_config() {
         let config = pinned_config();
         assert_eq!(config.text.block_count, 40);
