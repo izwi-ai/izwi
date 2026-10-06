@@ -3611,19 +3611,32 @@ mod tests {
         std::fs::remove_dir_all(dir_off.path()).ok();
 
         // MTP: same prompt, speculative rounds — must be token-identical.
-        let (_config, dir_on, mtp_model) = load("mtp-parity-on", true);
+        let (_config, _dir_on, mtp_model) = load("mtp-parity-on", true);
         let cache = native_physical_cache(&mtp_model);
         let mut mtp_state = mtp_model
             .start_decode_state_physical(&messages, 24, &config, None, cache)
             .unwrap();
         let mut mtp_deltas = Vec::new();
+        let mut last_tokens_generated = 0usize;
         for _ in 0..3 {
             let step = mtp_model.decode_quantum(&mut mtp_state, 4).unwrap();
             mtp_deltas.push(step.delta);
+            last_tokens_generated = step.tokens_generated;
             assert!(!step.finished);
         }
-        drop(mtp_state);
-        std::fs::remove_dir_all(dir_on.path()).ok();
+        // Evidence the draft/verify path actually ran: at least one
+        // speculative round executed, and the MTP cache cursor advanced one
+        // pair row per committed token — every committed token except the
+        // bootstrap token (published without a KV commit) has a pair.
+        assert!(
+            mtp_model.speculative_rounds() > 0,
+            "MTP decode must run speculative rounds"
+        );
+        assert_eq!(
+            mtp_model.mtp_cache_cursor(&mtp_state),
+            Some(last_tokens_generated - 1),
+            "MTP cache cursor must track committed tokens"
+        );
 
         assert_eq!(
             mtp_deltas, scalar_deltas,

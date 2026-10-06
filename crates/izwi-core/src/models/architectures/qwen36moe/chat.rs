@@ -226,6 +226,7 @@ impl Qwen36MoeChatModel {
             text_config,
             text_model,
             mtp_head: None,
+            mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -260,6 +261,7 @@ impl Qwen36MoeChatModel {
             text_config,
             text_model,
             mtp_head,
+            mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -404,6 +406,21 @@ impl Qwen36MoeChatModel {
             .as_ref()
             .map(|head| head.draft_depth() + 1)
             .unwrap_or(1)
+    }
+
+    /// Speculative rounds executed by this model instance — test and
+    /// diagnostics evidence that the draft/verify path engaged.
+    pub(crate) fn speculative_rounds(&self) -> u64 {
+        self.exec
+            .mtp_speculative_rounds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The MTP cache cursor for a session, when the session decoded through
+    /// the MTP path. The cursor must always track the session's text
+    /// position.
+    pub(crate) fn mtp_cache_cursor(&self, state: &ChatDecodeState) -> Option<usize> {
+        state.mtp_cache_cursor()
     }
 
     /// One decode quantum. With the MTP head loaded and a qualifying greedy

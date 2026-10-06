@@ -157,6 +157,12 @@ pub struct ChatDecodeState {
 }
 
 impl ChatDecodeState {
+    /// The MTP cache cursor for this session, when it decoded through the
+    /// MTP path. Always equal to `next_text_position` while MTP is active.
+    pub(crate) fn mtp_cache_cursor(&self) -> Option<usize> {
+        self.mtp_cache.as_ref().map(|cache| cache.context_len())
+    }
+
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
     }
@@ -598,6 +604,9 @@ pub(crate) struct Qwen35ChatExec {
     /// the load policy enabled it. `None` keeps every path byte-identical
     /// to the non-MTP behavior.
     pub(crate) mtp_head: Option<crate::models::architectures::qwen35::mtp::Qwen35MtpHead>,
+    /// Speculative rounds actually executed — telemetry and test evidence
+    /// that the draft/verify path ran rather than the scalar fallback.
+    pub(crate) mtp_speculative_rounds: std::sync::atomic::AtomicU64,
 }
 
 pub struct Qwen35ChatModel {
@@ -1151,7 +1160,6 @@ impl Qwen35ChatExec {
         let config = &state.config;
         self.mtp_head.is_some()
             && state.mtp_cache.is_some()
-            && state.mtp_anchor_hidden.is_some()
             && state.grammar.is_none()
             && !config.logprobs
             && config.temperature <= 1e-5
@@ -1162,27 +1170,10 @@ impl Qwen35ChatExec {
     }
 
     /// Greedy argmax over one logits row, clamped to the tokenizer vocab.
+    /// Uses the scalar sampler's `argmax_clamped` so tie-breaking and
+    /// non-finite handling are bit-identical to the non-MTP path.
     fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
-        let flat = logits.flatten_all()?;
-        let cols = flat.dim(0)?;
-        let clamped = if self.tokenizer.vocab_size < cols {
-            flat.narrow(0, 0, self.tokenizer.vocab_size)?
-        } else {
-            flat
-        };
-        let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        let (best_index, best_value) = values
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                if v > bv { (i, v) } else { (bi, bv) }
-            });
-        if !best_value.is_finite() {
-            return Err(Error::InferenceError(
-                "Qwen3.5 MTP verify produced non-finite logits".into(),
-            ));
-        }
-        Ok(best_index as u32)
+        argmax_clamped(&logits.flatten_all()?, self.tokenizer.vocab_size)
     }
 
     /// Ensure the per-session MTP cache exists. V1 allocates a standalone
@@ -1287,18 +1278,68 @@ impl Qwen35ChatExec {
         }
 
         let mut delta = String::new();
-        let mut committed = 0usize;
+
+        // Bootstrap: publish the first token by sampling the stored prefill
+        // logits — no KV commit, exactly like the scalar decode step's
+        // prologue. The pending token is what the first round forwards.
+        let mut published_bootstrap = false;
+        if state.pending_token.is_none() {
+            published_bootstrap = true;
+            let output = state.unconsumed_output.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.5 MTP quantum has neither pending token nor prefill output".into(),
+                )
+            })?;
+            let next = sample_next_token(
+                &output,
+                self.tokenizer.vocab_size,
+                &state.config,
+                &[],
+                &mut state.rng,
+            )?;
+            let mut step_delta = self
+                .tokenizer
+                .decode_token_delta(&mut state.decoder, next)?;
+            state.tokens_generated = state.tokens_generated.saturating_add(1);
+            state.assembled.push_str(&step_delta);
+            if state.tokens_generated >= state.max_new_tokens {
+                state.finished = true;
+                step_delta.push_str(&self.tokenizer.finish_decode(&mut state.decoder)?);
+            }
+            if !self.is_stop_token(next, &state.config) {
+                state.pending_token = Some(next);
+            } else {
+                state.finished = true;
+            }
+            delta.push_str(&step_delta);
+        }
+
+        // The bootstrap published one token, exactly like the scalar
+        // quantum's first step — it counts against the budget.
+        let mut committed = usize::from(published_bootstrap);
         let budget = input_budget.max(1);
+        // The anchor is seeded by the first scalar tail: it forwards the
+        // pending token, samples the next one, and writes the pair
+        // (embed(next), h(pos)) — exactly the qwen3.8 bootstrap shape.
+        let mut anchor_ready = state.mtp_anchor_hidden.is_some();
         while committed < budget && !state.finished {
             let remaining = budget - committed;
             // A round commits the pending token plus up to `depth` drafted
             // tokens; keep the round inside the granted budget.
-            let depth = head.draft_depth().min(remaining.saturating_sub(1));
+            let depth = if anchor_ready {
+                head.draft_depth().min(remaining.saturating_sub(1))
+            } else {
+                0
+            };
             if depth == 0 {
                 delta.push_str(&self.mtp_scalar_tail(state, head)?);
                 committed += 1;
+                anchor_ready = true;
             } else {
-                committed += self.mtp_speculative_round(state, head, depth)?;
+                let (round_tokens, round_delta) =
+                    self.mtp_speculative_round(state, head, depth)?;
+                committed += round_tokens;
+                delta.push_str(&round_delta);
             }
         }
         Ok(ChatDecodeStep {
@@ -1352,7 +1393,7 @@ impl Qwen35ChatExec {
             &mut state.physical_kv,
         )?;
         let normalized_hidden = self.text_model.normalize_hidden(&hidden)?;
-        let logits = self.text_model.project_hidden_span(&hidden)?;
+        let logits = self.text_model.forward_hidden_to_logits(&hidden)?;
         let history = if state.track_history {
             state.history_ids.as_slice()
         } else {
@@ -1384,13 +1425,13 @@ impl Qwen35ChatExec {
     }
 
     /// Speculative round: draft `depth` tokens, verify with the target, and
-    /// commit the accepted prefix. Returns the number of committed tokens.
+    /// commit the accepted prefix. Returns (committed tokens, their text).
     fn mtp_speculative_round(
         &self,
         state: &mut ChatDecodeState,
         head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
         depth: usize,
-    ) -> Result<usize> {
+    ) -> Result<(usize, String)> {
         let pending = state.pending_token.ok_or_else(|| {
             Error::InferenceError("Qwen3.5 MTP round has no pending token".into())
         })?;
@@ -1401,6 +1442,8 @@ impl Qwen35ChatExec {
 
         // Draft provisionally; the draft's MTP rows are discarded before
         // verification rewrites the canonical pairs.
+        self.mtp_speculative_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let continuation_positions: Vec<[usize; 3]> =
             (0..depth - 1).map(|offset| [position + offset; 3]).collect();
         let mtp_cache = state
@@ -1475,7 +1518,7 @@ impl Qwen35ChatExec {
         let count = kept.len();
         if count == 0 {
             state.finished = true;
-            return Ok(0);
+            return Ok((0, String::new()));
         }
 
         // Commit only the accepted prefix: install the linear states from
@@ -1517,7 +1560,7 @@ impl Qwen35ChatExec {
                 break;
             }
         }
-        Ok(count)
+        Ok((count, delta))
     }
 }
 
@@ -1592,6 +1635,7 @@ impl Qwen35ChatModel {
                 text_config,
                 text_model,
                 mtp_head: None,
+                mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
             },
             text_checkpoint,
             projector_checkpoint,
