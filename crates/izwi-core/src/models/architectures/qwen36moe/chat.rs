@@ -28,7 +28,7 @@ use crate::models::shared::moe::ExpertActivationCounters;
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::gguf::{parse_fixture_gguf_config, QWEN36_MOE_FIXTURE_GGUF_FILENAME};
-use super::native::Qwen36MoeNativeCheckpoint;
+use super::native::{Qwen36MoeMtpLoadPolicy, Qwen36MoeNativeCheckpoint};
 use super::native_model::load_text_model_native;
 
 const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN36_CUDA_BF16_KV";
@@ -170,11 +170,26 @@ impl Qwen36MoeChatModel {
             projection_backend = ?performance.cuda.projection_backend,
             "Qwen3.6-MoE performance policy"
         );
+        // MTP mirrors the qwen3.8 gating: the master CUDA switch also gates
+        // MTP on CUDA devices; CPU/Metal consult the MTP knob alone. Phase
+        // 3a validates and records the draft manifest; the draft head and
+        // decode quantum land in the following MTP phases.
+        let mtp_enabled = if device_kind == BackendKind::Cuda {
+            performance.cuda.enabled() && performance.cuda.mtp.enabled()
+        } else {
+            performance.cuda.mtp.enabled()
+        };
+        tracing::info!(mtp_enabled, "Qwen3.6-MoE MTP policy");
+        let mtp_policy = if mtp_enabled {
+            Qwen36MoeMtpLoadPolicy::Enabled
+        } else {
+            Qwen36MoeMtpLoadPolicy::Disabled
+        };
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let exec = if fixture_path.exists() {
             Self::load_fixture_gguf(model_dir, &fixture_path, variant, &device)?
         } else {
-            Self::load_native(model_dir, variant, &device, &performance.cuda)?
+            Self::load_native(model_dir, variant, &device, &performance.cuda, mtp_policy)?
         };
         Ok(Self {
             device_kind,
@@ -212,8 +227,10 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: &DeviceProfile,
         performance: &crate::performance::CudaPerformanceConfig,
+        mtp_policy: Qwen36MoeMtpLoadPolicy,
     ) -> Result<Qwen35ChatExec> {
-        let checkpoint = Qwen36MoeNativeCheckpoint::open(model_dir)?;
+        let checkpoint =
+            Qwen36MoeNativeCheckpoint::open_with_policies(model_dir, super::native::Qwen36MoeGeometryPolicy::from_env(), mtp_policy)?;
         let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model) =
             load_text_model_native(&checkpoint, device, &device.device, performance)?;

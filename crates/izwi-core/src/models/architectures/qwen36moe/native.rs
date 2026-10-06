@@ -209,7 +209,7 @@ pub fn synthetic_geometry_enabled() -> bool {
 }
 
 impl Qwen36MoeGeometryPolicy {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         if synthetic_geometry_enabled() {
             Self::Synthetic
         } else {
@@ -953,6 +953,160 @@ pub fn canonical_text_tensor_name(name: &str) -> Option<(Qwen36MoeTensorScope, O
     Some((Qwen36MoeTensorScope::Text, Some(name.to_string())))
 }
 
+/// One tensor of the qwen3.6 MTP draft manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen36MoeMtpTensorSpec {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub kind: ExpectedTensorKind,
+}
+
+impl Qwen36MoeMtpTensorSpec {
+    /// The safetensors dtype the manifest kind requires.
+    pub fn kind_to_safe_dtype(&self) -> SafeDType {
+        match self.kind {
+            ExpectedTensorKind::BlockFp8 => SafeDType::F8_E4M3,
+            ExpectedTensorKind::BlockFp8Scale
+            | ExpectedTensorKind::Dense
+            | ExpectedTensorKind::OptionalDense => SafeDType::BF16,
+        }
+    }
+}
+
+/// Validated inventory of the checkpoint's `mtp.*` tensors, recorded when the
+/// MTP load policy is enabled. Loading the draft head over these tensors is
+/// the next MTP phase; this struct is the handoff between validation and
+/// construction.
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36MoeMtpInventory {
+    pub tensors: BTreeMap<String, (Vec<usize>, SafeDType, u64)>,
+}
+
+/// Whether the load validates and records the MTP draft manifest. MTP stays
+/// opt-in: the default load skips `mtp.*` exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36MoeMtpLoadPolicy {
+    Disabled,
+    Enabled,
+}
+
+/// The qwen3.6 MTP draft topology mirrors the published qwen3_5_moe MTP
+/// layer: ONE recurrent decoder layer sharing the target's token embeddings
+/// and LM head, with a dense FFN sized by the MoE intermediate width and the
+/// target's gated full-attention geometry.
+///
+/// NOTE: the exact published manifest (names, shapes, dtypes) must be
+/// verified against the real Qwen3.6-35B-A3B-FP8 checkpoint at the hardware
+/// handoff — the loader fails closed on any drift, and MTP is disabled by
+/// default, so an unverified hypothesis can never silently misload.
+pub const QWEN36_MOE_MTP_LAYERS: usize = 1;
+pub const QWEN36_MOE_MTP_TENSOR_COUNT: usize = 22;
+
+pub fn mtp_tensor_plan(
+    text: &Qwen36MoeTextConfig,
+    block_shape: [usize; 2],
+) -> Result<Vec<Qwen36MoeMtpTensorSpec>> {
+    let hidden = text.hidden_size;
+    let intermediate = text.moe_intermediate_size;
+    let head_dim = text.attention_key_length;
+    let checked = |label: &str, value: Option<usize>| {
+        value.ok_or_else(|| config_error(label, "dimension product overflow"))
+    };
+    let query_width = checked(
+        "MTP query projection width",
+        text.attention_head_count.checked_mul(head_dim),
+    )?;
+    let gated_query_width = checked("MTP gated query width", query_width.checked_mul(2))?;
+    let kv_width = checked(
+        "MTP key/value projection width",
+        text.attention_head_count_kv.checked_mul(head_dim),
+    )?;
+    let fused_input = checked("MTP fused input width", hidden.checked_mul(2))?;
+
+    fn push_dense(specs: &mut Vec<Qwen36MoeMtpTensorSpec>, name: String, shape: Vec<usize>) {
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name,
+            shape,
+            kind: ExpectedTensorKind::Dense,
+        });
+    }
+    fn push_projection(
+        specs: &mut Vec<Qwen36MoeMtpTensorSpec>,
+        name: String,
+        shape: [usize; 2],
+        block_shape: [usize; 2],
+    ) -> Result<()> {
+        let [rows, cols] = shape;
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name: name.clone(),
+            shape: vec![rows, cols],
+            kind: ExpectedTensorKind::BlockFp8,
+        });
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name: format!("{name}_scale_inv"),
+            shape: vec![rows.div_ceil(block_shape[0]), cols.div_ceil(block_shape[1])],
+            kind: ExpectedTensorKind::BlockFp8Scale,
+        });
+        Ok(())
+    }
+
+    let mut specs = Vec::with_capacity(QWEN36_MOE_MTP_TENSOR_COUNT);
+    push_dense(&mut specs, "mtp.fc.weight".into(), vec![hidden, fused_input]);
+    for layer in 0..QWEN36_MOE_MTP_LAYERS {
+        let prefix = format!("mtp.layers.{layer}");
+        push_dense(&mut specs, format!("{prefix}.input_layernorm.weight"), vec![hidden]);
+        push_dense(
+            &mut specs,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        push_projection(
+            &mut specs,
+            format!("{prefix}.mlp.gate_proj.weight"),
+            [intermediate, hidden],
+            block_shape,
+        )?;
+        push_projection(
+            &mut specs,
+            format!("{prefix}.mlp.up_proj.weight"),
+            [intermediate, hidden],
+            block_shape,
+        )?;
+        push_projection(
+            &mut specs,
+            format!("{prefix}.mlp.down_proj.weight"),
+            [hidden, intermediate],
+            block_shape,
+        )?;
+        push_dense(&mut specs, format!("{prefix}.self_attn.q_norm.weight"), vec![head_dim]);
+        push_dense(&mut specs, format!("{prefix}.self_attn.k_norm.weight"), vec![head_dim]);
+        for (projection_name, shape) in [
+            ("q_proj", [gated_query_width, hidden]),
+            ("k_proj", [kv_width, hidden]),
+            ("v_proj", [kv_width, hidden]),
+            ("o_proj", [hidden, query_width]),
+        ] {
+            push_projection(
+                &mut specs,
+                format!("{prefix}.self_attn.{projection_name}.weight"),
+                shape,
+                block_shape,
+            )?;
+        }
+    }
+    push_dense(&mut specs, "mtp.norm.weight".into(), vec![hidden]);
+    push_dense(&mut specs, "mtp.pre_fc_norm_embedding.weight".into(), vec![hidden]);
+    push_dense(&mut specs, "mtp.pre_fc_norm_hidden.weight".into(), vec![hidden]);
+
+    if specs.len() != QWEN36_MOE_MTP_TENSOR_COUNT {
+        return Err(Error::ModelLoadError(format!(
+            "Qwen3.5/3.6-MoE MTP manifest resolved to {} tensors, expected {QWEN36_MOE_MTP_TENSOR_COUNT}",
+            specs.len()
+        )));
+    }
+    Ok(specs)
+}
+
 /// The expected checkpoint contract for one canonical text tensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedTensor {
@@ -1237,6 +1391,9 @@ pub struct Qwen36MoeNativeCheckpoint {
     /// Canonical text tensor name -> raw index name (layout normalization).
     text_tensor_names: BTreeMap<String, String>,
     pub skipped: SkippedScopeInventory,
+    /// Present only when the load policy enabled MTP; the validated draft
+    /// manifest the head-construction phase consumes.
+    pub mtp: Option<Qwen36MoeMtpInventory>,
 }
 
 impl Qwen36MoeNativeCheckpoint {
@@ -1244,20 +1401,44 @@ impl Qwen36MoeNativeCheckpoint {
         Self::open_with_policy(model_dir, Qwen36MoeGeometryPolicy::from_env())
     }
 
+    pub fn open_with_policies(
+        model_dir: &Path,
+        geometry: Qwen36MoeGeometryPolicy,
+        mtp: Qwen36MoeMtpLoadPolicy,
+    ) -> Result<Self> {
+        let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, geometry)?;
+        let tensors = IndexedSafetensors::open(model_dir)?;
+        Self::validate_with_policies(config, tensors, mtp)
+    }
+
     /// Open with an explicit geometry policy. Production callers use
     /// `open`; synthetic-fixture tests pass `Synthetic` directly so
     /// parallel tests never mutate the process environment.
     pub fn open_with_policy(model_dir: &Path, policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
-        let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, policy)?;
-        let tensors = IndexedSafetensors::open(model_dir)?;
-        Self::validate(config, tensors)
+        Self::open_with_policies(model_dir, policy, Qwen36MoeMtpLoadPolicy::Disabled)
     }
 
     pub fn validate(config: Qwen36MoeNativeConfig, tensors: IndexedSafetensors) -> Result<Self> {
+        Self::validate_with_policies(config, tensors, Qwen36MoeMtpLoadPolicy::Disabled)
+    }
+
+    pub fn validate_with_policies(
+        config: Qwen36MoeNativeConfig,
+        tensors: IndexedSafetensors,
+        mtp_policy: Qwen36MoeMtpLoadPolicy,
+    ) -> Result<Self> {
         let plan = expected_text_tensor_plan(&config)?;
+        let mtp_plan = match mtp_policy {
+            Qwen36MoeMtpLoadPolicy::Disabled => None,
+            Qwen36MoeMtpLoadPolicy::Enabled => Some(mtp_tensor_plan(
+                &config.text,
+                config.block_fp8.block_shape,
+            )?),
+        };
         let mut text_tensor_names = BTreeMap::new();
         let mut skipped = SkippedScopeInventory::default();
         let mut mtp_payload_bytes = 0u64;
+        let mut mtp_tensors: BTreeMap<String, (Vec<usize>, SafeDType, u64)> = BTreeMap::new();
 
         for raw_name in tensors.tensor_names() {
             let (scope, canonical) = canonical_text_tensor_name(raw_name)
@@ -1286,6 +1467,13 @@ impl Qwen36MoeNativeCheckpoint {
                         .tensor_info(raw_name)
                         .map(|info| info.storage_bytes as u64)
                         .unwrap_or(0);
+                    if mtp_plan.is_some() {
+                        let info = tensors.tensor_info(raw_name)?;
+                        mtp_tensors.insert(
+                            raw_name.to_string(),
+                            (info.shape.clone(), info.dtype, info.storage_bytes as u64),
+                        );
+                    }
                 }
                 Qwen36MoeTensorScope::Unknown => {
                     return Err(Error::ModelLoadError(format!(
@@ -1344,11 +1532,61 @@ impl Qwen36MoeNativeCheckpoint {
 
         skipped.mtp_payload_bytes = mtp_payload_bytes;
 
+        // Fail-closed MTP manifest validation: every planned tensor must be
+        // present with the exact shape and dtype, and no unplanned `mtp.*`
+        // tensor may exist. A drift is a hard load error naming the delta —
+        // the manifest is a handoff-verified hypothesis about the published
+        // checkpoint, so any mismatch must stop the load, not guess.
+        let mtp = if let Some(mtp_plan) = mtp_plan {
+            for spec in &mtp_plan {
+                let Some((shape, dtype, _)) = mtp_tensors.get(&spec.name) else {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5/3.6-MoE checkpoint is missing MTP tensor `{}` expected {:?}",
+                        spec.name, spec.shape
+                    )));
+                };
+                let dtype_ok = match spec.kind {
+                    ExpectedTensorKind::Dense => {
+                        matches!(dtype, SafeDType::BF16 | SafeDType::F16 | SafeDType::F32)
+                    }
+                    ExpectedTensorKind::BlockFp8 => *dtype == SafeDType::F8_E4M3,
+                    ExpectedTensorKind::BlockFp8Scale => *dtype == SafeDType::BF16,
+                    ExpectedTensorKind::OptionalDense => {
+                        matches!(dtype, SafeDType::BF16 | SafeDType::F16 | SafeDType::F32)
+                    }
+                };
+                if *shape != spec.shape || !dtype_ok {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5/3.6-MoE MTP tensor `{}` contract drift: expected {:?} {:?}, found {dtype:?} {shape:?}",
+                        spec.name, spec.kind, spec.shape
+                    )));
+                }
+            }
+            if mtp_tensors.len() != mtp_plan.len() {
+                let extra: Vec<&str> = mtp_tensors
+                    .keys()
+                    .filter(|name| !mtp_plan.iter().any(|spec| &spec.name == *name))
+                    .map(|name| name.as_str())
+                    .take(8)
+                    .collect();
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.5/3.6-MoE checkpoint declares {} unplanned MTP tensors, including {extra:?}; update the qwen36moe MTP manifest before enabling MTP",
+                    mtp_tensors.len() - mtp_plan.len()
+                )));
+            }
+            Some(Qwen36MoeMtpInventory {
+                tensors: mtp_tensors,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             tensors,
             text_tensor_names,
             skipped,
+            mtp,
         })
     }
 
@@ -2936,12 +3174,24 @@ mod tests {
             vec![4, 4],
             bf16_bytes(&[1.0; 16]),
         ));
-        tensors.push((
-            "mtp.norm.weight".into(),
-            SafeDType::BF16,
-            vec![hidden],
-            bf16_ones(hidden),
-        ));
+        // The MTP draft manifest, generated from the same plan the loader
+        // validates against — a drift in either side fails the tests.
+        for spec in mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap() {
+            let count: usize = spec.shape.iter().product();
+            let bytes = match spec.kind {
+                ExpectedTensorKind::Dense | ExpectedTensorKind::BlockFp8Scale => {
+                    bf16_uniform(0.05, count)
+                }
+                ExpectedTensorKind::BlockFp8 => vec![0x38u8; count],
+                ExpectedTensorKind::OptionalDense => bf16_uniform(0.05, count),
+            };
+            tensors.push((
+                spec.name.clone(),
+                spec.kind_to_safe_dtype(),
+                spec.shape.clone(),
+                bytes,
+            ));
+        }
         tensors
     }
 
@@ -3040,8 +3290,11 @@ mod tests {
         assert_eq!(text.block_count, 4);
         assert_eq!(text.moe_num_experts, 2);
         assert_eq!(checkpoint.skipped.vision_tensors, 1);
-        assert_eq!(checkpoint.skipped.mtp_tensors, 1);
+        // The full MTP draft manifest rides every checkpoint; the default
+        // load skips it until the MTP policy enables validation.
+        assert_eq!(checkpoint.skipped.mtp_tensors, 22);
         assert!(checkpoint.skipped.mtp_payload_bytes > 0);
+        assert!(checkpoint.mtp.is_none());
         // Composite layout is canonicalized: `raw_tensor_name` resolves the
         // raw index name for a canonical plan name.
         let raw = checkpoint
@@ -3135,6 +3388,103 @@ mod tests {
         .unwrap();
         assert_eq!(y.dims(), &[1, 8]);
         assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
+    }
+
+    #[test]
+    fn mtp_policy_validates_the_draft_manifest_fail_closed() {
+        let config = forward_config();
+        let dir = TestDir::new("mtp-ok");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+
+        // Disabled (default): manifest skipped, no inventory.
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+            Qwen36MoeMtpLoadPolicy::Disabled,
+        )
+        .unwrap();
+        assert!(checkpoint.mtp.is_none());
+
+        // Enabled: the fixture carries the exact plan, so validation passes
+        // and the inventory records every draft tensor.
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+            Qwen36MoeMtpLoadPolicy::Enabled,
+        )
+        .unwrap();
+        let inventory = checkpoint.mtp.as_ref().expect("MTP inventory recorded");
+        assert_eq!(inventory.tensors.len(), 22);
+        assert!(inventory.tensors.contains_key("mtp.fc.weight"));
+        assert!(
+            inventory
+                .tensors
+                .contains_key("mtp.layers.0.self_attn.q_proj.weight")
+        );
+        assert!(inventory.tensors.contains_key("mtp.norm.weight"));
+
+        // Missing tensor: fail closed naming it.
+        let missing = |dropped: &str| {
+            let dir = TestDir::new("mtp-missing");
+            let tensors: Vec<RawTensor> = tiny_checkpoint_tensors(&config)
+                .into_iter()
+                .filter(|(name, ..)| name != dropped)
+                .collect();
+            write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
+            Qwen36MoeNativeCheckpoint::open_with_policies(
+                dir.0.as_path(),
+                Qwen36MoeGeometryPolicy::Synthetic,
+                Qwen36MoeMtpLoadPolicy::Enabled,
+            )
+            .err()
+            .expect("missing MTP tensor must fail closed")
+            .to_string()
+        };
+        let error = missing("mtp.fc.weight");
+        assert!(error.contains("missing MTP tensor"), "{error}");
+        assert!(error.contains("mtp.fc.weight"), "{error}");
+
+        // Extra unplanned tensor: fail closed.
+        let dir = TestDir::new("mtp-extra");
+        let mut tensors = tiny_checkpoint_tensors(&config);
+        tensors.push((
+            "mtp.mystery.weight".into(),
+            SafeDType::BF16,
+            vec![4],
+            bf16_uniform(0.05, 4),
+        ));
+        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
+        let error = Qwen36MoeNativeCheckpoint::open_with_policies(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+            Qwen36MoeMtpLoadPolicy::Enabled,
+        )
+        .err()
+        .expect("unplanned MTP tensor must fail closed")
+        .to_string();
+        assert!(error.contains("unplanned MTP tensors"), "{error}");
+        assert!(error.contains("mtp.mystery.weight"), "{error}");
+
+        // Shape drift: fail closed.
+        let dir = TestDir::new("mtp-shape");
+        let mut tensors = tiny_checkpoint_tensors(&config);
+        let drifted = tensors
+            .iter_mut()
+            .find(|(name, ..)| name == "mtp.norm.weight")
+            .unwrap();
+        drifted.2 = vec![drifted.2[0] + 1];
+        drifted.3 = bf16_uniform(0.05, drifted.2[0]);
+        write_tiny_checkpoint_tensors(&config, dir.0.as_path(), tensors);
+        let error = Qwen36MoeNativeCheckpoint::open_with_policies(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+            Qwen36MoeMtpLoadPolicy::Enabled,
+        )
+        .err()
+        .expect("MTP shape drift must fail closed")
+        .to_string();
+        assert!(error.contains("contract drift"), "{error}");
+        assert!(error.contains("mtp.norm.weight"), "{error}");
     }
 
     #[test]
