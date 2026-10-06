@@ -31,6 +31,113 @@ pub(crate) fn mtp_model_layer(cfg: &Qwen35TextConfig) -> u32 {
     u32::try_from(cfg.block_count).unwrap_or(u32::MAX)
 }
 
+/// Per-request latency controller. It compares elapsed time per committed
+/// token, including draft, verification and prefix commit. Exploration is
+/// bounded to four arms (scalar and depths 1..3), one probe every eight rounds.
+/// Scheduler-limited tails do not train the controller.
+#[derive(Clone, Debug)]
+pub(crate) struct AdaptiveMtp {
+    pub(crate) enabled: bool,
+    speculation_disabled: bool,
+    pub(crate) fixed_depth: usize,
+    pub(crate) selected: usize,
+    pub(crate) samples: [u32; 4],
+    pub(crate) cost_per_token: [f64; 4],
+    pub(crate) rounds: u64,
+    pub(crate) probe: usize,
+}
+
+impl AdaptiveMtp {
+    pub(crate) fn new(enabled: bool, starting_depth: usize) -> Self {
+        let depth = starting_depth.clamp(1, 3);
+        Self {
+            enabled,
+            speculation_disabled: false,
+            fixed_depth: depth,
+            selected: depth,
+            samples: [0; 4],
+            cost_per_token: [0.0; 4],
+            rounds: 0,
+            probe: 0,
+        }
+    }
+
+    /// A numerical draft failure disables speculation for the entire request,
+    /// including fixed-depth mode and any delayed timing observations.
+    pub(crate) fn disable_after_nonfinite_draft(&mut self) {
+        self.speculation_disabled = true;
+    }
+
+    pub(crate) fn speculation_disabled(&self) -> bool {
+        self.speculation_disabled
+    }
+
+    /// Roll back timing policy without forgetting a numerical failure observed
+    /// either before the checkpoint or in the cancelled quantum.
+    pub(crate) fn restore_from_checkpoint(&mut self, checkpoint: Self) {
+        let speculation_disabled = self.speculation_disabled || checkpoint.speculation_disabled;
+        *self = checkpoint;
+        self.speculation_disabled = speculation_disabled;
+    }
+
+    pub(crate) fn can_train(&self, budget: usize) -> bool {
+        !self.speculation_disabled() && self.enabled && budget >= 4
+    }
+
+    pub(crate) fn depth(&self, budget: usize) -> usize {
+        if self.speculation_disabled {
+            return 0;
+        }
+        let ceiling = budget.saturating_sub(1).min(3);
+        if !self.enabled {
+            return self.fixed_depth.min(ceiling);
+        }
+        let arm = if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe
+        } else {
+            self.selected
+        };
+        arm.min(ceiling)
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        depth: usize,
+        committed: usize,
+        elapsed: std::time::Duration,
+        budget: usize,
+    ) {
+        if self.speculation_disabled
+            || !self.enabled
+            || depth > 3
+            || committed == 0
+            || budget < 4
+            || elapsed.is_zero()
+        {
+            return;
+        }
+        let cost = elapsed.as_secs_f64() / committed as f64;
+        self.cost_per_token[depth] = if self.samples[depth] == 0 {
+            cost
+        } else {
+            self.cost_per_token[depth] * 0.75 + cost * 0.25
+        };
+        self.samples[depth] = self.samples[depth].saturating_add(1);
+        if self.rounds > 0 && self.rounds.is_multiple_of(8) {
+            self.probe = (self.probe + 1) % 4;
+        }
+        self.rounds = self.rounds.saturating_add(1);
+        // Require a 5% advantage before switching to reduce timer noise churn.
+        for candidate in 0..4 {
+            if self.samples[candidate] > 0
+                && self.cost_per_token[candidate] < self.cost_per_token[self.selected] * 0.95
+            {
+                self.selected = candidate;
+            }
+        }
+    }
+}
+
 pub(crate) struct Qwen35MtpHead {
     hidden_size: usize,
     draft_depth: usize,
@@ -292,9 +399,10 @@ impl Qwen35MtpHead {
 }
 
 /// Argmax over `[1, 1, vocab]` (or `[vocab]`) draft logits, clamped to the
-/// tokenizer vocabulary. Greedy draft selection mirrors the target's greedy
-/// sampler: first-index-wins on ties, non-finite logits are a hard error.
-pub(crate) fn greedy_argmax(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+/// tokenizer vocabulary, or `None` when any clamped value is non-finite (the
+/// caller decides between a hard error and a fallback). First-index-wins on
+/// ties, mirroring the target's greedy sampler.
+pub(crate) fn draft_argmax(logits: &Tensor, vocab_size: usize) -> Result<Option<u32>> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
             "Qwen3.5 MTP draft received vocab_size=0".to_string(),
@@ -312,14 +420,146 @@ pub(crate) fn greedy_argmax(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     let mut best_value = f32::NEG_INFINITY;
     for (index, &value) in values.iter().enumerate() {
         if !value.is_finite() {
-            return Err(Error::InferenceError(
-                "Qwen3.5 MTP draft produced non-finite logits".into(),
-            ));
+            return Ok(None);
         }
         if value > best_value {
             best = index;
             best_value = value;
         }
     }
-    Ok(best as u32)
+    Ok(Some(best as u32))
+}
+
+/// Argmax over `[1, 1, vocab]` (or `[vocab]`) draft logits, clamped to the
+/// tokenizer vocabulary. Greedy draft selection mirrors the target's greedy
+/// sampler: first-index-wins on ties, non-finite logits are a hard error.
+pub(crate) fn greedy_argmax(logits: &Tensor, vocab_size: usize) -> Result<u32> {
+    draft_argmax(logits, vocab_size)?.ok_or_else(|| {
+        Error::InferenceError("Qwen3.5 MTP draft produced non-finite logits".into())
+    })
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::AdaptiveMtp;
+    use std::time::Duration;
+
+    #[test]
+    fn starts_shallow_explores_bounded_depths_and_selects_elapsed_cost() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        assert_eq!(policy.depth(4), 1);
+        let mut seen = [false; 4];
+        for _ in 0..160 {
+            let depth = policy.depth(4);
+            seen[depth] = true;
+            let committed = depth + 1;
+            // Depth two is fastest despite depth three accepting more tokens.
+            let cost = [20, 15, 8, 12][depth];
+            policy.observe(
+                depth,
+                committed,
+                Duration::from_millis(cost * committed as u64),
+                4,
+            );
+        }
+        assert_eq!(seen, [true; 4]);
+        assert_eq!(policy.selected, 2);
+        assert_eq!(policy.depth(1), 0);
+        assert!(policy.depth(2) <= 1);
+    }
+
+    #[test]
+    fn poor_speculation_selects_scalar_and_opt_out_is_fixed() {
+        let mut policy = AdaptiveMtp::new(true, 1);
+        for _ in 0..80 {
+            let depth = policy.depth(4);
+            policy.observe(
+                depth,
+                1,
+                Duration::from_millis(if depth == 0 { 5 } else { 30 }),
+                4,
+            );
+        }
+        assert_eq!(policy.selected, 0);
+        let mut fixed = AdaptiveMtp::new(false, 3);
+        fixed.observe(0, 1, Duration::from_nanos(1), 4);
+        assert_eq!(fixed.depth(4), 3);
+        assert_eq!(fixed.depth(2), 1);
+    }
+
+    #[test]
+    fn cancellation_clone_and_scheduler_limited_tails_do_not_change_policy() {
+        let base = AdaptiveMtp::new(true, 1);
+        let mut cancelled = base.clone();
+        cancelled.observe(1, 2, Duration::from_millis(1), 4);
+        assert_eq!(base.rounds, 0);
+        let mut limited = base.clone();
+        limited.observe(0, 1, Duration::from_millis(1), 1);
+        assert_eq!(limited.rounds, 0);
+    }
+
+    #[test]
+    fn numerical_disable_blocks_fixed_depth_probes_and_delayed_observations() {
+        for adaptive in [false, true] {
+            let mut policy = AdaptiveMtp::new(adaptive, 3);
+            assert!(!policy.speculation_disabled());
+            assert_eq!(policy.depth(4), 3);
+            for _ in 0..8 {
+                policy.observe(3, 4, Duration::from_millis(4), 4);
+            }
+            let before = policy.clone();
+            policy.disable_after_nonfinite_draft();
+            policy.disable_after_nonfinite_draft();
+            assert!(policy.speculation_disabled());
+            // Events queued before the failure must not train or re-enable
+            // the controller, even across multiple exploration intervals.
+            for _ in 0..32 {
+                for depth in 0..=3 {
+                    policy.observe(depth, depth + 1, Duration::from_nanos(1), 4);
+                }
+            }
+            for budget in [0, 1, 2, 4, usize::MAX] {
+                assert_eq!(policy.depth(budget), 0);
+                assert!(!policy.can_train(budget));
+            }
+            assert_eq!(policy.samples, before.samples);
+            assert_eq!(policy.cost_per_token, before.cost_per_token);
+            assert_eq!(policy.rounds, before.rounds);
+            assert_eq!(policy.probe, before.probe);
+            assert_eq!(policy.selected, before.selected);
+        }
+    }
+
+    #[test]
+    fn checkpoint_restore_keeps_either_numerical_latch_and_restores_timing_policy() {
+        for current_disabled in [false, true] {
+            for checkpoint_disabled in [false, true] {
+                let mut checkpoint = AdaptiveMtp::new(true, 1);
+                checkpoint.observe(1, 2, Duration::from_millis(2), 4);
+                if checkpoint_disabled {
+                    checkpoint.disable_after_nonfinite_draft();
+                }
+                let mut current = AdaptiveMtp::new(false, 3);
+                if current_disabled {
+                    current.disable_after_nonfinite_draft();
+                }
+                current.restore_from_checkpoint(checkpoint.clone());
+                let disabled = current_disabled || checkpoint_disabled;
+                assert_eq!(current.speculation_disabled(), disabled);
+                assert_eq!(current.enabled, checkpoint.enabled);
+                assert_eq!(current.fixed_depth, checkpoint.fixed_depth);
+                assert_eq!(current.selected, checkpoint.selected);
+                assert_eq!(current.samples, checkpoint.samples);
+                assert_eq!(current.cost_per_token, checkpoint.cost_per_token);
+                assert_eq!(current.rounds, checkpoint.rounds);
+                assert_eq!(current.probe, checkpoint.probe);
+                if disabled {
+                    current.observe(3, 4, Duration::from_nanos(1), 4);
+                    assert_eq!(current.rounds, checkpoint.rounds);
+                    assert_eq!(current.depth(4), 0);
+                    assert!(!current.can_train(4));
+                }
+            }
+        }
+    }
 }

@@ -37,6 +37,8 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 use super::text::{Qwen35MoeFfnGeometry, Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
+mod timing;
+
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
@@ -207,6 +209,11 @@ pub struct ChatDecodeState {
     /// session decodes through the MTP quantum path.
     mtp_cache: Option<PhysicalPagedKvCache>,
     mtp_anchor_hidden: Option<Tensor>,
+    /// DS9.4 per-request depth controller and its pending device-timed
+    /// rounds. The controller only trains where device event timing is
+    /// available; elsewhere the configured depth holds.
+    adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
 }
 
 impl ChatDecodeState {
@@ -297,6 +304,8 @@ impl ChatDecodeState {
             finished: self.finished,
             next_text_position: self.next_text_position,
             rng: self.rng.clone(),
+            adaptive_mtp: self.adaptive_mtp.clone(),
+            mtp_timings: self.mtp_timings.clone(),
         })
     }
 
@@ -313,6 +322,9 @@ impl ChatDecodeState {
         self.finished = checkpoint.finished;
         self.next_text_position = checkpoint.next_text_position;
         self.rng = checkpoint.rng;
+        self.adaptive_mtp
+            .restore_from_checkpoint(checkpoint.adaptive_mtp);
+        self.mtp_timings = checkpoint.mtp_timings;
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -372,6 +384,8 @@ pub(crate) struct Qwen35SharedStepCheckpoint {
     finished: bool,
     next_text_position: usize,
     rng: SimpleRng,
+    adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +706,9 @@ pub(crate) struct Qwen35ChatExec {
     pub(crate) mtp_speculative_rounds: std::sync::atomic::AtomicU64,
     /// DS9.4 speculative-envelope rounds executed across continuous rows.
     pub(crate) mtp_envelope_rounds: std::sync::atomic::AtomicU64,
+    /// Whether the adaptive depth controller may train (the performance
+    /// knob); the device check and head presence narrow it further.
+    pub(crate) mtp_adaptive: bool,
     /// Persistent KV storage dtype — the MTP cache arena follows it.
     pub(crate) kv_storage_dtype: DType,
 }
@@ -867,7 +884,25 @@ impl Qwen35ChatExec {
             grammar: self.grammar_runtime(config),
             mtp_cache,
             mtp_anchor_hidden: None,
+            adaptive_mtp: self.new_adaptive_mtp(),
+            mtp_timings: Vec::new(),
         })
+    }
+
+    /// Fresh depth controller for a new session: it trains only where device
+    /// event timing is available (CUDA) and the performance knob opted in;
+    /// elsewhere the configured draft depth holds for the whole request.
+    fn new_adaptive_mtp(&self) -> crate::models::architectures::qwen35::mtp::AdaptiveMtp {
+        let enabled = self.mtp_adaptive
+            && self.mtp_head.is_some()
+            && self.text_model.device().is_cuda();
+        crate::models::architectures::qwen35::mtp::AdaptiveMtp::new(
+            enabled,
+            self.mtp_head
+                .as_ref()
+                .map(|head| head.draft_depth())
+                .unwrap_or(1),
+        )
     }
 
     /// DS9.2 grammar runtime for this request, or `None` when the request
@@ -1388,23 +1423,43 @@ impl Qwen35ChatExec {
         // (embed(next), h(pos)) — exactly the qwen3.8 bootstrap shape.
         let mut anchor_ready = state.mtp_anchor_hidden.is_some();
         while committed < budget && !state.finished {
-            let remaining = budget - committed;
-            // A round commits the pending token plus up to `depth` drafted
-            // tokens; keep the round inside the granted budget.
+            // Output-capped remaining slice: the controller's observation
+            // budget is the round's own remaining slice, not the raw grant.
+            let remaining = (budget - committed).min(
+                state
+                    .max_new_tokens
+                    .saturating_sub(state.tokens_generated)
+                    .max(1),
+            );
+            self.observe_completed_mtp_timings(state);
+            let timer = if state.adaptive_mtp.can_train(remaining) {
+                timing::RoundTimer::start(self.text_model.device())
+            } else {
+                None
+            };
             let depth = if anchor_ready {
-                head.draft_depth().min(remaining.saturating_sub(1))
+                state.adaptive_mtp.depth(remaining)
             } else {
                 0
             };
-            if depth == 0 {
+            let round_tokens = if depth == 0 {
                 delta.push_str(&self.mtp_scalar_tail(state, head)?);
-                committed += 1;
                 anchor_ready = true;
+                1
             } else {
-                let (round_tokens, round_delta) =
-                    self.mtp_speculative_round(state, head, depth)?;
-                committed += round_tokens;
+                let (tokens, round_delta) = self.mtp_speculative_round(state, head, depth)?;
                 delta.push_str(&round_delta);
+                tokens
+            };
+            committed += round_tokens;
+            self.observe_completed_mtp_timings(state);
+            if let Some(pending) =
+                timer.and_then(|timer| timer.finish(depth, round_tokens, remaining))
+            {
+                if state.mtp_timings.len() == 4 {
+                    state.mtp_timings.remove(0);
+                }
+                state.mtp_timings.push(pending);
             }
         }
         Ok(ChatDecodeStep {
@@ -1658,6 +1713,26 @@ impl Qwen35ChatExec {
         self.mtp_head.is_some()
     }
 
+    /// Drain resolved device-event timings into the depth controller. The
+    /// bounded pending queue also rides the quantum checkpoint, so a
+    /// cancelled quantum restores observations and policy together.
+    fn observe_completed_mtp_timings(&self, state: &mut ChatDecodeState) {
+        let mut index = 0;
+        while index < state.mtp_timings.len() {
+            if let Some(elapsed) = state.mtp_timings[index].try_elapsed() {
+                let completed = state.mtp_timings.remove(index);
+                state.adaptive_mtp.observe(
+                    completed.depth,
+                    completed.committed,
+                    elapsed,
+                    completed.budget,
+                );
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     /// DS9.4: one shared speculative envelope for continuous rows. Every row
     /// must be decodable exactly as the scalar batch requires (the executor
     /// only grants envelope quanta to rows whose prefill bootstrap already
@@ -1721,23 +1796,34 @@ impl Qwen35ChatExec {
             // Per-row depths mirror the solo quantum: a round commits the
             // pending token plus up to `depth` drafted tokens, and the
             // anchor must be seeded by a scalar tail before the row drafts.
+            // Per-row (rather than a homogeneous minimum) keeps every row's
+            // round sequence identical to its solo quantum's.
             let depths: Vec<usize> = active
                 .iter()
                 .map(|&row| {
                     let state = &*states[row];
-                    let remaining = input_budget - committed[row];
-                    if state.mtp_anchor_hidden.is_some() {
-                        head.draft_depth().min(remaining.saturating_sub(1))
-                    } else {
+                    let remaining_budget = input_budget - committed[row];
+                    let remaining_output = state
+                        .max_new_tokens
+                        .saturating_sub(state.tokens_generated)
+                        .max(1);
+                    if state.mtp_anchor_hidden.is_none() {
                         0
+                    } else {
+                        state
+                            .adaptive_mtp
+                            .depth(remaining_output.min(remaining_budget))
+                            .min(remaining_budget)
+                            .min(remaining_output)
                     }
                 })
                 .collect();
             let max_depth = depths.iter().copied().max().unwrap_or(0);
             if max_depth == 0 {
                 // Every active row is on its scalar tail (budget down to one
-                // token or anchor not yet seeded): one committed token per
-                // row, each seeding its MTP pair.
+                // token, anchor not yet seeded, or a numerically disabled
+                // controller): one committed token per row, each seeding its
+                // MTP pair.
                 for &row in &active {
                     let delta = self.mtp_scalar_tail(states[row], head)?;
                     deltas[row].push_str(&delta);
@@ -1748,6 +1834,7 @@ impl Qwen35ChatExec {
                 continue;
             }
 
+            let round_started = std::time::Instant::now();
             self.mtp_envelope_rounds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Per-row MTP checkpoints: the draft's KV writes are provisional
@@ -1771,9 +1858,12 @@ impl Qwen35ChatExec {
 
             // Batched recurrent draft: one MTP-layer forward per draft step
             // across the rows still drafting at that depth, with greedy
-            // selection through the same argmax the solo draft uses.
+            // selection through the same argmax the solo draft uses. A
+            // non-finite draft logits row falls back to a scalar round and
+            // disables that row's speculation for the rest of its run.
             let mut draft_tokens = vec![Vec::new(); active.len()];
-            for step_index in 0..max_depth {
+            let mut draft_error_row: Option<usize> = None;
+            'draft: for step_index in 0..max_depth {
                 let drafting: Vec<usize> = (0..active.len())
                     .filter(|&position| depths[position] > step_index)
                     .collect();
@@ -1782,10 +1872,16 @@ impl Qwen35ChatExec {
                     let logits =
                         self.text_model
                             .project_with_shared_lm_head(&currents[position])?;
-                    tokens_step.push(crate::models::architectures::qwen35::mtp::greedy_argmax(
+                    match crate::models::architectures::qwen35::mtp::draft_argmax(
                         &logits,
                         self.tokenizer.vocab_size,
-                    )?);
+                    )? {
+                        Some(token) => tokens_step.push(token),
+                        None => {
+                            draft_error_row = Some(position);
+                            break 'draft;
+                        }
+                    }
                 }
                 for (fill, &position) in drafting.iter().enumerate() {
                     draft_tokens[position].push(tokens_step[fill]);
@@ -1872,6 +1968,23 @@ impl Qwen35ChatExec {
                     Error::InferenceError("Qwen3.5 speculative row lost its MTP cache".into())
                 })?;
                 mtp.restore_logical_checkpoint(mtp_checkpoints[position].clone())?;
+                if draft_error_row == Some(position) {
+                    state.adaptive_mtp.disable_after_nonfinite_draft();
+                }
+            }
+            if draft_error_row.is_some() {
+                // The envelope falls back to a scalar round together; the
+                // offending row's controller is disabled for the rest of its
+                // run and its depth() will keep reporting zero.
+                let mut subset = take_state_subset(states, &active);
+                let steps = self.decode_step_batch(&mut subset)?;
+                for (position, &row) in active.iter().enumerate() {
+                    deltas[row].push_str(&steps[position].delta);
+                    committed[row] += steps[position].input_tokens_committed;
+                    finished[row] = steps[position].finished;
+                }
+                active.retain(|&row| !finished[row] && committed[row] < input_budget);
+                continue;
             }
 
             // Verification and commit stay per row on each row's own caches.
@@ -1881,11 +1994,39 @@ impl Qwen35ChatExec {
                     let delta = self.mtp_scalar_tail(state, head)?;
                     deltas[row].push_str(&delta);
                     committed[row] += 1;
+                    // Scheduler-limited tails train the controller only when
+                    // the observation budget is the round's own remaining
+                    // slice, matching the solo quantum's timer gating.
+                    let remaining = (input_budget - committed[row]).min(
+                        state
+                            .max_new_tokens
+                            .saturating_sub(state.tokens_generated)
+                            .max(1),
+                    );
+                    if state.adaptive_mtp.can_train(remaining) {
+                        state
+                            .adaptive_mtp
+                            .observe(0, 1, round_started.elapsed(), remaining);
+                    }
                 } else {
                     let (tokens, delta) =
                         self.mtp_verify_and_commit(state, head, &draft_tokens[position])?;
                     committed[row] += tokens;
                     deltas[row].push_str(&delta);
+                    let remaining = (input_budget - committed[row]).min(
+                        state
+                            .max_new_tokens
+                            .saturating_sub(state.tokens_generated)
+                            .max(1),
+                    );
+                    if state.adaptive_mtp.can_train(remaining) {
+                        state.adaptive_mtp.observe(
+                            depths[position],
+                            tokens,
+                            round_started.elapsed(),
+                            remaining,
+                        );
+                    }
                 }
                 finished[row] = state.finished;
             }
@@ -1984,6 +2125,7 @@ impl Qwen35ChatModel {
                 mtp_head: None,
                 mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_adaptive: false,
                 kv_storage_dtype: DType::F32,
             },
             text_checkpoint,

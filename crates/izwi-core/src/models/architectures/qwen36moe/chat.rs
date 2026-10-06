@@ -236,6 +236,7 @@ impl Qwen36MoeChatModel {
             mtp_head: None,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_adaptive: false,
             kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
@@ -274,6 +275,7 @@ impl Qwen36MoeChatModel {
             mtp_head,
             mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_adaptive: performance.enabled() && performance.mtp_adaptive,
             kv_storage_dtype: kv_storage_provider.dtype(),
         })
     }
@@ -461,6 +463,7 @@ impl Qwen36MoeChatModel {
                     .exec
                     .mtp_envelope_rounds
                     .load(std::sync::atomic::Ordering::Relaxed),
+                "adaptive_depth": self.exec.mtp_adaptive,
                 "scope": "solo_quantum+continuous_envelope",
             },
         })
