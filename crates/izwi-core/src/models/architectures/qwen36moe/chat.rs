@@ -31,17 +31,93 @@ use super::gguf::{parse_fixture_gguf_config, QWEN36_MOE_FIXTURE_GGUF_FILENAME};
 use super::native::Qwen36MoeNativeCheckpoint;
 use super::native_model::load_text_model_native;
 
+const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN36_CUDA_BF16_KV";
+
+/// Persistent KV storage selection for one loaded model. CUDA picks BF16 by
+/// default (compute capability 8.0+) because BF16 activations narrowed into
+/// an F16 cache lose their exponent range above 65504 and can poison
+/// attention with infinities; the portable backends keep the F32 cache the
+/// fixture and CPU/Metal plans are validated against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen36MoeKvStorageProvider {
+    CpuF32,
+    MetalF32,
+    CudaF16Fallback,
+    CudaF16CapabilityFallback,
+    CudaBf16,
+}
+
+impl Qwen36MoeKvStorageProvider {
+    fn select(
+        backend: BackendKind,
+        cuda_compute_capability: Option<(u32, u32)>,
+        cuda_bf16_override: Option<&str>,
+    ) -> Self {
+        fn bf16_kv_enabled(raw: Option<&str>) -> bool {
+            matches!(
+                raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+                None | Some("1" | "true" | "yes" | "on")
+            )
+        }
+        fn cuda_supports_bf16(capability: Option<(u32, u32)>) -> bool {
+            capability.is_some_and(crate::backends::device::cuda_compute_capability_supports_bf16)
+        }
+        match backend {
+            BackendKind::Cpu => Self::CpuF32,
+            BackendKind::Metal => Self::MetalF32,
+            BackendKind::Cuda
+                if bf16_kv_enabled(cuda_bf16_override)
+                    && cuda_supports_bf16(cuda_compute_capability) =>
+            {
+                Self::CudaBf16
+            }
+            BackendKind::Cuda if bf16_kv_enabled(cuda_bf16_override) => {
+                Self::CudaF16CapabilityFallback
+            }
+            BackendKind::Cuda => Self::CudaF16Fallback,
+        }
+    }
+
+    const fn dtype(self) -> DType {
+        match self {
+            Self::CpuF32 | Self::MetalF32 => DType::F32,
+            Self::CudaF16Fallback | Self::CudaF16CapabilityFallback => DType::F16,
+            Self::CudaBf16 => DType::BF16,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CpuF32 => "portable_f32",
+            Self::MetalF32 => "metal_f32",
+            Self::CudaF16Fallback => "cuda_f16_fallback",
+            Self::CudaF16CapabilityFallback => "cuda_f16_capability_fallback",
+            Self::CudaBf16 => "cuda_bf16",
+        }
+    }
+
+    const fn fallback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::CudaF16Fallback => {
+                Some("CUDA BF16 KV disabled by IZWI_QWEN36_CUDA_BF16_KV; using F16")
+            }
+            Self::CudaF16CapabilityFallback => Some(
+                "CUDA BF16 KV requires an observed compute capability 8.0 or newer; using F16",
+            ),
+            _ => None,
+        }
+    }
+}
+
 pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
+    kv_storage_provider: Qwen36MoeKvStorageProvider,
     exec: Qwen35ChatExec,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
-        let dtype = match self.device_kind {
-            BackendKind::Cuda => DType::F16,
-            BackendKind::Cpu | BackendKind::Metal => DType::F32,
-        };
+        let dtype = self.kv_storage_provider.dtype();
         Ok(InferenceStateCapability::Managed(
             self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
         ))
@@ -59,13 +135,29 @@ impl Qwen36MoeChatModel {
             )));
         }
         let device_kind = BackendKind::from(device.kind);
+        let kv_storage_provider = Qwen36MoeKvStorageProvider::select(
+            device_kind,
+            device.capabilities.cuda_compute_capability,
+            std::env::var(CUDA_BF16_KV_ENV).ok().as_deref(),
+        );
+        tracing::info!(
+            provider = kv_storage_provider.as_str(),
+            "Qwen3.6-MoE KV storage selection"
+        );
+        if let Some(reason) = kv_storage_provider.fallback_reason() {
+            tracing::warn!(reason, "Qwen3.6-MoE KV storage fell back");
+        }
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
         let exec = if fixture_path.exists() {
             Self::load_fixture_gguf(model_dir, &fixture_path, variant, &device)?
         } else {
             Self::load_native(model_dir, variant, &device)?
         };
-        Ok(Self { device_kind, exec })
+        Ok(Self {
+            device_kind,
+            kv_storage_provider,
+            exec,
+        })
     }
 
     fn load_fixture_gguf(
@@ -889,6 +981,45 @@ mod tests {
             "row b batched continuations must match solo"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn kv_storage_provider_keeps_portable_f32_and_gates_cuda_bf16() {
+        let select = Qwen36MoeKvStorageProvider::select;
+        assert_eq!(select(BackendKind::Cpu, None, None), Qwen36MoeKvStorageProvider::CpuF32);
+        assert_eq!(select(BackendKind::Metal, None, None), Qwen36MoeKvStorageProvider::MetalF32);
+        // Default CUDA policy: BF16 on capability 8.0+, F16 below.
+        assert_eq!(
+            select(BackendKind::Cuda, Some((8, 0)), None),
+            Qwen36MoeKvStorageProvider::CudaBf16
+        );
+        assert_eq!(
+            select(BackendKind::Cuda, Some((9, 0)), Some("TRUE")),
+            Qwen36MoeKvStorageProvider::CudaBf16
+        );
+        assert_eq!(
+            select(BackendKind::Cuda, Some((7, 5)), None),
+            Qwen36MoeKvStorageProvider::CudaF16CapabilityFallback
+        );
+        assert_eq!(
+            select(BackendKind::Cuda, None, None),
+            Qwen36MoeKvStorageProvider::CudaF16CapabilityFallback
+        );
+        // The kill switch forces F16 even on capable hardware.
+        for raw in ["0", "false", "OFF", "no"] {
+            assert_eq!(
+                select(BackendKind::Cuda, Some((8, 0)), Some(raw)),
+                Qwen36MoeKvStorageProvider::CudaF16Fallback
+            );
+        }
+        // Dtypes: portable plans stay F32, CUDA plans are F16/BF16.
+        assert_eq!(Qwen36MoeKvStorageProvider::CpuF32.dtype(), DType::F32);
+        assert_eq!(Qwen36MoeKvStorageProvider::MetalF32.dtype(), DType::F32);
+        assert_eq!(
+            Qwen36MoeKvStorageProvider::CudaF16CapabilityFallback.dtype(),
+            DType::F16
+        );
+        assert_eq!(Qwen36MoeKvStorageProvider::CudaBf16.dtype(), DType::BF16);
     }
 
     #[test]
