@@ -363,6 +363,18 @@ impl Qwen36MoeChatModel {
         prepared: Option<&Qwen35PreparedPrompt>,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
+        self.start_decode_state_physical_with_mtp(messages, max_new_tokens, config, prepared, cache, None)
+    }
+
+    pub(crate) fn start_decode_state_physical_with_mtp(
+        &self,
+        messages: &[ChatMessage],
+        max_new_tokens: usize,
+        config: &ChatGenerationConfig,
+        prepared: Option<&Qwen35PreparedPrompt>,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
         let prepared = match prepared {
             Some(prepared) => prepared.clone(),
             None => self.prepare_prompt_for_execution(messages, config)?,
@@ -372,6 +384,7 @@ impl Qwen36MoeChatModel {
             max_new_tokens,
             config,
             cache,
+            mtp_cache,
         )?;
         self.exec.continue_resumable_prefill_physical(
             &mut state,
@@ -388,9 +401,11 @@ impl Qwen36MoeChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
-        self.exec
-            .begin_resumable_prefill_state_physical(prepared, max_new_tokens, config, cache)
+        self.exec.begin_resumable_prefill_state_physical(
+            prepared, max_new_tokens, config, cache, mtp_cache,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(

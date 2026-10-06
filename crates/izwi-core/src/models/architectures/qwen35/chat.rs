@@ -34,7 +34,6 @@ use crate::models::shared::sampling::{
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
-use super::cache::qwen35_composite_cache_contract;
 use super::text::{Qwen35MoeFfnGeometry, Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
@@ -197,6 +196,18 @@ impl ChatDecodeState {
         &mut self,
         cache: PhysicalPagedKvCache,
     ) -> Result<Qwen35SharedStepCheckpoint> {
+        self.begin_shared_step_quantum_with_mtp(cache, None)
+    }
+
+    /// Continuous-batch transaction checkpoint. The managed MTP cache, when
+    /// the family loaded a draft head, joins the same transaction: the
+    /// reservation must continue the session cursor and the rollback
+    /// restores both caches.
+    pub(crate) fn begin_shared_step_quantum_with_mtp(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<Qwen35SharedStepCheckpoint> {
         if self.physical_kv.arena().id() != cache.arena().id()
             || self.physical_kv.context_len() != cache.context_len()
         {
@@ -204,9 +215,25 @@ impl ChatDecodeState {
                 "Qwen3.5 shared-step KV reservation does not continue the session".into(),
             ));
         }
+        if let Some(mtp) = &mtp_cache {
+            // The MTP domain may live in its own arena; continuity is a
+            // cursor contract, not an arena identity contract.
+            let expected = self
+                .mtp_cache
+                .as_ref()
+                .map(|cache| cache.context_len())
+                .unwrap_or(0);
+            if mtp.context_len() != expected {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3.5 MTP reservation cursor {} does not continue the session cursor {expected}",
+                    mtp.context_len()
+                )));
+            }
+        }
         Ok(Qwen35SharedStepCheckpoint {
             text_state: self.text_state.clone(),
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
+            mtp_cache: std::mem::replace(&mut self.mtp_cache, mtp_cache),
             unconsumed_output: self.unconsumed_output.clone(),
             pending_token: self.pending_token,
             history_ids: self.history_ids.clone(),
@@ -222,6 +249,7 @@ impl ChatDecodeState {
     pub(crate) fn rollback_shared_step_quantum(&mut self, checkpoint: Qwen35SharedStepCheckpoint) {
         self.text_state = checkpoint.text_state;
         self.physical_kv = checkpoint.physical_kv;
+        self.mtp_cache = checkpoint.mtp_cache;
         self.unconsumed_output = checkpoint.unconsumed_output;
         self.pending_token = checkpoint.pending_token;
         self.history_ids = checkpoint.history_ids;
@@ -280,6 +308,7 @@ pub struct ChatDecodeStep {
 pub(crate) struct Qwen35SharedStepCheckpoint {
     text_state: Qwen35TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
+    mtp_cache: Option<PhysicalPagedKvCache>,
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
     history_ids: Vec<u32>,
@@ -644,7 +673,12 @@ impl Qwen35ChatExec {
         attention_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
-        qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
+        crate::models::architectures::qwen35::cache::qwen35_composite_cache_contract_with_mtp(
+            &self.text_config,
+            attention_dtype,
+            preferred_page_tokens,
+            self.mtp_head.is_some(),
+        )
     }
 
     pub(crate) fn chat_template(&self) -> &str {
@@ -741,6 +775,7 @@ impl Qwen35ChatExec {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
         if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -774,7 +809,7 @@ impl Qwen35ChatExec {
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
             grammar: self.grammar_runtime(config),
-            mtp_cache: None,
+            mtp_cache,
             mtp_anchor_hidden: None,
         })
     }
@@ -1737,6 +1772,7 @@ impl Qwen35ChatModel {
             max_new_tokens,
             config,
             cache,
+            None,
         )?;
         self.exec.continue_resumable_prefill_physical(
             &mut state,
@@ -1753,9 +1789,11 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
-        self.exec
-            .begin_resumable_prefill_state_physical(prepared, max_new_tokens, config, cache)
+        self.exec.begin_resumable_prefill_state_physical(
+            prepared, max_new_tokens, config, cache, mtp_cache,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(

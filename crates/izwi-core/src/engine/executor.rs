@@ -88,6 +88,10 @@ use state::{
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// The qwen3.5/3.6-MoE contract reuses the same domain numbering: full
+// attention at 1, the optional MTP draft layer at 4.
+const QWEN35_MOE_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const QWEN35_MOE_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
 // Cancellation signals are AtomicBools without a notification edge. Polling
 // at 40 Hz bounds cancelled FIFO residency without turning admission into a
 // hot loop.

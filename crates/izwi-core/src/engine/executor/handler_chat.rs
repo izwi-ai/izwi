@@ -966,16 +966,17 @@ impl NativeExecutor {
                     let tensor_reservation = views.tensor_state.clone();
                     let (cache, mtp_cache) = if request.model_variant.is_some_and(|variant| {
                         variant.family() == crate::catalog::ModelFamily::Qwen38Chat
+                            || variant.family() == crate::catalog::ModelFamily::Qwen35MoeChat
                     }) {
                         let target =
-                            views.take_paged_domain(super::QWEN38_TARGET_ATTENTION_DOMAIN, true)?;
-                        let mtp =
-                            views.take_paged_domain(super::QWEN38_MTP_ATTENTION_DOMAIN, false)?;
+                            views.take_paged_domain(super::QWEN35_MOE_TARGET_ATTENTION_DOMAIN, true)?;
+                        let mtp = views
+                            .take_paged_domain(super::QWEN35_MOE_MTP_ATTENTION_DOMAIN, false)?;
                         views.ensure_all_paged_consumed()?;
                         (
                             target.ok_or_else(|| {
                                 Error::InferenceError(
-                                    "continuous Qwen3.8 row lost its target cache".into(),
+                                    "continuous hybrid row lost its target cache".into(),
                                 )
                             })?,
                             mtp,

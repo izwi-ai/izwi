@@ -4495,16 +4495,9 @@ impl NativeChatDecodeState {
             Self::Qwen38(state) => state
                 .begin_shared_step_quantum(cache, mtp_cache)
                 .map(NativeChatDecodeCheckpoint::Qwen38),
-            Self::Qwen35(state) => {
-                if mtp_cache.is_some() {
-                    return Err(Error::InvalidInput(
-                        "Qwen3.8 MTP reservation was routed to a Qwen3.5 state".into(),
-                    ));
-                }
-                state
-                    .begin_shared_step_quantum(cache)
-                    .map(NativeChatDecodeCheckpoint::Qwen35)
-            }
+            Self::Qwen35(state) => state
+                .begin_shared_step_quantum_with_mtp(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Qwen35),
             Self::Lfm2(state) => {
                 if mtp_cache.is_some() {
                     return Err(Error::InvalidInput(
@@ -5056,10 +5049,11 @@ impl NativeChatModel {
                         max_new_tokens,
                         config,
                         target_cache,
+                        None,
                     )?,
                 ))
             }
-            Self::Qwen35Moe(model) if mtp_cache.is_none() => {
+            Self::Qwen35Moe(model) => {
                 let prepared = prepared
                     .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
                     .ok_or_else(|| {
@@ -5079,6 +5073,7 @@ impl NativeChatModel {
                         max_new_tokens,
                         config,
                         target_cache,
+                        mtp_cache,
                     )?,
                 ))
             }
