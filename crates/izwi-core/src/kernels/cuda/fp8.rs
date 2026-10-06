@@ -417,3 +417,74 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+    use crate::kernels::cuda::graphs::{IslandOutput, TensorIsland};
+    use candle_core::{DType, Tensor};
+
+    /// Phase 5 capture-compatibility spike: the block-FP8 projection custom
+    /// op must be capturable inside a CUDA graph island before any qwen36moe
+    /// trunk island is ported. The kernel launches through the standard
+    /// stream path with its output as the only allocation (no host reads,
+    /// no growable scratch — the reason Q8/QMatMul stay excluded), and the
+    /// identical kernel is already captured by qwen38's production MLP
+    /// islands; this test makes that verdict executable at hardware handoff.
+    /// A capture failure shows up as negative fallbacks with zero captures.
+    #[test]
+    fn compact_fp8_projection_is_capture_compatible() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let (n, k) = (64usize, 128usize);
+        if !provider_supported(&device, DType::BF16, n, k) {
+            return;
+        }
+        let weights = Tensor::full(0x38u8, (n, k), &device)
+            .unwrap()
+            .to_dtype(DType::U8)
+            .unwrap();
+        let scales = Tensor::ones((n.div_ceil(128), k.div_ceil(128)), DType::F32, &device).unwrap();
+        let island = TensorIsland::default();
+        for step in 0..3 {
+            let x = Tensor::full(step as f32 + 1.0, (2, k), &device)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let eager = block_fp8_projection(&x, &weights, &scales).unwrap();
+            let w = weights.clone();
+            let s = scales.clone();
+            let captured = island
+                .run_multi(
+                    &[&x],
+                    &[weights.clone(), scales.clone()],
+                    9,
+                    "qwen36moe.compact-fp8-spike",
+                    1 << 18,
+                    1 << 15,
+                    move |inputs| {
+                        let out = block_fp8_projection(&inputs[0], &w, &s)?;
+                        Ok(IslandOutput {
+                            outputs: vec![out],
+                            intermediates: vec![],
+                        })
+                    },
+                )
+                .unwrap()
+                .expect("captured region must execute on CUDA");
+            let expected = eager.to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap();
+            let actual = captured[0].to_dtype(DType::F32).unwrap().to_vec2::<f32>().unwrap();
+            for (row_a, row_e) in actual.iter().zip(expected.iter()) {
+                for (a, e) in row_a.iter().zip(row_e.iter()) {
+                    assert!((a - e).abs() <= 1e-2 + e.abs() * 1e-2, "{a} != {e}");
+                }
+            }
+        }
+        let d = island.diagnostics();
+        assert_eq!(d["captures"], 1, "the region must capture, not fall back");
+        assert_eq!(d["replays"], 2, "later steps must replay");
+        assert_eq!(d["negative_fallbacks"], 0);
+        island.invalidate();
+    }
+}
