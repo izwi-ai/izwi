@@ -386,8 +386,12 @@ impl Qwen36MoeNativeConfig {
         Self::from_json_with_policy(&raw, policy)
     }
 
+    /// Pinned-policy parse. Test-only callers validate pinned-geometry
+    /// rejection; production loads go through `load_with_policy`, and
+    /// deriving the policy from the process environment here would make
+    /// pinned-geometry tests racy against env-mutating tests.
     pub fn from_json(raw: &[u8]) -> Result<Self> {
-        Self::from_json_with_policy(raw, Qwen36MoeGeometryPolicy::from_env())
+        Self::from_json_with_policy(raw, Qwen36MoeGeometryPolicy::Pinned35B)
     }
 
     pub fn from_json_with_policy(raw: &[u8], policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
@@ -2875,6 +2879,12 @@ mod tests {
     struct TestDir(std::path::PathBuf);
 
     impl TestDir {
+        fn path(&self) -> &std::path::Path {
+            self.0.as_path()
+        }
+    }
+
+    impl TestDir {
         fn new(label: &str) -> Self {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3403,6 +3413,223 @@ mod tests {
         .unwrap();
         assert_eq!(y.dims(), &[1, 8]);
         assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
+    }
+
+    /// Minimal HF tokenizer pair for the native fixture: every byte of the
+    /// rendered ChatML prompt (letters, newline, specials) resolves to a
+    /// token, and the model vocab (32) equals the tokenizer vocab so greedy
+    /// argmax stays in range.
+    fn write_fixture_tokenizer(dir: &std::path::Path) {
+        let mut vocab = serde_json::Map::new();
+        for (index, token) in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+            "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "\u{010A}", "0", "<|im_start|>",
+            "<|im_end|>", "<|image_pad|>", "<|video_pad|>",
+        ]
+        .into_iter()
+            .enumerate()
+        {
+            vocab.insert(token.to_string(), serde_json::json!(index as u32));
+        }
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 28, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 29, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 30, "content": "<|image_pad|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 31, "content": "<|video_pad|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false,
+                              "trim_offsets": false, "use_regex": false},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true,
+                        "trim_offsets": true, "use_regex": true},
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                "fuse_unk": false, "byte_fallback": false,
+                "vocab": vocab,
+                "merges": []
+            }
+        });
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        let tokenizer_config = serde_json::json!({
+            "eos_token": "<|im_end|>",
+            "chat_template": "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
+        });
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_string(&tokenizer_config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Per-row physical cache for the native fixture: one full-attention
+    /// layer (model_layer 3, the interval-4 layout) over its own arena.
+    fn native_physical_cache(
+        model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+    ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use std::sync::Arc;
+        let kv_heads = model.text_config().attention_head_count_kv;
+        let head_dim = model.text_config().attention_key_length;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4248),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 16,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 3,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..16)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index: index as u32,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mtp_quantum_matches_scalar_greedy_decode_token_for_token() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        // The chat-level loader derives its geometry policy from the process
+        // environment; the tiny native fixture needs the synthetic hatch.
+        // The env lock keeps this exclusive of tests that clear the
+        // process environment, and the variable is removed on the way out.
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+
+        let write_native_fixture = |tag: &str| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            (config, dir)
+        };
+        let greedy_config = || ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str, mtp: bool| {
+            let (config, dir) = write_native_fixture(tag);
+            let device = DeviceProfile::cpu();
+            // PerformanceConfig keeps private resolution state, so the knobs
+            // are assigned after the default rather than via struct update.
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            assert_eq!(model.preferred_decode_tokens(), if mtp { 3 } else { 1 });
+            (config, dir, model)
+        };
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "abcd".to_string(),
+        }];
+        let config = greedy_config();
+
+        // Scalar reference: MTP off, plain decode steps.
+        let (_config, dir_off, scalar_model) = load("mtp-parity-off", false);
+        let cache = native_physical_cache(&scalar_model);
+        let mut scalar_state = scalar_model
+            .start_decode_state_physical(&messages, 24, &config, None, cache)
+            .unwrap();
+        let mut scalar_deltas = Vec::new();
+        for _ in 0..3 {
+            let step = scalar_model
+                .decode_quantum(&mut scalar_state, 4)
+                .unwrap();
+            scalar_deltas.push(step.delta);
+            assert!(!step.finished);
+        }
+        drop(scalar_state);
+        std::fs::remove_dir_all(dir_off.path()).ok();
+
+        // MTP: same prompt, speculative rounds — must be token-identical.
+        let (_config, dir_on, mtp_model) = load("mtp-parity-on", true);
+        let cache = native_physical_cache(&mtp_model);
+        let mut mtp_state = mtp_model
+            .start_decode_state_physical(&messages, 24, &config, None, cache)
+            .unwrap();
+        let mut mtp_deltas = Vec::new();
+        for _ in 0..3 {
+            let step = mtp_model.decode_quantum(&mut mtp_state, 4).unwrap();
+            mtp_deltas.push(step.delta);
+            assert!(!step.finished);
+        }
+        drop(mtp_state);
+        std::fs::remove_dir_all(dir_on.path()).ok();
+
+        assert_eq!(
+            mtp_deltas, scalar_deltas,
+            "speculative decode must match scalar greedy decode exactly"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
     }
 
     #[test]

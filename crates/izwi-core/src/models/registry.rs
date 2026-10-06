@@ -3738,11 +3738,12 @@ impl NativeChatModel {
                 model.sustained_cuda_mtp_quantum(),
                 model.mtp_in_continuous_enabled(),
             ),
-            Self::Qwen3(_)
-            | Self::Qwen35(_)
-            | Self::Qwen35Moe(_)
-            | Self::Gemma3(_)
-            | Self::Lfm2(_) => (1, false, false),
+            // Solo speculative quanta only: the batched MTP envelope is the
+            // next porting phase, so sustained/speculative-batch stay off.
+            Self::Qwen35Moe(model) => (model.preferred_decode_tokens(), false, false),
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {
+                (1, false, false)
+            }
         }
     }
 }
@@ -5397,6 +5398,18 @@ impl NativeChatModel {
         input_budget: usize,
     ) -> Result<NativeChatDecodeStep> {
         if let (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) = (self, &mut *state) {
+            let step = model.decode_quantum(state, input_budget.max(1))?;
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
+            return Ok(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+                logprobs,
+            });
+        }
+        if let (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) = (self, &mut *state) {
             let step = model.decode_quantum(state, input_budget.max(1))?;
             let logprobs = std::mem::take(&mut state.pending_logprobs);
             return Ok(NativeChatDecodeStep {

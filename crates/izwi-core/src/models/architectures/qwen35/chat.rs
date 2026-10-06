@@ -14,10 +14,16 @@ use tracing::{debug, info};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
 };
+use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::backends::kv::CandleAcceleratorKvArena;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
-use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
+use crate::kv::{
+    CacheBlockRef, InferenceStateCapability, InferenceStateContractProvider, KvArenaId, KvGroupId,
+    KvLayerBinding,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -143,6 +149,11 @@ pub struct ChatDecodeState {
     /// DS9.2: per-request constrained-decoding runtime, present only when
     /// the request asked for `response_format: json_object`.
     grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
+    /// MTP draft cache (one paged attention layer at model_layer =
+    /// block_count) and the latest draft anchor — present only while a
+    /// session decodes through the MTP quantum path.
+    mtp_cache: Option<PhysicalPagedKvCache>,
+    mtp_anchor_hidden: Option<Tensor>,
 }
 
 impl ChatDecodeState {
@@ -752,6 +763,8 @@ impl Qwen35ChatExec {
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
             grammar: self.grammar_runtime(config),
+            mtp_cache: None,
+            mtp_anchor_hidden: None,
         })
     }
 
@@ -1127,6 +1140,384 @@ impl Qwen35ChatExec {
             || token_id == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
+    }
+}
+
+impl Qwen35ChatExec {
+    /// Whether the MTP quantum path may drive this decode step: a loaded
+    /// draft head plus a greedy, unconstrained request — the only mode whose
+    /// acceptance rule (target argmax must equal the draft) is exact.
+    fn mtp_active(&self, state: &ChatDecodeState) -> bool {
+        let config = &state.config;
+        self.mtp_head.is_some()
+            && state.mtp_cache.is_some()
+            && state.mtp_anchor_hidden.is_some()
+            && state.grammar.is_none()
+            && !config.logprobs
+            && config.temperature <= 1e-5
+            && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+            && config.presence_penalty.abs() <= f32::EPSILON
+            && config.top_k == 0
+            && config.top_p >= 1.0
+    }
+
+    /// Greedy argmax over one logits row, clamped to the tokenizer vocab.
+    fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        let flat = logits.flatten_all()?;
+        let cols = flat.dim(0)?;
+        let clamped = if self.tokenizer.vocab_size < cols {
+            flat.narrow(0, 0, self.tokenizer.vocab_size)?
+        } else {
+            flat
+        };
+        let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let (best_index, best_value) = values
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            });
+        if !best_value.is_finite() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 MTP verify produced non-finite logits".into(),
+            ));
+        }
+        Ok(best_index as u32)
+    }
+
+    /// Ensure the per-session MTP cache exists. V1 allocates a standalone
+    /// one-layer arena sized for the model's full context; the managed MTP
+    /// KV domain (the qwen3.8 contract shape) replaces this when the
+    /// continuous-batch envelope lands.
+    fn ensure_mtp_cache(&self, state: &mut ChatDecodeState) -> Result<()> {
+        if state.mtp_cache.is_some() {
+            return Ok(());
+        }
+        let device = self.text_model.device().clone();
+        let cfg = &self.text_config;
+        let model_layer = u32::try_from(cfg.block_count)
+            .map_err(|_| Error::InvalidInput("Qwen3.5 MTP layer id exceeds u32".into()))?;
+        let backend = if device.is_cuda() {
+            BackendKind::Cuda
+        } else if device.is_metal() {
+            BackendKind::Metal
+        } else {
+            BackendKind::Cpu
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let id = KvArenaId {
+            model_instance: crate::engine::ModelInstanceId::new(nanos),
+            backend,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let page_tokens = 64usize;
+        let config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: page_tokens as u32,
+            capacity_pages: (cfg.context_length.max(1) as u32).div_ceil(page_tokens as u32),
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding: KvLayerBinding {
+                    model_layer,
+                    physical_layer: 0,
+                },
+                num_kv_heads: cfg.attention_head_count_kv as u32,
+                key_head_dim: cfg.attention_key_length as u32,
+                value_head_dim: cfg.attention_value_length as u32,
+            }],
+        };
+        let binding = KvLayerBinding {
+            model_layer,
+            physical_layer: 0,
+        };
+        let blocks = (0..config.capacity_pages)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let arena: std::sync::Arc<dyn KvArena> = if backend != BackendKind::Cpu {
+            std::sync::Arc::new(CandleAcceleratorKvArena::new_mutation_only(config, device)?)
+        } else {
+            std::sync::Arc::new(CpuKvArena::new(config)?)
+        };
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let arena: std::sync::Arc<dyn KvArena> = std::sync::Arc::new(CpuKvArena::new(config)?);
+        state.mtp_cache = Some(PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0)?);
+        Ok(())
+    }
+
+    /// One decode quantum (up to `input_budget` committed tokens). With an
+    /// MTP head and a qualifying request this runs speculative rounds —
+    /// draft `depth` tokens through the head, verify them with the target,
+    /// commit the accepted prefix; the fallback loops the scalar step.
+    pub(crate) fn decode_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let Some(head) = self.mtp_head.as_ref() else {
+            return self.decode_quantum_scalar(state, input_budget);
+        };
+        self.ensure_mtp_cache(state)?;
+        if !self.mtp_active(state) {
+            return self.decode_quantum_scalar(state, input_budget);
+        }
+        if state.finished || state.tokens_generated >= state.max_new_tokens {
+            state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
+            return Ok(ChatDecodeStep {
+                delta,
+                text: state.assembled.clone(),
+                tokens_generated: state.tokens_generated,
+                input_tokens_committed: 0,
+                finished: true,
+            });
+        }
+
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        let budget = input_budget.max(1);
+        while committed < budget && !state.finished {
+            let remaining = budget - committed;
+            // A round commits the pending token plus up to `depth` drafted
+            // tokens; keep the round inside the granted budget.
+            let depth = head.draft_depth().min(remaining.saturating_sub(1));
+            if depth == 0 {
+                delta.push_str(&self.mtp_scalar_tail(state, head)?);
+                committed += 1;
+            } else {
+                committed += self.mtp_speculative_round(state, head, depth)?;
+            }
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.assembled.clone(),
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed: committed,
+            finished: state.finished,
+        })
+    }
+
+    fn decode_quantum_scalar(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        for _ in 0..input_budget.max(1) {
+            let step = self.decode_step(state)?;
+            delta.push_str(&step.delta);
+            committed += step.input_tokens_committed;
+            if step.finished {
+                break;
+            }
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.assembled.clone(),
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed: committed,
+            finished: state.finished,
+        })
+    }
+
+    /// Scalar tail: forward the pending token, sample, and write the MTP
+    /// pair `(embed(next), h(pos))` at position pos.
+    fn mtp_scalar_tail(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+    ) -> Result<String> {
+        let pending = state.pending_token.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP scalar tail has no pending token".into())
+        })?;
+        let position = state.next_text_position;
+        let hidden = self.text_model.forward_token_id_hidden_at_physical(
+            pending,
+            [position; 3],
+            &mut state.text_state,
+            &mut state.physical_kv,
+        )?;
+        let normalized_hidden = self.text_model.normalize_hidden(&hidden)?;
+        let logits = self.text_model.project_hidden_span(&hidden)?;
+        let history = if state.track_history {
+            state.history_ids.as_slice()
+        } else {
+            &[]
+        };
+        state.pending_logprobs.clear();
+        let next = sample_next_token(
+            &logits,
+            self.tokenizer.vocab_size,
+            &state.config,
+            history,
+            &mut state.rng,
+        )?;
+        if state.track_history {
+            state.history_ids.push(next);
+        }
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let embedding = self.text_model.embed_token_ids(&[next])?;
+        let anchor = head.forward_step(&embedding, &normalized_hidden, [position; 3], mtp_cache)?;
+        state.mtp_anchor_hidden = Some(anchor);
+        state.pending_token = Some(next);
+        state.next_text_position += 1;
+        let mut delta = String::new();
+        delta.push_str(&self.publish_token(state, next)?);
+        Ok(delta)
+    }
+
+    /// Speculative round: draft `depth` tokens, verify with the target, and
+    /// commit the accepted prefix. Returns the number of committed tokens.
+    fn mtp_speculative_round(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+        depth: usize,
+    ) -> Result<usize> {
+        let pending = state.pending_token.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP round has no pending token".into())
+        })?;
+        let position = state.next_text_position;
+        let anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP round has no anchor".into())
+        })?;
+
+        // Draft provisionally; the draft's MTP rows are discarded before
+        // verification rewrites the canonical pairs.
+        let continuation_positions: Vec<[usize; 3]> =
+            (0..depth - 1).map(|offset| [position + offset; 3]).collect();
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let checkpoint = mtp_cache.logical_checkpoint();
+        let drafted = match head.draft_greedy(
+            &self.text_model,
+            &anchor,
+            depth,
+            &continuation_positions,
+            self.tokenizer.vocab_size,
+            mtp_cache,
+        ) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                mtp_cache.restore_logical_checkpoint(checkpoint)?;
+                return Err(error);
+            }
+        };
+        mtp_cache.restore_logical_checkpoint(checkpoint)?;
+
+        // Sequential target verification: one forward per candidate token,
+        // snapshotting linear state after each so any accepted prefix can be
+        // installed without re-running weights.
+        let target_inputs = std::iter::once(pending)
+            .chain(drafted.iter().copied())
+            .collect::<Vec<_>>();
+        let mut verify_hiddens = Vec::with_capacity(target_inputs.len());
+        let mut verify_logits = Vec::with_capacity(target_inputs.len());
+        let mut snapshots = Vec::with_capacity(target_inputs.len() + 1);
+        snapshots.push(state.text_state.snapshot_linear_states()?);
+        for (offset, &token) in target_inputs.iter().enumerate() {
+            let hidden = self.text_model.forward_token_id_hidden_at_physical(
+                token,
+                [position + offset; 3],
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )?;
+            let normalized = self.text_model.normalize_hidden(&hidden)?;
+            let logits = self.text_model.project_hidden_span(&hidden)?;
+            verify_hiddens.push(normalized);
+            verify_logits.push(logits);
+            snapshots.push(state.text_state.snapshot_linear_states()?);
+        }
+
+        // Greedy acceptance: emitted[i] is the target's prediction for
+        // position+i+1 — it matches drafted[i] while the draft is accepted,
+        // and the final row contributes the bonus token. The first emitted
+        // token lands at position+1: the pending token itself is never
+        // re-emitted.
+        let mut emitted = Vec::with_capacity(depth + 1);
+        for row in 0..=depth {
+            let token = self.greedy_token(&verify_logits[row])?;
+            emitted.push(token);
+            if row == depth || token != drafted[row] {
+                break;
+            }
+        }
+        let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
+        let mut kept: Vec<u32> = Vec::with_capacity(emitted.len());
+        for &token in &emitted {
+            if kept.len() >= remaining_outputs {
+                break;
+            }
+            kept.push(token);
+            if self.is_stop_token(token, &state.config) {
+                break;
+            }
+        }
+        let count = kept.len();
+        if count == 0 {
+            state.finished = true;
+            return Ok(0);
+        }
+
+        // Commit only the accepted prefix: install the linear states from
+        // the matching snapshot and drop the rejected KV rows. Full
+        // attention keeps its already-written rows; they sit beyond the
+        // truncated cursor and are rewritten by later steps.
+        state.text_state.restore_linear_states(&snapshots[count])?;
+        state.physical_kv.truncate_verified_prefix(position + count)?;
+
+        // Rebuild the draft state over the canonical commit: pair i = (embed
+        // of kept[i] — the token at position+i+1 — , the target hidden at
+        // position+i).
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let mut anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP anchor lost".into())
+        })?;
+        for (row, &token) in kept.iter().enumerate() {
+            let embedding = self.text_model.embed_token_ids(&[token])?;
+            anchor = head.forward_step(
+                &embedding,
+                &verify_hiddens[row],
+                [position + row; 3],
+                mtp_cache,
+            )?;
+        }
+        state.mtp_anchor_hidden = Some(anchor);
+        state.pending_token = kept.last().copied();
+        state.next_text_position += count;
+        if state.track_history {
+            state.history_ids.extend_from_slice(&kept);
+        }
+        let mut delta = String::new();
+        for &token in &kept {
+            delta.push_str(&self.publish_token(state, token)?);
+            if state.finished {
+                break;
+            }
+        }
+        Ok(count)
     }
 }
 

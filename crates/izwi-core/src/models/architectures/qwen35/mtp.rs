@@ -30,6 +30,7 @@ pub(crate) fn mtp_model_layer(cfg: &Qwen35TextConfig) -> u32 {
 
 pub(crate) struct Qwen35MtpHead {
     hidden_size: usize,
+    draft_depth: usize,
     pre_fc_norm_embedding: Qwen35RmsNorm,
     pre_fc_norm_hidden: Qwen35RmsNorm,
     fc: Qwen35Projection,
@@ -45,11 +46,13 @@ impl Qwen35MtpHead {
         source: &dyn Qwen35WeightSource,
         cfg: &Qwen35TextConfig,
         device: &Device,
+        draft_depth: usize,
     ) -> Result<Self> {
         let hidden = cfg.embedding_length;
         let eps = cfg.attention_layer_norm_rms_epsilon;
         Ok(Self {
             hidden_size: hidden,
+            draft_depth: draft_depth.clamp(1, 3),
             pre_fc_norm_embedding: source.rms_norm(
                 "mtpblk.0.mtp_pre_fc_norm_embedding.weight",
                 eps,
@@ -71,6 +74,11 @@ impl Qwen35MtpHead {
             mlp: Qwen35Mlp::load_via(source, device, "mtpblk.0")?,
             norm: source.rms_norm("mtpblk.0.mtp_norm.weight", eps, device)?,
         })
+    }
+
+    /// Configured greedy draft depth (tokens per speculative round).
+    pub(crate) fn draft_depth(&self) -> usize {
+        self.draft_depth
     }
 
     /// Execute one (candidate embedding, predecessor hidden) pair at
@@ -110,7 +118,9 @@ impl Qwen35MtpHead {
             let normalized = self.post_attention_norm.forward(&hidden)?;
             let mlp = self.mlp.forward(&normalized)?;
             let hidden = (&residual + &mlp)?;
-            self.norm.forward(&hidden).map_err(Error::from)
+            self.norm
+                .forward(&hidden)
+                .map_err(crate::error::Error::from)
         })();
         match result {
             Ok(hidden) => {
@@ -153,11 +163,10 @@ impl Qwen35MtpHead {
         }
         let mut current = seed_hidden.clone();
         let mut token_ids = Vec::with_capacity(depth);
-        for (_step, position_id) in continuation_positions
+        for position_id in continuation_positions
             .iter()
             .map(|position| Some(*position))
             .chain(std::iter::once(None))
-            .enumerate()
         {
             let logits = text.project_with_shared_lm_head(&current)?;
             let token = greedy_argmax(&logits, vocab_size)?;

@@ -395,6 +395,28 @@ impl Qwen36MoeChatModel {
         self.exec.decode_step(state)
     }
 
+    /// Tokens per decode quantum the scheduler should grant: one more than
+    /// the configured MTP draft depth when the draft head is loaded, so a
+    /// speculative round fits the grant; scalar (1) without MTP.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        self.exec
+            .mtp_head
+            .as_ref()
+            .map(|head| head.draft_depth() + 1)
+            .unwrap_or(1)
+    }
+
+    /// One decode quantum. With the MTP head loaded and a qualifying greedy
+    /// request this runs speculative draft/verify rounds; otherwise it loops
+    /// the scalar decode step exactly as before.
+    pub fn decode_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        self.exec.decode_quantum(state, input_budget)
+    }
+
     pub fn decode_step_batch(
         &self,
         states: &mut [&mut ChatDecodeState],
@@ -404,7 +426,7 @@ impl Qwen36MoeChatModel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::backends::kv::{KvArenaConfig, KvLayerConfig};
     use crate::engine::ModelInstanceId;
@@ -719,7 +741,7 @@ mod tests {
         (model, dir)
     }
 
-    fn physical_cache(model: &Qwen36MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
+    pub(crate) fn physical_cache(model: &Qwen36MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};

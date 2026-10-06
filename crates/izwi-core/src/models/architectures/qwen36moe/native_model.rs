@@ -476,7 +476,12 @@ pub(crate) fn load_text_model_native(
                     "Qwen3.5/3.6-MoE MTP enabled but the draft manifest was not validated".into(),
                 )
             })?;
-        Some(Qwen35MtpHead::load_via(&source, &text_config, device)?)
+        Some(Qwen35MtpHead::load_via(
+            &source,
+            &text_config,
+            device,
+            performance.mtp_draft_tokens,
+        )?)
     } else {
         None
     };

@@ -591,6 +591,11 @@ impl Qwen35TextModel {
         })
     }
 
+    /// The device the trunk (and any MTP head) executes on.
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn new_state(&self) -> Qwen35TextRuntimeState {
         Qwen35TextRuntimeState {
             layers: self.layers.iter().map(Qwen35Layer::new_state).collect(),
@@ -622,10 +627,30 @@ impl Qwen35TextModel {
         state: &mut Qwen35TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let hidden =
+            self.forward_token_id_hidden_at_physical(token_id, position_ids, state, cache)?;
+        self.forward_hidden_to_logits(&hidden)
+    }
+
+    /// Forward one token and return its PRE-norm hidden — the MTP
+    /// verification pass derives both the logits (`project_hidden_span`)
+    /// and the post-`output_norm` hidden (`normalize_hidden`) from it.
+    pub(crate) fn forward_token_id_hidden_at_physical(
+        &self,
+        token_id: u32,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
         let hidden = self.token_embeddings.forward(&input)?;
-        let hidden = self.forward_hidden_physical(&hidden, &[position_ids], state, cache)?;
-        self.forward_hidden_to_logits(&hidden)
+        self.forward_hidden_physical(&hidden, &[position_ids], state, cache)
+    }
+
+    /// Apply the trunk's `output_norm` — the MTP pair consumes the
+    /// post-norm hidden while logits flow through the LM head directly.
+    pub(crate) fn normalize_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.output_norm.forward(hidden).map_err(Error::from)
     }
 
     pub(crate) fn forward_token_ids_batch_at_physical(
@@ -910,10 +935,10 @@ impl Qwen35TextModel {
     /// `output_norm`. The MTP draft head shares the target's LM head exactly
     /// this way: its outputs are already normalized by `mtp.norm`.
     pub(crate) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.output.forward(hidden).map_err(Error::from)
+        self.output.forward(hidden)
     }
 
-    fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
+    pub(crate) fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
         validate_qwen35_finite_tensor(
             &hidden,
@@ -938,6 +963,90 @@ impl Qwen35TextModel {
                 state.layers.len(),
                 self.layers.len()
             )));
+        }
+        Ok(())
+    }
+}
+
+/// One linear layer's deep-copied runtime state — the restore unit for
+/// MTP verification rollback. Tensors are small (conv history slots plus
+/// one recurrent matrix) and cloned with independent storage.
+#[derive(Clone)]
+pub(crate) struct Qwen35LinearStateSnapshot {
+    conv_slots: Vec<Tensor>,
+    recurrent: Option<Tensor>,
+}
+
+impl Qwen35TextRuntimeState {
+    /// Deep-copy every linear layer's runtime state. Used by the MTP verify
+    /// pass: one snapshot per verify position bounds the rollback unit.
+    pub(crate) fn snapshot_linear_states(&self) -> Result<Vec<Qwen35LinearStateSnapshot>> {
+        self.layers
+            .iter()
+            .map(|layer| match layer {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => {
+                    let conv_slots = match conv_state {
+                        Some(ring) => ring
+                            .slots
+                            .iter()
+                            .map(deep_copy_tensor_storage)
+                            .collect::<candle_core::Result<Vec<_>>>()?,
+                        None => Vec::new(),
+                    };
+                    let recurrent = match recurrent_state {
+                        Some(tensor) => Some(deep_copy_tensor_storage(tensor)?),
+                        None => None,
+                    };
+                    Ok(Qwen35LinearStateSnapshot {
+                        conv_slots,
+                        recurrent,
+                    })
+                }
+                Qwen35LayerRuntimeState::Full => Ok(Qwen35LinearStateSnapshot {
+                    conv_slots: Vec::new(),
+                    recurrent: None,
+                }),
+            })
+            .collect()
+    }
+
+    /// Restore linear states from a snapshot, replacing current tensors with
+    /// freshly detached copies so the snapshot stays reusable.
+    pub(crate) fn restore_linear_states(
+        &mut self,
+        snapshot: &[Qwen35LinearStateSnapshot],
+    ) -> Result<()> {
+        if snapshot.len() != self.layers.len() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 linear state snapshot covers {} layers, state has {}",
+                snapshot.len(),
+                self.layers.len()
+            )));
+        }
+        for (layer, snap) in self.layers.iter_mut().zip(snapshot) {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            else {
+                continue;
+            };
+            if let Some(ring) = conv_state.as_mut() {
+                if ring.slots.len() == snap.conv_slots.len() {
+                    ring.slots = snap
+                        .conv_slots
+                        .iter()
+                        .map(deep_copy_tensor_storage)
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                    ring.next_idx = 0;
+                }
+            }
+            if let Some(snapshot_tensor) = &snap.recurrent {
+                *recurrent_state = Some(deep_copy_tensor_storage(snapshot_tensor)?);
+            }
         }
         Ok(())
     }
