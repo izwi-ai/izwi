@@ -260,6 +260,17 @@ impl ConvRingState {
                 self.next_idx
             )));
         }
+        // The ring holds the conv state arena's F32 dtype for the whole
+        // session; an incoming projection in another dtype would poison the
+        // ring with mixed-dtype slots that later `cat`/multiply fail on.
+        let slot_dtype = self.slots[self.next_idx].dtype();
+        if current.dtype() != slot_dtype {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 convolution ring dtype drift: ring {:?}, incoming {:?}",
+                slot_dtype,
+                current.dtype()
+            )));
+        }
         self.slots[self.next_idx] = current.clone();
         self.next_idx = (self.next_idx + 1) % self.slots.len();
         Ok(())
@@ -1603,9 +1614,13 @@ impl Qwen35LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            // The recurrent arena is F32 by contract (see
+            // `ensure_state_initialized`); a lazily-created state must agree
+            // with the pre-initialized dtype rather than inherit the
+            // activation dtype.
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
+                DType::F32,
                 value.device(),
             )?
         };
@@ -1693,9 +1708,10 @@ impl Qwen35LinearAttention {
             let current_state = if let Some(state) = recurrent_state.take() {
                 state
             } else {
+                // F32 by contract — see `ensure_state_initialized`.
                 Tensor::zeros(
                     (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                    value.dtype(),
+                    DType::F32,
                     value.device(),
                 )?
             };
@@ -1782,9 +1798,10 @@ impl Qwen35LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            // F32 by contract — see `ensure_state_initialized`.
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
+                DType::F32,
                 value.device(),
             )?
         };
