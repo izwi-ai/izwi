@@ -1801,6 +1801,250 @@ mod tests {
         assert_eq!(unconstrained.dtype(), candle_core::DType::BF16);
     }
 
+    /// Run the shared trunk's prefill + decode under a backend dtype plan and
+    /// assert the trunk's activation dtype survives the head with finite
+    /// logits. Used by the hardware-gated plan tests: the CPU device cannot
+    /// execute non-F32 plans faithfully (no BF16 gemm, unreliable F16 gemm),
+    /// so a mixed-dtype graph must be validated on the backend that runs it.
+    fn forward_under_dtype_plan(
+        label: &str,
+        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        mut cache: crate::models::shared::attention::physical::PhysicalPagedKvCache,
+        activation_dtype: candle_core::DType,
+    ) {
+        let mut state = model.new_state();
+        let logits = model
+            .prefill_token_ids_physical(
+                &[1, 2, 3],
+                &[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap()
+            .expect("prefill logits");
+        assert_eq!(
+            logits.dtype(),
+            activation_dtype,
+            "{label}: trunk activation dtype must survive the head"
+        );
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{label}: prefill logits must be finite"
+        );
+
+        let logits = model
+            .forward_token_id_at_physical(4, [3, 3, 3], &mut state, &mut cache)
+            .unwrap();
+        assert_eq!(logits.dtype(), activation_dtype, "{label}: decode dtype");
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{label}: decode logits must be finite"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_trunk_forwards_under_the_metal_dtype_plan_on_metal() {
+        use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::{DType, DeviceLocation};
+        use std::sync::Arc;
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; metal plan leg not run");
+            return;
+        };
+        let device_profile = DeviceProfile {
+            device: device.clone(),
+            kind: crate::backends::DeviceKind::Metal,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("plan-metal-hw");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The production Metal plan through the real constructor: ExpandedF16
+        // projections, F16 dense weights and norm weights, the F32 DeltaNet
+        // island and state arena, and an F32 KV arena. Before the F32 island
+        // this graph mixed F16 activations with F32 state in the conv and
+        // recurrence.
+        let source = Qwen36MoeNativeSource::new(&checkpoint, &device_profile);
+        let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
+        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+
+        let DeviceLocation::Metal { gpu_id } = device.location() else {
+            panic!("metal test device reported a non-metal location");
+        };
+        let gpu_id = gpu_id as u64;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4246),
+            backend: BackendKind::Metal,
+            device_ordinal: Some((gpu_id ^ (gpu_id >> 32)) as u32),
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(
+                KvArenaConfig {
+                    id,
+                    group,
+                    page_tokens: 8,
+                    capacity_pages: 8,
+                    growth: None,
+                    dtype: DType::F32,
+                    layers: vec![KvLayerConfig {
+                        binding: KvLayerBinding {
+                            model_layer: 3,
+                            physical_layer: 0,
+                        },
+                        num_kv_heads: 1,
+                        key_head_dim: 16,
+                        value_head_dim: 16,
+                    }],
+                },
+                device.clone(),
+            )
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+        forward_under_dtype_plan("plan-metal", &model, cache, DType::F16);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_trunk_dtype_plan_forwards_on_cuda_hardware() {
+        use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::{DType, DeviceLocation};
+        use std::sync::Arc;
+
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("plan-cuda-hw");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The tiny fixture's projections are not all fp8-kernel compatible,
+        // so this exercises the expanded-BF16 CUDA plan: real BF16 CUDA
+        // matmuls through every trunk block, the F32 DeltaNet island, and an
+        // F16 accelerator KV arena. The raw compact-FP8 residency has its own
+        // kernel tests; the full-checkpoint FP8 E2E stays a hardware handoff.
+        let source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::ExpandedBf16,
+            ProjectionMaterialization::BF16,
+        );
+        let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
+        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+
+        let DeviceLocation::Cuda { gpu_id } = device.location() else {
+            panic!("CUDA test device reported a non-CUDA location");
+        };
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4245),
+            backend: BackendKind::Cuda,
+            device_ordinal: u32::try_from(gpu_id).ok(),
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(
+                KvArenaConfig {
+                    id,
+                    group,
+                    page_tokens: 8,
+                    capacity_pages: 8,
+                    growth: None,
+                    dtype: DType::F16,
+                    layers: vec![KvLayerConfig {
+                        binding: KvLayerBinding {
+                            model_layer: 3,
+                            physical_layer: 0,
+                        },
+                        num_kv_heads: 1,
+                        key_head_dim: 16,
+                        value_head_dim: 16,
+                    }],
+                },
+                device.clone(),
+            )
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+        forward_under_dtype_plan("plan-cuda", &model, cache, DType::BF16);
+    }
+
     #[test]
     fn parses_the_pinned_qwen35_moe_config() {
         let config = pinned_config();
@@ -2406,9 +2650,17 @@ mod tests {
         bf16_bytes(&vec![1.0; count])
     }
 
+    /// Uniform BF16 fill at a magnitude that keeps the all-constant fixture
+    /// inside F16/BF16 range: unit-magnitude constants amplify multiplicatively
+    /// through the 32-wide MoE cascade to ~1e5, which saturates half-precision
+    /// plans into +Inf even though the graph itself is coherent.
+    fn bf16_uniform(value: f32, count: usize) -> Vec<u8> {
+        bf16_bytes(&vec![value; count])
+    }
+
     fn push_dense(tensors: &mut Vec<RawTensor>, name: String, shape: Vec<usize>) {
         let count: usize = shape.iter().product();
-        tensors.push((name, SafeDType::BF16, shape, bf16_ones(count)));
+        tensors.push((name, SafeDType::BF16, shape, bf16_uniform(0.05, count)));
     }
 
     fn push_fp8_proj(
@@ -2434,7 +2686,7 @@ mod tests {
             ),
             SafeDType::BF16,
             vec![scale_rows, scale_cols],
-            bf16_ones(scale_rows * scale_cols),
+            bf16_uniform(0.05, scale_rows * scale_cols),
         ));
     }
 
