@@ -28,6 +28,9 @@ use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::speculative_sampling::{
+    propose_speculative_draft, verify_speculative_proposals, SpeculativeDraft,
+};
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
@@ -198,6 +201,9 @@ pub struct ChatDecodeState {
     prefill_vision_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+    /// Derived draft stream: speculative proposals must not perturb the
+    /// target's draw sequence, so sampled drafting draws from its own fork.
+    draft_rng: SimpleRng,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
@@ -225,6 +231,16 @@ impl ChatDecodeState {
 
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
+    }
+
+    /// Committed output tokens for the session so far.
+    pub(crate) fn tokens_generated(&self) -> usize {
+        self.tokens_generated
+    }
+
+    /// Whether the session reached a stop condition or its output cap.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
     }
 
     pub(crate) fn uses_physical_kv(&self) -> bool {
@@ -304,6 +320,7 @@ impl ChatDecodeState {
             finished: self.finished,
             next_text_position: self.next_text_position,
             rng: self.rng.clone(),
+            draft_rng: self.draft_rng.clone(),
             adaptive_mtp: self.adaptive_mtp.clone(),
             mtp_timings: self.mtp_timings.clone(),
         })
@@ -322,6 +339,7 @@ impl ChatDecodeState {
         self.finished = checkpoint.finished;
         self.next_text_position = checkpoint.next_text_position;
         self.rng = checkpoint.rng;
+        self.draft_rng = checkpoint.draft_rng;
         self.adaptive_mtp
             .restore_from_checkpoint(checkpoint.adaptive_mtp);
         self.mtp_timings = checkpoint.mtp_timings;
@@ -371,6 +389,33 @@ pub struct ChatDecodeStep {
     pub finished: bool,
 }
 
+/// One drafted block awaiting verification. Greedy rounds carry bare token
+/// ids (exact prefix matching against the target argmax); sampled rounds
+/// carry each proposal with its full draft distribution so the shared
+/// verifier can run lossless rejection sampling.
+pub(crate) enum DraftBlock {
+    Greedy(Vec<u32>),
+    Stochastic(Vec<SpeculativeDraft>),
+}
+
+impl DraftBlock {
+    fn token_ids(&self) -> Vec<u32> {
+        match self {
+            DraftBlock::Greedy(tokens) => tokens.clone(),
+            DraftBlock::Stochastic(proposals) => {
+                proposals.iter().map(|proposal| proposal.token_id).collect()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            DraftBlock::Greedy(tokens) => tokens.len(),
+            DraftBlock::Stochastic(proposals) => proposals.len(),
+        }
+    }
+}
+
 pub(crate) struct Qwen35SharedStepCheckpoint {
     text_state: Qwen35TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
@@ -384,6 +429,7 @@ pub(crate) struct Qwen35SharedStepCheckpoint {
     finished: bool,
     next_text_position: usize,
     rng: SimpleRng,
+    draft_rng: SimpleRng,
     adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
     mtp_timings: Vec<timing::PendingRound>,
 }
@@ -858,6 +904,8 @@ impl Qwen35ChatExec {
         }
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let mut rng = SimpleRng::new(config.seed);
+        let draft_rng = rng.fork();
         Ok(ChatDecodeState {
             text_state: self.text_model.new_state(),
             physical_kv: cache,
@@ -880,7 +928,8 @@ impl Qwen35ChatExec {
             pending_logprobs: Vec::new(),
             prefill_vision_progress: 0,
             config: config.clone(),
-            rng: SimpleRng::new(config.seed),
+            rng,
+            draft_rng,
             grammar: self.grammar_runtime(config),
             mtp_cache,
             mtp_anchor_hidden: None,
@@ -1254,19 +1303,19 @@ impl Qwen35ChatExec {
 
 impl Qwen35ChatExec {
     /// Whether the MTP quantum path may drive this decode step: a loaded
-    /// draft head plus a greedy, unconstrained request — the only mode whose
-    /// acceptance rule (target argmax must equal the draft) is exact.
+    /// draft head plus an unconstrained request. Greedy requests accept by
+    /// exact prefix match; sampled requests (any temperature, penalties,
+    /// top-k/top-p) accept through the shared lossless rejection sampler,
+    /// which applies the same transforms to draft proposals and target
+    /// rows. Grammar and logprobs stay scalar-only: constrained decoding
+    /// must mask every sample, and logprob requests need the scalar
+    /// sampler's raw-logit accounting for tokens speculation never shows.
     fn mtp_active(&self, state: &ChatDecodeState) -> bool {
         let config = &state.config;
         self.mtp_head.is_some()
             && state.mtp_cache.is_some()
             && state.grammar.is_none()
             && !config.logprobs
-            && config.temperature <= 1e-5
-            && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-            && config.presence_penalty.abs() <= f32::EPSILON
-            && config.top_k == 0
-            && config.top_p >= 1.0
     }
 
     /// Greedy argmax over one logits row, clamped to the tokenizer vocab.
@@ -1391,7 +1440,7 @@ impl Qwen35ChatExec {
                 )
             })?;
             let next = sample_next_token(
-                &output,
+                &logits_last_row(&output)?,
                 self.tokenizer.vocab_size,
                 &state.config,
                 &[],
@@ -1560,16 +1609,26 @@ impl Qwen35ChatExec {
 
     /// Draft `depth` tokens provisionally through the head; the draft's MTP
     /// rows are discarded before verification rewrites the canonical pairs.
+    /// Greedy requests keep the no-distribution fast path; sampled requests
+    /// propose through the shared lossless sampler on the row's own draft
+    /// RNG stream, retaining each proposal's distribution for verification.
     fn mtp_draft(
         &self,
         state: &mut ChatDecodeState,
         head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
         depth: usize,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<DraftBlock> {
         let position = state.next_text_position;
         let anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
             Error::InferenceError("Qwen3.5 MTP round has no anchor".into())
         })?;
+        let stochastic = state.config.temperature > 1e-5;
+        let mut draft_history = if state.track_history {
+            state.history_ids.clone()
+        } else {
+            Vec::new()
+        };
+        let mut draft_proposals = Vec::with_capacity(depth);
 
         let continuation_positions: Vec<[usize; 3]> =
             (0..depth - 1).map(|offset| [position + offset; 3]).collect();
@@ -1578,34 +1637,67 @@ impl Qwen35ChatExec {
             .as_mut()
             .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
         let checkpoint = mtp_cache.logical_checkpoint();
-        let drafted = match head.draft_greedy(
+        let draft_rng_checkpoint = state.draft_rng.clone();
+        let vocab_size = self.tokenizer.vocab_size;
+        let drafted = head.draft_recurrently(
             &self.text_model,
             &anchor,
             depth,
             &continuation_positions,
-            self.tokenizer.vocab_size,
             mtp_cache,
-        ) {
-            Ok(tokens) => tokens,
+            |logits| {
+                if !stochastic {
+                    return crate::models::architectures::qwen35::mtp::greedy_argmax(
+                        logits,
+                        vocab_size,
+                    );
+                }
+                let mut values = logits_to_vec(&logits.i((0, 0))?)?;
+                truncate_logits_to_vocab(&mut values, vocab_size);
+                let proposal = propose_speculative_draft(
+                    &values,
+                    &state.config,
+                    &mut draft_history,
+                    &mut state.draft_rng,
+                )?;
+                let token_id = proposal.token_id;
+                draft_proposals.push(proposal);
+                Ok(token_id)
+            },
+        );
+        match drafted {
+            Ok(tokens) => {
+                // On success the advanced draft stream stays — proposals
+                // consumed it by design. Failures restore the checkpoint
+                // below, so a retried round redraws the same proposals.
+                mtp_cache.restore_logical_checkpoint(checkpoint)?;
+                Ok(if stochastic {
+                    DraftBlock::Stochastic(draft_proposals)
+                } else {
+                    DraftBlock::Greedy(tokens)
+                })
+            }
             Err(error) => {
                 mtp_cache.restore_logical_checkpoint(checkpoint)?;
-                return Err(error);
+                // Transactional RNG: a failed round never moves the draft
+                // stream, so the retried round redraws the same proposals.
+                state.draft_rng = draft_rng_checkpoint;
+                Err(error)
             }
-        };
-        mtp_cache.restore_logical_checkpoint(checkpoint)?;
-        Ok(drafted)
+        }
     }
 
-    /// Verify pre-drafted tokens against the target and commit the accepted
+    /// Verify a pre-drafted block against the target and commit the accepted
     /// prefix. Shared by the solo quantum and the continuous speculative
     /// envelope, so a row's round semantics are identical wherever it runs.
     fn mtp_verify_and_commit(
         &self,
         state: &mut ChatDecodeState,
         head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
-        drafted: &[u32],
+        drafted: &DraftBlock,
     ) -> Result<(usize, String)> {
         let depth = drafted.len();
+        let drafted_tokens = drafted.token_ids();
         let pending = state.pending_token.ok_or_else(|| {
             Error::InferenceError("Qwen3.5 MTP round has no pending token".into())
         })?;
@@ -1615,7 +1707,7 @@ impl Qwen35ChatExec {
         // snapshotting linear state after each so any accepted prefix can be
         // installed without re-running weights.
         let target_inputs = std::iter::once(pending)
-            .chain(drafted.iter().copied())
+            .chain(drafted_tokens.iter().copied())
             .collect::<Vec<_>>();
         let mut verify_hiddens = Vec::with_capacity(target_inputs.len());
         let mut verify_logits = Vec::with_capacity(target_inputs.len());
@@ -1635,19 +1727,42 @@ impl Qwen35ChatExec {
             snapshots.push(state.text_state.snapshot_linear_states()?);
         }
 
-        // Greedy acceptance: emitted[i] is the target's prediction for
-        // position+i+1 — it matches drafted[i] while the draft is accepted,
-        // and the final row contributes the bonus token. The first emitted
-        // token lands at position+1: the pending token itself is never
-        // re-emitted.
-        let mut emitted = Vec::with_capacity(depth + 1);
-        for row in 0..=depth {
-            let token = self.greedy_token(&verify_logits[row])?;
-            emitted.push(token);
-            if row == depth || token != drafted[row] {
-                break;
+        // The first emitted token lands at position+1: the pending token
+        // itself is never re-emitted. Greedy rounds accept by exact prefix
+        // match against the target argmax; sampled rounds run lossless
+        // rejection sampling over host logits rows (penalties, temperature,
+        // top-k/top-p applied identically to draft and target rows).
+        let emitted = if let DraftBlock::Stochastic(proposals) = drafted {
+            let mut host_rows = Vec::with_capacity(verify_logits.len());
+            for logits in &verify_logits {
+                let mut values = logits_to_vec(&logits_last_row(logits)?)?;
+                truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                host_rows.push(values);
             }
-        }
+            let mut verification_history = if state.track_history {
+                state.history_ids.clone()
+            } else {
+                Vec::new()
+            };
+            verify_speculative_proposals(
+                proposals,
+                &host_rows,
+                &state.config,
+                &mut verification_history,
+                &mut state.rng,
+            )?
+            .emitted_tokens
+        } else {
+            let mut emitted = Vec::with_capacity(depth + 1);
+            for row in 0..=depth {
+                let token = self.greedy_token(&verify_logits[row])?;
+                emitted.push(token);
+                if row == depth || token != drafted_tokens[row] {
+                    break;
+                }
+            }
+            emitted
+        };
         let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
         let mut kept: Vec<u32> = Vec::with_capacity(emitted.len());
         for &token in &emitted {
@@ -1857,11 +1972,20 @@ impl Qwen35ChatExec {
             }
 
             // Batched recurrent draft: one MTP-layer forward per draft step
-            // across the rows still drafting at that depth, with greedy
-            // selection through the same argmax the solo draft uses. A
-            // non-finite draft logits row falls back to a scalar round and
-            // disables that row's speculation for the rest of its run.
+            // across the rows still drafting at that depth. Greedy rows
+            // select through the same argmax the solo draft uses; sampled
+            // rows propose through the shared lossless sampler on their own
+            // draft RNG stream. A non-finite draft logits row falls back to
+            // a scalar round and disables that row's speculation for the
+            // rest of its run.
             let mut draft_tokens = vec![Vec::new(); active.len()];
+            let mut draft_proposals = vec![Vec::new(); active.len()];
+            let mut draft_histories = vec![Vec::new(); active.len()];
+            for (position, &row) in active.iter().enumerate() {
+                if states[row].track_history {
+                    draft_histories[position] = states[row].history_ids.clone();
+                }
+            }
             let mut draft_error_row: Option<usize> = None;
             'draft: for step_index in 0..max_depth {
                 let drafting: Vec<usize> = (0..active.len())
@@ -1869,18 +1993,29 @@ impl Qwen35ChatExec {
                     .collect();
                 let mut tokens_step = Vec::with_capacity(drafting.len());
                 for &position in &drafting {
+                    let row = active[position];
                     let logits =
                         self.text_model
                             .project_with_shared_lm_head(&currents[position])?;
-                    match crate::models::architectures::qwen35::mtp::draft_argmax(
-                        &logits,
-                        self.tokenizer.vocab_size,
-                    )? {
-                        Some(token) => tokens_step.push(token),
-                        None => {
-                            draft_error_row = Some(position);
-                            break 'draft;
-                        }
+                    let mut values = logits_to_vec(&logits.i((0, 0))?)?;
+                    truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                    if !values.iter().any(|value| value.is_finite()) {
+                        draft_error_row = Some(position);
+                        break 'draft;
+                    }
+                    if states[row].config.temperature > 1e-5 {
+                        let state = &mut *states[row];
+                        let proposal = propose_speculative_draft(
+                            &values,
+                            &state.config,
+                            &mut draft_histories[position],
+                            &mut state.draft_rng,
+                        )?;
+                        let token_id = proposal.token_id;
+                        draft_proposals[position].push(proposal);
+                        tokens_step.push(token_id);
+                    } else {
+                        tokens_step.push(argmax_values(&values)?);
                     }
                 }
                 for (fill, &position) in drafting.iter().enumerate() {
@@ -1987,6 +2122,18 @@ impl Qwen35ChatExec {
                 continue;
             }
 
+            // Greedy rows carry bare ids; sampled rows carry their proposal
+            // distributions into the shared verifier.
+            let draft_blocks: Vec<DraftBlock> = (0..active.len())
+                .map(|position| {
+                    if draft_proposals[position].is_empty() {
+                        DraftBlock::Greedy(std::mem::take(&mut draft_tokens[position]))
+                    } else {
+                        DraftBlock::Stochastic(std::mem::take(&mut draft_proposals[position]))
+                    }
+                })
+                .collect();
+
             // Verification and commit stay per row on each row's own caches.
             for (position, &row) in active.iter().enumerate() {
                 let state = &mut *states[row];
@@ -2010,7 +2157,7 @@ impl Qwen35ChatExec {
                     }
                 } else {
                     let (tokens, delta) =
-                        self.mtp_verify_and_commit(state, head, &draft_tokens[position])?;
+                        self.mtp_verify_and_commit(state, head, &draft_blocks[position])?;
                     committed[row] += tokens;
                     deltas[row].push_str(&delta);
                     let remaining = (input_budget - committed[row]).min(
@@ -3039,6 +3186,28 @@ fn sample_next_token(
         .ok_or_else(|| Error::InferenceError("Failed to sample Qwen3.5 token".to_string()))
 }
 
+/// Normalize model logits — `[1, seq, vocab]`, `[seq, vocab]`, or
+/// `[vocab]` — into the flat last-row vector the samplers consume. The
+/// stored prefill output is rank 3; forward paths return rank 1.
+fn logits_last_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
+        2 => Ok(logits.clone()),
+        3 => {
+            let (batch, sequence, _) = logits.dims3()?;
+            if batch != 1 || sequence == 0 {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3.5 sampler received malformed logits {batch}x{sequence}"
+                )));
+            }
+            logits.i((0, sequence - 1)).map_err(Error::from)
+        }
+        rank => Err(Error::InferenceError(format!(
+            "Unexpected Qwen3.5 logits rank for sampling: {rank}"
+        ))),
+    }
+}
+
 fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -3207,6 +3376,13 @@ impl SimpleRng {
         }
     }
 
+    /// Derive the draft RNG stream from the target stream: speculative
+    /// proposals must not perturb the target's draw sequence.
+    fn fork(&mut self) -> Self {
+        let seed = (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32());
+        Self::new(seed)
+    }
+
     fn next_u32(&mut self) -> u32 {
         let mut x = self.state;
         x ^= x >> 12;
@@ -3218,6 +3394,28 @@ impl SimpleRng {
 
     fn next_f32(&mut self) -> f32 {
         (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
+impl rand::RngCore for SimpleRng {
+    fn next_u32(&mut self) -> u32 {
+        SimpleRng::next_u32(self)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        (u64::from(SimpleRng::next_u32(self)) << 32) | u64::from(SimpleRng::next_u32(self))
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(std::mem::size_of::<u32>()) {
+            let bytes = SimpleRng::next_u32(self).to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
     }
 }
 

@@ -352,6 +352,12 @@ impl Qwen35MtpHead {
     /// continuation position. The first token never writes the MTP cache —
     /// it is selected from the seed alone — so `depth` tokens cost
     /// `depth - 1` pair forwards.
+    /// Greedy recurrent draft: project the current head output through the
+    /// target's raw LM head, take the argmax token, and feed
+    /// `(embedding(token), head output)` back through the layer at the next
+    /// continuation position. The first token never writes the MTP cache —
+    /// it is selected from the seed alone — so `depth` tokens cost
+    /// `depth - 1` pair forwards.
     pub(crate) fn draft_greedy(
         &self,
         text: &Qwen35TextModel,
@@ -361,6 +367,33 @@ impl Qwen35MtpHead {
         vocab_size: usize,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Vec<u32>> {
+        self.draft_recurrently(
+            text,
+            seed_hidden,
+            depth,
+            continuation_positions,
+            cache,
+            |logits| greedy_argmax(logits, vocab_size),
+        )
+    }
+
+    /// Recurrent draft with a caller-owned selection policy: `select`
+    /// receives the head output already projected through the target's raw
+    /// LM head and returns the token to draft. Stochastic policies sample
+    /// through the shared lossless proposal sampler; greedy policies take
+    /// the clamped argmax. The first token never writes the MTP cache.
+    pub(crate) fn draft_recurrently<S>(
+        &self,
+        text: &Qwen35TextModel,
+        seed_hidden: &Tensor,
+        depth: usize,
+        continuation_positions: &[[usize; 3]],
+        cache: &mut PhysicalPagedKvCache,
+        mut select: S,
+    ) -> Result<Vec<u32>>
+    where
+        S: FnMut(&Tensor) -> Result<u32>,
+    {
         if depth == 0 {
             return Ok(Vec::new());
         }
@@ -379,7 +412,7 @@ impl Qwen35MtpHead {
             .chain(std::iter::once(None))
         {
             let logits = text.project_with_shared_lm_head(&current)?;
-            let token = greedy_argmax(&logits, vocab_size)?;
+            let token = select(&logits)?;
             token_ids.push(token);
             match position_id {
                 Some(position_id) => {

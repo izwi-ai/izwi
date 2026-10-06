@@ -3896,6 +3896,183 @@ mod tests {
     }
 
     #[test]
+    fn stochastic_speculation_is_deterministic_and_solo_envelope_identical() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+
+        // Row a samples plain; row b adds a repetition penalty — together
+        // they exercise the lossless proposal/verify path with and without
+        // penalty-aware draft distributions inside one envelope.
+        let sampled_config = |seed: u64, penalty: f32| ChatGenerationConfig {
+            temperature: 1.0,
+            seed,
+            repetition_penalty: penalty,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = crate::performance::OptimizationMode::Auto;
+                performance.cuda.mtp_draft_tokens = 2;
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            (model, dir)
+        };
+        let messages_for = |content: &str| {
+            vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+            }]
+        };
+
+        let (model, dir) = load("stochastic-speculation");
+        let block_count = u32::try_from(model.text_config().block_count).unwrap();
+        let prompts = ["ab", "abcd"];
+        let seeds = [0x5EED_0007u64, 0x5EED_0011u64];
+        let penalties = [1.0f32, 1.1];
+        let max_new_tokens = 20usize;
+
+        // Runs one full stochastic generation per path. Token streams are
+        // only compared ACROSS RUNS of the same path: lossless rejection
+        // sampling preserves the target distribution, not a fixed sample
+        // sequence, and the envelope's batched MTP advance differs from the
+        // solo single-row advance by float noise that sampled proposals
+        // amplify (greedy token-identity is covered by the parity tests).
+        let run = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel| {
+            let run_solo = |row: usize| {
+                let config = sampled_config(seeds[row], penalties[row]);
+                let cache = native_physical_cache(model);
+                let mtp_cache = shared_native_caches(model, 1, 4).remove(0);
+                let mut state = model
+                    .start_decode_state_physical_with_mtp(
+                        &messages_for(prompts[row]),
+                        max_new_tokens,
+                        &config,
+                        None,
+                        cache,
+                        Some(mtp_cache),
+                    )
+                    .unwrap();
+                let mut text = String::new();
+                for _ in 0..64 {
+                    let step = model.decode_quantum(&mut state, 4).unwrap();
+                    text.push_str(&step.delta);
+                    if step.finished {
+                        break;
+                    }
+                }
+                assert!(
+                    state.is_finished(),
+                    "solo stochastic row {row} must finish (stop or output cap)"
+                );
+                assert!(
+                    state.tokens_generated() <= max_new_tokens,
+                    "solo stochastic row {row} must respect the output cap"
+                );
+                let cursor = model.mtp_cache_cursor(&state);
+                assert!(
+                    cursor == Some(state.tokens_generated() - 1)
+                        || (state.is_finished() && cursor == Some(state.tokens_generated())),
+                    "solo stochastic row {row} MTP cursor {cursor:?} must track committed tokens (a sampled stop token holds a pair but is not counted)"
+                );
+                text
+            };
+
+            // Envelope: both rows (mixed sampling configs) speculate in one
+            // shared-arena batch after their bootstrap quanta.
+            let mut caches = shared_native_caches(model, 2, 3);
+            let mut mtp_caches = shared_native_caches(model, 2, block_count);
+            let mut states = (0..2)
+                .map(|row| {
+                    let config = sampled_config(seeds[row], penalties[row]);
+                    model
+                        .start_decode_state_physical_with_mtp(
+                            &messages_for(prompts[row]),
+                            max_new_tokens,
+                            &config,
+                            None,
+                            caches.remove(0),
+                            Some(mtp_caches.remove(0)),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut envelope_text = [String::new(), String::new()];
+            for row in 0..2 {
+                envelope_text[row]
+                    .push_str(&model.decode_quantum(&mut states[row], 1).unwrap().delta);
+            }
+            for _ in 0..64 {
+                let [state_a, state_b] = states.as_mut_slice() else {
+                    unreachable!("two rows");
+                };
+                let mut rows = [state_a, state_b];
+                let steps = model
+                    .decode_speculative_batch(&mut rows, 4)
+                    .expect("stochastic envelope round");
+                for (row, step) in steps.iter().enumerate() {
+                    envelope_text[row].push_str(&step.delta);
+                }
+                if steps.iter().all(|step| step.finished) {
+                    break;
+                }
+            }
+            for (row, state) in states.iter().enumerate() {
+                assert!(
+                    state.is_finished() && state.tokens_generated() == max_new_tokens,
+                    "envelope stochastic row {row} must decode to the output cap"
+                );
+                let cursor = model.mtp_cache_cursor(state);
+                assert!(
+                    cursor == Some(state.tokens_generated() - 1)
+                        || (state.is_finished() && cursor == Some(state.tokens_generated())),
+                    "envelope stochastic row {row} MTP cursor {cursor:?} must track committed tokens (a sampled stop token holds a pair but is not counted)"
+                );
+            }
+            assert!(
+                model.envelope_rounds() > 0,
+                "stochastic envelope rounds must run"
+            );
+            let solo_text = [run_solo(0), run_solo(1)];
+            (solo_text, envelope_text)
+        };
+
+        let (solo_text, envelope_text) = run(&model);
+
+        // Determinism: identical seeds and paths must reproduce exactly.
+        let (solo_text_rerun, envelope_text_rerun) = run(&model);
+        assert_eq!(
+            solo_text, solo_text_rerun,
+            "solo stochastic decode must be deterministic per seed"
+        );
+        assert_eq!(
+            envelope_text, envelope_text_rerun,
+            "envelope stochastic decode must be deterministic per seed"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    #[test]
     fn mtp_head_loads_from_the_validated_manifest_and_drafts() {
         use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
