@@ -14,6 +14,7 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen35::mtp::Qwen35MtpHead;
 use crate::models::architectures::qwen35::text::{
     Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
 };
@@ -39,6 +40,41 @@ fn canonical_name(logical: &str) -> Option<String> {
     }
     if first == "output_norm" {
         return Some("model.norm.weight".into());
+    }
+    // The MTP draft head reuses the trunk's own loaders through a virtual
+    // block prefix: `mtpblk.{layer}.{logical}` resolves to the checkpoint's
+    // `mtp.layers.{layer}.*` (or layer-free `mtp.*`) names. Same suffix
+    // conventions as the text mapping so Qwen35FullAttention/Qwen35Mlp load
+    // the draft layer exactly like a trunk layer.
+    if first == "mtpblk" {
+        let layer: usize = parts.next()?.parse().ok()?;
+        let suffix = parts.collect::<Vec<_>>().join(".");
+        let canonical_suffix = match suffix.as_str() {
+            "attn_q.weight" => "self_attn.q_proj.weight".to_string(),
+            "attn_k.weight" => "self_attn.k_proj.weight".to_string(),
+            "attn_v.weight" => "self_attn.v_proj.weight".to_string(),
+            "attn_output.weight" => "self_attn.o_proj.weight".to_string(),
+            "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
+            "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
+            "attn_norm.weight" => "input_layernorm.weight".to_string(),
+            "post_attention_norm.weight" => "post_attention_layernorm.weight".to_string(),
+            "ffn_gate.weight" => "mlp.gate_proj.weight".to_string(),
+            "ffn_up.weight" => "mlp.up_proj.weight".to_string(),
+            "ffn_down.weight" => "mlp.down_proj.weight".to_string(),
+            "mtp_fc.weight" => "fc.weight".to_string(),
+            "mtp_norm.weight" => "norm.weight".to_string(),
+            "mtp_pre_fc_norm_embedding.weight" => "pre_fc_norm_embedding.weight".to_string(),
+            "mtp_pre_fc_norm_hidden.weight" => "pre_fc_norm_hidden.weight".to_string(),
+            other => return Some(format!("mtp.layers.{layer}.{other}")),
+        };
+        // Layer-free tensors (fc, norms) live directly under `mtp.`.
+        if matches!(
+            suffix.as_str(),
+            "mtp_fc.weight" | "mtp_norm.weight" | "mtp_pre_fc_norm_embedding.weight" | "mtp_pre_fc_norm_hidden.weight"
+        ) {
+            return Some(format!("mtp.{canonical_suffix}"));
+        }
+        return Some(format!("mtp.layers.{layer}.{canonical_suffix}"));
     }
     if first != "blk" {
         return None;
@@ -133,6 +169,19 @@ impl<'a> Qwen36MoeNativeSource<'a> {
                 "qwen36moe native checkpoint has no mapping for trunk tensor `{logical}`"
             ))
         })?;
+        if canonical.starts_with("mtp.") {
+            // MTP tensors resolve identity-named against the raw index; the
+            // manifest supplies the expected tensor kind.
+            let info = self.checkpoint.tensors.tensor_info(&canonical)?;
+            let kind = self
+                .checkpoint
+                .mtp_plan
+                .iter()
+                .find(|spec| spec.name == canonical)
+                .map(|spec| spec.kind)
+                .unwrap_or(ExpectedTensorKind::Dense);
+            return Ok((canonical, info.shape.clone(), kind));
+        }
         let raw = self.checkpoint.raw_tensor_name(&canonical)?;
         let info = self.checkpoint.tensors.tensor_info(raw)?;
         Ok((canonical, info.shape.clone(), tensor_kind(&info.dtype)))
@@ -409,9 +458,27 @@ pub(crate) fn load_text_model_native(
     device_profile: &DeviceProfile,
     device: &Device,
     performance: &crate::performance::CudaPerformanceConfig,
-) -> Result<(crate::models::architectures::qwen35::chat::Qwen35TextConfig, Qwen35TextModel)> {
+    mtp_enabled: bool,
+) -> Result<(
+    crate::models::architectures::qwen35::chat::Qwen35TextConfig,
+    Qwen35TextModel,
+    Option<Qwen35MtpHead>,
+)> {
     let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
     let source = Qwen36MoeNativeSource::new_with_performance(checkpoint, device_profile, performance);
     let model = Qwen35TextModel::load_with_source(&source, &text_config, device)?;
-    Ok((text_config, model))
+    let mtp_head = if mtp_enabled {
+        checkpoint
+            .mtp
+            .as_ref()
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Qwen3.5/3.6-MoE MTP enabled but the draft manifest was not validated".into(),
+                )
+            })?;
+        Some(Qwen35MtpHead::load_via(&source, &text_config, device)?)
+    } else {
+        None
+    };
+    Ok((text_config, model, mtp_head))
 }

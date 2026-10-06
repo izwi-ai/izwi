@@ -583,6 +583,10 @@ pub(crate) struct Qwen35ChatExec {
     pub(crate) tokenizer: Qwen35Tokenizer,
     pub(crate) text_config: Qwen35TextConfig,
     pub(crate) text_model: Qwen35TextModel,
+    /// MTP draft head when the checkpoint carries a validated manifest and
+    /// the load policy enabled it. `None` keeps every path byte-identical
+    /// to the non-MTP behavior.
+    pub(crate) mtp_head: Option<crate::models::architectures::qwen35::mtp::Qwen35MtpHead>,
 }
 
 pub struct Qwen35ChatModel {
@@ -1196,6 +1200,7 @@ impl Qwen35ChatModel {
                 tokenizer,
                 text_config,
                 text_model,
+                mtp_head: None,
             },
             text_checkpoint,
             projector_checkpoint,

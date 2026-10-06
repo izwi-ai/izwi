@@ -297,13 +297,13 @@ enum Qwen35Mixer {
     Full(Qwen35FullAttention),
 }
 
-struct Qwen35Mlp {
+pub(crate) struct Qwen35Mlp {
     gate: Qwen35Projection,
     up: Qwen35Projection,
     down: Qwen35Projection,
 }
 
-struct Qwen35FullAttention {
+pub(crate) struct Qwen35FullAttention {
     q_proj: Qwen35Projection,
     k_proj: Qwen35Projection,
     v_proj: Qwen35Projection,
@@ -899,6 +899,20 @@ impl Qwen35TextModel {
             .map_err(Error::from)
     }
 
+    /// Embed one token row: `[1, 1, hidden]` in the embedding table's dtype.
+    /// The MTP draft head reuses the target embeddings for its continuations.
+    pub(crate) fn embed_token_ids(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        self.token_embeddings.forward(&input).map_err(Error::from)
+    }
+
+    /// Project post-norm trunk hidden states through the raw LM head — no
+    /// `output_norm`. The MTP draft head shares the target's LM head exactly
+    /// this way: its outputs are already normalized by `mtp.norm`.
+    pub(crate) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.output.forward(hidden).map_err(Error::from)
+    }
+
     fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
         validate_qwen35_finite_tensor(
@@ -1083,7 +1097,7 @@ impl Qwen35Layer {
 }
 
 impl Qwen35Mlp {
-    fn load_via(
+    pub(crate) fn load_via(
         source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
@@ -1095,7 +1109,7 @@ impl Qwen35Mlp {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
         let gate_proj_out = self.gate.forward(hidden_states)?;
         let up_proj_out = self.up.forward(hidden_states)?;
@@ -1112,7 +1126,7 @@ impl Qwen35Mlp {
 }
 
 impl Qwen35FullAttention {
-    fn load_via(
+    pub(crate) fn load_via(
         source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
@@ -1153,7 +1167,7 @@ impl Qwen35FullAttention {
         })
     }
 
-    fn forward_physical(
+    pub(crate) fn forward_physical(
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],

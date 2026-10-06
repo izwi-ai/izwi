@@ -1394,6 +1394,12 @@ pub struct Qwen36MoeNativeCheckpoint {
     /// Present only when the load policy enabled MTP; the validated draft
     /// manifest the head-construction phase consumes.
     pub mtp: Option<Qwen36MoeMtpInventory>,
+    /// The MTP manifest derived from the trunk geometry — always present so
+    /// head construction can resolve tensor kinds even before validation.
+    pub mtp_plan: Vec<Qwen36MoeMtpTensorSpec>,
+    /// Canonical MTP tensor name -> raw index name (identity today, kept as a
+    /// map so raw-name resolution is uniform across scopes).
+    mtp_tensor_names: BTreeMap<String, String>,
 }
 
 impl Qwen36MoeNativeCheckpoint {
@@ -1428,16 +1434,15 @@ impl Qwen36MoeNativeCheckpoint {
         mtp_policy: Qwen36MoeMtpLoadPolicy,
     ) -> Result<Self> {
         let plan = expected_text_tensor_plan(&config)?;
+        let mtp_manifest = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)?;
         let mtp_plan = match mtp_policy {
             Qwen36MoeMtpLoadPolicy::Disabled => None,
-            Qwen36MoeMtpLoadPolicy::Enabled => Some(mtp_tensor_plan(
-                &config.text,
-                config.block_fp8.block_shape,
-            )?),
+            Qwen36MoeMtpLoadPolicy::Enabled => Some(mtp_manifest.clone()),
         };
         let mut text_tensor_names = BTreeMap::new();
         let mut skipped = SkippedScopeInventory::default();
         let mut mtp_payload_bytes = 0u64;
+        let mut mtp_tensor_names: BTreeMap<String, String> = BTreeMap::new();
         let mut mtp_tensors: BTreeMap<String, (Vec<usize>, SafeDType, u64)> = BTreeMap::new();
 
         for raw_name in tensors.tensor_names() {
@@ -1467,6 +1472,9 @@ impl Qwen36MoeNativeCheckpoint {
                         .tensor_info(raw_name)
                         .map(|info| info.storage_bytes as u64)
                         .unwrap_or(0);
+                    // MTP canonical names are the raw index names (the scope
+                    // canonicalizer returns None for them).
+                    mtp_tensor_names.insert(raw_name.to_string(), raw_name.to_string());
                     if mtp_plan.is_some() {
                         let info = tensors.tensor_info(raw_name)?;
                         mtp_tensors.insert(
@@ -1587,11 +1595,18 @@ impl Qwen36MoeNativeCheckpoint {
             text_tensor_names,
             skipped,
             mtp,
+            mtp_plan: mtp_manifest,
+            mtp_tensor_names,
         })
     }
 
-    /// Raw index name for a canonical text tensor name.
+    /// Raw index name for a canonical tensor name. MTP tensors are
+    /// identity-named in the index (they never enter the text plan), so a
+    /// `mtp.` canonical resolves to itself after an existence check.
     pub fn raw_tensor_name(&self, canonical: &str) -> Result<&str> {
+        if let Some(raw) = self.mtp_tensor_names.get(canonical) {
+            return Ok(raw.as_str());
+        }
         self.text_tensor_names
             .get(canonical)
             .map(|s| s.as_str())
@@ -1914,14 +1929,14 @@ mod tests {
         .unwrap();
 
         let device_profile = DeviceProfile::cpu();
-        let (text_config, model) =
-            load_text_model_native(
-                    &checkpoint,
-                    &device_profile,
-                    &candle_core::Device::Cpu,
-                    &crate::performance::CudaPerformanceConfig::default(),
-                )
-                .unwrap();
+        let (text_config, model, _mtp_head) = load_text_model_native(
+            &checkpoint,
+            &device_profile,
+            &candle_core::Device::Cpu,
+            &crate::performance::CudaPerformanceConfig::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(text_config.block_count, 4);
         let moe = text_config
             .moe_ffn
@@ -3388,6 +3403,106 @@ mod tests {
         .unwrap();
         assert_eq!(y.dims(), &[1, 8]);
         assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
+    }
+
+    #[test]
+    fn mtp_head_loads_from_the_validated_manifest_and_drafts() {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen36moe::native_model::load_text_model_native;
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::{DType, Device, Tensor};
+        use std::sync::Arc;
+
+        let config = forward_config();
+        let dir = TestDir::new("mtp-head");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+            Qwen36MoeMtpLoadPolicy::Enabled,
+        )
+        .unwrap();
+        let device_profile = DeviceProfile::cpu();
+        let (text_config, model, mtp_head) = load_text_model_native(
+            &checkpoint,
+            &device_profile,
+            &Device::Cpu,
+            &crate::performance::CudaPerformanceConfig::default(),
+            true,
+        )
+        .unwrap();
+        let head = mtp_head.expect("MTP head constructed when the policy enables it");
+
+        // The MTP layer binds one paged KV layer at model_layer = block_count.
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4247),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 8,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: text_config.block_count as u32,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: text_config.attention_head_count_kv as u32,
+                    key_head_dim: text_config.attention_key_length as u32,
+                    value_head_dim: text_config.attention_value_length as u32,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index: index as u32,
+                slot_generation: 1,
+            })
+            .collect();
+        let mut mtp_cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: text_config.block_count as u32,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+
+        // Greedy draft of depth 2 from a zero seed: one continuation pair is
+        // committed to the MTP cache, both tokens stay in vocabulary.
+        let seed = Tensor::zeros((1, 1, text_config.embedding_length), DType::F32, &Device::Cpu)
+            .unwrap();
+        let tokens = head
+            .draft_greedy(
+                &model,
+                &seed,
+                2,
+                &[[3, 3, 3]],
+                config.text.vocab_size,
+                &mut mtp_cache,
+            )
+            .unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(
+            tokens
+                .iter()
+                .all(|token| (*token as usize) < config.text.vocab_size)
+        );
+        assert_eq!(mtp_cache.context_len(), 1, "depth 2 commits one pair");
     }
 
     #[test]
