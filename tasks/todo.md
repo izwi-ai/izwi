@@ -20598,3 +20598,68 @@ greedy token-identity remains the pinned invariant; (3) replay pair rebuild cove
 rows only, matching a qwen35 prefill that writes no MTP pairs (unlike qwen38's
 shifted-pair prefill); (4) sampled stop tokens hold an MTP pair without counting as a
 generated token — the cursor invariant is cursor == tokens_generated - 1, or == on finish.
+
+# Plan — qwen36moe MTP manifest drift fix — 2026-10-07
+
+Field failure (Modal izwi-cuda, branch build): every native Qwen3.6-35B-A3B-FP8
+load 500s at the fail-closed MTP manifest — the branch's MTP load policy is
+default-on (`Auto` = enabled) and the 22-tensor dense-FFN manifest never met the
+real checkpoint, whose MTP layer has an MoE FFN (1,560 tensors: router + 256
+experts + shared expert). Research + full change surface:
+tasks/qwen36moe-mtp-manifest-drift-research-2026-10-07.md.
+
+- [x] C1: qwen36moe MTP load policy default-off (Auto no longer enables;
+      handoff opt-in env for tests/field verification); drop `let _ = mtp_policy;`
+      DONE `b621ed5a`.
+- [x] C2: prefix-taking `moe_ffn` seam on `Qwen35WeightSource`
+      DONE `31469577`.
+- [x] C3: MoE MTP manifest (config-derived count) + `Qwen36MoeSparseMlp` draft
+      head + fixture expert emission DONE `b68f1181`.
+- [x] C4: MTP bucket in resident-bytes accounting DONE `23e02411`.
+- [x] C5: published-census regression test for the MTP manifest DONE `d198be33`.
+- [x] Sibling: census-verify the qwen38 MTP manifest (report only) — CLEAN:
+      real Qwen3.8-27B-FP8 @ 017b9c7a has exactly the 22 dense-FFN mtp.* tensors
+      the manifest expects (no experts/router); the dense hypothesis is correct
+      for qwen3.8 and was wrong only for qwen3.6.
+- [x] Verify: CPU lib (2779), Metal CI lane (--lib --tests, exit 0), clippy
+      -D warnings CPU+Metal all-targets, fmt hunks per-file at baseline,
+      server/worker cargo check, worker process test green.
+
+## Review — 2026-10-07
+
+Five commits on qwen36moe-gdn-dtype close the MTP manifest drift:
+
+1. `b621ed5a` — the load policy resolves through `resolve_mtp_load_policy`:
+   the performance knob AND the explicit `IZWI_QWEN36_MTP_HANDOFF` opt-in
+   (qwen38 boolean grammar, fail-closed on invalid) must both enable MTP, on
+   every backend. Field mitigation without code = `IZWI_CUDA_MTP=off` is now
+   unnecessary; default loads skip `mtp.*` again.
+2. `31469577` — `Qwen35WeightSource::moe_ffn_prefix` (fail-closed default,
+   native override) + equivalence test.
+3. `b68f1181` — the manifest emits the real MoE contract (router + experts +
+   shared expert + gate, config-derived count 24+6N; 1,560 at the published
+   geometry) and the draft head builds `Qwen36MoeSparseMlp` through the
+   prefix seam; the native source translates the mtpblk prefix through
+   canonical_name before touching checkpoint names (the MoE body bypasses
+   resolve(), unlike the other loaders). Worker fixture writes the full
+   36-tensor manifest. Solo quantum / DS9.4 envelope / stochastic / replay
+   suites all execute the MoE draft head end-to-end on the fixture.
+4. `23e02411` — pinned inventory gains an MTP element bucket; admission
+   resolves the same policy and charges the bucket only when the head
+   loads (default numbers unchanged, CUDA context fit intact). Gotcha hit:
+   the resource_plan test computed its disabled leg outside env_test_lock
+   and raced the four MTP tests' env flips — fixed by one lock acquisition
+   around both legs.
+5. `d198be33` — MTP manifest pinned against the frozen published census
+   (30 pattern rows / 1,560 tensors), the W6 lesson applied to the scope
+   that lacked it.
+
+Verification: CPU lib 2779/0; Metal CI lane exit 0; clippy -D warnings
+CPU+Metal all-targets clean; fmt drift per-file at baseline (ed-2021 —
+note rustfmt inside the repo picks the workspace edition from Cargo.toml,
+ignoring a CLI --edition override: measure baselines in the same
+location); worker process test green with the complete fixture manifest;
+izwi-server/izwi-serving-worker compile. Hardware handoff remains: set
+IZWI_QWEN36_MTP_HANDOFF=1 on the H100, verify the manifest against the
+downloaded checkpoint headers, run MTP E2E + acceptance-rate evidence,
+then flip MTP_MANIFEST_CENSUS_VERIFIED (native.rs) to true.
