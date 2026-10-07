@@ -4,7 +4,9 @@
 //! The published checkpoint is an indexed Safetensors bundle whose matrix
 //! weights use 128x128 block-scaled `F8_E4M3` (companion `weight_scale_inv`
 //! tensors) while embeddings, norms, router/gate weights, DeltaNet in_proj /
-//! conv tensors, and the MTP head stay dense. This module owns the
+//! conv tensors, the MTP frame (fc, pre-fc norms) stay dense — the MTP
+//! layer's attention and MoE FFN follow the trunk's block-FP8 contract. This
+//! module owns the
 //! Qwen3.5-MoE configuration contract, the tensor-name plan, and checkpoint
 //! validation; shard reading, block-FP8 decoding, and projection
 //! materialization reuse the narrow primitives exposed by
@@ -14,8 +16,9 @@
 //! under `model.` (plain) or `model.language_model.` (composite), the vision
 //! tower under `model.visual.`, and the multi-token-prediction head under
 //! `mtp.`. Both language layouts are accepted and canonicalized; vision and
-//! MTP tensors are accounted but not loaded (text-only scope; the MTP
-//! manifest is recorded for the later speculative-decoding phase).
+//! MTP tensors are accounted but not loaded unless the MTP load policy
+//! enables the draft head, in which case the `mtp.*` manifest is validated
+//! fail-closed and its tensors become resident.
 //!
 //! Per-layer tensor names and shapes are derived from the Qwen3-Next lineage
 //! naming. The first open of a real downloaded checkpoint is expected to run
@@ -1047,22 +1050,30 @@ pub fn resolve_mtp_load_policy(
 
 /// The qwen3.6 MTP draft topology mirrors the published qwen3_5_moe MTP
 /// layer: ONE recurrent decoder layer sharing the target's token embeddings
-/// and LM head, with a dense FFN sized by the MoE intermediate width and the
-/// target's gated full-attention geometry.
+/// and LM head, with the target's gated full-attention geometry and the
+/// trunk's MoE feed-forward contract (BF16 router, block-FP8 routed experts,
+/// block-FP8 shared expert with its BF16 sigmoid gate) — census-verified
+/// against the published Qwen3.6-35B-A3B-FP8 checkpoint (revision 95a723d0;
+/// 1,560 `mtp.*` tensors at the pinned geometry).
 ///
-/// NOTE: the exact published manifest (names, shapes, dtypes) must be
-/// verified against the real Qwen3.6-35B-A3B-FP8 checkpoint at the hardware
-/// handoff — the loader fails closed on any drift, and MTP is disabled by
-/// default, so an unverified hypothesis can never silently misload.
+/// The loader still fails closed on any drift, and the load policy stays
+/// handoff-gated (see `resolve_mtp_load_policy`): an unverified hypothesis
+/// can never silently misload.
 pub const QWEN36_MOE_MTP_LAYERS: usize = 1;
-pub const QWEN36_MOE_MTP_TENSOR_COUNT: usize = 22;
+
+/// Published MTP tensor count for a text config: the fixed draft-layer
+/// frame (24 tensors — fc, three norms, router, shared expert with its
+/// gate, attention projections with their scales) plus six block-FP8
+/// tensors per routed expert.
+pub fn mtp_tensor_count(text: &Qwen36MoeTextConfig) -> usize {
+    24 + 6 * text.moe_num_experts
+}
 
 pub fn mtp_tensor_plan(
     text: &Qwen36MoeTextConfig,
     block_shape: [usize; 2],
 ) -> Result<Vec<Qwen36MoeMtpTensorSpec>> {
     let hidden = text.hidden_size;
-    let intermediate = text.moe_intermediate_size;
     let head_dim = text.attention_key_length;
     let checked = |label: &str, value: Option<usize>| {
         value.ok_or_else(|| config_error(label, "dimension product overflow"))
@@ -1105,7 +1116,7 @@ pub fn mtp_tensor_plan(
         Ok(())
     }
 
-    let mut specs = Vec::with_capacity(QWEN36_MOE_MTP_TENSOR_COUNT);
+    let mut specs = Vec::with_capacity(mtp_tensor_count(text));
     push_dense(&mut specs, "mtp.fc.weight".into(), vec![hidden, fused_input]);
     for layer in 0..QWEN36_MOE_MTP_LAYERS {
         let prefix = format!("mtp.layers.{layer}");
@@ -1115,24 +1126,37 @@ pub fn mtp_tensor_plan(
             format!("{prefix}.post_attention_layernorm.weight"),
             vec![hidden],
         );
-        push_projection(
+        // The draft layer's FFN mirrors the trunk's sparse MoE contract:
+        // an FP8-excluded BF16 router, block-FP8 routed experts, and the
+        // block-FP8 shared expert with its BF16 sigmoid gate.
+        push_dense(
             &mut specs,
-            format!("{prefix}.mlp.gate_proj.weight"),
-            [intermediate, hidden],
-            block_shape,
-        )?;
-        push_projection(
+            format!("{prefix}.mlp.gate.weight"),
+            vec![text.moe_num_experts, hidden],
+        );
+        for expert in 0..text.moe_num_experts {
+            for (suffix, shape) in expert_projection_shapes(text) {
+                push_projection(
+                    &mut specs,
+                    format!("{prefix}.mlp.experts.{expert}.{suffix}"),
+                    [shape[0], shape[1]],
+                    block_shape,
+                )?;
+            }
+        }
+        for (suffix, shape) in expert_projection_shapes(text) {
+            push_projection(
+                &mut specs,
+                format!("{prefix}.mlp.shared_expert.{suffix}"),
+                [shape[0], shape[1]],
+                block_shape,
+            )?;
+        }
+        push_dense(
             &mut specs,
-            format!("{prefix}.mlp.up_proj.weight"),
-            [intermediate, hidden],
-            block_shape,
-        )?;
-        push_projection(
-            &mut specs,
-            format!("{prefix}.mlp.down_proj.weight"),
-            [hidden, intermediate],
-            block_shape,
-        )?;
+            format!("{prefix}.mlp.shared_expert_gate.weight"),
+            vec![1, hidden],
+        );
         push_dense(&mut specs, format!("{prefix}.self_attn.q_norm.weight"), vec![head_dim]);
         push_dense(&mut specs, format!("{prefix}.self_attn.k_norm.weight"), vec![head_dim]);
         for (projection_name, shape) in [
@@ -1153,10 +1177,11 @@ pub fn mtp_tensor_plan(
     push_dense(&mut specs, "mtp.pre_fc_norm_embedding.weight".into(), vec![hidden]);
     push_dense(&mut specs, "mtp.pre_fc_norm_hidden.weight".into(), vec![hidden]);
 
-    if specs.len() != QWEN36_MOE_MTP_TENSOR_COUNT {
+    if specs.len() != mtp_tensor_count(text) {
         return Err(Error::ModelLoadError(format!(
-            "Qwen3.5/3.6-MoE MTP manifest resolved to {} tensors, expected {QWEN36_MOE_MTP_TENSOR_COUNT}",
-            specs.len()
+            "Qwen3.5/3.6-MoE MTP manifest resolved to {} tensors, expected {}",
+            specs.len(),
+            mtp_tensor_count(text)
         )));
     }
     Ok(specs)
@@ -3367,8 +3392,13 @@ mod tests {
         assert_eq!(text.moe_num_experts, 2);
         assert_eq!(checkpoint.skipped.vision_tensors, 1);
         // The full MTP draft manifest rides every checkpoint; the default
-        // load skips it until the MTP policy enables validation.
-        assert_eq!(checkpoint.skipped.mtp_tensors, 22);
+        // load skips it until the MTP policy enables validation. The
+        // emitted count follows the MoE manifest (2 fixture experts).
+        assert_eq!(
+            checkpoint.skipped.mtp_tensors,
+            mtp_tensor_count(&checkpoint.config.text)
+        );
+        assert_eq!(checkpoint.skipped.mtp_tensors, 36);
         assert!(checkpoint.skipped.mtp_payload_bytes > 0);
         assert!(checkpoint.mtp.is_none());
         // Composite layout is canonicalized: `raw_tensor_name` resolves the

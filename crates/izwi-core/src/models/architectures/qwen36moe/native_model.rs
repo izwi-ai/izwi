@@ -326,6 +326,23 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
     ) -> Result<Qwen36MoeSparseMlp> {
+        // The MoE body below addresses canonical checkpoint names directly.
+        // The MTP head passes the logical `mtpblk.{n}.mlp` prefix, so
+        // translate it once through the same name mapping the other draft
+        // loaders use; trunk callers already pass canonical prefixes.
+        let prefix = match prefix.strip_prefix("mtpblk.") {
+            Some(rest) => canonical_name(&format!("mtpblk.{rest}.gate.weight"))
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "qwen36moe weight source cannot resolve the MoE FFN prefix `{prefix}`"
+                    ))
+                })?
+                .strip_suffix(".gate.weight")
+                .expect("mapped MTP router name keeps the router suffix")
+                .to_string(),
+            None => prefix.to_string(),
+        };
+
         // Router: `mlp.gate.weight` is FP8-excluded (BF16 dense) in the
         // published quantization contract, so it rides the dense path.
         let router_canonical = format!("{prefix}.gate.weight");

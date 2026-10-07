@@ -965,13 +965,114 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
             ));
         }
     }
-    // Auxiliary scopes the loader must skip (vision tower + MTP leftovers).
+    // Vision tower: an auxiliary scope the loader must skip.
     tensors.push(dense(
         "model.visual.blocks.0.attn.qkv.weight".to_string(),
         &[4, 4],
         1.0,
     ));
+    // The full MTP draft manifest at this fixture's geometry (24 fixed
+    // tensors + 6 per routed expert), mirroring the loader's MoE contract:
+    // the fixture therefore also loads with MTP validation enabled, not
+    // only on the skip path.
+    tensors.push(dense(
+        "mtp.fc.weight".to_string(),
+        &[HIDDEN, HIDDEN * 2],
+        1.0,
+    ));
     tensors.push(dense("mtp.norm.weight".to_string(), &[HIDDEN], 1.0));
+    tensors.push(dense(
+        "mtp.pre_fc_norm_embedding.weight".to_string(),
+        &[HIDDEN],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.pre_fc_norm_hidden.weight".to_string(),
+        &[HIDDEN],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.input_layernorm.weight".to_string(),
+        &[HIDDEN],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.post_attention_layernorm.weight".to_string(),
+        &[HIDDEN],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.mlp.gate.weight".to_string(),
+        &[NUM_EXPERTS, HIDDEN],
+        1.0,
+    ));
+    for expert in 0..NUM_EXPERTS {
+        tensors.extend(fp8_projection(
+            format!("mtp.layers.0.mlp.experts.{expert}.gate_proj.weight"),
+            MOE_INTERMEDIATE,
+            HIDDEN,
+        ));
+        tensors.extend(fp8_projection(
+            format!("mtp.layers.0.mlp.experts.{expert}.up_proj.weight"),
+            MOE_INTERMEDIATE,
+            HIDDEN,
+        ));
+        tensors.extend(fp8_projection(
+            format!("mtp.layers.0.mlp.experts.{expert}.down_proj.weight"),
+            HIDDEN,
+            MOE_INTERMEDIATE,
+        ));
+    }
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight".to_string(),
+        SHARED_INTERMEDIATE,
+        HIDDEN,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight".to_string(),
+        SHARED_INTERMEDIATE,
+        HIDDEN,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight".to_string(),
+        HIDDEN,
+        SHARED_INTERMEDIATE,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.mlp.shared_expert_gate.weight".to_string(),
+        &[1, HIDDEN],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.self_attn.q_norm.weight".to_string(),
+        &[16],
+        1.0,
+    ));
+    tensors.push(dense(
+        "mtp.layers.0.self_attn.k_norm.weight".to_string(),
+        &[16],
+        1.0,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+        QUERY_WIDTH * 2,
+        HIDDEN,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.self_attn.k_proj.weight".to_string(),
+        KV_WIDTH,
+        HIDDEN,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.self_attn.v_proj.weight".to_string(),
+        KV_WIDTH,
+        HIDDEN,
+    ));
+    tensors.extend(fp8_projection(
+        "mtp.layers.0.self_attn.o_proj.weight".to_string(),
+        HIDDEN,
+        QUERY_WIDTH,
+    ));
 
     let write_shard = |path: &Path, tensors: &[Qwen36MoeFixtureTensor]| {
         let views = tensors

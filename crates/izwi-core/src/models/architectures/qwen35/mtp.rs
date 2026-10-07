@@ -19,9 +19,9 @@ use crate::error::{Error, Result};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen35::chat::Qwen35TextConfig;
 use crate::models::architectures::qwen35::text::{
-    Qwen35FullAttention, Qwen35Mlp, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel,
-    Qwen35WeightSource,
+    Qwen35FullAttention, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
 };
+use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use std::sync::Arc;
 
@@ -147,7 +147,7 @@ pub(crate) struct Qwen35MtpHead {
     input_layernorm: Qwen35RmsNorm,
     attention: Qwen35FullAttention,
     post_attention_norm: Qwen35RmsNorm,
-    mlp: Qwen35Mlp,
+    mlp: Qwen36MoeSparseMlp,
     norm: Qwen35RmsNorm,
 }
 
@@ -160,6 +160,12 @@ impl Qwen35MtpHead {
     ) -> Result<Self> {
         let hidden = cfg.embedding_length;
         let eps = cfg.attention_layer_norm_rms_epsilon;
+        // The published draft layer's FFN is the trunk's sparse MoE block,
+        // not a dense MLP (census: mtp.layers.0.mlp.{gate,shared_expert*,
+        // experts.*}) — build it exactly like a trunk layer.
+        let moe_geometry = cfg.moe_ffn.ok_or_else(|| {
+            Error::ModelLoadError("the MTP draft head requires the MoE FFN geometry".to_string())
+        })?;
         Ok(Self {
             hidden_size: hidden,
             draft_depth: draft_depth.clamp(1, 3),
@@ -181,7 +187,7 @@ impl Qwen35MtpHead {
                 eps,
                 device,
             )?,
-            mlp: Qwen35Mlp::load_via(source, device, "mtpblk.0")?,
+            mlp: source.moe_ffn_prefix("mtpblk.0.mlp", &moe_geometry, device)?,
             norm: source.rms_norm("mtpblk.0.mtp_norm.weight", eps, device)?,
         })
     }
