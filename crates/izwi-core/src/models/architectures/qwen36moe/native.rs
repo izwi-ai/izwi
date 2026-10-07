@@ -136,11 +136,11 @@ pub(crate) fn pinned_native_config() -> Qwen36MoeNativeConfig {
     .expect("pinned config constants pass validation")
 }
 
-/// Element inventory of the published checkpoint's persistent representation,
-/// derived from the same tensor plan the loader validates against: block-FP8
+/// Element counts of one tensor plan's persistent representation: block-FP8
 /// projection elements, dense elements, and the total tensor count (weights
 /// plus scale companions) that drives instantiation slack at MoE scale.
-pub(crate) struct PinnedRepresentationInventory {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RepresentationElementBucket {
     pub fp8_elements: u64,
     pub dense_elements: u64,
     pub tensor_count: u64,
@@ -154,46 +154,94 @@ pub(crate) struct PinnedRepresentationInventory {
     pub fp8_incompatible_elements: u64,
 }
 
-pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+/// Element inventory of the published checkpoint's persistent representation,
+/// derived from the same tensor plans the loader validates against.
+pub(crate) struct PinnedRepresentationInventory {
+    pub fp8_elements: u64,
+    pub dense_elements: u64,
+    pub tensor_count: u64,
+    pub fp8_scale_bytes: u64,
+    pub fp8_incompatible_elements: u64,
+    /// Element inventory of the MTP draft manifest. Admission charges this
+    /// bucket only when the MTP load policy makes the draft head resident;
+    /// the default load skips `mtp.*` exactly like the vision tower.
+    pub mtp: RepresentationElementBucket,
+}
+
+impl PinnedRepresentationInventory {
+    /// The text-trunk bucket as a standalone element count (the flat fields
+    /// of this inventory).
+    pub(crate) fn trunk_bucket(&self) -> RepresentationElementBucket {
+        RepresentationElementBucket {
+            fp8_elements: self.fp8_elements,
+            dense_elements: self.dense_elements,
+            tensor_count: self.tensor_count,
+            fp8_scale_bytes: self.fp8_scale_bytes,
+            fp8_incompatible_elements: self.fp8_incompatible_elements,
+        }
+    }
+}
+
+/// Fold one tensor plan into its resident-representation element counts.
+fn fold_representation_inventory(
+    entries: impl IntoIterator<Item = (ExpectedTensorKind, Vec<usize>)>,
+) -> RepresentationElementBucket {
     use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
-    let plan = expected_text_tensor_plan(&pinned_native_config())
-        .expect("pinned config produces the validated tensor plan");
-    let mut fp8_elements = 0u64;
-    let mut dense_elements = 0u64;
-    let mut fp8_scale_bytes = 0u64;
-    let mut fp8_incompatible_elements = 0u64;
-    for expected in plan.values() {
-        let count = expected
-            .shape
+    let mut bucket = RepresentationElementBucket::default();
+    for (kind, shape) in entries {
+        bucket.tensor_count += 1;
+        let count = shape
             .iter()
             .try_fold(1u64, |acc, &dim| {
                 acc.checked_mul(u64::try_from(dim).unwrap_or(u64::MAX))
             })
             .unwrap_or(u64::MAX);
-        match expected.kind {
+        match kind {
             BlockFp8 => {
-                fp8_elements = fp8_elements.saturating_add(count);
-                let (rows, cols) = (expected.shape[0], expected.shape[1]);
+                bucket.fp8_elements = bucket.fp8_elements.saturating_add(count);
+                let (rows, cols) = (shape[0], shape[1]);
                 let scale_entries =
                     rows.div_ceil(128).saturating_mul(cols.div_ceil(128)) as u64;
-                fp8_scale_bytes = fp8_scale_bytes.saturating_add(scale_entries.saturating_mul(4));
+                bucket.fp8_scale_bytes = bucket
+                    .fp8_scale_bytes
+                    .saturating_add(scale_entries.saturating_mul(4));
                 if rows % 64 != 0 || cols % 128 != 0 {
-                    fp8_incompatible_elements = fp8_incompatible_elements.saturating_add(count);
+                    bucket.fp8_incompatible_elements = bucket
+                        .fp8_incompatible_elements
+                        .saturating_add(count);
                 }
             }
-            Dense | OptionalDense => dense_elements = dense_elements.saturating_add(count),
+            Dense | OptionalDense => {
+                bucket.dense_elements = bucket.dense_elements.saturating_add(count)
+            }
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
             // toward the checkpoint's tensor count.
             BlockFp8Scale => {}
         }
     }
+    bucket
+}
+
+pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+    let config = pinned_native_config();
+    let plan = expected_text_tensor_plan(&config)
+        .expect("pinned config produces the validated tensor plan");
+    let mtp_plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)
+        .expect("pinned config produces the validated MTP manifest");
+    let trunk = fold_representation_inventory(
+        plan.into_values()
+            .map(|expected| (expected.kind, expected.shape)),
+    );
+    let mtp =
+        fold_representation_inventory(mtp_plan.into_iter().map(|spec| (spec.kind, spec.shape)));
     PinnedRepresentationInventory {
-        fp8_elements,
-        dense_elements,
-        tensor_count: plan.len() as u64,
-        fp8_scale_bytes,
-        fp8_incompatible_elements,
+        fp8_elements: trunk.fp8_elements,
+        dense_elements: trunk.dense_elements,
+        tensor_count: trunk.tensor_count,
+        fp8_scale_bytes: trunk.fp8_scale_bytes,
+        fp8_incompatible_elements: trunk.fp8_incompatible_elements,
+        mtp,
     }
 }
 
