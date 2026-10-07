@@ -416,6 +416,86 @@ mod tests {
             }
         }
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_projection_matches_portable_reference_at_trunk_geometry() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        // Real trunk projections: the fused q+gate q_proj is [8192, 2048] and
+        // the expert down projection is [2048, 512]. Scales are distinct per
+        // 128x128 block on BOTH axes so a scale-index swap cannot pass, and M
+        // crosses the mv/mm dispatch boundary (4/5) plus partial m-tiles.
+        // qwen36moe is this kernel's first production consumer and the toy
+        // geometry below (192x256) cannot catch real-geometry defects, so the
+        // trunk shapes are pinned here (see
+        // tasks/qwen36moe-native-cuda-gibberish-research-2026-10-07.md).
+        for (n, k, m_values) in [
+            (8192usize, 2048usize, &[1usize, 4, 5, 17, 64][..]),
+            (2048usize, 512usize, &[1usize, 4, 5, 33][..]),
+        ] {
+            let scale_rows = n.div_ceil(128);
+            let scale_cols = k.div_ceil(128);
+            let scales: Vec<f32> = (0..scale_rows * scale_cols)
+                .map(|i| 0.25 * (1 + (i % 8)) as f32)
+                .collect();
+            let raw: Vec<u8> = (0..n * k)
+                .map(|i| {
+                    let mixed = (i.wrapping_mul(0x9E37_79B1) >> 17) as u8;
+                    match mixed {
+                        0x7F => 0x38,
+                        0xFF => 0xB8,
+                        other => other,
+                    }
+                })
+                .collect();
+            let w_cpu = Tensor::from_vec(raw, (n, k), &Device::Cpu).unwrap();
+            let s_cpu =
+                Tensor::from_vec(scales, (scale_rows, scale_cols), &Device::Cpu).unwrap();
+            let w_gpu = w_cpu.to_device(&device).unwrap();
+            let s_gpu = s_cpu.to_device(&device).unwrap();
+            for m in m_values.iter().copied() {
+                let x_cpu = Tensor::from_vec(
+                    (0..m * k)
+                        .map(|i| (i % 7) as f32 * 0.125 - 0.5)
+                        .collect::<Vec<_>>(),
+                    (m, k),
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let expected = block_fp8_projection(&x_cpu, &w_cpu, &s_cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for dtype in [DType::F16, DType::BF16] {
+                    let x_gpu = x_cpu
+                        .to_dtype(dtype)
+                        .unwrap()
+                        .to_device(&device)
+                        .unwrap();
+                    let actual = block_fp8_projection(&x_gpu, &w_gpu, &s_gpu)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    for (index, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                        assert!(
+                            (a - e).abs() <= 0.1 + e.abs() * 0.025,
+                            "{dtype:?} n={n} k={k} M={m} index {index}: {a} != {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]

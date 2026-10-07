@@ -2526,8 +2526,16 @@ fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
         return Ok(x.clone());
     }
     let (batch, heads, dim) = x.dims3()?;
-    // Match llama.cpp's tiled repeat layout for Qwen3.5 linear attention:
-    // [h0, h1, ...] -> [h0, h1, ..., h0, h1, ...].
+    // TILED expansion is the trained convention for the Qwen3.5/3.6 lineage:
+    // value head j recalls key head (j % heads), matching llama.cpp's qwen35
+    // GGUF encoding. The production dense Qwen3.5 GGUFs (16 k-heads / 32
+    // v-heads → repeats=2) generate coherently through this exact layout
+    // daily, which pins the publisher's row semantics. Do NOT "fix" this to
+    // repeat_interleave: that is the Qwen3-Next/3.8 lineage convention
+    // (qwen38/text.rs repeat_interleave_head_states), and the two pairings are
+    // NOT reconcilable by any weight permutation — each trunk must match its
+    // own generation. Pinned by repeat_head_states_uses_tiled_order; see
+    // tasks/qwen36moe-native-cuda-gibberish-research-2026-10-07.md.
     let expanded = x.unsqueeze(1)?.broadcast_as((batch, repeats, heads, dim))?;
     expanded
         .reshape((batch, repeats * heads, dim))

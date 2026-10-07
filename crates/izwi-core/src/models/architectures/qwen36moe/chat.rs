@@ -1541,4 +1541,176 @@ pub(crate) mod tests {
         let metal_deltas = run(metal_profile);
         assert_eq!(cpu_deltas, metal_deltas, "CPU and Metal must agree");
     }
+
+    /// Physical cache for a REAL checkpoint, built from the model's own
+    /// inference-state contract: one arena layer per paged-attention layer in
+    /// contract order, the contract's preferred page size, and the production
+    /// CUDA KV storage dtype (BF16 — the default policy in
+    /// `Qwen36MoeKvStorageProvider::select`). The fixture `physical_cache`
+    /// helper hardcodes the 4-layer fixture geometry and cannot be reused.
+    #[cfg(feature = "cuda")]
+    fn real_checkpoint_cache(
+        model: &Qwen36MoeChatModel,
+        device: &DeviceProfile,
+        total_tokens: usize,
+    ) -> PhysicalPagedKvCache {
+        use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::KvArena;
+        use crate::kv::v2::StateDomainSpec;
+        use candle_core::DeviceLocation;
+
+        let contract = match model.inference_state_contract().expect("contract") {
+            InferenceStateCapability::Managed(contract) => contract,
+            other => panic!("expected managed contract, got {other:?}"),
+        };
+        let paged = contract
+            .domains
+            .iter()
+            .find_map(|domain| match domain {
+                StateDomainSpec::PagedAttention(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("contract must expose the paged-attention domain");
+        let page_tokens = paged.page_size.preferred_tokens.max(1) as usize;
+        let capacity_pages = total_tokens.div_ceil(page_tokens) + 4;
+        // Production CUDA KV storage policy (BF16 by default; see
+        // Qwen36MoeKvStorageProvider::select).
+        let storage_dtype = DType::BF16;
+        let device_ordinal = match device.device.location() {
+            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+            _ => None,
+        };
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(7777),
+            backend: BackendKind::from(device.kind),
+            device_ordinal,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let layer_specs: Vec<(usize, u32, u32, u32)> = paged
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                (
+                    index,
+                    layer.model_layer as usize,
+                    layer.kv_heads,
+                    layer.key_head_dim,
+                    layer.value_head_dim,
+                )
+            })
+            .collect();
+        let layers: Vec<KvLayerConfig> = layer_specs
+            .iter()
+            .map(|(index, model_layer, kv_heads, key_head_dim, value_head_dim)| KvLayerConfig {
+                binding: KvLayerBinding {
+                    model_layer: *model_layer,
+                    physical_layer: *index,
+                },
+                num_kv_heads: *kv_heads,
+                key_head_dim: *key_head_dim,
+                value_head_dim: *value_head_dim,
+            })
+            .collect();
+        let bindings: Vec<KvLayerBinding> = layer_specs
+            .iter()
+            .map(|(index, model_layer, _, _, _)| KvLayerBinding {
+                model_layer: *model_layer,
+                physical_layer: *index,
+            })
+            .collect();
+        let arena_config = KvArenaConfig {
+            id,
+            group,
+            page_tokens,
+            capacity_pages,
+            growth: None,
+            dtype: storage_dtype,
+            layers,
+        };
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(arena_config, device.device.clone())
+                .expect("CUDA KV arena"),
+        );
+        let blocks = (0..capacity_pages)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).expect("physical cache")
+    }
+
+    /// Real-checkpoint ground truth — the first text-level numerics assertion
+    /// this family has ever had. Every prior test ran synthetic fixtures with
+    /// random weights and self-consistency assertions only, so trunk-numerics
+    /// corruption (the 2026-10-07 H100 multilingual-salad signature: clean
+    /// load, destroyed hidden states) had no executable check. Loads the
+    /// published checkpoint from IZWI_QWEN36_REAL_CHECKPOINT_E2E, generates
+    /// from a fixed English prompt, and fails if the output is not
+    /// overwhelmingly ASCII. Logs the full output either way so a failing
+    /// handoff run doubles as the diagnostic.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn real_checkpoint_generates_ascii_coherent_text_on_cuda() {
+        let Some(dir) = std::env::var("IZWI_QWEN36_REAL_CHECKPOINT_E2E")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("IZWI_QWEN36_REAL_CHECKPOINT_E2E unset; real-checkpoint probe not run");
+            return;
+        };
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Cuda,
+        )
+        .expect("CUDA backend detection");
+        assert!(
+            profile.device.is_cuda(),
+            "real-checkpoint probe requested but no CUDA device is available"
+        );
+        let dir = PathBuf::from(dir.trim());
+        let model = Qwen36MoeChatModel::load(
+            &dir,
+            ModelVariant::Qwen36Moe35BA3BFp8,
+            profile.clone(),
+        )
+        .expect("published checkpoint must load through the production path");
+        let cache = real_checkpoint_cache(&model, &profile, 96);
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "Hello! Please introduce yourself in one short sentence.".to_string(),
+        }];
+        let mut state = model
+            .start_decode_state_physical(&messages, 32, &generation_config(), None, cache)
+            .expect("decode state");
+        let mut text = String::new();
+        for _ in 0..32 {
+            let step = model.decode_step(&mut state).expect("decode step");
+            if step.finished {
+                break;
+            }
+            text.push_str(&step.delta);
+        }
+        eprintln!("real-checkpoint probe output: {text:?}");
+        let total = text.chars().count();
+        let ascii = text.chars().filter(|c| c.is_ascii()).count();
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            ascii as f64 / total as f64
+        };
+        eprintln!("real-checkpoint probe ascii ratio: {ratio:.3} ({ascii}/{total})");
+        assert!(
+            total >= 16,
+            "model produced almost no text ({total} chars): {text:?}"
+        );
+        assert!(
+            ratio >= 0.8,
+            "model output is not ASCII-coherent (ratio {ratio:.3}) — trunk numerics are \
+             corrupted; output: {text:?}"
+        );
+    }
 }
