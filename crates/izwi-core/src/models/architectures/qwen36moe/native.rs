@@ -994,6 +994,57 @@ pub enum Qwen36MoeMtpLoadPolicy {
     Enabled,
 }
 
+/// Explicit field/test opt-in for the qwen36moe MTP load policy. The
+/// performance knob alone must not enable MTP for this family yet: the draft
+/// manifest is still a hypothesis about the published checkpoint, and the
+/// default-on gate it shipped with failed every native load of the real
+/// 35B checkpoint (the MTP layer carries an MoE FFN, not the assumed dense
+/// one — see tasks/qwen36moe-mtp-manifest-drift-research-2026-10-07.md).
+pub const MTP_HANDOFF_ENV: &str = "IZWI_QWEN36_MTP_HANDOFF";
+
+/// Set once the handoff evidence exists: a real-checkpoint census matching
+/// the manifest plus MoE draft-head execution on the target hardware.
+const MTP_MANIFEST_CENSUS_VERIFIED: bool = false;
+
+/// The explicit opt-in half of the MTP gate. Follows the qwen38 policy
+/// boolean grammar; an invalid value is a hard config error rather than a
+/// silent default.
+pub fn mtp_handoff_opt_in() -> Result<bool> {
+    if MTP_MANIFEST_CENSUS_VERIFIED {
+        return Ok(true);
+    }
+    let value = std::env::var(MTP_HANDOFF_ENV).unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(Error::ConfigError(format!(
+            "invalid {MTP_HANDOFF_ENV} value: {other}"
+        ))),
+    }
+}
+
+/// Resolve the MTP load policy from the performance knobs plus the handoff
+/// opt-in. On CUDA the master CUDA switch also gates MTP (mirroring qwen38);
+/// CPU/Metal consult the MTP knob alone. The handoff opt-in is required on
+/// every backend — both the validation and the draft head are unverified
+/// against the published checkpoint until the hardware handoff lands.
+pub fn resolve_mtp_load_policy(
+    backend: BackendKind,
+    performance: &crate::performance::CudaPerformanceConfig,
+) -> Result<Qwen36MoeMtpLoadPolicy> {
+    let knob_enabled = if backend == BackendKind::Cuda {
+        performance.enabled() && performance.mtp.enabled()
+    } else {
+        performance.mtp.enabled()
+    };
+    if knob_enabled && mtp_handoff_opt_in()? {
+        Ok(Qwen36MoeMtpLoadPolicy::Enabled)
+    } else {
+        Ok(Qwen36MoeMtpLoadPolicy::Disabled)
+    }
+}
+
 /// The qwen3.6 MTP draft topology mirrors the published qwen3_5_moe MTP
 /// layer: ONE recurrent decoder layer sharing the target's token embeddings
 /// and LM head, with a dense FFN sized by the MoE intermediate width and the
@@ -3535,6 +3586,54 @@ mod tests {
     }
 
     #[test]
+    fn mtp_load_policy_requires_the_handoff_opt_in() {
+        use crate::performance::{OptimizationMode, PerformanceConfig};
+
+        let _env_guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(MTP_HANDOFF_ENV);
+        let cuda_knobs = PerformanceConfig::default().cuda;
+
+        // Default knobs (Auto everywhere) must not enable MTP for this
+        // family: the draft manifest is unverified until the handoff.
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cuda, &cuda_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cpu, &cuda_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+
+        // The explicit opt-in re-enables it on every backend.
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            std::env::set_var(MTP_HANDOFF_ENV, "1");
+            assert_eq!(
+                resolve_mtp_load_policy(backend, &cuda_knobs).unwrap(),
+                Qwen36MoeMtpLoadPolicy::Enabled,
+                "{backend:?}"
+            );
+        }
+
+        // The knob's explicit off stays authoritative over the opt-in.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut off_knobs = PerformanceConfig::default().cuda;
+        off_knobs.mtp = OptimizationMode::Off;
+        std::env::set_var(MTP_HANDOFF_ENV, "1");
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cpu, &off_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+
+        // Invalid values fail closed naming the variable.
+        std::env::set_var(MTP_HANDOFF_ENV, "maybe");
+        let error = resolve_mtp_load_policy(BackendKind::Cpu, &cuda_knobs).unwrap_err();
+        assert!(error.to_string().contains(MTP_HANDOFF_ENV));
+        std::env::remove_var(MTP_HANDOFF_ENV);
+    }
+
+    #[test]
     fn mtp_quantum_matches_scalar_greedy_decode_token_for_token() {
         use crate::model::ModelVariant;
         use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
@@ -3545,6 +3644,7 @@ mod tests {
         // process environment, and the variable is removed on the way out.
         let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
 
         let write_native_fixture = |tag: &str| {
             let config = forward_config();
@@ -3643,6 +3743,7 @@ mod tests {
             "speculative decode must match scalar greedy decode exactly"
         );
         std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
     }
 
     /// Per-row caches over ONE shared arena with disjoint block windows —
@@ -3711,6 +3812,7 @@ mod tests {
 
         let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
 
         let greedy_config = || ChatGenerationConfig {
             temperature: 0.0,
@@ -3891,6 +3993,7 @@ mod tests {
             "row b envelope decode must match scalar greedy decode"
         );
         std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
         std::fs::remove_dir_all(dir_solo.path()).ok();
         std::fs::remove_dir_all(dir_envelope.path()).ok();
     }
@@ -3902,6 +4005,7 @@ mod tests {
 
         let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
 
         // Row a samples plain; row b adds a repetition penalty — together
         // they exercise the lossless proposal/verify path with and without
@@ -4069,6 +4173,7 @@ mod tests {
             "envelope stochastic decode must be deterministic per seed"
         );
         std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
         std::fs::remove_dir_all(dir.path()).ok();
     }
 
@@ -4079,6 +4184,7 @@ mod tests {
 
         let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
 
         let load = |tag: &str, mtp: bool| {
             let config = forward_config();
@@ -4193,5 +4299,6 @@ mod tests {
             std::fs::remove_dir_all(dir.path()).ok();
         }
         std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
     }
 }
