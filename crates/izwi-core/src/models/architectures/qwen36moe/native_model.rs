@@ -317,8 +317,15 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
     ) -> Result<Qwen36MoeSparseMlp> {
-        let prefix = format!("model.layers.{layer}.mlp");
+        self.moe_ffn_prefix(&format!("model.layers.{layer}.mlp"), geometry, device)
+    }
 
+    fn moe_ffn_prefix(
+        &self,
+        prefix: &str,
+        geometry: &Qwen35MoeFfnGeometry,
+        device: &Device,
+    ) -> Result<Qwen36MoeSparseMlp> {
         // Router: `mlp.gate.weight` is FP8-excluded (BF16 dense) in the
         // published quantization contract, so it rides the dense path.
         let router_canonical = format!("{prefix}.gate.weight");

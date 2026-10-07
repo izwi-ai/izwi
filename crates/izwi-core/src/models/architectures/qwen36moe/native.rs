@@ -3586,6 +3586,57 @@ mod tests {
     }
 
     #[test]
+    fn moe_ffn_prefix_resolves_the_same_block_as_the_trunk_layer() {
+        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::{
+            Qwen36MoeNativeSource, qwen35_text_config_from_native,
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("moe-ffn-prefix-seam");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::PackedQ8_0,
+            ProjectionMaterialization::F32,
+        );
+        let geometry = qwen35_text_config_from_native(&checkpoint.config.text)
+            .moe_ffn
+            .expect("the fixture carries the MoE FFN geometry");
+        let device = candle_core::Device::Cpu;
+
+        let via_layer = source.moe_ffn(0, &geometry, &device).unwrap();
+        let via_prefix = source
+            .moe_ffn_prefix("model.layers.0.mlp", &geometry, &device)
+            .unwrap();
+
+        // Identical source tensors must produce identical forward output —
+        // the seam only changes name resolution, not assembly.
+        let input = candle_core::Tensor::ones(
+            (2, config.text.hidden_size),
+            candle_core::DType::F32,
+            &device,
+        )
+        .unwrap();
+        let a = via_layer.forward(&input).unwrap();
+        let b = via_prefix.forward(&input).unwrap();
+        let drift = (&a - &b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(drift <= 1e-6, "prefix seam drift: {drift}");
+    }
+
+    #[test]
     fn mtp_load_policy_requires_the_handoff_opt_in() {
         use crate::performance::{OptimizationMode, PerformanceConfig};
 

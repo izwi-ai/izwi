@@ -440,6 +440,23 @@ pub(crate) trait Qwen35WeightSource {
         device: &Device,
     ) -> Result<Qwen36MoeSparseMlp>;
 
+    /// Sparse-expert feed-forward weights at an arbitrary logical prefix.
+    /// The MTP draft head builds its FFN under `mtpblk.{layer}.mlp`, which
+    /// sits outside the trunk's `model.layers.{n}` indexing, so sources
+    /// whose name resolution can address that scope override this; the
+    /// default fails closed (a GGUF bundle has no such tensors).
+    fn moe_ffn_prefix(
+        &self,
+        _prefix: &str,
+        _geometry: &Qwen35MoeFfnGeometry,
+        _device: &Device,
+    ) -> Result<Qwen36MoeSparseMlp> {
+        Err(Error::ModelLoadError(
+            "this weight source cannot address an MoE FFN outside the trunk layer indexing"
+                .to_string(),
+        ))
+    }
+
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
 }
