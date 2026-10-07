@@ -2990,6 +2990,241 @@ mod tests {
     }
 
     #[test]
+    fn mtp_manifest_matches_the_published_checkpoint_census() {
+        let config = pinned_config();
+        let plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap();
+
+        // Fold the per-index plan into name-pattern rows: every digit run in
+        // a canonical name (layer, expert) becomes `{}`. All entries sharing
+        // a pattern must agree on kind and shape.
+        fn pattern(name: &str) -> String {
+            let mut out = String::with_capacity(name.len());
+            let mut chars = name.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    out.push_str("{}");
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let mut rows: BTreeMap<String, (ExpectedTensorKind, Vec<usize>, usize)> = BTreeMap::new();
+        for spec in &plan {
+            let entry = rows
+                .entry(pattern(&spec.name))
+                .or_insert_with(|| (spec.kind, spec.shape.clone(), 0));
+            assert_eq!(entry.0, spec.kind, "pattern kind drift at {}", spec.name);
+            assert_eq!(entry.1, spec.shape, "pattern shape drift at {}", spec.name);
+            entry.2 += 1;
+        }
+
+        // Frozen census of the published `mtp.*` scope (Qwen/Qwen3.6-35B-A3B-FP8
+        // safetensors headers, revision 95a723d0, fetched 2026-10-04): 1,560
+        // tensors forming the draft layer's trunk-style contract — the MoE
+        // FFN (BF16 router, block-FP8 routed experts, block-FP8 shared expert
+        // with its BF16 sigmoid gate) plus the gated full-attention set and
+        // the dense draft frame. The original dense-FFN hypothesis shipped
+        // default-on and failed every native load on the H100; fixtures
+        // derived from the plan cannot catch plan-vs-published drift, so the
+        // observed census is pinned here as executable contract.
+        let published: &[(&str, ExpectedTensorKind, &[usize], usize)] = &[
+            (
+                "mtp.fc.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048, 4_096],
+                1,
+            ),
+            ("mtp.norm.weight", ExpectedTensorKind::Dense, &[2_048], 1),
+            (
+                "mtp.layers.{}.input_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.post_attention_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.gate.weight",
+                ExpectedTensorKind::Dense,
+                &[256, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert_gate.weight",
+                ExpectedTensorKind::Dense,
+                &[1, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.v_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.v_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.o_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.o_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                1,
+            ),
+            (
+                "mtp.pre_fc_norm_embedding.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.pre_fc_norm_hidden.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+        ];
+        assert_eq!(rows.len(), published.len(), "pattern-set size");
+        for (name, kind, shape, count) in published {
+            let row = rows
+                .get(*name)
+                .unwrap_or_else(|| panic!("MTP plan has no row for published pattern {name}"));
+            assert_eq!(row.0, *kind, "{name}");
+            assert_eq!(row.1, *shape, "{name}");
+            assert_eq!(row.2, *count, "{name}");
+        }
+        // Every published tensor is accounted exactly once.
+        let total: usize = published.iter().map(|row| row.3).sum();
+        assert_eq!(total, 1_560);
+        assert_eq!(total, plan.len());
+    }
+
+    #[test]
     fn projection_residency_policy_matches_backend_envelopes() {
         let cpu = DeviceProfile::cpu();
         assert_eq!(
