@@ -96,3 +96,14 @@
   Corollary: a fixture generated FROM the plan fn can never catch plan-vs-published
   drift — pin an executable census of the PUBLISHED tensors for every validated
   plan, trunk and MTP alike.
+- A test that asserts on a single request after a state change is a POLL-CADENCE
+  RACE, not a deterministic check: a gateway learns a peer's durable claim and an
+  in-flight invocation's released credit on its own status-poller cadence
+  (90-110% jitter), so a fixed sleep or one-shot assertion races an observation
+  the product never promised synchronously. Assert on the CONVERGED outcome
+  (bounded retry, fail after a generous window), and keep the strict guard: only
+  served-or-shed may be retried, anything else fails immediately. Corollary: a
+  shared/database-side signal is NOT a valid proxy for another process's in-memory
+  registry — a peer's row can be staler than a third party's view, so it cannot
+  gate the race. Diagnose these by running the lane under realistic CPU load
+  (the repo's CI runners are 2 vCPU): an idle machine hid a 1-in-6 flake.
