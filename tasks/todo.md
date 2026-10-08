@@ -20663,3 +20663,32 @@ izwi-server/izwi-serving-worker compile. Hardware handoff remains: set
 IZWI_QWEN36_MTP_HANDOFF=1 on the H100, verify the manifest against the
 downloaded checkpoint headers, run MTP E2E + acceptance-rate evidence,
 then flip MTP_MANIFEST_CENSUS_VERIFIED (native.rs) to true.
+
+# Plan — CI failures fix on qwen36moe-gdn-dtype — 2026-10-08
+
+Address the 3 failing CI gates in run 37626403789 (PR #220):
+1. Repository Hygiene: rustfmt failure in `crates/izwi-core/src/kernels/cuda.rs`.
+2. CUDA Compile (Driverless): `usize` vs `u32` type mismatches in `real_checkpoint_cache` under `feature = "cuda"`.
+3. Cargo Validation (CPU): port collision race in `cargo test -p izwi-server --test fleet_rig`.
+
+- [x] C1: Fix hygiene rustfmt failure in `crates/izwi-core/src/kernels/cuda.rs`
+- [x] C2: Fix type mismatches in `real_checkpoint_cache` in `crates/izwi-core/src/models/architectures/qwen36moe/chat.rs`
+- [x] C3: Fix port collision race and serialize `fleet_rig` integration tests in `crates/izwi-server/tests/fleet_rig.rs` and `scripts/ci/check-backend-truth.sh`
+- [x] Verification: run hygiene, cargo-cpu, and target checks
+
+## Review — 2026-10-08
+
+Three logical commits resolve the three failing CI gates on `qwen36moe-gdn-dtype`:
+
+1. `54b94431` (`style(hygiene): format qwen35 tiled recurrence device suite in cuda.rs`):
+   Formats the newly pinned `qwen35_tiled_recurrence_device_tests` module in
+   `crates/izwi-core/src/kernels/cuda.rs` to satisfy the repository hygiene `rustfmt` gate.
+2. `ee6c44b4` (`fix(qwen36moe): align physical KV layer and block types to u32 in real-checkpoint probe`):
+   Fixes type mismatches (`usize` assigned to `u32` struct fields for `page_tokens`,
+   `capacity_pages`, `model_layer`, `physical_layer`, and `index` in `KvLayerBinding`,
+   `KvArenaConfig`, and `CacheBlockRef`) in `real_checkpoint_cache` in
+   `crates/izwi-core/src/models/architectures/qwen36moe/chat.rs`.
+3. `fcaba5f3` (`fix(fleet_rig): eliminate port collision race in fleet integration tests`):
+   In `crates/izwi-server/tests/fleet_rig.rs`, replaces the blind 800ms sleep in `spawn_gateway`
+   with active `/readyz` polling and early exit detection, and in `scripts/ci/check-backend-truth.sh`,
+   runs `fleet_rig` with `-- --test-threads=1` to eliminate inter-test port race conditions.
