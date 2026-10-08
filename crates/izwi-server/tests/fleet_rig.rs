@@ -106,17 +106,31 @@ async fn spawn_gateway(
     approvals: &[String],
     extra_env: Vec<(&'static str, String)>,
 ) -> GatewayProcess {
+    let client = reqwest::Client::new();
     // The bind-learn-release port probe can lose its port to an unrelated
     // ephemeral connection when many processes spawn concurrently; retry the
     // spawn on the resulting address-in-use boot failure.
-    for attempt in 0..3 {
+    for attempt in 0..5 {
         let mut gateway =
             spawn_gateway_once(gateway_id, fleet_db_path, approvals, extra_env.clone()).await;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        if matches!(gateway.child.try_wait(), Ok(Some(_)))
-            && gateway.stderr_tail().contains("Address already in use")
-        {
-            assert!(attempt < 2, "gateway spawn kept losing its port race");
+        let ready_url = format!("{}/readyz", gateway.base);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut address_in_use = false;
+        while Instant::now() < deadline {
+            if matches!(gateway.child.try_wait(), Ok(Some(_)))
+                && gateway.stderr_tail().contains("Address already in use")
+            {
+                address_in_use = true;
+                break;
+            }
+            if let Ok(response) = client.get(&ready_url).send().await {
+                if response.status().is_success() {
+                    return gateway;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if address_in_use && attempt + 1 < 5 {
             continue;
         }
         return gateway;
