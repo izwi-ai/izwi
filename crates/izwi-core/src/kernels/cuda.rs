@@ -3730,19 +3730,12 @@ mod qwen35_tiled_recurrence_device_tests {
         let values = Tensor::from_vec(values, (1, SEQ, HEADS, VALUE_DIM), &device).unwrap();
         let gates = Tensor::from_vec(gates, (1, SEQ, HEADS), &device).unwrap();
         let betas = Tensor::from_vec(betas, (1, SEQ, HEADS), &device).unwrap();
-        let initial =
-            Tensor::from_vec(initial, (1, HEADS, KEY_DIM, VALUE_DIM), &device).unwrap();
+        let initial = Tensor::from_vec(initial, (1, HEADS, KEY_DIM, VALUE_DIM), &device).unwrap();
         let initial_before = initial.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
 
         for tile_size in [SEQ, 17] {
             let (output, next_state) = try_tiled_deltanet_recurrence(
-                &queries,
-                &keys,
-                &values,
-                &gates,
-                &betas,
-                &initial,
-                tile_size,
+                &queries, &keys, &values, &gates, &betas, &initial, tile_size,
             )
             .unwrap_or_else(|| panic!("tiled recurrence must engage on CUDA (tile {tile_size})"));
             assert_eq!(output.dims(), [1, SEQ, HEADS, VALUE_DIM]);
@@ -3761,7 +3754,11 @@ mod qwen35_tiled_recurrence_device_tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            for (index, (a, e)) in actual_output.iter().zip(expected_outputs.iter()).enumerate() {
+            for (index, (a, e)) in actual_output
+                .iter()
+                .zip(expected_outputs.iter())
+                .enumerate()
+            {
                 assert!(
                     (a - e).abs() <= 1e-2 + e.abs() * 1e-3,
                     "tile {tile_size} output[{index}]: {a} != {e}"
@@ -3776,9 +3773,7 @@ mod qwen35_tiled_recurrence_device_tests {
         }
         let initial_after = initial.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
         assert_eq!(
-            initial_before
-                .to_vec1::<f32>()
-                .unwrap(),
+            initial_before.to_vec1::<f32>().unwrap(),
             initial_after.to_vec1::<f32>().unwrap(),
             "the recurrence must treat the initial state as read-only"
         );
