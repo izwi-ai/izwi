@@ -20676,6 +20676,34 @@ Address the 3 failing CI gates in run 37626403789 (PR #220):
 - [x] C3: Fix port collision race and serialize `fleet_rig` integration tests in `crates/izwi-server/tests/fleet_rig.rs` and `scripts/ci/check-backend-truth.sh`
 - [x] Verification: run hygiene, cargo-cpu, and target checks
 
+# Plan — fleet rig PostgreSQL lane CI failure — 2026-10-08
+
+Run 37814128549 (job 113438246600, commit 9236aaae) failed at
+`Run the fleet rig PostgreSQL lane` with exit code 101. The `fleet_rig_postgres`
+test asserted a single-shot `chat()` returned 200 after terminating every
+PostgreSQL backend; it instead got `503 no fresh, ready worker`.
+
+Root cause (reproduced and confirmed locally): the DINV-06 leg is a poll-cadence
+race, NOT a regression from the previous fix. Two pre-existing races:
+
+1. Claim steering: `sleep(700ms)` then a single `chat()` assumed the gateway
+   notices the rig's claim within 700ms. Under load the poller lags and dispatch
+   lands on the claimed worker.
+2. Outage leg: the steering dispatch leaves worker two mid-invocation (0 credits,
+   1 active). Closing the DB freezes that stale observation in both gateways.
+   With worker one's credit already claimed, selection finds no eligible worker
+   and returns 503.
+
+Proven by bisect: pre-fix commit `6a429f01` fails 1/6 idle and 1/8 under load;
+the shared observation table is NOT a valid proxy for a gateway's registry (a
+peer's row can be staler), so a DB-side settle cannot fix it.
+
+- [x] C4: Replace both single-shot assertions with a bounded-convergence
+      `chat_until` helper (retries only served-or-shed, panics after 30s).
+- [x] Verification: 15/15 idle, 10/10 under realistic CPU load
+      (pre-fix: 1/8); step 8 + step 9 of the fleet-stores job both green;
+      cargo-cpu fleet_rig green; hygiene green; no timing regression (11.8s).
+
 ## Review — 2026-10-08
 
 Three logical commits resolve the three failing CI gates on `qwen36moe-gdn-dtype`:

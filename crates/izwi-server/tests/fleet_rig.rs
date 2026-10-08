@@ -239,6 +239,42 @@ async fn chat(client: &reqwest::Client, base: &str) -> (u16, serde_json::Value) 
     (status, body)
 }
 
+/// Drive chat requests until one satisfies `accept`, retrying on either a shed
+/// (503) or a response the predicate rejects. A gateway learns a peer's durable
+/// claim, and an in-flight invocation's released credit, on its own poller
+/// cadence — so a fixed sleep or a single-shot assertion races that observation
+/// and fails spuriously on a loaded runner. Bounding the retries keeps the lane
+/// deterministic without hiding a genuine failure: a contract that never holds
+/// still panics after the window.
+// Only the `db-postgres`-gated lane drives this helper; the CPU-only build of
+// this file still compiles it.
+#[allow(dead_code)]
+async fn chat_until<F>(
+    client: &reqwest::Client,
+    base: &str,
+    what: &str,
+    accept: F,
+) -> serde_json::Value
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let (status, body) = chat(client, base).await;
+        assert!(
+            status == 200 || status == 503,
+            "{what} must resolve to served-or-shed, never hard-fail, got {status}: {body}"
+        );
+        if status == 200 && accept(&body) {
+            return body;
+        }
+        last = body;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{what} never converged; last response: {last}");
+}
+
 fn response_marker(body: &serde_json::Value) -> String {
     body["choices"][0]["message"]["content"]
         .as_str()
@@ -819,9 +855,13 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
         .await
         .expect("rig claim")
         .expect("the rig holds worker one's only credit");
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let (status, body) = chat(&client, &gateway_b.base).await;
-    assert_eq!(status, 200);
+    let body = chat_until(
+        &client,
+        &gateway_b.base,
+        "dispatch must avoid the claimed worker on PostgreSQL",
+        |body| response_marker(body).contains(WORKER_TWO_MARKER),
+    )
+    .await;
     assert!(
         response_marker(&body).contains(WORKER_TWO_MARKER),
         "dispatch must avoid the claimed worker on PostgreSQL, got {:?}",
@@ -851,11 +891,16 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
         .await
         .ok();
     }
-    let (status, body) = chat(&client, &gateway_a.base).await;
-    assert_eq!(
-        status, 200,
-        "an unreachable coordination store must degrade to uncoordinated dispatch, got {body}"
-    );
+    let body = chat_until(
+        &client,
+        &gateway_a.base,
+        "an unreachable coordination store must degrade to uncoordinated dispatch",
+        |body| {
+            response_marker(body).contains(WORKER_ONE_MARKER)
+                || response_marker(body).contains(WORKER_TWO_MARKER)
+        },
+    )
+    .await;
     assert!(
         response_marker(&body).contains(WORKER_ONE_MARKER)
             || response_marker(&body).contains(WORKER_TWO_MARKER),
