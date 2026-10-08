@@ -1571,8 +1571,9 @@ pub(crate) mod tests {
                 _ => None,
             })
             .expect("contract must expose the paged-attention domain");
-        let page_tokens = paged.page_size.preferred_tokens.max(1) as usize;
-        let capacity_pages = total_tokens.div_ceil(page_tokens) + 4;
+        let page_tokens = paged.page_size.preferred_tokens.max(1);
+        let capacity_pages = u32::try_from(total_tokens.div_ceil(page_tokens as usize) + 4)
+            .expect("capacity pages fit u32");
         // Production CUDA KV storage policy (BF16 by default; see
         // Qwen36MoeKvStorageProvider::select).
         let storage_dtype = DType::BF16;
@@ -1587,14 +1588,14 @@ pub(crate) mod tests {
             generation: 1,
         };
         let group = KvGroupId::new(1);
-        let layer_specs: Vec<(usize, u32, u32, u32)> = paged
+        let layer_specs: Vec<(u32, u32, u32, u32, u32)> = paged
             .layers
             .iter()
             .enumerate()
             .map(|(index, layer)| {
                 (
-                    index,
-                    layer.model_layer as usize,
+                    index as u32,
+                    layer.model_layer,
                     layer.kv_heads,
                     layer.key_head_dim,
                     layer.value_head_dim,
@@ -1603,21 +1604,21 @@ pub(crate) mod tests {
             .collect();
         let layers: Vec<KvLayerConfig> = layer_specs
             .iter()
-            .map(|(index, model_layer, kv_heads, key_head_dim, value_head_dim)| KvLayerConfig {
+            .map(|&(physical_layer, model_layer, kv_heads, key_head_dim, value_head_dim)| KvLayerConfig {
                 binding: KvLayerBinding {
-                    model_layer: *model_layer,
-                    physical_layer: *index,
+                    model_layer,
+                    physical_layer,
                 },
-                num_kv_heads: *kv_heads,
-                key_head_dim: *key_head_dim,
-                value_head_dim: *value_head_dim,
+                num_kv_heads: kv_heads,
+                key_head_dim,
+                value_head_dim,
             })
             .collect();
         let bindings: Vec<KvLayerBinding> = layer_specs
             .iter()
-            .map(|(index, model_layer, _, _, _)| KvLayerBinding {
-                model_layer: *model_layer,
-                physical_layer: *index,
+            .map(|&(physical_layer, model_layer, _, _, _)| KvLayerBinding {
+                model_layer,
+                physical_layer,
             })
             .collect();
         let arena_config = KvArenaConfig {
