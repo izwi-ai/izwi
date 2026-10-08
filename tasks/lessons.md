@@ -87,3 +87,12 @@
   toolchain is installed with `--profile minimal`, and the workspace
   `.cargo/config.toml` travels with the checkout — a python3 rustc-wrapper
   requires python3 in any minimal container image (see the run-191 CUDA fix).
+- A manifest authored by mirroring another family is a HYPOTHESIS, not a contract:
+  fail-closed validation of an unverified manifest must not ship default-on (2nd
+  occurrence of the Oct-4 trunk contract-drift class — this time the MTP manifest
+  took down every native qwen36moe load on the H100). Before enabling manifest
+  validation by default, either census the published checkpoint (HTTP range-request
+  header fetch, no download needed) or gate the feature off until the handoff.
+  Corollary: a fixture generated FROM the plan fn can never catch plan-vs-published
+  drift — pin an executable census of the PUBLISHED tensors for every validated
+  plan, trunk and MTP alike.
