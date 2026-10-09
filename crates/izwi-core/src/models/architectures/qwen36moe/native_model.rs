@@ -8,16 +8,15 @@
 //! backend's persistent residency (CPU packed Q8_0, Metal expanded F16,
 //! CUDA raw block-FP8 with per-tensor Q8_0 fallback).
 
-use std::sync::Arc;
+use candle_core::quantized::QMatMul;
 
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen35::mtp::Qwen35MtpHead;
 use crate::models::architectures::qwen35::text::{
-    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35TextModel, Qwen35WeightSource,
+    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
 };
 use crate::models::architectures::qwen38::native::ProjectionMaterialization;
 use crate::models::architectures::qwen36moe::native::{
@@ -41,6 +40,41 @@ fn canonical_name(logical: &str) -> Option<String> {
     }
     if first == "output_norm" {
         return Some("model.norm.weight".into());
+    }
+    // The MTP draft head reuses the trunk's own loaders through a virtual
+    // block prefix: `mtpblk.{layer}.{logical}` resolves to the checkpoint's
+    // `mtp.layers.{layer}.*` (or layer-free `mtp.*`) names. Same suffix
+    // conventions as the text mapping so Qwen35FullAttention/Qwen35Mlp load
+    // the draft layer exactly like a trunk layer.
+    if first == "mtpblk" {
+        let layer: usize = parts.next()?.parse().ok()?;
+        let suffix = parts.collect::<Vec<_>>().join(".");
+        let canonical_suffix = match suffix.as_str() {
+            "attn_q.weight" => "self_attn.q_proj.weight".to_string(),
+            "attn_k.weight" => "self_attn.k_proj.weight".to_string(),
+            "attn_v.weight" => "self_attn.v_proj.weight".to_string(),
+            "attn_output.weight" => "self_attn.o_proj.weight".to_string(),
+            "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
+            "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
+            "attn_norm.weight" => "input_layernorm.weight".to_string(),
+            "post_attention_norm.weight" => "post_attention_layernorm.weight".to_string(),
+            "ffn_gate.weight" => "mlp.gate_proj.weight".to_string(),
+            "ffn_up.weight" => "mlp.up_proj.weight".to_string(),
+            "ffn_down.weight" => "mlp.down_proj.weight".to_string(),
+            "mtp_fc.weight" => "fc.weight".to_string(),
+            "mtp_norm.weight" => "norm.weight".to_string(),
+            "mtp_pre_fc_norm_embedding.weight" => "pre_fc_norm_embedding.weight".to_string(),
+            "mtp_pre_fc_norm_hidden.weight" => "pre_fc_norm_hidden.weight".to_string(),
+            other => return Some(format!("mtp.layers.{layer}.{other}")),
+        };
+        // Layer-free tensors (fc, norms) live directly under `mtp.`.
+        if matches!(
+            suffix.as_str(),
+            "mtp_fc.weight" | "mtp_norm.weight" | "mtp_pre_fc_norm_embedding.weight" | "mtp_pre_fc_norm_hidden.weight"
+        ) {
+            return Some(format!("mtp.{canonical_suffix}"));
+        }
+        return Some(format!("mtp.layers.{layer}.{canonical_suffix}"));
     }
     if first != "blk" {
         return None;
@@ -79,12 +113,44 @@ pub(crate) struct Qwen36MoeNativeSource<'a> {
 }
 
 impl<'a> Qwen36MoeNativeSource<'a> {
+    /// Test seam: build the source under an explicit residency/dense plan so
+    /// a backend's dtype plan (CUDA, Metal) can be executed end-to-end on the
+    /// CPU device, where candle's dtype checks are identical to — and louder
+    /// than — the accelerator backends'. The production constructor derives
+    /// both fields from the device profile instead.
+    #[cfg(test)]
+    pub(crate) fn for_plan_tests(
+        checkpoint: &'a Qwen36MoeNativeCheckpoint,
+        residency: Qwen36MoeProjectionResidency,
+        dense_target: ProjectionMaterialization,
+    ) -> Self {
+        Self {
+            checkpoint,
+            residency,
+            dense_target,
+        }
+    }
+
     pub(crate) fn new(
         checkpoint: &'a Qwen36MoeNativeCheckpoint,
         device_profile: &DeviceProfile,
     ) -> Self {
-        let residency =
-            Qwen36MoeNativeCheckpoint::projection_residency_policy(device_profile);
+        Self::new_with_performance(
+            checkpoint,
+            device_profile,
+            &crate::performance::CudaPerformanceConfig::default(),
+        )
+    }
+
+    pub(crate) fn new_with_performance(
+        checkpoint: &'a Qwen36MoeNativeCheckpoint,
+        device_profile: &DeviceProfile,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Self {
+        let residency = Qwen36MoeNativeCheckpoint::projection_residency_policy_with_performance(
+            BackendKind::from(device_profile.kind),
+            performance,
+        );
         let dense_target = match BackendKind::from(device_profile.kind) {
             BackendKind::Cpu => ProjectionMaterialization::F32,
             BackendKind::Metal => ProjectionMaterialization::F16,
@@ -103,6 +169,19 @@ impl<'a> Qwen36MoeNativeSource<'a> {
                 "qwen36moe native checkpoint has no mapping for trunk tensor `{logical}`"
             ))
         })?;
+        if canonical.starts_with("mtp.") {
+            // MTP tensors resolve identity-named against the raw index; the
+            // manifest supplies the expected tensor kind.
+            let info = self.checkpoint.tensors.tensor_info(&canonical)?;
+            let kind = self
+                .checkpoint
+                .mtp_plan
+                .iter()
+                .find(|spec| spec.name == canonical)
+                .map(|spec| spec.kind)
+                .unwrap_or(ExpectedTensorKind::Dense);
+            return Ok((canonical, info.shape.clone(), kind));
+        }
         let raw = self.checkpoint.raw_tensor_name(&canonical)?;
         let info = self.checkpoint.tensors.tensor_info(raw)?;
         Ok((canonical, info.shape.clone(), tensor_kind(&info.dtype)))
@@ -136,22 +215,15 @@ impl<'a> Qwen36MoeNativeSource<'a> {
         Ok(tensor)
     }
 
-    fn wrap_dense_projection(
-        tensor: Tensor,
-        residency: Qwen36MoeProjectionResidency,
-    ) -> Result<Qwen35Projection> {
-        let ggml_dtype = match residency {
-            Qwen36MoeProjectionResidency::PackedQ8_0 => GgmlDType::F32,
-            Qwen36MoeProjectionResidency::ExpandedF16 => GgmlDType::F16,
-            Qwen36MoeProjectionResidency::ExpandedBf16 | Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback => {
-                GgmlDType::BF16
-            }
-            Qwen36MoeProjectionResidency::ExpandedF32 => GgmlDType::F32,
-        };
-        let quantized = QTensor::quantize(&tensor, ggml_dtype).map_err(Error::from)?;
-        Ok(Qwen35Projection::Quantized(
-            QMatMul::from_arc(Arc::new(quantized)).map_err(Error::from)?,
-        ))
+    fn wrap_dense_projection(tensor: Tensor) -> Result<Qwen35Projection> {
+        // The materialized tensor already carries the plan's dtype (F32 CPU,
+        // F16 Metal, BF16 CUDA). A quantized-nn-style QTensor round-trip
+        // would silently upcast it: candle's QTensor::dequantize is F32-only
+        // for every GGML dtype, so the BF16/F16 residencies turned into F32
+        // weights and broke the non-F32 activation graphs at the first
+        // matmul. Keep the tensor directly; QMatMul's Tensor branch matmuls
+        // in the weight's dtype, which matches the plan's activations.
+        Ok(Qwen35Projection::Quantized(QMatMul::Tensor(tensor)))
     }
 }
 
@@ -191,7 +263,7 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
                 device,
                 self.dense_target,
             )?;
-            return Self::wrap_dense_projection(tensor, self.residency);
+            return Self::wrap_dense_projection(tensor);
         }
         match self.checkpoint.materialize_projection(
             &canonical,
@@ -200,9 +272,7 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
             self.residency,
         )? {
             Qwen36MoeProjection::Packed(qmatmul) => Ok(Qwen35Projection::Quantized(qmatmul)),
-            Qwen36MoeProjection::Dense(tensor) => {
-                Self::wrap_dense_projection(tensor, self.residency)
-            }
+            Qwen36MoeProjection::Dense(tensor) => Self::wrap_dense_projection(tensor),
             Qwen36MoeProjection::CompactFp8(raw) => Ok(Qwen35Projection::CompactFp8 {
                 weights: raw.weights,
                 scales: raw.scales,
@@ -210,16 +280,35 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         }
     }
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
-        let tensor = self.materialize_dense_weight(name, device)?;
-        let quantized = QTensor::quantize(&tensor, GgmlDType::F32).map_err(Error::from)?;
-        RmsNorm::from_qtensor(quantized, eps).map_err(Error::from)
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm> {
+        // Candle's rmsnorm op requires x and weight in the same dtype on
+        // every backend, and the trunk's activations carry the dense
+        // target's dtype (BF16 CUDA, F16 Metal, F32 CPU). quantized_nn's
+        // RmsNorm always dequantizes its weight to F32, so a BF16/F16
+        // activation plan would die at the first norm — on CUDA through
+        // Map2's "dtype mismatch in binary op". Keep the materialized
+        // activation-dtype tensor instead; the checkpoint stores these
+        // weights in that same dtype, so nothing is requantized.
+        Ok(Qwen35RmsNorm::new(
+            self.materialize_dense_weight(name, device)?,
+            eps,
+        ))
     }
 
-    fn dense(&self, name: &str, _dtype: Option<DType>, device: &Device) -> Result<Tensor> {
-        // Native dense math tensors (norms, DeltaNet in-proj/conv, dt_bias,
-        // A_log) always materialize through the per-backend dense target.
-        self.materialize_dense_weight(name, device)
+    fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {
+        // Native dense math tensors (DeltaNet dt_bias/conv/A_log, ssm norm)
+        // materialize through the per-backend dense target, then honor the
+        // trunk's requested dtype: the DeltaNet math is pinned to F32 so it
+        // matches the F32 state arena under every residency plan (the
+        // per-backend targets otherwise hand back BF16 on CUDA and F16 on
+        // Metal).
+        let tensor = self.materialize_dense_weight(name, device)?;
+        match dtype {
+            Some(target) if tensor.dtype() != target => {
+                tensor.to_dtype(target).map_err(Error::from)
+            }
+            _ => Ok(tensor),
+        }
     }
 
     fn moe_ffn(
@@ -228,7 +317,31 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
     ) -> Result<Qwen36MoeSparseMlp> {
-        let prefix = format!("model.layers.{layer}.mlp");
+        self.moe_ffn_prefix(&format!("model.layers.{layer}.mlp"), geometry, device)
+    }
+
+    fn moe_ffn_prefix(
+        &self,
+        prefix: &str,
+        geometry: &Qwen35MoeFfnGeometry,
+        device: &Device,
+    ) -> Result<Qwen36MoeSparseMlp> {
+        // The MoE body below addresses canonical checkpoint names directly.
+        // The MTP head passes the logical `mtpblk.{n}.mlp` prefix, so
+        // translate it once through the same name mapping the other draft
+        // loaders use; trunk callers already pass canonical prefixes.
+        let prefix = match prefix.strip_prefix("mtpblk.") {
+            Some(rest) => canonical_name(&format!("mtpblk.{rest}.gate.weight"))
+                .ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "qwen36moe weight source cannot resolve the MoE FFN prefix `{prefix}`"
+                    ))
+                })?
+                .strip_suffix(".gate.weight")
+                .expect("mapped MTP router name keeps the router suffix")
+                .to_string(),
+            None => prefix.to_string(),
+        };
 
         // Router: `mlp.gate.weight` is FP8-excluded (BF16 dense) in the
         // published quantization contract, so it rides the dense path.
@@ -368,9 +481,33 @@ pub(crate) fn load_text_model_native(
     checkpoint: &Qwen36MoeNativeCheckpoint,
     device_profile: &DeviceProfile,
     device: &Device,
-) -> Result<(crate::models::architectures::qwen35::chat::Qwen35TextConfig, Qwen35TextModel)> {
+    performance: &crate::performance::CudaPerformanceConfig,
+    mtp_enabled: bool,
+) -> Result<(
+    crate::models::architectures::qwen35::chat::Qwen35TextConfig,
+    Qwen35TextModel,
+    Option<Qwen35MtpHead>,
+)> {
     let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-    let source = Qwen36MoeNativeSource::new(checkpoint, device_profile);
+    let source = Qwen36MoeNativeSource::new_with_performance(checkpoint, device_profile, performance);
     let model = Qwen35TextModel::load_with_source(&source, &text_config, device)?;
-    Ok((text_config, model))
+    let mtp_head = if mtp_enabled {
+        checkpoint
+            .mtp
+            .as_ref()
+            .ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Qwen3.5/3.6-MoE MTP enabled but the draft manifest was not validated".into(),
+                )
+            })?;
+        Some(Qwen35MtpHead::load_via(
+            &source,
+            &text_config,
+            device,
+            performance.mtp_draft_tokens,
+        )?)
+    } else {
+        None
+    };
+    Ok((text_config, model, mtp_head))
 }

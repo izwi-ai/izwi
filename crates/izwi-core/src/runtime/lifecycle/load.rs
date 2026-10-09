@@ -1297,7 +1297,7 @@ impl ModelLifecycleController {
                 let estimate = qwen36moe_memory::synthetic_fixture_estimate(model_path)?;
                 return Ok(model_resource_plan(backend, estimate));
             }
-            return qwen36moe_memory::resource_plan(backend);
+            return qwen36moe_memory::resource_plan(backend, &self.config.performance);
         }
         if variant == ModelVariant::FishAudioS2Pro {
             let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(

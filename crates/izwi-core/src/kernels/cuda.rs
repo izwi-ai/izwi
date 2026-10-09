@@ -3604,3 +3604,178 @@ mod qwen38_dtype_device_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod qwen35_tiled_recurrence_device_tests {
+    use super::*;
+
+    fn pseudo_random(seed: u64) -> f32 {
+        // Deterministic LCG in [-1, 1).
+        let state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (((state >> 33) as i64 & 0xfffff) as f32 / 0xfffff as f32) * 2.0 - 1.0
+    }
+
+    /// Gated delta rule over a sequence, mirroring the qwen35 production
+    /// data flow: queries/keys arrive l2-normalized (eps 1e-6, applied by the
+    /// trunk before dispatch), decay gates arrive raw, and the query is
+    /// scaled by 1/sqrt(key_dim) at output. Decay is applied before the
+    /// recall, and the output reads the UPDATED state — the FLA convention.
+    fn delta_rule_sequence_reference(
+        queries: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        gates: &[f32],
+        betas: &[f32],
+        initial: &[f32],
+        seq: usize,
+        heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut state = initial.to_vec();
+        let mut outputs = vec![0f32; seq * heads * value_dim];
+        let query_scale = 1.0 / (key_dim as f32).sqrt();
+        for token in 0..seq {
+            for head in 0..heads {
+                let token_head = token * heads + head;
+                let decay = gates[token_head].exp();
+                let beta = betas[token_head];
+                let q_base = token_head * key_dim;
+                let k_base = token_head * key_dim;
+                let v_base = token_head * value_dim;
+                let s_base = head * key_dim * value_dim;
+                for value_idx in 0..value_dim {
+                    let mut recalled = 0f32;
+                    for key_idx in 0..key_dim {
+                        recalled += keys[k_base + key_idx]
+                            * (decay * state[s_base + key_idx * value_dim + value_idx]);
+                    }
+                    let delta = (values[v_base + value_idx] - recalled) * beta;
+                    for key_idx in 0..key_dim {
+                        let state_idx = s_base + key_idx * value_dim + value_idx;
+                        let next = decay * state[state_idx] + keys[k_base + key_idx] * delta;
+                        state[state_idx] = next;
+                        outputs[token_head * value_dim + value_idx] +=
+                            queries[q_base + key_idx] * query_scale * next;
+                    }
+                }
+            }
+        }
+        (outputs, state)
+    }
+
+    /// The qwen35 prefill tiled DeltaNet recurrence is the one qwen35-specific
+    /// fused kernel with zero prior hardware coverage: qwen38's production CUDA
+    /// path uses its own kernels, and every qwen35 test runs the portable
+    /// fallback on CPU fixtures. This pins the kernel against an independent
+    /// delta-rule reference at the REAL qwen36moe geometry (32 heads,
+    /// 128x128, multi-tile sequence), through both the single-call and the
+    /// chunked tiling paths (see
+    /// tasks/qwen36moe-native-cuda-gibberish-research-2026-10-07.md).
+    #[test]
+    fn tiled_recurrence_sequence_matches_delta_rule_reference_at_trunk_geometry() {
+        let Some(device) = cuda_test_device() else {
+            return;
+        };
+        const HEADS: usize = 32;
+        const KEY_DIM: usize = 128;
+        const VALUE_DIM: usize = 128;
+        const SEQ: usize = 96;
+
+        let mut queries = vec![0f32; SEQ * HEADS * KEY_DIM];
+        let mut keys = vec![0f32; SEQ * HEADS * KEY_DIM];
+        for token in 0..SEQ {
+            for head in 0..HEADS {
+                let base = (token * HEADS + head) * KEY_DIM;
+                let (mut q_norm, mut k_norm) = (0f32, 0f32);
+                for key_idx in 0..KEY_DIM {
+                    let q = pseudo_random((base + key_idx) as u64);
+                    let k = pseudo_random(((base + key_idx) as u64).wrapping_add(0x9E37));
+                    queries[base + key_idx] = q;
+                    keys[base + key_idx] = k;
+                    q_norm += q * q;
+                    k_norm += k * k;
+                }
+                q_norm = (q_norm + 1e-6).sqrt();
+                k_norm = (k_norm + 1e-6).sqrt();
+                for key_idx in 0..KEY_DIM {
+                    queries[base + key_idx] /= q_norm;
+                    keys[base + key_idx] /= k_norm;
+                }
+            }
+        }
+        let values: Vec<f32> = (0..SEQ * HEADS * VALUE_DIM)
+            .map(|i| pseudo_random(i as u64) * 0.5)
+            .collect();
+        // Production gate ranges: decay g <= 0 (softplus times a <= 0) and
+        // beta = sigmoid in (0, 1).
+        let gates: Vec<f32> = (0..SEQ * HEADS)
+            .map(|i| -pseudo_random((i as u64).wrapping_add(0xBEEF)).abs() - 0.01)
+            .collect();
+        let betas: Vec<f32> = (0..SEQ * HEADS)
+            .map(|i| 0.5 + pseudo_random((i as u64).wrapping_add(0xCAFE)) * 0.45)
+            .collect();
+        let initial: Vec<f32> = (0..HEADS * KEY_DIM * VALUE_DIM)
+            .map(|i| pseudo_random((i as u64).wrapping_add(0xF00D)) * 0.1)
+            .collect();
+
+        let (expected_outputs, expected_state) = delta_rule_sequence_reference(
+            &queries, &keys, &values, &gates, &betas, &initial, SEQ, HEADS, KEY_DIM, VALUE_DIM,
+        );
+
+        let queries = Tensor::from_vec(queries, (1, SEQ, HEADS, KEY_DIM), &device).unwrap();
+        let keys = Tensor::from_vec(keys, (1, SEQ, HEADS, KEY_DIM), &device).unwrap();
+        let values = Tensor::from_vec(values, (1, SEQ, HEADS, VALUE_DIM), &device).unwrap();
+        let gates = Tensor::from_vec(gates, (1, SEQ, HEADS), &device).unwrap();
+        let betas = Tensor::from_vec(betas, (1, SEQ, HEADS), &device).unwrap();
+        let initial = Tensor::from_vec(initial, (1, HEADS, KEY_DIM, VALUE_DIM), &device).unwrap();
+        let initial_before = initial.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+
+        for tile_size in [SEQ, 17] {
+            let (output, next_state) = try_tiled_deltanet_recurrence(
+                &queries, &keys, &values, &gates, &betas, &initial, tile_size,
+            )
+            .unwrap_or_else(|| panic!("tiled recurrence must engage on CUDA (tile {tile_size})"));
+            assert_eq!(output.dims(), [1, SEQ, HEADS, VALUE_DIM]);
+            assert_eq!(next_state.dims(), [1, HEADS, KEY_DIM, VALUE_DIM]);
+            let actual_output = output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let actual_state = next_state
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            for (index, (a, e)) in actual_output
+                .iter()
+                .zip(expected_outputs.iter())
+                .enumerate()
+            {
+                assert!(
+                    (a - e).abs() <= 1e-2 + e.abs() * 1e-3,
+                    "tile {tile_size} output[{index}]: {a} != {e}"
+                );
+            }
+            for (index, (a, e)) in actual_state.iter().zip(expected_state.iter()).enumerate() {
+                assert!(
+                    (a - e).abs() <= 1e-2 + e.abs() * 1e-3,
+                    "tile {tile_size} state[{index}]: {a} != {e}"
+                );
+            }
+        }
+        let initial_after = initial.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        assert_eq!(
+            initial_before.to_vec1::<f32>().unwrap(),
+            initial_after.to_vec1::<f32>().unwrap(),
+            "the recurrence must treat the initial state as read-only"
+        );
+    }
+}

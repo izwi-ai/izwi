@@ -3,7 +3,6 @@ use std::sync::Arc;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding};
 use candle_core::quantized::QMatMul;
-use candle_transformers::quantized_nn::RmsNorm;
 
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -36,9 +35,16 @@ pub struct Qwen35TextModel {
     device: Device,
     token_embeddings: Embedding,
     layers: Vec<Qwen35Layer>,
-    output_norm: RmsNorm,
+    output_norm: Qwen35RmsNorm,
     output: Qwen35Projection,
     finite_diagnostics_enabled: bool,
+}
+
+/// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
+/// pair rebuild consumes them) plus the optional final-row logits.
+pub(crate) struct Qwen35PrefillSpanOutput {
+    pub hidden_states: Tensor,
+    pub logits: Option<Tensor>,
 }
 
 #[derive(Clone)]
@@ -260,6 +266,17 @@ impl ConvRingState {
                 self.next_idx
             )));
         }
+        // The ring holds the conv state arena's F32 dtype for the whole
+        // session; an incoming projection in another dtype would poison the
+        // ring with mixed-dtype slots that later `cat`/multiply fail on.
+        let slot_dtype = self.slots[self.next_idx].dtype();
+        if current.dtype() != slot_dtype {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 convolution ring dtype drift: ring {:?}, incoming {:?}",
+                slot_dtype,
+                current.dtype()
+            )));
+        }
         self.slots[self.next_idx] = current.clone();
         self.next_idx = (self.next_idx + 1) % self.slots.len();
         Ok(())
@@ -276,9 +293,9 @@ enum Qwen35LayerRuntimeState {
 }
 
 struct Qwen35Layer {
-    attn_norm: RmsNorm,
+    attn_norm: Qwen35RmsNorm,
     mixer: Qwen35Mixer,
-    post_attention_norm: RmsNorm,
+    post_attention_norm: Qwen35RmsNorm,
     ffn: Qwen35FeedForward,
 }
 
@@ -287,19 +304,19 @@ enum Qwen35Mixer {
     Full(Qwen35FullAttention),
 }
 
-struct Qwen35Mlp {
+pub(crate) struct Qwen35Mlp {
     gate: Qwen35Projection,
     up: Qwen35Projection,
     down: Qwen35Projection,
 }
 
-struct Qwen35FullAttention {
+pub(crate) struct Qwen35FullAttention {
     q_proj: Qwen35Projection,
     k_proj: Qwen35Projection,
     v_proj: Qwen35Projection,
     o_proj: Qwen35Projection,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    q_norm: Qwen35RmsNorm,
+    k_norm: Qwen35RmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -334,6 +351,32 @@ struct Qwen35LinearAttention {
 struct Qwen35GatedRmsNorm {
     weight: Tensor,
     eps: f64,
+}
+
+/// RMS norm over the shared trunk's own weight tensor.
+///
+/// `quantized_nn::RmsNorm` always dequantizes its weight to F32, which
+/// breaks every plan whose activations are not F32: candle's rmsnorm op
+/// requires x and weight in the same dtype on all backends, and a mixed
+/// pair dies inside the op (on CUDA through Map2's "dtype mismatch in
+/// binary op"). Sources therefore hand over the weight already materialized
+/// in the plan's activation dtype (BF16 CUDA, F16 Metal, F32 CPU/GGUF).
+#[derive(Debug, Clone)]
+pub(crate) struct Qwen35RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl Qwen35RmsNorm {
+    pub(crate) fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+}
+
+impl Module for Qwen35RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+    }
 }
 
 /// Sparse-expert feed-forward geometry shared by every layer of a
@@ -383,7 +426,7 @@ pub(crate) trait Qwen35WeightSource {
 
     fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection>;
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm>;
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm>;
 
     /// Dense tensor, coerced to `dtype` when requested (always F32 when
     /// `Some(F32)`).
@@ -396,6 +439,23 @@ pub(crate) trait Qwen35WeightSource {
         geometry: &Qwen35MoeFfnGeometry,
         device: &Device,
     ) -> Result<Qwen36MoeSparseMlp>;
+
+    /// Sparse-expert feed-forward weights at an arbitrary logical prefix.
+    /// The MTP draft head builds its FFN under `mtpblk.{layer}.mlp`, which
+    /// sits outside the trunk's `model.layers.{n}` indexing, so sources
+    /// whose name resolution can address that scope override this; the
+    /// default fails closed (a GGUF bundle has no such tensors).
+    fn moe_ffn_prefix(
+        &self,
+        _prefix: &str,
+        _geometry: &Qwen35MoeFfnGeometry,
+        _device: &Device,
+    ) -> Result<Qwen36MoeSparseMlp> {
+        Err(Error::ModelLoadError(
+            "this weight source cannot address an MoE FFN outside the trunk layer indexing"
+                .to_string(),
+        ))
+    }
 
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
@@ -424,7 +484,7 @@ impl Qwen35WeightSource for GgufSource<'_> {
         )?))
     }
 
-    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
+    fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm> {
         load_rms_norm(self.loader, device, name, eps)
     }
 
@@ -555,6 +615,11 @@ impl Qwen35TextModel {
         })
     }
 
+    /// The device the trunk (and any MTP head) executes on.
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn new_state(&self) -> Qwen35TextRuntimeState {
         Qwen35TextRuntimeState {
             layers: self.layers.iter().map(Qwen35Layer::new_state).collect(),
@@ -586,10 +651,30 @@ impl Qwen35TextModel {
         state: &mut Qwen35TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let hidden =
+            self.forward_token_id_hidden_at_physical(token_id, position_ids, state, cache)?;
+        self.forward_hidden_to_logits(&hidden)
+    }
+
+    /// Forward one token and return its PRE-norm hidden — the MTP
+    /// verification pass derives both the logits (`project_hidden_span`)
+    /// and the post-`output_norm` hidden (`normalize_hidden`) from it.
+    pub(crate) fn forward_token_id_hidden_at_physical(
+        &self,
+        token_id: u32,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
         let hidden = self.token_embeddings.forward(&input)?;
-        let hidden = self.forward_hidden_physical(&hidden, &[position_ids], state, cache)?;
-        self.forward_hidden_to_logits(&hidden)
+        self.forward_hidden_physical(&hidden, &[position_ids], state, cache)
+    }
+
+    /// Apply the trunk's `output_norm` — the MTP pair consumes the
+    /// post-norm hidden while logits flow through the LM head directly.
+    pub(crate) fn normalize_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.output_norm.forward(hidden).map_err(Error::from)
     }
 
     pub(crate) fn forward_token_ids_batch_at_physical(
@@ -758,6 +843,45 @@ impl Qwen35TextModel {
         self.forward_hidden_to_logits(&hidden)
     }
 
+    /// Prefill one span and return every row's PRE-`output_norm` hidden plus,
+    /// when requested, the final row's logits. Replay spans rebuild the MTP
+    /// draft domain from the hidden rows; ordinary prefill ignores them.
+    pub(crate) fn prefill_token_ids_with_hidden_physical(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        compute_logits: bool,
+    ) -> Result<Qwen35PrefillSpanOutput> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 replay prefill requires a non-empty span".into(),
+            ));
+        }
+        if token_ids.len() != position_ids.len() {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 replay prefill span mismatch: {} token ids for {} position ids",
+                token_ids.len(),
+                position_ids.len()
+            )));
+        }
+        record_prefill_sequence_span(token_ids.len());
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        let hidden = self.token_embeddings.forward(&input)?;
+        let hidden_states = self.forward_hidden_physical(&hidden, position_ids, state, cache)?;
+        let logits = if compute_logits {
+            let last = hidden_states.narrow(1, token_ids.len() - 1, 1)?;
+            Some(self.forward_hidden_to_logits(&last)?)
+        } else {
+            None
+        };
+        Ok(Qwen35PrefillSpanOutput {
+            hidden_states,
+            logits,
+        })
+    }
+
     pub(crate) fn prefill_input_embeddings_physical(
         &self,
         input_embeddings: &Tensor,
@@ -863,7 +987,21 @@ impl Qwen35TextModel {
             .map_err(Error::from)
     }
 
-    fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
+    /// Embed one token row: `[1, 1, hidden]` in the embedding table's dtype.
+    /// The MTP draft head reuses the target embeddings for its continuations.
+    pub(crate) fn embed_token_ids(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), &self.device)?;
+        self.token_embeddings.forward(&input).map_err(Error::from)
+    }
+
+    /// Project post-norm trunk hidden states through the raw LM head — no
+    /// `output_norm`. The MTP draft head shares the target's LM head exactly
+    /// this way: its outputs are already normalized by `mtp.norm`.
+    pub(crate) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.output.forward(hidden)
+    }
+
+    pub(crate) fn project_hidden_span(&self, hidden: &Tensor) -> Result<Tensor> {
         let hidden = self.output_norm.forward(hidden)?;
         validate_qwen35_finite_tensor(
             &hidden,
@@ -888,6 +1026,90 @@ impl Qwen35TextModel {
                 state.layers.len(),
                 self.layers.len()
             )));
+        }
+        Ok(())
+    }
+}
+
+/// One linear layer's deep-copied runtime state — the restore unit for
+/// MTP verification rollback. Tensors are small (conv history slots plus
+/// one recurrent matrix) and cloned with independent storage.
+#[derive(Clone)]
+pub(crate) struct Qwen35LinearStateSnapshot {
+    conv_slots: Vec<Tensor>,
+    recurrent: Option<Tensor>,
+}
+
+impl Qwen35TextRuntimeState {
+    /// Deep-copy every linear layer's runtime state. Used by the MTP verify
+    /// pass: one snapshot per verify position bounds the rollback unit.
+    pub(crate) fn snapshot_linear_states(&self) -> Result<Vec<Qwen35LinearStateSnapshot>> {
+        self.layers
+            .iter()
+            .map(|layer| match layer {
+                Qwen35LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => {
+                    let conv_slots = match conv_state {
+                        Some(ring) => ring
+                            .slots
+                            .iter()
+                            .map(deep_copy_tensor_storage)
+                            .collect::<candle_core::Result<Vec<_>>>()?,
+                        None => Vec::new(),
+                    };
+                    let recurrent = match recurrent_state {
+                        Some(tensor) => Some(deep_copy_tensor_storage(tensor)?),
+                        None => None,
+                    };
+                    Ok(Qwen35LinearStateSnapshot {
+                        conv_slots,
+                        recurrent,
+                    })
+                }
+                Qwen35LayerRuntimeState::Full => Ok(Qwen35LinearStateSnapshot {
+                    conv_slots: Vec::new(),
+                    recurrent: None,
+                }),
+            })
+            .collect()
+    }
+
+    /// Restore linear states from a snapshot, replacing current tensors with
+    /// freshly detached copies so the snapshot stays reusable.
+    pub(crate) fn restore_linear_states(
+        &mut self,
+        snapshot: &[Qwen35LinearStateSnapshot],
+    ) -> Result<()> {
+        if snapshot.len() != self.layers.len() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 linear state snapshot covers {} layers, state has {}",
+                snapshot.len(),
+                self.layers.len()
+            )));
+        }
+        for (layer, snap) in self.layers.iter_mut().zip(snapshot) {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            else {
+                continue;
+            };
+            if let Some(ring) = conv_state.as_mut() {
+                if ring.slots.len() == snap.conv_slots.len() {
+                    ring.slots = snap
+                        .conv_slots
+                        .iter()
+                        .map(deep_copy_tensor_storage)
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+                    ring.next_idx = 0;
+                }
+            }
+            if let Some(snapshot_tensor) = &snap.recurrent {
+                *recurrent_state = Some(deep_copy_tensor_storage(snapshot_tensor)?);
+            }
         }
         Ok(())
     }
@@ -1047,7 +1269,7 @@ impl Qwen35Layer {
 }
 
 impl Qwen35Mlp {
-    fn load_via(
+    pub(crate) fn load_via(
         source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
@@ -1059,7 +1281,7 @@ impl Qwen35Mlp {
         })
     }
 
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
         let gate_proj_out = self.gate.forward(hidden_states)?;
         let up_proj_out = self.up.forward(hidden_states)?;
@@ -1076,7 +1298,7 @@ impl Qwen35Mlp {
 }
 
 impl Qwen35FullAttention {
-    fn load_via(
+    pub(crate) fn load_via(
         source: &dyn Qwen35WeightSource,
         device: &Device,
         prefix: &str,
@@ -1117,7 +1339,7 @@ impl Qwen35FullAttention {
         })
     }
 
-    fn forward_physical(
+    pub(crate) fn forward_physical(
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],
@@ -1194,7 +1416,7 @@ impl Qwen35FullAttention {
         self.o_proj.forward(&output)
     }
 
-    fn forward_physical_decode_batch(
+    pub(crate) fn forward_physical_decode_batch(
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],
@@ -1561,10 +1783,26 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        // The DeltaNet block computes in F32 regardless of the trunk
+        // activation dtype: the recurrent/conv state arena, the softplus
+        // decay gates, and every fused CUDA kernel (causal conv, tiled
+        // DeltaNet recurrence, gated delta decode, gated RMS norm) are
+        // F32-only, while activations may be BF16/F16 under the CUDA/Metal
+        // native plans. Upcast at entry, downcast before `out_proj` — the
+        // same contract the qwen3.8 DeltaNet applies. Without the island a
+        // CUDA forward fails inside the conv/recurrence with candle's
+        // "dtype mismatch in binary op".
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self
+            .qkv_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let z = self.gate_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?.to_dtype(DType::F32)?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -1603,9 +1841,13 @@ impl Qwen35LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            // The recurrent arena is F32 by contract (see
+            // `ensure_state_initialized`); a lazily-created state must agree
+            // with the pre-initialized dtype rather than inherit the
+            // activation dtype.
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
+                DType::F32,
                 value.device(),
             )?
         };
@@ -1621,7 +1863,9 @@ impl Qwen35LinearAttention {
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, 1, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output)
     }
 
@@ -1636,10 +1880,18 @@ impl Qwen35LinearAttention {
                 "Qwen3.5 linear-attention decode batch dimensions do not match".into(),
             ));
         }
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let residual_dtype = hidden_states.dtype();
+        // F32 compute island — see `forward` for the contract.
+        let mixed_qkv = self
+            .qkv_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let z = self.gate_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?.to_dtype(DType::F32)?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(Error::InferenceError(format!(
                 "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
@@ -1693,9 +1945,10 @@ impl Qwen35LinearAttention {
             let current_state = if let Some(state) = recurrent_state.take() {
                 state
             } else {
+                // F32 by contract — see `ensure_state_initialized`.
                 Tensor::zeros(
                     (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                    value.dtype(),
+                    DType::F32,
                     value.device(),
                 )?
             };
@@ -1716,6 +1969,7 @@ impl Qwen35LinearAttention {
             1,
             self.num_v_heads * self.head_v_dim,
         ))?;
+        let output = output.to_dtype(residual_dtype)?;
         self.out_proj.forward(&output)
     }
 
@@ -1741,10 +1995,18 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        // F32 compute island — see `forward` for the contract.
+        let residual_dtype = hidden_states.dtype();
+        let mixed_qkv = self
+            .qkv_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
+        let z = self.gate_proj.forward(hidden_states)?.to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?.to_dtype(DType::F32)?;
+        let alpha = self
+            .alpha_proj
+            .forward(hidden_states)?
+            .to_dtype(DType::F32)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
@@ -1782,9 +2044,10 @@ impl Qwen35LinearAttention {
         let current_state = if let Some(state) = recurrent_state.take() {
             state
         } else {
+            // F32 by contract — see `ensure_state_initialized`.
             Tensor::zeros(
                 (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
+                DType::F32,
                 value.device(),
             )?
         };
@@ -1847,7 +2110,9 @@ impl Qwen35LinearAttention {
         let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
-        let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
+        let output = output
+            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output)
     }
 
@@ -1985,8 +2250,14 @@ fn load_rms_norm(
     device: &Device,
     name: &str,
     eps: f64,
-) -> Result<RmsNorm> {
-    RmsNorm::from_qtensor(loader.load_qtensor(name, device)?, eps).map_err(Error::from)
+) -> Result<Qwen35RmsNorm> {
+    Ok(Qwen35RmsNorm::new(
+        loader
+            .load_qtensor(name, device)?
+            .dequantize(device)
+            .map_err(Error::from)?,
+        eps,
+    ))
 }
 
 fn load_dense(
@@ -2255,8 +2526,16 @@ fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
         return Ok(x.clone());
     }
     let (batch, heads, dim) = x.dims3()?;
-    // Match llama.cpp's tiled repeat layout for Qwen3.5 linear attention:
-    // [h0, h1, ...] -> [h0, h1, ..., h0, h1, ...].
+    // TILED expansion is the trained convention for the Qwen3.5/3.6 lineage:
+    // value head j recalls key head (j % heads), matching llama.cpp's qwen35
+    // GGUF encoding. The production dense Qwen3.5 GGUFs (16 k-heads / 32
+    // v-heads → repeats=2) generate coherently through this exact layout
+    // daily, which pins the publisher's row semantics. Do NOT "fix" this to
+    // repeat_interleave: that is the Qwen3-Next/3.8 lineage convention
+    // (qwen38/text.rs repeat_interleave_head_states), and the two pairings are
+    // NOT reconcilable by any weight permutation — each trunk must match its
+    // own generation. Pinned by repeat_head_states_uses_tiled_order; see
+    // tasks/qwen36moe-native-cuda-gibberish-research-2026-10-07.md.
     let expanded = x.unsqueeze(1)?.broadcast_as((batch, repeats, heads, dim))?;
     expanded
         .reshape((batch, repeats * heads, dim))
@@ -2565,6 +2844,133 @@ mod tests {
             for (scalar, batch) in scalar.iter().zip(&batch) {
                 assert!((scalar - batch).abs() < 1e-5, "{scalar} != {batch}");
             }
+        }
+    }
+
+    #[test]
+    fn linear_attention_computes_in_f32_under_bf16_activations() {
+        // Mirror the CUDA native plan in miniature: CompactFp8 projections
+        // (the CPU fp8 decode kernel returns the activation's dtype, so the
+        // block input is BF16) against an F32 state arena. The whole conv →
+        // recurrence → gated-norm island must run in F32 and hand the trunk
+        // back its BF16 activation dtype; before the F32 island this failed
+        // with a mixed-dtype binary op inside the conv step.
+        let device = &Device::Cpu;
+        let fp8_projection = |rows: usize, cols: usize| {
+            Qwen35Projection::CompactFp8 {
+                weights: Tensor::from_vec(vec![0x38u8; rows * cols], (rows, cols), device).unwrap(),
+                scales: Tensor::from_vec(vec![1f32], (1, 1), device).unwrap(),
+            }
+        };
+        let dense_f32 = |values: &[f32], shape: (usize, usize)| {
+            Tensor::from_vec(values.to_vec(), shape, device).unwrap()
+        };
+        let conv_kernel = dense_f32(
+            &(0..24)
+                .map(|index| 0.01 * ((index % 4) + 1) as f32)
+                .collect::<Vec<_>>(),
+            (6, 4),
+        );
+        let conv_kernel_slices = super::pre_slice_conv_kernel(&conv_kernel, 4).unwrap();
+        let mixer = Qwen35LinearAttention {
+            qkv_proj: fp8_projection(6, 4),
+            gate_proj: fp8_projection(2, 4),
+            beta_proj: fp8_projection(1, 4),
+            alpha_proj: fp8_projection(1, 4),
+            dt_bias: Tensor::zeros((1, 1, 1), DType::F32, device).unwrap(),
+            a: Tensor::full(-0.5f32, (1, 1, 1), device).unwrap(),
+            conv_kernel,
+            conv_kernel_slices,
+            norm: Qwen35GatedRmsNorm {
+                weight: Tensor::ones(2, DType::F32, device).unwrap(),
+                eps: 1e-6,
+            },
+            out_proj: fp8_projection(4, 2),
+            num_k_heads: 1,
+            num_v_heads: 1,
+            head_k_dim: 2,
+            head_v_dim: 2,
+            conv_dim: 6,
+            kernel_size: 4,
+            tiled_recurrence_enabled: false,
+            tiled_recurrence_tile_size_override: None,
+        };
+
+        let bf16_input = |values: &[f32], seq: usize| {
+            Tensor::from_vec(values.to_vec(), (1, seq, 4), device)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let new_state = || Qwen35LayerRuntimeState::Linear {
+            conv_state: Some(ConvRingState {
+                slots: (0..3)
+                    .map(|_| Tensor::zeros((6, 1), DType::F32, device).unwrap())
+                    .collect(),
+                next_idx: 0,
+            }),
+            recurrent_state: None,
+        };
+
+        // Decode step (seq == 1).
+        let mut state = new_state();
+        let output = mixer
+            .forward(&bf16_input(&[0.2, -0.1, 0.3, 0.4], 1), &mut state)
+            .unwrap();
+        assert_eq!(output.dtype(), DType::BF16, "trunk dtype must be restored");
+        assert!(
+            output
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite()),
+            "decode output must be finite"
+        );
+        let Qwen35LayerRuntimeState::Linear {
+            recurrent_state: Some(recurrent),
+            ..
+        } = &state
+        else {
+            panic!("decode must leave a recurrent state")
+        };
+        assert_eq!(recurrent.dtype(), DType::F32, "state arena stays F32");
+
+        // Prefill (seq > 1) exercises the sequence path and its conv ring.
+        let mut state = new_state();
+        let output = mixer
+            .forward_sequence(
+                &bf16_input(&[0.2, -0.1, 0.3, 0.4, -0.3, 0.5, 0.1, 0.2], 2),
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(output.dtype(), DType::BF16);
+        let values = output
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+        // Prefill must be numerically stable under the F32 island: identical
+        // prefixes of the same sequence agree token-for-token with the decode
+        // step on the same prefix.
+        let mut decode_state = new_state();
+        let decode_output = mixer
+            .forward(&bf16_input(&[0.2, -0.1, 0.3, 0.4], 1), &mut decode_state)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (prefill, decode) in values[..2].iter().zip(&decode_output) {
+            assert!((prefill - decode).abs() < 1e-4, "{prefill} != {decode}");
         }
     }
 

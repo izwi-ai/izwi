@@ -385,14 +385,21 @@ fn load_qwen35_moe_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
-    _performance: &crate::performance::PerformanceConfig,
-    _prefix_reuse: PrefixReuseMode,
+    performance: &crate::performance::PerformanceConfig,
+    prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
     // Hybrid-recurrent prefix reuse is unproven for this family (the DS1
     // catalog cell is excluded), so the mode is deliberately not engaged.
-    Ok(NativeChatModel::Qwen35Moe(Qwen36MoeChatModel::load(
-        model_dir, variant, device,
-    )?))
+    let backend = BackendKind::from(device.kind);
+    Ok(NativeChatModel::Qwen35Moe(
+        Qwen36MoeChatModel::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            performance,
+            prefix_reuse_engages(variant, backend, prefix_reuse),
+        )?,
+    ))
 }
 
 fn load_lfm25_audio_model(
@@ -3717,6 +3724,32 @@ impl NativeChatModel {
             Self::Lfm2(model) => model.max_context_tokens(),
         }
     }
+
+    /// Executor scheduler profile for multi-token decode quanta:
+    /// `(preferred_decode_tokens, sustained_decode_quantum,
+    /// speculative_decode_batch)`. Families whose decode step always consumes
+    /// exactly one token per row return the scalar default; a family opts
+    /// into wider quanta (e.g. MTP speculative decoding) by overriding these
+    /// values.
+    pub fn speculative_decode_profile(&self) -> (usize, bool, bool) {
+        match self {
+            Self::Qwen38(model) => (
+                model.preferred_decode_tokens(),
+                model.sustained_cuda_mtp_quantum(),
+                model.mtp_in_continuous_enabled(),
+            ),
+            // Solo speculative quanta plus, with a loaded head, the DS9.4
+            // continuous envelope; sustained-CUDA quanta stay qwen3.8-only.
+            Self::Qwen35Moe(model) => (
+                model.preferred_decode_tokens(),
+                false,
+                model.speculative_batch_enabled(),
+            ),
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {
+                (1, false, false)
+            }
+        }
+    }
 }
 
 impl InferenceStateContractProvider for NativeChatModel {
@@ -4466,16 +4499,9 @@ impl NativeChatDecodeState {
             Self::Qwen38(state) => state
                 .begin_shared_step_quantum(cache, mtp_cache)
                 .map(NativeChatDecodeCheckpoint::Qwen38),
-            Self::Qwen35(state) => {
-                if mtp_cache.is_some() {
-                    return Err(Error::InvalidInput(
-                        "Qwen3.8 MTP reservation was routed to a Qwen3.5 state".into(),
-                    ));
-                }
-                state
-                    .begin_shared_step_quantum(cache)
-                    .map(NativeChatDecodeCheckpoint::Qwen35)
-            }
+            Self::Qwen35(state) => state
+                .begin_shared_step_quantum_with_mtp(cache, mtp_cache)
+                .map(NativeChatDecodeCheckpoint::Qwen35),
             Self::Lfm2(state) => {
                 if mtp_cache.is_some() {
                     return Err(Error::InvalidInput(
@@ -5027,10 +5053,11 @@ impl NativeChatModel {
                         max_new_tokens,
                         config,
                         target_cache,
+                        None,
                     )?,
                 ))
             }
-            Self::Qwen35Moe(model) if mtp_cache.is_none() => {
+            Self::Qwen35Moe(model) => {
                 let prepared = prepared
                     .and_then(NativeChatPreparedPrompt::as_qwen35_moe)
                     .ok_or_else(|| {
@@ -5050,6 +5077,7 @@ impl NativeChatModel {
                         max_new_tokens,
                         config,
                         target_cache,
+                        mtp_cache,
                     )?,
                 ))
             }
@@ -5380,6 +5408,18 @@ impl NativeChatModel {
                 logprobs,
             });
         }
+        if let (Self::Qwen35Moe(model), NativeChatDecodeState::Qwen35(state)) = (self, &mut *state) {
+            let step = model.decode_quantum(state, input_budget.max(1))?;
+            let logprobs = std::mem::take(&mut state.pending_logprobs);
+            return Ok(NativeChatDecodeStep {
+                delta: step.delta,
+                text: step.text,
+                tokens_generated: step.tokens_generated,
+                input_tokens_committed: step.input_tokens_committed,
+                finished: step.finished,
+                logprobs,
+            });
+        }
         let mut delta = String::new();
         let mut text = String::new();
         let mut tokens_generated = 0usize;
@@ -5409,43 +5449,75 @@ impl NativeChatModel {
         })
     }
 
-    /// DS9.4: one shared speculative envelope over continuous rows. Only the
-    /// Qwen3.8 MTP model supports it; other families reject the route.
+    /// DS9.4: one shared speculative envelope over continuous rows. The
+    /// Qwen3.8 and qwen3.6-MoE MTP models support it; other families reject
+    /// the route.
     pub(crate) fn decode_speculative_batch(
         &self,
         states: &mut [&mut NativeChatDecodeState],
         input_budget: usize,
     ) -> Result<Vec<NativeChatDecodeStep>> {
-        let Self::Qwen38(model) = self else {
-            return Err(Error::InvalidInput(
-                "speculative envelopes require the Qwen3.8 MTP model".into(),
-            ));
-        };
-        let mut typed = Vec::with_capacity(states.len());
-        for state in states.iter_mut() {
-            match &mut **state {
-                NativeChatDecodeState::Qwen38(state) => typed.push(state),
-                _ => {
-                    return Err(Error::InvalidInput(
-                        "Qwen3.8 speculative envelope received another model's state".into(),
-                    ))
+        match self {
+            Self::Qwen38(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen38(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.8 speculative envelope received another model's state"
+                                    .into(),
+                            ))
+                        }
+                    }
                 }
+                let steps = model.decode_speculative_batch(&mut typed, input_budget)?;
+                let mut out = Vec::with_capacity(steps.len());
+                for (step, state) in steps.into_iter().zip(typed.iter_mut()) {
+                    let logprobs = std::mem::take(&mut state.pending_logprobs);
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
             }
+            Self::Qwen35Moe(model) => {
+                let mut typed = Vec::with_capacity(states.len());
+                for state in states.iter_mut() {
+                    match &mut **state {
+                        NativeChatDecodeState::Qwen35(state) => typed.push(state),
+                        _ => {
+                            return Err(Error::InvalidInput(
+                                "Qwen3.6-MoE speculative envelope received another model's state"
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+                let steps = model.decode_speculative_batch(&mut typed, input_budget)?;
+                let mut out = Vec::with_capacity(steps.len());
+                for (step, state) in steps.into_iter().zip(typed.iter_mut()) {
+                    let logprobs = std::mem::take(&mut state.pending_logprobs);
+                    out.push(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    });
+                }
+                Ok(out)
+            }
+            _ => Err(Error::InvalidInput(
+                "speculative envelopes require an MTP speculative model".into(),
+            )),
         }
-        let steps = model.decode_speculative_batch(&mut typed, input_budget)?;
-        let mut out = Vec::with_capacity(steps.len());
-        for (step, state) in steps.into_iter().zip(typed.iter_mut()) {
-            let logprobs = std::mem::take(&mut state.pending_logprobs);
-            out.push(NativeChatDecodeStep {
-                delta: step.delta,
-                text: step.text,
-                tokens_generated: step.tokens_generated,
-                input_tokens_committed: step.input_tokens_committed,
-                finished: step.finished,
-                logprobs,
-            });
-        }
-        Ok(out)
     }
 
     pub fn decode_step_batch(
@@ -6013,6 +6085,7 @@ impl ModelRegistry {
                     None,
                     match model.as_ref() {
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
+                        NativeChatModel::Qwen35Moe(model) => Some(model.runtime_diagnostics()),
                         _ => None,
                     },
                 ));

@@ -27,9 +27,24 @@ use crate::models::registry::{
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
+/// Family-typed durable continuation record for a suspended chat session.
+pub(super) enum SuspendedReplayCheckpoint {
+    Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
+    Qwen35Moe(crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint),
+}
+
+impl SuspendedReplayCheckpoint {
+    pub(super) fn replay_tokens(&self) -> usize {
+        match self {
+            Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen35Moe(checkpoint) => checkpoint.replay_tokens(),
+        }
+    }
+}
+
 pub(super) struct SuspendedChatDecode {
     pub(super) variant: ModelVariant,
-    pub(super) checkpoint: crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint,
+    pub(super) checkpoint: SuspendedReplayCheckpoint,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) streamed_text: String,

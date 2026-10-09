@@ -87,3 +87,23 @@
   toolchain is installed with `--profile minimal`, and the workspace
   `.cargo/config.toml` travels with the checkout — a python3 rustc-wrapper
   requires python3 in any minimal container image (see the run-191 CUDA fix).
+- A manifest authored by mirroring another family is a HYPOTHESIS, not a contract:
+  fail-closed validation of an unverified manifest must not ship default-on (2nd
+  occurrence of the Oct-4 trunk contract-drift class — this time the MTP manifest
+  took down every native qwen36moe load on the H100). Before enabling manifest
+  validation by default, either census the published checkpoint (HTTP range-request
+  header fetch, no download needed) or gate the feature off until the handoff.
+  Corollary: a fixture generated FROM the plan fn can never catch plan-vs-published
+  drift — pin an executable census of the PUBLISHED tensors for every validated
+  plan, trunk and MTP alike.
+- A test that asserts on a single request after a state change is a POLL-CADENCE
+  RACE, not a deterministic check: a gateway learns a peer's durable claim and an
+  in-flight invocation's released credit on its own status-poller cadence
+  (90-110% jitter), so a fixed sleep or one-shot assertion races an observation
+  the product never promised synchronously. Assert on the CONVERGED outcome
+  (bounded retry, fail after a generous window), and keep the strict guard: only
+  served-or-shed may be retried, anything else fails immediately. Corollary: a
+  shared/database-side signal is NOT a valid proxy for another process's in-memory
+  registry — a peer's row can be staler than a third party's view, so it cannot
+  gate the race. Diagnose these by running the lane under realistic CPU load
+  (the repo's CI runners are 2 vCPU): an idle machine hid a 1-in-6 flake.

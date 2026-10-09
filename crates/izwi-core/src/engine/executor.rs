@@ -74,7 +74,7 @@ use crate::error::{Error, Result};
 use crate::kv::{CacheDomainId, KvArenaId, KvGroupId, KvStorageDType, KvStorageFormat};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
-use crate::models::registry::{AsrModelLease, NativeAsrModel, NativeChatModel, QwenTtsModelLease};
+use crate::models::registry::{AsrModelLease, NativeAsrModel, QwenTtsModelLease};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::ModelRegistry;
 use crate::runtime::{PhysicalExecutionAdmission, PhysicalExecutionLease};
@@ -88,6 +88,10 @@ use state::{
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// The qwen3.5/3.6-MoE contract reuses the same domain numbering: full
+// attention at 1, the optional MTP draft layer at 4.
+const QWEN35_MOE_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const QWEN35_MOE_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
 // Cancellation signals are AtomicBools without a notification edge. Polling
 // at 40 Hz bounds cancelled FIFO residency without turning admission into a
 // hot loop.
@@ -3367,14 +3371,7 @@ impl ModelExecutor for NativeExecutor {
                 request
                     .prepared_chat_model_for_executor()
                     .ok()
-                    .and_then(|model| match model.as_ref() {
-                        NativeChatModel::Qwen38(model) => Some((
-                            model.preferred_decode_tokens(),
-                            model.sustained_cuda_mtp_quantum(),
-                            model.mtp_in_continuous_enabled(),
-                        )),
-                        _ => None,
-                    })
+                    .map(|model| model.as_ref().speculative_decode_profile())
                     .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;

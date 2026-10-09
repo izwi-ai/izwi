@@ -366,7 +366,7 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
     cargo test --locked -p izwi-server --lib
-    cargo test --locked -p izwi-server --test fleet_rig
+    cargo test --locked -p izwi-server --test fleet_rig -- --test-threads=1
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
 }
@@ -397,7 +397,7 @@ run_fleet_rig_postgres() {
         exit 1
     fi
 
-    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig
+    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig -- --test-threads=1
 }
 
 run_cargo_metal() {

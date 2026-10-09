@@ -20521,3 +20521,202 @@ Risks for the H100 handoff: (1) the fp8 kernel perf is unmeasured (that
 is P3); (2) CUDA-compile lane must run in CI before merge; (3) a real
 checkpoint load must be re-verified end-to-end (contract fix + compact
 residency + fitted arena) with the representation diagnostics logged.
+
+# Plan — qwen3.8→qwen3.6-MoE port remainder (3d/3e/3f/5/6) — session 2026-10-06 (part 2)
+
+Continued tasks/qwen36-moe-qwen38-feature-port-research-2026-10-06.md from tip c19d50d5.
+
+## Plan
+- [x] Phase 3d — batched speculative envelope (commit f9874703)
+  - [x] `Qwen35MtpHead::forward_steps_batch`: one MTP pair per row in a single op over a
+        shared arena (shared slot lowering, common write-completion fence); sequential
+        per-row fallback when standalone arenas differ
+  - [x] `Qwen35ChatExec::decode_speculative_batch`: per-row depths (solo rule), per-row MTP
+        logical checkpoints, batched draft advance, per-row verify/commit via
+        `mtp_verify_and_commit` extracted from `mtp_speculative_round` (solo and batch share
+        semantics by construction); ineligible requests (grammar/logprobs/penalties/temp —
+        pre-3f) collapse to scalar rounds; anchor-less rows ride scalar tails
+  - [x] Registry dispatch arm + `speculative_batch_enabled` profile opt-in + executor gate
+  - [x] Envelope rounds counter + diagnostics; 3-way parity test (envelope == solo
+        speculative == scalar greedy) over one shared target arena + one shared MTP arena
+  - Gotcha: rows sharing one arena are required by the batched advance — the DS9.4
+    shared-slot lowering needs one `lower_slots` call; managed-domain rows qualify,
+    standalone per-session arenas degrade to the sequential advance
+- [x] Phase 3e — adaptive depth + round timing (commit 73ad24c2)
+  - [x] `AdaptiveMtp` ported unchanged; state fields `adaptive_mtp` + `mtp_timings`
+  - [x] Solo: CUDA-event `RoundTimer` pending queue (bounded 4) drained at quantum
+        boundaries; envelope: host `Instant` observations; CPU/Metal keep fixed depth
+  - [x] Controller rides the quantum checkpoint with the stronger-numerical-latch restore;
+        solo remaining slices became output-cap aware (same emissions, fewer wasted drafts)
+  - [x] Envelope non-finite draft → disable latch + scalar round; `draft_argmax` split
+  - [x] 5 ported bandit unit tests
+- [x] Phase 3f — stochastic rejection sampling (commit 193ded65)
+  - [x] `mtp_active` relaxed to grammar/logprobs-only exclusions; sampled requests draft via
+        `propose_speculative_draft` and verify via `verify_speculative_proposals`
+  - [x] `DraftBlock` (Greedy ids | Stochastic distributions); head `draft_recurrently` with a
+        caller selection policy; greedy fast path untouched
+  - [x] `SimpleRng::fork` + `rand::RngCore`; forked draft stream, transactional per round,
+        riding the quantum checkpoint
+  - [x] Fixed latent rank-3 bug: MTP bootstrap sampled stored prefill logits raw —
+        `logits_last_row` normalization added; `decode_step`'s inline sample journaled
+  - [x] Stochastic test: per-seed determinism solo+envelope, completion, cursor invariants
+        (sampled stop token holds a pair without counting), mixed per-row configs
+- [x] Phase 5 — graph islands spike (commit 3dd1bb3f)
+  - [x] Executable hardware-gated spike: block-FP8 projection captured via
+        `TensorIsland::run_multi`, expects 1 capture + 2 replays + 0 negative fallbacks
+  - [x] Static verdict evidence: kernel's only allocation is its output (stream path), and
+        it is the identical kernel qwen38 production islands capture
+  - [ ] Island port into the qwen3.5 trunk — GATED on the spike passing at H100 handoff +
+        a scoping decision for sparse-model regions (routed experts ≠ dense MLP analogy)
+- [x] Phase 6 — replay checkpoints (commit cf6c9dbc)
+  - [x] `Qwen35PromptJournal` + `Qwen35ReplayCheckpoint` (CPU-only) + state journal fields
+  - [x] `publish_token` = single journal choke point (bootstrap refactored through it;
+        `decode_step`'s inline publish journals — the batch always did)
+  - [x] `begin_replay_state_physical` + `continue_replay_physical` span recompute: prompt
+        rows via prefill path, generated rows one token per span, MTP pairs rebuilt for
+        decode rows only (qwen35 prefill writes none), final pair seeds the anchor
+  - [x] Fail-closed: finished/vision/grammar cannot suspend; decode during replay errors;
+        checkpoint-during-replay retains the original journal
+  - [x] Executor suspend/resume/span-drive for Qwen35Moe via `SuspendedReplayCheckpoint`
+  - [x] Replay test: headless+MTP legs, step-exact continuation, mid-run re-suspension,
+        MTP-cursor preservation
+
+## Verification (2026-10-06, session part 2)
+- Full izwi-core lib CPU: 2776 passed / 0 failed after every commit
+- Metal lane (`--features metal --lib`): green (2826 passed)
+- `cargo clippy -p izwi-core --all-targets`: clean after every commit
+- Branch: 22 commits vs main (tip 3dd1bb3f), unpushed; CUDA-compile + H100 evidence remain
+  the hardware handoff (MTP manifest census, spike verdict, acceptance rates)
+
+## Review (2026-10-06, session part 2)
+All remaining plan items except the hardware-gated Phase 5 island port are implemented and
+proven at the model level. Key semantic decisions: (1) envelope rounds reuse the extracted
+solo verify/commit so solo/batch parity is structural, not tested-by-accident; (2) stochastic
+token streams are NOT compared across solo/envelope because rejection sampling preserves the
+distribution, not a fixed sequence, and the batched MTP advance differs by float noise —
+greedy token-identity remains the pinned invariant; (3) replay pair rebuild covers decode
+rows only, matching a qwen35 prefill that writes no MTP pairs (unlike qwen38's
+shifted-pair prefill); (4) sampled stop tokens hold an MTP pair without counting as a
+generated token — the cursor invariant is cursor == tokens_generated - 1, or == on finish.
+
+# Plan — qwen36moe MTP manifest drift fix — 2026-10-07
+
+Field failure (Modal izwi-cuda, branch build): every native Qwen3.6-35B-A3B-FP8
+load 500s at the fail-closed MTP manifest — the branch's MTP load policy is
+default-on (`Auto` = enabled) and the 22-tensor dense-FFN manifest never met the
+real checkpoint, whose MTP layer has an MoE FFN (1,560 tensors: router + 256
+experts + shared expert). Research + full change surface:
+tasks/qwen36moe-mtp-manifest-drift-research-2026-10-07.md.
+
+- [x] C1: qwen36moe MTP load policy default-off (Auto no longer enables;
+      handoff opt-in env for tests/field verification); drop `let _ = mtp_policy;`
+      DONE `b621ed5a`.
+- [x] C2: prefix-taking `moe_ffn` seam on `Qwen35WeightSource`
+      DONE `31469577`.
+- [x] C3: MoE MTP manifest (config-derived count) + `Qwen36MoeSparseMlp` draft
+      head + fixture expert emission DONE `b68f1181`.
+- [x] C4: MTP bucket in resident-bytes accounting DONE `23e02411`.
+- [x] C5: published-census regression test for the MTP manifest DONE `d198be33`.
+- [x] Sibling: census-verify the qwen38 MTP manifest (report only) — CLEAN:
+      real Qwen3.8-27B-FP8 @ 017b9c7a has exactly the 22 dense-FFN mtp.* tensors
+      the manifest expects (no experts/router); the dense hypothesis is correct
+      for qwen3.8 and was wrong only for qwen3.6.
+- [x] Verify: CPU lib (2779), Metal CI lane (--lib --tests, exit 0), clippy
+      -D warnings CPU+Metal all-targets, fmt hunks per-file at baseline,
+      server/worker cargo check, worker process test green.
+
+## Review — 2026-10-07
+
+Five commits on qwen36moe-gdn-dtype close the MTP manifest drift:
+
+1. `b621ed5a` — the load policy resolves through `resolve_mtp_load_policy`:
+   the performance knob AND the explicit `IZWI_QWEN36_MTP_HANDOFF` opt-in
+   (qwen38 boolean grammar, fail-closed on invalid) must both enable MTP, on
+   every backend. Field mitigation without code = `IZWI_CUDA_MTP=off` is now
+   unnecessary; default loads skip `mtp.*` again.
+2. `31469577` — `Qwen35WeightSource::moe_ffn_prefix` (fail-closed default,
+   native override) + equivalence test.
+3. `b68f1181` — the manifest emits the real MoE contract (router + experts +
+   shared expert + gate, config-derived count 24+6N; 1,560 at the published
+   geometry) and the draft head builds `Qwen36MoeSparseMlp` through the
+   prefix seam; the native source translates the mtpblk prefix through
+   canonical_name before touching checkpoint names (the MoE body bypasses
+   resolve(), unlike the other loaders). Worker fixture writes the full
+   36-tensor manifest. Solo quantum / DS9.4 envelope / stochastic / replay
+   suites all execute the MoE draft head end-to-end on the fixture.
+4. `23e02411` — pinned inventory gains an MTP element bucket; admission
+   resolves the same policy and charges the bucket only when the head
+   loads (default numbers unchanged, CUDA context fit intact). Gotcha hit:
+   the resource_plan test computed its disabled leg outside env_test_lock
+   and raced the four MTP tests' env flips — fixed by one lock acquisition
+   around both legs.
+5. `d198be33` — MTP manifest pinned against the frozen published census
+   (30 pattern rows / 1,560 tensors), the W6 lesson applied to the scope
+   that lacked it.
+
+Verification: CPU lib 2779/0; Metal CI lane exit 0; clippy -D warnings
+CPU+Metal all-targets clean; fmt drift per-file at baseline (ed-2021 —
+note rustfmt inside the repo picks the workspace edition from Cargo.toml,
+ignoring a CLI --edition override: measure baselines in the same
+location); worker process test green with the complete fixture manifest;
+izwi-server/izwi-serving-worker compile. Hardware handoff remains: set
+IZWI_QWEN36_MTP_HANDOFF=1 on the H100, verify the manifest against the
+downloaded checkpoint headers, run MTP E2E + acceptance-rate evidence,
+then flip MTP_MANIFEST_CENSUS_VERIFIED (native.rs) to true.
+
+# Plan — CI failures fix on qwen36moe-gdn-dtype — 2026-10-08
+
+Address the 3 failing CI gates in run 37626403789 (PR #220):
+1. Repository Hygiene: rustfmt failure in `crates/izwi-core/src/kernels/cuda.rs`.
+2. CUDA Compile (Driverless): `usize` vs `u32` type mismatches in `real_checkpoint_cache` under `feature = "cuda"`.
+3. Cargo Validation (CPU): port collision race in `cargo test -p izwi-server --test fleet_rig`.
+
+- [x] C1: Fix hygiene rustfmt failure in `crates/izwi-core/src/kernels/cuda.rs`
+- [x] C2: Fix type mismatches in `real_checkpoint_cache` in `crates/izwi-core/src/models/architectures/qwen36moe/chat.rs`
+- [x] C3: Fix port collision race and serialize `fleet_rig` integration tests in `crates/izwi-server/tests/fleet_rig.rs` and `scripts/ci/check-backend-truth.sh`
+- [x] Verification: run hygiene, cargo-cpu, and target checks
+
+# Plan — fleet rig PostgreSQL lane CI failure — 2026-10-08
+
+Run 37814128549 (job 113438246600, commit 9236aaae) failed at
+`Run the fleet rig PostgreSQL lane` with exit code 101. The `fleet_rig_postgres`
+test asserted a single-shot `chat()` returned 200 after terminating every
+PostgreSQL backend; it instead got `503 no fresh, ready worker`.
+
+Root cause (reproduced and confirmed locally): the DINV-06 leg is a poll-cadence
+race, NOT a regression from the previous fix. Two pre-existing races:
+
+1. Claim steering: `sleep(700ms)` then a single `chat()` assumed the gateway
+   notices the rig's claim within 700ms. Under load the poller lags and dispatch
+   lands on the claimed worker.
+2. Outage leg: the steering dispatch leaves worker two mid-invocation (0 credits,
+   1 active). Closing the DB freezes that stale observation in both gateways.
+   With worker one's credit already claimed, selection finds no eligible worker
+   and returns 503.
+
+Proven by bisect: pre-fix commit `6a429f01` fails 1/6 idle and 1/8 under load;
+the shared observation table is NOT a valid proxy for a gateway's registry (a
+peer's row can be staler), so a DB-side settle cannot fix it.
+
+- [x] C4: Replace both single-shot assertions with a bounded-convergence
+      `chat_until` helper (retries only served-or-shed, panics after 30s).
+- [x] Verification: 15/15 idle, 10/10 under realistic CPU load
+      (pre-fix: 1/8); step 8 + step 9 of the fleet-stores job both green;
+      cargo-cpu fleet_rig green; hygiene green; no timing regression (11.8s).
+
+## Review — 2026-10-08
+
+Three logical commits resolve the three failing CI gates on `qwen36moe-gdn-dtype`:
+
+1. `54b94431` (`style(hygiene): format qwen35 tiled recurrence device suite in cuda.rs`):
+   Formats the newly pinned `qwen35_tiled_recurrence_device_tests` module in
+   `crates/izwi-core/src/kernels/cuda.rs` to satisfy the repository hygiene `rustfmt` gate.
+2. `ee6c44b4` (`fix(qwen36moe): align physical KV layer and block types to u32 in real-checkpoint probe`):
+   Fixes type mismatches (`usize` assigned to `u32` struct fields for `page_tokens`,
+   `capacity_pages`, `model_layer`, `physical_layer`, and `index` in `KvLayerBinding`,
+   `KvArenaConfig`, and `CacheBlockRef`) in `real_checkpoint_cache` in
+   `crates/izwi-core/src/models/architectures/qwen36moe/chat.rs`.
+3. `fcaba5f3` (`fix(fleet_rig): eliminate port collision race in fleet integration tests`):
+   In `crates/izwi-server/tests/fleet_rig.rs`, replaces the blind 800ms sleep in `spawn_gateway`
+   with active `/readyz` polling and early exit detection, and in `scripts/ci/check-backend-truth.sh`,
+   runs `fleet_rig` with `-- --test-threads=1` to eliminate inter-test port race conditions.

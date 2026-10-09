@@ -4,7 +4,9 @@
 //! The published checkpoint is an indexed Safetensors bundle whose matrix
 //! weights use 128x128 block-scaled `F8_E4M3` (companion `weight_scale_inv`
 //! tensors) while embeddings, norms, router/gate weights, DeltaNet in_proj /
-//! conv tensors, and the MTP head stay dense. This module owns the
+//! conv tensors, the MTP frame (fc, pre-fc norms) stay dense — the MTP
+//! layer's attention and MoE FFN follow the trunk's block-FP8 contract. This
+//! module owns the
 //! Qwen3.5-MoE configuration contract, the tensor-name plan, and checkpoint
 //! validation; shard reading, block-FP8 decoding, and projection
 //! materialization reuse the narrow primitives exposed by
@@ -14,8 +16,9 @@
 //! under `model.` (plain) or `model.language_model.` (composite), the vision
 //! tower under `model.visual.`, and the multi-token-prediction head under
 //! `mtp.`. Both language layouts are accepted and canonicalized; vision and
-//! MTP tensors are accounted but not loaded (text-only scope; the MTP
-//! manifest is recorded for the later speculative-decoding phase).
+//! MTP tensors are accounted but not loaded unless the MTP load policy
+//! enables the draft head, in which case the `mtp.*` manifest is validated
+//! fail-closed and its tensors become resident.
 //!
 //! Per-layer tensor names and shapes are derived from the Qwen3-Next lineage
 //! naming. The first open of a real downloaded checkpoint is expected to run
@@ -133,11 +136,11 @@ pub(crate) fn pinned_native_config() -> Qwen36MoeNativeConfig {
     .expect("pinned config constants pass validation")
 }
 
-/// Element inventory of the published checkpoint's persistent representation,
-/// derived from the same tensor plan the loader validates against: block-FP8
+/// Element counts of one tensor plan's persistent representation: block-FP8
 /// projection elements, dense elements, and the total tensor count (weights
 /// plus scale companions) that drives instantiation slack at MoE scale.
-pub(crate) struct PinnedRepresentationInventory {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RepresentationElementBucket {
     pub fp8_elements: u64,
     pub dense_elements: u64,
     pub tensor_count: u64,
@@ -151,46 +154,94 @@ pub(crate) struct PinnedRepresentationInventory {
     pub fp8_incompatible_elements: u64,
 }
 
-pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+/// Element inventory of the published checkpoint's persistent representation,
+/// derived from the same tensor plans the loader validates against.
+pub(crate) struct PinnedRepresentationInventory {
+    pub fp8_elements: u64,
+    pub dense_elements: u64,
+    pub tensor_count: u64,
+    pub fp8_scale_bytes: u64,
+    pub fp8_incompatible_elements: u64,
+    /// Element inventory of the MTP draft manifest. Admission charges this
+    /// bucket only when the MTP load policy makes the draft head resident;
+    /// the default load skips `mtp.*` exactly like the vision tower.
+    pub mtp: RepresentationElementBucket,
+}
+
+impl PinnedRepresentationInventory {
+    /// The text-trunk bucket as a standalone element count (the flat fields
+    /// of this inventory).
+    pub(crate) fn trunk_bucket(&self) -> RepresentationElementBucket {
+        RepresentationElementBucket {
+            fp8_elements: self.fp8_elements,
+            dense_elements: self.dense_elements,
+            tensor_count: self.tensor_count,
+            fp8_scale_bytes: self.fp8_scale_bytes,
+            fp8_incompatible_elements: self.fp8_incompatible_elements,
+        }
+    }
+}
+
+/// Fold one tensor plan into its resident-representation element counts.
+fn fold_representation_inventory(
+    entries: impl IntoIterator<Item = (ExpectedTensorKind, Vec<usize>)>,
+) -> RepresentationElementBucket {
     use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
-    let plan = expected_text_tensor_plan(&pinned_native_config())
-        .expect("pinned config produces the validated tensor plan");
-    let mut fp8_elements = 0u64;
-    let mut dense_elements = 0u64;
-    let mut fp8_scale_bytes = 0u64;
-    let mut fp8_incompatible_elements = 0u64;
-    for expected in plan.values() {
-        let count = expected
-            .shape
+    let mut bucket = RepresentationElementBucket::default();
+    for (kind, shape) in entries {
+        bucket.tensor_count += 1;
+        let count = shape
             .iter()
             .try_fold(1u64, |acc, &dim| {
                 acc.checked_mul(u64::try_from(dim).unwrap_or(u64::MAX))
             })
             .unwrap_or(u64::MAX);
-        match expected.kind {
+        match kind {
             BlockFp8 => {
-                fp8_elements = fp8_elements.saturating_add(count);
-                let (rows, cols) = (expected.shape[0], expected.shape[1]);
+                bucket.fp8_elements = bucket.fp8_elements.saturating_add(count);
+                let (rows, cols) = (shape[0], shape[1]);
                 let scale_entries =
                     rows.div_ceil(128).saturating_mul(cols.div_ceil(128)) as u64;
-                fp8_scale_bytes = fp8_scale_bytes.saturating_add(scale_entries.saturating_mul(4));
+                bucket.fp8_scale_bytes = bucket
+                    .fp8_scale_bytes
+                    .saturating_add(scale_entries.saturating_mul(4));
                 if rows % 64 != 0 || cols % 128 != 0 {
-                    fp8_incompatible_elements = fp8_incompatible_elements.saturating_add(count);
+                    bucket.fp8_incompatible_elements = bucket
+                        .fp8_incompatible_elements
+                        .saturating_add(count);
                 }
             }
-            Dense | OptionalDense => dense_elements = dense_elements.saturating_add(count),
+            Dense | OptionalDense => {
+                bucket.dense_elements = bucket.dense_elements.saturating_add(count)
+            }
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
             // toward the checkpoint's tensor count.
             BlockFp8Scale => {}
         }
     }
+    bucket
+}
+
+pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory {
+    let config = pinned_native_config();
+    let plan = expected_text_tensor_plan(&config)
+        .expect("pinned config produces the validated tensor plan");
+    let mtp_plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)
+        .expect("pinned config produces the validated MTP manifest");
+    let trunk = fold_representation_inventory(
+        plan.into_values()
+            .map(|expected| (expected.kind, expected.shape)),
+    );
+    let mtp =
+        fold_representation_inventory(mtp_plan.into_iter().map(|spec| (spec.kind, spec.shape)));
     PinnedRepresentationInventory {
-        fp8_elements,
-        dense_elements,
-        tensor_count: plan.len() as u64,
-        fp8_scale_bytes,
-        fp8_incompatible_elements,
+        fp8_elements: trunk.fp8_elements,
+        dense_elements: trunk.dense_elements,
+        tensor_count: trunk.tensor_count,
+        fp8_scale_bytes: trunk.fp8_scale_bytes,
+        fp8_incompatible_elements: trunk.fp8_incompatible_elements,
+        mtp,
     }
 }
 
@@ -209,7 +260,7 @@ pub fn synthetic_geometry_enabled() -> bool {
 }
 
 impl Qwen36MoeGeometryPolicy {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         if synthetic_geometry_enabled() {
             Self::Synthetic
         } else {
@@ -386,8 +437,12 @@ impl Qwen36MoeNativeConfig {
         Self::from_json_with_policy(&raw, policy)
     }
 
+    /// Pinned-policy parse. Test-only callers validate pinned-geometry
+    /// rejection; production loads go through `load_with_policy`, and
+    /// deriving the policy from the process environment here would make
+    /// pinned-geometry tests racy against env-mutating tests.
     pub fn from_json(raw: &[u8]) -> Result<Self> {
-        Self::from_json_with_policy(raw, Qwen36MoeGeometryPolicy::from_env())
+        Self::from_json_with_policy(raw, Qwen36MoeGeometryPolicy::Pinned35B)
     }
 
     pub fn from_json_with_policy(raw: &[u8], policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
@@ -953,6 +1008,233 @@ pub fn canonical_text_tensor_name(name: &str) -> Option<(Qwen36MoeTensorScope, O
     Some((Qwen36MoeTensorScope::Text, Some(name.to_string())))
 }
 
+/// One tensor of the qwen3.6 MTP draft manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen36MoeMtpTensorSpec {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub kind: ExpectedTensorKind,
+}
+
+impl Qwen36MoeMtpTensorSpec {
+    /// The safetensors dtype the manifest kind requires.
+    pub fn kind_to_safe_dtype(&self) -> SafeDType {
+        match self.kind {
+            ExpectedTensorKind::BlockFp8 => SafeDType::F8_E4M3,
+            ExpectedTensorKind::BlockFp8Scale
+            | ExpectedTensorKind::Dense
+            | ExpectedTensorKind::OptionalDense => SafeDType::BF16,
+        }
+    }
+}
+
+/// Validated inventory of the checkpoint's `mtp.*` tensors, recorded when the
+/// MTP load policy is enabled. Loading the draft head over these tensors is
+/// the next MTP phase; this struct is the handoff between validation and
+/// construction.
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36MoeMtpInventory {
+    pub tensors: BTreeMap<String, (Vec<usize>, SafeDType, u64)>,
+}
+
+/// Whether the load validates and records the MTP draft manifest. MTP stays
+/// opt-in: the default load skips `mtp.*` exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36MoeMtpLoadPolicy {
+    Disabled,
+    Enabled,
+}
+
+/// Explicit field/test opt-in for the qwen36moe MTP load policy. The
+/// performance knob alone must not enable MTP for this family yet: the draft
+/// manifest is still a hypothesis about the published checkpoint, and the
+/// default-on gate it shipped with failed every native load of the real
+/// 35B checkpoint (the MTP layer carries an MoE FFN, not the assumed dense
+/// one — see tasks/qwen36moe-mtp-manifest-drift-research-2026-10-07.md).
+pub const MTP_HANDOFF_ENV: &str = "IZWI_QWEN36_MTP_HANDOFF";
+
+/// Set once the handoff evidence exists: a real-checkpoint census matching
+/// the manifest plus MoE draft-head execution on the target hardware.
+const MTP_MANIFEST_CENSUS_VERIFIED: bool = false;
+
+/// The explicit opt-in half of the MTP gate. Follows the qwen38 policy
+/// boolean grammar; an invalid value is a hard config error rather than a
+/// silent default.
+pub fn mtp_handoff_opt_in() -> Result<bool> {
+    if MTP_MANIFEST_CENSUS_VERIFIED {
+        return Ok(true);
+    }
+    let value = std::env::var(MTP_HANDOFF_ENV).unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(Error::ConfigError(format!(
+            "invalid {MTP_HANDOFF_ENV} value: {other}"
+        ))),
+    }
+}
+
+/// Resolve the MTP load policy from the performance knobs plus the handoff
+/// opt-in. On CUDA the master CUDA switch also gates MTP (mirroring qwen38);
+/// CPU/Metal consult the MTP knob alone. The handoff opt-in is required on
+/// every backend — both the validation and the draft head are unverified
+/// against the published checkpoint until the hardware handoff lands.
+pub fn resolve_mtp_load_policy(
+    backend: BackendKind,
+    performance: &crate::performance::CudaPerformanceConfig,
+) -> Result<Qwen36MoeMtpLoadPolicy> {
+    let knob_enabled = if backend == BackendKind::Cuda {
+        performance.enabled() && performance.mtp.enabled()
+    } else {
+        performance.mtp.enabled()
+    };
+    if knob_enabled && mtp_handoff_opt_in()? {
+        Ok(Qwen36MoeMtpLoadPolicy::Enabled)
+    } else {
+        Ok(Qwen36MoeMtpLoadPolicy::Disabled)
+    }
+}
+
+/// The qwen3.6 MTP draft topology mirrors the published qwen3_5_moe MTP
+/// layer: ONE recurrent decoder layer sharing the target's token embeddings
+/// and LM head, with the target's gated full-attention geometry and the
+/// trunk's MoE feed-forward contract (BF16 router, block-FP8 routed experts,
+/// block-FP8 shared expert with its BF16 sigmoid gate) — census-verified
+/// against the published Qwen3.6-35B-A3B-FP8 checkpoint (revision 95a723d0;
+/// 1,560 `mtp.*` tensors at the pinned geometry).
+///
+/// The loader still fails closed on any drift, and the load policy stays
+/// handoff-gated (see `resolve_mtp_load_policy`): an unverified hypothesis
+/// can never silently misload.
+pub const QWEN36_MOE_MTP_LAYERS: usize = 1;
+
+/// Published MTP tensor count for a text config: the fixed draft-layer
+/// frame (24 tensors — fc, three norms, router, shared expert with its
+/// gate, attention projections with their scales) plus six block-FP8
+/// tensors per routed expert.
+pub fn mtp_tensor_count(text: &Qwen36MoeTextConfig) -> usize {
+    24 + 6 * text.moe_num_experts
+}
+
+pub fn mtp_tensor_plan(
+    text: &Qwen36MoeTextConfig,
+    block_shape: [usize; 2],
+) -> Result<Vec<Qwen36MoeMtpTensorSpec>> {
+    let hidden = text.hidden_size;
+    let head_dim = text.attention_key_length;
+    let checked = |label: &str, value: Option<usize>| {
+        value.ok_or_else(|| config_error(label, "dimension product overflow"))
+    };
+    let query_width = checked(
+        "MTP query projection width",
+        text.attention_head_count.checked_mul(head_dim),
+    )?;
+    let gated_query_width = checked("MTP gated query width", query_width.checked_mul(2))?;
+    let kv_width = checked(
+        "MTP key/value projection width",
+        text.attention_head_count_kv.checked_mul(head_dim),
+    )?;
+    let fused_input = checked("MTP fused input width", hidden.checked_mul(2))?;
+
+    fn push_dense(specs: &mut Vec<Qwen36MoeMtpTensorSpec>, name: String, shape: Vec<usize>) {
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name,
+            shape,
+            kind: ExpectedTensorKind::Dense,
+        });
+    }
+    fn push_projection(
+        specs: &mut Vec<Qwen36MoeMtpTensorSpec>,
+        name: String,
+        shape: [usize; 2],
+        block_shape: [usize; 2],
+    ) -> Result<()> {
+        let [rows, cols] = shape;
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name: name.clone(),
+            shape: vec![rows, cols],
+            kind: ExpectedTensorKind::BlockFp8,
+        });
+        specs.push(Qwen36MoeMtpTensorSpec {
+            name: format!("{name}_scale_inv"),
+            shape: vec![rows.div_ceil(block_shape[0]), cols.div_ceil(block_shape[1])],
+            kind: ExpectedTensorKind::BlockFp8Scale,
+        });
+        Ok(())
+    }
+
+    let mut specs = Vec::with_capacity(mtp_tensor_count(text));
+    push_dense(&mut specs, "mtp.fc.weight".into(), vec![hidden, fused_input]);
+    for layer in 0..QWEN36_MOE_MTP_LAYERS {
+        let prefix = format!("mtp.layers.{layer}");
+        push_dense(&mut specs, format!("{prefix}.input_layernorm.weight"), vec![hidden]);
+        push_dense(
+            &mut specs,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        // The draft layer's FFN mirrors the trunk's sparse MoE contract:
+        // an FP8-excluded BF16 router, block-FP8 routed experts, and the
+        // block-FP8 shared expert with its BF16 sigmoid gate.
+        push_dense(
+            &mut specs,
+            format!("{prefix}.mlp.gate.weight"),
+            vec![text.moe_num_experts, hidden],
+        );
+        for expert in 0..text.moe_num_experts {
+            for (suffix, shape) in expert_projection_shapes(text) {
+                push_projection(
+                    &mut specs,
+                    format!("{prefix}.mlp.experts.{expert}.{suffix}"),
+                    [shape[0], shape[1]],
+                    block_shape,
+                )?;
+            }
+        }
+        for (suffix, shape) in expert_projection_shapes(text) {
+            push_projection(
+                &mut specs,
+                format!("{prefix}.mlp.shared_expert.{suffix}"),
+                [shape[0], shape[1]],
+                block_shape,
+            )?;
+        }
+        push_dense(
+            &mut specs,
+            format!("{prefix}.mlp.shared_expert_gate.weight"),
+            vec![1, hidden],
+        );
+        push_dense(&mut specs, format!("{prefix}.self_attn.q_norm.weight"), vec![head_dim]);
+        push_dense(&mut specs, format!("{prefix}.self_attn.k_norm.weight"), vec![head_dim]);
+        for (projection_name, shape) in [
+            ("q_proj", [gated_query_width, hidden]),
+            ("k_proj", [kv_width, hidden]),
+            ("v_proj", [kv_width, hidden]),
+            ("o_proj", [hidden, query_width]),
+        ] {
+            push_projection(
+                &mut specs,
+                format!("{prefix}.self_attn.{projection_name}.weight"),
+                shape,
+                block_shape,
+            )?;
+        }
+    }
+    push_dense(&mut specs, "mtp.norm.weight".into(), vec![hidden]);
+    push_dense(&mut specs, "mtp.pre_fc_norm_embedding.weight".into(), vec![hidden]);
+    push_dense(&mut specs, "mtp.pre_fc_norm_hidden.weight".into(), vec![hidden]);
+
+    if specs.len() != mtp_tensor_count(text) {
+        return Err(Error::ModelLoadError(format!(
+            "Qwen3.5/3.6-MoE MTP manifest resolved to {} tensors, expected {}",
+            specs.len(),
+            mtp_tensor_count(text)
+        )));
+    }
+    Ok(specs)
+}
+
 /// The expected checkpoint contract for one canonical text tensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedTensor {
@@ -1237,6 +1519,15 @@ pub struct Qwen36MoeNativeCheckpoint {
     /// Canonical text tensor name -> raw index name (layout normalization).
     text_tensor_names: BTreeMap<String, String>,
     pub skipped: SkippedScopeInventory,
+    /// Present only when the load policy enabled MTP; the validated draft
+    /// manifest the head-construction phase consumes.
+    pub mtp: Option<Qwen36MoeMtpInventory>,
+    /// The MTP manifest derived from the trunk geometry — always present so
+    /// head construction can resolve tensor kinds even before validation.
+    pub mtp_plan: Vec<Qwen36MoeMtpTensorSpec>,
+    /// Canonical MTP tensor name -> raw index name (identity today, kept as a
+    /// map so raw-name resolution is uniform across scopes).
+    mtp_tensor_names: BTreeMap<String, String>,
 }
 
 impl Qwen36MoeNativeCheckpoint {
@@ -1244,20 +1535,43 @@ impl Qwen36MoeNativeCheckpoint {
         Self::open_with_policy(model_dir, Qwen36MoeGeometryPolicy::from_env())
     }
 
+    pub fn open_with_policies(
+        model_dir: &Path,
+        geometry: Qwen36MoeGeometryPolicy,
+        mtp: Qwen36MoeMtpLoadPolicy,
+    ) -> Result<Self> {
+        let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, geometry)?;
+        let tensors = IndexedSafetensors::open(model_dir)?;
+        Self::validate_with_policies(config, tensors, mtp)
+    }
+
     /// Open with an explicit geometry policy. Production callers use
     /// `open`; synthetic-fixture tests pass `Synthetic` directly so
     /// parallel tests never mutate the process environment.
     pub fn open_with_policy(model_dir: &Path, policy: Qwen36MoeGeometryPolicy) -> Result<Self> {
-        let config = Qwen36MoeNativeConfig::load_with_policy(model_dir, policy)?;
-        let tensors = IndexedSafetensors::open(model_dir)?;
-        Self::validate(config, tensors)
+        Self::open_with_policies(model_dir, policy, Qwen36MoeMtpLoadPolicy::Disabled)
     }
 
     pub fn validate(config: Qwen36MoeNativeConfig, tensors: IndexedSafetensors) -> Result<Self> {
+        Self::validate_with_policies(config, tensors, Qwen36MoeMtpLoadPolicy::Disabled)
+    }
+
+    pub fn validate_with_policies(
+        config: Qwen36MoeNativeConfig,
+        tensors: IndexedSafetensors,
+        mtp_policy: Qwen36MoeMtpLoadPolicy,
+    ) -> Result<Self> {
         let plan = expected_text_tensor_plan(&config)?;
+        let mtp_manifest = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)?;
+        let mtp_plan = match mtp_policy {
+            Qwen36MoeMtpLoadPolicy::Disabled => None,
+            Qwen36MoeMtpLoadPolicy::Enabled => Some(mtp_manifest.clone()),
+        };
         let mut text_tensor_names = BTreeMap::new();
         let mut skipped = SkippedScopeInventory::default();
         let mut mtp_payload_bytes = 0u64;
+        let mut mtp_tensor_names: BTreeMap<String, String> = BTreeMap::new();
+        let mut mtp_tensors: BTreeMap<String, (Vec<usize>, SafeDType, u64)> = BTreeMap::new();
 
         for raw_name in tensors.tensor_names() {
             let (scope, canonical) = canonical_text_tensor_name(raw_name)
@@ -1286,6 +1600,16 @@ impl Qwen36MoeNativeCheckpoint {
                         .tensor_info(raw_name)
                         .map(|info| info.storage_bytes as u64)
                         .unwrap_or(0);
+                    // MTP canonical names are the raw index names (the scope
+                    // canonicalizer returns None for them).
+                    mtp_tensor_names.insert(raw_name.to_string(), raw_name.to_string());
+                    if mtp_plan.is_some() {
+                        let info = tensors.tensor_info(raw_name)?;
+                        mtp_tensors.insert(
+                            raw_name.to_string(),
+                            (info.shape.clone(), info.dtype, info.storage_bytes as u64),
+                        );
+                    }
                 }
                 Qwen36MoeTensorScope::Unknown => {
                     return Err(Error::ModelLoadError(format!(
@@ -1344,16 +1668,73 @@ impl Qwen36MoeNativeCheckpoint {
 
         skipped.mtp_payload_bytes = mtp_payload_bytes;
 
+        // Fail-closed MTP manifest validation: every planned tensor must be
+        // present with the exact shape and dtype, and no unplanned `mtp.*`
+        // tensor may exist. A drift is a hard load error naming the delta —
+        // the manifest is a handoff-verified hypothesis about the published
+        // checkpoint, so any mismatch must stop the load, not guess.
+        let mtp = if let Some(mtp_plan) = mtp_plan {
+            for spec in &mtp_plan {
+                let Some((shape, dtype, _)) = mtp_tensors.get(&spec.name) else {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5/3.6-MoE checkpoint is missing MTP tensor `{}` expected {:?}",
+                        spec.name, spec.shape
+                    )));
+                };
+                let dtype_ok = match spec.kind {
+                    ExpectedTensorKind::Dense => {
+                        matches!(dtype, SafeDType::BF16 | SafeDType::F16 | SafeDType::F32)
+                    }
+                    ExpectedTensorKind::BlockFp8 => *dtype == SafeDType::F8_E4M3,
+                    ExpectedTensorKind::BlockFp8Scale => *dtype == SafeDType::BF16,
+                    ExpectedTensorKind::OptionalDense => {
+                        matches!(dtype, SafeDType::BF16 | SafeDType::F16 | SafeDType::F32)
+                    }
+                };
+                if *shape != spec.shape || !dtype_ok {
+                    return Err(Error::ModelLoadError(format!(
+                        "Qwen3.5/3.6-MoE MTP tensor `{}` contract drift: expected {:?} {:?}, found {dtype:?} {shape:?}",
+                        spec.name, spec.kind, spec.shape
+                    )));
+                }
+            }
+            if mtp_tensors.len() != mtp_plan.len() {
+                let extra: Vec<&str> = mtp_tensors
+                    .keys()
+                    .filter(|name| !mtp_plan.iter().any(|spec| &spec.name == *name))
+                    .map(|name| name.as_str())
+                    .take(8)
+                    .collect();
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.5/3.6-MoE checkpoint declares {} unplanned MTP tensors, including {extra:?}; update the qwen36moe MTP manifest before enabling MTP",
+                    mtp_tensors.len() - mtp_plan.len()
+                )));
+            }
+            Some(Qwen36MoeMtpInventory {
+                tensors: mtp_tensors,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             tensors,
             text_tensor_names,
             skipped,
+            mtp,
+            mtp_plan: mtp_manifest,
+            mtp_tensor_names,
         })
     }
 
-    /// Raw index name for a canonical text tensor name.
+    /// Raw index name for a canonical tensor name. MTP tensors are
+    /// identity-named in the index (they never enter the text plan), so a
+    /// `mtp.` canonical resolves to itself after an existence check.
     pub fn raw_tensor_name(&self, canonical: &str) -> Result<&str> {
+        if let Some(raw) = self.mtp_tensor_names.get(canonical) {
+            return Ok(raw.as_str());
+        }
         self.text_tensor_names
             .get(canonical)
             .map(|s| s.as_str())
@@ -1377,10 +1758,32 @@ impl Qwen36MoeNativeCheckpoint {
     /// decodes per GEMM inside the fp8 projection kernel, falling back per
     /// tensor to packed Q8_0 where the kernel contract cannot execute.
     pub fn projection_residency_policy(device: &DeviceProfile) -> Qwen36MoeProjectionResidency {
-        match BackendKind::from(device.kind) {
+        Self::projection_residency_policy_with_performance(
+            BackendKind::from(device.kind),
+            &crate::performance::CudaPerformanceConfig::default(),
+        )
+    }
+
+    /// Performance-config-aware residency: the qwen3.6 CUDA deployment
+    /// defaults to raw block-FP8 residency (the pinned census is fully
+    /// kernel-compatible), with `projection_backend = "q8"` — or the master
+    /// CUDA switch — as the escape hatch back to expanded BF16 weights.
+    /// This deliberately diverges from qwen3.8, whose Auto retains packed Q8.
+    pub fn projection_residency_policy_with_performance(
+        backend: BackendKind,
+        performance: &crate::performance::CudaPerformanceConfig,
+    ) -> Qwen36MoeProjectionResidency {
+        match backend {
             BackendKind::Cpu => Qwen36MoeProjectionResidency::PackedQ8_0,
             BackendKind::Metal => Qwen36MoeProjectionResidency::ExpandedF16,
-            BackendKind::Cuda => Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback,
+            BackendKind::Cuda
+                if performance.enabled()
+                    && performance.projection_backend
+                        != crate::performance::CudaProjectionBackend::Q8 =>
+            {
+                Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback
+            }
+            BackendKind::Cuda => Qwen36MoeProjectionResidency::ExpandedBf16,
         }
     }
 
@@ -1654,9 +2057,14 @@ mod tests {
         .unwrap();
 
         let device_profile = DeviceProfile::cpu();
-        let (text_config, model) =
-            load_text_model_native(&checkpoint, &device_profile, &candle_core::Device::Cpu)
-                .unwrap();
+        let (text_config, model, _mtp_head) = load_text_model_native(
+            &checkpoint,
+            &device_profile,
+            &candle_core::Device::Cpu,
+            &crate::performance::CudaPerformanceConfig::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(text_config.block_count, 4);
         let moe = text_config
             .moe_ffn
@@ -1747,6 +2155,339 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn residency_policy_follows_the_projection_backend_knob() {
+        use crate::performance::{CudaPerformanceConfig, CudaProjectionBackend, OptimizationMode};
+        let policy = Qwen36MoeNativeCheckpoint::projection_residency_policy_with_performance;
+        // Portable backends are performance-independent.
+        assert_eq!(
+            policy(BackendKind::Cpu, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::PackedQ8_0
+        );
+        assert_eq!(
+            policy(BackendKind::Metal, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::ExpandedF16
+        );
+        // CUDA default: raw block-FP8 residency (the deployment posture).
+        assert_eq!(
+            policy(BackendKind::Cuda, &CudaPerformanceConfig::default()),
+            Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback
+        );
+        // Explicit Q8 (or the master CUDA switch) escapes to expanded BF16.
+        let q8 = CudaPerformanceConfig {
+            projection_backend: CudaProjectionBackend::Q8,
+            ..CudaPerformanceConfig::default()
+        };
+        assert_eq!(
+            policy(BackendKind::Cuda, &q8),
+            Qwen36MoeProjectionResidency::ExpandedBf16
+        );
+        let master_off = CudaPerformanceConfig {
+            mode: OptimizationMode::Off,
+            ..CudaPerformanceConfig::default()
+        };
+        assert_eq!(
+            policy(BackendKind::Cuda, &master_off),
+            Qwen36MoeProjectionResidency::ExpandedBf16
+        );
+    }
+
+    #[test]
+    fn native_dense_source_honors_the_trunks_requested_dtype() {
+        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
+
+        let config = forward_config();
+        let dir = TestDir::new("dense-dtype");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The CUDA plan is the case that matters: dense_target is BF16, but
+        // the trunk requests F32 for the DeltaNet math tensors so they match
+        // the F32 state arena. The source must honor the request instead of
+        // silently returning the per-backend target dtype.
+        let cuda_plan_on_cpu = DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind: crate::backends::DeviceKind::Cuda,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        let source = Qwen36MoeNativeSource::new(&checkpoint, &cuda_plan_on_cpu);
+        let device = candle_core::Device::Cpu;
+
+        let dt_bias = source
+            .dense("blk.0.ssm_dt.bias", Some(candle_core::DType::F32), &device)
+            .unwrap();
+        assert_eq!(dt_bias.dtype(), candle_core::DType::F32);
+        let conv_kernel = source
+            .dense(
+                "blk.0.ssm_conv1d.weight",
+                Some(candle_core::DType::F32),
+                &device,
+            )
+            .unwrap();
+        assert_eq!(conv_kernel.dtype(), candle_core::DType::F32);
+        // A_log is transformed to F32 at materialization regardless.
+        let a = source
+            .dense("blk.0.ssm_a", Some(candle_core::DType::F32), &device)
+            .unwrap();
+        assert_eq!(a.dtype(), candle_core::DType::F32);
+
+        // Without a request the per-backend target still applies.
+        let unconstrained = source
+            .dense("blk.0.ssm_dt.bias", None, &device)
+            .unwrap();
+        assert_eq!(unconstrained.dtype(), candle_core::DType::BF16);
+    }
+
+    /// Run the shared trunk's prefill + decode under a backend dtype plan and
+    /// assert the trunk's activation dtype survives the head with finite
+    /// logits. Used by the hardware-gated plan tests: the CPU device cannot
+    /// execute non-F32 plans faithfully (no BF16 gemm, unreliable F16 gemm),
+    /// so a mixed-dtype graph must be validated on the backend that runs it.
+    fn forward_under_dtype_plan(
+        label: &str,
+        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        mut cache: crate::models::shared::attention::physical::PhysicalPagedKvCache,
+        activation_dtype: candle_core::DType,
+    ) {
+        let mut state = model.new_state();
+        let logits = model
+            .prefill_token_ids_physical(
+                &[1, 2, 3],
+                &[[0, 0, 0], [1, 1, 1], [2, 2, 2]],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap()
+            .expect("prefill logits");
+        assert_eq!(
+            logits.dtype(),
+            activation_dtype,
+            "{label}: trunk activation dtype must survive the head"
+        );
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{label}: prefill logits must be finite"
+        );
+
+        let logits = model
+            .forward_token_id_at_physical(4, [3, 3, 3], &mut state, &mut cache)
+            .unwrap();
+        assert_eq!(logits.dtype(), activation_dtype, "{label}: decode dtype");
+        let values = logits
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "{label}: decode logits must be finite"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn native_trunk_forwards_under_the_metal_dtype_plan_on_metal() {
+        use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::{DType, DeviceLocation};
+        use std::sync::Arc;
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; metal plan leg not run");
+            return;
+        };
+        let device_profile = DeviceProfile {
+            device: device.clone(),
+            kind: crate::backends::DeviceKind::Metal,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("plan-metal-hw");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The production Metal plan through the real constructor: ExpandedF16
+        // projections, F16 dense weights and norm weights, the F32 DeltaNet
+        // island and state arena, and an F32 KV arena. Before the F32 island
+        // this graph mixed F16 activations with F32 state in the conv and
+        // recurrence.
+        let source = Qwen36MoeNativeSource::new(&checkpoint, &device_profile);
+        let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
+        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+
+        let DeviceLocation::Metal { gpu_id } = device.location() else {
+            panic!("metal test device reported a non-metal location");
+        };
+        let gpu_id = gpu_id as u64;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4246),
+            backend: BackendKind::Metal,
+            device_ordinal: Some((gpu_id ^ (gpu_id >> 32)) as u32),
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(
+                KvArenaConfig {
+                    id,
+                    group,
+                    page_tokens: 8,
+                    capacity_pages: 8,
+                    growth: None,
+                    dtype: DType::F32,
+                    layers: vec![KvLayerConfig {
+                        binding: KvLayerBinding {
+                            model_layer: 3,
+                            physical_layer: 0,
+                        },
+                        num_kv_heads: 1,
+                        key_head_dim: 16,
+                        value_head_dim: 16,
+                    }],
+                },
+                device.clone(),
+            )
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+        forward_under_dtype_plan("plan-metal", &model, cache, DType::F16);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn native_trunk_dtype_plan_forwards_on_cuda_hardware() {
+        use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::{DType, DeviceLocation};
+        use std::sync::Arc;
+
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("plan-cuda-hw");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+
+        // The tiny fixture's projections are not all fp8-kernel compatible,
+        // so this exercises the expanded-BF16 CUDA plan: real BF16 CUDA
+        // matmuls through every trunk block, the F32 DeltaNet island, and an
+        // F16 accelerator KV arena. The raw compact-FP8 residency has its own
+        // kernel tests; the full-checkpoint FP8 E2E stays a hardware handoff.
+        let source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::ExpandedBf16,
+            ProjectionMaterialization::BF16,
+        );
+        let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
+        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+
+        let DeviceLocation::Cuda { gpu_id } = device.location() else {
+            panic!("CUDA test device reported a non-CUDA location");
+        };
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4245),
+            backend: BackendKind::Cuda,
+            device_ordinal: u32::try_from(gpu_id).ok(),
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(
+                KvArenaConfig {
+                    id,
+                    group,
+                    page_tokens: 8,
+                    capacity_pages: 8,
+                    growth: None,
+                    dtype: DType::F16,
+                    layers: vec![KvLayerConfig {
+                        binding: KvLayerBinding {
+                            model_layer: 3,
+                            physical_layer: 0,
+                        },
+                        num_kv_heads: 1,
+                        key_head_dim: 16,
+                        value_head_dim: 16,
+                    }],
+                },
+                device.clone(),
+            )
+            .unwrap(),
+        );
+        let blocks = (0..8)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let cache = PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap();
+        forward_under_dtype_plan("plan-cuda", &model, cache, DType::BF16);
     }
 
     #[test]
@@ -2249,6 +2990,241 @@ mod tests {
     }
 
     #[test]
+    fn mtp_manifest_matches_the_published_checkpoint_census() {
+        let config = pinned_config();
+        let plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap();
+
+        // Fold the per-index plan into name-pattern rows: every digit run in
+        // a canonical name (layer, expert) becomes `{}`. All entries sharing
+        // a pattern must agree on kind and shape.
+        fn pattern(name: &str) -> String {
+            let mut out = String::with_capacity(name.len());
+            let mut chars = name.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    out.push_str("{}");
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
+        let mut rows: BTreeMap<String, (ExpectedTensorKind, Vec<usize>, usize)> = BTreeMap::new();
+        for spec in &plan {
+            let entry = rows
+                .entry(pattern(&spec.name))
+                .or_insert_with(|| (spec.kind, spec.shape.clone(), 0));
+            assert_eq!(entry.0, spec.kind, "pattern kind drift at {}", spec.name);
+            assert_eq!(entry.1, spec.shape, "pattern shape drift at {}", spec.name);
+            entry.2 += 1;
+        }
+
+        // Frozen census of the published `mtp.*` scope (Qwen/Qwen3.6-35B-A3B-FP8
+        // safetensors headers, revision 95a723d0, fetched 2026-10-04): 1,560
+        // tensors forming the draft layer's trunk-style contract — the MoE
+        // FFN (BF16 router, block-FP8 routed experts, block-FP8 shared expert
+        // with its BF16 sigmoid gate) plus the gated full-attention set and
+        // the dense draft frame. The original dense-FFN hypothesis shipped
+        // default-on and failed every native load on the H100; fixtures
+        // derived from the plan cannot catch plan-vs-published drift, so the
+        // observed census is pinned here as executable contract.
+        let published: &[(&str, ExpectedTensorKind, &[usize], usize)] = &[
+            (
+                "mtp.fc.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048, 4_096],
+                1,
+            ),
+            ("mtp.norm.weight", ExpectedTensorKind::Dense, &[2_048], 1),
+            (
+                "mtp.layers.{}.input_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.post_attention_layernorm.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.gate.weight",
+                ExpectedTensorKind::Dense,
+                &[256, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.experts.{}.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                256,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.gate_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.up_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.down_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 512],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.gate_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.up_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert.down_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 4],
+                1,
+            ),
+            (
+                "mtp.layers.{}.mlp.shared_expert_gate.weight",
+                ExpectedTensorKind::Dense,
+                &[1, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_norm.weight",
+                ExpectedTensorKind::Dense,
+                &[256],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[8_192, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.q_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[64, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.k_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.v_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[512, 2_048],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.v_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[4, 16],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.o_proj.weight",
+                ExpectedTensorKind::BlockFp8,
+                &[2_048, 4_096],
+                1,
+            ),
+            (
+                "mtp.layers.{}.self_attn.o_proj.weight_scale_inv",
+                ExpectedTensorKind::BlockFp8Scale,
+                &[16, 32],
+                1,
+            ),
+            (
+                "mtp.pre_fc_norm_embedding.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+            (
+                "mtp.pre_fc_norm_hidden.weight",
+                ExpectedTensorKind::Dense,
+                &[2_048],
+                1,
+            ),
+        ];
+        assert_eq!(rows.len(), published.len(), "pattern-set size");
+        for (name, kind, shape, count) in published {
+            let row = rows
+                .get(*name)
+                .unwrap_or_else(|| panic!("MTP plan has no row for published pattern {name}"));
+            assert_eq!(row.0, *kind, "{name}");
+            assert_eq!(row.1, *shape, "{name}");
+            assert_eq!(row.2, *count, "{name}");
+        }
+        // Every published tensor is accounted exactly once.
+        let total: usize = published.iter().map(|row| row.3).sum();
+        assert_eq!(total, 1_560);
+        assert_eq!(total, plan.len());
+    }
+
+    #[test]
     fn projection_residency_policy_matches_backend_envelopes() {
         let cpu = DeviceProfile::cpu();
         assert_eq!(
@@ -2260,6 +3236,12 @@ mod tests {
     // ---- Disk-based checkpoint validation (synthetic tiny geometry) ----
 
     struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn path(&self) -> &std::path::Path {
+            self.0.as_path()
+        }
+    }
 
     impl TestDir {
         fn new(label: &str) -> Self {
@@ -2354,9 +3336,17 @@ mod tests {
         bf16_bytes(&vec![1.0; count])
     }
 
+    /// Uniform BF16 fill at a magnitude that keeps the all-constant fixture
+    /// inside F16/BF16 range: unit-magnitude constants amplify multiplicatively
+    /// through the 32-wide MoE cascade to ~1e5, which saturates half-precision
+    /// plans into +Inf even though the graph itself is coherent.
+    fn bf16_uniform(value: f32, count: usize) -> Vec<u8> {
+        bf16_bytes(&vec![value; count])
+    }
+
     fn push_dense(tensors: &mut Vec<RawTensor>, name: String, shape: Vec<usize>) {
         let count: usize = shape.iter().product();
-        tensors.push((name, SafeDType::BF16, shape, bf16_ones(count)));
+        tensors.push((name, SafeDType::BF16, shape, bf16_uniform(0.05, count)));
     }
 
     fn push_fp8_proj(
@@ -2382,7 +3372,7 @@ mod tests {
             ),
             SafeDType::BF16,
             vec![scale_rows, scale_cols],
-            bf16_ones(scale_rows * scale_cols),
+            bf16_uniform(0.05, scale_rows * scale_cols),
         ));
     }
 
@@ -2568,12 +3558,24 @@ mod tests {
             vec![4, 4],
             bf16_bytes(&[1.0; 16]),
         ));
-        tensors.push((
-            "mtp.norm.weight".into(),
-            SafeDType::BF16,
-            vec![hidden],
-            bf16_ones(hidden),
-        ));
+        // The MTP draft manifest, generated from the same plan the loader
+        // validates against — a drift in either side fails the tests.
+        for spec in mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap() {
+            let count: usize = spec.shape.iter().product();
+            let bytes = match spec.kind {
+                ExpectedTensorKind::Dense | ExpectedTensorKind::BlockFp8Scale => {
+                    bf16_uniform(0.05, count)
+                }
+                ExpectedTensorKind::BlockFp8 => vec![0x38u8; count],
+                ExpectedTensorKind::OptionalDense => bf16_uniform(0.05, count),
+            };
+            tensors.push((
+                spec.name.clone(),
+                spec.kind_to_safe_dtype(),
+                spec.shape.clone(),
+                bytes,
+            ));
+        }
         tensors
     }
 
@@ -2672,8 +3674,16 @@ mod tests {
         assert_eq!(text.block_count, 4);
         assert_eq!(text.moe_num_experts, 2);
         assert_eq!(checkpoint.skipped.vision_tensors, 1);
-        assert_eq!(checkpoint.skipped.mtp_tensors, 1);
+        // The full MTP draft manifest rides every checkpoint; the default
+        // load skips it until the MTP policy enables validation. The
+        // emitted count follows the MoE manifest (2 fixture experts).
+        assert_eq!(
+            checkpoint.skipped.mtp_tensors,
+            mtp_tensor_count(&checkpoint.config.text)
+        );
+        assert_eq!(checkpoint.skipped.mtp_tensors, 36);
         assert!(checkpoint.skipped.mtp_payload_bytes > 0);
+        assert!(checkpoint.mtp.is_none());
         // Composite layout is canonicalized: `raw_tensor_name` resolves the
         // raw index name for a canonical plan name.
         let raw = checkpoint
@@ -2769,74 +3779,890 @@ mod tests {
         assert_eq!(y.to_vec2::<f32>().unwrap(), [vec![2.0; 8]]);
     }
 
-    #[test]
-    fn rejects_unexpected_and_missing_text_tensors_by_name() {
-        let config = tiny_config();
-        let dir = TestDir::new("open-extra");
-        write_tiny_checkpoint(&config, dir.0.as_path());
-        // Rewrite the checkpoint with one extra unexpected text tensor.
-        let mut with_extra = tiny_checkpoint_tensors(&config);
-        with_extra.push((
-            "model.language_model.layers.0.mlp.mystery.weight".into(),
-            SafeDType::BF16,
-            vec![4],
-            bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
-        ));
-        let refs: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = with_extra
-            .iter()
-            .map(|(name, dtype, shape, data)| {
-                (name.as_str(), *dtype, shape.clone(), data.as_slice())
+    /// Minimal HF tokenizer pair for the native fixture: every byte of the
+    /// rendered ChatML prompt (letters, newline, specials) resolves to a
+    /// token, and the model vocab (32) equals the tokenizer vocab so greedy
+    /// argmax stays in range.
+    fn write_fixture_tokenizer(dir: &std::path::Path) {
+        let mut vocab = serde_json::Map::new();
+        for (index, token) in [
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+            "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "\u{010A}", "0", "<|im_start|>",
+            "<|im_end|>", "<|image_pad|>", "<|video_pad|>",
+        ]
+        .into_iter()
+            .enumerate()
+        {
+            vocab.insert(token.to_string(), serde_json::json!(index as u32));
+        }
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 28, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 29, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 30, "content": "<|image_pad|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 31, "content": "<|video_pad|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false,
+                              "trim_offsets": false, "use_regex": false},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true,
+                        "trim_offsets": true, "use_regex": true},
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                "fuse_unk": false, "byte_fallback": false,
+                "vocab": vocab,
+                "merges": []
+            }
+        });
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        let tokenizer_config = serde_json::json!({
+            "eos_token": "<|im_end|>",
+            "chat_template": "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
+        });
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_string(&tokenizer_config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Per-row physical cache for the native fixture: one full-attention
+    /// layer (model_layer 3, the interval-4 layout) over its own arena.
+    fn native_physical_cache(
+        model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+    ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use std::sync::Arc;
+        let kv_heads = model.text_config().attention_head_count_kv;
+        let head_dim = model.text_config().attention_key_length;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4248),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 16,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 3,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                }],
+            })
+            .unwrap(),
+        );
+        let blocks = (0..16)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index: index as u32,
+                slot_generation: 1,
             })
             .collect();
-        write_safetensors(&dir.0.join("extra.safetensors"), &refs);
-        let mut weight_map = serde_json::Map::new();
-        for (name, ..) in &refs {
-            weight_map.insert((*name).to_string(), json!("extra.safetensors"));
-        }
-        write_index(dir.0.as_path(), serde_json::Value::Object(weight_map));
+        PhysicalPagedKvCache::new(
+            arena,
+            vec![KvLayerBinding {
+                model_layer: 3,
+                physical_layer: 0,
+            }],
+            blocks,
+            0,
+        )
+        .unwrap()
+    }
 
-        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
+    #[test]
+    fn moe_ffn_prefix_resolves_the_same_block_as_the_trunk_layer() {
+        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::{
+            Qwen36MoeNativeSource, qwen35_text_config_from_native,
+        };
+
+        let config = forward_config();
+        let dir = TestDir::new("moe-ffn-prefix-seam");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
             dir.0.as_path(),
             Qwen36MoeGeometryPolicy::Synthetic,
         )
-        .err()
-        .expect("unexpected tensor must fail closed")
-        .to_string();
-        assert!(error.contains("outside the validated plan"), "{error}");
-        assert!(error.contains("mystery"), "{error}");
+        .unwrap();
+        let source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::PackedQ8_0,
+            ProjectionMaterialization::F32,
+        );
+        let geometry = qwen35_text_config_from_native(&checkpoint.config.text)
+            .moe_ffn
+            .expect("the fixture carries the MoE FFN geometry");
+        let device = candle_core::Device::Cpu;
 
-        // Missing required tensor (drop the full-attention o_proj) fails by
-        // naming the gap.
-        let dir_missing = TestDir::new("open-missing");
-        write_tiny_checkpoint(&config, dir_missing.0.as_path());
-        let tensors = tiny_checkpoint_tensors(&config);
-        let pruned: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = tensors
-            .iter()
-            .filter(|(name, ..)| {
-                !name.ends_with("layers.3.self_attn.o_proj.weight")
-                    && !name.ends_with("layers.3.self_attn.o_proj.weight_scale_inv")
+        let via_layer = source.moe_ffn(0, &geometry, &device).unwrap();
+        let via_prefix = source
+            .moe_ffn_prefix("model.layers.0.mlp", &geometry, &device)
+            .unwrap();
+
+        // Identical source tensors must produce identical forward output —
+        // the seam only changes name resolution, not assembly.
+        let input = candle_core::Tensor::ones(
+            (2, config.text.hidden_size),
+            candle_core::DType::F32,
+            &device,
+        )
+        .unwrap();
+        let a = via_layer.forward(&input).unwrap();
+        let b = via_prefix.forward(&input).unwrap();
+        let drift = (&a - &b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(drift <= 1e-6, "prefix seam drift: {drift}");
+    }
+
+    #[test]
+    fn mtp_load_policy_requires_the_handoff_opt_in() {
+        use crate::performance::{OptimizationMode, PerformanceConfig};
+
+        let _env_guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(MTP_HANDOFF_ENV);
+        let cuda_knobs = PerformanceConfig::default().cuda;
+
+        // Default knobs (Auto everywhere) must not enable MTP for this
+        // family: the draft manifest is unverified until the handoff.
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cuda, &cuda_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cpu, &cuda_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+
+        // The explicit opt-in re-enables it on every backend.
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            std::env::set_var(MTP_HANDOFF_ENV, "1");
+            assert_eq!(
+                resolve_mtp_load_policy(backend, &cuda_knobs).unwrap(),
+                Qwen36MoeMtpLoadPolicy::Enabled,
+                "{backend:?}"
+            );
+        }
+
+        // The knob's explicit off stays authoritative over the opt-in.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut off_knobs = PerformanceConfig::default().cuda;
+        off_knobs.mtp = OptimizationMode::Off;
+        std::env::set_var(MTP_HANDOFF_ENV, "1");
+        assert_eq!(
+            resolve_mtp_load_policy(BackendKind::Cpu, &off_knobs).unwrap(),
+            Qwen36MoeMtpLoadPolicy::Disabled
+        );
+
+        // Invalid values fail closed naming the variable.
+        std::env::set_var(MTP_HANDOFF_ENV, "maybe");
+        let error = resolve_mtp_load_policy(BackendKind::Cpu, &cuda_knobs).unwrap_err();
+        assert!(error.to_string().contains(MTP_HANDOFF_ENV));
+        std::env::remove_var(MTP_HANDOFF_ENV);
+    }
+
+    #[test]
+    fn mtp_quantum_matches_scalar_greedy_decode_token_for_token() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        // The chat-level loader derives its geometry policy from the process
+        // environment; the tiny native fixture needs the synthetic hatch.
+        // The env lock keeps this exclusive of tests that clear the
+        // process environment, and the variable is removed on the way out.
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
+
+        let write_native_fixture = |tag: &str| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            (config, dir)
+        };
+        let greedy_config = || ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str, mtp: bool| {
+            let (config, dir) = write_native_fixture(tag);
+            let device = DeviceProfile::cpu();
+            // PerformanceConfig keeps private resolution state, so the knobs
+            // are assigned after the default rather than via struct update.
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            assert_eq!(model.preferred_decode_tokens(), if mtp { 3 } else { 1 });
+            (config, dir, model)
+        };
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "abcd".to_string(),
+        }];
+        let config = greedy_config();
+
+        // Scalar reference: MTP off, plain decode steps.
+        let (_config, dir_off, scalar_model) = load("mtp-parity-off", false);
+        let cache = native_physical_cache(&scalar_model);
+        let mut scalar_state = scalar_model
+            .start_decode_state_physical(&messages, 24, &config, None, cache)
+            .unwrap();
+        let mut scalar_deltas = Vec::new();
+        for _ in 0..3 {
+            let step = scalar_model
+                .decode_quantum(&mut scalar_state, 4)
+                .unwrap();
+            scalar_deltas.push(step.delta);
+            assert!(!step.finished);
+        }
+        drop(scalar_state);
+        std::fs::remove_dir_all(dir_off.path()).ok();
+
+        // MTP: same prompt, speculative rounds — must be token-identical.
+        let (_config, _dir_on, mtp_model) = load("mtp-parity-on", true);
+        let cache = native_physical_cache(&mtp_model);
+        let mut mtp_state = mtp_model
+            .start_decode_state_physical(&messages, 24, &config, None, cache)
+            .unwrap();
+        let mut mtp_deltas = Vec::new();
+        let mut last_tokens_generated = 0usize;
+        for _ in 0..3 {
+            let step = mtp_model.decode_quantum(&mut mtp_state, 4).unwrap();
+            mtp_deltas.push(step.delta);
+            last_tokens_generated = step.tokens_generated;
+            assert!(!step.finished);
+        }
+        // Evidence the draft/verify path actually ran: at least one
+        // speculative round executed, and the MTP cache cursor advanced one
+        // pair row per committed token — every committed token except the
+        // bootstrap token (published without a KV commit) has a pair.
+        assert!(
+            mtp_model.speculative_rounds() > 0,
+            "MTP decode must run speculative rounds"
+        );
+        assert_eq!(
+            mtp_model.mtp_cache_cursor(&mtp_state),
+            Some(last_tokens_generated - 1),
+            "MTP cache cursor must track committed tokens"
+        );
+
+        assert_eq!(
+            mtp_deltas, scalar_deltas,
+            "speculative decode must match scalar greedy decode exactly"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
+    }
+
+    /// Per-row caches over ONE shared arena with disjoint block windows —
+    /// the continuous-batch geometry. `model_layer` selects the target
+    /// full-attention row (3) or the MTP draft row (block_count).
+    fn shared_native_caches(
+        model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+        rows: usize,
+        model_layer: u32,
+    ) -> Vec<crate::models::shared::attention::physical::PhysicalPagedKvCache> {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use std::sync::Arc;
+        let kv_heads = model.text_config().attention_head_count_kv;
+        let head_dim = model.text_config().attention_key_length;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4248 + u64::from(model_layer)),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let pages_per_row = 16u32;
+        let binding = KvLayerBinding {
+            model_layer,
+            physical_layer: 0,
+        };
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: pages_per_row * rows as u32,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: vec![KvLayerConfig {
+                    binding,
+                    num_kv_heads: kv_heads as u32,
+                    key_head_dim: head_dim as u32,
+                    value_head_dim: head_dim as u32,
+                }],
             })
-            .map(|(name, dtype, shape, data)| {
-                (name.as_str(), *dtype, shape.clone(), data.as_slice())
+            .unwrap(),
+        );
+        (0..rows)
+            .map(|row| {
+                let blocks = (0..pages_per_row)
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index: index + row as u32 * pages_per_row,
+                        slot_generation: 1,
+                    })
+                    .collect();
+                PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn speculative_envelope_matches_solo_and_scalar_decode() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
+
+        let greedy_config = || ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str, mtp: bool| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            (model, dir)
+        };
+        let messages_for = |content: &str| {
+            vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+            }]
+        };
+        let run_to_completion = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+                                 state: &mut crate::models::architectures::qwen35::chat::ChatDecodeState|
+         -> String {
+            let mut text = String::new();
+            for _ in 0..64 {
+                let step = model.decode_quantum(state, 4).unwrap();
+                text.push_str(&step.delta);
+                if step.finished {
+                    break;
+                }
+            }
+            text
+        };
+
+        let prompts = ["ab", "abcd"];
+        let config = greedy_config();
+
+        // Scalar reference (MTP off).
+        let (scalar_model, dir_scalar) = load("envelope-parity-scalar", false);
+        let scalar_text: Vec<String> = prompts
+            .iter()
+            .map(|prompt| {
+                let cache = native_physical_cache(&scalar_model);
+                let mut state = scalar_model
+                    .start_decode_state_physical(
+                        &messages_for(prompt),
+                        20,
+                        &config,
+                        None,
+                        cache,
+                    )
+                    .unwrap();
+                run_to_completion(&scalar_model, &mut state)
             })
             .collect();
-        let mut missing_map = serde_json::Map::new();
-        for (name, ..) in &pruned {
-            missing_map.insert((*name).to_string(), json!("layers.safetensors"));
+        drop(scalar_model);
+        std::fs::remove_dir_all(dir_scalar.path()).ok();
+
+        // Solo MTP reference: each row decodes speculative quanta alone.
+        let (mtp_model, dir_solo) = load("envelope-parity-solo", true);
+        let solo_text: Vec<String> = prompts
+            .iter()
+            .map(|prompt| {
+                let cache = native_physical_cache(&mtp_model);
+                let mtp_cache = shared_native_caches(&mtp_model, 1, 4).remove(0);
+                let mut state = mtp_model
+                    .start_decode_state_physical_with_mtp(
+                        &messages_for(prompt),
+                        20,
+                        &config,
+                        None,
+                        cache,
+                        Some(mtp_cache),
+                    )
+                    .unwrap();
+                run_to_completion(&mtp_model, &mut state)
+            })
+            .collect();
+
+        // Envelope: both rows decode through decode_speculative_batch after
+        // their scalar bootstrap quanta, sharing one target arena and one
+        // MTP arena through disjoint windows. A dedicated instance keeps the
+        // round counters attributable to this leg alone.
+        let (envelope_model, dir_envelope) = load("envelope-parity-batch", true);
+        let block_count = u32::try_from(envelope_model.text_config().block_count).unwrap();
+        let mut caches = shared_native_caches(&envelope_model, 2, 3);
+        let mut mtp_caches = shared_native_caches(&envelope_model, 2, block_count);
+        let mut state_a = envelope_model
+            .start_decode_state_physical_with_mtp(
+                &messages_for(prompts[0]),
+                20,
+                &config,
+                None,
+                caches.remove(0),
+                Some(mtp_caches.remove(0)),
+            )
+            .unwrap();
+        let mut state_b = envelope_model
+            .start_decode_state_physical_with_mtp(
+                &messages_for(prompts[1]),
+                20,
+                &config,
+                None,
+                caches.remove(0),
+                Some(mtp_caches.remove(0)),
+            )
+            .unwrap();
+        // The prefill bootstrap is the scalar prefill quantum exactly as the
+        // executor dispatches it: one budget-1 decode_quantum per row. Its
+        // text joins the row's stream like the solo reference's bootstrap.
+        let mut envelope_text = [String::new(), String::new()];
+        envelope_text[0].push_str(&envelope_model.decode_quantum(&mut state_a, 1).unwrap().delta);
+        envelope_text[1].push_str(&envelope_model.decode_quantum(&mut state_b, 1).unwrap().delta);
+        let mut last_generated = [0usize, 0];
+        for _ in 0..64 {
+            let mut rows = [&mut state_a, &mut state_b];
+            let steps = envelope_model
+                .decode_speculative_batch(&mut rows, 4)
+                .expect("speculative envelope round");
+            for (row, step) in steps.iter().enumerate() {
+                envelope_text[row].push_str(&step.delta);
+                last_generated[row] = step.tokens_generated;
+            }
+            if steps.iter().all(|step| step.finished) {
+                break;
+            }
         }
-        write_safetensors(&dir_missing.0.join("layers.safetensors"), &pruned);
-        write_index(
-            dir_missing.0.as_path(),
-            serde_json::Value::Object(missing_map),
+        assert!(
+            envelope_model.envelope_rounds() > 0,
+            "the envelope must run batched speculative rounds"
         );
-        let error = Qwen36MoeNativeCheckpoint::open_with_policy(
-            dir_missing.0.as_path(),
-            Qwen36MoeGeometryPolicy::Synthetic,
-        )
-        .err()
-        .expect("missing tensor must fail closed")
-        .to_string();
-        assert!(error.contains("missing 2 required text tensors"), "{error}");
-        assert!(error.contains("o_proj"), "{error}");
+        assert_eq!(
+            envelope_model.speculative_rounds(),
+            0,
+            "the envelope must not route rounds through the solo quantum"
+        );
+        for (row, state) in [&mut state_a, &mut state_b].into_iter().enumerate() {
+            assert_eq!(
+                envelope_model.mtp_cache_cursor(state),
+                Some(last_generated[row] - 1),
+                "envelope row {row} MTP cursor must track committed tokens"
+            );
+        }
+        assert_eq!(
+            envelope_text[0], solo_text[0],
+            "row a envelope decode must match its solo speculative decode"
+        );
+        assert_eq!(
+            envelope_text[1], solo_text[1],
+            "row b envelope decode must match its solo speculative decode"
+        );
+        assert_eq!(
+            envelope_text[0], scalar_text[0],
+            "row a envelope decode must match scalar greedy decode"
+        );
+        assert_eq!(
+            envelope_text[1], scalar_text[1],
+            "row b envelope decode must match scalar greedy decode"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
+        std::fs::remove_dir_all(dir_solo.path()).ok();
+        std::fs::remove_dir_all(dir_envelope.path()).ok();
+    }
+
+    #[test]
+    fn stochastic_speculation_is_deterministic_and_solo_envelope_identical() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
+
+        // Row a samples plain; row b adds a repetition penalty — together
+        // they exercise the lossless proposal/verify path with and without
+        // penalty-aware draft distributions inside one envelope.
+        let sampled_config = |seed: u64, penalty: f32| ChatGenerationConfig {
+            temperature: 1.0,
+            seed,
+            repetition_penalty: penalty,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let load = |tag: &str| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = crate::performance::OptimizationMode::Auto;
+                performance.cuda.mtp_draft_tokens = 2;
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            (model, dir)
+        };
+        let messages_for = |content: &str| {
+            vec![ChatMessage {
+                role: ChatRole::User,
+                content: content.to_string(),
+            }]
+        };
+
+        let (model, dir) = load("stochastic-speculation");
+        let block_count = u32::try_from(model.text_config().block_count).unwrap();
+        let prompts = ["ab", "abcd"];
+        let seeds = [0x5EED_0007u64, 0x5EED_0011u64];
+        let penalties = [1.0f32, 1.1];
+        let max_new_tokens = 20usize;
+
+        // Runs one full stochastic generation per path. Token streams are
+        // only compared ACROSS RUNS of the same path: lossless rejection
+        // sampling preserves the target distribution, not a fixed sample
+        // sequence, and the envelope's batched MTP advance differs from the
+        // solo single-row advance by float noise that sampled proposals
+        // amplify (greedy token-identity is covered by the parity tests).
+        let run = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel| {
+            let run_solo = |row: usize| {
+                let config = sampled_config(seeds[row], penalties[row]);
+                let cache = native_physical_cache(model);
+                let mtp_cache = shared_native_caches(model, 1, 4).remove(0);
+                let mut state = model
+                    .start_decode_state_physical_with_mtp(
+                        &messages_for(prompts[row]),
+                        max_new_tokens,
+                        &config,
+                        None,
+                        cache,
+                        Some(mtp_cache),
+                    )
+                    .unwrap();
+                let mut text = String::new();
+                for _ in 0..64 {
+                    let step = model.decode_quantum(&mut state, 4).unwrap();
+                    text.push_str(&step.delta);
+                    if step.finished {
+                        break;
+                    }
+                }
+                assert!(
+                    state.is_finished(),
+                    "solo stochastic row {row} must finish (stop or output cap)"
+                );
+                assert!(
+                    state.tokens_generated() <= max_new_tokens,
+                    "solo stochastic row {row} must respect the output cap"
+                );
+                let cursor = model.mtp_cache_cursor(&state);
+                assert!(
+                    cursor == Some(state.tokens_generated() - 1)
+                        || (state.is_finished() && cursor == Some(state.tokens_generated())),
+                    "solo stochastic row {row} MTP cursor {cursor:?} must track committed tokens (a sampled stop token holds a pair but is not counted)"
+                );
+                text
+            };
+
+            // Envelope: both rows (mixed sampling configs) speculate in one
+            // shared-arena batch after their bootstrap quanta.
+            let mut caches = shared_native_caches(model, 2, 3);
+            let mut mtp_caches = shared_native_caches(model, 2, block_count);
+            let mut states = (0..2)
+                .map(|row| {
+                    let config = sampled_config(seeds[row], penalties[row]);
+                    model
+                        .start_decode_state_physical_with_mtp(
+                            &messages_for(prompts[row]),
+                            max_new_tokens,
+                            &config,
+                            None,
+                            caches.remove(0),
+                            Some(mtp_caches.remove(0)),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut envelope_text = [String::new(), String::new()];
+            for row in 0..2 {
+                envelope_text[row]
+                    .push_str(&model.decode_quantum(&mut states[row], 1).unwrap().delta);
+            }
+            for _ in 0..64 {
+                let [state_a, state_b] = states.as_mut_slice() else {
+                    unreachable!("two rows");
+                };
+                let mut rows = [state_a, state_b];
+                let steps = model
+                    .decode_speculative_batch(&mut rows, 4)
+                    .expect("stochastic envelope round");
+                for (row, step) in steps.iter().enumerate() {
+                    envelope_text[row].push_str(&step.delta);
+                }
+                if steps.iter().all(|step| step.finished) {
+                    break;
+                }
+            }
+            for (row, state) in states.iter().enumerate() {
+                assert!(
+                    state.is_finished() && state.tokens_generated() == max_new_tokens,
+                    "envelope stochastic row {row} must decode to the output cap"
+                );
+                let cursor = model.mtp_cache_cursor(state);
+                assert!(
+                    cursor == Some(state.tokens_generated() - 1)
+                        || (state.is_finished() && cursor == Some(state.tokens_generated())),
+                    "envelope stochastic row {row} MTP cursor {cursor:?} must track committed tokens (a sampled stop token holds a pair but is not counted)"
+                );
+            }
+            assert!(
+                model.envelope_rounds() > 0,
+                "stochastic envelope rounds must run"
+            );
+            let solo_text = [run_solo(0), run_solo(1)];
+            (solo_text, envelope_text)
+        };
+
+        let (solo_text, envelope_text) = run(&model);
+
+        // Determinism: identical seeds and paths must reproduce exactly.
+        let (solo_text_rerun, envelope_text_rerun) = run(&model);
+        assert_eq!(
+            solo_text, solo_text_rerun,
+            "solo stochastic decode must be deterministic per seed"
+        );
+        assert_eq!(
+            envelope_text, envelope_text_rerun,
+            "envelope stochastic decode must be deterministic per seed"
+        );
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
+        std::fs::remove_dir_all(dir.path()).ok();
+    }
+
+    #[test]
+    fn replay_checkpoint_preserves_decode_across_suspension() {
+        use crate::model::ModelVariant;
+        use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+
+        let _env_guard = crate::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY", "1");
+        std::env::set_var(super::MTP_HANDOFF_ENV, "1");
+
+        let load = |tag: &str, mtp: bool| {
+            let config = forward_config();
+            let dir = TestDir::new(tag);
+            write_tiny_checkpoint(&config, dir.path());
+            write_fixture_tokenizer(dir.path());
+            let device = DeviceProfile::cpu();
+            #[allow(clippy::field_reassign_with_default)]
+            let performance = {
+                let mut performance = crate::performance::PerformanceConfig::default();
+                performance.cuda.mtp = if mtp {
+                    crate::performance::OptimizationMode::Auto
+                } else {
+                    crate::performance::OptimizationMode::Off
+                };
+                performance.cuda.mtp_draft_tokens = if mtp { 2 } else { 1 };
+                performance
+            };
+            let model = crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel::load_with_performance(
+                dir.0.as_path(),
+                ModelVariant::Qwen36Moe35BA3BFp8,
+                device,
+                &performance,
+                false,
+            )
+            .unwrap();
+            (model, dir)
+        };
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "abcd".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            ..ChatGenerationConfig::default()
+        };
+        let fresh_caches = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
+                            mtp: bool| {
+            let block_count = u32::try_from(model.text_config().block_count).unwrap();
+            let target = shared_native_caches(model, 1, 3).remove(0);
+            let mtp_cache = mtp.then(|| shared_native_caches(model, 1, block_count).remove(0));
+            (target, mtp_cache)
+        };
+
+        for (tag, mtp) in [("replay-headless", false), ("replay-mtp", true)] {
+            let (model, dir) = load(tag, mtp);
+            let (target, mtp_cache) = fresh_caches(&model, mtp);
+            let mut uninterrupted = model
+                .start_decode_state_physical_with_mtp(
+                    &messages, 16, &config, None, target, mtp_cache,
+                )
+                .unwrap();
+            // Suspended immediately after prefill: the replay recomputes the
+            // prompt span exactly as the original prefill ran it.
+            let initial = uninterrupted.replay_checkpoint().unwrap();
+            let prompt_tokens = initial.replay_tokens();
+            assert!(prompt_tokens > 0);
+            let (target, mtp_cache) = fresh_caches(&model, mtp);
+            let mut resumed = model
+                .begin_replay_state_physical(&initial, target, mtp_cache)
+                .unwrap();
+            // Decode cannot run while a replay is pending.
+            assert!(model.decode_quantum(&mut resumed, 1).is_err());
+            assert!(
+                model
+                    .continue_replay_physical(&mut resumed, 0, prompt_tokens)
+                    .unwrap(),
+                "single-span replay must report completion"
+            );
+            assert!(resumed.replay_tokens().is_none());
+
+            // Step both sessions to completion, re-suspending the resumed
+            // session once mid-run: generated tokens replay in one-token
+            // spans, the same decode path that produced them.
+            let mut re_suspended = false;
+            while !uninterrupted.is_finished() {
+                let expected = model.decode_quantum(&mut uninterrupted, 4).unwrap();
+                let actual = model.decode_quantum(&mut resumed, 4).unwrap();
+                assert_eq!(actual.delta, expected.delta, "post-replay step must match");
+                assert_eq!(actual.tokens_generated, expected.tokens_generated);
+                assert_eq!(
+                    resumed.tokens_generated(),
+                    uninterrupted.tokens_generated()
+                );
+                assert_eq!(
+                    model.mtp_cache_cursor(&resumed),
+                    model.mtp_cache_cursor(&uninterrupted),
+                    "MTP cursor must survive suspension"
+                );
+                if !re_suspended && uninterrupted.tokens_generated() >= 6 {
+                    re_suspended = true;
+                    let checkpoint = resumed.replay_checkpoint().unwrap();
+                    let (target, mtp_cache) = fresh_caches(&model, mtp);
+                    resumed = model
+                        .begin_replay_state_physical(&checkpoint, target, mtp_cache)
+                        .unwrap();
+                    let appended = checkpoint.replay_tokens();
+                    for cursor in 0..appended {
+                        let complete = model
+                            .continue_replay_physical(&mut resumed, cursor, cursor + 1)
+                            .unwrap();
+                        assert_eq!(complete, cursor + 1 == appended);
+                    }
+                    assert!(resumed.replay_tokens().is_none());
+                }
+            }
+            assert!(re_suspended, "the fixture must reach the mid-run suspension");
+            // Fail-closed gate: finished sessions cannot suspend.
+            assert!(uninterrupted.replay_checkpoint().is_err());
+            std::fs::remove_dir_all(dir.path()).ok();
+        }
+        std::env::remove_var("IZWI_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY");
+        std::env::remove_var(super::MTP_HANDOFF_ENV);
     }
 }

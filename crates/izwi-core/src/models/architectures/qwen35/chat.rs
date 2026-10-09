@@ -14,23 +14,33 @@ use tracing::{debug, info};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, TensorStateArena,
 };
+use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::backends::kv::CandleAcceleratorKvArena;
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
-use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
+use crate::kv::{
+    CacheBlockRef, InferenceStateCapability, InferenceStateContractProvider, KvArenaId, KvGroupId,
+    KvLayerBinding,
+};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::speculative_sampling::{
+    propose_speculative_draft, verify_speculative_proposals, SpeculativeDraft,
+};
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
-use super::cache::qwen35_composite_cache_contract;
 use super::text::{Qwen35MoeFfnGeometry, Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
+
+mod timing;
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
@@ -115,6 +125,99 @@ fn expected_physical_decode_cursor(prefill_progress: usize, tokens_generated: us
     prefill_progress.saturating_add(tokens_generated.saturating_sub(1))
 }
 
+/// Shared decodability gate for every continuous-batch entry path (scalar
+/// rounds and speculative envelopes): the executor only grants multi-row
+/// quanta to rows whose prefill bootstrap already ran, so an undecodable row
+/// is a contract breach, not a degrade.
+fn validate_continuous_decode_rows(states: &[&mut ChatDecodeState]) -> Result<()> {
+    for (row, state) in states.iter().enumerate() {
+        let expected_physical_cursor =
+            expected_physical_decode_cursor(state.prefill_progress, state.tokens_generated);
+        let mut reasons: Vec<String> = Vec::new();
+        if state.finished {
+            reasons.push("finished".into());
+        }
+        if state.tokens_generated >= state.max_new_tokens {
+            reasons.push("max_new_tokens reached".into());
+        }
+        if state.unconsumed_output.is_some() {
+            reasons.push("unconsumed prefill output".into());
+        }
+        if state.pending_token.is_none() {
+            reasons.push("no pending token".into());
+        }
+        if state.physical_kv.context_len() != expected_physical_cursor {
+            reasons.push(format!(
+                "physical cursor {} != expected {expected_physical_cursor}",
+                state.physical_kv.context_len()
+            ));
+        }
+        if !reasons.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "continuous chat batch row {row} is not decodable: {}",
+                reasons.join("; ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// DS9.4 sub-batch reborrows: gather a subset of rows out of a batch slice
+/// while keeping every row independently mutable. Row ids are ascending.
+fn take_state_subset<'a>(
+    states: &'a mut [&mut ChatDecodeState],
+    ids: &[usize],
+) -> Vec<&'a mut ChatDecodeState> {
+    let mut rest: &mut [&mut ChatDecodeState] = states;
+    let mut out = Vec::with_capacity(ids.len());
+    for (position, &id) in ids.iter().enumerate() {
+        let (_skipped, tail) = rest.split_at_mut(id - position);
+        let (taken, remainder) = tail.split_at_mut(1);
+        out.push(&mut *taken[0]);
+        rest = remainder;
+    }
+    out
+}
+
+/// CPU-only prompt journal for replay: prompt ids, their rope positions, and
+/// the first decode text position. Deliberately excludes vision embeddings —
+/// sessions with vision inputs cannot suspend (fail closed).
+#[derive(Clone)]
+pub(crate) struct Qwen35PromptJournal {
+    prompt_ids: Vec<u32>,
+    prompt_positions: Vec<[usize; 3]>,
+    next_text_position: usize,
+    has_vision: bool,
+}
+
+/// Durable CPU-only continuation record. It deliberately owns no tensors,
+/// cache views, device events, or physical sequence identities.
+#[derive(Clone)]
+pub(crate) struct Qwen35ReplayCheckpoint {
+    prompt_journal: Qwen35PromptJournal,
+    generated_ids: Vec<u32>,
+    appended_tokens: usize,
+    prefill_progress: usize,
+    pending_token: Option<u32>,
+    history_ids: Vec<u32>,
+    decoder: IncrementalDecoder,
+    tokens_generated: usize,
+    track_history: bool,
+    assembled: String,
+    max_new_tokens: usize,
+    next_text_position: usize,
+    config: ChatGenerationConfig,
+    rng: SimpleRng,
+    draft_rng: SimpleRng,
+    adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
+}
+
+impl Qwen35ReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.appended_tokens
+    }
+}
+
 pub struct ChatDecodeState {
     text_state: Qwen35TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
@@ -137,17 +240,112 @@ pub struct ChatDecodeState {
     prefill_vision_progress: usize,
     config: ChatGenerationConfig,
     rng: SimpleRng,
+    /// Derived draft stream: speculative proposals must not perturb the
+    /// target's draw sequence, so sampled drafting draws from its own fork.
+    draft_rng: SimpleRng,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
     /// DS9.2: per-request constrained-decoding runtime, present only when
     /// the request asked for `response_format: json_object`.
     grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
+    /// MTP draft cache (one paged attention layer at model_layer =
+    /// block_count) and the latest draft anchor — present only while a
+    /// session decodes through the MTP quantum path.
+    mtp_cache: Option<PhysicalPagedKvCache>,
+    mtp_anchor_hidden: Option<Tensor>,
+    /// DS9.4 per-request depth controller and its pending device-timed
+    /// rounds. The controller only trains where device event timing is
+    /// available; elsewhere the configured depth holds.
+    adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
+    /// Suspension support: the prompt journal, the append-only generated
+    /// token journal (bounded by max_new_tokens), and a pending replay being
+    /// recomputed span by span.
+    prompt_journal: Qwen35PromptJournal,
+    generated_ids: Vec<u32>,
+    replay: Option<std::sync::Arc<Qwen35ReplayCheckpoint>>,
 }
 
 impl ChatDecodeState {
+    /// The MTP cache cursor for this session, when it decoded through the
+    /// MTP path. Always equal to `next_text_position` while MTP is active.
+    pub(crate) fn mtp_cache_cursor(&self) -> Option<usize> {
+        self.mtp_cache.as_ref().map(|cache| cache.context_len())
+    }
+
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
+    }
+
+    /// Committed output tokens for the session so far.
+    pub(crate) fn tokens_generated(&self) -> usize {
+        self.tokens_generated
+    }
+
+    /// Whether the session reached a stop condition or its output cap.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Tokens still to recompute before decode resumes, when a replay is
+    /// pending on this session.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay.as_ref().map(|saved| saved.appended_tokens)
+    }
+
+    /// Capture the durable CPU continuation record. Caller must fence the
+    /// completed step before releasing the physical state. Vision and
+    /// grammar sessions cannot suspend: their recompute needs inputs the
+    /// journal deliberately does not carry.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Qwen35ReplayCheckpoint> {
+        if let Some(saved) = &self.replay {
+            return Ok((**saved).clone());
+        }
+        if self.finished {
+            return Err(Error::InvalidInput(
+                "cannot suspend a finished Qwen3.5 sequence".into(),
+            ));
+        }
+        if self.prompt_journal.has_vision {
+            return Err(Error::InvalidInput(
+                "cannot suspend a Qwen3.5 session with vision inputs".into(),
+            ));
+        }
+        if self.grammar.is_some() {
+            return Err(Error::InvalidInput(
+                "cannot suspend a grammar-constrained Qwen3.5 session".into(),
+            ));
+        }
+        let appended_tokens = self.physical_kv.context_len();
+        let known = self
+            .prompt_journal
+            .prompt_ids
+            .len()
+            .saturating_add(self.generated_ids.len());
+        if appended_tokens > known || appended_tokens < self.prefill_progress {
+            return Err(Error::InferenceError(
+                "Qwen3.5 replay journal does not cover cache cursor".into(),
+            ));
+        }
+        Ok(Qwen35ReplayCheckpoint {
+            prompt_journal: self.prompt_journal.clone(),
+            generated_ids: self.generated_ids.clone(),
+            appended_tokens,
+            prefill_progress: self.prefill_progress,
+            pending_token: self.pending_token,
+            history_ids: self.history_ids.clone(),
+            decoder: self.decoder.clone(),
+            tokens_generated: self.tokens_generated,
+            track_history: self.track_history,
+            assembled: self.assembled.clone(),
+            max_new_tokens: self.max_new_tokens,
+            next_text_position: self.next_text_position,
+            config: self.config.clone(),
+            rng: self.rng.clone(),
+            draft_rng: self.draft_rng.clone(),
+            adaptive_mtp: self.adaptive_mtp.clone(),
+        })
     }
 
     pub(crate) fn uses_physical_kv(&self) -> bool {
@@ -180,6 +378,18 @@ impl ChatDecodeState {
         &mut self,
         cache: PhysicalPagedKvCache,
     ) -> Result<Qwen35SharedStepCheckpoint> {
+        self.begin_shared_step_quantum_with_mtp(cache, None)
+    }
+
+    /// Continuous-batch transaction checkpoint. The managed MTP cache, when
+    /// the family loaded a draft head, joins the same transaction: the
+    /// reservation must continue the session cursor and the rollback
+    /// restores both caches.
+    pub(crate) fn begin_shared_step_quantum_with_mtp(
+        &mut self,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<Qwen35SharedStepCheckpoint> {
         if self.physical_kv.arena().id() != cache.arena().id()
             || self.physical_kv.context_len() != cache.context_len()
         {
@@ -187,9 +397,25 @@ impl ChatDecodeState {
                 "Qwen3.5 shared-step KV reservation does not continue the session".into(),
             ));
         }
+        if let Some(mtp) = &mtp_cache {
+            // The MTP domain may live in its own arena; continuity is a
+            // cursor contract, not an arena identity contract.
+            let expected = self
+                .mtp_cache
+                .as_ref()
+                .map(|cache| cache.context_len())
+                .unwrap_or(0);
+            if mtp.context_len() != expected {
+                return Err(Error::InferenceError(format!(
+                    "Qwen3.5 MTP reservation cursor {} does not continue the session cursor {expected}",
+                    mtp.context_len()
+                )));
+            }
+        }
         Ok(Qwen35SharedStepCheckpoint {
             text_state: self.text_state.clone(),
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
+            mtp_cache: std::mem::replace(&mut self.mtp_cache, mtp_cache),
             unconsumed_output: self.unconsumed_output.clone(),
             pending_token: self.pending_token,
             history_ids: self.history_ids.clone(),
@@ -199,12 +425,17 @@ impl ChatDecodeState {
             finished: self.finished,
             next_text_position: self.next_text_position,
             rng: self.rng.clone(),
+            draft_rng: self.draft_rng.clone(),
+            adaptive_mtp: self.adaptive_mtp.clone(),
+            mtp_timings: self.mtp_timings.clone(),
+            replay: self.replay.clone(),
         })
     }
 
     pub(crate) fn rollback_shared_step_quantum(&mut self, checkpoint: Qwen35SharedStepCheckpoint) {
         self.text_state = checkpoint.text_state;
         self.physical_kv = checkpoint.physical_kv;
+        self.mtp_cache = checkpoint.mtp_cache;
         self.unconsumed_output = checkpoint.unconsumed_output;
         self.pending_token = checkpoint.pending_token;
         self.history_ids = checkpoint.history_ids;
@@ -214,6 +445,11 @@ impl ChatDecodeState {
         self.finished = checkpoint.finished;
         self.next_text_position = checkpoint.next_text_position;
         self.rng = checkpoint.rng;
+        self.draft_rng = checkpoint.draft_rng;
+        self.adaptive_mtp
+            .restore_from_checkpoint(checkpoint.adaptive_mtp);
+        self.mtp_timings = checkpoint.mtp_timings;
+        self.replay = checkpoint.replay;
     }
 
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
@@ -260,9 +496,37 @@ pub struct ChatDecodeStep {
     pub finished: bool,
 }
 
+/// One drafted block awaiting verification. Greedy rounds carry bare token
+/// ids (exact prefix matching against the target argmax); sampled rounds
+/// carry each proposal with its full draft distribution so the shared
+/// verifier can run lossless rejection sampling.
+pub(crate) enum DraftBlock {
+    Greedy(Vec<u32>),
+    Stochastic(Vec<SpeculativeDraft>),
+}
+
+impl DraftBlock {
+    fn token_ids(&self) -> Vec<u32> {
+        match self {
+            DraftBlock::Greedy(tokens) => tokens.clone(),
+            DraftBlock::Stochastic(proposals) => {
+                proposals.iter().map(|proposal| proposal.token_id).collect()
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            DraftBlock::Greedy(tokens) => tokens.len(),
+            DraftBlock::Stochastic(proposals) => proposals.len(),
+        }
+    }
+}
+
 pub(crate) struct Qwen35SharedStepCheckpoint {
     text_state: Qwen35TextRuntimeState,
     physical_kv: PhysicalPagedKvCache,
+    mtp_cache: Option<PhysicalPagedKvCache>,
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
     history_ids: Vec<u32>,
@@ -272,6 +536,10 @@ pub(crate) struct Qwen35SharedStepCheckpoint {
     finished: bool,
     next_text_position: usize,
     rng: SimpleRng,
+    draft_rng: SimpleRng,
+    adaptive_mtp: crate::models::architectures::qwen35::mtp::AdaptiveMtp,
+    mtp_timings: Vec<timing::PendingRound>,
+    replay: Option<std::sync::Arc<Qwen35ReplayCheckpoint>>,
 }
 
 #[derive(Debug, Clone)]
@@ -583,6 +851,20 @@ pub(crate) struct Qwen35ChatExec {
     pub(crate) tokenizer: Qwen35Tokenizer,
     pub(crate) text_config: Qwen35TextConfig,
     pub(crate) text_model: Qwen35TextModel,
+    /// MTP draft head when the checkpoint carries a validated manifest and
+    /// the load policy enabled it. `None` keeps every path byte-identical
+    /// to the non-MTP behavior.
+    pub(crate) mtp_head: Option<crate::models::architectures::qwen35::mtp::Qwen35MtpHead>,
+    /// Speculative rounds actually executed — telemetry and test evidence
+    /// that the draft/verify path ran rather than the scalar fallback.
+    pub(crate) mtp_speculative_rounds: std::sync::atomic::AtomicU64,
+    /// DS9.4 speculative-envelope rounds executed across continuous rows.
+    pub(crate) mtp_envelope_rounds: std::sync::atomic::AtomicU64,
+    /// Whether the adaptive depth controller may train (the performance
+    /// knob); the device check and head presence narrow it further.
+    pub(crate) mtp_adaptive: bool,
+    /// Persistent KV storage dtype — the MTP cache arena follows it.
+    pub(crate) kv_storage_dtype: DType,
 }
 
 pub struct Qwen35ChatModel {
@@ -618,7 +900,12 @@ impl Qwen35ChatExec {
         attention_dtype: DType,
         preferred_page_tokens: usize,
     ) -> Result<InferenceStateContract> {
-        qwen35_composite_cache_contract(&self.text_config, attention_dtype, preferred_page_tokens)
+        crate::models::architectures::qwen35::cache::qwen35_composite_cache_contract_with_mtp(
+            &self.text_config,
+            attention_dtype,
+            preferred_page_tokens,
+            self.mtp_head.is_some(),
+        )
     }
 
     pub(crate) fn chat_template(&self) -> &str {
@@ -715,6 +1002,7 @@ impl Qwen35ChatExec {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
         if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
             return Err(Error::InvalidInput(
@@ -724,6 +1012,8 @@ impl Qwen35ChatExec {
         }
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let mut rng = SimpleRng::new(config.seed);
+        let draft_rng = rng.fork();
         Ok(ChatDecodeState {
             text_state: self.text_model.new_state(),
             physical_kv: cache,
@@ -746,9 +1036,38 @@ impl Qwen35ChatExec {
             pending_logprobs: Vec::new(),
             prefill_vision_progress: 0,
             config: config.clone(),
-            rng: SimpleRng::new(config.seed),
+            rng,
+            draft_rng,
             grammar: self.grammar_runtime(config),
+            mtp_cache,
+            mtp_anchor_hidden: None,
+            adaptive_mtp: self.new_adaptive_mtp(),
+            mtp_timings: Vec::new(),
+            prompt_journal: Qwen35PromptJournal {
+                prompt_ids: prepared.prompt_ids.clone(),
+                prompt_positions: prepared.prompt_positions.clone(),
+                next_text_position: prepared.next_text_position,
+                has_vision: prepared.vision_inputs.is_some(),
+            },
+            generated_ids: Vec::new(),
+            replay: None,
         })
+    }
+
+    /// Fresh depth controller for a new session: it trains only where device
+    /// event timing is available (CUDA) and the performance knob opted in;
+    /// elsewhere the configured draft depth holds for the whole request.
+    fn new_adaptive_mtp(&self) -> crate::models::architectures::qwen35::mtp::AdaptiveMtp {
+        let enabled = self.mtp_adaptive
+            && self.mtp_head.is_some()
+            && self.text_model.device().is_cuda();
+        crate::models::architectures::qwen35::mtp::AdaptiveMtp::new(
+            enabled,
+            self.mtp_head
+                .as_ref()
+                .map(|head| head.draft_depth())
+                .unwrap_or(1),
+        )
     }
 
     /// DS9.2 grammar runtime for this request, or `None` when the request
@@ -867,6 +1186,11 @@ impl Qwen35ChatExec {
     }
 
     pub(crate) fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.replay.is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode cannot run before replay completes".into(),
+            ));
+        }
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -951,6 +1275,7 @@ impl Qwen35ChatExec {
         if state.track_history {
             state.history_ids.push(next);
         }
+        state.generated_ids.push(next);
         state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
         state.pending_token = Some(next);
@@ -982,20 +1307,7 @@ impl Qwen35ChatExec {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        for state in states.iter() {
-            let expected_physical_cursor =
-                expected_physical_decode_cursor(state.prefill_progress, state.tokens_generated);
-            if state.finished
-                || state.tokens_generated >= state.max_new_tokens
-                || state.unconsumed_output.is_some()
-                || state.pending_token.is_none()
-                || state.physical_kv.context_len() != expected_physical_cursor
-            {
-                return Err(Error::InvalidInput(
-                    "continuous chat batch contains a non-decodable Qwen3.5 state".into(),
-                ));
-            }
-        }
+        validate_continuous_decode_rows(states)?;
         let mut token_ids = Vec::with_capacity(states.len());
         let mut positions = Vec::with_capacity(states.len());
         let mut text_states = Vec::with_capacity(states.len());
@@ -1083,6 +1395,9 @@ impl Qwen35ChatExec {
     }
 
     fn publish_token(&self, state: &mut ChatDecodeState, token: u32) -> Result<String> {
+        // Append-only replay journal: every published token, bounded by the
+        // output cap. A trailing stop token is journaled but never counted.
+        state.generated_ids.push(token);
         if self.is_stop_token(token, &state.config) {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -1108,6 +1423,1077 @@ impl Qwen35ChatExec {
             || token_id == self.tokenizer.specials.eos
             || self.tokenizer.specials.eos_alt == Some(token_id)
             || config.stop_token_ids.contains(&token_id)
+    }
+}
+
+impl Qwen35ChatExec {
+    /// Whether the MTP quantum path may drive this decode step: a loaded
+    /// draft head plus an unconstrained request. Greedy requests accept by
+    /// exact prefix match; sampled requests (any temperature, penalties,
+    /// top-k/top-p) accept through the shared lossless rejection sampler,
+    /// which applies the same transforms to draft proposals and target
+    /// rows. Grammar and logprobs stay scalar-only: constrained decoding
+    /// must mask every sample, and logprob requests need the scalar
+    /// sampler's raw-logit accounting for tokens speculation never shows.
+    fn mtp_active(&self, state: &ChatDecodeState) -> bool {
+        let config = &state.config;
+        self.mtp_head.is_some()
+            && state.mtp_cache.is_some()
+            && state.grammar.is_none()
+            && !config.logprobs
+    }
+
+    /// Greedy argmax over one logits row, clamped to the tokenizer vocab.
+    /// Uses the scalar sampler's `argmax_clamped` so tie-breaking and
+    /// non-finite handling are bit-identical to the non-MTP path.
+    fn greedy_token(&self, logits: &Tensor) -> Result<u32> {
+        argmax_clamped(&logits.flatten_all()?, self.tokenizer.vocab_size)
+    }
+
+    /// Ensure the per-session MTP cache exists. V1 allocates a standalone
+    /// one-layer arena sized for the model's full context; the managed MTP
+    /// KV domain (the qwen3.8 contract shape) replaces this when the
+    /// continuous-batch envelope lands.
+    fn ensure_mtp_cache(&self, state: &mut ChatDecodeState) -> Result<()> {
+        if state.mtp_cache.is_some() {
+            return Ok(());
+        }
+        let device = self.text_model.device().clone();
+        let cfg = &self.text_config;
+        let model_layer = u32::try_from(cfg.block_count)
+            .map_err(|_| Error::InvalidInput("Qwen3.5 MTP layer id exceeds u32".into()))?;
+        let backend = if device.is_cuda() {
+            BackendKind::Cuda
+        } else if device.is_metal() {
+            BackendKind::Metal
+        } else {
+            BackendKind::Cpu
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let id = KvArenaId {
+            model_instance: crate::engine::ModelInstanceId::new(nanos),
+            backend,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let page_tokens = 64usize;
+        let config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: page_tokens as u32,
+            capacity_pages: (cfg.context_length.max(1) as u32).div_ceil(page_tokens as u32),
+            growth: None,
+            dtype: self.kv_storage_dtype,
+            layers: vec![KvLayerConfig {
+                binding: KvLayerBinding {
+                    model_layer,
+                    physical_layer: 0,
+                },
+                num_kv_heads: cfg.attention_head_count_kv as u32,
+                key_head_dim: cfg.attention_key_length as u32,
+                value_head_dim: cfg.attention_value_length as u32,
+            }],
+        };
+        let binding = KvLayerBinding {
+            model_layer,
+            physical_layer: 0,
+        };
+        let blocks = (0..config.capacity_pages)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let arena: std::sync::Arc<dyn KvArena> = if backend != BackendKind::Cpu {
+            std::sync::Arc::new(CandleAcceleratorKvArena::new_mutation_only(config, device)?)
+        } else {
+            std::sync::Arc::new(CpuKvArena::new(config)?)
+        };
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let arena: std::sync::Arc<dyn KvArena> = std::sync::Arc::new(CpuKvArena::new(config)?);
+        state.mtp_cache = Some(PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0)?);
+        Ok(())
+    }
+
+    /// One decode quantum (up to `input_budget` committed tokens). With an
+    /// MTP head and a qualifying request this runs speculative rounds —
+    /// draft `depth` tokens through the head, verify them with the target,
+    /// commit the accepted prefix; the fallback loops the scalar step.
+    pub(crate) fn decode_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        if state.replay.is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode cannot run before replay completes".into(),
+            ));
+        }
+        let Some(head) = self.mtp_head.as_ref() else {
+            return self.decode_quantum_scalar(state, input_budget);
+        };
+        self.ensure_mtp_cache(state)?;
+        if !self.mtp_active(state) {
+            return self.decode_quantum_scalar(state, input_budget);
+        }
+        if state.finished || state.tokens_generated >= state.max_new_tokens {
+            state.finished = true;
+            let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
+            state.assembled.push_str(&delta);
+            return Ok(ChatDecodeStep {
+                delta,
+                text: state.assembled.clone(),
+                tokens_generated: state.tokens_generated,
+                input_tokens_committed: 0,
+                finished: true,
+            });
+        }
+
+        let mut delta = String::new();
+
+        // Bootstrap: publish the first token by sampling the stored prefill
+        // logits — no KV commit, exactly like the scalar decode step's
+        // prologue. The pending token is what the first round forwards.
+        let mut published_bootstrap = false;
+        if state.pending_token.is_none() {
+            published_bootstrap = true;
+            let output = state.unconsumed_output.take().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.5 MTP quantum has neither pending token nor prefill output".into(),
+                )
+            })?;
+            let next = sample_next_token(
+                &logits_last_row(&output)?,
+                self.tokenizer.vocab_size,
+                &state.config,
+                &[],
+                &mut state.rng,
+            )?;
+            // Publish through the shared choke point so the cap, stop, and
+            // replay-journal handling cannot drift from the scalar step.
+            let step_delta = self.publish_token(state, next)?;
+            if !self.is_stop_token(next, &state.config) {
+                state.pending_token = Some(next);
+            }
+            delta.push_str(&step_delta);
+        }
+
+        // The bootstrap published one token, exactly like the scalar
+        // quantum's first step — it counts against the budget.
+        let mut committed = usize::from(published_bootstrap);
+        let budget = input_budget.max(1);
+        // The anchor is seeded by the first scalar tail: it forwards the
+        // pending token, samples the next one, and writes the pair
+        // (embed(next), h(pos)) — exactly the qwen3.8 bootstrap shape.
+        let mut anchor_ready = state.mtp_anchor_hidden.is_some();
+        while committed < budget && !state.finished {
+            // Output-capped remaining slice: the controller's observation
+            // budget is the round's own remaining slice, not the raw grant.
+            let remaining = (budget - committed).min(
+                state
+                    .max_new_tokens
+                    .saturating_sub(state.tokens_generated)
+                    .max(1),
+            );
+            self.observe_completed_mtp_timings(state);
+            let timer = if state.adaptive_mtp.can_train(remaining) {
+                timing::RoundTimer::start(self.text_model.device())
+            } else {
+                None
+            };
+            let depth = if anchor_ready {
+                state.adaptive_mtp.depth(remaining)
+            } else {
+                0
+            };
+            let round_tokens = if depth == 0 {
+                delta.push_str(&self.mtp_scalar_tail(state, head)?);
+                anchor_ready = true;
+                1
+            } else {
+                let (tokens, round_delta) = self.mtp_speculative_round(state, head, depth)?;
+                delta.push_str(&round_delta);
+                tokens
+            };
+            committed += round_tokens;
+            self.observe_completed_mtp_timings(state);
+            if let Some(pending) =
+                timer.and_then(|timer| timer.finish(depth, round_tokens, remaining))
+            {
+                if state.mtp_timings.len() == 4 {
+                    state.mtp_timings.remove(0);
+                }
+                state.mtp_timings.push(pending);
+            }
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.assembled.clone(),
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed: committed,
+            finished: state.finished,
+        })
+    }
+
+    fn decode_quantum_scalar(
+        &self,
+        state: &mut ChatDecodeState,
+        input_budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        if state.replay.is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode cannot run before replay completes".into(),
+            ));
+        }
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        for _ in 0..input_budget.max(1) {
+            let step = self.decode_step(state)?;
+            delta.push_str(&step.delta);
+            committed += step.input_tokens_committed;
+            if step.finished {
+                break;
+            }
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.assembled.clone(),
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed: committed,
+            finished: state.finished,
+        })
+    }
+
+    /// Scalar tail: forward the pending token, sample, and write the MTP
+    /// pair `(embed(next), h(pos))` at position pos.
+    fn mtp_scalar_tail(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+    ) -> Result<String> {
+        let pending = state.pending_token.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP scalar tail has no pending token".into())
+        })?;
+        let position = state.next_text_position;
+        let hidden = self.text_model.forward_token_id_hidden_at_physical(
+            pending,
+            [position; 3],
+            &mut state.text_state,
+            &mut state.physical_kv,
+        )?;
+        let normalized_hidden = self.text_model.normalize_hidden(&hidden)?;
+        let logits = self.text_model.forward_hidden_to_logits(&hidden)?;
+        let history = if state.track_history {
+            state.history_ids.as_slice()
+        } else {
+            &[]
+        };
+        state.pending_logprobs.clear();
+        let next = sample_next_token(
+            &logits,
+            self.tokenizer.vocab_size,
+            &state.config,
+            history,
+            &mut state.rng,
+        )?;
+        if state.track_history {
+            state.history_ids.push(next);
+        }
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let embedding = self.text_model.embed_token_ids(&[next])?;
+        let anchor = head.forward_step(&embedding, &normalized_hidden, [position; 3], mtp_cache)?;
+        state.mtp_anchor_hidden = Some(anchor);
+        state.pending_token = Some(next);
+        state.next_text_position += 1;
+        let mut delta = String::new();
+        delta.push_str(&self.publish_token(state, next)?);
+        Ok(delta)
+    }
+
+    /// Speculative round: draft `depth` tokens, verify with the target, and
+    /// commit the accepted prefix. Returns (committed tokens, their text).
+    fn mtp_speculative_round(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+        depth: usize,
+    ) -> Result<(usize, String)> {
+        self.mtp_speculative_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let drafted = self.mtp_draft(state, head, depth)?;
+        self.mtp_verify_and_commit(state, head, &drafted)
+    }
+
+    /// Draft `depth` tokens provisionally through the head; the draft's MTP
+    /// rows are discarded before verification rewrites the canonical pairs.
+    /// Greedy requests keep the no-distribution fast path; sampled requests
+    /// propose through the shared lossless sampler on the row's own draft
+    /// RNG stream, retaining each proposal's distribution for verification.
+    fn mtp_draft(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+        depth: usize,
+    ) -> Result<DraftBlock> {
+        let position = state.next_text_position;
+        let anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP round has no anchor".into())
+        })?;
+        let stochastic = state.config.temperature > 1e-5;
+        let mut draft_history = if state.track_history {
+            state.history_ids.clone()
+        } else {
+            Vec::new()
+        };
+        let mut draft_proposals = Vec::with_capacity(depth);
+
+        let continuation_positions: Vec<[usize; 3]> =
+            (0..depth - 1).map(|offset| [position + offset; 3]).collect();
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let checkpoint = mtp_cache.logical_checkpoint();
+        let draft_rng_checkpoint = state.draft_rng.clone();
+        let vocab_size = self.tokenizer.vocab_size;
+        let drafted = head.draft_recurrently(
+            &self.text_model,
+            &anchor,
+            depth,
+            &continuation_positions,
+            mtp_cache,
+            |logits| {
+                if !stochastic {
+                    return crate::models::architectures::qwen35::mtp::greedy_argmax(
+                        logits,
+                        vocab_size,
+                    );
+                }
+                let mut values = logits_to_vec(&logits.i((0, 0))?)?;
+                truncate_logits_to_vocab(&mut values, vocab_size);
+                let proposal = propose_speculative_draft(
+                    &values,
+                    &state.config,
+                    &mut draft_history,
+                    &mut state.draft_rng,
+                )?;
+                let token_id = proposal.token_id;
+                draft_proposals.push(proposal);
+                Ok(token_id)
+            },
+        );
+        match drafted {
+            Ok(tokens) => {
+                // On success the advanced draft stream stays — proposals
+                // consumed it by design. Failures restore the checkpoint
+                // below, so a retried round redraws the same proposals.
+                mtp_cache.restore_logical_checkpoint(checkpoint)?;
+                Ok(if stochastic {
+                    DraftBlock::Stochastic(draft_proposals)
+                } else {
+                    DraftBlock::Greedy(tokens)
+                })
+            }
+            Err(error) => {
+                mtp_cache.restore_logical_checkpoint(checkpoint)?;
+                // Transactional RNG: a failed round never moves the draft
+                // stream, so the retried round redraws the same proposals.
+                state.draft_rng = draft_rng_checkpoint;
+                Err(error)
+            }
+        }
+    }
+
+    /// Verify a pre-drafted block against the target and commit the accepted
+    /// prefix. Shared by the solo quantum and the continuous speculative
+    /// envelope, so a row's round semantics are identical wherever it runs.
+    fn mtp_verify_and_commit(
+        &self,
+        state: &mut ChatDecodeState,
+        head: &crate::models::architectures::qwen35::mtp::Qwen35MtpHead,
+        drafted: &DraftBlock,
+    ) -> Result<(usize, String)> {
+        let depth = drafted.len();
+        let drafted_tokens = drafted.token_ids();
+        let pending = state.pending_token.ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP round has no pending token".into())
+        })?;
+        let position = state.next_text_position;
+
+        // Sequential target verification: one forward per candidate token,
+        // snapshotting linear state after each so any accepted prefix can be
+        // installed without re-running weights.
+        let target_inputs = std::iter::once(pending)
+            .chain(drafted_tokens.iter().copied())
+            .collect::<Vec<_>>();
+        let mut verify_hiddens = Vec::with_capacity(target_inputs.len());
+        let mut verify_logits = Vec::with_capacity(target_inputs.len());
+        let mut snapshots = Vec::with_capacity(target_inputs.len() + 1);
+        snapshots.push(state.text_state.snapshot_linear_states()?);
+        for (offset, &token) in target_inputs.iter().enumerate() {
+            let hidden = self.text_model.forward_token_id_hidden_at_physical(
+                token,
+                [position + offset; 3],
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )?;
+            let normalized = self.text_model.normalize_hidden(&hidden)?;
+            let logits = self.text_model.project_hidden_span(&hidden)?;
+            verify_hiddens.push(normalized);
+            verify_logits.push(logits);
+            snapshots.push(state.text_state.snapshot_linear_states()?);
+        }
+
+        // The first emitted token lands at position+1: the pending token
+        // itself is never re-emitted. Greedy rounds accept by exact prefix
+        // match against the target argmax; sampled rounds run lossless
+        // rejection sampling over host logits rows (penalties, temperature,
+        // top-k/top-p applied identically to draft and target rows).
+        let emitted = if let DraftBlock::Stochastic(proposals) = drafted {
+            let mut host_rows = Vec::with_capacity(verify_logits.len());
+            for logits in &verify_logits {
+                let mut values = logits_to_vec(&logits_last_row(logits)?)?;
+                truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                host_rows.push(values);
+            }
+            let mut verification_history = if state.track_history {
+                state.history_ids.clone()
+            } else {
+                Vec::new()
+            };
+            verify_speculative_proposals(
+                proposals,
+                &host_rows,
+                &state.config,
+                &mut verification_history,
+                &mut state.rng,
+            )?
+            .emitted_tokens
+        } else {
+            let mut emitted = Vec::with_capacity(depth + 1);
+            for row in 0..=depth {
+                let token = self.greedy_token(&verify_logits[row])?;
+                emitted.push(token);
+                if row == depth || token != drafted_tokens[row] {
+                    break;
+                }
+            }
+            emitted
+        };
+        let remaining_outputs = state.max_new_tokens.saturating_sub(state.tokens_generated);
+        let mut kept: Vec<u32> = Vec::with_capacity(emitted.len());
+        for &token in &emitted {
+            if kept.len() >= remaining_outputs {
+                break;
+            }
+            kept.push(token);
+            if self.is_stop_token(token, &state.config) {
+                break;
+            }
+        }
+        let count = kept.len();
+        if count == 0 {
+            state.finished = true;
+            return Ok((0, String::new()));
+        }
+
+        // Commit only the accepted prefix: install the linear states from
+        // the matching snapshot and drop the rejected KV rows. Full
+        // attention keeps its already-written rows; they sit beyond the
+        // truncated cursor and are rewritten by later steps.
+        state.text_state.restore_linear_states(&snapshots[count])?;
+        state.physical_kv.truncate_verified_prefix(position + count)?;
+
+        // Rebuild the draft state over the canonical commit: pair i = (embed
+        // of kept[i] — the token at position+i+1 — , the target hidden at
+        // position+i).
+        let mtp_cache = state
+            .mtp_cache
+            .as_mut()
+            .ok_or_else(|| Error::InferenceError("Qwen3.5 MTP cache lost".into()))?;
+        let mut anchor = state.mtp_anchor_hidden.clone().ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 MTP anchor lost".into())
+        })?;
+        for (row, &token) in kept.iter().enumerate() {
+            let embedding = self.text_model.embed_token_ids(&[token])?;
+            anchor = head.forward_step(
+                &embedding,
+                &verify_hiddens[row],
+                [position + row; 3],
+                mtp_cache,
+            )?;
+        }
+        state.mtp_anchor_hidden = Some(anchor);
+        state.pending_token = kept.last().copied();
+        state.next_text_position += count;
+        if state.track_history {
+            state.history_ids.extend_from_slice(&kept);
+        }
+        let mut delta = String::new();
+        for &token in &kept {
+            delta.push_str(&self.publish_token(state, token)?);
+            if state.finished {
+                break;
+            }
+        }
+        Ok((count, delta))
+    }
+
+    /// Whether this exec carries a loaded MTP draft head — the load-time
+    /// gate behind the continuous speculative envelope profile.
+    pub(crate) fn has_mtp_head(&self) -> bool {
+        self.mtp_head.is_some()
+    }
+
+    /// Rebuild a decode state from a durable checkpoint over fresh cache
+    /// reservations. No device state is restored: the appended KV rows and
+    /// the MTP draft domain are recomputed by replay spans before decode
+    /// resumes.
+    pub(crate) fn begin_replay_state_physical(
+        &self,
+        saved: &Qwen35ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0
+            || mtp_cache
+                .as_ref()
+                .is_some_and(|cache| cache.context_len() != 0)
+            || self.mtp_head.is_some() != mtp_cache.is_some()
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 replay requires fresh matching cache reservations".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            text_state: self.text_model.new_state(),
+            physical_kv: cache,
+            mtp_cache,
+            mtp_anchor_hidden: None,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: saved.pending_token,
+            history_ids: saved.history_ids.clone(),
+            decoder: saved.decoder.clone(),
+            tokens_generated: saved.tokens_generated,
+            track_history: saved.track_history,
+            assembled: saved.assembled.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            next_text_position: saved.next_text_position,
+            prefill_progress: saved.prefill_progress,
+            prefill_vision_progress: 0,
+            config: saved.config.clone(),
+            rng: saved.rng.clone(),
+            draft_rng: saved.draft_rng.clone(),
+            pending_logprobs: Vec::new(),
+            grammar: None,
+            adaptive_mtp: saved.adaptive_mtp.clone(),
+            mtp_timings: Vec::new(),
+            prompt_journal: saved.prompt_journal.clone(),
+            generated_ids: saved.generated_ids.clone(),
+            replay: (saved.appended_tokens > 0).then(|| std::sync::Arc::new(saved.clone())),
+        })
+    }
+
+    /// Rebuild one scheduler span without sampling or emitting output. The
+    /// span recomputes target rows over the prompt-plus-generated journal
+    /// and, with a loaded head, rebuilds the MTP draft pairs whose
+    /// successors are already known. The pending token is the last span's
+    /// MTP successor; it is not forwarded to the target cache.
+    pub(crate) fn continue_replay_physical(
+        &self,
+        state: &mut ChatDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let saved = state
+            .replay
+            .as_ref()
+            .ok_or_else(|| Error::InvalidInput("Qwen3.5 state has no pending replay".into()))?;
+        if state.physical_kv.context_len() != span_start
+            || span_end <= span_start
+            || span_end > saved.appended_tokens
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 replay span does not continue its append cursor".into(),
+            ));
+        }
+        let prompt_len = saved.prompt_journal.prompt_ids.len();
+        let known_len = prompt_len + saved.generated_ids.len();
+        let token_at = |index: usize| {
+            if index < prompt_len {
+                saved.prompt_journal.prompt_ids.get(index).copied()
+            } else if index <= known_len.saturating_sub(1) {
+                saved.generated_ids.get(index - prompt_len).copied()
+            } else {
+                None
+            }
+        };
+        // The last journaled token is the pending one: it is the MTP
+        // successor at the append cursor but is not forwarded by the target.
+        let ids: Vec<_> = (span_start..span_end).filter_map(token_at).collect();
+        let positions: Vec<_> = (span_start..span_end)
+            .map(|index| {
+                if index < prompt_len {
+                    saved.prompt_journal.prompt_positions[index]
+                } else {
+                    [saved.prompt_journal.next_text_position + index - prompt_len; 3]
+                }
+            })
+            .collect();
+        if ids.len() != positions.len() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 replay journal has a gap inside the scheduled span".into(),
+            ));
+        }
+        let prompt_complete = saved.prefill_progress == prompt_len;
+        let chunk_size = qwen35_prefill_chunk_size();
+        for start in (span_start..span_end).step_by(chunk_size) {
+            let end = (start + chunk_size).min(span_end);
+            let chunk_ids = &ids[start - span_start..end - span_start];
+            let chunk_positions = &positions[start - span_start..end - span_start];
+            let output = self.text_model.prefill_token_ids_with_hidden_physical(
+                chunk_ids,
+                chunk_positions,
+                &mut state.text_state,
+                &mut state.physical_kv,
+                end == saved.appended_tokens && saved.pending_token.is_none(),
+            )?;
+            if let (Some(head), Some(mtp)) = (&self.mtp_head, state.mtp_cache.as_mut()) {
+                // The original session's prefill writes no MTP pairs — pairs
+                // exist only for decode rows (sequence index >= prompt_len),
+                // each pairing a row's post-norm hidden with its successor's
+                // embedding. The pending token supplies the final successor
+                // without being forwarded to the target cache.
+                let pair_rows: Vec<usize> = (start..end)
+                    .filter(|&index| index >= prompt_len)
+                    .collect();
+                let count = pair_rows.len();
+                if count > 0 {
+                    let successors = pair_rows
+                        .iter()
+                        .map(|&index| {
+                            token_at(index + 1).ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Qwen3.5 replay journal lost an MTP successor".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let embeddings = self.text_model.embed_token_ids(&successors)?;
+                    // Pair rows are the chunk's trailing decode rows; their
+                    // hiddens start at the first pair row's span offset.
+                    let hidden_offset = pair_rows[0] - span_start;
+                    let predecessors = self.text_model.normalize_hidden(
+                        &output.hidden_states.narrow(1, hidden_offset, count)?,
+                    )?;
+                    let mut last_hidden = None;
+                    for (row, &index) in pair_rows.iter().enumerate() {
+                        let hidden = head.forward_step(
+                            &embeddings.narrow(1, row, 1)?,
+                            &predecessors.narrow(1, row, 1)?,
+                            positions[index - span_start],
+                            mtp,
+                        )?;
+                        last_hidden = Some(hidden);
+                    }
+                    if end == saved.appended_tokens && prompt_complete {
+                        // The final pair seeds the resumed draft anchor
+                        // exactly like a scalar tail would.
+                        state.mtp_anchor_hidden = last_hidden;
+                    }
+                }
+            }
+            if end == saved.appended_tokens && prompt_complete && saved.pending_token.is_none() {
+                state.unconsumed_output = output.logits;
+            }
+        }
+        let finished = span_end == saved.appended_tokens;
+        if finished {
+            state.replay = None;
+        }
+        Ok(finished)
+    }
+
+    /// Drain resolved device-event timings into the depth controller. The
+    /// bounded pending queue also rides the quantum checkpoint, so a
+    /// cancelled quantum restores observations and policy together.
+    fn observe_completed_mtp_timings(&self, state: &mut ChatDecodeState) {
+        let mut index = 0;
+        while index < state.mtp_timings.len() {
+            if let Some(elapsed) = state.mtp_timings[index].try_elapsed() {
+                let completed = state.mtp_timings.remove(index);
+                state.adaptive_mtp.observe(
+                    completed.depth,
+                    completed.committed,
+                    elapsed,
+                    completed.budget,
+                );
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// DS9.4: one shared speculative envelope for continuous rows. Every row
+    /// must be decodable exactly as the scalar batch requires (the executor
+    /// only grants envelope quanta to rows whose prefill bootstrap already
+    /// ran) and MTP-resident. A row without a seeded anchor sits out its
+    /// first round as a scalar tail, and any row whose request disqualifies
+    /// speculation (grammar, logprobs, sampling penalties) collapses the
+    /// whole call to scalar rounds — the scalar batch is the only path that
+    /// can serve those configs. Verification and commit stay per row on each
+    /// row's own physical cache; only the draft advances batch.
+    pub(crate) fn decode_speculative_batch(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+        input_budget: usize,
+    ) -> Result<Vec<ChatDecodeStep>> {
+        let head = self.mtp_head.as_ref().ok_or_else(|| {
+            Error::InferenceError("Qwen3.5 speculative batch requires a loaded MTP head".into())
+        })?;
+        let state_count = states.len();
+        if state_count == 0 {
+            return Ok(Vec::new());
+        }
+        validate_continuous_decode_rows(states)?;
+        let mut deltas = vec![String::new(); state_count];
+        let mut committed = vec![0usize; state_count];
+        let mut finished = vec![false; state_count];
+        let mut active: Vec<usize> = (0..state_count).collect();
+        active.retain(|&row| !finished[row] && committed[row] < input_budget);
+        // Rows share one MTP arena whenever their caches were cut from the
+        // same pool (the managed-domain split does this); the batched draft
+        // advance needs it, standalone per-session arenas advance in turn.
+        let shared_mtp_arena = active.iter().all(|&row| {
+            states[row]
+                .mtp_cache
+                .as_ref()
+                .is_some_and(|cache| {
+                    std::sync::Arc::ptr_eq(
+                        cache.arena(),
+                        states[active[0]]
+                            .mtp_cache
+                            .as_ref()
+                            .expect("eligibility checked mtp cache")
+                            .arena(),
+                    )
+                })
+        });
+
+        while !active.is_empty() {
+            let all_eligible = active.iter().all(|&row| self.mtp_active(states[row]));
+            if !all_eligible {
+                let mut subset = take_state_subset(states, &active);
+                let steps = self.decode_step_batch(&mut subset)?;
+                for (position, &row) in active.iter().enumerate() {
+                    deltas[row].push_str(&steps[position].delta);
+                    committed[row] += steps[position].input_tokens_committed;
+                    finished[row] = steps[position].finished;
+                }
+                active.retain(|&row| !finished[row] && committed[row] < input_budget);
+                continue;
+            }
+
+            // Per-row depths mirror the solo quantum: a round commits the
+            // pending token plus up to `depth` drafted tokens, and the
+            // anchor must be seeded by a scalar tail before the row drafts.
+            // Per-row (rather than a homogeneous minimum) keeps every row's
+            // round sequence identical to its solo quantum's.
+            let depths: Vec<usize> = active
+                .iter()
+                .map(|&row| {
+                    let state = &*states[row];
+                    let remaining_budget = input_budget - committed[row];
+                    let remaining_output = state
+                        .max_new_tokens
+                        .saturating_sub(state.tokens_generated)
+                        .max(1);
+                    if state.mtp_anchor_hidden.is_none() {
+                        0
+                    } else {
+                        state
+                            .adaptive_mtp
+                            .depth(remaining_output.min(remaining_budget))
+                            .min(remaining_budget)
+                            .min(remaining_output)
+                    }
+                })
+                .collect();
+            let max_depth = depths.iter().copied().max().unwrap_or(0);
+            if max_depth == 0 {
+                // Every active row is on its scalar tail (budget down to one
+                // token, anchor not yet seeded, or a numerically disabled
+                // controller): one committed token per row, each seeding its
+                // MTP pair.
+                for &row in &active {
+                    let delta = self.mtp_scalar_tail(states[row], head)?;
+                    deltas[row].push_str(&delta);
+                    committed[row] += 1;
+                    finished[row] = states[row].finished;
+                }
+                active.retain(|&row| !finished[row] && committed[row] < input_budget);
+                continue;
+            }
+
+            let round_started = std::time::Instant::now();
+            self.mtp_envelope_rounds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Per-row MTP checkpoints: the draft's KV writes are provisional
+            // and rolled back before verification rewrites the positions.
+            let mut mtp_checkpoints = Vec::with_capacity(active.len());
+            for &row in &active {
+                let state = &mut *states[row];
+                let mtp = state.mtp_cache.as_mut().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.5 speculative row lost its MTP cache".into())
+                })?;
+                mtp_checkpoints.push(mtp.logical_checkpoint());
+            }
+            let mut currents: Vec<Tensor> = Vec::with_capacity(active.len());
+            for &row in &active {
+                let state = &*states[row];
+                let anchor = state.mtp_anchor_hidden.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.5 speculative row has no recurrent anchor".into())
+                })?;
+                currents.push(anchor.clone());
+            }
+
+            // Batched recurrent draft: one MTP-layer forward per draft step
+            // across the rows still drafting at that depth. Greedy rows
+            // select through the same argmax the solo draft uses; sampled
+            // rows propose through the shared lossless sampler on their own
+            // draft RNG stream. A non-finite draft logits row falls back to
+            // a scalar round and disables that row's speculation for the
+            // rest of its run.
+            let mut draft_tokens = vec![Vec::new(); active.len()];
+            let mut draft_proposals = vec![Vec::new(); active.len()];
+            let mut draft_histories = vec![Vec::new(); active.len()];
+            for (position, &row) in active.iter().enumerate() {
+                if states[row].track_history {
+                    draft_histories[position] = states[row].history_ids.clone();
+                }
+            }
+            let mut draft_error_row: Option<usize> = None;
+            'draft: for step_index in 0..max_depth {
+                let drafting: Vec<usize> = (0..active.len())
+                    .filter(|&position| depths[position] > step_index)
+                    .collect();
+                let mut tokens_step = Vec::with_capacity(drafting.len());
+                for &position in &drafting {
+                    let row = active[position];
+                    let logits =
+                        self.text_model
+                            .project_with_shared_lm_head(&currents[position])?;
+                    let mut values = logits_to_vec(&logits.i((0, 0))?)?;
+                    truncate_logits_to_vocab(&mut values, self.tokenizer.vocab_size);
+                    if !values.iter().any(|value| value.is_finite()) {
+                        draft_error_row = Some(position);
+                        break 'draft;
+                    }
+                    if states[row].config.temperature > 1e-5 {
+                        let state = &mut *states[row];
+                        let proposal = propose_speculative_draft(
+                            &values,
+                            &state.config,
+                            &mut draft_histories[position],
+                            &mut state.draft_rng,
+                        )?;
+                        let token_id = proposal.token_id;
+                        draft_proposals[position].push(proposal);
+                        tokens_step.push(token_id);
+                    } else {
+                        tokens_step.push(argmax_values(&values)?);
+                    }
+                }
+                for (fill, &position) in drafting.iter().enumerate() {
+                    draft_tokens[position].push(tokens_step[fill]);
+                }
+                if step_index + 1 < max_depth {
+                    let advancing: Vec<usize> = (0..active.len())
+                        .filter(|&position| depths[position] > step_index + 1)
+                        .collect();
+                    if advancing.is_empty() {
+                        continue;
+                    }
+                    let advance_tokens = advancing
+                        .iter()
+                        .map(|&position| draft_tokens[position][step_index])
+                        .collect::<Vec<_>>();
+                    let positions = advancing
+                        .iter()
+                        .map(|&position| {
+                            let row = active[position];
+                            [states[row].next_text_position + step_index; 3]
+                        })
+                        .collect::<Vec<_>>();
+                    let mut embeddings = Vec::with_capacity(advancing.len());
+                    for &token in &advance_tokens {
+                        embeddings.push(self.text_model.embed_token_ids(&[token])?);
+                    }
+                    let embeddings = Tensor::cat(&embeddings, 0)?;
+                    let hiddens = Tensor::cat(
+                        &advancing
+                            .iter()
+                            .map(|&position| &currents[position])
+                            .collect::<Vec<_>>(),
+                        0,
+                    )?;
+                    if shared_mtp_arena {
+                        let mut subset = take_state_subset(states, &active);
+                        let mut caches = Vec::with_capacity(advancing.len());
+                        for (position, state) in subset.iter_mut().enumerate() {
+                            if !advancing.contains(&position) {
+                                continue;
+                            }
+                            let mtp = state.mtp_cache.as_mut().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Qwen3.5 speculative row lost its MTP cache".into(),
+                                )
+                            })?;
+                            caches.push(mtp);
+                        }
+                        let next = head.forward_steps_batch(
+                            &embeddings,
+                            &hiddens,
+                            &positions,
+                            caches.as_mut_slice(),
+                        )?;
+                        for (fill, &position) in advancing.iter().enumerate() {
+                            currents[position] = next.i(fill)?.unsqueeze(0)?;
+                        }
+                    } else {
+                        // Standalone per-session MTP arenas cannot share one
+                        // lowered slot map — advance the rows one at a time.
+                        for (fill, &position) in advancing.iter().enumerate() {
+                            let row = active[position];
+                            let state = &mut *states[row];
+                            let mtp = state.mtp_cache.as_mut().ok_or_else(|| {
+                                Error::InferenceError(
+                                    "Qwen3.5 speculative row lost its MTP cache".into(),
+                                )
+                            })?;
+                            let next = head.forward_step(
+                                &embeddings.i(fill)?.unsqueeze(0)?,
+                                &currents[position],
+                                positions[fill],
+                                mtp,
+                            )?;
+                            currents[position] = next;
+                        }
+                    }
+                }
+            }
+
+            for (position, &row) in active.iter().enumerate() {
+                let state = &mut *states[row];
+                let mtp = state.mtp_cache.as_mut().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.5 speculative row lost its MTP cache".into())
+                })?;
+                mtp.restore_logical_checkpoint(mtp_checkpoints[position].clone())?;
+                if draft_error_row == Some(position) {
+                    state.adaptive_mtp.disable_after_nonfinite_draft();
+                }
+            }
+            if draft_error_row.is_some() {
+                // The envelope falls back to a scalar round together; the
+                // offending row's controller is disabled for the rest of its
+                // run and its depth() will keep reporting zero.
+                let mut subset = take_state_subset(states, &active);
+                let steps = self.decode_step_batch(&mut subset)?;
+                for (position, &row) in active.iter().enumerate() {
+                    deltas[row].push_str(&steps[position].delta);
+                    committed[row] += steps[position].input_tokens_committed;
+                    finished[row] = steps[position].finished;
+                }
+                active.retain(|&row| !finished[row] && committed[row] < input_budget);
+                continue;
+            }
+
+            // Greedy rows carry bare ids; sampled rows carry their proposal
+            // distributions into the shared verifier.
+            let draft_blocks: Vec<DraftBlock> = (0..active.len())
+                .map(|position| {
+                    if draft_proposals[position].is_empty() {
+                        DraftBlock::Greedy(std::mem::take(&mut draft_tokens[position]))
+                    } else {
+                        DraftBlock::Stochastic(std::mem::take(&mut draft_proposals[position]))
+                    }
+                })
+                .collect();
+
+            // Verification and commit stay per row on each row's own caches.
+            for (position, &row) in active.iter().enumerate() {
+                let state = &mut *states[row];
+                if depths[position] == 0 {
+                    let delta = self.mtp_scalar_tail(state, head)?;
+                    deltas[row].push_str(&delta);
+                    committed[row] += 1;
+                    // Scheduler-limited tails train the controller only when
+                    // the observation budget is the round's own remaining
+                    // slice, matching the solo quantum's timer gating.
+                    let remaining = (input_budget - committed[row]).min(
+                        state
+                            .max_new_tokens
+                            .saturating_sub(state.tokens_generated)
+                            .max(1),
+                    );
+                    if state.adaptive_mtp.can_train(remaining) {
+                        state
+                            .adaptive_mtp
+                            .observe(0, 1, round_started.elapsed(), remaining);
+                    }
+                } else {
+                    let (tokens, delta) =
+                        self.mtp_verify_and_commit(state, head, &draft_blocks[position])?;
+                    committed[row] += tokens;
+                    deltas[row].push_str(&delta);
+                    let remaining = (input_budget - committed[row]).min(
+                        state
+                            .max_new_tokens
+                            .saturating_sub(state.tokens_generated)
+                            .max(1),
+                    );
+                    if state.adaptive_mtp.can_train(remaining) {
+                        state.adaptive_mtp.observe(
+                            depths[position],
+                            tokens,
+                            round_started.elapsed(),
+                            remaining,
+                        );
+                    }
+                }
+                finished[row] = state.finished;
+            }
+            active.retain(|&row| !finished[row] && committed[row] < input_budget);
+        }
+
+        let mut steps = Vec::with_capacity(state_count);
+        for row in 0..state_count {
+            let state = &*states[row];
+            steps.push(ChatDecodeStep {
+                delta: std::mem::take(&mut deltas[row]),
+                text: if state.finished {
+                    state.assembled.clone()
+                } else {
+                    String::new()
+                },
+                tokens_generated: state.tokens_generated,
+                input_tokens_committed: committed[row],
+                finished: state.finished,
+            });
+        }
+        Ok(steps)
     }
 }
 
@@ -1181,6 +2567,11 @@ impl Qwen35ChatModel {
                 tokenizer,
                 text_config,
                 text_model,
+                mtp_head: None,
+                mtp_speculative_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
+            mtp_adaptive: false,
+                kv_storage_dtype: DType::F32,
             },
             text_checkpoint,
             projector_checkpoint,
@@ -1279,6 +2670,7 @@ impl Qwen35ChatModel {
             max_new_tokens,
             config,
             cache,
+            None,
         )?;
         self.exec.continue_resumable_prefill_physical(
             &mut state,
@@ -1295,9 +2687,11 @@ impl Qwen35ChatModel {
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
-        self.exec
-            .begin_resumable_prefill_state_physical(prepared, max_new_tokens, config, cache)
+        self.exec.begin_resumable_prefill_state_physical(
+            prepared, max_new_tokens, config, cache, mtp_cache,
+        )
     }
 
     pub(crate) fn continue_resumable_prefill_physical(
@@ -2090,6 +3484,28 @@ fn sample_next_token(
         .ok_or_else(|| Error::InferenceError("Failed to sample Qwen3.5 token".to_string()))
 }
 
+/// Normalize model logits — `[1, seq, vocab]`, `[seq, vocab]`, or
+/// `[vocab]` — into the flat last-row vector the samplers consume. The
+/// stored prefill output is rank 3; forward paths return rank 1.
+fn logits_last_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
+        2 => Ok(logits.clone()),
+        3 => {
+            let (batch, sequence, _) = logits.dims3()?;
+            if batch != 1 || sequence == 0 {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3.5 sampler received malformed logits {batch}x{sequence}"
+                )));
+            }
+            logits.i((0, sequence - 1)).map_err(Error::from)
+        }
+        rank => Err(Error::InferenceError(format!(
+            "Unexpected Qwen3.5 logits rank for sampling: {rank}"
+        ))),
+    }
+}
+
 fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -2258,6 +3674,13 @@ impl SimpleRng {
         }
     }
 
+    /// Derive the draft RNG stream from the target stream: speculative
+    /// proposals must not perturb the target's draw sequence.
+    fn fork(&mut self) -> Self {
+        let seed = (u64::from(self.next_u32()) << 32) | u64::from(self.next_u32());
+        Self::new(seed)
+    }
+
     fn next_u32(&mut self) -> u32 {
         let mut x = self.state;
         x ^= x >> 12;
@@ -2269,6 +3692,28 @@ impl SimpleRng {
 
     fn next_f32(&mut self) -> f32 {
         (self.next_u32() as f64 / (u32::MAX as f64 + 1.0)) as f32
+    }
+}
+
+impl rand::RngCore for SimpleRng {
+    fn next_u32(&mut self) -> u32 {
+        SimpleRng::next_u32(self)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        (u64::from(SimpleRng::next_u32(self)) << 32) | u64::from(SimpleRng::next_u32(self))
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(std::mem::size_of::<u32>()) {
+            let bytes = SimpleRng::next_u32(self).to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
     }
 }
 
