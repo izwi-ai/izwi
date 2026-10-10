@@ -692,6 +692,7 @@ impl DeviceSelector {
             .ok()?
             .ok()?;
         if device.is_cuda() {
+            configure_cuda_event_tracking(&device);
             let cuda_capabilities = Self::detect_cuda_capabilities(ordinal);
             let supports_bf16 = cuda_capabilities
                 .compute_capability
@@ -970,8 +971,87 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
     CudaProbe::default()
 }
 
+/// Environment switch keeping cudarc's per-allocation event tracking on.
+pub(crate) const CUDA_EVENT_TRACKING_ENV: &str = "IZWI_CUDA_EVENT_TRACKING";
+
+fn cuda_event_tracking_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        )
+    })
+}
+
+/// cudarc gives every allocation read/write events to order streams, but
+/// izwi drives each context through Candle's per-thread stream and never
+/// enters multi-stream mode, so the events are never recorded. They still
+/// cost an event create per allocation and a stream wait plus a destroy per
+/// free: about four driver calls per tensor, on every eager decode op. Turn
+/// tracking off for this device's context unless the switch asks to keep it,
+/// or the context already orders several streams.
+fn configure_cuda_event_tracking(device: &Device) {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cuda) = device {
+        let context = cuda.cuda_stream().context().clone();
+        if cuda_event_tracking_requested(std::env::var(CUDA_EVENT_TRACKING_ENV).ok().as_deref())
+            || context.is_in_multi_stream_mode()
+        {
+            info!(
+                multi_stream = context.is_in_multi_stream_mode(),
+                "CUDA per-allocation event tracking kept on"
+            );
+            return;
+        }
+        // SAFETY: single-stream context: the events never order anything,
+        // so allocations without them are synchronized exactly as before.
+        unsafe { context.disable_event_tracking() };
+        info!("CUDA per-allocation event tracking off (single-stream context)");
+    }
+    let _ = device;
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cuda_event_tracking_switch_values() {
+        for value in ["1", " true ", "ON"] {
+            assert!(super::cuda_event_tracking_requested(Some(value)), "{value}");
+        }
+        for value in ["0", "off", "", "false"] {
+            assert!(
+                !super::cuda_event_tracking_requested(Some(value)),
+                "{value}"
+            );
+        }
+        assert!(!super::cuda_event_tracking_requested(None));
+    }
+
+    /// The selected CUDA device's context runs without per-allocation events
+    /// (single-stream mode), unless the switch keeps them.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_device_selection_turns_event_tracking_off() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let context = device
+            .as_cuda_device()
+            .unwrap()
+            .cuda_stream()
+            .context()
+            .clone();
+        let requested = super::cuda_event_tracking_requested(
+            std::env::var(super::CUDA_EVENT_TRACKING_ENV)
+                .ok()
+                .as_deref(),
+        );
+        assert_eq!(
+            context.is_event_tracking(),
+            requested || context.is_in_multi_stream_mode()
+        );
+    }
+
     use super::*;
 
     #[test]
