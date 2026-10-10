@@ -344,8 +344,29 @@ struct Qwen35LinearAttention {
     head_v_dim: usize,
     conv_dim: usize,
     kernel_size: usize,
+    v_head_order: Qwen35LinearVHeadOrder,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+}
+
+/// How a checkpoint orders the DeltaNet value heads relative to the shared
+/// key heads when `num_v_heads > num_k_heads` (`r = num_v_heads /
+/// num_k_heads` value heads per key head).
+///
+/// HF safetensors store value heads GROUPED by key head
+/// (`[K0v0..K0v{r-1}, K1v0, ...]`) and expand q/k with `repeat_interleave`:
+/// value head `j` reads key head `j / r`. llama.cpp's Qwen3.5/3.6 conversion
+/// (`_LinearAttentionVReorderBase`) permutes every value-head-indexed tensor
+/// into TILED order (`[K0v0, K1v0, ..., K0v1, ...]`) so `ggml_repeat` can do
+/// the expansion: value head `j` reads key head `j % num_k_heads`. The two
+/// are the same model under a value-side permutation; what matters is that
+/// the expansion matches the checkpoint's storage order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen35LinearVHeadOrder {
+    /// llama.cpp-converted GGUF.
+    Tiled,
+    /// Native HF safetensors.
+    Grouped,
 }
 
 struct Qwen35GatedRmsNorm {
@@ -446,6 +467,12 @@ pub(crate) trait Qwen35WeightSource {
     fn projection(&self, name: &str, device: &Device) -> Result<Qwen35Projection>;
 
     fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm>;
+
+    /// Storage order of the DeltaNet value heads (see
+    /// [`Qwen35LinearVHeadOrder`]). GGUF sources are tiled by conversion.
+    fn linear_v_head_order(&self) -> Qwen35LinearVHeadOrder {
+        Qwen35LinearVHeadOrder::Tiled
+    }
 
     /// Dense tensor, coerced to `dtype` when requested (always F32 when
     /// `Some(F32)`).
@@ -1780,6 +1807,7 @@ impl Qwen35LinearAttention {
             head_v_dim,
             conv_dim,
             kernel_size: cfg.ssm_conv_kernel,
+            v_head_order: source.linear_v_head_order(),
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
         })
@@ -1852,9 +1880,8 @@ impl Qwen35LinearAttention {
                     self.num_v_heads, self.num_k_heads
                 )));
             }
-            let repeats = self.num_v_heads / self.num_k_heads;
-            query = repeat_head_states(&query, repeats)?;
-            key = repeat_head_states(&key, repeats)?;
+            query = self.expand_key_heads(&query)?;
+            key = self.expand_key_heads(&key)?;
         }
 
         let current_state = if let Some(state) = recurrent_state.take() {
@@ -1957,9 +1984,8 @@ impl Qwen35LinearAttention {
             let mut query = l2norm(&query, 1e-6)?;
             let mut key = l2norm(&key, 1e-6)?;
             if self.num_v_heads != self.num_k_heads {
-                let repeats = self.num_v_heads / self.num_k_heads;
-                query = repeat_head_states(&query, repeats)?;
-                key = repeat_head_states(&key, repeats)?;
+                query = self.expand_key_heads(&query)?;
+                key = self.expand_key_heads(&key)?;
             }
             let current_state = if let Some(state) = recurrent_state.take() {
                 state
@@ -2075,7 +2101,12 @@ impl Qwen35LinearAttention {
         let g = g.reshape((1, seq_len, self.num_v_heads))?;
         let tile_size =
             qwen35_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let fused_sequence = if self.tiled_recurrence_enabled {
+        // The compact (un-expanded) Metal sequence kernel hard-codes the tiled
+        // pairing (`key_head = v_head % num_k_heads`), so a grouped checkpoint
+        // may only reach it once q/k are expanded below.
+        let compact_heads_compatible = self.num_v_heads == self.num_k_heads
+            || self.v_head_order == Qwen35LinearVHeadOrder::Tiled;
+        let fused_sequence = if self.tiled_recurrence_enabled && compact_heads_compatible {
             try_tiled_deltanet_recurrence(
                 &query,
                 &key,
@@ -2092,15 +2123,15 @@ impl Qwen35LinearAttention {
             fused_sequence
         } else {
             // CUDA's equal-head kernel and the portable Candle reference consume
-            // tiled Q/K heads. The Metal sequence op above consumes the compact
-            // converted-GGUF 16K layout directly for both 16V and 32V models.
+            // q/k already expanded to one head per value head. The Metal
+            // sequence op above consumes the compact converted-GGUF 16K layout
+            // directly for both 16V and 32V tiled models.
             let (query, key) = if self.num_v_heads == self.num_k_heads {
                 (query, key)
             } else {
-                let repeats = self.num_v_heads / self.num_k_heads;
                 (
-                    repeat_head_states_seq(&query, repeats)?,
-                    repeat_head_states_seq(&key, repeats)?,
+                    self.expand_key_heads_seq(&query)?,
+                    self.expand_key_heads_seq(&key)?,
                 )
             };
             if self.tiled_recurrence_enabled {
@@ -2133,6 +2164,26 @@ impl Qwen35LinearAttention {
             .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
             .to_dtype(residual_dtype)?;
         self.out_proj.forward(&output)
+    }
+
+    /// Expand `[batch, num_k_heads, dim]` q/k to one head per value head in
+    /// the checkpoint's value-head order.
+    fn expand_key_heads(&self, x: &Tensor) -> Result<Tensor> {
+        let repeats = self.num_v_heads / self.num_k_heads;
+        match self.v_head_order {
+            Qwen35LinearVHeadOrder::Tiled => repeat_head_states(x, repeats),
+            Qwen35LinearVHeadOrder::Grouped => repeat_interleave_head_states(x, repeats),
+        }
+    }
+
+    /// Sequence form of [`Self::expand_key_heads`] over
+    /// `[batch, seq, num_k_heads, dim]`.
+    fn expand_key_heads_seq(&self, x: &Tensor) -> Result<Tensor> {
+        let repeats = self.num_v_heads / self.num_k_heads;
+        match self.v_head_order {
+            Qwen35LinearVHeadOrder::Tiled => repeat_head_states_seq(x, repeats),
+            Qwen35LinearVHeadOrder::Grouped => repeat_interleave_head_states_seq(x, repeats),
+        }
     }
 
     fn depthwise_conv_sequence(
@@ -2540,24 +2591,41 @@ fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
+/// Tiled key-head expansion `[h0..hK, h0..hK, ...]`: value head `j` reads key
+/// head `j % K`. Matches llama.cpp-converted GGUF, whose conversion permutes
+/// the value heads into tiled order (see [`Qwen35LinearVHeadOrder`]).
 fn repeat_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
     if repeats <= 1 {
         return Ok(x.clone());
     }
     let (batch, heads, dim) = x.dims3()?;
-    // TILED expansion is the trained convention for the Qwen3.5/3.6 lineage:
-    // value head j recalls key head (j % heads), matching llama.cpp's qwen35
-    // GGUF encoding. The production dense Qwen3.5 GGUFs (16 k-heads / 32
-    // v-heads → repeats=2) generate coherently through this exact layout
-    // daily, which pins the publisher's row semantics. Do NOT "fix" this to
-    // repeat_interleave: that is the Qwen3-Next/3.8 lineage convention
-    // (qwen38/text.rs repeat_interleave_head_states), and the two pairings are
-    // NOT reconcilable by any weight permutation — each trunk must match its
-    // own generation. Pinned by repeat_head_states_uses_tiled_order; see
-    // tasks/qwen36moe-native-cuda-gibberish-research-2026-10-07.md.
     let expanded = x.unsqueeze(1)?.broadcast_as((batch, repeats, heads, dim))?;
     expanded
         .reshape((batch, repeats * heads, dim))
+        .map_err(Error::from)
+}
+
+/// Grouped key-head expansion `[h0, h0, h1, h1, ...]` (HF `repeat_interleave`):
+/// value head `j` reads key head `j / repeats`. Matches native HF safetensors.
+fn repeat_interleave_head_states(x: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats <= 1 {
+        return Ok(x.clone());
+    }
+    let (batch, heads, dim) = x.dims3()?;
+    x.unsqueeze(2)?
+        .broadcast_as((batch, heads, repeats, dim))?
+        .reshape((batch, heads * repeats, dim))
+        .map_err(Error::from)
+}
+
+fn repeat_interleave_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
+    if repeats <= 1 {
+        return Ok(x.clone());
+    }
+    let (batch, seq, heads, dim) = x.dims4()?;
+    x.unsqueeze(3)?
+        .broadcast_as((batch, seq, heads, repeats, dim))?
+        .reshape((batch, seq, heads * repeats, dim))
         .map_err(Error::from)
 }
 
@@ -2717,8 +2785,9 @@ mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
-        softplus, ConvRingState, Qwen35GatedRmsNorm, Qwen35LayerRuntimeState,
-        Qwen35LinearAttention, Qwen35Projection, Qwen35TextRuntimeState,
+        repeat_interleave_head_states, repeat_interleave_head_states_seq, softplus, ConvRingState,
+        Qwen35GatedRmsNorm, Qwen35LayerRuntimeState, Qwen35LinearAttention, Qwen35LinearVHeadOrder,
+        Qwen35Projection, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2784,6 +2853,7 @@ mod tests {
             head_v_dim: 2,
             conv_dim: 6,
             kernel_size: 4,
+            v_head_order: Qwen35LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
         };
@@ -2911,6 +2981,7 @@ mod tests {
             head_v_dim: 2,
             conv_dim: 6,
             kernel_size: 4,
+            v_head_order: Qwen35LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
         };
@@ -3067,6 +3138,58 @@ mod tests {
                 vec![3.0, 4.0]
             ]]
         );
+    }
+
+    #[test]
+    fn repeat_interleave_head_states_uses_grouped_order() {
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 2), &Device::Cpu)
+            .expect("tensor should build");
+        let repeated = repeat_interleave_head_states(&x, 2).expect("repeat should succeed");
+        assert_eq!(
+            repeated.to_vec3::<f32>().expect("values"),
+            vec![vec![
+                vec![1.0, 2.0],
+                vec![1.0, 2.0],
+                vec![3.0, 4.0],
+                vec![3.0, 4.0]
+            ]]
+        );
+        let seq = x.unsqueeze(1).expect("seq axis");
+        let repeated_seq =
+            repeat_interleave_head_states_seq(&seq, 2).expect("repeat should succeed");
+        assert_eq!(
+            repeated_seq
+                .squeeze(1)
+                .expect("squeeze")
+                .to_vec3::<f32>()
+                .expect("values"),
+            repeated.to_vec3::<f32>().expect("values")
+        );
+    }
+
+    /// The two value-head orders are the same model under llama.cpp's
+    /// grouped→tiled value permutation (`_LinearAttentionVReorderBase`): new
+    /// tiled head `n` holds grouped head `(n % K) * r + n / K`, and must read
+    /// the same key head under tiled expansion that the grouped head reads
+    /// under `repeat_interleave`. Pins the equivalence that lets the trunk
+    /// serve both GGUF (tiled) and native HF (grouped) checkpoints.
+    #[test]
+    fn tiled_and_grouped_expansions_agree_under_the_value_permutation() {
+        let (num_k, repeats, dim) = (16usize, 2usize, 3usize);
+        let keys: Vec<f32> = (0..num_k * dim).map(|v| v as f32).collect();
+        let x = Tensor::from_vec(keys, (1, num_k, dim), &Device::Cpu).expect("tensor");
+        let tiled = repeat_head_states(&x, repeats)
+            .expect("tiled")
+            .to_vec3::<f32>()
+            .unwrap();
+        let grouped = repeat_interleave_head_states(&x, repeats)
+            .expect("grouped")
+            .to_vec3::<f32>()
+            .unwrap();
+        for n in 0..num_k * repeats {
+            let grouped_head = (n % num_k) * repeats + n / num_k;
+            assert_eq!(tiled[0][n], grouped[0][grouped_head], "tiled head {n}");
+        }
     }
 
     #[test]

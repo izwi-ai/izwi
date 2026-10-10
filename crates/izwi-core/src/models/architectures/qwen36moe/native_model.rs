@@ -16,7 +16,8 @@ use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen35::mtp::Qwen35MtpHead;
 use crate::models::architectures::qwen35::text::{
-    Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
+    Qwen35LinearVHeadOrder, Qwen35MoeFfnGeometry, Qwen35Projection, Qwen35RmsNorm,
+    Qwen35TextModel, Qwen35WeightSource,
 };
 use crate::models::architectures::qwen38::native::ProjectionMaterialization;
 use crate::models::architectures::qwen36moe::native::{
@@ -301,6 +302,13 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
             ProjectionMaterialization::F32,
         )?;
         Ok(Qwen35RmsNorm::new((stored + 1.0)?, eps))
+    }
+
+    fn linear_v_head_order(&self) -> Qwen35LinearVHeadOrder {
+        // HF safetensors keep the DeltaNet value heads grouped by key head
+        // (`repeat_interleave` pairing); only llama.cpp's GGUF conversion
+        // permutes them into the trunk's default tiled order.
+        Qwen35LinearVHeadOrder::Grouped
     }
 
     fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {
