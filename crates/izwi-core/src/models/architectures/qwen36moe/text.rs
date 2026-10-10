@@ -17,6 +17,7 @@ use crate::backends::state::{
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::norm;
+use crate::kernels::cuda::rope::{self, MropePosition, QkNormRopeSpec};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -340,6 +341,10 @@ pub(crate) struct Qwen36FullAttention {
     mrope_sections: Vec<usize>,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
+    /// Fused q/k norm + RoPE for single-token decode with its device-resident
+    /// inverse frequencies, when resolved at load.
+    fused_qk: Option<(QkNormRopeSpec, Tensor)>,
+    fused_qk_path: Qwen36FusedPath,
 }
 
 struct Qwen36LinearAttention {
@@ -820,6 +825,15 @@ impl Qwen36TextModel {
             0.02,
         )?;
         Ok(())
+    }
+
+    /// Fused q/k norm + RoPE across the full-attention layers, for the admin
+    /// diagnostics.
+    pub(crate) fn qk_rope_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Full(attention) => Some(&attention.fused_qk_path),
+            Qwen36Mixer::Linear(_) => None,
+        }))
     }
 
     /// Fused RMSNorm resolution, for the admin diagnostics.
@@ -1534,7 +1548,7 @@ impl Qwen36FullAttention {
         prefix: &str,
         cfg: &Qwen36TextConfig,
     ) -> Result<Self> {
-        Ok(Self {
+        let mut attention = Self {
             q_proj: source.projection(&format!("{prefix}.attn_q.weight"), device)?,
             k_proj: source.projection(&format!("{prefix}.attn_k.weight"), device)?,
             v_proj: source.projection(&format!("{prefix}.attn_v.weight"), device)?,
@@ -1566,7 +1580,190 @@ impl Qwen36FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
+            fused_qk: None,
+            fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
+        };
+        attention.resolve_fused_qk(device, false);
+        Ok(attention)
+    }
+
+    /// Resolve the fused q/k norm + RoPE at load: CUDA only in production
+    /// (`allow_cpu` exercises the portable path in tests), F32 head-norm gains,
+    /// and a self-check against the norm + rotary chain at text and
+    /// multimodal positions.
+    fn resolve_fused_qk(&mut self, device: &Device, allow_cpu: bool) {
+        self.fused_qk = None;
+        let spec = QkNormRopeSpec {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            rope_dim: self.rope_dim,
+            eps: self.q_norm.eps as f32,
+        };
+        self.fused_qk_path = if legacy_requested(FUSED_DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
+        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
+            Qwen36FusedPath::legacy("fused q/k norm + RoPE runs on CUDA only")
+        } else if !rope::supported(device, DType::BF16, self.head_dim, self.rope_dim)
+            || self.q_norm.weight.dtype() != DType::F32
+            || self.k_norm.weight.dtype() != DType::F32
+            || self.q_norm.eps != self.k_norm.eps
+            || self.rope_inv_freqs.len() != self.rope_dim / 2
+        {
+            Qwen36FusedPath::legacy(
+                "fused q/k norm + RoPE needs SM80+, F32 head-norm gains and an even rotary dim",
+            )
+        } else {
+            let inv_freq = Tensor::from_vec(
+                self.rope_inv_freqs.clone(),
+                self.rope_inv_freqs.len(),
+                &Device::Cpu,
+            )
+            .and_then(|t| t.to_device(device));
+            match inv_freq.map_err(Error::from).and_then(|inv_freq| {
+                self.fused_qk_self_check(&spec, &inv_freq, device)
+                    .map(|()| inv_freq)
+            }) {
+                Ok(inv_freq) => {
+                    self.fused_qk = Some((spec, inv_freq));
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 fused q/k norm + RoPE self-check failed; using the rotary chain"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// The M-RoPE position the fused kernel would use, or `None` when the
+    /// positions need sections this layer does not declare (the reference
+    /// chain reports that error).
+    fn fused_position(&self, position_ids: [usize; 3]) -> Option<MropePosition> {
+        let sectioned = position_ids[0] != position_ids[1] || position_ids[0] != position_ids[2];
+        if sectioned
+            && (self.mrope_sections.len() < 3
+                || self.mrope_sections.iter().sum::<usize>() != self.rope_dim / 2)
+        {
+            return None;
+        }
+        Some(MropePosition {
+            temporal: position_ids[0],
+            height: position_ids[1],
+            width: position_ids[2],
+            height_section: self.mrope_sections.get(1).copied().unwrap_or(0),
+            width_section: self.mrope_sections.get(2).copied().unwrap_or(0),
         })
+    }
+
+    /// Normalized, rotated `(q, k)` for one token, `[1, 1, heads, head_dim]`,
+    /// through the fused kernel when resolved and applicable, else the chain.
+    /// `q_proj` is the gated projection `[1, 1, heads, 2 * head_dim]`, `k_proj`
+    /// is `[1, 1, kv_heads, head_dim]`.
+    fn token_qk(
+        &self,
+        q_proj: &Tensor,
+        k_proj: &Tensor,
+        position_ids: [usize; 3],
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some((spec, inv_freq)) = &self.fused_qk {
+            if let Some(position) = self.fused_position(position_ids) {
+                if matches!(q_proj.dtype(), DType::F16 | DType::BF16) {
+                    return Ok(rope::qk_norm_rope(
+                        q_proj,
+                        k_proj,
+                        &self.q_norm.weight,
+                        &self.k_norm.weight,
+                        inv_freq,
+                        spec,
+                        position,
+                    )?);
+                }
+            }
+        }
+        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+        let key_states = self.k_norm.forward(&k_proj.contiguous()?)?;
+        self.apply_rope(&query_states, &key_states, position_ids)
+    }
+
+    fn fused_qk_self_check(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        device: &Device,
+    ) -> Result<()> {
+        let dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F16
+        };
+        let wave = |n: usize, seed: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 2.5)
+                .collect::<Vec<_>>()
+        };
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let q_proj = Tensor::from_vec(
+            wave(self.num_heads * 2 * self.head_dim, 1.0),
+            (1, 1, self.num_heads, 2 * self.head_dim),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?;
+        let k_proj = Tensor::from_vec(
+            wave(self.num_kv_heads * self.head_dim, 2.0),
+            (1, 1, self.num_kv_heads, self.head_dim),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?;
+        let mut positions = vec![[5usize, 5, 5], [3000, 3000, 3000]];
+        if self.fused_position([7, 3, 11]).is_some() {
+            positions.push([7, 3, 11]);
+        }
+        for position_ids in positions {
+            let position = self.fused_position(position_ids).ok_or_else(|| {
+                Error::InferenceError("self-check position needs M-RoPE sections".into())
+            })?;
+            let (q, k) = rope::qk_norm_rope(
+                &q_proj,
+                &k_proj,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                inv_freq,
+                spec,
+                position,
+            )?;
+            let query_states = self
+                .q_norm
+                .forward(&q_proj.narrow(3, 0, self.head_dim)?.contiguous()?)?;
+            let key_states = self.k_norm.forward(&k_proj)?;
+            let (q_ref, k_ref) = self.apply_rope(&query_states, &key_states, position_ids)?;
+            compare_values(
+                "fused query norm + RoPE",
+                &host(&q)?,
+                &host(&q_ref)?,
+                0.01,
+                0.03,
+            )?;
+            compare_values(
+                "fused key norm + RoPE",
+                &host(&k)?,
+                &host(&k_ref)?,
+                0.01,
+                0.03,
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn forward_physical(
@@ -1591,7 +1788,6 @@ impl Qwen36FullAttention {
             self.num_heads,
             self.head_dim * 2,
         ))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             1,
             seq_len,
@@ -1609,11 +1805,12 @@ impl Qwen36FullAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let (query_states, key_states) = if seq_len == 1 {
-            self.apply_rope(&query_states, &key_states, position_ids[0])?
+            self.token_qk(&q_proj, &key_states, position_ids[0])?
         } else {
+            let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+            let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+            let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
             self.apply_rope_sequence(&query_states, &key_states, position_ids)?
         };
         let queries = query_states
@@ -1687,7 +1884,6 @@ impl Qwen36FullAttention {
             self.num_heads,
             self.head_dim * 2,
         ))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             batch_size,
             1,
@@ -1705,15 +1901,13 @@ impl Qwen36FullAttention {
             self.num_kv_heads,
             self.head_dim,
         ))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
         for row in 0..batch_size {
-            let q_row = query_states.i(row)?.unsqueeze(0)?;
+            let q_row = q_proj.i(row)?.unsqueeze(0)?;
             let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope(&q_row, &k_row, position_ids[row])?;
+            let (q_row, k_row) = self.token_qk(&q_row, &k_row, position_ids[row])?;
             queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
             keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
             values.push(
@@ -3492,6 +3686,104 @@ mod tests {
                 "{label} index {index}: {a} vs {e}"
             );
         }
+    }
+
+    fn attention_for_qk(sections: Vec<usize>) -> super::Qwen36FullAttention {
+        let device = &Device::Cpu;
+        let unused = || {
+            Qwen36Projection::Quantized(QMatMul::Tensor(
+                Tensor::zeros((1, 1), DType::F32, device).unwrap(),
+            ))
+        };
+        let gain = |seed: f32| {
+            super::Qwen36RmsNorm::new(
+                Tensor::from_vec(
+                    (0..64)
+                        .map(|i| 1.0 + ((i as f32 + seed) * 0.3).sin() * 0.2)
+                        .collect::<Vec<_>>(),
+                    64,
+                    device,
+                )
+                .unwrap(),
+                1e-6,
+            )
+        };
+        super::Qwen36FullAttention {
+            q_proj: unused(),
+            k_proj: unused(),
+            v_proj: unused(),
+            o_proj: unused(),
+            q_norm: gain(1.0),
+            k_norm: gain(2.0),
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            rope_dim: 16,
+            rope_theta: 10_000_000.0,
+            mrope_sections: sections,
+            rope_kernel_enabled: false,
+            rope_inv_freqs: super::build_rope_inv_freqs(16, 10_000_000.0).unwrap(),
+            fused_qk: None,
+            fused_qk_path: Qwen36FusedPath::legacy("test"),
+        }
+    }
+
+    #[test]
+    fn fused_qk_norm_rope_matches_the_rotary_chain() {
+        let legacy = attention_for_qk(vec![3, 3, 2]);
+        let mut fused = attention_for_qk(vec![3, 3, 2]);
+        fused.resolve_fused_qk(&Device::Cpu, true);
+        assert_eq!(fused.fused_qk_path, Qwen36FusedPath::Fused);
+        let q_proj = Tensor::from_vec(
+            (0..4 * 128)
+                .map(|i| (i as f32 * 0.754_877_7).sin() * 2.0)
+                .collect::<Vec<_>>(),
+            (1, 1, 4, 128),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+        let k_proj = Tensor::from_vec(
+            (0..2 * 64)
+                .map(|i| (i as f32 * 0.31).cos() * 2.0)
+                .collect::<Vec<_>>(),
+            (1, 1, 2, 64),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+        for position in [[0usize, 0, 0], [17, 17, 17], [9000, 9000, 9000], [7, 3, 11]] {
+            let (q, k) = fused.token_qk(&q_proj, &k_proj, position).unwrap();
+            let (q_ref, k_ref) = legacy.token_qk(&q_proj, &k_proj, position).unwrap();
+            assert_eq!(q.dims(), q_ref.dims());
+            assert_eq!(k.dims(), k_ref.dims());
+            assert_close(
+                &flat(&q),
+                &flat(&q_ref),
+                2e-3,
+                &format!("q at {position:?}"),
+            );
+            assert_close(
+                &flat(&k),
+                &flat(&k_ref),
+                2e-3,
+                &format!("k at {position:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn fused_qk_defers_unsectioned_multimodal_positions_to_the_chain() {
+        let mut attention = attention_for_qk(vec![]);
+        attention.resolve_fused_qk(&Device::Cpu, true);
+        assert!(attention.fused_qk.is_some());
+        assert!(attention.fused_position([4, 4, 4]).is_some());
+        assert!(
+            attention.fused_position([4, 2, 9]).is_none(),
+            "sectionless layers leave M-RoPE validation to the reference chain"
+        );
     }
 
     #[test]
