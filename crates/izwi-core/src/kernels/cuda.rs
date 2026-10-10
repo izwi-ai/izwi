@@ -24,6 +24,7 @@ pub mod moe;
 pub mod norm;
 pub mod rope;
 pub mod sampling;
+pub mod segment_graph;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
