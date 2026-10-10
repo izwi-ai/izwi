@@ -895,6 +895,85 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "metal")]
+        #[test]
+        fn metal_fused_block_matches_the_metal_dispatcher_and_the_cpu_block() {
+            let Some(gpu) = crate::backends::metal_device_if_available(0) else {
+                return;
+            };
+            let to_gpu = |linear: Qwen36MoeLinear| match linear {
+                Qwen36MoeLinear::CompactFp8 { weights, scales } => Qwen36MoeLinear::CompactFp8 {
+                    weights: weights.to_device(&gpu).unwrap(),
+                    scales: scales.to_device(&gpu).unwrap(),
+                },
+                Qwen36MoeLinear::Dense(t) => Qwen36MoeLinear::Dense(t.to_device(&gpu).unwrap()),
+                other => other,
+            };
+            let gpu_block = |request| {
+                let experts = experts()
+                    .into_iter()
+                    .map(|e| Qwen36MoeExpertWeights {
+                        gate: to_gpu(e.gate),
+                        up: to_gpu(e.up),
+                        down: to_gpu(e.down),
+                    })
+                    .collect();
+                let shared = shared(I, true);
+                let shared = Qwen36MoeSharedExpertWeights {
+                    gate: to_gpu(shared.gate),
+                    up: to_gpu(shared.up),
+                    down: to_gpu(shared.down),
+                    output_gate: shared.output_gate.map(to_gpu),
+                };
+                Qwen36MoeSparseMlp::from_weights_with_backend(
+                    to_gpu(router()),
+                    experts,
+                    shared,
+                    &geometry(I),
+                    request,
+                )
+                .unwrap()
+            };
+            let fused = gpu_block(Qwen36MoeBackendRequest::Auto);
+            assert_eq!(
+                fused.backend(),
+                &Qwen36FusedPath::Fused,
+                "the Metal self-check must pass"
+            );
+            let legacy = gpu_block(Qwen36MoeBackendRequest::Legacy);
+            let cpu = block(Qwen36MoeBackendRequest::Auto, I, true);
+            for tokens in [1, 4] {
+                let x = input(tokens);
+                let x_gpu = x.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+                let host = |t: Tensor| {
+                    t.to_dtype(DType::F32)
+                        .unwrap()
+                        .to_device(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let fused_out = host(fused.forward(&x_gpu).unwrap());
+                let legacy_out = host(legacy.forward(&x_gpu).unwrap());
+                let cpu_out = values(&cpu.forward(&x).unwrap());
+                let scale = cpu_out.iter().fold(0f32, |m, v| m.max(v.abs()));
+                for (index, ((f, l), c)) in
+                    fused_out.iter().zip(&legacy_out).zip(&cpu_out).enumerate()
+                {
+                    assert!(
+                        (f - l).abs() <= 0.03 * scale,
+                        "T={tokens} {index}: Metal fused {f} vs Metal legacy {l}"
+                    );
+                    assert!(
+                        (f - c).abs() <= 0.03 * scale,
+                        "T={tokens} {index}: Metal fused {f} vs CPU {c}"
+                    );
+                }
+            }
+        }
+
         #[test]
         fn self_check_rejects_a_mismatched_expert_layout() {
             let Qwen36MoeStacking::Stacked {

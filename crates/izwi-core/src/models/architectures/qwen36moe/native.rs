@@ -152,6 +152,11 @@ pub(crate) struct RepresentationElementBucket {
     /// kernel cannot execute (`n % 64 != 0 || k % 128 != 0`); under the
     /// native-FP8 residency these fall back to packed Q8_0.
     pub fp8_incompatible_elements: u64,
+    /// The routed and shared expert share of `fp8_elements` (and of
+    /// `fp8_scale_bytes`): Metal keeps exactly these as raw block-FP8 for the
+    /// fused MoE kernels while the rest of the trunk expands to F16.
+    pub expert_fp8_elements: u64,
+    pub expert_fp8_scale_bytes: u64,
 }
 
 /// Element inventory of the published checkpoint's persistent representation,
@@ -162,6 +167,8 @@ pub(crate) struct PinnedRepresentationInventory {
     pub tensor_count: u64,
     pub fp8_scale_bytes: u64,
     pub fp8_incompatible_elements: u64,
+    pub expert_fp8_elements: u64,
+    pub expert_fp8_scale_bytes: u64,
     /// Element inventory of the MTP draft manifest. Admission charges this
     /// bucket only when the MTP load policy makes the draft head resident;
     /// the default load skips `mtp.*` exactly like the vision tower.
@@ -178,17 +185,25 @@ impl PinnedRepresentationInventory {
             tensor_count: self.tensor_count,
             fp8_scale_bytes: self.fp8_scale_bytes,
             fp8_incompatible_elements: self.fp8_incompatible_elements,
+            expert_fp8_elements: self.expert_fp8_elements,
+            expert_fp8_scale_bytes: self.expert_fp8_scale_bytes,
         }
     }
 }
 
+/// Whether a checkpoint tensor belongs to a routed or the shared expert (the
+/// projections the fused MoE stacks).
+fn is_expert_tensor(name: &str) -> bool {
+    name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert.")
+}
+
 /// Fold one tensor plan into its resident-representation element counts.
 fn fold_representation_inventory(
-    entries: impl IntoIterator<Item = (ExpectedTensorKind, Vec<usize>)>,
+    entries: impl IntoIterator<Item = (bool, ExpectedTensorKind, Vec<usize>)>,
 ) -> RepresentationElementBucket {
     use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
     let mut bucket = RepresentationElementBucket::default();
-    for (kind, shape) in entries {
+    for (expert, kind, shape) in entries {
         bucket.tensor_count += 1;
         let count = shape
             .iter()
@@ -205,6 +220,12 @@ fn fold_representation_inventory(
                 bucket.fp8_scale_bytes = bucket
                     .fp8_scale_bytes
                     .saturating_add(scale_entries.saturating_mul(4));
+                if expert {
+                    bucket.expert_fp8_elements = bucket.expert_fp8_elements.saturating_add(count);
+                    bucket.expert_fp8_scale_bytes = bucket
+                        .expert_fp8_scale_bytes
+                        .saturating_add(scale_entries.saturating_mul(4));
+                }
                 if rows % 64 != 0 || cols % 128 != 0 {
                     bucket.fp8_incompatible_elements = bucket
                         .fp8_incompatible_elements
@@ -230,17 +251,22 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
     let mtp_plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)
         .expect("pinned config produces the validated MTP manifest");
     let trunk = fold_representation_inventory(
-        plan.into_values()
-            .map(|expected| (expected.kind, expected.shape)),
+        plan.into_iter()
+            .map(|(name, expected)| (is_expert_tensor(&name), expected.kind, expected.shape)),
     );
-    let mtp =
-        fold_representation_inventory(mtp_plan.into_iter().map(|spec| (spec.kind, spec.shape)));
+    let mtp = fold_representation_inventory(
+        mtp_plan
+            .into_iter()
+            .map(|spec| (is_expert_tensor(&spec.name), spec.kind, spec.shape)),
+    );
     PinnedRepresentationInventory {
         fp8_elements: trunk.fp8_elements,
         dense_elements: trunk.dense_elements,
         tensor_count: trunk.tensor_count,
         fp8_scale_bytes: trunk.fp8_scale_bytes,
         fp8_incompatible_elements: trunk.fp8_incompatible_elements,
+        expert_fp8_elements: trunk.expert_fp8_elements,
+        expert_fp8_scale_bytes: trunk.expert_fp8_scale_bytes,
         mtp,
     }
 }
@@ -1862,10 +1888,16 @@ impl Qwen36MoeNativeCheckpoint {
         expected_shape: [usize; 2],
         block_shape: [usize; 2],
     ) -> bool {
+        // CUDA runs the native plan in BF16, Metal in F16.
+        let activation = if device.is_metal() {
+            candle_core::DType::F16
+        } else {
+            candle_core::DType::BF16
+        };
         block_shape == [128, 128]
             && crate::kernels::cuda::fp8::provider_supported(
                 device,
-                candle_core::DType::BF16,
+                activation,
                 expected_shape[0],
                 expected_shape[1],
             )

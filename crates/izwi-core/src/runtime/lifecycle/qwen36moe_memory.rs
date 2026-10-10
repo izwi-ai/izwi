@@ -3,8 +3,9 @@
 //!
 //! The numbers derive from the loader's own pinned tensor plans, so admission
 //! can never drift from what the checkpoint actually materializes: CPU packs
-//! projections as Q8_0 and keeps dense tensors in F32, Metal expands F16
-//! (Apple GPUs have no FP8 path), and CUDA keeps the checkpoint's raw
+//! projections as Q8_0 and keeps dense tensors in F32, Metal keeps the
+//! experts as raw block-FP8 (decoded in software by the fused MoE kernels) and
+//! expands the rest to F16, and CUDA keeps the checkpoint's raw
 //! block-FP8 bytes resident with per-tensor packed-Q8_0 fallback for tensors
 //! the fp8 projection kernel cannot execute (`projection_residency_policy`).
 //! Scale companions and vision tensors never become resident text-trunk
@@ -54,12 +55,24 @@ fn bucket_resident_bytes(
         BackendKind::Cpu => q8_bytes
             .checked_add(dense_bytes(4)?)
             .ok_or_else(overflow),
-        BackendKind::Metal => (bucket
-            .fp8_elements
-            .checked_add(bucket.dense_elements)
-            .ok_or_else(overflow)?)
-        .checked_mul(2)
-        .ok_or_else(overflow),
+        // Metal keeps the routed and shared experts as raw block-FP8 bytes
+        // plus F32 scales for the fused MoE kernels and expands the rest of
+        // the trunk (and every dense tensor) to F16.
+        BackendKind::Metal => {
+            let expanded = bucket
+                .fp8_elements
+                .saturating_sub(bucket.expert_fp8_elements)
+                .checked_add(bucket.dense_elements)
+                .ok_or_else(overflow)?
+                .checked_mul(2)
+                .ok_or_else(overflow)?;
+            bucket
+                .expert_fp8_elements
+                .checked_add(bucket.expert_fp8_scale_bytes)
+                .ok_or_else(overflow)?
+                .checked_add(expanded)
+                .ok_or_else(overflow)
+        }
         BackendKind::Cuda => {
             // Native block-FP8 residency: conforming tensors keep raw E4M3FN
             // bytes (1 B/element) plus their F32 block scales; the remainder
@@ -256,9 +269,25 @@ mod tests {
         );
         assert!(cpu.load_peak_bytes > cpu.resident_bytes);
 
-        let expected_metal = (inventory.fp8_elements + inventory.dense_elements) * 2;
+        // Metal: raw block-FP8 experts (+ F32 scales) for the fused MoE
+        // kernels, F16 expansion for the rest of the trunk and dense tensors.
+        let expected_metal = inventory.expert_fp8_elements
+            + inventory.expert_fp8_scale_bytes
+            + (inventory.fp8_elements - inventory.expert_fp8_elements + inventory.dense_elements)
+                * 2;
         assert_eq!(metal.resident_bytes, expected_metal);
         assert!(metal.load_peak_bytes > metal.resident_bytes);
+        // The experts dominate the checkpoint, so FP8 experts take Metal from
+        // ~65 GiB (full F16 expansion) to under 40 GiB: a 64 GB Mac fits.
+        assert!(
+            inventory.expert_fp8_elements * 10 > inventory.fp8_elements * 9,
+            "experts are the bulk of the block-FP8 elements"
+        );
+        assert!(
+            metal.resident_bytes < 40 * GIB,
+            "Metal residency {}",
+            metal.resident_bytes
+        );
 
         // CUDA native-FP8 residency: raw E4M3FN bytes (1 B/element) plus F32
         // block scales for the kernel-conforming projections (all of them in
@@ -282,7 +311,11 @@ mod tests {
         // reservation under the same per-backend policy.
         let cpu_mtp = inventory.mtp.fp8_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES
             + inventory.mtp.dense_elements * 4;
-        let metal_mtp = (inventory.mtp.fp8_elements + inventory.mtp.dense_elements) * 2;
+        let metal_mtp = inventory.mtp.expert_fp8_elements
+            + inventory.mtp.expert_fp8_scale_bytes
+            + (inventory.mtp.fp8_elements - inventory.mtp.expert_fp8_elements
+                + inventory.mtp.dense_elements)
+                * 2;
         let cuda_mtp = inventory.mtp.fp8_elements
             + inventory.mtp.fp8_scale_bytes
             + inventory.mtp.dense_elements * 2;

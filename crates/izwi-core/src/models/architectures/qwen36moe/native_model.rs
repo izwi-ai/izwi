@@ -110,6 +110,11 @@ fn canonical_name(logical: &str) -> Option<String> {
 pub(crate) struct Qwen36MoeNativeSource<'a> {
     checkpoint: &'a Qwen36MoeNativeCheckpoint,
     residency: Qwen36MoeProjectionResidency,
+    /// Routed and shared expert projections. Metal keeps them as raw
+    /// block-FP8 for the fused MoE kernels (half the bytes of the F16
+    /// expansion the rest of its trunk uses); elsewhere they follow
+    /// `residency`.
+    expert_residency: Qwen36MoeProjectionResidency,
     dense_target: ProjectionMaterialization,
 }
 
@@ -128,6 +133,7 @@ impl<'a> Qwen36MoeNativeSource<'a> {
         Self {
             checkpoint,
             residency,
+            expert_residency: residency,
             dense_target,
         }
     }
@@ -157,9 +163,16 @@ impl<'a> Qwen36MoeNativeSource<'a> {
             BackendKind::Metal => ProjectionMaterialization::F16,
             BackendKind::Cuda => ProjectionMaterialization::BF16,
         };
+        let expert_residency = match BackendKind::from(device_profile.kind) {
+            BackendKind::Metal if cfg!(feature = "metal") => {
+                Qwen36MoeProjectionResidency::NativeFp8WithQ8Fallback
+            }
+            _ => residency,
+        };
         Self {
             checkpoint,
             residency,
+            expert_residency,
             dense_target,
         }
     }
@@ -446,10 +459,12 @@ impl Qwen36MoeNativeSource<'_> {
                 )))
             }
         };
-        match self
-            .checkpoint
-            .materialize_projection(canonical, expected, device, self.residency)?
-        {
+        match self.checkpoint.materialize_projection(
+            canonical,
+            expected,
+            device,
+            self.expert_residency,
+        )? {
             Qwen36MoeProjection::Packed(qmatmul) => Ok(Qwen36MoeLinear::Quantized(qmatmul)),
             Qwen36MoeProjection::Dense(tensor) => Ok(Qwen36MoeLinear::from_dense(tensor)),
             Qwen36MoeProjection::CompactFp8(raw) => Ok(Qwen36MoeLinear::CompactFp8 {

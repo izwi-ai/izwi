@@ -94,6 +94,16 @@ pub(crate) enum Qwen36MoeStacking {
     },
 }
 
+/// Trunk activation dtype of the native plan on `device` (BF16 CUDA, F16
+/// Metal, F32 CPU), used for the support probe and the self-check inputs.
+fn activation_dtype(device: &Device) -> DType {
+    match device {
+        Device::Cuda(_) => DType::BF16,
+        Device::Metal(_) => DType::F16,
+        Device::Cpu => DType::F32,
+    }
+}
+
 fn compact(linear: &Qwen36MoeLinear) -> Option<(&Tensor, &Tensor)> {
     match linear {
         Qwen36MoeLinear::CompactFp8 { weights, scales } => Some((weights, scales)),
@@ -207,11 +217,7 @@ impl Qwen36MoeFusedExperts {
             shared_slot_id: geometry.num_experts,
             norm_topk: true,
         };
-        let activation = if device.is_cuda() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
+        let activation = activation_dtype(&device);
         if spec.top_k == 0
             || spec.top_k > spec.num_experts
             || spec.num_experts > moe::MAX_EXPERTS
@@ -359,7 +365,7 @@ impl Qwen36MoeFusedExperts {
         let dtype_ok = match flat.device() {
             Device::Cpu => matches!(flat.dtype(), DType::F32 | DType::F16 | DType::BF16),
             Device::Cuda(_) => matches!(flat.dtype(), DType::F16 | DType::BF16),
-            _ => false,
+            Device::Metal(_) => flat.dtype() == DType::F16,
         };
         dtype_ok
             && flat.dim(0).is_ok_and(|tokens| tokens > 0)
@@ -424,11 +430,7 @@ impl Qwen36MoeFusedExperts {
         shared: &Qwen36MoeSharedExpertWeights,
     ) -> Result<()> {
         let device = self.w13.device().clone();
-        let dtype = if device.is_cuda() {
-            DType::BF16
-        } else {
-            DType::F32
-        };
+        let dtype = activation_dtype(&device);
         let slots = self.spec.slots();
         for tokens in [1usize, 5] {
             let values = (0..tokens * self.hidden)
