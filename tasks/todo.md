@@ -1,3 +1,67 @@
+# Plan — Separate Qwen3.5 / Qwen3.6 / Qwen3.8 model code — 2026-10-10
+
+Problem: `qwen36moe` runs on the `qwen35` trunk. The 3.6 rollout (#217-#220 plus
+follow-up fixes) added ~2.5k lines to `qwen35` (MTP head, FP8/native weight
+sources, replay checkpoints, value-head order, conv-ring snapshots, etc.), and
+the registry routes BOTH families through one `NativeChatDecodeState::Qwen35`
+variant, so dense Qwen3.5 picked up 3.6 behaviour (e.g. replay journals,
+MTP-aware shared steps). `qwen38` only gained a comment and a dtype guard (#220).
+Baseline "before 3.6" = `691f7a30` (#216).
+
+Decisions:
+- `qwen36moe` owns a private fork of the HEAD trunk: `text.rs`, `cache.rs`,
+  `mtp.rs`, and `exec.rs` (+ `exec/timing.rs`) = HEAD `qwen35/chat.rs` minus the
+  dense `Qwen35ChatModel` + vision. CamelCase `Qwen35*` -> `Qwen36*` in the fork.
+  GGUF metadata keys, kernel names and string literals stay as they are, so 3.6
+  runtime behaviour is unchanged.
+- `qwen35` is restored byte-for-byte to `691f7a30`, minus the MoE plumbing that
+  pointed at the deleted `qwen35moe` module (sparse FFN branch, MoE geometry,
+  `Qwen35Moe35BA3BFp8` thinking arm). No Qwen3.5 MoE model is served any more.
+- `qwen38/text.rs` restored to `691f7a30` (drops the #220 conv-ring dtype guard).
+- Registry/executor: a separate `Qwen36Moe` variant on `NativeChatModel`,
+  `NativeChatDecodeState`, `NativeChatDecodeCheckpoint`, `NativeChatPreparedPrompt`,
+  and `SuspendedReplayCheckpoint`. Dense Qwen3.5 arms go back to their pre-3.6 calls.
+- Out of scope (unchanged): `qwen36moe -> qwen38::native` ingestion primitives
+  (IndexedSafetensors / block-FP8 materialization). This dependency predates 3.6
+  and forking it is ~3k lines of loader + global load state. Shared kernels,
+  tokenizer, catalog id `ModelFamily::Qwen35MoeChat`, and server sampling profile
+  also stay as they are.
+
+- [x] Fork HEAD qwen35 trunk files into qwen36moe; rename; strip dense/vision; repoint qwen36moe imports
+- [x] Restore qwen35 to 691f7a30; remove MoE plumbing; delete qwen35/mtp.rs and chat/timing.rs
+- [x] Restore qwen38/text.rs to 691f7a30
+- [x] Split registry + executor enums (Qwen36Moe variants); dense arms back to pre-3.6 API
+- [x] Verify: `git diff 691f7a30 -- qwen35 qwen38` shows only the intended removals; no cross-family imports
+- [x] Verify: cargo check workspace (all targets), clippy -D warnings, qwen/registry/executor tests, qwen36moe golden fixture
+
+## Review
+
+- `qwen36moe/{text,cache,mtp,exec,exec/timing}.rs` = HEAD qwen35 trunk, `Qwen35*` -> `Qwen36*`.
+  Vision removed from the exec. Prepared prompts were always text-only (`vision_inputs: None`),
+  so an image-pad segment now fails with the same error it hit before. Dense loader,
+  vision prompt helpers, and the dense-only tests are dropped from the fork.
+- `qwen35` vs `691f7a30`: -163/+9 lines, all MoE plumbing for the deleted `qwen35moe`
+  module (sparse FFN branch, `Qwen35MoeFfnGeometry`, `moe_ffn` source method, expert
+  counters, `load_hf` tokenizer path, the MoE thinking-default arm). `qwen38` vs
+  `691f7a30`: one comment (now names `qwen36moe` as the ingestion-primitive consumer).
+- Registry/executor: `NativeChatModel::Qwen36Moe`, plus new `Qwen36Moe` variants on
+  `NativeChatDecodeState`, `NativeChatDecodeCheckpoint`, `NativeChatPreparedPrompt`, and
+  `SuspendedReplayCheckpoint`. Dense 3.5 is back to `begin_shared_step_quantum(cache)` with
+  the MTP rejection, the 4-arg resumable prefill, and no replay/suspension. The Qwen3.8
+  continuous-row path uses its own QWEN38_* domains again; 3.6 has QWEN36_MOE_* domains.
+- Evidence: izwi-core lib 2819 passed / 0 failed (baseline 2797 tests; +32 = forked copies,
+  the 11 tests the 3.6 work had added to qwen35 all moved to qwen36moe). The qwen filter went
+  from 474 to 506 passing, including `native_trunk_matches_the_hf_reference_logits`. The worker
+  `qwen35_moe_process` real-HTTP test passes. Clippy -D warnings is clean (core/server/worker/
+  cli, plus izwi-core `--features metal`). Workspace `cargo check --all-targets` and
+  `git diff --check` are clean.
+- Not verified locally: the CUDA feature build (no nvcc). The cuda-only blocks in the fork
+  were reviewed statically, and every symbol resolves. Run `check-backend-truth.sh
+  cargo-cuda-compile` in CI.
+- Behaviour notes: both families still read `IZWI_QWEN35_*` env knobs (preserved on purpose
+  for 3.6). `ModelFamily::Qwen35MoeChat` and its telemetry label `qwen35_moe_chat` are
+  unchanged (public/API identifiers).
+
 # Plan — DS10 best-effort groundwork (planning only) — 2026-09-28
 
 Scope: the DS10 deferred register, split into a groundwork tier (buildable
