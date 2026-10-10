@@ -174,9 +174,7 @@ impl Qwen35TextRuntimeState {
                     "Qwen3.5 convolution ring is invalid at the physical boundary".into(),
                 ));
             }
-            let ordered = (0..ring.slots.len())
-                .map(|offset| &ring.slots[(ring.next_idx + offset) % ring.slots.len()])
-                .collect::<Vec<_>>();
+            let ordered = ring.ordered_slots().collect::<Vec<_>>();
             let ring_tensor = Tensor::stack(&ordered, 0)?;
             let component = u32::try_from(recurrent.len() + 1)
                 .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
@@ -235,6 +233,14 @@ struct ConvRingState {
 }
 
 impl ConvRingState {
+    /// History slots oldest first — the logical order every serialized form
+    /// (arena staging, MTP rollback snapshots) stores, so a restore can
+    /// rebuild the ring with `next_idx = 0`.
+    fn ordered_slots(&self) -> impl Iterator<Item = &Tensor> {
+        let len = self.slots.len();
+        (0..len).map(move |offset| &self.slots[(self.next_idx + offset) % len])
+    }
+
     /// Move every logical history slot into independent fixed-history storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
@@ -1097,10 +1103,13 @@ impl Qwen35TextRuntimeState {
                     conv_state,
                     recurrent_state,
                 } => {
+                    // Logical (oldest-first) order: the restore rebuilds the
+                    // ring with `next_idx = 0`, so copying the physical slot
+                    // order would rotate the history whenever the ring had
+                    // wrapped.
                     let conv_slots = match conv_state {
                         Some(ring) => ring
-                            .slots
-                            .iter()
+                            .ordered_slots()
                             .map(deep_copy_tensor_storage)
                             .collect::<candle_core::Result<Vec<_>>>()?,
                         None => Vec::new(),
@@ -3195,6 +3204,50 @@ mod tests {
             let grouped_head = (n % num_k) * repeats + n / num_k;
             assert_eq!(tiled[0][n], grouped[0][grouped_head], "tiled head {n}");
         }
+    }
+
+    /// MTP rollback must restore the conv history in logical order: a ring
+    /// whose `next_idx` has wrapped mid-buffer comes back with the same
+    /// oldest-to-newest sequence (the restore rebuilds it at `next_idx = 0`).
+    #[test]
+    fn linear_state_snapshot_restores_a_wrapped_conv_ring_in_order() {
+        let slot = |value: f32| Tensor::full(value, (1, 2), &Device::Cpu).unwrap();
+        let logical = |state: &Qwen35TextRuntimeState| -> Vec<f32> {
+            let Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ring),
+                ..
+            } = &state.layers[0]
+            else {
+                panic!("linear layer with a conv ring");
+            };
+            ring.ordered_slots()
+                .map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0])
+                .collect()
+        };
+        // Physical [3, 1, 2] with next_idx 1 = logical oldest→newest [1, 2, 3].
+        let mut state = Qwen35TextRuntimeState {
+            layers: vec![Qwen35LayerRuntimeState::Linear {
+                conv_state: Some(ConvRingState {
+                    slots: vec![slot(3.0), slot(1.0), slot(2.0)],
+                    next_idx: 1,
+                }),
+                recurrent_state: Some(slot(9.0)),
+            }],
+        };
+        assert_eq!(logical(&state), vec![1.0, 2.0, 3.0]);
+        let snapshot = state.snapshot_linear_states().unwrap();
+
+        // Advance the ring past the snapshot, then roll back.
+        if let Qwen35LayerRuntimeState::Linear {
+            conv_state: Some(ring),
+            ..
+        } = &mut state.layers[0]
+        {
+            ring.push_decode(&slot(4.0)).unwrap();
+        }
+        assert_eq!(logical(&state), vec![2.0, 3.0, 4.0]);
+        state.restore_linear_states(&snapshot).unwrap();
+        assert_eq!(logical(&state), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
