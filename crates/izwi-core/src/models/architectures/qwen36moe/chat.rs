@@ -197,7 +197,8 @@ impl Qwen36MoeChatModel {
             )?
         };
         let moe = exec.text_model.moe_backend_summary();
-        tracing::info!(%moe, "Qwen3.6-MoE sparse-expert execution path");
+        let gdn_decode = exec.text_model.gdn_decode_summary();
+        tracing::info!(%moe, %gdn_decode, "Qwen3.6-MoE fused kernel paths");
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -443,6 +444,7 @@ impl Qwen36MoeChatModel {
                 "mtp_enabled": self.performance.mtp.enabled(),
             },
             "moe": self.exec.text_model.moe_backend_summary(),
+            "gdn_decode": self.exec.text_model.gdn_decode_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -1293,6 +1295,14 @@ pub(crate) mod tests {
         assert!(moe["legacy_reasons"][0]
             .as_str()
             .is_some_and(|reason| reason.contains("block-FP8")));
+        // The fixture's linear-attention layers stay on the Candle chain: the
+        // fused DeltaNet decode is CUDA-only.
+        let gdn = &model.runtime_diagnostics()["gdn_decode"];
+        assert_eq!(gdn["backend"], "legacy");
+        assert_eq!(gdn["fused_layers"], 0);
+        assert!(gdn["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("CUDA only")));
 
         // Re-run and require identical output (seeded rng, greedy decode).
         let first: Vec<String> = steps.iter().map(|step| step.delta.clone()).collect();

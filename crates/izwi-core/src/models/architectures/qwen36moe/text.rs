@@ -15,6 +15,7 @@ use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -32,6 +33,9 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::exec::Qwen36TextConfig;
+use crate::models::architectures::qwen36moe::fast_path::{
+    compare_values, legacy_requested, Qwen36FusedPath,
+};
 use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
 pub struct Qwen36TextModel {
@@ -356,7 +360,15 @@ struct Qwen36LinearAttention {
     v_head_order: Qwen36LinearVHeadOrder,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    /// Fused single-token decode kernels, when resolved at load (see
+    /// [`Qwen36LinearAttention::resolve_fused_decode`]).
+    fused_decode: Option<GdnDecodeSpec>,
+    fused_decode_path: Qwen36FusedPath,
 }
+
+/// Environment switch for the fused DeltaNet decode (`legacy`/`off`/`0`
+/// keeps the Candle op chain).
+const FUSED_DECODE_ENV: &str = "IZWI_QWEN36_FUSED_DECODE";
 
 /// How a checkpoint orders the DeltaNet value heads relative to the shared
 /// key heads when `num_v_heads > num_k_heads` (`r = num_v_heads /
@@ -706,6 +718,15 @@ impl Qwen36TextModel {
         super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
             Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
             Qwen36FeedForward::Dense(_) => None,
+        }))
+    }
+
+    /// Fused single-token DeltaNet decode across the linear-attention layers,
+    /// for the admin diagnostics.
+    pub(crate) fn gdn_decode_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Linear(linear) => Some(&linear.fused_decode_path),
+            Qwen36Mixer::Full(_) => None,
         }))
     }
 
@@ -1812,7 +1833,7 @@ impl Qwen36LinearAttention {
             eps: cfg.attention_layer_norm_rms_epsilon,
         };
 
-        Ok(Self {
+        let mut mixer = Self {
             qkv_proj: source.projection(&format!("{prefix}.attn_qkv.weight"), device)?,
             gate_proj: source.projection(&format!("{prefix}.attn_gate.weight"), device)?,
             beta_proj: source.projection(&format!("{prefix}.ssm_beta.weight"), device)?,
@@ -1832,10 +1853,247 @@ impl Qwen36LinearAttention {
             v_head_order: source.linear_v_head_order(),
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
-        })
+            fused_decode: None,
+            fused_decode_path: Qwen36FusedPath::legacy("unresolved"),
+        };
+        mixer.resolve_fused_decode(cfg.embedding_length, device, false);
+        Ok(mixer)
+    }
+
+    /// Resolve the fused single-token decode at load. Production enables it on
+    /// CUDA only (`allow_cpu` lets tests run the portable reference), for
+    /// 128-dim heads and a 4-tap conv, after a self-check against the Candle
+    /// op chain on this layer's own weights.
+    fn resolve_fused_decode(&mut self, hidden: usize, device: &Device, allow_cpu: bool) {
+        self.fused_decode = None;
+        self.fused_decode_path = if legacy_requested(FUSED_DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
+        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
+            Qwen36FusedPath::legacy("fused DeltaNet decode runs on CUDA only")
+        } else if !gdn::supported(device, self.head_k_dim, self.head_v_dim, self.kernel_size)
+            || self.num_k_heads == 0
+            || !self.num_v_heads.is_multiple_of(self.num_k_heads)
+        {
+            Qwen36FusedPath::legacy(
+                "fused DeltaNet decode needs SM80+, 128-dim heads, a 4-tap conv and value heads divisible by key heads",
+            )
+        } else {
+            let spec = GdnDecodeSpec {
+                key_heads: self.num_k_heads,
+                value_heads: self.num_v_heads,
+                grouped: self.v_head_order == Qwen36LinearVHeadOrder::Grouped,
+                norm_eps: self.norm.eps as f32,
+            };
+            match self.fused_decode_self_check(&spec, hidden, device) {
+                Ok(()) => {
+                    self.fused_decode = Some(spec);
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 fused DeltaNet decode self-check failed; using the Candle op chain"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// Run one synthetic decode step through both paths from identical states
+    /// and require matching outputs, recurrent states and conv rings.
+    fn fused_decode_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden: usize,
+        device: &Device,
+    ) -> Result<()> {
+        let dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        let wave = |n: usize, seed: f32, scale: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+                .collect::<Vec<_>>()
+        };
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let x = Tensor::from_vec(wave(hidden, 0.0, 1.5), (1, 1, hidden), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)?;
+        let slot = |seed: f32| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                wave(self.conv_dim, seed, 1.0),
+                (self.conv_dim, 1),
+                &Device::Cpu,
+            )?
+            .to_device(device)?)
+        };
+        let state_dims = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let initial = Qwen36LayerRuntimeState::Linear {
+            conv_state: Some(ConvRingState {
+                slots: vec![slot(1.0)?, slot(2.0)?, slot(3.0)?],
+                next_idx: 1,
+            }),
+            recurrent_state: Some(
+                Tensor::from_vec(wave(state_len, 4.0, 0.3), state_dims, &Device::Cpu)?
+                    .to_device(device)?,
+            ),
+        };
+        let mut legacy_state = initial.clone();
+        let mut fused_state = initial;
+        let expected = self.forward_legacy(&x, &mut legacy_state)?;
+        let actual = self.forward_fused(spec, &x, &mut fused_state)?;
+        compare_values(
+            "DeltaNet decode output",
+            &host(&actual)?,
+            &host(&expected)?,
+            0.03,
+            0.08,
+        )?;
+        let (
+            Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(legacy_ring),
+                recurrent_state: Some(legacy_recurrent),
+            },
+            Qwen36LayerRuntimeState::Linear {
+                conv_state: Some(fused_ring),
+                recurrent_state: Some(fused_recurrent),
+            },
+        ) = (&legacy_state, &fused_state)
+        else {
+            return Err(Error::InferenceError(
+                "DeltaNet decode self-check lost its layer state".into(),
+            ));
+        };
+        compare_values(
+            "DeltaNet recurrent state",
+            &host(fused_recurrent)?,
+            &host(legacy_recurrent)?,
+            0.01,
+            0.05,
+        )?;
+        if legacy_ring.next_idx != fused_ring.next_idx {
+            return Err(Error::InferenceError(
+                "DeltaNet decode self-check: conv ring cursor diverged".into(),
+            ));
+        }
+        for (fused, legacy) in fused_ring.slots.iter().zip(&legacy_ring.slots) {
+            compare_values(
+                "DeltaNet conv ring",
+                &host(fused)?,
+                &host(legacy)?,
+                1e-6,
+                1e-6,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether a single-token decode can take the fused kernels with this
+    /// layer state (3-slot F32 ring, F32 or absent recurrent state).
+    fn fused_decode_accepts(hidden_states: &Tensor, state: &Qwen36LayerRuntimeState) -> bool {
+        matches!(hidden_states.dtype(), DType::F32 | DType::F16 | DType::BF16)
+            && matches!(
+                state,
+                Qwen36LayerRuntimeState::Linear {
+                    conv_state: Some(ring),
+                    recurrent_state,
+                } if ring.slots.len() == gdn::CONV_TAPS - 1
+                    && ring.next_idx < ring.slots.len()
+                    && ring.slots.iter().all(|slot| slot.dtype() == DType::F32)
+                    && recurrent_state.as_ref().is_none_or(|s| s.dtype() == DType::F32)
+            )
+    }
+
+    /// One token's conv + recurrence + gated norm through the fused kernels,
+    /// from projection outputs `mixed_qkv`, `z`, `beta_raw`, `alpha` (one row
+    /// each). Advances the ring and replaces the recurrent state; returns the
+    /// out-projection input `[value_heads * head_v_dim]` in `z`'s dtype.
+    fn fused_decode_row(
+        &self,
+        spec: &GdnDecodeSpec,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        state: &mut Qwen36LayerRuntimeState,
+    ) -> Result<Tensor> {
+        let Qwen36LayerRuntimeState::Linear {
+            conv_state: Some(ring),
+            recurrent_state,
+        } = state
+        else {
+            return Err(Error::InferenceError(
+                "Qwen3.6 fused DeltaNet decode needs an initialized linear-attention state".into(),
+            ));
+        };
+        let history = ring.ordered_slots().cloned().collect::<Vec<_>>();
+        let (conv, current) = gdn::conv_decode(
+            mixed_qkv,
+            &self.conv_kernel,
+            [&history[0], &history[1], &history[2]],
+        )?;
+        ring.push_decode(&current.reshape((self.conv_dim, 1))?)?;
+        let previous = match recurrent_state.take() {
+            Some(previous) => previous,
+            None => Tensor::zeros(
+                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                DType::F32,
+                conv.device(),
+            )?,
+        };
+        let (y, next) = gdn::recurrent_decode(
+            &conv,
+            z,
+            beta_raw,
+            alpha,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            &previous,
+            spec,
+        )?;
+        *recurrent_state = Some(next);
+        Ok(y)
+    }
+
+    fn forward_fused(
+        &self,
+        spec: &GdnDecodeSpec,
+        hidden_states: &Tensor,
+        state: &mut Qwen36LayerRuntimeState,
+    ) -> Result<Tensor> {
+        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
+        let z = self.gate_proj.forward(hidden_states)?;
+        let beta_raw = self.beta_proj.forward(hidden_states)?;
+        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let y = self.fused_decode_row(spec, &mixed_qkv, &z, &beta_raw, &alpha, state)?;
+        self.out_proj
+            .forward(&y.reshape((1, 1, self.num_v_heads * self.head_v_dim))?)
     }
 
     fn forward(
+        &self,
+        hidden_states: &Tensor,
+        state: &mut Qwen36LayerRuntimeState,
+    ) -> Result<Tensor> {
+        match &self.fused_decode {
+            Some(spec) if Self::fused_decode_accepts(hidden_states, state) => {
+                self.forward_fused(spec, hidden_states, state)
+            }
+            _ => self.forward_legacy(hidden_states, state),
+        }
+    }
+
+    fn forward_legacy(
         &self,
         hidden_states: &Tensor,
         state: &mut Qwen36LayerRuntimeState,
@@ -1948,8 +2206,39 @@ impl Qwen36LinearAttention {
                 "Qwen3.5 linear-attention decode batch dimensions do not match".into(),
             ));
         }
+        if let Some(spec) = &self.fused_decode {
+            if states
+                .iter()
+                .all(|state| Self::fused_decode_accepts(hidden_states, state))
+            {
+                let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
+                let z = self.gate_proj.forward(hidden_states)?;
+                let beta_raw = self.beta_proj.forward(hidden_states)?;
+                let alpha = self.alpha_proj.forward(hidden_states)?;
+                let rows = states
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(row, state)| {
+                        self.fused_decode_row(
+                            spec,
+                            &mixed_qkv.i(row)?,
+                            &z.i(row)?,
+                            &beta_raw.i(row)?,
+                            &alpha.i(row)?,
+                            state,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let output = Tensor::stack(&rows, 0)?.reshape((
+                    batch_size,
+                    1,
+                    self.num_v_heads * self.head_v_dim,
+                ))?;
+                return self.out_proj.forward(&output);
+            }
+        }
         let residual_dtype = hidden_states.dtype();
-        // F32 compute island — see `forward` for the contract.
+        // F32 compute island — see `forward_legacy` for the contract.
         let mixed_qkv = self
             .qkv_proj
             .forward(hidden_states)?
@@ -2816,9 +3105,11 @@ mod tests {
         Qwen36GatedRmsNorm, Qwen36LayerRuntimeState, Qwen36LinearAttention, Qwen36LinearVHeadOrder,
         Qwen36Projection, Qwen36TextRuntimeState,
     };
+    use crate::kernels::cuda::gdn::GdnDecodeSpec;
     use crate::models::architectures::qwen36moe::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
+    use crate::models::architectures::qwen36moe::fast_path::Qwen36FusedPath;
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
@@ -2883,6 +3174,8 @@ mod tests {
             v_head_order: Qwen36LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            fused_decode: None,
+            fused_decode_path: Qwen36FusedPath::legacy("test"),
         };
         let initial_state = |row: usize| Qwen36LayerRuntimeState::Linear {
             conv_state: Some(ConvRingState {
@@ -2963,6 +3256,217 @@ mod tests {
         }
     }
 
+    /// A real-geometry-per-head DeltaNet mixer (128-dim heads, 4-tap conv)
+    /// with 2 key heads, 4 value heads and dense F32 projections.
+    fn gdn_mixer(order: Qwen36LinearVHeadOrder) -> Qwen36LinearAttention {
+        let device = &Device::Cpu;
+        let (hidden, hk, hv, d) = (128usize, 2usize, 4usize, 128usize);
+        let conv_dim = (2 * hk + hv) * d;
+        let wave = |n: usize, seed: f32, scale: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.618_034).sin() * scale)
+                .collect::<Vec<_>>()
+        };
+        let dense = |rows: usize, cols: usize, seed: f32, scale: f32| {
+            Qwen36Projection::Quantized(QMatMul::Tensor(
+                Tensor::from_vec(wave(rows * cols, seed, scale), (rows, cols), device).unwrap(),
+            ))
+        };
+        let conv_kernel =
+            Tensor::from_vec(wave(conv_dim * 4, 3.0, 0.4), (conv_dim, 4), device).unwrap();
+        let conv_kernel_slices = super::pre_slice_conv_kernel(&conv_kernel, 4).unwrap();
+        Qwen36LinearAttention {
+            qkv_proj: dense(conv_dim, hidden, 1.0, 0.12),
+            gate_proj: dense(hv * d, hidden, 2.0, 0.12),
+            beta_proj: dense(hv, hidden, 4.0, 0.12),
+            alpha_proj: dense(hv, hidden, 5.0, 0.12),
+            dt_bias: Tensor::from_vec(wave(hv, 6.0, 1.0), (1, 1, hv), device).unwrap(),
+            a: Tensor::from_vec(vec![-0.5f32, -1.5, -0.25, -3.0], (1, 1, hv), device).unwrap(),
+            conv_kernel,
+            conv_kernel_slices,
+            norm: Qwen36GatedRmsNorm {
+                weight: Tensor::from_vec(
+                    wave(d, 7.0, 0.2)
+                        .iter()
+                        .map(|v| 1.0 + v)
+                        .collect::<Vec<_>>(),
+                    d,
+                    device,
+                )
+                .unwrap(),
+                eps: 1e-6,
+            },
+            out_proj: dense(hidden, hv * d, 8.0, 0.05),
+            num_k_heads: hk,
+            num_v_heads: hv,
+            head_k_dim: d,
+            head_v_dim: d,
+            conv_dim,
+            kernel_size: 4,
+            v_head_order: order,
+            tiled_recurrence_enabled: false,
+            tiled_recurrence_tile_size_override: None,
+            fused_decode: None,
+            fused_decode_path: Qwen36FusedPath::legacy("test"),
+        }
+    }
+
+    fn gdn_state(seed: f32) -> Qwen36LayerRuntimeState {
+        let conv_dim = 8 * 128;
+        Qwen36LayerRuntimeState::Linear {
+            conv_state: Some(ConvRingState {
+                slots: (0..3)
+                    .map(|slot| {
+                        Tensor::from_vec(
+                            (0..conv_dim)
+                                .map(|i| ((i as f32 + seed + slot as f32) * 0.31).cos() * 0.5)
+                                .collect::<Vec<_>>(),
+                            (conv_dim, 1),
+                            &Device::Cpu,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                next_idx: 2,
+            }),
+            recurrent_state: None,
+        }
+    }
+
+    fn flat(tensor: &Tensor) -> Vec<f32> {
+        tensor
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tol: f32, label: &str) {
+        let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - e).abs() <= tol * scale,
+                "{label} index {index}: {a} vs {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_gdn_decode_tracks_the_candle_chain_across_steps() {
+        for order in [
+            Qwen36LinearVHeadOrder::Grouped,
+            Qwen36LinearVHeadOrder::Tiled,
+        ] {
+            let legacy = gdn_mixer(order);
+            let mut fused = gdn_mixer(order);
+            fused.resolve_fused_decode(128, &Device::Cpu, true);
+            assert_eq!(fused.fused_decode_path, Qwen36FusedPath::Fused, "{order:?}");
+            let (mut legacy_state, mut fused_state) = (gdn_state(0.0), gdn_state(0.0));
+            for step in 0..4 {
+                let x = Tensor::from_vec(
+                    (0..128)
+                        .map(|i| ((i + 37 * step) as f32 * 0.754_877_7).sin() * 1.5)
+                        .collect::<Vec<_>>(),
+                    (1, 1, 128),
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let expected = legacy.forward(&x, &mut legacy_state).unwrap();
+                let actual = fused.forward(&x, &mut fused_state).unwrap();
+                assert_close(
+                    &flat(&actual),
+                    &flat(&expected),
+                    1e-4,
+                    &format!("{order:?} step {step}"),
+                );
+            }
+            let (
+                Qwen36LayerRuntimeState::Linear {
+                    conv_state: Some(legacy_ring),
+                    recurrent_state: Some(legacy_recurrent),
+                },
+                Qwen36LayerRuntimeState::Linear {
+                    conv_state: Some(fused_ring),
+                    recurrent_state: Some(fused_recurrent),
+                },
+            ) = (&legacy_state, &fused_state)
+            else {
+                panic!("decode must keep the hybrid state");
+            };
+            assert_eq!(legacy_ring.next_idx, fused_ring.next_idx);
+            for (l, f) in legacy_ring.slots.iter().zip(&fused_ring.slots) {
+                assert_eq!(flat(l), flat(f));
+            }
+            assert_close(
+                &flat(fused_recurrent),
+                &flat(legacy_recurrent),
+                1e-5,
+                "state",
+            );
+        }
+    }
+
+    #[test]
+    fn fused_gdn_batched_decode_matches_scalar_rows() {
+        let mut mixer = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
+        mixer.resolve_fused_decode(128, &Device::Cpu, true);
+        assert!(mixer.fused_decode.is_some());
+        let input = Tensor::from_vec(
+            (0..256)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>(),
+            (2, 1, 128),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut scalar_states = [gdn_state(1.0), gdn_state(2.0)];
+        let scalar = (0..2)
+            .map(|row| {
+                flat(
+                    &mixer
+                        .forward(
+                            &input.i(row).unwrap().unsqueeze(0).unwrap(),
+                            &mut scalar_states[row],
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        let mut batch_states = [gdn_state(1.0), gdn_state(2.0)];
+        let mut refs = batch_states.iter_mut().collect::<Vec<_>>();
+        let batched = flat(&mixer.forward_decode_batch(&input, &mut refs).unwrap());
+        assert_close(&batched, &scalar, 1e-4, "batch vs scalar");
+    }
+
+    #[test]
+    fn fused_gdn_self_check_rejects_the_wrong_head_order() {
+        let mixer = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
+        let wrong = GdnDecodeSpec {
+            key_heads: 2,
+            value_heads: 4,
+            grouped: false,
+            norm_eps: 1e-6,
+        };
+        let error = mixer
+            .fused_decode_self_check(&wrong, 128, &Device::Cpu)
+            .expect_err("a mismatched head order must fail the self-check");
+        assert!(format!("{error}").contains("diverges"), "{error}");
+    }
+
+    #[test]
+    fn fused_gdn_decode_stays_off_outside_cuda_in_production() {
+        let mut mixer = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
+        mixer.resolve_fused_decode(128, &Device::Cpu, false);
+        assert!(mixer.fused_decode.is_none());
+        assert!(matches!(
+            &mixer.fused_decode_path,
+            Qwen36FusedPath::Legacy { reason } if reason.contains("CUDA only")
+        ));
+    }
+
     #[test]
     fn linear_attention_computes_in_f32_under_bf16_activations() {
         // Mirror the CUDA native plan in miniature: CompactFp8 projections
@@ -3011,6 +3515,8 @@ mod tests {
             v_head_order: Qwen36LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            fused_decode: None,
+            fused_decode_path: Qwen36FusedPath::legacy("test"),
         };
 
         let bf16_input = |values: &[f32], seq: usize| {
