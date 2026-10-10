@@ -1905,14 +1905,14 @@ impl Qwen36FullAttention {
             Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
         } else if !fused_device(device, allow_cpu) {
             Qwen36FusedPath::legacy("fused q/k norm + RoPE runs on CUDA and Metal only")
-        } else if !rope::supported(device, DType::BF16, self.head_dim, self.rope_dim)
+        } else if !rope::supported(device, norm_dtype(device), self.head_dim, self.rope_dim)
             || self.q_norm.weight.dtype() != DType::F32
             || self.k_norm.weight.dtype() != DType::F32
             || self.q_norm.eps != self.k_norm.eps
             || self.rope_inv_freqs.len() != self.rope_dim / 2
         {
             Qwen36FusedPath::legacy(
-                "fused q/k norm + RoPE needs SM80+, F32 head-norm gains and an even rotary dim",
+                "fused q/k norm + RoPE needs SM80+ on CUDA, F32 head-norm gains and an even rotary dim",
             )
         } else {
             let inv_freq = Tensor::from_vec(
@@ -4196,6 +4196,21 @@ mod tests {
         .unwrap()
     }
 
+    /// Synthetic weights are built on the host; the source hands them over on
+    /// the load device like the real sources do.
+    fn e2e_on(projection: Qwen36Projection, device: &Device) -> Qwen36Projection {
+        match projection {
+            Qwen36Projection::CompactFp8 { weights, scales } => Qwen36Projection::CompactFp8 {
+                weights: weights.to_device(device).unwrap(),
+                scales: scales.to_device(device).unwrap(),
+            },
+            Qwen36Projection::Quantized(QMatMul::Tensor(weight)) => {
+                Qwen36Projection::Quantized(QMatMul::Tensor(weight.to_device(device).unwrap()))
+            }
+            other => other,
+        }
+    }
+
     impl super::Qwen36WeightSource for SyntheticFp8Source {
         fn has(&self, _name: &str) -> bool {
             true
@@ -4204,12 +4219,12 @@ mod tests {
         fn projection(
             &self,
             name: &str,
-            _device: &Device,
+            device: &Device,
         ) -> crate::error::Result<Qwen36Projection> {
             let (h, conv_dim, value_width) = (E2E_HIDDEN, 1024usize, 512usize);
             let suffix = name.rsplit_once('.').map(|(head, _)| head).unwrap_or(name);
             let kind = suffix.rsplit_once('.').map(|(_, k)| k).unwrap_or(suffix);
-            Ok(match kind {
+            let projection = match kind {
                 "attn_qkv" => e2e_fp8(conv_dim, h, name),
                 "attn_gate" => e2e_fp8(value_width, h, name),
                 "ssm_out" => e2e_fp8(h, value_width, name),
@@ -4226,14 +4241,15 @@ mod tests {
                     DType::F16,
                 ))),
                 other => panic!("unexpected synthetic projection {name} ({other})"),
-            })
+            };
+            Ok(e2e_on(projection, device))
         }
 
         fn rms_norm(
             &self,
             name: &str,
             eps: f64,
-            _device: &Device,
+            device: &Device,
         ) -> crate::error::Result<super::Qwen36RmsNorm> {
             let width = if name.contains("attn_q_norm") || name.contains("attn_k_norm") {
                 128
@@ -4245,7 +4261,7 @@ mod tests {
                 .map(|v| 1.0 + v)
                 .collect::<Vec<_>>();
             Ok(super::Qwen36RmsNorm::new(
-                Tensor::from_vec(gains, width, &Device::Cpu).unwrap(),
+                Tensor::from_vec(gains, width, device).unwrap(),
                 eps,
             ))
         }
@@ -4258,7 +4274,7 @@ mod tests {
             &self,
             name: &str,
             dtype: Option<DType>,
-            _device: &Device,
+            device: &Device,
         ) -> crate::error::Result<Tensor> {
             let tensor = if name.ends_with("ssm_conv1d.weight") {
                 e2e_dense(1024, 4, name, DType::F32)
@@ -4280,21 +4296,25 @@ mod tests {
             Ok(match dtype {
                 Some(dtype) => tensor.to_dtype(dtype).unwrap(),
                 None => tensor,
-            })
+            }
+            .to_device(device)?)
         }
 
         fn moe_ffn(
             &self,
             layer: usize,
             geometry: &super::Qwen36MoeFfnGeometry,
-            _device: &Device,
+            device: &Device,
         ) -> crate::error::Result<crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp>
         {
             use crate::models::architectures::qwen36moe::sparse::{
                 Qwen36MoeExpertWeights, Qwen36MoeLinear, Qwen36MoeSharedExpertWeights,
                 Qwen36MoeSparseMlp,
             };
-            let linear = |rows: usize, cols: usize, name: String| match e2e_fp8(rows, cols, &name) {
+            let linear = |rows: usize, cols: usize, name: String| match e2e_on(
+                e2e_fp8(rows, cols, &name),
+                device,
+            ) {
                 Qwen36Projection::CompactFp8 { weights, scales } => {
                     Qwen36MoeLinear::CompactFp8 { weights, scales }
                 }
@@ -4312,12 +4332,10 @@ mod tests {
                 gate: linear(i, h, format!("{layer}.shared.gate")),
                 up: linear(i, h, format!("{layer}.shared.up")),
                 down: linear(h, i, format!("{layer}.shared.down")),
-                output_gate: Some(Qwen36MoeLinear::from_dense(e2e_dense(
-                    1,
-                    h,
-                    &format!("{layer}.shared.output_gate"),
-                    DType::F32,
-                ))),
+                output_gate: Some(Qwen36MoeLinear::from_dense(
+                    e2e_dense(1, h, &format!("{layer}.shared.output_gate"), DType::F32)
+                        .to_device(device)?,
+                )),
             };
             let router = Qwen36MoeLinear::from_dense(
                 (e2e_dense(
@@ -4325,53 +4343,75 @@ mod tests {
                     h,
                     &format!("{layer}.router"),
                     DType::F32,
-                ) * 4.0)
-                    .unwrap(),
+                ) * 4.0)?
+                    .to_device(device)?,
             );
             Qwen36MoeSparseMlp::from_weights_with_backend(
                 router, experts, shared, geometry, self.moe,
             )
         }
 
-        fn token_embeddings(&self, _device: &Device) -> crate::error::Result<Tensor> {
-            Ok(e2e_dense(E2E_VOCAB, E2E_HIDDEN, "token_embd", DType::F16))
+        fn token_embeddings(&self, device: &Device) -> crate::error::Result<Tensor> {
+            Ok(e2e_dense(E2E_VOCAB, E2E_HIDDEN, "token_embd", DType::F16).to_device(device)?)
         }
     }
 
-    fn e2e_cache() -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
-        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+    fn e2e_cache(
+        device: &Device,
+    ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
         use crate::backends::BackendKind;
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
         use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use candle_core::DeviceLocation;
         let bindings = vec![KvLayerBinding {
             model_layer: 3,
             physical_layer: 0,
         }];
+        let (backend, device_ordinal) = match device.location() {
+            DeviceLocation::Cpu => (BackendKind::Cpu, None),
+            DeviceLocation::Cuda { gpu_id } => (BackendKind::Cuda, Some(gpu_id as u32)),
+            DeviceLocation::Metal { gpu_id } => {
+                let gpu_id = gpu_id as u64;
+                (BackendKind::Metal, Some((gpu_id ^ (gpu_id >> 32)) as u32))
+            }
+        };
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(4251),
-            backend: BackendKind::Cpu,
-            device_ordinal: None,
+            backend,
+            device_ordinal,
             generation: 1,
         };
         let group = KvGroupId::new(1);
-        let arena = Arc::new(
-            CpuKvArena::new(KvArenaConfig {
-                id,
-                group,
-                page_tokens: 8,
-                capacity_pages: 8,
-                growth: None,
-                dtype: DType::F32,
-                layers: vec![KvLayerConfig {
-                    binding: bindings[0],
-                    num_kv_heads: 1,
-                    key_head_dim: 128,
-                    value_head_dim: 128,
-                }],
-            })
-            .unwrap(),
-        );
+        let config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: 8,
+            capacity_pages: 8,
+            growth: None,
+            dtype: DType::F32,
+            layers: vec![KvLayerConfig {
+                binding: bindings[0],
+                num_kv_heads: 1,
+                key_head_dim: 128,
+                value_head_dim: 128,
+            }],
+        };
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let arena: Arc<dyn KvArena> = if device.is_cpu() {
+            Arc::new(CpuKvArena::new(config).unwrap())
+        } else {
+            Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    config,
+                    device.clone(),
+                )
+                .unwrap(),
+            )
+        };
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let arena: Arc<dyn KvArena> = Arc::new(CpuKvArena::new(config).unwrap());
         let blocks = (0..8u32)
             .map(|index| CacheBlockRef {
                 arena: id,
@@ -4395,7 +4435,7 @@ mod tests {
     fn e2e_logits(model: &super::Qwen36TextModel, tokens: &[u32], prompt: usize) -> Vec<Vec<f32>> {
         let positions: Vec<[usize; 3]> = (0..tokens.len()).map(|p| [p, p, p]).collect();
         let mut state = model.new_state();
-        let mut cache = e2e_cache();
+        let mut cache = e2e_cache(&model.device);
         let mut rows = vec![flat(
             &model
                 .prefill_token_ids_physical(
@@ -4465,9 +4505,15 @@ mod tests {
         );
         assert_eq!(legacy.moe_backend_summary()["backend"], "legacy");
 
+        assert_tracks_reference(&fused, &legacy);
+    }
+
+    /// Prefill 6 tokens, then decode 8: every step within 1% relative L2 of
+    /// the reference model's logits and on its argmax.
+    fn assert_tracks_reference(fused: &super::Qwen36TextModel, reference: &super::Qwen36TextModel) {
         let tokens: Vec<u32> = (0..14).map(|i| (i * 7 + 3) % E2E_VOCAB as u32).collect();
-        let expected = e2e_logits(&legacy, &tokens, 6);
-        let actual = e2e_logits(&fused, &tokens, 6);
+        let expected = e2e_logits(reference, &tokens, 6);
+        let actual = e2e_logits(fused, &tokens, 6);
         for (step, (a, e)) in actual.iter().zip(&expected).enumerate() {
             let err: f32 = a
                 .iter()
@@ -4489,6 +4535,45 @@ mod tests {
                 "step {step}: fused decode picks a different token"
             );
         }
+    }
+
+    /// The Metal leg loads through production resolution (no test hook): each
+    /// fast path must pass its self-check on the GPU and resolve to fused, and
+    /// the GPU trunk must track the CPU reference.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn every_fused_path_resolves_and_tracks_the_reference_trunk_on_metal() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; metal end-to-end leg not run");
+            return;
+        };
+        let cfg = e2e_config();
+        let reference = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source {
+                moe: Qwen36MoeBackendRequest::Legacy,
+            },
+            &cfg,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let fused = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source {
+                moe: Qwen36MoeBackendRequest::Auto,
+            },
+            &cfg,
+            &device,
+        )
+        .unwrap();
+        for (path, summary) in [
+            ("moe", fused.moe_backend_summary()),
+            ("gdn_decode", fused.gdn_decode_summary()),
+            ("qk_rope", fused.qk_rope_summary()),
+            ("rms_norm", fused.rms_norm_summary()),
+        ] {
+            assert_eq!(summary["backend"], "fused", "{path}: {summary}");
+        }
+        assert_tracks_reference(&fused, &reference);
     }
 
     #[test]
