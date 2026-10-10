@@ -384,6 +384,24 @@ struct Qwen36LinearAttention {
 /// keeps the Candle op chain).
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN36_FUSED_DECODE";
 
+/// Whether the fused decode kernels run on `device` in production (CUDA, and
+/// Metal when built with it); `allow_cpu` lets tests use the portable paths.
+fn fused_device(device: &Device, allow_cpu: bool) -> bool {
+    device.is_cuda()
+        || (cfg!(feature = "metal") && device.is_metal())
+        || (allow_cpu && device.is_cpu())
+}
+
+/// 16-bit activation dtype of the native plan for the fused norms: F16 on
+/// Metal, BF16 elsewhere.
+fn norm_dtype(device: &Device) -> DType {
+    if device.is_metal() {
+        DType::F16
+    } else {
+        DType::BF16
+    }
+}
+
 /// How a checkpoint orders the DeltaNet value heads relative to the shared
 /// key heads when `num_v_heads > num_k_heads` (`r = num_v_heads /
 /// num_k_heads` value heads per key head).
@@ -908,9 +926,9 @@ impl Qwen36TextModel {
         let device = self.device.clone();
         let path = if legacy_requested(FUSED_DECODE_ENV) {
             Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
-        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
-            Qwen36FusedPath::legacy("fused RMSNorm runs on CUDA only")
-        } else if !norm::supported(&device, DType::BF16) {
+        } else if !fused_device(&device, allow_cpu) {
+            Qwen36FusedPath::legacy("fused RMSNorm runs on CUDA and Metal only")
+        } else if !norm::supported(&device, norm_dtype(&device)) {
             Qwen36FusedPath::legacy("fused RMSNorm needs SM80+")
         } else {
             match self.fused_norm_self_check() {
@@ -953,9 +971,10 @@ impl Qwen36TextModel {
                 .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 3.0)
                 .collect::<Vec<_>>()
         };
+        let dtype = norm_dtype(&self.device);
         let tensor = |seed: f32| -> Result<Tensor> {
             Ok(Tensor::from_vec(wave(seed), (3, 1, hidden), &Device::Cpu)?
-                .to_dtype(DType::BF16)?
+                .to_dtype(dtype)?
                 .to_device(&self.device)?)
         };
         let host = |tensor: &Tensor| -> Result<Vec<f32>> {
@@ -1830,7 +1849,7 @@ impl Qwen36FullAttention {
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
             packed_qkv: None,
         };
-        if device.is_cuda() && !legacy_requested(FUSED_DECODE_ENV) {
+        if fused_device(device, false) && !legacy_requested(FUSED_DECODE_ENV) {
             attention.packed_qkv = pack_projections(&mut [
                 &mut attention.q_proj,
                 &mut attention.k_proj,
@@ -1884,8 +1903,8 @@ impl Qwen36FullAttention {
         };
         self.fused_qk_path = if legacy_requested(FUSED_DECODE_ENV) {
             Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
-        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
-            Qwen36FusedPath::legacy("fused q/k norm + RoPE runs on CUDA only")
+        } else if !fused_device(device, allow_cpu) {
+            Qwen36FusedPath::legacy("fused q/k norm + RoPE runs on CUDA and Metal only")
         } else if !rope::supported(device, DType::BF16, self.head_dim, self.rope_dim)
             || self.q_norm.weight.dtype() != DType::F32
             || self.k_norm.weight.dtype() != DType::F32
@@ -2464,7 +2483,7 @@ impl Qwen36LinearAttention {
             packed_in: None,
             packed_beta_alpha: None,
         };
-        if device.is_cuda() && !legacy_requested(FUSED_DECODE_ENV) {
+        if fused_device(device, false) && !legacy_requested(FUSED_DECODE_ENV) {
             mixer.pack_projections();
         }
         mixer.resolve_fused_decode(cfg.embedding_length, device, false);
@@ -2510,8 +2529,8 @@ impl Qwen36LinearAttention {
         self.fused_decode = None;
         self.fused_decode_path = if legacy_requested(FUSED_DECODE_ENV) {
             Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
-        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
-            Qwen36FusedPath::legacy("fused DeltaNet decode runs on CUDA only")
+        } else if !fused_device(device, allow_cpu) {
+            Qwen36FusedPath::legacy("fused DeltaNet decode runs on CUDA and Metal only")
         } else if !gdn::supported(device, self.head_k_dim, self.head_v_dim, self.kernel_size)
             || self.num_k_heads == 0
             || !self.num_v_heads.is_multiple_of(self.num_k_heads)
@@ -4733,7 +4752,7 @@ mod tests {
         assert!(mixer.fused_decode.is_none());
         assert!(matches!(
             &mixer.fused_decode_path,
-            Qwen36FusedPath::Legacy { reason } if reason.contains("CUDA only")
+            Qwen36FusedPath::Legacy { reason } if reason.contains("CUDA and Metal only")
         ));
     }
 

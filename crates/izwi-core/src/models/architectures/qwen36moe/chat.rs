@@ -1315,11 +1315,11 @@ pub(crate) mod tests {
         assert_eq!(gdn["fused_layers"], 0);
         assert_eq!(
             model.runtime_diagnostics()["rms_norm"]["legacy_reasons"][0],
-            "fused RMSNorm runs on CUDA only"
+            "fused RMSNorm runs on CUDA and Metal only"
         );
         assert_eq!(
             model.runtime_diagnostics()["qk_rope"]["legacy_reasons"][0],
-            "fused q/k norm + RoPE runs on CUDA only"
+            "fused q/k norm + RoPE runs on CUDA and Metal only"
         );
         assert_eq!(
             model.runtime_diagnostics()["fp8_gemv"]["legacy_reasons"][0],
@@ -1327,7 +1327,7 @@ pub(crate) mod tests {
         );
         assert!(gdn["legacy_reasons"][0]
             .as_str()
-            .is_some_and(|reason| reason.contains("CUDA only")));
+            .is_some_and(|reason| reason.contains("CUDA and Metal only")));
 
         // Re-run and require identical output (seeded rng, greedy decode).
         let first: Vec<String> = steps.iter().map(|step| step.delta.clone()).collect();
