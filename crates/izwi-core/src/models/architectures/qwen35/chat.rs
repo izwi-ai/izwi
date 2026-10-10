@@ -1569,11 +1569,18 @@ impl Qwen35ChatExec {
                     "Qwen3.5 MTP quantum has neither pending token nor prefill output".into(),
                 )
             })?;
+            // Same penalty history as every other sampled step: the prompt
+            // ids are already in it, and the bootstrap token is no exception.
+            let history: &[u32] = if state.track_history {
+                state.history_ids.as_slice()
+            } else {
+                &[]
+            };
             let next = sample_next_token(
                 &logits_last_row(&output)?,
                 self.tokenizer.vocab_size,
                 &state.config,
-                &[],
+                history,
                 &mut state.rng,
             )?;
             // Publish through the shared choke point so the cap, stop, and
