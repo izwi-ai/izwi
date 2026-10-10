@@ -215,6 +215,109 @@ pub fn recurrent_decode(
     ))
 }
 
+/// Where a CUDA-graph decode step finds one layer's state: `table[slot..slot +
+/// TABLE_ENTRIES]` in a device table of addresses that the host refreshes
+/// before each replay. A captured graph bakes kernel arguments, but each step
+/// reads the previous state and writes fresh state tensors at new addresses.
+/// Entries, in order: conv history slots h0, h1, h2 (oldest first), the next
+/// conv history `[3, conv_dim]`, the recurrent state in, the recurrent state
+/// out. All F32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateTable {
+    pub address: u64,
+    pub slot: usize,
+}
+
+/// Table entries per DeltaNet layer (see [`StateTable`]).
+pub const TABLE_ENTRIES: usize = 6;
+
+/// [`conv_decode`] with the history in and out taken from `table`; returns
+/// the conv output. CUDA only.
+#[cfg(feature = "cuda")]
+pub fn conv_decode_table(x: &Tensor, weight: &Tensor, table: StateTable) -> Result<Tensor> {
+    let conv_dim = x.elem_count();
+    if weight.dims() != [conv_dim, CONV_TAPS]
+        || weight.dtype() != DType::F32
+        || !matches!(x.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        || !x.device().is_cuda()
+    {
+        candle_core::bail!(
+            "invalid table DeltaNet conv contract: x {:?} {:?} on {:?}, weight {:?}",
+            x.dims(),
+            x.dtype(),
+            x.device().location(),
+            weight.dims()
+        )
+    }
+    cuda_impl::conv_table(x, weight, table, conv_dim)
+}
+
+/// [`recurrent_decode`] with the state in and out taken from `table`; returns
+/// `y`. CUDA only.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn recurrent_decode_table(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    table: StateTable,
+    spec: &GdnDecodeSpec,
+) -> Result<Tensor> {
+    spec.validate()?;
+    let (hv, d) = (spec.value_heads, HEAD_DIM);
+    let dtype = z.dtype();
+    if conv.elem_count() != spec.conv_dim()
+        || conv.dtype() != DType::F32
+        || z.elem_count() != hv * d
+        || beta_raw.elem_count() != hv
+        || alpha.elem_count() != hv
+        || beta_raw.dtype() != dtype
+        || alpha.dtype() != dtype
+        || !matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+        || dt_bias.elem_count() != hv
+        || a.elem_count() != hv
+        || dt_bias.dtype() != DType::F32
+        || a.dtype() != DType::F32
+        || norm_weight.dims() != [d]
+        || norm_weight.dtype() != DType::F32
+        || !conv.device().is_cuda()
+    {
+        candle_core::bail!("invalid table DeltaNet recurrent decode contract for {spec:?}")
+    }
+    cuda_impl::recurrent_table(
+        conv,
+        z,
+        beta_raw,
+        alpha,
+        dt_bias,
+        a,
+        norm_weight,
+        table,
+        spec,
+    )
+}
+
+/// Device address of a contiguous F32 CUDA tensor's first element, for a
+/// [`StateTable`].
+#[cfg(feature = "cuda")]
+pub fn f32_address(tensor: &Tensor) -> Result<u64> {
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    let (storage, layout) = tensor.storage_and_layout();
+    let candle_core::Storage::Cuda(cuda) = &*storage else {
+        candle_core::bail!("DeltaNet state table entries must be CUDA tensors")
+    };
+    if tensor.dtype() != DType::F32 || !layout.is_contiguous() {
+        candle_core::bail!("DeltaNet state table entries must be contiguous F32")
+    }
+    let stream = tensor.device().as_cuda_device()?.cuda_stream();
+    let (base, _guard) = cuda.as_cuda_slice::<f32>()?.device_ptr(&stream);
+    Ok(base + (layout.start_offset() * std::mem::size_of::<f32>()) as u64)
+}
+
 fn host(t: &Tensor) -> Result<Vec<f32>> {
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
@@ -450,6 +553,130 @@ mod cuda_impl {
         };
         Ok((y, wrap(next, device, Shape::from((1, hv, d, d)))))
     }
+
+    pub(super) fn conv_table(
+        x: &Tensor,
+        weight: &Tensor,
+        table: super::StateTable,
+        conv_dim: usize,
+    ) -> Result<Tensor> {
+        let device = x.device().as_cuda_device()?;
+        let x = x.contiguous()?;
+        let weight = weight.contiguous()?;
+        let (x_storage, _) = x.storage_and_layout();
+        let (w_storage, _) = weight.storage_and_layout();
+        let w = view::<f32>(&w_storage, &weight)?;
+        // SAFETY: one thread writes each output channel.
+        let out = unsafe { device.alloc::<f32>(conv_dim)? };
+        let config = LaunchConfig {
+            grid_dim: ((conv_dim as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! launch {
+            ($ty:ty, $name:literal) => {{
+                let xv = view::<$ty>(&x_storage, &x)?;
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&xv);
+                builder.arg(&w);
+                candle_core::builder_arg!(builder, table.address, table.slot as i32);
+                builder.arg(&out);
+                candle_core::builder_arg!(builder, conv_dim as i32);
+                // SAFETY: argument order and types match the kernel; the table
+                // entries are valid F32 buffers of the documented sizes.
+                unsafe { builder.launch(config) }.w()?;
+            }};
+        }
+        match x.dtype() {
+            DType::BF16 => launch!(half::bf16, "qwen36moe_gdn_conv_table_bf16"),
+            DType::F16 => launch!(half::f16, "qwen36moe_gdn_conv_table_f16"),
+            DType::F32 => launch!(f32, "qwen36moe_gdn_conv_table_f32"),
+            other => candle_core::bail!("fused DeltaNet conv does not support {other:?}"),
+        }
+        Ok(wrap(out, device, Shape::from(conv_dim)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn recurrent_table(
+        conv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        dt_bias: &Tensor,
+        a: &Tensor,
+        norm_weight: &Tensor,
+        table: super::StateTable,
+        spec: &GdnDecodeSpec,
+    ) -> Result<Tensor> {
+        let device = conv.device().as_cuda_device()?;
+        let (hv, d) = (spec.value_heads, HEAD_DIM);
+        let tensors = [conv, z, beta_raw, alpha, dt_bias, a, norm_weight].map(|t| t.contiguous());
+        let [conv, z, beta_raw, alpha, dt_bias, a, norm_weight] = tensors;
+        let (conv, z, beta_raw, alpha) = (conv?, z?, beta_raw?, alpha?);
+        let (dt_bias, a, norm_weight) = (dt_bias?, a?, norm_weight?);
+        let (conv_s, _) = conv.storage_and_layout();
+        let (z_s, _) = z.storage_and_layout();
+        let (b_s, _) = beta_raw.storage_and_layout();
+        let (al_s, _) = alpha.storage_and_layout();
+        let (dt_s, _) = dt_bias.storage_and_layout();
+        let (a_s, _) = a.storage_and_layout();
+        let (n_s, _) = norm_weight.storage_and_layout();
+        let conv_v = view::<f32>(&conv_s, &conv)?;
+        let dt_v = view::<f32>(&dt_s, &dt_bias)?;
+        let a_v = view::<f32>(&a_s, &a)?;
+        let n_v = view::<f32>(&n_s, &norm_weight)?;
+        let config = LaunchConfig {
+            grid_dim: (hv as u32, 1, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! launch {
+            ($ty:ty, $name:literal) => {{
+                let zv = view::<$ty>(&z_s, &z)?;
+                let bv = view::<$ty>(&b_s, &beta_raw)?;
+                let alv = view::<$ty>(&al_s, &alpha)?;
+                // SAFETY: the kernel writes every output channel.
+                let y = unsafe { device.alloc::<$ty>(hv * d)? };
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&conv_v);
+                builder.arg(&zv);
+                builder.arg(&bv);
+                builder.arg(&alv);
+                builder.arg(&dt_v);
+                builder.arg(&a_v);
+                builder.arg(&n_v);
+                candle_core::builder_arg!(builder, table.address, table.slot as i32);
+                builder.arg(&y);
+                candle_core::builder_arg!(
+                    builder,
+                    spec.key_heads as i32,
+                    spec.value_heads as i32,
+                    i32::from(spec.grouped),
+                    spec.norm_eps
+                );
+                // SAFETY: argument order and types match the kernel; the table
+                // entries are valid F32 buffers of the documented sizes.
+                unsafe { builder.launch(config) }.w()?;
+                wrap(y, device, Shape::from(hv * d))
+            }};
+        }
+        Ok(match z.dtype() {
+            DType::BF16 => launch!(half::bf16, "qwen36moe_gdn_decode_table_bf16"),
+            DType::F16 => launch!(half::f16, "qwen36moe_gdn_decode_table_f16"),
+            DType::F32 => launch!(f32, "qwen36moe_gdn_decode_table_f32"),
+            other => candle_core::bail!("fused DeltaNet decode does not support {other:?}"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +791,89 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// The table-addressed kernels (CUDA graph replay) read and write the same
+    /// state as the direct kernels, bit for bit, through a real device table
+    /// at a non-zero slot.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_table_kernels_match_the_direct_kernels() {
+        use crate::kernels::cuda::segment_graph::DeviceTable;
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let d = HEAD_DIM;
+        let spec = GdnDecodeSpec {
+            key_heads: 16,
+            value_heads: 32,
+            grouped: true,
+            norm_eps: 1e-6,
+        };
+        let conv_dim = spec.conv_dim();
+        let g = |t: Tensor| t.to_device(&device).unwrap();
+        let x = g(tensor(values(conv_dim, 1.0, 2.0), &[1, 1, conv_dim])
+            .to_dtype(DType::BF16)
+            .unwrap());
+        let w = g(tensor(values(conv_dim * 4, 2.0, 0.5), &[conv_dim, 4]));
+        let h: Vec<Tensor> = (0..3)
+            .map(|i| {
+                g(tensor(
+                    values(conv_dim, 9.0 + i as f32, 1.0),
+                    &[conv_dim, 1],
+                ))
+            })
+            .collect();
+        let bf16 = |n: usize, seed: f32, scale: f32| {
+            g(tensor(values(n, seed, scale), &[n])
+                .to_dtype(DType::BF16)
+                .unwrap())
+        };
+        let (z, beta, alpha) = (
+            bf16(32 * d, 5.0, 2.0),
+            bf16(32, 6.0, 2.0),
+            bf16(32, 7.0, 3.0),
+        );
+        let dt = g(tensor(values(32, 8.0, 1.0), &[32]));
+        let a = g(tensor(
+            values(32, 9.0, 1.0).iter().map(|v| -v.exp()).collect(),
+            &[32],
+        ));
+        let norm = g(tensor(
+            values(d, 10.0, 0.2).iter().map(|v| 1.0 + v).collect(),
+            &[d],
+        ));
+        let state = g(tensor(values(32 * d * d, 11.0, 0.3), &[1, 32, d, d]));
+
+        let (conv, history) = conv_decode(&x, &w, [&h[0], &h[1], &h[2]]).unwrap();
+        let (y, next) =
+            recurrent_decode(&conv, &z, &beta, &alpha, &dt, &a, &norm, &state, &spec).unwrap();
+
+        let history_out = Tensor::zeros((3, conv_dim), DType::F32, &device).unwrap();
+        let state_out = Tensor::zeros((1, 32, d, d), DType::F32, &device).unwrap();
+        let mut table = DeviceTable::new(&device, 2 * TABLE_ENTRIES).unwrap();
+        let entries = [&h[0], &h[1], &h[2], &history_out, &state, &state_out]
+            .map(|t| f32_address(t).unwrap());
+        table.write(TABLE_ENTRIES, &entries).unwrap();
+        let slot = StateTable {
+            address: table.address(),
+            slot: TABLE_ENTRIES,
+        };
+        let conv_t = conv_decode_table(&x, &w, slot).unwrap();
+        let y_t = recurrent_decode_table(&conv_t, &z, &beta, &alpha, &dt, &a, &norm, slot, &spec)
+            .unwrap();
+        let host = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(host(&conv_t), host(&conv));
+        assert_eq!(host(&history_out), host(&history));
+        assert_eq!(host(&y_t), host(&y));
+        assert_eq!(host(&state_out), host(&next));
     }
 
     #[cfg(feature = "cuda")]

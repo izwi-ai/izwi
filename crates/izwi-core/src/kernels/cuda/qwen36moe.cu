@@ -438,6 +438,36 @@ Q36_GDN_EXPORT(__half, f16)
 Q36_GDN_EXPORT(__nv_bfloat16, bf16)
 Q36_GDN_EXPORT(float, f32)
 
+// Table-addressed forms for CUDA graph replay. A captured graph bakes kernel
+// arguments, but a decode step reads the previous state and writes fresh state
+// tensors whose addresses change every step. These variants read the per-layer
+// state addresses from a device table the host refreshes before each replay:
+//   table[slot + 0..2] : conv history slots h0, h1, h2 (oldest first, F32)
+//   table[slot + 3]    : next conv history [3, conv_dim] (F32, written)
+//   table[slot + 4]    : recurrent state in [value_heads, 128, 128] (F32)
+//   table[slot + 5]    : recurrent state out (F32, written)
+// Everything else is identical to the direct kernels above.
+#define Q36_GDN_TABLE_EXPORT(T, S)                                                             \
+  extern "C" __global__ void qwen36moe_gdn_conv_table_##S(                                     \
+      const T* x, const float* w, const unsigned long long* table, int slot, float* out,       \
+      int conv_dim) {                                                                          \
+    const unsigned long long* e = table + slot;                                                \
+    q36_gdn_conv<T>(x, w, (const float*)e[0], (const float*)e[1], (const float*)e[2], out,    \
+                    (float*)e[3], conv_dim);                                                   \
+  }                                                                                            \
+  extern "C" __global__ void __launch_bounds__(512) qwen36moe_gdn_decode_table_##S(           \
+      const float* conv, const T* z, const T* beta_raw, const T* alpha, const float* dt_bias, \
+      const float* a, const float* norm_w, const unsigned long long* table, int slot, T* y,   \
+      int key_heads, int value_heads, int grouped, float norm_eps) {                           \
+    const unsigned long long* e = table + slot;                                                \
+    q36_gdn_decode<T>(conv, z, beta_raw, alpha, dt_bias, a, norm_w, (const float*)e[4],       \
+                      (float*)e[5], y, key_heads, value_heads, grouped, norm_eps);             \
+  }
+
+Q36_GDN_TABLE_EXPORT(__half, f16)
+Q36_GDN_TABLE_EXPORT(__nv_bfloat16, bf16)
+Q36_GDN_TABLE_EXPORT(float, f32)
+
 // ---------------------------------------------------------------------------
 // RMSNorm with an F32 gain over 16-bit activations, optionally fused with the
 // preceding residual add. Replaces cast -> rms_norm -> cast (and the add) with
