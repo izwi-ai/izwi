@@ -48,6 +48,7 @@ pub struct Qwen36TextModel {
     output: Qwen36Projection,
     finite_diagnostics_enabled: bool,
     fused_norm_path: Qwen36FusedPath,
+    fp8_gemv_path: Qwen36FusedPath,
 }
 
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
@@ -722,9 +723,38 @@ impl Qwen36TextModel {
             output,
             finite_diagnostics_enabled,
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
+            fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
         };
         model.resolve_fused_norms(false);
+        model.resolve_vectorized_fp8_decode();
         Ok(model)
+    }
+
+    /// Enable the vectorized block-FP8 decode GEMV (process-wide) after it
+    /// matches the reference decode kernel on this device. Compact-FP8
+    /// projections keep the reference kernel otherwise.
+    fn resolve_vectorized_fp8_decode(&mut self) {
+        self.fp8_gemv_path = if legacy_requested(FUSED_DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("vectorized FP8 decode GEMV runs on CUDA only")
+        } else {
+            match crate::kernels::cuda::fp8::verify_and_enable_vectorized_decode(&self.device) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "vectorized FP8 decode GEMV self-check failed; keeping the reference kernel"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// Vectorized FP8 decode GEMV resolution, for the admin diagnostics.
+    pub(crate) fn fp8_gemv_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.fp8_gemv_path])
     }
 
     /// Enable the fused RMSNorm kernels on every trunk norm (layer, q/k and

@@ -200,7 +200,15 @@ impl Qwen36MoeChatModel {
         let gdn_decode = exec.text_model.gdn_decode_summary();
         let rms_norm = exec.text_model.rms_norm_summary();
         let qk_rope = exec.text_model.qk_rope_summary();
-        tracing::info!(%moe, %gdn_decode, %rms_norm, %qk_rope, "Qwen3.6-MoE fused kernel paths");
+        let fp8_gemv = exec.text_model.fp8_gemv_summary();
+        tracing::info!(
+            %moe,
+            %gdn_decode,
+            %rms_norm,
+            %qk_rope,
+            %fp8_gemv,
+            "Qwen3.6-MoE fused kernel paths"
+        );
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -449,6 +457,7 @@ impl Qwen36MoeChatModel {
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
             "rms_norm": self.exec.text_model.rms_norm_summary(),
             "qk_rope": self.exec.text_model.qk_rope_summary(),
+            "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -1311,6 +1320,10 @@ pub(crate) mod tests {
         assert_eq!(
             model.runtime_diagnostics()["qk_rope"]["legacy_reasons"][0],
             "fused q/k norm + RoPE runs on CUDA only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["fp8_gemv"]["legacy_reasons"][0],
+            "vectorized FP8 decode GEMV runs on CUDA only"
         );
         assert!(gdn["legacy_reasons"][0]
             .as_str()
