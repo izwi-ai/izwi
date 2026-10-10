@@ -4442,6 +4442,15 @@ impl NativeChatPreparedPrompt {
         }
     }
 
+    /// Phase 5a: token count of the prompt's stable history (what the next
+    /// turn of the conversation shares), when the family declares one.
+    pub fn managed_snapshot_boundary(&self) -> Option<usize> {
+        match self {
+            Self::Qwen36Moe(prepared) => prepared.history_boundary(),
+            Self::Qwen35(_) | Self::Qwen38(_) => None,
+        }
+    }
+
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),

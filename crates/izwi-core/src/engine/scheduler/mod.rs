@@ -543,6 +543,11 @@ struct RequestMetadata {
     /// The first prefill chunk is aligned to this boundary so the committed
     /// tensor state can publish a snapshot for cross-request fork.
     managed_snapshot_prefill_interval: Option<u32>,
+    /// Phase 5a: the prompt's stable-history boundary declared by the
+    /// prepared prompt. A prefill span crossing its interval-aligned floor
+    /// is clipped to end there, so the manager can publish the committed
+    /// tensor snapshot that the conversation's next turn attaches to.
+    managed_snapshot_boundary: Option<u32>,
     /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
     /// are already resident (shared pages plus a forked tensor snapshot), so
     /// the first prefill span starts here instead of zero. `None` means a
@@ -738,6 +743,7 @@ impl Scheduler {
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
+            managed_snapshot_boundary: request.managed_snapshot_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
         };
 
@@ -803,6 +809,7 @@ impl Scheduler {
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
+                managed_snapshot_boundary: request.managed_snapshot_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
             },
         );
@@ -988,6 +995,33 @@ impl Scheduler {
             boundary
         } else {
             target_tokens
+        }
+    }
+
+    /// Phase 5a: clip an incremental prefill span `[start, start + tokens)`
+    /// that crosses the declared history boundary, floored to the snapshot
+    /// interval, so it ends exactly on it. Spans that end at or before it, or
+    /// start at or past it, keep their exact length.
+    fn clip_prefill_to_snapshot_boundary(
+        metadata: &RequestMetadata,
+        start: usize,
+        tokens: usize,
+    ) -> usize {
+        let (Some(interval), Some(boundary)) = (
+            metadata.managed_snapshot_prefill_interval,
+            metadata.managed_snapshot_boundary,
+        ) else {
+            return tokens;
+        };
+        if metadata.cache_policy.prefill != PrefillMode::Incremental || interval < 2 {
+            return tokens;
+        }
+        let (interval, boundary) = (interval as usize, boundary as usize);
+        let aligned = boundary - boundary % interval;
+        if aligned > start && aligned < start.saturating_add(tokens) {
+            aligned - start
+        } else {
+            tokens
         }
     }
 
@@ -1589,6 +1623,8 @@ impl Scheduler {
 
             let target_tokens =
                 Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
+            let target_tokens =
+                Self::clip_prefill_to_snapshot_boundary(&metadata, num_computed, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
@@ -1705,6 +1741,8 @@ impl Scheduler {
 
             let target_tokens =
                 Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
+            let target_tokens =
+                Self::clip_prefill_to_snapshot_boundary(&metadata, prefix_start, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             let span_end = prefix_start.saturating_add(num_tokens);
@@ -3518,8 +3556,65 @@ mod tests {
             capacity_blocked_on: None,
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
+            managed_snapshot_boundary: None,
             managed_prefix_cursor: None,
         }
+    }
+
+    #[test]
+    fn prefill_spans_clip_to_the_declared_history_boundary() {
+        let mut metadata = snapshot_metadata(Some(64), PrefillMode::Incremental);
+        metadata.managed_snapshot_boundary = Some(200);
+        // Aligned boundary 192: a span crossing it ends there.
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 256),
+            192
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 128, 256),
+            64
+        );
+        // Spans ending at or before it, or starting at or past it, keep their length.
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 192),
+            192
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 100),
+            100
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 192, 64),
+            64
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 256, 64),
+            64
+        );
+        // A boundary below one interval floors to zero: nothing to clip.
+        metadata.managed_snapshot_boundary = Some(40);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 256),
+            256
+        );
+        // Without an interval, a boundary, or incremental prefill: unchanged.
+        let mut unshared = snapshot_metadata(None, PrefillMode::Incremental);
+        unshared.managed_snapshot_boundary = Some(200);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&unshared, 0, 256),
+            256
+        );
+        let mut full = snapshot_metadata(Some(64), PrefillMode::Full);
+        full.managed_snapshot_boundary = Some(200);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&full, 0, 256),
+            256
+        );
+        let undeclared = snapshot_metadata(Some(64), PrefillMode::Incremental);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&undeclared, 0, 256),
+            256
+        );
     }
 
     #[test]

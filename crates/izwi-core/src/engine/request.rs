@@ -1071,6 +1071,13 @@ pub struct EngineCoreRequest {
     /// prefill span from this cursor and the managed prepare re-verifies it
     /// transactionally before any attach is staged.
     pub(super) managed_prefix_cursor: Option<u32>,
+    /// Phase 5a: token count of the prompt's stable history, declared by the
+    /// prepared prompt. A later request continuing the same conversation
+    /// shares exactly these tokens, so a hybrid model snapshots its state at
+    /// the interval-aligned boundary at or below it (see the scheduler's span
+    /// clip and the manager's snapshot publication). `None` keeps the
+    /// first-chunk-only publication.
+    pub(super) managed_snapshot_boundary: Option<u32>,
     /// Request-specific shape/workspace facts produced by the exact loaded
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
@@ -2179,6 +2186,11 @@ impl EngineCoreRequest {
         if let Some((stage_id, cost)) = prepared_continuous_cost {
             self.install_prepared_stage_cost(stage_id, cost)?;
         }
+        self.managed_snapshot_boundary = prepared_chat_prompt
+            .as_ref()
+            .and_then(NativeChatPreparedPrompt::managed_snapshot_boundary)
+            .filter(|boundary| *boundary <= prompt_tokens.len())
+            .and_then(|boundary| u32::try_from(boundary).ok());
         self.prompt_tokens = prompt_tokens;
         self.sync_task_from_fields();
         self.chat_execution_ready = Some(ChatExecutionReady {
@@ -4468,6 +4480,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4529,6 +4542,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4590,6 +4604,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4648,6 +4663,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4707,6 +4723,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4766,6 +4783,7 @@ impl EngineCoreRequest {
             v2_state_runtime: None,
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
+            managed_snapshot_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -5121,6 +5139,16 @@ impl EngineCoreRequest {
 
     pub(crate) fn managed_prefix_cursor(&self) -> Option<u32> {
         self.managed_prefix_cursor
+    }
+
+    /// Phase 5a: the prepared prompt's stable-history boundary (tokens).
+    pub(crate) fn managed_snapshot_boundary(&self) -> Option<u32> {
+        self.managed_snapshot_boundary
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_managed_snapshot_boundary_for_test(&mut self, boundary: Option<u32>) {
+        self.managed_snapshot_boundary = boundary;
     }
 
     pub(crate) fn managed_cache_runtime(

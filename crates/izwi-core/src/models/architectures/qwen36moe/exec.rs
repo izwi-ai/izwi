@@ -77,11 +77,18 @@ pub struct Qwen36PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
+    /// Tokens of the stable history: everything before the final assistant
+    /// generation header, which the next turn of the conversation shares.
+    history_boundary: Option<usize>,
 }
 
 impl Qwen36PreparedPrompt {
     pub fn prompt_ids(&self) -> &[u32] {
         &self.prompt_ids
+    }
+
+    pub(crate) fn history_boundary(&self) -> Option<usize> {
+        self.history_boundary
     }
 
     pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
@@ -932,6 +939,7 @@ impl Qwen36ChatExec {
             next_text_position: prompt_positions.len(),
             prompt_ids,
             prompt_positions,
+            history_boundary: None,
         })
     }
 
@@ -3402,6 +3410,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
+            history_boundary: None,
         };
         let preparation_calls = AtomicUsize::new(0);
         let resolved = resolve_prepared_prompt(Some(&prepared), || {
