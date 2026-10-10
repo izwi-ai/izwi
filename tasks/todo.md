@@ -8,7 +8,11 @@ Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2
 - most of Phase 6: every fused path runs on Metal and experts stay raw FP8, about 37 GB resident
   instead of 69 GB (`5594d188`..`23a7a8fe`);
 - the Phase 7 Q8_0 CPU LM head (`8ce1e08a`);
-- fixes from a correctness review of the whole range (`8167d0a9`..`35d9d5b4`; see Review).
+- fixes from a correctness review of the whole range (`8167d0a9`..`35d9d5b4`; see Review);
+- the rest of Phase 2 (`5833c393`..`197aff9d`): fused attention gate, one greedy readback,
+  packed conv history;
+- Phase 3, piecewise CUDA graph decode for single-row steps (`6f93f515`..`ff3d5027`), hardened
+  after a review of its failure paths (`1f4262d6`).
 
 See the Review section for what to check on the first GPU deploy.
 
@@ -77,7 +81,7 @@ The kill switch (environment variable) is the rollback.
       clippy with and without CUDA (fake nvcc); emulator runs at 35B shapes.
 - [ ] On the GPU: self-check passes at load; diagnostics `moe.backend = fused`; fixed-prompt t/s.
 
-## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — MOSTLY DONE (unmeasured) — gate ≥80 t/s
+## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — DONE (unmeasured) — gate ≥80 t/s
 - [x] Vectorized FP8 decode GEMV `qwen38_fp8_mv2_*`: 16-byte loads and the exact
       byte_perm/shift E4M3→F16 decode. Enabled process-wide only after a device check against the
       reference kernel (`c53c7a60`, `2cb161d3`).
@@ -91,24 +95,78 @@ The kill switch (environment variable) is the rollback.
       layer's trailing add folds into the next layer's norm (`d5d62bac`).
 - [x] Fused q/k norm + partial M-RoPE from device inverse frequencies; no per-layer RoPE upload
       (`828b1106`, `355893c7`).
-- [ ] Open:
-  - fused attention output gate (sigmoid·mul);
-  - fused KV write;
-  - one-readback greedy argmax (2 syncs → 1);
-  - stop the per-quantum restore/re-stage of the 30 conv rings.
-
-  The last one touches the engine's transactional state; it needs GPU iteration.
+- [x] Fused attention output gate (`5833c393`, `61cf4719`). One kernel reads the gated `q_proj`
+      layout and writes `attn · sigmoid(gate)`, replacing a strided gate copy, a sigmoid and a
+      multiply. CUDA, Metal and a CPU reference; a load self-check; an `attn_gate` diagnostics
+      summary.
+- [x] One readback per greedy token on CUDA (`93d84104`). The device greedy kernel returns
+      `(token, finite)` with the host fallback's own semantics (finite max, lowest index on
+      ties). 2 syncs → 1 per row, and one readback for an all-greedy batch.
+- [x] Conv history as one tensor (`197aff9d`). The fused conv step writes the shifted
+      `[3, conv_dim]` history in the same launch. Staging hands it over by handle instead of
+      stacking 30 rings per token, and restore stops splitting views.
+- Deferred: fused K+V page write (shared KV arena, all models), BF16 GDN state.
 - [x] Every kernel has a CPU reference and/or emulator run, a load-time self-check, and the
       `IZWI_QWEN36_FUSED_DECODE=legacy` kill switch (norms, q/k RoPE, GEMV and packing share it).
 - [ ] Optional: BF16 GDN state experiment, parity-gated.
 
-## Phase 3 — Whole-step CUDA graphs plus async scheduling (M) — gate ≥150 t/s
-- [ ] Capture feasibility first (one GDN and one attention layer, mistral.rs recipe); fall back
-      to an activation arena if Candle allocations fail inside capture.
-- [ ] Persistent device input buffers; graph-safe paged attention; buckets 1-32; graph LRU.
-- [ ] Async scheduling: prepare step n+1 during step n, pinned async token read.
-- [ ] Replay self-check (first replay vs one eager step, per bucket);
-      `IZWI_QWEN36_CUDA_GRAPHS=0` kill switch.
+## Phase 3 — CUDA graphs plus async scheduling (M) — CORE DONE (unmeasured) — gate ≥150 t/s
+Design 2026-10-10: **piecewise capture**, as vLLM does by default. Everything except attention
+goes into graphs; the parts that need per-step host data stay eager. For B = 1 decode with
+every fused path active, the step becomes 11 graph segments:
+- segment 0: layers 0-2, plus layer 3's norm and packed q/k/v projection;
+- segments 1-9: the previous attention layer's gate, `o_proj`, add+norm and MoE, then three
+  DeltaNet layers, then the next attention layer's norm and q/k/v;
+- segment 10: layer 39's tail and the output norm.
+
+Eager between segments: q/k norm + RoPE (positions are kernel scalars), the paged KV write,
+paged attention (context-dependent strategy), the LM head (cuBLAS) and the greedy readback.
+
+- [x] DeltaNet state through a device address table (`9c2a0d56`). The table-addressed conv and
+      recurrent kernels read their state in/out addresses from a table the host refreshes once
+      per step (one upload). Graphs read the row's current state and write a fresh slab, so
+      there are no state copies and committed state is never mutated. They are bit-identical
+      to the direct kernels in the emulator.
+
+      Instead of a gather node, a segment adopts the previous graph's retained outputs
+      (residual, `q_proj`) in place. Only the attention output is copied in, one launch per
+      segment.
+- [x] Segment runner `kernels::cuda::segment_graph` (`6f93f515`): warm under the htod-cache
+      guard, then thread-local capture with `AUTO_FREE_ON_LAUNCH` over stable inputs, then
+      replay. Fence and leak-on-failure teardown, as `TensorIsland` does.
+- [x] Orchestrator `qwen36moe::decode_graph` (`9dc38069` refactor, `ff3d5027`). Phases:
+      warm → capture + verify → verify → replay. Each verification compares eager vs replay
+      outputs and written state; the step always continues on the eager results. Any failure
+      disables graph decode, with the reason in diagnostics.
+- [x] Switches: `IZWI_QWEN36_CUDA_GRAPHS=0`, `cuda.decode_graphs`, `cuda.mode`. A `cuda_graphs`
+      diagnostics summary. Admission reserves 128 MiB as a deferred claim.
+- [x] Pre-flight: the CUDA end-to-end leg decodes through the graphs against the legacy trunk
+      and checks the phase counters. Off CUDA, the same segments run eagerly and must match the
+      standard decode bit for bit (CPU and Metal).
+- [x] Review of the capture code (`1f4262d6`). It found no wrong-token bug. The failure paths
+      were hardened:
+  - the capture ends through a raw-driver guard, since cudarc's `end_capture` can return a
+    stale context error without ending it;
+  - event tracking is off during capture;
+  - the graph is launched once after instantiation;
+  - failed-capture outputs are leaked, not freed;
+  - a GPU-side step fence orders steps that run on different threads;
+  - only graph failures disable graph decode;
+  - verification scratch is allocated per segment.
+- Known risk: each DeltaNet segment includes the dense beta/alpha projection (cuBLAS). If
+  cuBLAS refuses capture on the H100, `cuda_graphs` reports `capture of segment 0 failed: …`
+  and decode stays eager. The fix is to run those projections through a custom GEMV.
+- Follow-up idea, measure first: cudarc creates 2 events per allocation and waits on and
+  destroys them on every free, about 6 driver calls per tensor, which izwi never needs in
+  single-stream mode. Disabling event tracking process-wide, as mistral.rs does, could cut
+  eager host time noticeably. It is context-global, so it needs its own change and check.
+- Deferred to GPU iteration:
+  - B > 1 buckets;
+  - capturing attention (persistent slot and metadata buffers, a captured partitioned
+    kernel);
+  - async scheduling (launch step n+1 before reading token n; that needs speculative-continue
+    rollback in the engine);
+  - a pinned async token read.
 
 ## Phase 4 — MTP (M) — gate ≥1.1× Phase 3 on the fixed prompt, else default off
 - [ ] Batched verification (M = 1+depth) as a full graph.
@@ -193,19 +251,35 @@ IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --features cuda --lib --
 ```
 
 This runs every fused kernel at the real 35B geometry against its CPU reference, then the whole
-fused trunk against the legacy trunk on the GPU. A failure names the path; turn it off with the
-matching switch from step 4.
+fused trunk against the legacy trunk on the GPU, graph decode included. A failure names the path;
+turn it off with the matching switch from step 4.
+
+Look first at `cuda_segment_graph_replays_fresh_inputs`. It is the smallest test of the capture
+recipe: a strided op and intermediates freed inside the capture. If it fails, production graph
+decode will also fail to capture and disable itself. Decode stays correct but eager, so set
+`IZWI_QWEN36_CUDA_GRAPHS=0` to skip the attempts and report the error.
 
 **1. The load log.** It has one line, `Qwen3.6-MoE fused kernel paths`, which reports `moe`,
-`gdn_decode`, `rms_norm`, `qk_rope` and `fp8_gemv`. On an SM80+ GPU every `backend` should be
-`fused`. The same JSON is under `GET /v1/admin/models/{id}` → `runtime_diagnostics`.
+`gdn_decode`, `rms_norm`, `qk_rope`, `attn_gate`, `fp8_gemv` and `cuda_graphs`. On an SM80+ GPU
+every `backend` should be `fused`. The same JSON is under `GET /v1/admin/models/{id}` →
+`runtime_diagnostics`.
+
+After a few generated tokens, `cuda_graphs` should show:
+- `"phase": "replay"`;
+- `captures` = `segments` = 11;
+- `verified_segments` = 22;
+- `replays` growing by 11 per token.
+
+If `phase` is `disabled`, `legacy_reasons` says why (capture failure, verification mismatch,
+or a step error). Decode is then eager and correct, just slower; report the reason.
 
 **2. If any path says `legacy`.** The reason string says why:
 - `self-check failed: …` is a kernel bug on that device. The path is safely off; report the
   message.
 - `…=legacy` means the kill switch is set.
 
-**3. Run the fixed-prompt check.** Estimated range after Phases 1-2: 80-150 t/s.
+**3. Run the fixed-prompt check.** Estimated range: 80-150 t/s with Phases 1-2 alone; Phase 3
+should add most of the rest of the way to 150-200 if graphs reach `replay`.
 
 **4. Isolate a suspect path with the kill switches.** Each needs a redeploy, no code change:
 - `IZWI_QWEN36_MOE_BACKEND=legacy`
@@ -213,6 +287,7 @@ matching switch from step 4.
 - the global CUDA switches also work: `IZWI_CUDA_FUSED_DECODE=off`,
   `IZWI_CUDA_PACKED_PROJECTIONS=off`, or `IZWI_CUDA_MODE=off` for everything, the fused MoE
   included. The diagnostics reason names the switch.
+- graph decode alone: `IZWI_QWEN36_CUDA_GRAPHS=0` or `IZWI_CUDA_DECODE_GRAPHS=off`.
 
 **5. Expected per-token launch budget** (counted from code, not measured): about 520, down from
 about 6,200.
@@ -226,7 +301,15 @@ about 6,200.
 | Engine state staging | ~30-60 | |
 | lm_head and argmax | ~6 | |
 
-There are no host syncs inside the MoE. The two greedy-argmax readbacks remain.
+There are no host syncs inside the MoE.
+
+Since then:
+- the gate fusion removes ~20 launches per token;
+- the packed conv history removes the 30 staging stacks;
+- greedy needs one readback.
+
+With graph decode at `replay`, the host issues about 11 graph launches plus ~10 eager
+operations per attention layer, roughly 120-150 calls per token instead of about 520.
 
 **6. Load time grows slightly** from the self-checks (about 1-2 s on an H100) and from stacking the
 experts (a transient of about 1 GB per layer while loading, now charged in admission). If a
