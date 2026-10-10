@@ -20,6 +20,7 @@ pub mod fp8;
 pub mod gdn;
 pub mod graphs;
 pub mod moe;
+pub mod norm;
 pub mod sampling;
 pub mod timing;
 

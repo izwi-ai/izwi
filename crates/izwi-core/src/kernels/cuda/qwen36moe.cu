@@ -433,3 +433,72 @@ __device__ void q36_gdn_decode(
 Q36_GDN_EXPORT(__half, f16)
 Q36_GDN_EXPORT(__nv_bfloat16, bf16)
 Q36_GDN_EXPORT(float, f32)
+
+// ---------------------------------------------------------------------------
+// RMSNorm with an F32 gain over 16-bit activations, optionally fused with the
+// preceding residual add. Replaces cast -> rms_norm -> cast (and the add) with
+// one launch. The residual sum is rounded to T before normalization, matching
+// a T-dtype add followed by the norm. One block per row.
+template <class T>
+__device__ void q36_rms_norm(
+    const T* __restrict__ x,
+    const T* __restrict__ residual,
+    const float* __restrict__ w,
+    T* __restrict__ sum_out,
+    T* __restrict__ out,
+    int hidden,
+    float eps) {
+  __shared__ float part[32];
+  __shared__ float inv_shared;
+  const size_t base = (size_t)blockIdx.x * hidden;
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    float v = float(x[base + i]);
+    if (residual != nullptr) {
+      const T sum = T(float(residual[base + i]) + v);
+      if (sum_out != nullptr) {
+        sum_out[base + i] = sum;
+      }
+      v = float(sum);
+    }
+    ss = fmaf(v, v, ss);
+  }
+  ss = q36_warp_sum(ss);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (lane == 0) {
+    part[warp] = ss;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int warps = (blockDim.x + 31) >> 5;
+    float total = lane < warps ? part[lane] : 0.f;
+    total = q36_warp_sum(total);
+    if (lane == 0) {
+      inv_shared = 1.f / sqrtf(total / (float)hidden + eps);
+    }
+  }
+  __syncthreads();
+  const float inv = inv_shared;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    float v = float(x[base + i]);
+    if (residual != nullptr) {
+      v = float(T(float(residual[base + i]) + v));
+    }
+    out[base + i] = T(v * inv * w[i]);
+  }
+}
+
+#define Q36_NORM_EXPORT(T, S)                                                                   \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_rms_norm_##S(                    \
+      const T* x, const float* w, T* out, int hidden, float eps) {                              \
+    q36_rms_norm<T>(x, nullptr, w, nullptr, out, hidden, eps);                                  \
+  }                                                                                             \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_add_rms_norm_##S(                \
+      const T* x, const T* residual, const float* w, T* sum_out, T* out, int hidden,           \
+      float eps) {                                                                              \
+    q36_rms_norm<T>(x, residual, w, sum_out, out, hidden, eps);                                 \
+  }
+
+Q36_NORM_EXPORT(__half, f16)
+Q36_NORM_EXPORT(__nv_bfloat16, bf16)
