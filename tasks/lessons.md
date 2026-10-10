@@ -168,3 +168,19 @@
   mismatch. Start with the phase whose targets are COUNTED in code (for example, 80 syncs per
   token), not estimated, so it is safe without a profile. Restate any earlier promotion rule
   that assumed hardware evidence instead of silently ignoring it.
+- Never gate a commit on `cargo test ... | grep ... | head && git commit`: a pipeline's exit
+  status is the LAST command's (`head` exits 0 even when the build failed and grep matched
+  nothing), so a non-compiling tree got committed. Capture output to a file, keep each
+  command's `$?`, and commit only inside `if [ $T -eq 0 ] && [ $C -eq 0 ]; then ... fi`. A
+  silent/empty test summary is a failure, not a pass.
+- When applying rustfmt only to "my" hunks of a file with pre-existing format drift, rustfmt's
+  import re-sorting splits one logical move into a removal hunk and an insertion hunk at
+  different lines; applying only the hunk that overlaps my edits silently DELETES imports.
+  Re-compile after any partial-format pass, and prefer hand-formatting the few new hunks.
+- Without nvcc/GPU locally (macOS), CUDA work is still verifiable before deploy: Apple clang
+  parses CUDA device code with `-x cuda --cuda-device-only -fsyntax-only -nocudainc` plus a small
+  stub header (validate the stubs by checking the repo's existing .cu files first); a
+  std::thread-per-CUDA-thread emulator (block barriers + warp-shuffle exchange) runs the real
+  kernel source against a float64 reference; and `cargo check/clippy --features cuda` works with
+  a fake `nvcc` that prints a 5-line `--version` (cudarc reads line 4) and touches the PTX/object
+  outputs the build scripts expect.
