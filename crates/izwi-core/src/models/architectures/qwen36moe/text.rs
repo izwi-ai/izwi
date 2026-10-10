@@ -2698,14 +2698,17 @@ impl Qwen36LinearAttention {
             &self.conv_kernel,
             [&history[0], &history[1], &history[2]],
         )?;
-        ring.push_decode(&current.reshape((self.conv_dim, 1))?)?;
-        let previous = match recurrent_state.take() {
+        let zeros;
+        let previous = match recurrent_state.as_ref() {
             Some(previous) => previous,
-            None => Tensor::zeros(
-                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                DType::F32,
-                conv.device(),
-            )?,
+            None => {
+                zeros = Tensor::zeros(
+                    (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                    DType::F32,
+                    conv.device(),
+                )?;
+                &zeros
+            }
         };
         let (y, next) = gdn::recurrent_decode(
             &conv,
@@ -2715,9 +2718,12 @@ impl Qwen36LinearAttention {
             &self.dt_bias,
             &self.a,
             &self.norm.weight,
-            &previous,
+            previous,
             spec,
         )?;
+        // Publish the ring slot and the new state only after both kernels
+        // succeed: a failed step leaves the layer state untouched.
+        ring.push_decode(&current.reshape((self.conv_dim, 1))?)?;
         *recurrent_state = Some(next);
         Ok(y)
     }
