@@ -3057,7 +3057,6 @@ impl RuntimeService {
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
-        core_config.apply_backend_context_capacity(config.portable_context_ceiling());
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
@@ -3069,6 +3068,9 @@ impl RuntimeService {
             PrefixCachePolicy::Disabled => 0,
             PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
         };
+        // After the prefix settings: CUDA sizes its page cap for a maximum-
+        // length request plus the prefix budget.
+        core_config.apply_backend_context_capacity(config.portable_context_ceiling());
         core_config.enable_chunked_prefill = config.enable_chunked_prefill;
         core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
         // DS4 hierarchical offload: explicit opt-in through the host pool
