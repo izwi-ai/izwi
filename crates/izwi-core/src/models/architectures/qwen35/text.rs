@@ -2441,8 +2441,13 @@ fn build_mrope(
         }
     }
 
-    let emb = Tensor::from_vec(interleaved, (1, 1, half_dim), device)?.to_dtype(dtype)?;
-    Ok((emb.cos()?, emb.sin()?))
+    // Take cos/sin of the F32 angles and cast only the results (HF computes
+    // `freqs.cos()` / `.sin()` in fp32 before `.to(x.dtype)`). Rounding the
+    // angle first puts BF16's 8-bit mantissa on `position * inv_freq`: ~0.15
+    // rad of phase error by position 128 and effectively random rotations by
+    // ~4K, and F16 overflows the angle to inf (NaN cos/sin) past 65504.
+    let emb = Tensor::from_vec(interleaved, (1, 1, half_dim), device)?;
+    Ok((emb.cos()?.to_dtype(dtype)?, emb.sin()?.to_dtype(dtype)?))
 }
 
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -3343,6 +3348,57 @@ mod tests {
         for (idx, expected_theta) in expected.iter().enumerate() {
             assert!((cos_vals[0][0][idx] - expected_theta.cos()).abs() < 1e-5);
             assert!((sin_vals[0][0][idx] - expected_theta.sin()).abs() < 1e-5);
+        }
+    }
+
+    /// Half-precision plans must round cos/sin, never the angle: at long
+    /// positions a BF16 angle is phase noise and an F16 angle overflows.
+    #[test]
+    fn build_mrope_keeps_long_position_angles_in_f32() {
+        // Qwen3.6-35B-A3B rotary geometry: 64 rotary dims, theta 1e7.
+        let half_dim = 32;
+        let inv_freqs: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / 10_000_000f32.powf(2.0 * i as f32 / 64.0))
+            .collect();
+        for position in [4_096usize, 70_000] {
+            let (cos_ref, sin_ref) = build_mrope(
+                64,
+                [position; 3],
+                &[11, 11, 10],
+                &inv_freqs,
+                &Device::Cpu,
+                DType::F32,
+            )
+            .expect("f32 mrope");
+            let cos_ref = cos_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let sin_ref = sin_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for dtype in [DType::BF16, DType::F16] {
+                let (cos, sin) = build_mrope(
+                    64,
+                    [position; 3],
+                    &[11, 11, 10],
+                    &inv_freqs,
+                    &Device::Cpu,
+                    dtype,
+                )
+                .expect("half-precision mrope");
+                assert_eq!(cos.dtype(), dtype);
+                for (values, reference) in [(cos, &cos_ref), (sin, &sin_ref)] {
+                    let values = values
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    for (value, expected) in values.iter().zip(reference.iter()) {
+                        assert!(
+                            (value - expected).abs() < 1e-2,
+                            "{dtype:?} position {position}: {value} vs {expected}"
+                        );
+                    }
+                }
+            }
         }
     }
 
