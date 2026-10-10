@@ -294,7 +294,7 @@ __device__ void q36_gdn_conv(
     const float* __restrict__ h1,
     const float* __restrict__ h2,
     float* __restrict__ out,
-    float* __restrict__ cur,
+    float* __restrict__ history,
     int conv_dim) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= conv_dim) {
@@ -302,12 +302,16 @@ __device__ void q36_gdn_conv(
   }
   const float xc = float(x[c]);
   const float* wc = w + (size_t)c * 4;
+  const float p1 = h1[c], p2 = h2[c];
   float v = xc * wc[3];
   v = v + h0[c] * wc[0];
-  v = v + h1[c] * wc[1];
-  v = v + h2[c] * wc[2];
+  v = v + p1 * wc[1];
+  v = v + p2 * wc[2];
   out[c] = v / (1.f + expf(-v));
-  cur[c] = xc;
+  // The next step's history, oldest first: [h1, h2, x].
+  history[c] = p1;
+  history[(size_t)conv_dim + c] = p2;
+  history[2 * (size_t)conv_dim + c] = xc;
 }
 
 // conv: [conv_dim] F32 = q (key_heads*128) | k (key_heads*128) | v (value_heads*128)
@@ -419,8 +423,8 @@ __device__ void q36_gdn_decode(
 #define Q36_GDN_EXPORT(T, S)                                                                   \
   extern "C" __global__ void qwen36moe_gdn_conv_##S(                                           \
       const T* x, const float* w, const float* h0, const float* h1, const float* h2,          \
-      float* out, float* cur, int conv_dim) {                                                  \
-    q36_gdn_conv<T>(x, w, h0, h1, h2, out, cur, conv_dim);                                     \
+      float* out, float* history, int conv_dim) {                                              \
+    q36_gdn_conv<T>(x, w, h0, h1, h2, out, history, conv_dim);                                 \
   }                                                                                            \
   extern "C" __global__ void __launch_bounds__(512) qwen36moe_gdn_decode_##S(                 \
       const float* conv, const T* z, const T* beta_raw, const T* alpha, const float* dt_bias, \

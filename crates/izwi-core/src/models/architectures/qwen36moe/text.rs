@@ -137,11 +137,7 @@ impl Qwen36TextRuntimeState {
                 Error::InferenceError("Qwen3.5 convolution component is absent".into())
             })?;
             *recurrent_state = Some(recurrent_tensor.clone());
-            let history_len = convolution_tensor.dim(0)?;
-            let slots = (0..history_len)
-                .map(|index| convolution_tensor.i(index).map_err(Error::from))
-                .collect::<Result<Vec<_>>>()?;
-            *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+            *conv_state = Some(ConvRingState::from_history(convolution_tensor.clone())?);
         }
         if recurrent_components.next().is_some() || convolution_components.next().is_some() {
             return Err(Error::InferenceError(
@@ -186,8 +182,7 @@ impl Qwen36TextRuntimeState {
                     "Qwen3.5 convolution ring is invalid at the physical boundary".into(),
                 ));
             }
-            let ordered = ring.ordered_slots().collect::<Vec<_>>();
-            let ring_tensor = Tensor::stack(&ordered, 0)?;
+            let ring_tensor = ring.history()?;
             let component = u32::try_from(recurrent.len() + 1)
                 .map_err(|_| Error::InvalidInput("Qwen3.5 state component overflow".into()))?;
             recurrent.push(StateComponentValue {
@@ -242,9 +237,52 @@ fn convolution_domain_v2() -> StateDomainId {
 struct ConvRingState {
     slots: Vec<Tensor>,
     next_idx: usize,
+    /// The whole history as one `[slots, conv_dim, 1]` tensor whose rows are
+    /// `slots` in order (`next_idx == 0`), when it is held that way. The fused
+    /// conv step writes it in one launch and restore reads it whole, so
+    /// staging hands it over without a stack. Any slot mutation clears it.
+    packed: Option<Tensor>,
 }
 
 impl ConvRingState {
+    fn new(slots: Vec<Tensor>, next_idx: usize) -> Self {
+        Self {
+            slots,
+            next_idx,
+            packed: None,
+        }
+    }
+
+    /// A ring over `history` `[slots, conv_dim, 1]`, oldest first.
+    fn from_history(history: Tensor) -> Result<Self> {
+        let slots = (0..history.dim(0)?)
+            .map(|index| history.i(index).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            slots,
+            next_idx: 0,
+            packed: Some(history),
+        })
+    }
+
+    /// The history as one `[slots, conv_dim, 1]` tensor, oldest first.
+    fn history(&self) -> Result<Tensor> {
+        match &self.packed {
+            Some(history) => Ok(history.clone()),
+            None => {
+                let ordered = self.ordered_slots().collect::<Vec<_>>();
+                Tensor::stack(&ordered, 0).map_err(Error::from)
+            }
+        }
+    }
+
+    /// Replace the history with `slots`, oldest first.
+    fn replace_slots(&mut self, slots: Vec<Tensor>) {
+        self.slots = slots;
+        self.next_idx = 0;
+        self.packed = None;
+    }
+
     /// History slots oldest first — the logical order every serialized form
     /// (arena staging, MTP rollback snapshots) stores, so a restore can
     /// rebuild the ring with `next_idx = 0`.
@@ -268,6 +306,7 @@ impl ConvRingState {
             .iter()
             .map(deep_copy_tensor_storage)
             .collect::<candle_core::Result<Vec<_>>>()?;
+        self.packed = None;
         Ok(())
     }
 
@@ -297,6 +336,7 @@ impl ConvRingState {
         }
         self.slots[self.next_idx] = current.clone();
         self.next_idx = (self.next_idx + 1) % self.slots.len();
+        self.packed = None;
         Ok(())
     }
 }
@@ -1600,12 +1640,12 @@ impl Qwen36TextRuntimeState {
             };
             if let Some(ring) = conv_state.as_mut() {
                 if ring.slots.len() == snap.conv_slots.len() {
-                    ring.slots = snap
-                        .conv_slots
-                        .iter()
-                        .map(deep_copy_tensor_storage)
-                        .collect::<candle_core::Result<Vec<_>>>()?;
-                    ring.next_idx = 0;
+                    ring.replace_slots(
+                        snap.conv_slots
+                            .iter()
+                            .map(deep_copy_tensor_storage)
+                            .collect::<candle_core::Result<Vec<_>>>()?,
+                    );
                 }
             }
             if let Some(snapshot_tensor) = &snap.recurrent {
@@ -1700,7 +1740,7 @@ impl Qwen36Layer {
                 for _ in 0..history_len {
                     slots.push(owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device)?);
                 }
-                *conv_state = Some(ConvRingState { slots, next_idx: 0 });
+                *conv_state = Some(ConvRingState::new(slots, 0));
             }
             if recurrent_state.is_none() {
                 *recurrent_state = Some(owned_zero_tensor(
@@ -2707,10 +2747,10 @@ impl Qwen36LinearAttention {
         let state_dims = (1, self.num_v_heads, self.head_k_dim, self.head_v_dim);
         let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
         let initial = Qwen36LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: vec![slot(1.0)?, slot(2.0)?, slot(3.0)?],
-                next_idx: 1,
-            }),
+            conv_state: Some(ConvRingState::new(
+                vec![slot(1.0)?, slot(2.0)?, slot(3.0)?],
+                1,
+            )),
             recurrent_state: Some(
                 Tensor::from_vec(wave(state_len, 4.0, 0.3), state_dims, &Device::Cpu)?
                     .to_device(device)?,
@@ -2749,20 +2789,15 @@ impl Qwen36LinearAttention {
             0.01,
             0.05,
         )?;
-        if legacy_ring.next_idx != fused_ring.next_idx {
-            return Err(Error::InferenceError(
-                "DeltaNet decode self-check: conv ring cursor diverged".into(),
-            ));
-        }
-        for (fused, legacy) in fused_ring.slots.iter().zip(&legacy_ring.slots) {
-            compare_values(
-                "DeltaNet conv ring",
-                &host(fused)?,
-                &host(legacy)?,
-                1e-6,
-                1e-6,
-            )?;
-        }
+        // The rings may differ physically (packed vs cursor); their logical
+        // oldest-first histories must be identical.
+        compare_values(
+            "DeltaNet conv history",
+            &host(&fused_ring.history()?)?,
+            &host(&legacy_ring.history()?)?,
+            1e-6,
+            1e-6,
+        )?;
         Ok(())
     }
 
@@ -2805,7 +2840,7 @@ impl Qwen36LinearAttention {
             ));
         };
         let history = ring.ordered_slots().cloned().collect::<Vec<_>>();
-        let (conv, current) = gdn::conv_decode(
+        let (conv, next_history) = gdn::conv_decode(
             mixed_qkv,
             &self.conv_kernel,
             [&history[0], &history[1], &history[2]],
@@ -2833,9 +2868,13 @@ impl Qwen36LinearAttention {
             previous,
             spec,
         )?;
-        // Publish the ring slot and the new state only after both kernels
-        // succeed: a failed step leaves the layer state untouched.
-        ring.push_decode(&current.reshape((self.conv_dim, 1))?)?;
+        // Publish the advanced history and the new state only after both
+        // kernels succeed: a failed step leaves the layer state untouched.
+        *ring = ConvRingState::from_history(next_history.reshape((
+            gdn::CONV_TAPS - 1,
+            self.conv_dim,
+            1,
+        ))?)?;
         *recurrent_state = Some(next);
         Ok(y)
     }
@@ -3296,10 +3335,11 @@ impl Qwen36LinearAttention {
                 try_qwen35_causal_conv_sequence(mixed_qkv, &self.conv_kernel, &history)
             {
                 let final_history = deep_copy_tensor_storage(&final_history)?;
-                buffer.slots = (0..history_len)
-                    .map(|idx| final_history.narrow(1, idx, 1))
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-                buffer.next_idx = 0;
+                buffer.replace_slots(
+                    (0..history_len)
+                        .map(|idx| final_history.narrow(1, idx, 1))
+                        .collect::<candle_core::Result<Vec<_>>>()?,
+                );
                 return Ok(output);
             }
         }
@@ -3949,14 +3989,14 @@ mod tests {
             packed_beta_alpha: None,
         };
         let initial_state = |row: usize| Qwen36LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: (0..3)
+            conv_state: Some(ConvRingState::new(
+                (0..3)
                     .map(|slot| {
                         Tensor::full((row * 3 + slot + 1) as f32 * 0.01, (6, 1), device).unwrap()
                     })
                     .collect(),
-                next_idx: row,
-            }),
+                row,
+            )),
             recurrent_state: None,
         };
         let initial = [initial_state(0), initial_state(1)];
@@ -4087,8 +4127,8 @@ mod tests {
     fn gdn_state(seed: f32) -> Qwen36LayerRuntimeState {
         let conv_dim = 8 * 128;
         Qwen36LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: (0..3)
+            conv_state: Some(ConvRingState::new(
+                (0..3)
                     .map(|slot| {
                         Tensor::from_vec(
                             (0..conv_dim)
@@ -4100,8 +4140,8 @@ mod tests {
                         .unwrap()
                     })
                     .collect(),
-                next_idx: 2,
-            }),
+                2,
+            )),
             recurrent_state: None,
         }
     }
@@ -4914,9 +4954,17 @@ mod tests {
             else {
                 panic!("decode must keep the hybrid state");
             };
-            assert_eq!(legacy_ring.next_idx, fused_ring.next_idx);
-            for (l, f) in legacy_ring.slots.iter().zip(&fused_ring.slots) {
-                assert_eq!(flat(l), flat(f));
+            // Same logical oldest-first history. The fused step keeps it as
+            // one packed tensor, so staging hands it over without a stack.
+            assert_eq!(
+                flat(&legacy_ring.history().unwrap()),
+                flat(&fused_ring.history().unwrap())
+            );
+            assert!(legacy_ring.packed.is_none());
+            let packed = fused_ring.packed.as_ref().expect("fused ring is packed");
+            assert_eq!(packed.dims(), [3, fused.conv_dim, 1]);
+            for (index, slot) in fused_ring.slots.iter().enumerate() {
+                assert_eq!(flat(slot), flat(&packed.i(index).unwrap()));
             }
             assert_close(
                 &flat(fused_recurrent),
@@ -5161,12 +5209,12 @@ mod tests {
                 .unwrap()
         };
         let new_state = || Qwen36LayerRuntimeState::Linear {
-            conv_state: Some(ConvRingState {
-                slots: (0..3)
+            conv_state: Some(ConvRingState::new(
+                (0..3)
                     .map(|_| Tensor::zeros((6, 1), DType::F32, device).unwrap())
                     .collect(),
-                next_idx: 0,
-            }),
+                0,
+            )),
             recurrent_state: None,
         };
 
@@ -5381,10 +5429,7 @@ mod tests {
         // Physical [3, 1, 2] with next_idx 1 = logical oldest→newest [1, 2, 3].
         let mut state = Qwen36TextRuntimeState {
             layers: vec![Qwen36LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState {
-                    slots: vec![slot(3.0), slot(1.0), slot(2.0)],
-                    next_idx: 1,
-                }),
+                conv_state: Some(ConvRingState::new(vec![slot(3.0), slot(1.0), slot(2.0)], 1)),
                 recurrent_state: Some(slot(9.0)),
             }],
         };
@@ -5402,6 +5447,46 @@ mod tests {
         assert_eq!(logical(&state), vec![2.0, 3.0, 4.0]);
         state.restore_linear_states(&snapshot).unwrap();
         assert_eq!(logical(&state), vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Staging hands a packed history over as-is (no stack), a cursor ring
+    /// stacks in logical order, and any slot mutation drops the packed handle.
+    #[test]
+    fn conv_ring_stages_a_packed_history_without_copying() {
+        let slot = |value: f32| Tensor::full(value, (2, 1), &Device::Cpu).unwrap();
+        let values = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let ring = ConvRingState::new(vec![slot(3.0), slot(1.0), slot(2.0)], 1);
+        assert_eq!(
+            values(&ring.history().unwrap()),
+            [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        );
+
+        let history =
+            Tensor::from_vec(vec![1f32, 1.0, 2.0, 2.0, 3.0, 3.0], (3, 2, 1), &Device::Cpu).unwrap();
+        let mut ring = ConvRingState::from_history(history.clone()).unwrap();
+        assert_eq!(ring.history().unwrap().id(), history.id(), "no stack");
+        assert_eq!(
+            ring.ordered_slots()
+                .map(|t| values(t)[0])
+                .collect::<Vec<_>>(),
+            [1.0, 2.0, 3.0]
+        );
+
+        ring.push_decode(&slot(4.0)).unwrap();
+        assert!(ring.packed.is_none());
+        assert_eq!(
+            values(&ring.history().unwrap()),
+            [2.0, 2.0, 3.0, 3.0, 4.0, 4.0]
+        );
+
+        let mut ring = ConvRingState::from_history(history).unwrap();
+        ring.replace_slots(vec![slot(7.0), slot(8.0), slot(9.0)]);
+        assert!(ring.packed.is_none());
+        assert_eq!(
+            values(&ring.history().unwrap()),
+            [7.0, 7.0, 8.0, 8.0, 9.0, 9.0]
+        );
     }
 
     #[test]
@@ -5442,7 +5527,7 @@ mod tests {
         }
         let mut state = Qwen36TextRuntimeState {
             layers: vec![Qwen36LayerRuntimeState::Linear {
-                conv_state: Some(ConvRingState { slots, next_idx: 0 }),
+                conv_state: Some(ConvRingState::new(slots, 0)),
                 recurrent_state: None,
             }],
         };
@@ -5467,7 +5552,7 @@ mod tests {
         let slots = (0..3)
             .map(|_| Tensor::zeros((32, 1), DType::F32, &Device::Cpu).unwrap())
             .collect();
-        let mut ring = ConvRingState { slots, next_idx: 0 };
+        let mut ring = ConvRingState::new(slots, 0);
         let projection = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
         let current = projection.i((0, 0)).unwrap().reshape((32, 1)).unwrap();
         let projection_storage = tensor_storage_address(&current);
@@ -5675,12 +5760,12 @@ mod tests {
             } else {
                 let conv_width = num_v_heads * 2;
                 layers.push(Qwen36LayerRuntimeState::Linear {
-                    conv_state: Some(ConvRingState {
-                        slots: (0..3)
+                    conv_state: Some(ConvRingState::new(
+                        (0..3)
                             .map(|_| Tensor::zeros((conv_width, 1), DType::F32, device).unwrap())
                             .collect(),
-                        next_idx: 0,
-                    }),
+                        0,
+                    )),
                     recurrent_state: Some(
                         Tensor::zeros((1, num_v_heads, 2, 2), DType::F32, device).unwrap(),
                     ),

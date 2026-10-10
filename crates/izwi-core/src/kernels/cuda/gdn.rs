@@ -75,7 +75,9 @@ pub fn supported(device: &Device, head_k_dim: usize, head_v_dim: usize, conv_tap
 
 /// Causal-conv decode step. `x` holds `conv_dim` activations (any shape),
 /// `weight` is `[conv_dim, 4]` F32, and `history` is the three F32 slots oldest
-/// first. Returns `(silu(conv) [conv_dim] F32, float(x) [conv_dim] F32)`.
+/// first. Returns `(silu(conv) [conv_dim] F32, next history [3, conv_dim] F32)`,
+/// the next history being `[history[1], history[2], float(x)]`, so the ring
+/// advances in the same launch.
 pub fn conv_decode(x: &Tensor, weight: &Tensor, history: [&Tensor; 3]) -> Result<(Tensor, Tensor)> {
     let conv_dim = x.elem_count();
     if weight.dims() != [conv_dim, CONV_TAPS]
@@ -113,9 +115,10 @@ pub fn conv_decode(x: &Tensor, weight: &Tensor, history: [&Tensor; 3]) -> Result
             v / (1.0 + (-v).exp())
         })
         .collect::<Vec<_>>();
+    let next = [h[1].as_slice(), h[2].as_slice(), xs.as_slice()].concat();
     Ok((
         Tensor::from_vec(out, conv_dim, x.device())?,
-        Tensor::from_vec(xs, conv_dim, x.device())?,
+        Tensor::from_vec(next, (3, conv_dim), x.device())?,
     ))
 }
 
@@ -326,7 +329,7 @@ mod cuda_impl {
         let h2 = view::<f32>(&h2_storage, &h[2])?;
         // SAFETY: one thread writes each channel of both outputs.
         let out = unsafe { device.alloc::<f32>(conv_dim)? };
-        let cur = unsafe { device.alloc::<f32>(conv_dim)? };
+        let next = unsafe { device.alloc::<f32>(3 * conv_dim)? };
         let config = LaunchConfig {
             grid_dim: ((conv_dim as u32).div_ceil(256), 1, 1),
             block_dim: (256, 1, 1),
@@ -347,7 +350,7 @@ mod cuda_impl {
                 builder.arg(&h1);
                 builder.arg(&h2);
                 builder.arg(&out);
-                builder.arg(&cur);
+                builder.arg(&next);
                 candle_core::builder_arg!(builder, conv_dim as i32);
                 // SAFETY: argument order and types match the kernel signature.
                 unsafe { builder.launch(config) }.w()?;
@@ -361,7 +364,7 @@ mod cuda_impl {
         }
         Ok((
             wrap(out, device, Shape::from(conv_dim)),
-            wrap(cur, device, Shape::from(conv_dim)),
+            wrap(next, device, Shape::from((3, conv_dim))),
         ))
     }
 
@@ -464,14 +467,14 @@ mod tests {
     }
 
     #[test]
-    fn conv_decode_matches_the_tap_formula_and_returns_the_ring_slot() {
+    fn conv_decode_matches_the_tap_formula_and_returns_the_next_history() {
         let conv_dim = 5;
         let x = tensor(vec![0.5, -1.0, 2.0, 0.0, 1.5], &[1, 1, conv_dim]);
         let w = tensor(values(conv_dim * 4, 1.0, 0.5), &[conv_dim, 4]);
         let h: Vec<Tensor> = (0..3)
             .map(|i| tensor(values(conv_dim, 10.0 * i as f32, 1.0), &[conv_dim, 1]))
             .collect();
-        let (out, cur) = conv_decode(&x, &w, [&h[0], &h[1], &h[2]]).unwrap();
+        let (out, next) = conv_decode(&x, &w, [&h[0], &h[1], &h[2]]).unwrap();
         let (xs, ws) = (host(&x).unwrap(), host(&w).unwrap());
         let hs: Vec<Vec<f32>> = h.iter().map(|t| host(t).unwrap()).collect();
         for (c, got) in out.to_vec1::<f32>().unwrap().iter().enumerate() {
@@ -481,7 +484,12 @@ mod tests {
                 + hs[2][c] * ws[c * 4 + 2];
             assert!((got - v / (1.0 + (-v).exp())).abs() < 1e-6);
         }
-        assert_eq!(cur.to_vec1::<f32>().unwrap(), xs);
+        // The ring advances: [h1, h2, x], oldest first.
+        assert_eq!(next.dims(), [3, conv_dim]);
+        assert_eq!(
+            next.to_vec2::<f32>().unwrap(),
+            vec![hs[1].clone(), hs[2].clone(), xs.clone()]
+        );
     }
 
     #[test]
@@ -641,7 +649,7 @@ mod tests {
                 }
             };
             close(&gpu.0, &cpu.0, 1e-5, "conv");
-            assert_eq!(gpu.1, cpu.1, "ring slot must be the exact F32 input");
+            assert_eq!(gpu.1, cpu.1, "next history must be the exact F32 slots");
             close(&gpu.2, &cpu.2, 1e-2, "y");
             close(&gpu.3, &cpu.3, 1e-5, "state");
         }

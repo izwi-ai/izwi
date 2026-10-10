@@ -453,36 +453,40 @@ kernel void q36m_combine_f16(
 template <typename T>
 inline void q36m_gdn_conv(
     device const T* x, device const float* w, device const float* h0, device const float* h1,
-    device const float* h2, device float* out, device float* cur, uint conv_dim, uint c) {
+    device const float* h2, device float* out, device float* history, uint conv_dim, uint c) {
     if (c >= conv_dim) {
         return;
     }
     const float xc = float(x[c]);
     device const float* wc = w + (ulong)c * 4;
+    const float p1 = h1[c], p2 = h2[c];
     float v = xc * wc[3];
     v = v + h0[c] * wc[0];
-    v = v + h1[c] * wc[1];
-    v = v + h2[c] * wc[2];
+    v = v + p1 * wc[1];
+    v = v + p2 * wc[2];
     out[c] = v / (1.0f + exp(-v));
-    cur[c] = xc;
+    // The next step's history, oldest first: [h1, h2, x].
+    history[c] = p1;
+    history[(ulong)conv_dim + c] = p2;
+    history[2 * (ulong)conv_dim + c] = xc;
 }
 
 kernel void q36m_gdn_conv_f16(
     device const half* x [[buffer(0)]], device const float* w [[buffer(1)]],
     device const float* h0 [[buffer(2)]], device const float* h1 [[buffer(3)]],
     device const float* h2 [[buffer(4)]], device float* out [[buffer(5)]],
-    device float* cur [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
+    device float* history [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
     uint c [[thread_position_in_grid]]) {
-    q36m_gdn_conv<half>(x, w, h0, h1, h2, out, cur, conv_dim, c);
+    q36m_gdn_conv<half>(x, w, h0, h1, h2, out, history, conv_dim, c);
 }
 
 kernel void q36m_gdn_conv_f32(
     device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
     device const float* h0 [[buffer(2)]], device const float* h1 [[buffer(3)]],
     device const float* h2 [[buffer(4)]], device float* out [[buffer(5)]],
-    device float* cur [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
+    device float* history [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
     uint c [[thread_position_in_grid]]) {
-    q36m_gdn_conv<float>(x, w, h0, h1, h2, out, cur, conv_dim, c);
+    q36m_gdn_conv<float>(x, w, h0, h1, h2, out, history, conv_dim, c);
 }
 
 // One 512-thread threadgroup per value head (128-dim heads).
@@ -1208,7 +1212,7 @@ pub(crate) fn gdn_conv(
         bind(&h[2], "history", 4)?,
     ];
     let out = device.new_buffer(conv_dim, DType::F32, "q36m-gdn-conv")?;
-    let cur = device.new_buffer(conv_dim, DType::F32, "q36m-gdn-slot")?;
+    let next = device.new_buffer(3 * conv_dim, DType::F32, "q36m-gdn-history")?;
     let encoder = device.command_encoder()?;
     encoder.set_label("q36m-gdn-conv");
     encoder.set_compute_pipeline_state(&pipeline(
@@ -1221,14 +1225,14 @@ pub(crate) fn gdn_conv(
         encoder.set_input_buffer(2 + index, Some(bound.buffer()?), bound.offset);
     }
     encoder.set_output_buffer(5, Some(&out), 0);
-    encoder.set_output_buffer(6, Some(&cur), 0);
+    encoder.set_output_buffer(6, Some(&next), 0);
     encoder.set_bytes(7, &u32_arg(conv_dim, "conv dim")?);
     encoder.dispatch_threads(grid(conv_dim, 1), grid(256, 1));
     drop(encoder);
     drop((xb, wb, hb));
     Ok((
         wrap(&device, out, Shape::from(conv_dim), DType::F32),
-        wrap(&device, cur, Shape::from(conv_dim), DType::F32),
+        wrap(&device, next, Shape::from((3, conv_dim)), DType::F32),
     ))
 }
 
@@ -1657,7 +1661,7 @@ mod tests {
             )
             .unwrap();
             assert_close(&host(&gpu_conv), &host(&cpu_conv), 1e-5, "conv");
-            assert_eq!(host(&gpu_cur), host(&cpu_cur), "ring slot");
+            assert_eq!(host(&gpu_cur), host(&cpu_cur), "conv history");
             assert_close(
                 &host(&gpu_y),
                 &host(&cpu_y),
