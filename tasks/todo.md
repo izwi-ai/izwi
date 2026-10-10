@@ -1,3 +1,116 @@
+# Plan — Chat turn persistence fails with "Failed to append chat turn message" — 2026-10-10
+
+Symptom (Modal `izwi-cuda`, Qwen3.6-35B-A3B-FP8, thread `e2612e11…`): the stream runs to
+completion, then ends with `{"event":"error","error":"Failed to persist assistant message:
+Failed to append chat turn message"}`. The answer is shown but never saved. An earlier turn in
+the same thread (274 tokens, 34 s) saved fine. The failing turn ran 178 s.
+
+## Root cause (confirmed)
+
+1. **Deferred read-then-write transaction racing a constant writer.**
+   `ChatStore::append_turn_with_system_prompt` (`chat_store.rs:348`) opens a DEFERRED
+   transaction (`db.begin()`), reads the thread and the latest message timestamp (this pins a
+   WAL read snapshot), then INSERTs. If any other connection commits between that read and the
+   INSERT, SQLite refuses the upgrade at once with `SQLITE_BUSY_SNAPSHOT` (extended code 517,
+   "database is locked"). The 3 s `busy_timeout` does not apply to this error. `append_message`
+   (`chat_store.rs:254`) has the same pattern.
+2. **The batch worker writes to the same SQLite file all the time.** `start_batch_runtime_worker`
+   runs on every non-gateway serve (`lib.rs:506`). Each idle slot runs `record_heartbeat("polling")`
+   every 250 ms (`worker.rs:602`), and each call is an autocommit upsert into
+   `runtime_worker_heartbeats` (`store.rs:5381`, `7053`). Production has **29 slots**, roughly
+   **116 commits/s**. There are also two unconditional `BEGIN IMMEDIATE` maintenance transactions
+   every 30 s. With that write rate, each chat turn fails at random. Generation length is not the
+   cause.
+3. **The real error is hidden.** `handlers.rs:462` formats with `{err}`, and anyhow's `Display`
+   prints only the outermost context, which drops the SQLite error. Nothing is logged on the
+   server either, so Modal logs show only `POST … -> 200 OK`.
+4. The batch store already knows about this hazard and uses `BEGIN IMMEDIATE` through
+   `runtime_write_transaction_options()` (`store.rs:7905-7926`). The chat store never adopted it.
+
+Evidence:
+- **DB copy:** `PRAGMA integrity_check` returns `ok` on a copy of `izwi-data:/izwi.sqlite3`
+  (+wal/shm), and a 60 KB assistant insert succeeds on that copy. This rules out corruption,
+  schema, size and content.
+- **Repro:** `scratchpad/busy_snapshot_demo.py` gets DEFERRED → `database is locked` (517)
+  immediately, and IMMEDIATE → OK.
+
+## Fix
+
+- [x] **Shared write-tx helper.** Move `runtime_write_transaction_options()` from
+      `batch_runtime/store.rs` to `db/mod.rs` as `pub(crate) fn write_transaction_options()`,
+      keeping its doc comment. Point the batch store at it (no behaviour change).
+- [x] **Chat store uses IMMEDIATE.** In `chat_store.rs:254` and `:348`, replace `db.begin()` with
+      `db.begin_with_options(write_transaction_options())`. The write lock is then taken before the
+      snapshot, and `busy_timeout` covers waiting on heartbeats. The turn lock and ordering logic
+      stay as they are.
+- [x] **Same bug class elsewhere.** Audit the deferred `begin()` callers that read before they
+      write: `voice_observation_store.rs:79` and the ~19 calls in `studio_project_store.rs`.
+      Switch any that read-then-write to the helper. Leave `batch_runtime/fleet.rs:252` alone
+      unless it is SQLite read-then-write.
+- [x] **Surface and log persistence errors.** In `handlers.rs:462`, log
+      `tracing::error!(thread_id, correlation_id, error = %format!("{err:#}"), …)`. Keep the
+      client message stable and add the chained cause (`{err:#}`). Check the non-stream path
+      (`map_store_or_not_found`) also logs the full chain.
+- [x] **Cut heartbeat write amplification (separate commit).** `record_heartbeat` should write
+      only when the status, stage or lease changes, or when the last write is older than a
+      refresh interval well below `heartbeat_stale_after_ms` (e.g. 5 s). Optionally share one
+      heartbeat across a worker's slots. This takes background commits from ~116/s to under 1/s,
+      which also cuts WAL churn on the Modal Volume.
+
+## Tests / verification
+
+- [x] **Regression test** in `chat_store.rs` tests, using a temp-file WAL DB with a pool of more
+      than 1:
+      - spawn a task that commits a write in a tight loop on another pooled connection;
+      - run `append_turn_with_system_prompt` ~200 times and assert every call succeeds;
+      - first prove the test fails on the current code (deferred), then passes with the fix.
+- [x] Heartbeat throttle tests: an idle slot does not write on every poll; a status change
+      writes at once; liveness stays under the staleness threshold.
+- [x] Run `cargo test -p izwi-server chat_store batch_runtime`, `cargo clippy -D warnings` and
+      `cargo fmt --check`.
+- [ ] Redeploy Modal (`IZWI_GIT_REF=fix-qwen36-serving`) and send 5+ long streaming prompts to
+      one thread. Check that every turn appears in `GET …/messages` and that no persist errors
+      show in the logs.
+
+## Review
+
+Commits on `fix-qwen36-serving`:
+- `5e1e7ff6` fix(chat): IMMEDIATE turn transactions. Adds `db::write_transaction_options()` and
+  removes the private copy in the batch store. The regression test
+  `turns_persist_while_another_connection_commits_continuously` failed on turn 1 before the
+  fix with the exact production error (`Failed to append chat turn message: … (code: 517)
+  database is locked`). It passes 8/8 repeated runs after.
+- `5d93ee00` fix(store): all 18 Studio transactions and the voice observation transaction now
+  use the helper, since every one of them writes. `batch_runtime/fleet.rs` is untouched
+  because its transaction is Postgres-only.
+- `256e377f` fix(chat): storage errors use `{err:#}` and are logged with the thread and
+  correlation ids. The same fix applies to agent handlers and voice realtime session creation.
+  A unit test pins the chained message.
+- `03a03e29` perf(batch-worker): an unchanged heartbeat is re-sent at most once per **1 s**, not
+  the 5 s in the plan. The 5 s figure is the readiness staleness default
+  (`IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS`), so 1 s keeps a safe margin. Changes are still
+  written immediately, and the runner's heartbeat mutex now holds the last written update. A
+  test drives the store's test clock to prove that idle polls skip, a drain writes at once, and
+  the refresh happens after the interval.
+
+Verification:
+- `cargo test -p izwi-server --lib`: 746 passed.
+- `cargo clippy -p izwi-server --all-targets -D warnings`: clean.
+- `rustfmt --check` on every touched file: clean. `cargo fmt --check` still reports drift in
+  files this change does not touch, and that drift pre-dates it.
+- Not done yet: Modal redeploy and live verification. The deploy builds from the
+  `fix-qwen36-serving` remote ref, so it needs a push first.
+
+## Follow-up (infra, not in this fix)
+
+- SQLite in WAL mode lives on a Modal Volume (`/data/izwi.sqlite3`). Volumes auto-commit every
+  few seconds, have no distributed locking, and resolve concurrent writes as last-write-wins
+  (redeploy overlap = two writers). Integrity is fine today, but this is a corruption risk.
+  Options:
+  - keep the live DB on container-local disk and snapshot it to the Volume;
+  - point `IZWI_DATABASE_URL` at managed Postgres, which is already supported.
+  Document the choice in `izwi-deploy-examples/examples/01-modal-cuda`.
+
 # Plan — Separate Qwen3.5 / Qwen3.6 / Qwen3.8 model code — 2026-10-10
 
 Problem: `qwen36moe` runs on the `qwen35` trunk. The 3.6 rollout (#217-#220 plus
