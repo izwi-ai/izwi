@@ -428,6 +428,10 @@ struct Qwen36LinearAttention {
     /// one GEMV each on the fused decode path.
     packed_in: Option<Qwen36Projection>,
     packed_beta_alpha: Option<Qwen36Projection>,
+    /// The dense beta+alpha pack as F32 rows for the router GEMV kernel
+    /// (one izwi launch instead of a cuBLAS GEMM, which keeps CUDA graph
+    /// segments free of cuBLAS), when it matches the pack on this device.
+    beta_alpha_rows: Option<Tensor>,
 }
 
 /// Environment switch for the fused DeltaNet decode (`legacy`/`off`/`0`
@@ -721,6 +725,52 @@ fn pack_projections(parts: &mut [&mut Qwen36Projection]) -> Option<Qwen36Project
         }
     }
     Some(packed)
+}
+
+/// F32 rows of a small dense 16-bit projection, for the router GEMV kernel
+/// (`moe::router_logits`, which rounds through the activation dtype as the
+/// dense projection does). Kept only if a two-row probe matches the dense
+/// projection on its own device.
+fn gemv_rows(projection: &Qwen36Projection) -> Option<Tensor> {
+    let Qwen36Projection::Quantized(QMatMul::Tensor(weight)) = projection else {
+        return None;
+    };
+    let dtype = weight.dtype();
+    let (_, cols) = weight.dims2().ok()?;
+    if !matches!(dtype, DType::F16 | DType::BF16) || !cols.is_multiple_of(4) {
+        return None;
+    }
+    let rows = weight.to_dtype(DType::F32).ok()?;
+    let probe = Tensor::from_vec(
+        (0..2 * cols)
+            .map(|i| ((i as f32) * 0.754_877_7).sin() * 1.5)
+            .collect::<Vec<_>>(),
+        (2, 1, cols),
+        &Device::Cpu,
+    )
+    .and_then(|t| t.to_dtype(dtype))
+    .and_then(|t| t.to_device(weight.device()))
+    .ok()?;
+    let host = |t: Tensor| -> Option<Vec<f32>> {
+        t.to_dtype(DType::F32)
+            .ok()?
+            .flatten_all()
+            .ok()?
+            .to_device(&Device::Cpu)
+            .ok()?
+            .to_vec1::<f32>()
+            .ok()
+    };
+    let expected = host(projection.forward(&probe).ok()?)?;
+    let actual = host(
+        crate::kernels::cuda::moe::router_logits(&probe.reshape((2, cols)).ok()?, &rows)
+            .ok()?
+            .to_dtype(dtype)
+            .ok()?,
+    )?;
+    compare_values("beta/alpha GEMV rows", &actual, &expected, 0.01, 0.02)
+        .ok()
+        .map(|()| rows)
 }
 
 impl Qwen36Projection {
@@ -2714,6 +2764,7 @@ impl Qwen36LinearAttention {
             fused_decode_path: Qwen36FusedPath::legacy("unresolved"),
             packed_in: None,
             packed_beta_alpha: None,
+            beta_alpha_rows: None,
         };
         let cuda = source.cuda_switches();
         if fused_device(device, false)
@@ -2732,6 +2783,7 @@ impl Qwen36LinearAttention {
     fn pack_projections(&mut self) {
         self.packed_in = pack_projections(&mut [&mut self.qkv_proj, &mut self.gate_proj]);
         self.packed_beta_alpha = pack_projections(&mut [&mut self.beta_proj, &mut self.alpha_proj]);
+        self.beta_alpha_rows = self.packed_beta_alpha.as_ref().and_then(gemv_rows);
     }
 
     /// `(mixed_qkv, z, beta_raw, alpha)` projection outputs, through the packed
@@ -2747,14 +2799,26 @@ impl Qwen36LinearAttention {
             }
             None => (self.qkv_proj.forward(x)?, self.gate_proj.forward(x)?),
         };
-        let (beta_raw, alpha) = match &self.packed_beta_alpha {
-            Some(packed) => {
-                let out = packed.forward(x)?;
-                (
-                    out.narrow(D::Minus1, 0, self.num_v_heads)?,
-                    out.narrow(D::Minus1, self.num_v_heads, self.num_v_heads)?,
+        let beta_alpha = match (&self.beta_alpha_rows, &self.packed_beta_alpha) {
+            (Some(rows), _) if matches!(x.dtype(), DType::F16 | DType::BF16) => {
+                let (batch, seq, hidden) = x.dims3()?;
+                Some(
+                    crate::kernels::cuda::moe::router_logits(
+                        &x.reshape((batch * seq, hidden))?,
+                        rows,
+                    )?
+                    .to_dtype(x.dtype())?
+                    .reshape((batch, seq, rows.dim(0)?))?,
                 )
             }
+            (_, Some(packed)) => Some(packed.forward(x)?),
+            _ => None,
+        };
+        let (beta_raw, alpha) = match beta_alpha {
+            Some(out) => (
+                out.narrow(D::Minus1, 0, self.num_v_heads)?,
+                out.narrow(D::Minus1, self.num_v_heads, self.num_v_heads)?,
+            ),
             None => (self.beta_proj.forward(x)?, self.alpha_proj.forward(x)?),
         };
         Ok((mixed_qkv, z, beta_raw, alpha))
@@ -4074,6 +4138,7 @@ mod tests {
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
+            beta_alpha_rows: None,
         };
         let initial_state = |row: usize| Qwen36LayerRuntimeState::Linear {
             conv_state: Some(ConvRingState::new(
@@ -4208,6 +4273,7 @@ mod tests {
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
+            beta_alpha_rows: None,
         }
     }
 
@@ -4805,6 +4871,7 @@ mod tests {
             fused.attn_gate_summary()
         );
         assert_eq!(legacy.moe_backend_summary()["backend"], "legacy");
+        assert_beta_alpha_gemv(&fused);
 
         assert_tracks_reference(&fused, &legacy, 0.01, false);
     }
@@ -4902,6 +4969,19 @@ mod tests {
         }
     }
 
+    /// Every DeltaNet layer runs its dense beta/alpha pack through the router
+    /// GEMV (16-bit trunks: the production dtypes).
+    fn assert_beta_alpha_gemv(model: &super::Qwen36TextModel) {
+        for (index, layer) in model.layers.iter().enumerate() {
+            if let super::Qwen36Mixer::Linear(linear) = &layer.mixer {
+                assert!(
+                    linear.beta_alpha_rows.is_some(),
+                    "layer {index}: beta/alpha pack not on the router GEMV"
+                );
+            }
+        }
+    }
+
     /// The GPU legs load through production resolution, not the test hook:
     /// each listed fast path must pass its self-check on the device and
     /// resolve to fused.
@@ -4920,6 +5000,7 @@ mod tests {
         for (path, summary) in paths {
             assert_eq!(summary["backend"], "fused", "{path}: {summary}");
         }
+        assert_beta_alpha_gemv(model);
     }
 
     /// Metal runs F16 activations, so the reference is the CPU legacy trunk.
@@ -5399,6 +5480,7 @@ mod tests {
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
             packed_beta_alpha: None,
+            beta_alpha_rows: None,
         };
 
         let bf16_input = |values: &[f32], seq: usize| {
