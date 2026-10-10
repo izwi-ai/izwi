@@ -1,3 +1,130 @@
+# Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
+
+Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
+This is a planning entry only. No code has changed.
+
+**Revised 2026-10-10: there is no measurement phase.** There is no access to a profiler or to
+same-H100 vLLM/llama.cpp runs, so work starts at Phase 1. Doc §5.1 covers how each phase is
+verified:
+- the app's own tokens/ms/t/s readout on a fixed prompt;
+- structural tests that need no GPU;
+- path counters in diagnostics;
+- a self-check that runs when the model loads on the GPU.
+
+**Symptom / baseline.** H100, Qwen3.6-35B-A3B-FP8, read from the app: 2,049 tokens, 159,879 ms,
+**13 t/s** (77 ms/token). Published references: vLLM **212 tok/s** on one H100 SXM (139-151 on
+H100 NVL); llama.cpp 269-275 tok/s (Q8_0) on an RTX PRO 6000.
+
+**Root cause, counted from code.** Host-dispatch bound. Per token: about 6,200 Candle ops, about
+655 host-to-device copies, **about 82 blocking device-to-host syncs**. About 65% of the overhead
+is `SparseMoeDispatcher::dispatch` (`models/shared/moe.rs:166-216`):
+- it reads the top-k back with `to_vec2` (2 syncs per layer);
+- then it loops over the 8 experts, each with 2 `from_vec` uploads, `index_select`, 3 FP8 GEMVs
+  and an `index_add`.
+
+The rest is unfused GDN (about 49 ops per layer), norms and RoPE, a byte-wise FP8 GEMV, and no
+CUDA graphs. MTP is off, and in its current form it could not help.
+
+**Promotion rule** (replaces "exact-SHA hardware evidence"). A fast path is on by default when:
+- its CPU-reference tests and golden parity are green;
+- the CUDA build compiles in CI;
+- its load-time self-check passes on the deployed GPU;
+- the fixed-prompt check is no slower than the previous deploy.
+
+The kill switch (environment variable) is the rollback.
+
+## Fixed-prompt check (after every deploy that lands a phase)
+- [ ] New thread, model warm. Same long-answer prompt and sampling settings every time.
+- [ ] Record tokens / ms / t/s and the git SHA in the Review table below. Only compare runs with
+      ≥1,000 tokens.
+- [ ] Expected: Phase 1 → 35-50 · Phase 2 → 80-120 · Phase 3 → 150-200+ · Phase 4 → ×1.1-1.4.
+      Well below range: check the diagnostics for a fallback first.
+
+## Phase 1 — Device-resident fused MoE, CUDA (M) — START HERE — gate ≥35 t/s, 0 MoE readbacks
+- [ ] 1.0 Verification scaffolding (lands first):
+  - counting readback helper for every `to_vec*`/`to_scalar` on the decode path;
+  - path counters (`moe_backend`, `gdn_decode_kernel`, `graph_replays`/`eager_steps`,
+    `self_check_failed`) in `runtime_diagnostics`;
+  - load-time self-check framework (probe vs legacy oracle → auto-disable on mismatch);
+  - optional TTFT plus decode-only t/s chip.
+- [ ] Fused router kernel (softmax, top-8, renorm), with ids and weights left on the device.
+- [ ] Stacked per-layer `w13`/`w2` FP8 residency, with the shared expert folded in as slot 9
+      (weight `sigmoid(gate·x)`).
+- [ ] `fp8_moe_gemv` decode kernel (gate+up+SiLU-mul, then down plus weighted reduce) and a
+      grouped FP8 prefill GEMM (sorted ids).
+- [ ] Control path `IZWI_QWEN36_MOE_BACKEND=q8_gguf` through Candle 0.11 `moe_gemm_gguf`;
+      `legacy` kill switch.
+- [ ] Checks:
+  - CPU reference of the grouped algorithm and the router matches the legacy dispatcher
+    (T=1/4/9/256, collisions, shared slot);
+  - golden parity;
+  - readback counter shows 0 MoE readbacks per token (80 on `legacy`, which proves it RED);
+  - CI CUDA compile;
+  - GPU self-check at load;
+  - fixed-prompt check, and diagnostics show `moe_backend=fp8_grouped`.
+
+## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — gate ≥80 t/s
+- [ ] Rewrite `fp8.cu` `mv`: 16-byte loads, Marlin bit-trick E4M3 → BF16 with the bias folded
+      into the scales.
+- [ ] Packed projections (qkv+z, a+b, attention q/k/v).
+- [ ] GDN decode in 2-3 launches: conv update, gating + L2 + delta rule with in-kernel head
+      mapping (no expand or `cat`), gated RMSNorm. State updated in place.
+- [ ] Fused add + rms_norm(1+w); device RoPE table plus fused qk-norm/RoPE/gate; fused KV write.
+- [ ] Stop per-quantum state restore and re-stage; `lm_head` plus argmax in one pass.
+- [ ] Each kernel: CPU reference (grouped and tiled head orders), load-time self-check,
+      `IZWI_QWEN36_FUSED_DECODE=0` kill switch. The GEMV gain is partly hidden until Phase 3.
+- [ ] Optional: BF16 GDN state experiment, parity-gated.
+
+## Phase 3 — Whole-step CUDA graphs plus async scheduling (M) — gate ≥150 t/s
+- [ ] Capture feasibility first (one GDN and one attention layer, mistral.rs recipe); fall back
+      to an activation arena if Candle allocations fail inside capture.
+- [ ] Persistent device input buffers; graph-safe paged attention; buckets 1-32; graph LRU.
+- [ ] Async scheduling: prepare step n+1 during step n, pinned async token read.
+- [ ] Replay self-check (first replay vs one eager step, per bucket);
+      `IZWI_QWEN36_CUDA_GRAPHS=0` kill switch.
+
+## Phase 4 — MTP (M) — gate ≥1.1× Phase 3 on the fixed prompt, else default off
+- [ ] Batched verification (M = 1+depth) as a full graph.
+- [ ] K-slot GDN and conv state snapshots written by the kernel, replacing the 60 MB copies.
+- [ ] Finish the census and handoff (`MTP_MANIFEST_CENSUS_VERIFIED`); adaptive depth 1-2;
+      acceptance rate in diagnostics.
+
+## Phase 5 — Prefill / TTFT (M-L)
+- [ ] FP8 tensor-core grouped GEMM on SM90; chunked GDN prefill (FLA chunk 64); larger prefill
+      chunks; hybrid prefix-cache snapshots at message boundaries. Judged by the TTFT chip from 1.0.
+
+## Phase 6 — Metal (M-L)
+- [ ] Q8_0 stacked experts instead of F16 expansion (67.5 → about 37 GiB); validate F16 overflow
+      on real weights.
+- [ ] Device-routed MoE `CustomOp` (`topk_moe`, `mul_mv_id`/`mul_mm_id`, fused gate+up,
+      `moe_reduce`).
+- [ ] Register-resident fused GDN kernel (MLX `gated_delta_step` style) that handles the grouped
+      head order.
+- [ ] Device RoPE table, fused norms, encoder tuning.
+- [ ] Judge on a 16 GB dev Mac: golden parity, plus relative gains on the synthetic real-geometry
+      `qwen36moe_layer_bench`.
+
+## Phase 7 — CPU (S-M)
+- [ ] Q8_0 `lm_head` and embeddings (−40% bytes per token); consistent `CANDLE_NUM_THREADS`.
+- [ ] Grouped MoE (expert-to-token table, fused gate+up, one Rayon dispatch; GEMM per expert for
+      prefill); fused SIMD GDN; parallel cached requant.
+- [ ] Judge with golden parity and the layer bench.
+
+## Phase 8 — Smaller NVIDIA GPUs and 4-bit (M-L)
+- [ ] FP8 kernels on SM80/86/89/120 (bit-trick dequant, `cvt` on SM89+); fix admission for the
+      SM<80 fallback; fix the misleading `projection_backend="q8"`.
+- [ ] Real llama.cpp `qwen35moe` GGUF ingestion (Q4_K_M about 21 GB, Q8_0, MTP GGUFs) for
+      24-32 GB GPUs, smaller Macs and CPU.
+- [ ] Later: expert offload / GPU expert LRU for 8-16 GB GPUs.
+
+## Review
+
+| Date | SHA | Phase landed | Tokens | ms | t/s | Diagnostics notes |
+|---|---|---|---|---|---|---|
+| 2026-10-10 | (pre-plan) | baseline | 2,049 | 159,879 | 13 | legacy MoE, no graphs, MTP off |
+
+---
+
 # Plan — Chat turn persistence fails with "Failed to append chat turn message" — 2026-10-10
 
 Symptom (Modal `izwi-cuda`, Qwen3.6-35B-A3B-FP8, thread `e2612e11…`): the stream runs to

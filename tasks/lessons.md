@@ -158,3 +158,13 @@
   `git hash-object -w` + `git update-index --cacheinfo`, test the index state under
   `git stash push --keep-index`, then restore with `git checkout stash@{0} -- <files>` and
   drop the stash — `git stash pop` conflicts once the staged hunks are committed.
+- Do not make a plan's first phase depend on measurement access the user may not have
+  (profilers, benchmark lanes, side-by-side runs of other engines on the production GPU).
+  Before gating work on "measure first", confirm what hardware and tooling the user can reach.
+  When the answer is "none beyond the deployed app", verify progress with what exists: the app's
+  own throughput readout on a fixed prompt, CPU-testable structural invariants (count
+  device-to-host readbacks through one helper), path counters in diagnostics, and load-time
+  self-checks that compare each new GPU fast path to the legacy path and disable it on
+  mismatch. Start with the phase whose targets are COUNTED in code (for example, 80 syncs per
+  token), not estimated, so it is safe without a profile. Restate any earlier promotion rule
+  that assumed hardware evidence instead of silently ignoring it.
