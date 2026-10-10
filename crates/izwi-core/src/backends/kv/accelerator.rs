@@ -545,6 +545,27 @@ fn update_resident_byte_gauge(gauge: &AtomicU64, before: usize, after: usize) {
     }
 }
 
+/// Opt-in state of the CUDA split decode kernel for one arena.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+struct CudaSplitDecodeGate {
+    /// Requested and not yet failed a check.
+    enabled: bool,
+    /// `(dtype, query heads, KV heads, head dim)` that passed the first-use
+    /// checks.
+    verified: Vec<(DType, usize, usize, usize)>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaSplitDecodeGate {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            verified: Vec::new(),
+        }
+    }
+}
+
 /// Device-resident KV storage backed by Candle's accelerator tensors.
 ///
 /// `new_mutation_only` is deliberately explicit: it exposes the independently
@@ -586,7 +607,10 @@ pub struct CandleAcceleratorKvArena {
     portable_attention_dispatches: AtomicU64,
     cuda_native_attention_dispatches: AtomicU64,
     cuda_flash_attention_dispatches: AtomicU64,
+    cuda_split_decode_dispatches: AtomicU64,
     metal_native_attention_dispatches: AtomicU64,
+    #[cfg(feature = "cuda")]
+    cuda_split_decode: Mutex<CudaSplitDecodeGate>,
     cuda_graph_warmups: AtomicU64,
     cuda_graph_captures: AtomicU64,
     cuda_graph_replays: AtomicU64,
@@ -693,7 +717,12 @@ impl CandleAcceleratorKvArena {
             portable_attention_dispatches: AtomicU64::new(0),
             cuda_native_attention_dispatches: AtomicU64::new(0),
             cuda_flash_attention_dispatches: AtomicU64::new(0),
+            cuda_split_decode_dispatches: AtomicU64::new(0),
             metal_native_attention_dispatches: AtomicU64::new(0),
+            #[cfg(feature = "cuda")]
+            cuda_split_decode: Mutex::new(CudaSplitDecodeGate::new(
+                backend == BackendKind::Cuda && crate::kernels::cuda::split_decode::requested(),
+            )),
             cuda_graph_warmups: AtomicU64::new(0),
             cuda_graph_captures: AtomicU64::new(0),
             cuda_graph_replays: AtomicU64::new(0),
@@ -730,6 +759,7 @@ impl CandleAcceleratorKvArena {
             KvAttentionProvider::Portable => &self.portable_attention_dispatches,
             KvAttentionProvider::CudaNative => &self.cuda_native_attention_dispatches,
             KvAttentionProvider::CudaFlashAttention => &self.cuda_flash_attention_dispatches,
+            KvAttentionProvider::CudaSplitDecode => &self.cuda_split_decode_dispatches,
             KvAttentionProvider::MetalNative => &self.metal_native_attention_dispatches,
             KvAttentionProvider::CpuReference => return,
         };
@@ -1352,8 +1382,121 @@ impl CandleAcceleratorKvArena {
         layer: &AcceleratorLayerStorage,
         args: PagedKvDecodeArgs<'_>,
     ) -> Result<Tensor> {
-        let batch_size = args.batch.sequences.len();
         let device_metadata = self.cached_decode_plan(args.batch)?;
+        if let Some(output) = self.cuda_split_paged_decode(layer, &args, &device_metadata)? {
+            return Ok(output);
+        }
+        self.cuda_provider_paged_decode(layer, &args, &device_metadata)
+    }
+
+    /// The opt-in split decode kernel (`IZWI_CUDA_SPLIT_DECODE=1`). The first
+    /// call for each geometry runs the synthetic self-check and compares its
+    /// output with the current provider's; any failure turns the kernel off for
+    /// this arena and leaves the provider in place.
+    #[cfg(feature = "cuda")]
+    fn cuda_split_paged_decode(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvDecodeArgs<'_>,
+        device_metadata: &DecodeDeviceMetadata,
+    ) -> Result<Option<Tensor>> {
+        use crate::kernels::cuda::split_decode;
+
+        let query_heads = args.queries.dims()[1];
+        let geometry = (
+            self.storage_dtype,
+            query_heads,
+            layer.num_kv_heads,
+            layer.key_head_dim,
+        );
+        let gate = || {
+            self.cuda_split_decode
+                .lock()
+                .map_err(|_| Error::InferenceError("CUDA split decode gate was poisoned".into()))
+        };
+        let verified = {
+            let gate = gate()?;
+            if !gate.enabled
+                || self.cuda_kv_storage != CudaKvStorageFormat::Dense
+                || args.queries.dtype() != self.storage_dtype
+                || !split_decode::supported(
+                    self.storage_dtype,
+                    query_heads,
+                    layer.num_kv_heads,
+                    layer.key_head_dim,
+                    layer.value_head_dim,
+                )
+            {
+                return Ok(None);
+            }
+            gate.verified.contains(&geometry)
+        };
+        let batch = args.batch.sequences.len();
+        let run = || {
+            split_decode::paged_decode(
+                args.queries,
+                &layer.keys,
+                &layer.values,
+                &device_metadata.native_metadata,
+                batch,
+                query_heads,
+                layer.num_kv_heads,
+                self.config.page_tokens as usize,
+                device_metadata.max_blocks,
+                args.softmax_scale,
+                args.softcap,
+                split_decode::partitions(batch, layer.num_kv_heads, device_metadata.max_context),
+            )
+        };
+        if verified {
+            let output = run()?;
+            self.record_attention_provider(KvAttentionProvider::CudaSplitDecode);
+            return Ok(Some(output));
+        }
+        let checked = (|| -> Result<Tensor> {
+            split_decode::self_check(
+                &self.device,
+                self.storage_dtype,
+                query_heads,
+                layer.num_kv_heads,
+                layer.key_head_dim,
+            )?;
+            let output = run()?;
+            let reference = self.cuda_provider_paged_decode(layer, args, device_metadata)?;
+            split_decode::compare(&output, &reference)?;
+            Ok(output)
+        })();
+        let mut gate = gate()?;
+        match checked {
+            Ok(output) => {
+                gate.verified.push(geometry);
+                tracing::info!(
+                    dtype = ?geometry.0,
+                    query_heads,
+                    kv_heads = geometry.2,
+                    head_dim = geometry.3,
+                    "CUDA split decode verified against the current attention provider"
+                );
+                self.record_attention_provider(KvAttentionProvider::CudaSplitDecode);
+                Ok(Some(output))
+            }
+            Err(error) => {
+                gate.enabled = false;
+                tracing::warn!("CUDA split decode disabled: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// FlashAttention-2 when eligible, otherwise the native paged kernel.
+    #[cfg(feature = "cuda")]
+    fn cuda_provider_paged_decode(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvDecodeArgs<'_>,
+        device_metadata: &DecodeDeviceMetadata,
+    ) -> Result<Tensor> {
+        let batch_size = args.batch.sequences.len();
         let tuning = self.cuda_paged_tuning(
             layer.key_head_dim,
             layer.value_head_dim,
@@ -2155,6 +2298,7 @@ impl KvArena for CandleAcceleratorKvArena {
             cuda_flash_attention_dispatches: self
                 .cuda_flash_attention_dispatches
                 .load(Ordering::Relaxed),
+            cuda_split_decode_dispatches: self.cuda_split_decode_dispatches.load(Ordering::Relaxed),
             metal_native_attention_dispatches: self
                 .metal_native_attention_dispatches
                 .load(Ordering::Relaxed),

@@ -25,6 +25,7 @@ pub mod norm;
 pub mod rope;
 pub mod sampling;
 pub mod segment_graph;
+pub mod split_decode;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

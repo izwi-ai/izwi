@@ -154,6 +154,8 @@ pub struct KvArenaOperationStats {
     pub portable_attention_dispatches: u64,
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
+    /// Opt-in grouped-query split decode (`IZWI_CUDA_SPLIT_DECODE=1`).
+    pub cuda_split_decode_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
     pub cuda_graph_warmups: u64,
     pub cuda_graph_captures: u64,
@@ -174,6 +176,7 @@ pub enum KvAttentionProvider {
     CudaNative,
     CudaFlashAttention,
     MetalNative,
+    CudaSplitDecode,
 }
 
 impl KvAttentionProvider {
@@ -184,6 +187,7 @@ impl KvAttentionProvider {
             Self::CudaNative => "cuda_native",
             Self::CudaFlashAttention => "cuda_flash_attention",
             Self::MetalNative => "metal_native",
+            Self::CudaSplitDecode => "cuda_split_decode",
         }
     }
 
@@ -198,6 +202,7 @@ impl KvAttentionProvider {
             3 => Some(Self::CudaNative),
             4 => Some(Self::CudaFlashAttention),
             5 => Some(Self::MetalNative),
+            6 => Some(Self::CudaSplitDecode),
             _ => None,
         }
     }

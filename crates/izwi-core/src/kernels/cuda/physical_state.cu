@@ -675,6 +675,412 @@ IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(f16, __half)
 IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(bf16, __nv_bfloat16)
 #endif
 
+// Grouped-query split decode. One block owns (row, KV head, partition) and
+// reads each K/V row of its token range once for every query head sharing that
+// KV head; the kernels above (and FlashAttention-2 without splits) run one
+// block per query head over the whole context, so B = 1 decode occupies only
+// Hq SMs and re-reads each KV row group-size times. A warp scores 32 keys at a
+// time, one key per lane, so scores need no cross-lane reduction, then folds
+// those 32 value rows into accumulators that give each lane a slice of the
+// head dimension. Partitions write the [max, sum, unnormalized output]
+// partials of the partitioned kernel; izwi_paged_decode_split_reduce merges
+// them. Token ranges derive from the device context length, so the host only
+// chooses the partition count.
+#define IZWI_SPLIT_DECODE_WARPS 4
+#define IZWI_SPLIT_DECODE_MAX_GROUP 8
+#define IZWI_SPLIT_DECODE_MAX_PARTITIONS 1024
+
+// Loads N contiguous elements as floats. The host requires base pointers
+// aligned to 16 bytes, and callers index in multiples of N.
+template <typename T, int N>
+__device__ __forceinline__ void izwi_load_floats(const T* __restrict__ source,
+                                                 float* target) {
+  if constexpr (N * sizeof(T) == 16) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(source);
+    const T* lanes = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      target[i] = izwi_to_float(lanes[i]);
+    }
+  } else if constexpr (N * sizeof(T) == 8) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(source);
+    const T* lanes = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      target[i] = izwi_to_float(lanes[i]);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      target[i] = izwi_to_float(source[i]);
+    }
+  }
+}
+
+template <typename T, int HEAD_DIM>
+__device__ void izwi_paged_decode_gqa_partition(
+    const T* __restrict__ queries,
+    const T* __restrict__ keys,
+    const T* __restrict__ values,
+    const unsigned int* __restrict__ metadata,
+    float* __restrict__ partials,
+    int batch,
+    int query_heads,
+    int kv_heads,
+    int page_tokens,
+    int max_blocks,
+    int capacity_pages,
+    int num_partitions,
+    float softmax_scale,
+    float softcap) {
+  constexpr int MAX_GROUP = IZWI_SPLIT_DECODE_MAX_GROUP;
+  constexpr int LANE_DIMS = HEAD_DIM / 32;
+  constexpr int KEY_CHUNK = 16 / sizeof(T);
+  static_assert(HEAD_DIM % (32 * 4) == 0, "head dim must give each lane 4n dims");
+  static_assert(HEAD_DIM % KEY_CHUNK == 0, "key rows load in 16-byte chunks");
+  __shared__ float shared_queries[MAX_GROUP * HEAD_DIM];
+  __shared__ float shared_output[MAX_GROUP * HEAD_DIM];
+  __shared__ float shared_max[IZWI_SPLIT_DECODE_WARPS][MAX_GROUP];
+  __shared__ float shared_sum[IZWI_SPLIT_DECODE_WARPS][MAX_GROUP];
+  __shared__ int shared_corrupt;
+
+  const int row_kv = blockIdx.x;
+  const int partition = blockIdx.y;
+  if (row_kv >= batch * kv_heads || partition >= num_partitions) {
+    return;
+  }
+  const int row = row_kv / kv_heads;
+  const int kv_head = row_kv - row * kv_heads;
+  const int group = query_heads / kv_heads;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const unsigned int context_len = metadata[row];
+  const unsigned int first_page_offset = metadata[batch + row];
+  const unsigned int* block_table = metadata + batch * 2 + row * max_blocks;
+  const unsigned long long partial_stride = HEAD_DIM + 2;
+
+  // Every condition is uniform across the block. An invalid row writes empty
+  // partials, which the reduction turns into a zero output.
+  bool valid = group >= 1 && group <= MAX_GROUP &&
+               group * kv_heads == query_heads && page_tokens > 0 &&
+               max_blocks > 0 && capacity_pages > 0 && num_partitions > 0 &&
+               context_len > 0 &&
+               first_page_offset < static_cast<unsigned int>(page_tokens);
+  if (valid) {
+    const unsigned long long physical_tokens =
+        static_cast<unsigned long long>(context_len) + first_page_offset;
+    valid = (physical_tokens + page_tokens - 1) / page_tokens <=
+            static_cast<unsigned long long>(max_blocks);
+  }
+  unsigned int token_start = 0;
+  unsigned int token_end = 0;
+  if (valid) {
+    const unsigned int span =
+        (context_len + num_partitions - 1) / num_partitions;
+    token_start = min(context_len, partition * span);
+    token_end = min(context_len, token_start + span);
+  }
+
+  for (int i = threadIdx.x; i < group * HEAD_DIM && valid; i += blockDim.x) {
+    shared_queries[i] =
+        izwi_to_float(queries[(row * query_heads + kv_head * group) * HEAD_DIM + i]);
+  }
+  if (threadIdx.x == 0) {
+    shared_corrupt = 0;
+  }
+  __syncthreads();
+
+  float running_max[MAX_GROUP];
+  float running_sum[MAX_GROUP];  // this lane's keys only, reduced at the end
+  float accumulator[MAX_GROUP][LANE_DIMS];
+#pragma unroll
+  for (int g = 0; g < MAX_GROUP; ++g) {
+    running_max[g] = -INFINITY;
+    running_sum[g] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < LANE_DIMS; ++j) {
+      accumulator[g][j] = 0.0f;
+    }
+  }
+
+  for (unsigned int tile = token_start + warp * 32; tile < token_end;
+       tile += IZWI_SPLIT_DECODE_WARPS * 32) {
+    const unsigned int token = tile + lane;
+    bool live = token < token_end;
+    int row_offset = 0;
+    float score[MAX_GROUP];
+#pragma unroll
+    for (int g = 0; g < MAX_GROUP; ++g) {
+      score[g] = 0.0f;
+    }
+    if (live) {
+      const unsigned int physical_token = token + first_page_offset;
+      const unsigned int logical_page = physical_token / page_tokens;
+      const unsigned int physical_page = block_table[logical_page];
+      if (physical_page >= static_cast<unsigned int>(capacity_pages)) {
+        shared_corrupt = 1;
+        live = false;
+      } else {
+        row_offset = ((physical_page * page_tokens +
+                       (physical_token - logical_page * page_tokens)) *
+                          kv_heads +
+                      kv_head) *
+                     HEAD_DIM;
+        const T* key = keys + row_offset;
+#pragma unroll 4
+        for (int d = 0; d < HEAD_DIM; d += KEY_CHUNK) {
+          float key_chunk[KEY_CHUNK];
+          izwi_load_floats<T, KEY_CHUNK>(key + d, key_chunk);
+#pragma unroll
+          for (int g = 0; g < MAX_GROUP; ++g) {
+            if (g < group) {
+              const float* query = shared_queries + g * HEAD_DIM + d;
+#pragma unroll
+              for (int j = 0; j < KEY_CHUNK; ++j) {
+                score[g] += query[j] * key_chunk[j];
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Lane 0 always holds a live token, so each tile maximum is finite.
+#pragma unroll
+    for (int g = 0; g < MAX_GROUP; ++g) {
+      if (g < group) {
+        float scaled = score[g] * softmax_scale;
+        if (softcap > 0.0f) {
+          scaled = softcap * tanhf(scaled / softcap);
+        }
+        float tile_max = live ? scaled : -INFINITY;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, offset));
+        }
+        const float next_max = fmaxf(running_max[g], tile_max);
+        const float rescale = expf(running_max[g] - next_max);
+        running_max[g] = next_max;
+        score[g] = live ? expf(scaled - next_max) : 0.0f;
+        running_sum[g] = running_sum[g] * rescale + score[g];
+#pragma unroll
+        for (int j = 0; j < LANE_DIMS; ++j) {
+          accumulator[g][j] *= rescale;
+        }
+      }
+    }
+
+    const int tile_keys = static_cast<int>(min(32u, token_end - tile));
+    for (int key = 0; key < tile_keys; ++key) {
+      const int value_row = __shfl_sync(0xffffffffu, row_offset, key);
+      float value[LANE_DIMS];
+      izwi_load_floats<T, LANE_DIMS>(values + value_row + lane * LANE_DIMS, value);
+#pragma unroll
+      for (int g = 0; g < MAX_GROUP; ++g) {
+        if (g < group) {
+          const float weight = __shfl_sync(0xffffffffu, score[g], key);
+#pragma unroll
+          for (int j = 0; j < LANE_DIMS; ++j) {
+            accumulator[g][j] += weight * value[j];
+          }
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int g = 0; g < MAX_GROUP; ++g) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      running_sum[g] += __shfl_xor_sync(0xffffffffu, running_sum[g], offset);
+    }
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int g = 0; g < MAX_GROUP; ++g) {
+      shared_max[warp][g] = running_max[g];
+      shared_sum[warp][g] = running_sum[g];
+    }
+  }
+  __syncthreads();
+
+  // Merge the warps in a fixed order so the result is deterministic.
+  float block_max[MAX_GROUP];
+  float block_sum[MAX_GROUP];
+  float warp_scale[MAX_GROUP];
+  const bool corrupt = shared_corrupt != 0;
+#pragma unroll
+  for (int g = 0; g < MAX_GROUP; ++g) {
+    block_max[g] = -INFINITY;
+    for (int w = 0; w < IZWI_SPLIT_DECODE_WARPS; ++w) {
+      block_max[g] = fmaxf(block_max[g], shared_max[w][g]);
+    }
+    block_sum[g] = 0.0f;
+    warp_scale[g] = 0.0f;
+    if (block_max[g] != -INFINITY && !corrupt) {
+      for (int w = 0; w < IZWI_SPLIT_DECODE_WARPS; ++w) {
+        if (shared_max[w][g] != -INFINITY) {
+          block_sum[g] += shared_sum[w][g] * expf(shared_max[w][g] - block_max[g]);
+        }
+      }
+      if (running_max[g] != -INFINITY) {
+        warp_scale[g] = expf(running_max[g] - block_max[g]);
+      }
+    } else {
+      block_max[g] = -INFINITY;
+    }
+  }
+  for (int w = 0; w < IZWI_SPLIT_DECODE_WARPS; ++w) {
+    if (warp == w) {
+#pragma unroll
+      for (int g = 0; g < MAX_GROUP; ++g) {
+        if (g < group) {
+#pragma unroll
+          for (int j = 0; j < LANE_DIMS; ++j) {
+            const int index = g * HEAD_DIM + lane * LANE_DIMS + j;
+            const float scaled = accumulator[g][j] * warp_scale[g];
+            shared_output[index] = w == 0 ? scaled : shared_output[index] + scaled;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int i = threadIdx.x; i < group * HEAD_DIM; i += blockDim.x) {
+    const int g = i / HEAD_DIM;
+    const unsigned long long base =
+        (static_cast<unsigned long long>(row * query_heads + kv_head * group + g) *
+             num_partitions +
+         partition) *
+        partial_stride;
+    partials[base + 2 + (i - g * HEAD_DIM)] =
+        valid && !corrupt ? shared_output[i] : 0.0f;
+  }
+  if (threadIdx.x < group) {
+    const int g = threadIdx.x;
+    const unsigned long long base =
+        (static_cast<unsigned long long>(row * query_heads + kv_head * group + g) *
+             num_partitions +
+         partition) *
+        partial_stride;
+    // Indexing by the thread's own head keeps the register arrays static.
+    float head_max = -INFINITY;
+    float head_sum = 0.0f;
+#pragma unroll
+    for (int h = 0; h < MAX_GROUP; ++h) {
+      if (h == g) {
+        head_max = block_max[h];
+        head_sum = block_sum[h];
+      }
+    }
+    partials[base] = valid ? head_max : -INFINITY;
+    partials[base + 1] = valid ? head_sum : 0.0f;
+  }
+}
+
+// Merges split-decode partials: one block per (row, query head). Unlike the
+// serial partition reduction above, the partition weights are computed in one
+// parallel pass, so each output dimension is an independent weighted sum.
+template <typename T>
+__device__ void izwi_paged_decode_split_reduce(
+    const float* __restrict__ partials,
+    T* __restrict__ output,
+    int row_heads,
+    int value_dim,
+    int num_partitions) {
+  __shared__ float weights[IZWI_SPLIT_DECODE_MAX_PARTITIONS];
+  __shared__ float scratch[32];
+  const int row_head = blockIdx.x;
+  if (row_head >= row_heads || num_partitions > IZWI_SPLIT_DECODE_MAX_PARTITIONS) {
+    return;
+  }
+  const unsigned long long stride = static_cast<unsigned long long>(value_dim) + 2;
+  const float* row = partials + static_cast<unsigned long long>(row_head) * num_partitions * stride;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int warps = (blockDim.x + 31) >> 5;
+
+  float local_max = -INFINITY;
+  for (int p = threadIdx.x; p < num_partitions; p += blockDim.x) {
+    if (row[p * stride + 1] > 0.0f) {
+      local_max = fmaxf(local_max, row[p * stride]);
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+  }
+  if (lane == 0) {
+    scratch[warp] = local_max;
+  }
+  __syncthreads();
+  float global_max = -INFINITY;
+  for (int w = 0; w < warps; ++w) {
+    global_max = fmaxf(global_max, scratch[w]);
+  }
+  __syncthreads();
+
+  float local_sum = 0.0f;
+  for (int p = threadIdx.x; p < num_partitions; p += blockDim.x) {
+    const float sum = row[p * stride + 1];
+    const float weight = sum > 0.0f ? expf(row[p * stride] - global_max) : 0.0f;
+    weights[p] = weight;
+    local_sum += sum * weight;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+  }
+  if (lane == 0) {
+    scratch[warp] = local_sum;
+  }
+  __syncthreads();
+  float total = 0.0f;
+  for (int w = 0; w < warps; ++w) {
+    total += scratch[w];
+  }
+
+  for (int d = threadIdx.x; d < value_dim; d += blockDim.x) {
+    float value = 0.0f;
+    for (int p = 0; p < num_partitions; ++p) {
+      value += weights[p] * row[p * stride + 2 + d];
+    }
+    output[static_cast<unsigned long long>(row_head) * value_dim + d] =
+        izwi_from_float<T>(total > 0.0f ? value / total : 0.0f);
+  }
+}
+
+#define IZWI_DEFINE_PAGED_DECODE_SPLIT(SUFFIX, TYPE, DIM)                      \
+  extern "C" __global__ void __launch_bounds__(IZWI_SPLIT_DECODE_WARPS * 32)  \
+      physical_paged_decode_split_##SUFFIX##_d##DIM(                           \
+          const TYPE* queries, const TYPE* keys, const TYPE* values,           \
+          const unsigned int* metadata, float* partials, int batch,            \
+          int query_heads, int kv_heads, int page_tokens, int max_blocks,      \
+          int capacity_pages, int num_partitions, float softmax_scale,         \
+          float softcap) {                                                     \
+    izwi_paged_decode_gqa_partition<TYPE, DIM>(                                \
+        queries, keys, values, metadata, partials, batch, query_heads,         \
+        kv_heads, page_tokens, max_blocks, capacity_pages, num_partitions,     \
+        softmax_scale, softcap);                                               \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_SPLIT(f16, __half, 128)
+IZWI_DEFINE_PAGED_DECODE_SPLIT(f16, __half, 256)
+IZWI_DEFINE_PAGED_DECODE_SPLIT(bf16, __nv_bfloat16, 128)
+IZWI_DEFINE_PAGED_DECODE_SPLIT(bf16, __nv_bfloat16, 256)
+
+#define IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(SUFFIX, TYPE)                    \
+  extern "C" __global__ void physical_paged_decode_split_reduce_##SUFFIX(     \
+      const float* partials, TYPE* output, int row_heads, int value_dim,       \
+      int num_partitions) {                                                    \
+    izwi_paged_decode_split_reduce<TYPE>(partials, output, row_heads,          \
+                                         value_dim, num_partitions);           \
+  }
+
+IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(f16, __half)
+IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(bf16, __nv_bfloat16)
+
 extern "C" __global__ void physical_paged_decode_f32(
     const float* queries,
     const float* keys,

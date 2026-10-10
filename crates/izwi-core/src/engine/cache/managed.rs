@@ -79,6 +79,7 @@ pub struct ManagedKvOperationSnapshot {
     pub portable_attention_dispatches: u64,
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
+    pub cuda_split_decode_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
     pub cuda_graph_warmups: u64,
     pub cuda_graph_captures: u64,
@@ -148,6 +149,9 @@ impl ManagedKvOperationSnapshot {
         self.cuda_flash_attention_dispatches = self
             .cuda_flash_attention_dispatches
             .saturating_add(other.cuda_flash_attention_dispatches);
+        self.cuda_split_decode_dispatches = self
+            .cuda_split_decode_dispatches
+            .saturating_add(other.cuda_split_decode_dispatches);
         self.metal_native_attention_dispatches = self
             .metal_native_attention_dispatches
             .saturating_add(other.metal_native_attention_dispatches);
@@ -866,6 +870,8 @@ impl ManagedKvCacheManager {
                                 .cuda_native_attention_dispatches,
                             cuda_flash_attention_dispatches: operation_stats
                                 .cuda_flash_attention_dispatches,
+                            cuda_split_decode_dispatches: operation_stats
+                                .cuda_split_decode_dispatches,
                             metal_native_attention_dispatches: operation_stats
                                 .metal_native_attention_dispatches,
                             cuda_graph_warmups: operation_stats.cuda_graph_warmups,
