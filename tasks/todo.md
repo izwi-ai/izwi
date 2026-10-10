@@ -1,7 +1,8 @@
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
-This is a planning entry only. No code has changed.
+**Status 2026-10-10:** Phases 1-2 are implemented on `fix-qwen36-serving` (`ad60fa95`..`b07ae122`)
+and are unmeasured on hardware. See the Review section for what to check on the first GPU deploy.
 
 **Revised 2026-10-10: there is no measurement phase.** There is no access to a profiler or to
 same-H100 vLLM/llama.cpp runs, so work starts at Phase 1. Doc §5.1 covers how each phase is
@@ -40,39 +41,57 @@ The kill switch (environment variable) is the rollback.
 - [ ] Expected: Phase 1 → 35-50 · Phase 2 → 80-120 · Phase 3 → 150-200+ · Phase 4 → ×1.1-1.4.
       Well below range: check the diagnostics for a fallback first.
 
-## Phase 1 — Device-resident fused MoE, CUDA (M) — START HERE — gate ≥35 t/s, 0 MoE readbacks
-- [ ] 1.0 Verification scaffolding (lands first):
-  - counting readback helper for every `to_vec*`/`to_scalar` on the decode path;
-  - path counters (`moe_backend`, `gdn_decode_kernel`, `graph_replays`/`eager_steps`,
-    `self_check_failed`) in `runtime_diagnostics`;
-  - load-time self-check framework (probe vs legacy oracle → auto-disable on mismatch);
-  - optional TTFT plus decode-only t/s chip.
-- [ ] Fused router kernel (softmax, top-8, renorm), with ids and weights left on the device.
-- [ ] Stacked per-layer `w13`/`w2` FP8 residency, with the shared expert folded in as slot 9
-      (weight `sigmoid(gate·x)`).
-- [ ] `fp8_moe_gemv` decode kernel (gate+up+SiLU-mul, then down plus weighted reduce) and a
-      grouped FP8 prefill GEMM (sorted ids).
-- [ ] Control path `IZWI_QWEN36_MOE_BACKEND=q8_gguf` through Candle 0.11 `moe_gemm_gguf`;
-      `legacy` kill switch.
-- [ ] Checks:
-  - CPU reference of the grouped algorithm and the router matches the legacy dispatcher
-    (T=1/4/9/256, collisions, shared slot);
-  - golden parity;
-  - readback counter shows 0 MoE readbacks per token (80 on `legacy`, which proves it RED);
-  - CI CUDA compile;
-  - GPU self-check at load;
-  - fixed-prompt check, and diagnostics show `moe_backend=fp8_grouped`.
+## Phase 1 — Device-resident fused MoE, CUDA (M) — DONE (unmeasured) — gate ≥35 t/s
+- [x] Verification scaffolding:
+  - shared `qwen36moe::fast_path` with `Qwen36FusedPath`, `legacy_requested`, `summarize` and
+    `compare_values` (`92764e69`);
+  - per-path summaries in `runtime_diagnostics` and the load log;
+  - a load-time self-check in every fast path.
 
-## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — gate ≥80 t/s
-- [ ] Rewrite `fp8.cu` `mv`: 16-byte loads, Marlin bit-trick E4M3 → BF16 with the bias folded
-      into the scales.
-- [ ] Packed projections (qkv+z, a+b, attention q/k/v).
-- [ ] GDN decode in 2-3 launches: conv update, gating + L2 + delta rule with in-kernel head
-      mapping (no expand or `cat`), gated RMSNorm. State updated in place.
-- [ ] Fused add + rms_norm(1+w); device RoPE table plus fused qk-norm/RoPE/gate; fused KV write.
-- [ ] Stop per-quantum state restore and re-stage; `lm_head` plus argmax in one pass.
-- [ ] Each kernel: CPU reference (grouped and tiled head orders), load-time self-check,
-      `IZWI_QWEN36_FUSED_DECODE=0` kill switch. The GEMV gain is partly hidden until Phase 3.
+  Deviations:
+  - The global readback-counter helper was dropped. Instead, a CPU test asserts that the fused
+    block never enters the host dispatcher (its activation counters stay at 0, while legacy
+    records 3·K).
+  - The TTFT/decode chip is still open.
+- [x] Fused router kernel (softmax, top-8, renorm, folded shared slot). Ids and weights stay on
+      the device (`ad60fa95`).
+- [x] Stacked `w13`/`w2` FP8 residency with the shared expert folded in as slot 257. The
+      per-expert projections become views, so residency does not grow (`1829be3a`).
+- [x] Grouped gate+up+SwiGLU and down+weighted-combine GEMV kernels (`ad60fa95`).
+  - They also serve prefill: about 10× over the per-expert loop at 256-token chunks.
+  - The weight-reusing grouped GEMM moves to Phase 5.
+- [x] Router GEMV reads BF16 activations and F32 rows directly; MoE is 4 launches per layer
+      (`04de1d6d`).
+- [x] `IZWI_QWEN36_MOE_BACKEND=legacy` (or off/0/false) is the kill switch. The `q8_gguf` control
+      path was dropped: we cannot A/B it without hardware.
+- [x] Checks: grouped CPU reference == per-expert composition; fused == dispatcher for gated,
+      ungated and unfoldable shared experts; rotated-expert self-check is RED; golden parity green;
+      clippy with and without CUDA (fake nvcc); emulator runs at 35B shapes.
+- [ ] On the GPU: self-check passes at load; diagnostics `moe.backend = fused`; fixed-prompt t/s.
+
+## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — MOSTLY DONE (unmeasured) — gate ≥80 t/s
+- [x] Vectorized FP8 decode GEMV `qwen38_fp8_mv2_*`: 16-byte loads and the exact
+      byte_perm/shift E4M3→F16 decode. Enabled process-wide only after a device check against the
+      reference kernel (`c53c7a60`, `2cb161d3`).
+- [x] Packed projections: DeltaNet qkv+z and beta+alpha, attention q+k+v. Each pack is verified,
+      and the parts become views (`b07ae122`).
+- [x] GDN decode in 2 launches: a conv step that returns the ring slot, then gating + L2 +
+      register-held delta rule + gated RMSNorm with in-kernel head mapping (`516be34e`,
+      `5dd06355`). The state is a fresh allocation, not updated in place, which keeps state
+      publication transactional.
+- [x] Fused residual add + RMSNorm(1+w) on every trunk norm (`a90b08bb`, `37e4e0fb`). Each
+      layer's trailing add folds into the next layer's norm (`d5d62bac`).
+- [x] Fused q/k norm + partial M-RoPE from device inverse frequencies; no per-layer RoPE upload
+      (`828b1106`, `355893c7`).
+- [ ] Open:
+  - fused attention output gate (sigmoid·mul);
+  - fused KV write;
+  - one-readback greedy argmax (2 syncs → 1);
+  - stop the per-quantum restore/re-stage of the 30 conv rings.
+
+  The last one touches the engine's transactional state; it needs GPU iteration.
+- [x] Every kernel has a CPU reference and/or emulator run, a load-time self-check, and the
+      `IZWI_QWEN36_FUSED_DECODE=legacy` kill switch (norms, q/k RoPE, GEMV and packing share it).
 - [ ] Optional: BF16 GDN state experiment, parity-gated.
 
 ## Phase 3 — Whole-step CUDA graphs plus async scheduling (M) — gate ≥150 t/s
@@ -122,6 +141,40 @@ The kill switch (environment variable) is the rollback.
 | Date | SHA | Phase landed | Tokens | ms | t/s | Diagnostics notes |
 |---|---|---|---|---|---|---|
 | 2026-10-10 | (pre-plan) | baseline | 2,049 | 159,879 | 13 | legacy MoE, no graphs, MTP off |
+
+### First GPU deploy of Phases 1-2: what to check
+
+**1. The load log.** It has one line, `Qwen3.6-MoE fused kernel paths`, which reports `moe`,
+`gdn_decode`, `rms_norm`, `qk_rope` and `fp8_gemv`. On an SM80+ GPU every `backend` should be
+`fused`. The same JSON is under `GET /v1/admin/models/{id}` → `runtime_diagnostics`.
+
+**2. If any path says `legacy`.** The reason string says why:
+- `self-check failed: …` is a kernel bug on that device. The path is safely off; report the
+  message.
+- `…=legacy` means the kill switch is set.
+
+**3. Run the fixed-prompt check.** Estimated range after Phases 1-2: 80-150 t/s.
+
+**4. Isolate a suspect path with the kill switches.** Each needs a redeploy, no code change:
+- `IZWI_QWEN36_MOE_BACKEND=legacy`
+- `IZWI_QWEN36_FUSED_DECODE=legacy`
+
+**5. Expected per-token launch budget** (counted from code, not measured): about 520, down from
+about 6,200.
+
+| Area | Launches per token | Breakdown |
+|---|---|---|
+| DeltaNet | 150 | 5 × 30 layers |
+| Attention | ~90 | ~9 × 10 layers |
+| MoE | 160 | 4 × 40 layers |
+| Norms | 80 | |
+| Engine state staging | ~30-60 | |
+| lm_head and argmax | ~6 | |
+
+There are no host syncs inside the MoE. The two greedy-argmax readbacks remain.
+
+**6. Load time grows slightly** from the self-checks (about 1-2 s on an H100) and from stacking the
+experts (a transient of about 1 GB per layer while loading).
 
 ---
 
