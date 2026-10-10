@@ -144,7 +144,7 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: DeviceProfile,
         performance: &crate::performance::PerformanceConfig,
-        _prefix_reuse: bool,
+        prefix_reuse: bool,
     ) -> Result<Self> {
         performance.validate()?;
         if variant != ModelVariant::Qwen36Moe35BA3BFp8 {
@@ -178,7 +178,7 @@ impl Qwen36MoeChatModel {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         tracing::info!(mtp_enabled, "Qwen3.6-MoE MTP policy");
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
-        let exec = if fixture_path.exists() {
+        let mut exec = if fixture_path.exists() {
             Self::load_fixture_gguf(
                 model_dir,
                 &fixture_path,
@@ -196,6 +196,14 @@ impl Qwen36MoeChatModel {
                 kv_storage_provider,
             )?
         };
+        // Phase 5a: the registry resolved cross-request prefix reuse for this
+        // family and backend; the contract shares only when no MTP head loaded.
+        exec.prefix_caching = prefix_reuse;
+        tracing::info!(
+            prefix_reuse,
+            shares_prefixes = prefix_reuse && exec.mtp_head.is_none(),
+            "Qwen3.6-MoE prefix reuse"
+        );
         let moe = exec.text_model.moe_backend_summary();
         let gdn_decode = exec.text_model.gdn_decode_summary();
         let rms_norm = exec.text_model.rms_norm_summary();
@@ -247,6 +255,7 @@ impl Qwen36MoeChatModel {
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_adaptive: false,
             kv_storage_dtype: kv_storage_provider.dtype(),
+            prefix_caching: false,
         })
     }
 
@@ -282,6 +291,7 @@ impl Qwen36MoeChatModel {
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_adaptive: performance.enabled() && performance.mtp_adaptive,
             kv_storage_dtype: kv_storage_provider.dtype(),
+            prefix_caching: false,
         })
     }
 
@@ -869,6 +879,279 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("izwi-qwen36moe-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Phase 5a: a session attaching a published prefix (shared pages below
+    /// the fork cursor plus the publisher's forked DeltaNet snapshot) must
+    /// generate exactly what a fresh run of the same prompt generates, and
+    /// decoding must never mutate the published snapshot. The attach uses the
+    /// manager's real primitives (see qwen38's attach tests).
+    #[test]
+    fn attached_prefill_matches_the_fresh_run_and_keeps_the_snapshot_intact() {
+        use crate::backends::kv::CpuKvArena;
+        use crate::backends::state::{
+            negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+            StateBackendPlanRequest, StateComponentValue, TensorStateArena, TensorStateCapacity,
+        };
+        use crate::models::architectures::qwen36moe::cache::{
+            CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
+        };
+
+        let (mut model, _dir) = load_fixture("prefix-attach");
+        model.exec.prefix_caching = true;
+        let exec = &model.exec;
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let prepared = exec
+            .prepare_text_prompt(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: "a shared conversation history, then a new question".into(),
+                }],
+                &config,
+            )
+            .unwrap();
+        let total = prepared.prompt_ids().len();
+        let page = 8usize;
+        let fork = (total / 2) - (total / 2) % page;
+        assert!(
+            fork >= page && fork < total,
+            "prompt {total} tokens, fork {fork}"
+        );
+
+        // One paged arena with addressable blocks: the publisher's pages below
+        // the fork are shared; every session keeps private pages above it.
+        let kv_heads = model.text_config().attention_head_count_kv as u32;
+        let head_dim = model.text_config().attention_key_length as u32;
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(5151),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let bindings = [(1u32, 0u32), (3, 1)].map(|(model_layer, physical_layer)| KvLayerBinding {
+            model_layer,
+            physical_layer,
+        });
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: page as u32,
+                capacity_pages: 64,
+                growth: None,
+                dtype: DType::F32,
+                layers: bindings
+                    .iter()
+                    .map(|binding| KvLayerConfig {
+                        binding: *binding,
+                        num_kv_heads: kv_heads,
+                        key_head_dim: head_dim,
+                        value_head_dim: head_dim,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        let view = |blocks: std::ops::Range<u32>, context_len: usize| {
+            PhysicalPagedKvCache::new(
+                arena.clone(),
+                bindings.to_vec(),
+                blocks
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    })
+                    .collect(),
+                context_len,
+            )
+            .unwrap()
+        };
+        let pages = |tokens: usize| tokens.div_ceil(page) as u32 + 2;
+
+        let contract = exec
+            .managed_composite_cache_contract(DType::F32, page)
+            .unwrap();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let capacity = TensorStateCapacity::for_plan(&plan, 8, 8).unwrap();
+        let tensors = TensorStateArena::new(Arc::new(plan), capacity, Device::Cpu).unwrap();
+
+        let decode = |state: &mut ChatDecodeState| {
+            let mut text = String::new();
+            for _ in 0..8 {
+                let step = exec.decode_quantum(state, 1).unwrap();
+                text.push_str(&step.delta);
+                if step.finished {
+                    break;
+                }
+            }
+            text
+        };
+
+        // Publisher: prefill [0, fork) and commit the hybrid state there.
+        let mut publisher = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(0..pages(total), 0),
+                None,
+            )
+            .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut publisher, &prepared, 0, fork)
+            .unwrap());
+        assert_eq!(publisher.physical_context_len(), fork);
+        let published = PhysicalStateSequenceId::new(1).unwrap();
+        tensors.register(published).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        tensors.begin(transaction, published).unwrap();
+        publisher
+            .stage_tensor_state(&tensors, transaction.get())
+            .unwrap();
+        tensors.commit(transaction, fork as u64).unwrap();
+        let snapshot_values = |sequence| {
+            [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN]
+                .iter()
+                .flat_map(|domain| {
+                    tensors
+                        .read(sequence, *domain)
+                        .unwrap()
+                        .unwrap()
+                        .components
+                        .iter()
+                        .flat_map(|component| {
+                            component
+                                .tensor
+                                .as_ref()
+                                .unwrap()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot_before = snapshot_values(published);
+
+        // Fresh reference over private pages.
+        let fresh_base = pages(total);
+        let mut reference = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(fresh_base..fresh_base + pages(total), 0),
+                None,
+            )
+            .unwrap();
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, 0, total)
+            .unwrap());
+        let reference_state = reference.linear_state_values();
+        assert!(!reference_state.is_empty());
+        let expected = decode(&mut reference);
+        assert!(!expected.is_empty());
+
+        // Attached session: the publisher's pages below the fork, private pages
+        // above, and the forked snapshot. Only [fork, total) is prefilled.
+        let fork_pages = (fork / page) as u32;
+        let private_base = 2 * fresh_base;
+        let blocks = (0..fork_pages).chain(private_base..private_base + pages(total));
+        let mut attached = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                PhysicalPagedKvCache::new(
+                    arena.clone(),
+                    bindings.to_vec(),
+                    blocks
+                        .map(|index| CacheBlockRef {
+                            arena: id,
+                            group,
+                            index,
+                            slot_generation: 1,
+                        })
+                        .collect(),
+                    fork,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let forked = PhysicalStateSequenceId::new(2).unwrap();
+        tensors.register(forked).unwrap();
+        let fork_transaction = PhysicalStateTransactionId::new(2).unwrap();
+        tensors.begin(fork_transaction, forked).unwrap();
+        for domain in [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN] {
+            let snapshot = tensors.read(published, domain).unwrap().unwrap();
+            let components = snapshot
+                .components
+                .iter()
+                .map(|component| StateComponentValue {
+                    component: component.component,
+                    tensor: component.tensor.clone(),
+                })
+                .collect();
+            tensors
+                .stage_replace(fork_transaction, domain, 0, fork as u64, components)
+                .unwrap();
+        }
+        tensors.commit(fork_transaction, fork as u64).unwrap();
+        attached.bind_tensor_sequence(forked.get()).unwrap();
+        attached.restore_tensor_state(&tensors).unwrap();
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut attached, &prepared, fork, total)
+            .unwrap());
+        assert_eq!(attached.physical_context_len(), total);
+        assert_eq!(
+            attached.linear_state_values(),
+            reference_state,
+            "the attached DeltaNet state must equal the fresh run's, bit for bit"
+        );
+        assert_eq!(
+            decode(&mut attached),
+            expected,
+            "the attached session must generate the fresh run's tokens"
+        );
+        assert_eq!(
+            snapshot_values(published),
+            snapshot_before,
+            "decoding an attached session must not mutate the published snapshot"
+        );
+
+        // A cursor at or past the prompt end has no private token to compute.
+        assert!(exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(0..pages(total), total),
+                None
+            )
+            .is_err());
     }
 
     fn load_fixture(tag: &str) -> (Qwen36MoeChatModel, PathBuf) {

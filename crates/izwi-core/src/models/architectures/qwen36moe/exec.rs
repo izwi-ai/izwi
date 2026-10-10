@@ -458,6 +458,16 @@ impl ChatDecodeState {
         self.replay = checkpoint.replay;
     }
 
+    #[cfg(test)]
+    pub(crate) fn physical_context_len(&self) -> usize {
+        self.physical_kv.context_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn linear_state_values(&self) -> Vec<f32> {
+        self.text_state.linear_state_values()
+    }
+
     pub(crate) fn bind_tensor_sequence(&mut self, sequence: u64) -> Result<()> {
         let sequence = PhysicalStateSequenceId::new(sequence)?;
         if self
@@ -872,6 +882,10 @@ pub(crate) struct Qwen36ChatExec {
     pub(crate) mtp_adaptive: bool,
     /// Persistent KV storage dtype — the MTP cache arena follows it.
     pub(crate) kv_storage_dtype: DType,
+    /// Phase 5a: cross-request prefix reuse is engaged for this load (the
+    /// contract then shares committed pages and DeltaNet snapshots unless an
+    /// MTP head is loaded).
+    pub(crate) prefix_caching: bool,
 }
 
 impl Qwen36ChatExec {
@@ -904,6 +918,7 @@ impl Qwen36ChatExec {
             attention_dtype,
             preferred_page_tokens,
             self.mtp_head.is_some(),
+            self.prefix_caching,
         )
     }
 
@@ -1004,9 +1019,18 @@ impl Qwen36ChatExec {
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
-        if prepared.prompt_ids.is_empty() || cache.context_len() != 0 {
+        // A managed prefix attach (Phase 5a) hands over a reservation whose
+        // physical cursor already sits above zero: shared pages plus a forked
+        // DeltaNet snapshot that the executor restores before the first span.
+        // Prefill resumes at that cursor and must compute at least one
+        // private token; MTP state never attaches.
+        let prefill_start = cache.context_len();
+        if prepared.prompt_ids.is_empty()
+            || prefill_start >= prepared.prompt_ids.len()
+            || mtp_cache.as_ref().is_some_and(|mtp| mtp.context_len() != 0)
+        {
             return Err(Error::InvalidInput(
-                "Qwen3.5 physical prefill requires a non-empty prompt and an empty reservation"
+                "Qwen3.5 physical prefill requires a non-empty prompt with a cache cursor below it"
                     .into(),
             ));
         }
@@ -1032,7 +1056,7 @@ impl Qwen36ChatExec {
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             next_text_position: prepared.next_text_position,
-            prefill_progress: 0,
+            prefill_progress: prefill_start,
             pending_logprobs: Vec::new(),
             config: config.clone(),
             rng,

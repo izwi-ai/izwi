@@ -104,6 +104,30 @@ impl Qwen36TextRuntimeState {
         Some(())
     }
 
+    /// Every DeltaNet layer's conv history (logical order) and recurrent
+    /// state, flattened, for tests comparing two sessions exactly.
+    #[cfg(test)]
+    pub(crate) fn linear_state_values(&self) -> Vec<f32> {
+        let mut values = Vec::new();
+        for layer in &self.layers {
+            if let Qwen36LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            {
+                if let Some(ring) = conv_state {
+                    for slot in ring.ordered_slots() {
+                        values.extend(slot.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                    }
+                }
+                if let Some(state) = recurrent_state {
+                    values.extend(state.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                }
+            }
+        }
+        values
+    }
+
     pub(crate) fn restore_tensor_domains(
         &mut self,
         arena: &TensorStateArena,

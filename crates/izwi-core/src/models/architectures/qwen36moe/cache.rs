@@ -9,7 +9,8 @@ use crate::error::{Error, Result};
 use crate::kv::v2::{
     AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
     KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
-    PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
+    PlacementPolicy, PositionSemantics, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent,
+    StateClock,
     StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
     StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
     CURRENT_INFERENCE_STATE_ABI,
@@ -29,16 +30,28 @@ pub(crate) fn qwen35_composite_cache_contract(
     attention_dtype: DType,
     preferred_page_tokens: usize,
 ) -> Result<InferenceStateContract> {
-    qwen35_composite_cache_contract_with_mtp(config, attention_dtype, preferred_page_tokens, false)
+    qwen35_composite_cache_contract_with_mtp(
+        config,
+        attention_dtype,
+        preferred_page_tokens,
+        false,
+        false,
+    )
 }
 
 /// `mtp` appends the draft layer's paged domain (model_layer = block_count)
 /// to the consistency group. MTP state never shares prefixes.
+///
+/// `prefix_caching` (Phase 5a) shares committed prefixes across requests as
+/// Qwen3.8 does (DS1.2b): the attention domain publishes committed pages and
+/// the recurrent/convolution domains publish transactional snapshots at page
+/// boundaries. A loaded MTP head keeps every domain private.
 pub(crate) fn qwen35_composite_cache_contract_with_mtp(
     config: &Qwen36TextConfig,
     attention_dtype: DType,
     preferred_page_tokens: usize,
     mtp: bool,
+    prefix_caching: bool,
 ) -> Result<InferenceStateContract> {
     if config.full_attention_interval == 0 {
         return Err(Error::InvalidInput(
@@ -111,12 +124,27 @@ pub(crate) fn qwen35_composite_cache_contract_with_mtp(
         ));
     }
 
-    let retained_header = |id| StateDomainHeader {
+    let share_prefixes = prefix_caching && !mtp;
+    let attention_prefix = if share_prefixes {
+        PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let tensor_prefix = if share_prefixes {
+        PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred),
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let retained_header = |id, prefix: PrefixPolicy| StateDomainHeader {
         id,
         scope: StateScope::Retained,
         clock: StateClock::DecoderTokens,
         placement: PlacementPolicy::BackendLocalWithHostOffload,
-        prefix: PrefixPolicy::Disabled,
+        prefix,
         checkpoint: CheckpointPolicy::Transactional,
     };
     let tensor_components = |layers: &[(u32, u64)], role: TensorRole| {
@@ -148,18 +176,18 @@ pub(crate) fn qwen35_composite_cache_contract_with_mtp(
     };
     let mut domain_specs = vec![StateDomainSpec::PagedAttention(
         PagedAttentionDomainSpec {
-            header: retained_header(FULL_ATTENTION_DOMAIN),
+            header: retained_header(FULL_ATTENTION_DOMAIN, attention_prefix),
             layers: attention_layers.clone(),
             page_size: paged_page_size,
             accepted_dtypes: vec![dtype],
         },
     )];
     domain_specs.push(StateDomainSpec::Tensor(TensorStateDomainSpec {
-        header: retained_header(RECURRENT_STATE_DOMAIN),
+        header: retained_header(RECURRENT_STATE_DOMAIN, tensor_prefix.clone()),
         components: tensor_components(&recurrent_layers, TensorRole::RecurrentHidden)?,
     }));
     domain_specs.push(StateDomainSpec::Tensor(TensorStateDomainSpec {
-        header: retained_header(CONVOLUTION_STATE_DOMAIN),
+        header: retained_header(CONVOLUTION_STATE_DOMAIN, tensor_prefix),
         components: tensor_components(&convolution_layers, TensorRole::ConvolutionState)?,
     }));
     if mtp {
@@ -264,8 +292,9 @@ mod tests {
 
     #[test]
     fn mtp_flag_appends_the_draft_layer_domain_to_the_consistency_group() {
-        let contract = qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true)
-            .unwrap();
+        let contract =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true, false)
+                .unwrap();
         assert_eq!(contract.domains.len(), 4);
 
         let StateDomainSpec::PagedAttention(mtp) = &contract.domains[3] else {
@@ -285,6 +314,37 @@ mod tests {
         let group = &contract.groups[0];
         assert!(group.domains.contains(&MTP_ATTENTION_DOMAIN));
         assert!(!group.prefix_shareable);
+    }
+
+    #[test]
+    fn prefix_caching_declares_shareable_policies_and_mtp_stays_private() {
+        let shared =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, false, true)
+                .unwrap();
+        let StateDomainSpec::PagedAttention(attention) = &shared.domains[0] else {
+            panic!("expected paged-attention domain");
+        };
+        assert_eq!(
+            attention.header.prefix,
+            PrefixPolicy::CommittedPages {
+                positions: PositionSemantics::Absolute,
+            }
+        );
+        for tensor in &shared.domains[1..] {
+            assert_eq!(
+                tensor.header().prefix,
+                PrefixPolicy::CommittedSnapshots { interval_steps: 32 }
+            );
+        }
+
+        // A loaded MTP head keeps every domain private.
+        let with_mtp =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true, true)
+                .unwrap();
+        assert!(with_mtp
+            .domains
+            .iter()
+            .all(|domain| domain.header().prefix == PrefixPolicy::Disabled));
     }
 
     #[test]
