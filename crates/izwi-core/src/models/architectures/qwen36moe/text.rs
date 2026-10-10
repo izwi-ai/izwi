@@ -346,6 +346,8 @@ pub(crate) struct Qwen36FullAttention {
     /// inverse frequencies, when resolved at load.
     fused_qk: Option<(QkNormRopeSpec, Tensor)>,
     fused_qk_path: Qwen36FusedPath,
+    /// `q_proj` + `k_proj` + `v_proj` packed for one decode GEMV.
+    packed_qkv: Option<Qwen36Projection>,
 }
 
 struct Qwen36LinearAttention {
@@ -372,6 +374,10 @@ struct Qwen36LinearAttention {
     /// [`Qwen36LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
     fused_decode_path: Qwen36FusedPath,
+    /// `qkv_proj` + `gate_proj` (and `beta_proj` + `alpha_proj`) packed for
+    /// one GEMV each on the fused decode path.
+    packed_in: Option<Qwen36Projection>,
+    packed_beta_alpha: Option<Qwen36Projection>,
 }
 
 /// Environment switch for the fused DeltaNet decode (`legacy`/`off`/`0`
@@ -511,6 +517,135 @@ pub struct Qwen36MoeFfnGeometry {
 pub(crate) enum Qwen36Projection {
     Quantized(QMatMul),
     CompactFp8 { weights: Tensor, scales: Tensor },
+}
+
+/// Largest dense pack (elements) worth duplicating: the DeltaNet beta/alpha
+/// pair. Larger dense projections are not packed so expanded F16/BF16
+/// residencies never double.
+const MAX_DENSE_PACK_ELEMENTS: usize = 1 << 20;
+
+/// Pack projections that read the same input into one along their output
+/// rows, so one GEMV computes them all. Block-FP8 parts must sit on 128-row
+/// block boundaries and are replaced by views into the packed weights
+/// (residency does not grow); small dense parts are concatenated. The pack is
+/// verified (one synthetic row through the packed weights must reproduce every
+/// part) before any part is replaced. Returns `None` with the parts untouched
+/// when they cannot be packed.
+fn pack_projections(parts: &mut [&mut Qwen36Projection]) -> Option<Qwen36Projection> {
+    let compact = parts
+        .iter()
+        .map(|part| match &**part {
+            Qwen36Projection::CompactFp8 { weights, scales } => Some((weights, scales)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let built = if let Some(compact) = compact {
+        let dims = compact
+            .iter()
+            .map(|(w, _)| w.dims2().ok())
+            .collect::<Option<Vec<_>>>()?;
+        let cols = dims.first()?.1;
+        if dims
+            .iter()
+            .any(|&(rows, k)| k != cols || !rows.is_multiple_of(128))
+        {
+            return None;
+        }
+        let weights = Tensor::cat(&compact.iter().map(|(w, _)| *w).collect::<Vec<_>>(), 0).ok()?;
+        let scales = Tensor::cat(&compact.iter().map(|(_, s)| *s).collect::<Vec<_>>(), 0).ok()?;
+        let mut views = Vec::with_capacity(dims.len());
+        let mut offset = 0;
+        for &(rows, _) in &dims {
+            views.push(Qwen36Projection::CompactFp8 {
+                weights: weights.narrow(0, offset, rows).ok()?,
+                scales: scales.narrow(0, offset / 128, rows / 128).ok()?,
+            });
+            offset += rows;
+        }
+        (
+            Qwen36Projection::CompactFp8 { weights, scales },
+            Some(views),
+            cols,
+        )
+    } else {
+        let dense = parts
+            .iter()
+            .map(|part| match &**part {
+                Qwen36Projection::Quantized(QMatMul::Tensor(tensor)) => Some(tensor),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let cols = dense.first()?.dims2().ok()?.1;
+        let total: usize = dense.iter().map(|t| t.elem_count()).sum();
+        if total > MAX_DENSE_PACK_ELEMENTS
+            || dense.iter().any(|t| {
+                t.dims2().map(|(_, k)| k).ok() != Some(cols) || t.dtype() != dense[0].dtype()
+            })
+        {
+            return None;
+        }
+        let packed = Tensor::cat(&dense, 0).ok()?;
+        (
+            Qwen36Projection::Quantized(QMatMul::Tensor(packed)),
+            None,
+            cols,
+        )
+    };
+    let (packed, views, cols) = built;
+    let device = match &packed {
+        Qwen36Projection::CompactFp8 { weights, .. } => weights.device().clone(),
+        Qwen36Projection::Quantized(QMatMul::Tensor(t)) => t.device().clone(),
+        _ => return None,
+    };
+    let dtype = if device.is_cuda() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    let probe = Tensor::from_vec(
+        (0..cols)
+            .map(|i| ((i as f32) * 0.754_877_7).sin())
+            .collect::<Vec<_>>(),
+        (1, cols),
+        &Device::Cpu,
+    )
+    .and_then(|t| t.to_dtype(dtype))
+    .and_then(|t| t.to_device(&device))
+    .ok()?;
+    let packed_out = packed.forward(&probe).ok()?;
+    let mut offset = 0;
+    for part in parts.iter() {
+        let expected = part.forward(&probe).ok()?;
+        let width = expected.dim(1).ok()?;
+        let actual = packed_out.narrow(1, offset, width).ok()?;
+        let diff = (actual.to_dtype(DType::F32).ok()? - expected.to_dtype(DType::F32).ok()?)
+            .ok()?
+            .abs()
+            .ok()?
+            .max_all()
+            .ok()?
+            .to_scalar::<f32>()
+            .ok()?;
+        let scale = expected
+            .to_dtype(DType::F32)
+            .ok()?
+            .abs()
+            .ok()?
+            .max_all()
+            .ok()?
+            .to_scalar::<f32>()
+            .ok()?;
+        if diff.is_nan() || diff > 1e-3 * scale.max(1e-6) {
+            return None;
+        }
+        offset += width;
+    }
+    if let Some(views) = views {
+        for (part, view) in parts.iter_mut().zip(views) {
+            **part = view;
+        }
+    }
+    Some(packed)
 }
 
 impl Qwen36Projection {
@@ -1661,9 +1796,45 @@ impl Qwen36FullAttention {
             )?,
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
+            packed_qkv: None,
         };
+        if device.is_cuda() && !legacy_requested(FUSED_DECODE_ENV) {
+            attention.packed_qkv = pack_projections(&mut [
+                &mut attention.q_proj,
+                &mut attention.k_proj,
+                &mut attention.v_proj,
+            ]);
+        }
         attention.resolve_fused_qk(device, false);
         Ok(attention)
+    }
+
+    /// Decode-step `(q_proj [b, 1, heads, 2 * head_dim], k [b, 1, kv, head_dim],
+    /// v [b, 1, kv, head_dim])`, through the packed GEMV when available.
+    fn decode_projections(&self, hidden_states: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let batch = hidden_states.dim(0)?;
+        let q_width = self.num_heads * self.head_dim * 2;
+        let kv_width = self.num_kv_heads * self.head_dim;
+        let (q, k, v) = match &self.packed_qkv {
+            Some(packed) => {
+                let out = packed.forward(hidden_states)?;
+                (
+                    out.narrow(D::Minus1, 0, q_width)?,
+                    out.narrow(D::Minus1, q_width, kv_width)?,
+                    out.narrow(D::Minus1, q_width + kv_width, kv_width)?,
+                )
+            }
+            None => (
+                self.q_proj.forward(hidden_states)?,
+                self.k_proj.forward(hidden_states)?,
+                self.v_proj.forward(hidden_states)?,
+            ),
+        };
+        Ok((
+            q.reshape((batch, 1, self.num_heads, self.head_dim * 2))?,
+            k.reshape((batch, 1, self.num_kv_heads, self.head_dim))?,
+            v.reshape((batch, 1, self.num_kv_heads, self.head_dim))?,
+        ))
     }
 
     /// Resolve the fused q/k norm + RoPE at load: CUDA only in production
@@ -1861,28 +2032,34 @@ impl Qwen36FullAttention {
                 position_ids.len()
             )));
         }
-        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_heads,
-            self.head_dim * 2,
-        ))?;
+        let (q_proj, key_states, value_states) = if seq_len == 1 {
+            self.decode_projections(hidden_states)?
+        } else {
+            (
+                self.q_proj.forward(hidden_states)?.reshape((
+                    1,
+                    seq_len,
+                    self.num_heads,
+                    self.head_dim * 2,
+                ))?,
+                self.k_proj.forward(hidden_states)?.reshape((
+                    1,
+                    seq_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                ))?,
+                self.v_proj.forward(hidden_states)?.reshape((
+                    1,
+                    seq_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                ))?,
+            )
+        };
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             1,
             seq_len,
             self.num_heads * self.head_dim,
-        ))?;
-        let key_states = self.k_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let value_states = self.v_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
         ))?;
         let (query_states, key_states) = if seq_len == 1 {
             self.token_qk(&q_proj, &key_states, position_ids[0])?
@@ -1957,28 +2134,11 @@ impl Qwen36FullAttention {
                 "Qwen3.5 decode received an incompatible prepared slot map".into(),
             ));
         }
-        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_heads,
-            self.head_dim * 2,
-        ))?;
+        let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             batch_size,
             1,
             self.num_heads * self.head_dim,
-        ))?;
-        let key_states = self.k_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let value_states = self.v_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
         ))?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
@@ -2269,9 +2429,45 @@ impl Qwen36LinearAttention {
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("unresolved"),
+            packed_in: None,
+            packed_beta_alpha: None,
         };
+        if device.is_cuda() && !legacy_requested(FUSED_DECODE_ENV) {
+            mixer.pack_projections();
+        }
         mixer.resolve_fused_decode(cfg.embedding_length, device, false);
         Ok(mixer)
+    }
+
+    fn pack_projections(&mut self) {
+        self.packed_in = pack_projections(&mut [&mut self.qkv_proj, &mut self.gate_proj]);
+        self.packed_beta_alpha = pack_projections(&mut [&mut self.beta_proj, &mut self.alpha_proj]);
+    }
+
+    /// `(mixed_qkv, z, beta_raw, alpha)` projection outputs, through the packed
+    /// GEMVs when available.
+    fn decode_projections(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let (mixed_qkv, z) = match &self.packed_in {
+            Some(packed) => {
+                let out = packed.forward(x)?;
+                (
+                    out.narrow(D::Minus1, 0, self.conv_dim)?,
+                    out.narrow(D::Minus1, self.conv_dim, self.num_v_heads * self.head_v_dim)?,
+                )
+            }
+            None => (self.qkv_proj.forward(x)?, self.gate_proj.forward(x)?),
+        };
+        let (beta_raw, alpha) = match &self.packed_beta_alpha {
+            Some(packed) => {
+                let out = packed.forward(x)?;
+                (
+                    out.narrow(D::Minus1, 0, self.num_v_heads)?,
+                    out.narrow(D::Minus1, self.num_v_heads, self.num_v_heads)?,
+                )
+            }
+            None => (self.beta_proj.forward(x)?, self.alpha_proj.forward(x)?),
+        };
+        Ok((mixed_qkv, z, beta_raw, alpha))
     }
 
     /// Resolve the fused single-token decode at load. Production enables it on
@@ -2485,10 +2681,7 @@ impl Qwen36LinearAttention {
         hidden_states: &Tensor,
         state: &mut Qwen36LayerRuntimeState,
     ) -> Result<Tensor> {
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta_raw = self.beta_proj.forward(hidden_states)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let (mixed_qkv, z, beta_raw, alpha) = self.decode_projections(hidden_states)?;
         let y = self.fused_decode_row(spec, &mixed_qkv, &z, &beta_raw, &alpha, state)?;
         self.out_proj
             .forward(&y.reshape((1, 1, self.num_v_heads * self.head_v_dim))?)
@@ -2625,10 +2818,7 @@ impl Qwen36LinearAttention {
                 .iter()
                 .all(|state| Self::fused_decode_accepts(hidden_states, state))
             {
-                let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-                let z = self.gate_proj.forward(hidden_states)?;
-                let beta_raw = self.beta_proj.forward(hidden_states)?;
-                let alpha = self.alpha_proj.forward(hidden_states)?;
+                let (mixed_qkv, z, beta_raw, alpha) = self.decode_projections(hidden_states)?;
                 let rows = states
                     .iter_mut()
                     .enumerate()
@@ -3590,6 +3780,8 @@ mod tests {
             tiled_recurrence_tile_size_override: None,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            packed_in: None,
+            packed_beta_alpha: None,
         };
         let initial_state = |row: usize| Qwen36LayerRuntimeState::Linear {
             conv_state: Some(ConvRingState {
@@ -3722,6 +3914,8 @@ mod tests {
             tiled_recurrence_tile_size_override: None,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            packed_in: None,
+            packed_beta_alpha: None,
         }
     }
 
@@ -3804,6 +3998,7 @@ mod tests {
             rope_inv_freqs: super::build_rope_inv_freqs(16, 10_000_000.0).unwrap(),
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("test"),
+            packed_qkv: None,
         }
     }
 
@@ -3957,6 +4152,120 @@ mod tests {
         }
     }
 
+    fn compact_projection(rows: usize, seed: u64) -> Qwen36Projection {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let bytes = (0..rows * 128)
+            .map(|_| loop {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let byte = state as u8;
+                if byte & 0x7f != 0x7f {
+                    break byte;
+                }
+            })
+            .collect::<Vec<_>>();
+        Qwen36Projection::CompactFp8 {
+            weights: Tensor::from_vec(bytes, (rows, 128), &Device::Cpu).unwrap(),
+            scales: Tensor::from_vec(
+                (0..rows / 128)
+                    .map(|i| 0.01 + i as f32 * 0.003)
+                    .collect::<Vec<_>>(),
+                (rows / 128, 1),
+                &Device::Cpu,
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn packed_projections_reproduce_each_part_through_views() {
+        let (mut a, mut b) = (compact_projection(256, 1), compact_projection(128, 2));
+        let (a0, b0) = (a.clone(), b.clone());
+        let packed = super::pack_projections(&mut [&mut a, &mut b])
+            .expect("block-aligned block-FP8 parts must pack");
+        let x = Tensor::from_vec(
+            (0..2 * 128)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>(),
+            (2, 128),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let out = packed.forward(&x).unwrap();
+        assert_eq!(out.dims(), [2, 384]);
+        assert_eq!(
+            flat(&out.narrow(1, 0, 256).unwrap()),
+            flat(&a0.forward(&x).unwrap())
+        );
+        assert_eq!(
+            flat(&out.narrow(1, 256, 128).unwrap()),
+            flat(&b0.forward(&x).unwrap())
+        );
+        // The parts are now views into the packed weights and still agree.
+        assert_eq!(
+            flat(&a.forward(&x).unwrap()),
+            flat(&a0.forward(&x).unwrap())
+        );
+        assert_eq!(
+            flat(&b.forward(&x).unwrap()),
+            flat(&b0.forward(&x).unwrap())
+        );
+        let Qwen36Projection::CompactFp8 { weights, .. } = &b else {
+            panic!("packed part must stay block-FP8");
+        };
+        assert_eq!(weights.layout().start_offset(), 256 * 128);
+
+        // Parts off the 128-row block grid are refused and left untouched.
+        let (mut c, mut d) = (compact_projection(128, 3), compact_projection(128, 4));
+        let Qwen36Projection::CompactFp8 { weights, scales } = &d else {
+            unreachable!()
+        };
+        d = Qwen36Projection::CompactFp8 {
+            weights: weights.narrow(0, 0, 64).unwrap(),
+            scales: scales.clone(),
+        };
+        let d0 = d.clone();
+        assert!(super::pack_projections(&mut [&mut c, &mut d]).is_none());
+        let (
+            Qwen36Projection::CompactFp8 { weights: left, .. },
+            Qwen36Projection::CompactFp8 { weights: right, .. },
+        ) = (&d, &d0)
+        else {
+            unreachable!()
+        };
+        assert_eq!(left.dims(), right.dims());
+    }
+
+    #[test]
+    fn fused_gdn_decode_with_packed_projections_tracks_the_chain() {
+        let legacy = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
+        let mut fused = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
+        fused.pack_projections();
+        assert!(fused.packed_in.is_some() && fused.packed_beta_alpha.is_some());
+        fused.resolve_fused_decode(128, &Device::Cpu, true);
+        assert_eq!(fused.fused_decode_path, Qwen36FusedPath::Fused);
+        let (mut legacy_state, mut fused_state) = (gdn_state(3.0), gdn_state(3.0));
+        for step in 0..3 {
+            let x = Tensor::from_vec(
+                (0..128)
+                    .map(|i| ((i + 11 * step) as f32 * 0.754_877_7).sin())
+                    .collect::<Vec<_>>(),
+                (1, 1, 128),
+                &Device::Cpu,
+            )
+            .unwrap();
+            let expected = legacy.forward(&x, &mut legacy_state).unwrap();
+            let actual = fused.forward(&x, &mut fused_state).unwrap();
+            assert_close(
+                &flat(&actual),
+                &flat(&expected),
+                1e-4,
+                &format!("step {step}"),
+            );
+        }
+    }
+
     #[test]
     fn fused_gdn_batched_decode_matches_scalar_rows() {
         let mut mixer = gdn_mixer(Qwen36LinearVHeadOrder::Grouped);
@@ -4066,6 +4375,8 @@ mod tests {
             tiled_recurrence_tile_size_override: None,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
+            packed_in: None,
+            packed_beta_alpha: None,
         };
 
         let bf16_input = |values: &[f32], seq: usize| {
