@@ -171,6 +171,21 @@ pub fn fp8_moe_grouped(
             inter,
         );
     }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::grouped(
+            x,
+            routing,
+            slots,
+            w13,
+            s13,
+            w2,
+            s2,
+            experts_total,
+            hidden,
+            inter,
+        );
+    }
     let act = fp8_gate_up(x, routing, slots, w13, s13)?;
     fp8_down(&act, routing, slots, w2, s2)
 }

@@ -290,6 +290,164 @@ kernel void q36m_down_f16(
         y[(ulong)token * hidden + h] = half(total);
     }
 }
+
+// ---- Expert-major (grouped) MoE for prefill; see the CUDA kernels. ----
+kernel void q36m_group_pairs(
+    device const float* routing [[buffer(0)]], device int* offsets [[buffer(1)]],
+    device int* sorted_pairs [[buffer(2)]], constant uint& tokens [[buffer(3)]],
+    constant uint& slots [[buffer(4)]], constant uint& experts_total [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+    threadgroup atomic_int counts[520];
+    threadgroup atomic_int fill[520];
+    threadgroup int starts[521];
+    for (uint e = tid; e < experts_total; e += threads) {
+        atomic_store_explicit(&counts[e], 0, memory_order_relaxed);
+        atomic_store_explicit(&fill[e], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint pairs = tokens * slots;
+    for (uint p = tid; p < pairs; p += threads) {
+        const uint token = p / slots;
+        const float expert_f = routing[(ulong)token * 2 * slots + (p - token * slots)];
+        if (expert_f >= 0.0f && uint(expert_f) < experts_total) {
+            atomic_fetch_add_explicit(&counts[uint(expert_f)], 1, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int running = 0;
+        for (uint e = 0; e < experts_total; ++e) {
+            starts[e] = running;
+            offsets[e] = running;
+            running += atomic_load_explicit(&counts[e], memory_order_relaxed);
+        }
+        offsets[experts_total] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint p = tid; p < pairs; p += threads) {
+        const uint token = p / slots;
+        const float expert_f = routing[(ulong)token * 2 * slots + (p - token * slots)];
+        if (expert_f >= 0.0f && uint(expert_f) < experts_total) {
+            const uint e = uint(expert_f);
+            const int index = atomic_fetch_add_explicit(&fill[e], 1, memory_order_relaxed);
+            sorted_pairs[starts[e] + index] = int(p);
+        }
+    }
+}
+
+// Requires hidden % 512 == 0 and hidden / 512 <= 8.
+kernel void q36m_gate_up_grouped_f16(
+    device const half* x [[buffer(0)]], device const int* offsets [[buffer(1)]],
+    device const int* sorted_pairs [[buffer(2)]], device const uchar* w13 [[buffer(3)]],
+    device const float* s13 [[buffer(4)]], device half* act [[buffer(5)]],
+    constant uint& slots [[buffer(6)]], constant uint& hidden [[buffer(7)]],
+    constant uint& inter [[buffer(8)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint expert = tg.x;
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    const uint n = tg.y * 8 + sg;
+    if (begin == end || n >= inter) {
+        return;
+    }
+    const uint kblocks = hidden >> 7;
+    const uint chunks = hidden >> 9;
+    device const uchar* wg = w13 + ((ulong)expert * 2 * inter + n) * hidden;
+    device const uchar* wu = wg + (ulong)inter * hidden;
+    device const float* expert_scales = s13 + (ulong)expert * ((2 * inter) >> 7) * kblocks;
+    device const float* sgs = expert_scales + (ulong)(n >> 7) * kblocks;
+    device const float* sus = expert_scales + (ulong)((inter + n) >> 7) * kblocks;
+    uint4 qg[8];
+    uint4 qu[8];
+    float scale_g[8];
+    float scale_u[8];
+    for (uint c = 0; c < chunks; ++c) {
+        const uint k0 = lane * 16 + c * 512;
+        qg[c] = *((device const uint4*)(wg + k0));
+        qu[c] = *((device const uint4*)(wu + k0));
+        scale_g[c] = sgs[k0 >> 7];
+        scale_u[c] = sus[k0 >> 7];
+    }
+    for (int i = begin; i < end; ++i) {
+        const uint pair = uint(sorted_pairs[i]);
+        device const half* xt = x + (ulong)(pair / slots) * hidden;
+        float accg = 0.0f;
+        float accu = 0.0f;
+        for (uint c = 0; c < chunks; ++c) {
+            float xv[16];
+            q36m_load16(xt + lane * 16 + c * 512, xv);
+            accg = fma(q36m_dot16(qg[c], xv), scale_g[c], accg);
+            accu = fma(q36m_dot16(qu[c], xv), scale_u[c], accu);
+        }
+        accg = simd_sum(accg) * 256.0f;
+        accu = simd_sum(accu) * 256.0f;
+        if (lane == 0) {
+            const float silu = accg / (1.0f + exp(-accg));
+            act[(ulong)pair * inter + n] = half(silu * accu);
+        }
+    }
+}
+
+// Requires inter % 512 == 0 and inter / 512 <= 4.
+kernel void q36m_down_grouped_f16(
+    device const half* act [[buffer(0)]], device const int* offsets [[buffer(1)]],
+    device const int* sorted_pairs [[buffer(2)]], device const uchar* w2 [[buffer(3)]],
+    device const float* s2 [[buffer(4)]], device float* partial [[buffer(5)]],
+    constant uint& hidden [[buffer(6)]], constant uint& inter [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint expert = tg.x;
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    const uint h = tg.y * 8 + sg;
+    if (begin == end || h >= hidden) {
+        return;
+    }
+    const uint kblocks = inter >> 7;
+    const uint chunks = inter >> 9;
+    device const uchar* w = w2 + ((ulong)expert * hidden + h) * inter;
+    device const float* sc = s2 + ((ulong)expert * (hidden >> 7) + (h >> 7)) * kblocks;
+    uint4 q[4];
+    float scale[4];
+    for (uint c = 0; c < chunks; ++c) {
+        const uint k0 = lane * 16 + c * 512;
+        q[c] = *((device const uint4*)(w + k0));
+        scale[c] = sc[k0 >> 7];
+    }
+    for (int i = begin; i < end; ++i) {
+        const uint pair = uint(sorted_pairs[i]);
+        device const half* a = act + (ulong)pair * inter;
+        float acc = 0.0f;
+        for (uint c = 0; c < chunks; ++c) {
+            float av[16];
+            q36m_load16(a + lane * 16 + c * 512, av);
+            acc = fma(q36m_dot16(q[c], av), scale[c], acc);
+        }
+        acc = simd_sum(acc) * 256.0f;
+        if (lane == 0) {
+            partial[(ulong)pair * hidden + h] = acc;
+        }
+    }
+}
+
+kernel void q36m_combine_f16(
+    device const float* partial [[buffer(0)]], device const float* routing [[buffer(1)]],
+    device half* y [[buffer(2)]], constant uint& slots [[buffer(3)]],
+    constant uint& hidden [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    const uint h = gid.x;
+    const uint token = gid.y;
+    if (h >= hidden) {
+        return;
+    }
+    device const float* weights = routing + (ulong)token * 2 * slots + slots;
+    float total = 0.0f;
+    for (uint s = 0; s < slots; ++s) {
+        total = fma(weights[s], partial[((ulong)token * slots + s) * hidden + h], total);
+    }
+    y[(ulong)token * hidden + h] = half(total);
+}
 "#;
 
 fn pipeline(device: &MetalDevice, name: &'static str) -> Result<ComputePipeline> {
@@ -568,6 +726,102 @@ pub(crate) fn gate_up(
     Ok(wrap(&device, out, shape, DType::F16))
 }
 
+/// Expert-major routed MoE for prefill (see `moe::fp8_moe_grouped`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grouped(
+    x: &Tensor,
+    routing: &Tensor,
+    slots: usize,
+    w13: &Tensor,
+    s13: &Tensor,
+    w2: &Tensor,
+    s2: &Tensor,
+    experts_total: usize,
+    hidden: usize,
+    inter: usize,
+) -> Result<Tensor> {
+    if x.dtype() != DType::F16 {
+        bail!(
+            "Metal grouped MoE needs F16 activations, found {:?}",
+            x.dtype()
+        )
+    }
+    let device = metal_device(x)?;
+    let tokens = x.dim(0)?;
+    let pairs = tokens * slots;
+    let (x, routing, w13, s13, w2, s2) = (
+        x.contiguous()?,
+        routing.contiguous()?,
+        w13.contiguous()?,
+        s13.contiguous()?,
+        w2.contiguous()?,
+        s2.contiguous()?,
+    );
+    let xb = bind(&x, "activations", 32)?;
+    let rb = bind(&routing, "routing", 4)?;
+    let w13b = bind(&w13, "w13", 16)?;
+    let s13b = bind(&s13, "s13", 4)?;
+    let w2b = bind(&w2, "w2", 16)?;
+    let s2b = bind(&s2, "s2", 4)?;
+    let offsets = device.new_buffer(experts_total + 1, DType::U32, "q36m-offsets")?;
+    let sorted = device.new_buffer(pairs, DType::U32, "q36m-sorted")?;
+    let act = device.new_buffer(pairs * inter, DType::F16, "q36m-grouped-act")?;
+    let partial = device.new_buffer(pairs * hidden, DType::F32, "q36m-grouped-partial")?;
+    let (out, shape) = output(
+        &device,
+        Shape::from((tokens, hidden)),
+        DType::F16,
+        "q36m-grouped",
+    )?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-grouped");
+    encoder.set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_group_pairs")?);
+    encoder.set_input_buffer(0, Some(rb.buffer()?), rb.offset);
+    encoder.set_output_buffer(1, Some(&offsets), 0);
+    encoder.set_output_buffer(2, Some(&sorted), 0);
+    encoder.set_bytes(3, &u32_arg(tokens, "tokens")?);
+    encoder.set_bytes(4, &u32_arg(slots, "slots")?);
+    encoder.set_bytes(5, &u32_arg(experts_total, "experts")?);
+    encoder.dispatch_thread_groups(grid(1, 1), grid(1024, 1));
+    encoder.insert_memory_barrier();
+    encoder.set_compute_pipeline_state(&pipeline(
+        device.metal_device(),
+        "q36m_gate_up_grouped_f16",
+    )?);
+    encoder.set_input_buffer(0, Some(xb.buffer()?), xb.offset);
+    encoder.set_input_buffer(1, Some(&offsets), 0);
+    encoder.set_input_buffer(2, Some(&sorted), 0);
+    encoder.set_input_buffer(3, Some(w13b.buffer()?), w13b.offset);
+    encoder.set_input_buffer(4, Some(s13b.buffer()?), s13b.offset);
+    encoder.set_output_buffer(5, Some(&act), 0);
+    encoder.set_bytes(6, &u32_arg(slots, "slots")?);
+    encoder.set_bytes(7, &u32_arg(hidden, "hidden")?);
+    encoder.set_bytes(8, &u32_arg(inter, "inter")?);
+    encoder.dispatch_thread_groups(grid(experts_total, inter.div_ceil(8)), grid(256, 1));
+    encoder.insert_memory_barrier();
+    encoder.set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_down_grouped_f16")?);
+    encoder.set_input_buffer(0, Some(&act), 0);
+    encoder.set_input_buffer(1, Some(&offsets), 0);
+    encoder.set_input_buffer(2, Some(&sorted), 0);
+    encoder.set_input_buffer(3, Some(w2b.buffer()?), w2b.offset);
+    encoder.set_input_buffer(4, Some(s2b.buffer()?), s2b.offset);
+    encoder.set_output_buffer(5, Some(&partial), 0);
+    encoder.set_bytes(6, &u32_arg(hidden, "hidden")?);
+    encoder.set_bytes(7, &u32_arg(inter, "inter")?);
+    encoder.dispatch_thread_groups(grid(experts_total, hidden.div_ceil(8)), grid(256, 1));
+    encoder.insert_memory_barrier();
+    encoder.set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_combine_f16")?);
+    encoder.set_input_buffer(0, Some(&partial), 0);
+    encoder.set_input_buffer(1, Some(rb.buffer()?), rb.offset);
+    encoder.set_output_buffer(2, Some(&out), 0);
+    encoder.set_bytes(3, &u32_arg(slots, "slots")?);
+    encoder.set_bytes(4, &u32_arg(hidden, "hidden")?);
+    encoder.dispatch_threads(grid(hidden, tokens), grid(256, 1));
+    drop(encoder);
+    drop((xb, rb, w13b, s13b, w2b, s2b));
+    Ok(wrap(&device, out, shape, DType::F16))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn down(
     act: &Tensor,
@@ -697,6 +951,80 @@ mod tests {
             let actual = host(&block_fp8_projection(&to(&x), &to(&w), &to(&s)).unwrap());
             assert_close(&actual, &expected, 2e-3, &format!("m={m} n={n} k={k}"));
         }
+    }
+
+    #[test]
+    fn metal_grouped_prefill_matches_the_per_pair_kernels() {
+        let Some(gpu) = device() else { return };
+        let (hidden, inter, experts, tokens) = (1024usize, 512usize, 33usize, 48usize);
+        let spec = RouteSpec {
+            num_experts: experts,
+            top_k: 4,
+            shared: SharedSlot::Gated,
+            shared_slot_id: experts,
+            norm_topk: true,
+        };
+        let total = experts + 1;
+        let to = |t: Tensor| t.to_device(&gpu).unwrap();
+        let w13 = to(Tensor::from_vec(
+            bytes(total * 2 * inter * hidden, 11),
+            (total, 2 * inter, hidden),
+            &Device::Cpu,
+        )
+        .unwrap());
+        let s13 = to(Tensor::from_vec(
+            wave(total * (2 * inter / 128) * (hidden / 128), 1.0, 0.001)
+                .iter()
+                .map(|v| v.abs() + 0.002)
+                .collect::<Vec<_>>(),
+            (total, 2 * inter / 128, hidden / 128),
+            &Device::Cpu,
+        )
+        .unwrap());
+        let w2 = to(Tensor::from_vec(
+            bytes(total * hidden * inter, 12),
+            (total, hidden, inter),
+            &Device::Cpu,
+        )
+        .unwrap());
+        let s2 = to(Tensor::from_vec(
+            wave(total * (hidden / 128) * (inter / 128), 2.0, 0.001)
+                .iter()
+                .map(|v| v.abs() + 0.002)
+                .collect::<Vec<_>>(),
+            (total, hidden / 128, inter / 128),
+            &Device::Cpu,
+        )
+        .unwrap());
+        let logits = to(Tensor::from_vec(
+            wave(tokens * (experts + 1), 3.0, 3.0),
+            (tokens, experts + 1),
+            &Device::Cpu,
+        )
+        .unwrap());
+        let x = to(Tensor::from_vec(
+            wave(tokens * hidden, 4.0, 1.5),
+            (tokens, hidden),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap());
+        let routing = moe::route(&logits, &spec).unwrap();
+        let slots = spec.slots();
+        let per_pair = host(
+            &moe::fp8_down(
+                &moe::fp8_gate_up(&x, &routing, slots, &w13, &s13).unwrap(),
+                &routing,
+                slots,
+                &w2,
+                &s2,
+            )
+            .unwrap(),
+        );
+        let grouped =
+            host(&moe::fp8_moe_grouped(&x, &routing, slots, &w13, &s13, &w2, &s2).unwrap());
+        assert_close(&grouped, &per_pair, 0.005, "grouped vs per-pair");
     }
 
     #[test]
