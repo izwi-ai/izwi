@@ -7,8 +7,10 @@
 //! 1. **warm**: run eagerly under Candle's htod-cache guard. That populates the
 //!    strided-op parameter cache and the small-constant upload cache a capture
 //!    must hit, since an upload inside a capture fails.
-//! 2. **capture**: thread-local stream capture over stable input buffers,
-//!    instantiated with `AUTO_FREE_ON_LAUNCH`. Nothing executes.
+//! 2. **capture**: thread-local stream capture over stable input buffers, with
+//!    cudarc's per-allocation event tracking off for the window. The graph is
+//!    instantiated with `AUTO_FREE_ON_LAUNCH` and launched once, so its
+//!    retained output memory is mapped.
 //! 3. **replay**: copy the inputs into the stable buffers and launch. An input
 //!    adopted at capture (another graph's retained output, already at a fixed
 //!    address) is not copied.
@@ -18,6 +20,9 @@
 //! the graph is destroyed behind a stream fence. The ownership rules follow
 //! [`super::graphs::TensorIsland`]: nothing allocated before the capture may be
 //! freed inside it, and the closure may not read device values on the host.
+//! Nor may it upload host data. Candle's small-upload cache is per thread, so
+//! an upload would miss after a thread switch, and a hit would bake a stale
+//! value into the graph.
 //! Off CUDA, only [`SegmentGraph::warm`] (eager execution) is available.
 use candle_core::{Device, Result, Tensor};
 
@@ -139,8 +144,9 @@ impl SegmentGraph {
     }
 
     /// Capture `f` over stable copies of `inputs` (adopted inputs are used in
-    /// place). Nothing executes until [`Self::replay`]. On failure the stream
-    /// leaves capture mode and no graph is kept.
+    /// place), then launch the graph once on those copies. On failure the
+    /// stream leaves capture mode, CUDA errors the failed capture left on the
+    /// context are cleared, and no graph is kept.
     pub fn capture<F>(&mut self, inputs: &[SegmentInput<'_>], f: F) -> Result<()>
     where
         F: FnOnce(&[Tensor]) -> Result<Vec<Tensor>>,
@@ -188,31 +194,127 @@ impl SegmentGraph {
 mod device {
     use super::SegmentInput;
     use candle_core::cuda_backend::cudarc::driver::{
+        result,
         sys::{
-            CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            self, CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
             CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
         },
-        CudaGraph,
+        CudaContext,
     };
     use candle_core::{Result, Tensor};
-    use std::mem::ManuallyDrop;
+    use std::sync::Arc;
 
+    fn driver(what: &str, error: impl std::fmt::Display) -> candle_core::Error {
+        candle_core::Error::Msg(format!("{what}: {error}"))
+    }
+
+    /// An instantiated graph held through raw driver handles. cudarc's
+    /// `CudaGraph` goes through `bind_to_thread`, which first returns any
+    /// error another call left on the context (`check_err`). For
+    /// `end_capture`, that would return early and leave the stream in capture
+    /// mode.
     struct Graph {
-        raw: ManuallyDrop<CudaGraph>,
+        graph: sys::CUgraph,
+        exec: sys::CUgraphExec,
         device: candle_core::CudaDevice,
     }
 
     // SAFETY: CUDA graph APIs allow serialized use from any thread. Every
     // access goes through `&mut SegmentGraph` / `&SegmentGraph` behind the
-    // owner's lock, and `Drop` binds the context and fences before destroying.
+    // owner's lock, and the owner fences before destruction.
     unsafe impl Send for Graph {}
     unsafe impl Sync for Graph {}
 
+    impl Graph {
+        fn launch(&self) -> Result<()> {
+            let stream = self.device.cuda_stream();
+            // SAFETY: the exec is live, and the stream is this device's.
+            unsafe { result::graph::launch(self.exec, stream.cu_stream()) }
+                .map_err(|error| driver("graph launch", error))
+        }
+    }
+
     impl Drop for Graph {
         fn drop(&mut self) {
-            let _ = self.device.cuda_stream().context().bind_to_thread();
-            // SAFETY: dropped exactly once, after the owner's fence.
-            unsafe { ManuallyDrop::drop(&mut self.raw) }
+            let ctx = self.device.cuda_stream().context().cu_ctx();
+            // SAFETY: the handles are owned here and destroyed exactly once,
+            // after the owner's fence; the context outlives the device handle.
+            unsafe {
+                let _ = result::ctx::set_current(ctx);
+                let _ = result::graph::exec_destroy(self.exec);
+                let _ = result::graph::destroy(self.graph);
+            }
+        }
+    }
+
+    /// Ends the stream capture on every exit path (error, early return,
+    /// panic), so the per-thread stream never stays in capture mode.
+    struct CaptureGuard {
+        stream: sys::CUstream,
+        active: bool,
+    }
+
+    impl CaptureGuard {
+        fn finish(mut self) -> std::result::Result<sys::CUgraph, result::DriverError> {
+            self.active = false;
+            // SAFETY: this guard began the capture on `stream`.
+            unsafe { result::stream::end_capture(self.stream) }
+        }
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            // SAFETY: as in `finish`; a partial graph is discarded.
+            unsafe {
+                if let Ok(graph) = result::stream::end_capture(self.stream) {
+                    if !graph.is_null() {
+                        let _ = result::graph::destroy(graph);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Turns cudarc's per-allocation event tracking off for the capture window.
+    /// Each allocation gets read/write events, but izwi never enters
+    /// multi-stream mode, so the events are never recorded. Freeing an
+    /// allocation still waits on them, and inside a capture a wait on an event
+    /// the capture did not record can invalidate it; the segments allocate and
+    /// free intermediates inside the capture. In multi-stream mode the events
+    /// do order streams, so capture is refused there.
+    struct EventTrackingOff {
+        ctx: Arc<CudaContext>,
+        was_on: bool,
+    }
+
+    impl EventTrackingOff {
+        fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+            if ctx.is_in_multi_stream_mode() {
+                candle_core::bail!(
+                    "segment capture needs a single-stream context (event tracking orders streams)"
+                )
+            }
+            let was_on = ctx.is_event_tracking();
+            if was_on {
+                // SAFETY: single-stream mode: the events never order anything.
+                unsafe { ctx.disable_event_tracking() };
+            }
+            Ok(Self {
+                ctx: ctx.clone(),
+                was_on,
+            })
+        }
+    }
+
+    impl Drop for EventTrackingOff {
+        fn drop(&mut self) {
+            if self.was_on {
+                // SAFETY: restores the default for allocations made afterwards.
+                unsafe { self.ctx.enable_event_tracking() };
+            }
         }
     }
 
@@ -258,25 +360,95 @@ mod device {
             })
             .collect::<Result<Vec<_>>>()?;
         let stream = device.cuda_stream();
+        let ctx = stream.context().clone();
         let _htod = device.enable_cuda_graph_htod_cache();
-        stream
-            .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(|error| candle_core::Error::Msg(format!("begin capture: {error}")))?;
+        let events = EventTrackingOff::new(&ctx)?;
+        // SAFETY: the stream is this device's; the guard ends the capture.
+        unsafe {
+            result::stream::begin_capture(stream.cu_stream(), CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        }
+        .map_err(|error| driver("begin capture", error))?;
+        let guard = CaptureGuard {
+            stream: stream.cu_stream(),
+            active: true,
+        };
         let computation = f(&stable);
-        // Always leave capture mode, even when the closure failed.
-        let ended = stream.end_capture(CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
-        let outputs = computation?;
-        let graph = ended
-            .map_err(|error| candle_core::Error::Msg(format!("end capture: {error}")))?
-            .ok_or_else(|| candle_core::Error::Msg("segment capture recorded no work".into()))?;
-        if outputs.is_empty() {
-            candle_core::bail!("a captured segment must return outputs")
+        let ended = guard.finish();
+        drop(events);
+        let fail = |message: String| -> candle_core::Error {
+            // Frees inside a failed capture record errors on the context;
+            // clear them so they cannot fail an unrelated later call.
+            if let Err(error) = ctx.check_err() {
+                tracing::debug!(%error, "cleared CUDA errors left by a failed segment capture");
+            }
+            candle_core::Error::Msg(message)
+        };
+        let graph = match (computation, ended) {
+            (Ok(outputs), Ok(graph)) if !graph.is_null() && !outputs.is_empty() => {
+                // SAFETY: `graph` came from a completed capture.
+                match unsafe {
+                    result::graph::instantiate(
+                        graph,
+                        CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+                    )
+                } {
+                    Ok(exec) => (
+                        Graph {
+                            graph,
+                            exec,
+                            device: device.clone(),
+                        },
+                        outputs,
+                    ),
+                    Err(error) => {
+                        // SAFETY: the graph is ours and never instantiated.
+                        unsafe {
+                            let _ = result::graph::destroy(graph);
+                        }
+                        // Graph-memory outputs of an uninstantiated graph were
+                        // never mapped: freeing them would be invalid.
+                        std::mem::forget(outputs);
+                        return Err(fail(format!("graph instantiate: {error}")));
+                    }
+                }
+            }
+            (Ok(outputs), ended) => {
+                if let Ok(graph) = ended {
+                    if !graph.is_null() {
+                        // SAFETY: an unused graph from the capture.
+                        unsafe {
+                            let _ = result::graph::destroy(graph);
+                        }
+                    }
+                }
+                std::mem::forget(outputs);
+                return Err(fail(match ended {
+                    Err(error) => format!("end capture: {error}"),
+                    Ok(_) => "segment capture recorded no work or outputs".into(),
+                }));
+            }
+            (Err(error), ended) => {
+                if let Ok(graph) = ended {
+                    if !graph.is_null() {
+                        // SAFETY: an unused graph from the capture.
+                        unsafe {
+                            let _ = result::graph::destroy(graph);
+                        }
+                    }
+                }
+                return Err(fail(format!("segment capture: {error}")));
+            }
+        };
+        let (graph, outputs) = graph;
+        // Launch once now, as `TensorIsland` does: the retained outputs are
+        // graph memory, mapped only once the graph has run.
+        if let Err(error) = graph.launch() {
+            std::mem::forget(outputs);
+            std::mem::forget(graph);
+            return Err(fail(format!("first launch: {error}")));
         }
         Ok(Captured {
-            graph: Some(Graph {
-                raw: ManuallyDrop::new(graph),
-                device,
-            }),
+            graph: Some(graph),
             outputs,
             inputs: stable,
             adopted: inputs.iter().map(|input| input.adopt).collect(),
@@ -310,10 +482,7 @@ mod device {
             let Some(graph) = &self.graph else {
                 candle_core::bail!("segment graph was destroyed")
             };
-            graph
-                .raw
-                .launch()
-                .map_err(|error| candle_core::Error::Msg(format!("segment replay: {error}")))?;
+            graph.launch()?;
             Ok(self.outputs.clone())
         }
     }

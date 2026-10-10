@@ -108,6 +108,80 @@ struct Runtime {
     phase: Phase,
     graphs: Vec<SegmentGraph>,
     table: Option<DeviceTable>,
+    /// Recorded after each step's queued work. The next step's stream waits
+    /// on it: consecutive steps may run on different threads, whose
+    /// per-thread streams are not ordered, while they share the table and
+    /// the graphs' buffers.
+    #[cfg(feature = "cuda")]
+    fence: Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>,
+}
+
+impl Runtime {
+    /// Order this step's work after the previous step's (a GPU-side wait).
+    fn order_after_previous(&self, device: &Device) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let (Some(fence), Device::Cuda(cuda)) = (&self.fence, device) {
+            return cuda
+                .cuda_stream()
+                .wait(fence)
+                .map_err(|error| segment_error(&format!("step fence wait: {error}")));
+        }
+        let _ = device;
+        Ok(())
+    }
+
+    /// Mark the end of this step's queued work for the next step.
+    fn mark_step_end(&mut self, device: &Device) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = device {
+            let stream = cuda.cuda_stream();
+            if self.fence.is_none() {
+                self.fence = Some(
+                    stream
+                        .context()
+                        .new_event(None)
+                        .map_err(|error| segment_error(&format!("step fence: {error}")))?,
+                );
+            }
+            if let Some(fence) = &self.fence {
+                fence
+                    .record(&stream)
+                    .map_err(|error| segment_error(&format!("step fence record: {error}")))?;
+            }
+        }
+        let _ = device;
+        Ok(())
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // Wait for the last step, which may have run on another thread,
+        // before the graphs and the table it used are destroyed.
+        #[cfg(feature = "cuda")]
+        if let Some(fence) = &self.fence {
+            let _ = fence.synchronize();
+        }
+    }
+}
+
+/// A failed step: `Graph` errors come from the graph machinery (table,
+/// replay) and disable graph decode; `Other` errors are the step's own.
+enum StepError {
+    Graph(Error),
+    Other(Error),
+}
+
+impl From<Error> for StepError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<candle_core::Error> for StepError {
+    fn from(error: candle_core::Error) -> Self {
+        Self::Other(error.into())
+    }
 }
 
 /// Graph decode for one model (see the module docs).
@@ -210,6 +284,8 @@ impl Qwen36DecodeGraphs {
                     phase: Phase::Warm,
                     graphs,
                     table: None,
+                    #[cfg(feature = "cuda")]
+                    fence: None,
                 }),
                 warmups: AtomicU64::new(0),
                 captures: AtomicU64::new(0),
@@ -279,6 +355,7 @@ impl Qwen36DecodeGraphs {
             self.eager_steps.fetch_add(1, Relaxed);
             return Ok(None);
         };
+        runtime.order_after_previous(&device)?;
         let step = self.run_step(
             &mut runtime,
             model,
@@ -291,20 +368,21 @@ impl Qwen36DecodeGraphs {
             metadata,
             completions,
         );
+        let marked = runtime.mark_step_end(&device);
         let (hidden, phase, published) = match step {
             Ok(done) => done,
-            Err(error) => {
-                // A failure while graphs are active may be the graphs'
-                // fault: decode eagerly from now on.
-                if self.capture && runtime.phase != Phase::Warm {
-                    runtime.phase = Phase::Disabled(format!("graph decode step failed: {error}"));
-                    for graph in runtime.graphs.iter_mut() {
-                        graph.reset();
-                    }
+            Err(StepError::Graph(error)) => {
+                // The graph machinery failed: decode eagerly from now on.
+                runtime.phase = Phase::Disabled(format!("graph decode step failed: {error}"));
+                for graph in runtime.graphs.iter_mut() {
+                    graph.reset();
                 }
+                tracing::warn!(%error, "Qwen3.6 CUDA graph decode disabled; decoding eagerly");
                 return Err(error);
             }
+            Err(StepError::Other(error)) => return Err(error),
         };
+        marked?;
         runtime.phase = match phase {
             Phase::Warm if self.capture => Phase::Capture,
             Phase::Warm => Phase::Warm,
@@ -338,9 +416,11 @@ impl Qwen36DecodeGraphs {
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
-    ) -> Result<(Tensor, Phase, StateOutputs)> {
-        let published = StateOutputs::allocate(model, device)?;
-        let ios = self.state_io(runtime, model, inputs, &published, device)?;
+    ) -> std::result::Result<(Tensor, Phase, StateOutputs), StepError> {
+        let published = StateOutputs::allocate(model, device, None)?;
+        let ios = self
+            .state_io(runtime, model, inputs, &published, device)
+            .map_err(StepError::Graph)?;
         let run = |segment: &Segment, inputs: &[Tensor]| run_segment(model, segment, &ios, inputs);
         // The segment runner speaks Candle errors.
         let run_candle = |segment: &Segment, inputs: &[Tensor]| {
@@ -397,7 +477,9 @@ impl Qwen36DecodeGraphs {
                 }
                 Phase::Replay => {
                     let replay_inputs = segment_inputs(&step_inputs, previous_graph.as_deref());
-                    let outputs = runtime.graphs[index].replay(&replay_inputs)?;
+                    let outputs = runtime.graphs[index]
+                        .replay(&replay_inputs)
+                        .map_err(|error| StepError::Graph(error.into()))?;
                     self.replays.fetch_add(1, Relaxed);
                     previous_graph = Some(outputs.clone());
                     outputs
@@ -432,9 +514,7 @@ impl Qwen36DecodeGraphs {
             .filter(|layer| matches!(layer.mixer, Qwen36Mixer::Full(_)))
             .count();
         if physical_layer != attention_layers {
-            return Err(segment_error(
-                "graph decode did not cover every attention layer",
-            ));
+            return Err(segment_error("graph decode did not cover every attention layer").into());
         }
         let [hidden] = <[Tensor; 1]>::try_from(carried)
             .map_err(|_| segment_error("the last segment returns the hidden state"))?;
@@ -524,7 +604,7 @@ impl Qwen36DecodeGraphs {
         eager: &[Tensor],
     ) -> std::result::Result<Vec<Tensor>, String> {
         let mut check = || -> Result<Vec<Tensor>> {
-            let scratch = StateOutputs::allocate(model, device)?;
+            let scratch = StateOutputs::allocate(model, device, Some(&segment.linear))?;
             self.point_segment(runtime, segment, inputs, &scratch)?;
             let replay_inputs = segment_inputs(step_inputs, None);
             let graph = runtime.graphs[index].replay(&replay_inputs)?;
@@ -777,18 +857,22 @@ struct StateOutputs {
 }
 
 impl StateOutputs {
-    /// One slab for every DeltaNet layer's next history `[3, conv_dim]` and
-    /// state `[1, Hv, Dk, Dv]` (F32). The kernels write every element.
-    fn allocate(model: &Qwen36TextModel, device: &Device) -> Result<Self> {
+    /// One slab for the next history `[3, conv_dim]` and state
+    /// `[1, Hv, Dk, Dv]` (F32) of every DeltaNet layer, or of `only` those
+    /// layers. The kernels write every element.
+    fn allocate(model: &Qwen36TextModel, device: &Device, only: Option<&[usize]>) -> Result<Self> {
         let sizes = model
             .layers
             .iter()
-            .map(|layer| match &layer.mixer {
-                Qwen36Mixer::Linear(mixer) => Some((
-                    mixer.conv_dim,
-                    (mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim),
-                )),
-                Qwen36Mixer::Full(_) => None,
+            .enumerate()
+            .map(|(index, layer)| match &layer.mixer {
+                Qwen36Mixer::Linear(mixer) if only.is_none_or(|only| only.contains(&index)) => {
+                    Some((
+                        mixer.conv_dim,
+                        (mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim),
+                    ))
+                }
+                _ => None,
             })
             .collect::<Vec<_>>();
         let total = sizes
@@ -796,6 +880,11 @@ impl StateOutputs {
             .flatten()
             .map(|(conv_dim, (hv, dk, dv))| (gdn::CONV_TAPS - 1) * conv_dim + hv * dk * dv)
             .sum::<usize>();
+        if total == 0 {
+            return Ok(Self {
+                layers: sizes.iter().map(|_| None).collect(),
+            });
+        }
         let slab = uninit_f32(total, device)?;
         let mut offset = 0usize;
         let mut layers = Vec::with_capacity(sizes.len());
