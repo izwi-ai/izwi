@@ -1,11 +1,11 @@
-//! Qwen3.5-MoE chat model loader and text generation.
+//! Qwen3.6-MoE chat model loader and text generation.
 //!
 //! The wrapper is deliberately thin: it owns family-specific loading (the
 //! native block-FP8 bundle, or the synthetic GGUF fixture for CI) and
 //! text-only prompt preparation, while prompt rendering, the hybrid decode
-//! state machinery, and sampling come from the shared
-//! [`Qwen35ChatExec`](crate::models::architectures::qwen35::chat::Qwen35ChatExec)
-//! core the dense `Qwen35ChatModel` drives.
+//! state machinery, and sampling come from this family's
+//! [`Qwen36ChatExec`](crate::models::architectures::qwen36moe::exec::Qwen36ChatExec)
+//! core.
 
 use std::path::Path;
 
@@ -16,11 +16,11 @@ use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState, ChatDecodeStep, Qwen35ChatExec, Qwen35PreparedPrompt, Qwen35TextConfig,
-    Qwen35Tokenizer,
+use crate::models::architectures::qwen36moe::exec::{
+    ChatDecodeState, ChatDecodeStep, Qwen36ChatExec, Qwen36PreparedPrompt, Qwen36TextConfig,
+    Qwen36Tokenizer,
 };
-use crate::models::architectures::qwen35::text::{GgufSource, Qwen35TextModel};
+use crate::models::architectures::qwen36moe::text::{GgufSource, Qwen36TextModel};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
@@ -113,7 +113,7 @@ pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
     kv_storage_provider: Qwen36MoeKvStorageProvider,
     performance: crate::performance::CudaPerformanceConfig,
-    exec: Qwen35ChatExec,
+    exec: Qwen36ChatExec,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
@@ -210,17 +210,17 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: &DeviceProfile,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let loader =
             GgufLoader::from_path_with_backend(fixture_path, BackendKind::from(device.kind))?;
         let text_config = parse_fixture_gguf_config(&loader)?;
-        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &loader)?;
-        let text_model = Qwen35TextModel::load_with_source(
+        let tokenizer = Qwen36Tokenizer::load(model_dir, variant, &loader)?;
+        let text_model = Qwen36TextModel::load_with_source(
             &GgufSource::new(&loader),
             &text_config,
             &device.device,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -240,14 +240,14 @@ impl Qwen36MoeChatModel {
         performance: &crate::performance::CudaPerformanceConfig,
         mtp_policy: Qwen36MoeMtpLoadPolicy,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
             model_dir,
             super::native::Qwen36MoeGeometryPolicy::from_env(),
             mtp_policy,
         )?;
-        let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
+        let tokenizer = Qwen36Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model, mtp_head) = load_text_model_native(
             &checkpoint,
             device,
@@ -255,7 +255,7 @@ impl Qwen36MoeChatModel {
             performance,
             mtp_enabled,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -272,7 +272,7 @@ impl Qwen36MoeChatModel {
         self.exec.variant()
     }
 
-    pub fn text_config(&self) -> &Qwen35TextConfig {
+    pub fn text_config(&self) -> &Qwen36TextConfig {
         self.exec.text_config()
     }
 
@@ -315,7 +315,7 @@ impl Qwen36MoeChatModel {
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<Qwen35PreparedPrompt> {
+    ) -> Result<Qwen36PreparedPrompt> {
         if !config.request.media_inputs.is_empty() {
             return Err(Error::InvalidInput(
                 "Qwen3.5/3.6-MoE serving is text-only and does not accept media inputs".to_string(),
@@ -352,7 +352,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         self.start_decode_state_physical_with_mtp(messages, max_new_tokens, config, prepared, cache, None)
@@ -363,7 +363,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
@@ -389,7 +389,7 @@ impl Qwen36MoeChatModel {
 
     pub(crate) fn begin_resumable_prefill_state_physical(
         &self,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
@@ -403,7 +403,7 @@ impl Qwen36MoeChatModel {
     pub(crate) fn continue_resumable_prefill_physical(
         &self,
         state: &mut ChatDecodeState,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         span_start: usize,
         span_end: usize,
     ) -> Result<bool> {
@@ -521,7 +521,7 @@ impl Qwen36MoeChatModel {
     /// spans before decode resumes.
     pub(crate) fn begin_replay_state_physical(
         &self,
-        saved: &crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint,
+        saved: &crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {

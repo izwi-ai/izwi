@@ -31,7 +31,7 @@ use crate::models::shared::moe::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use crate::models::architectures::qwen35::text::Qwen35MoeFfnGeometry;
+use crate::models::architectures::qwen36moe::text::Qwen36MoeFfnGeometry;
 
 /// Persistent form of one projection inside the sparse block. `Quantized`
 /// keeps quantized residency (GGUF tensors, CPU-packed Q8_0 requants);
@@ -155,7 +155,7 @@ impl Qwen36MoeSparseMlp {
         router: Qwen36MoeLinear,
         experts: Vec<Qwen36MoeExpertWeights>,
         shared: Qwen36MoeSharedExpertWeights,
-        geometry: &Qwen35MoeFfnGeometry,
+        geometry: &Qwen36MoeFfnGeometry,
     ) -> Result<Self> {
         if experts.len() != geometry.num_experts {
             return Err(Error::ModelLoadError(format!(
@@ -230,7 +230,7 @@ fn rank3(tensor: &Tensor) -> bool {
 pub(crate) fn load_gguf_sparse_mlp(
     loader: &GgufLoader,
     layer: usize,
-    geometry: &Qwen35MoeFfnGeometry,
+    geometry: &Qwen36MoeFfnGeometry,
     device: &Device,
 ) -> Result<Qwen36MoeSparseMlp> {
     let prefix = format!("blk.{layer}");
@@ -360,8 +360,8 @@ mod tests {
     const TOP_K: usize = 2;
     const TOKENS: usize = 3;
 
-    fn geometry(shared_ff: usize) -> Qwen35MoeFfnGeometry {
-        Qwen35MoeFfnGeometry {
+    fn geometry(shared_ff: usize) -> Qwen36MoeFfnGeometry {
+        Qwen36MoeFfnGeometry {
             num_experts: NUM_EXPERTS,
             num_experts_per_tok: TOP_K,
             expert_intermediate_size: FF,

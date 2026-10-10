@@ -2197,7 +2197,7 @@ mod tests {
 
     #[test]
     fn native_dense_source_honors_the_trunks_requested_dtype() {
-        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
         use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
 
         let config = forward_config();
@@ -2276,7 +2276,7 @@ mod tests {
 
     #[test]
     fn native_rms_norms_apply_the_zero_centered_gain() {
-        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
         use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
         use candle_core::Module;
 
@@ -2444,7 +2444,7 @@ mod tests {
     /// rest token by token (one logits row per position from `prompt - 1`),
     /// then prefill the whole sequence in one span (its last row).
     fn golden_trunk_logits(
-        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        model: &crate::models::architectures::qwen36moe::text::Qwen36TextModel,
         text: &Qwen36MoeTextConfig,
         token_ids: &[u32],
         prompt: usize,
@@ -2537,7 +2537,7 @@ mod tests {
     /// Q8_0) must track it to quantization tolerance.
     #[test]
     fn native_trunk_matches_the_hf_reference_logits() {
-        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
         use crate::models::architectures::qwen36moe::native_model::{
             load_text_model_native, qwen35_text_config_from_native, Qwen36MoeNativeSource,
         };
@@ -2558,7 +2558,7 @@ mod tests {
             Qwen36MoeProjectionResidency::ExpandedF32,
             ProjectionMaterialization::F32,
         );
-        let exact = Qwen35TextModel::load_with_source(
+        let exact = Qwen36TextModel::load_with_source(
             &exact_source,
             &qwen35_text_config_from_native(&text),
             &device,
@@ -2623,7 +2623,7 @@ mod tests {
     /// so a mixed-dtype graph must be validated on the backend that runs it.
     fn forward_under_dtype_plan(
         label: &str,
-        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        model: &crate::models::architectures::qwen36moe::text::Qwen36TextModel,
         mut cache: crate::models::shared::attention::physical::PhysicalPagedKvCache,
         activation_dtype: candle_core::DType,
     ) {
@@ -2674,7 +2674,7 @@ mod tests {
         use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
         use crate::models::architectures::qwen36moe::native_model::{
             qwen35_text_config_from_native, Qwen36MoeNativeSource,
         };
@@ -2709,7 +2709,7 @@ mod tests {
         // recurrence.
         let source = Qwen36MoeNativeSource::new(&checkpoint, &device_profile);
         let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+        let model = Qwen36TextModel::load_with_source(&source, &text_config, &device).unwrap();
 
         let DeviceLocation::Metal { gpu_id } = device.location() else {
             panic!("metal test device reported a non-metal location");
@@ -2772,7 +2772,7 @@ mod tests {
         use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
         use crate::models::architectures::qwen36moe::native_model::{
             qwen35_text_config_from_native, Qwen36MoeNativeSource,
         };
@@ -2804,7 +2804,7 @@ mod tests {
             ProjectionMaterialization::BF16,
         );
         let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+        let model = Qwen36TextModel::load_with_source(&source, &text_config, &device).unwrap();
 
         let DeviceLocation::Cuda { gpu_id } = device.location() else {
             panic!("CUDA test device reported a non-CUDA location");
@@ -4091,7 +4091,7 @@ mod tests {
 
     #[test]
     fn compact_fp8_residency_keeps_raw_bytes_and_decodes_block_scales() {
-        use crate::models::architectures::qwen35::text::Qwen35Projection;
+        use crate::models::architectures::qwen36moe::text::Qwen36Projection;
 
         let mut config = tiny_config();
         // The fp8 projection kernel contract pins 128x128 block scales; the
@@ -4139,7 +4139,7 @@ mod tests {
         let mut input = vec![0f32; 32];
         input[5] = 1.0;
         let x = candle_core::Tensor::from_vec(input, (1, 32), &candle_core::Device::Cpu).unwrap();
-        let y = Qwen35Projection::CompactFp8 {
+        let y = Qwen36Projection::CompactFp8 {
             weights: compact.weights,
             scales: compact.scales,
         }
@@ -4270,7 +4270,7 @@ mod tests {
 
     #[test]
     fn moe_ffn_prefix_resolves_the_same_block_as_the_trunk_layer() {
-        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
         use crate::models::architectures::qwen36moe::native_model::{
             Qwen36MoeNativeSource, qwen35_text_config_from_native,
         };
@@ -4588,7 +4588,7 @@ mod tests {
             }]
         };
         let run_to_completion = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
-                                 state: &mut crate::models::architectures::qwen35::chat::ChatDecodeState|
+                                 state: &mut crate::models::architectures::qwen36moe::exec::ChatDecodeState|
          -> String {
             let mut text = String::new();
             for _ in 0..64 {

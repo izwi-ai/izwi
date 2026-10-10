@@ -30,14 +30,14 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 /// Family-typed durable continuation record for a suspended chat session.
 pub(super) enum SuspendedReplayCheckpoint {
     Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
-    Qwen35Moe(crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint),
+    Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
 }
 
 impl SuspendedReplayCheckpoint {
     pub(super) fn replay_tokens(&self) -> usize {
         match self {
             Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
-            Self::Qwen35Moe(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
         }
     }
 }
