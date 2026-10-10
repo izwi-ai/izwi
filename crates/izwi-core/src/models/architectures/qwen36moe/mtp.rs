@@ -7,7 +7,7 @@
 //! projected through the raw LM head directly (the trunk's `output_norm`
 //! never applies to draft logits).
 //!
-//! The head is deliberately built through [`Qwen35WeightSource`] with the
+//! The head is deliberately built through [`Qwen36WeightSource`] with the
 //! `mtpblk.{layer}` logical prefix so the trunk's own attention/MLP/norm
 //! loaders construct it exactly like a trunk layer; the native source
 //! translates those names to the checkpoint's `mtp.layers.0.*` layout.
@@ -17,9 +17,9 @@ use candle_core::{Device, Module, Tensor, D};
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
 use crate::kv::KvDecodeBatchMetadata;
-use crate::models::architectures::qwen35::chat::Qwen35TextConfig;
-use crate::models::architectures::qwen35::text::{
-    Qwen35FullAttention, Qwen35Projection, Qwen35RmsNorm, Qwen35TextModel, Qwen35WeightSource,
+use crate::models::architectures::qwen36moe::exec::Qwen36TextConfig;
+use crate::models::architectures::qwen36moe::text::{
+    Qwen36FullAttention, Qwen36Projection, Qwen36RmsNorm, Qwen36TextModel, Qwen36WeightSource,
 };
 use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 /// The MTP layer occupies one virtual layer id past the last trunk layer —
 /// the id the MTP KV domain binds in the state contract.
-pub(crate) fn mtp_model_layer(cfg: &Qwen35TextConfig) -> u32 {
+pub(crate) fn mtp_model_layer(cfg: &Qwen36TextConfig) -> u32 {
     u32::try_from(cfg.block_count).unwrap_or(u32::MAX)
 }
 
@@ -138,23 +138,23 @@ impl AdaptiveMtp {
     }
 }
 
-pub(crate) struct Qwen35MtpHead {
+pub(crate) struct Qwen36MtpHead {
     hidden_size: usize,
     draft_depth: usize,
-    pre_fc_norm_embedding: Qwen35RmsNorm,
-    pre_fc_norm_hidden: Qwen35RmsNorm,
-    fc: Qwen35Projection,
-    input_layernorm: Qwen35RmsNorm,
-    attention: Qwen35FullAttention,
-    post_attention_norm: Qwen35RmsNorm,
+    pre_fc_norm_embedding: Qwen36RmsNorm,
+    pre_fc_norm_hidden: Qwen36RmsNorm,
+    fc: Qwen36Projection,
+    input_layernorm: Qwen36RmsNorm,
+    attention: Qwen36FullAttention,
+    post_attention_norm: Qwen36RmsNorm,
     mlp: Qwen36MoeSparseMlp,
-    norm: Qwen35RmsNorm,
+    norm: Qwen36RmsNorm,
 }
 
-impl Qwen35MtpHead {
+impl Qwen36MtpHead {
     pub(crate) fn load_via(
-        source: &dyn Qwen35WeightSource,
-        cfg: &Qwen35TextConfig,
+        source: &dyn Qwen36WeightSource,
+        cfg: &Qwen36TextConfig,
         device: &Device,
         draft_depth: usize,
     ) -> Result<Self> {
@@ -181,7 +181,7 @@ impl Qwen35MtpHead {
             )?,
             fc: source.projection("mtpblk.0.mtp_fc.weight", device)?,
             input_layernorm: source.rms_norm("mtpblk.0.attn_norm.weight", eps, device)?,
-            attention: Qwen35FullAttention::load_via(source, device, "mtpblk.0", cfg)?,
+            attention: Qwen36FullAttention::load_via(source, device, "mtpblk.0", cfg)?,
             post_attention_norm: source.rms_norm(
                 "mtpblk.0.post_attention_norm.weight",
                 eps,
@@ -366,7 +366,7 @@ impl Qwen35MtpHead {
     /// `depth - 1` pair forwards.
     pub(crate) fn draft_greedy(
         &self,
-        text: &Qwen35TextModel,
+        text: &Qwen36TextModel,
         seed_hidden: &Tensor,
         depth: usize,
         continuation_positions: &[[usize; 3]],
@@ -390,7 +390,7 @@ impl Qwen35MtpHead {
     /// the clamped argmax. The first token never writes the MTP cache.
     pub(crate) fn draft_recurrently<S>(
         &self,
-        text: &Qwen35TextModel,
+        text: &Qwen36TextModel,
         seed_hidden: &Tensor,
         depth: usize,
         continuation_positions: &[[usize; 3]],

@@ -152,6 +152,14 @@ pub(crate) struct RepresentationElementBucket {
     /// kernel cannot execute (`n % 64 != 0 || k % 128 != 0`); under the
     /// native-FP8 residency these fall back to packed Q8_0.
     pub fp8_incompatible_elements: u64,
+    /// The routed and shared expert share of `fp8_elements` (and of
+    /// `fp8_scale_bytes`): Metal keeps exactly these as raw block-FP8 for the
+    /// fused MoE kernels while the rest of the trunk expands to F16.
+    pub expert_fp8_elements: u64,
+    pub expert_fp8_scale_bytes: u64,
+    /// Dense elements of the LM head, which the CPU residency packs as Q8_0
+    /// instead of keeping F32 (it is ~40% of the CPU decode traffic).
+    pub lm_head_elements: u64,
 }
 
 /// Element inventory of the published checkpoint's persistent representation,
@@ -162,6 +170,9 @@ pub(crate) struct PinnedRepresentationInventory {
     pub tensor_count: u64,
     pub fp8_scale_bytes: u64,
     pub fp8_incompatible_elements: u64,
+    pub expert_fp8_elements: u64,
+    pub expert_fp8_scale_bytes: u64,
+    pub lm_head_elements: u64,
     /// Element inventory of the MTP draft manifest. Admission charges this
     /// bucket only when the MTP load policy makes the draft head resident;
     /// the default load skips `mtp.*` exactly like the vision tower.
@@ -178,17 +189,30 @@ impl PinnedRepresentationInventory {
             tensor_count: self.tensor_count,
             fp8_scale_bytes: self.fp8_scale_bytes,
             fp8_incompatible_elements: self.fp8_incompatible_elements,
+            expert_fp8_elements: self.expert_fp8_elements,
+            expert_fp8_scale_bytes: self.expert_fp8_scale_bytes,
+            lm_head_elements: self.lm_head_elements,
         }
     }
 }
 
+/// Canonical name of the untied LM head.
+pub(crate) const LM_HEAD_TENSOR: &str = "lm_head.weight";
+
+/// Whether a checkpoint tensor belongs to a routed or the shared expert (the
+/// projections the fused MoE stacks).
+fn is_expert_tensor(name: &str) -> bool {
+    name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert.")
+}
+
 /// Fold one tensor plan into its resident-representation element counts.
 fn fold_representation_inventory(
-    entries: impl IntoIterator<Item = (ExpectedTensorKind, Vec<usize>)>,
+    entries: impl IntoIterator<Item = (String, ExpectedTensorKind, Vec<usize>)>,
 ) -> RepresentationElementBucket {
     use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
     let mut bucket = RepresentationElementBucket::default();
-    for (kind, shape) in entries {
+    for (name, kind, shape) in entries {
+        let expert = is_expert_tensor(&name);
         bucket.tensor_count += 1;
         let count = shape
             .iter()
@@ -205,6 +229,12 @@ fn fold_representation_inventory(
                 bucket.fp8_scale_bytes = bucket
                     .fp8_scale_bytes
                     .saturating_add(scale_entries.saturating_mul(4));
+                if expert {
+                    bucket.expert_fp8_elements = bucket.expert_fp8_elements.saturating_add(count);
+                    bucket.expert_fp8_scale_bytes = bucket
+                        .expert_fp8_scale_bytes
+                        .saturating_add(scale_entries.saturating_mul(4));
+                }
                 if rows % 64 != 0 || cols % 128 != 0 {
                     bucket.fp8_incompatible_elements = bucket
                         .fp8_incompatible_elements
@@ -212,7 +242,10 @@ fn fold_representation_inventory(
                 }
             }
             Dense | OptionalDense => {
-                bucket.dense_elements = bucket.dense_elements.saturating_add(count)
+                bucket.dense_elements = bucket.dense_elements.saturating_add(count);
+                if name == LM_HEAD_TENSOR {
+                    bucket.lm_head_elements = bucket.lm_head_elements.saturating_add(count);
+                }
             }
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
@@ -230,17 +263,23 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
     let mtp_plan = mtp_tensor_plan(&config.text, config.block_fp8.block_shape)
         .expect("pinned config produces the validated MTP manifest");
     let trunk = fold_representation_inventory(
-        plan.into_values()
-            .map(|expected| (expected.kind, expected.shape)),
+        plan.into_iter()
+            .map(|(name, expected)| (name, expected.kind, expected.shape)),
     );
-    let mtp =
-        fold_representation_inventory(mtp_plan.into_iter().map(|spec| (spec.kind, spec.shape)));
+    let mtp = fold_representation_inventory(
+        mtp_plan
+            .into_iter()
+            .map(|spec| (spec.name.to_string(), spec.kind, spec.shape)),
+    );
     PinnedRepresentationInventory {
         fp8_elements: trunk.fp8_elements,
         dense_elements: trunk.dense_elements,
         tensor_count: trunk.tensor_count,
         fp8_scale_bytes: trunk.fp8_scale_bytes,
         fp8_incompatible_elements: trunk.fp8_incompatible_elements,
+        expert_fp8_elements: trunk.expert_fp8_elements,
+        expert_fp8_scale_bytes: trunk.expert_fp8_scale_bytes,
+        lm_head_elements: trunk.lm_head_elements,
         mtp,
     }
 }
@@ -1183,7 +1222,7 @@ pub fn mtp_tensor_plan(
             vec![text.moe_num_experts, hidden],
         );
         for expert in 0..text.moe_num_experts {
-            for (suffix, shape) in expert_projection_shapes(text) {
+            for (suffix, shape) in expert_projection_shapes(text, text.moe_intermediate_size) {
                 push_projection(
                     &mut specs,
                     format!("{prefix}.mlp.experts.{expert}.{suffix}"),
@@ -1192,7 +1231,9 @@ pub fn mtp_tensor_plan(
                 )?;
             }
         }
-        for (suffix, shape) in expert_projection_shapes(text) {
+        for (suffix, shape) in
+            expert_projection_shapes(text, text.shared_expert_intermediate_size)
+        {
             push_projection(
                 &mut specs,
                 format!("{prefix}.mlp.shared_expert.{suffix}"),
@@ -1343,7 +1384,7 @@ pub fn expected_text_tensor_plan(
             ExpectedTensorKind::Dense,
         );
         for expert in 0..text.moe_num_experts {
-            for (suffix, shape) in expert_projection_shapes(text) {
+            for (suffix, shape) in expert_projection_shapes(text, text.moe_intermediate_size) {
                 insert_fp8_projection(
                     &mut plan,
                     format!("{prefix}.mlp.experts.{expert}.{suffix}"),
@@ -1353,7 +1394,9 @@ pub fn expected_text_tensor_plan(
                 );
             }
         }
-        for (suffix, shape) in expert_projection_shapes(text) {
+        for (suffix, shape) in
+            expert_projection_shapes(text, text.shared_expert_intermediate_size)
+        {
             insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.mlp.shared_expert.{suffix}"),
@@ -1487,20 +1530,17 @@ pub fn expected_text_tensor_plan(
     Ok(plan)
 }
 
-fn expert_projection_shapes(text: &Qwen36MoeTextConfig) -> [(&'static str, Vec<usize>); 3] {
+/// SwiGLU projection shapes for one expert of the given intermediate width
+/// (`moe_intermediate_size` for routed experts,
+/// `shared_expert_intermediate_size` for the shared expert).
+fn expert_projection_shapes(
+    text: &Qwen36MoeTextConfig,
+    intermediate: usize,
+) -> [(&'static str, Vec<usize>); 3] {
     [
-        (
-            "gate_proj.weight",
-            vec![text.moe_intermediate_size, text.hidden_size],
-        ),
-        (
-            "up_proj.weight",
-            vec![text.moe_intermediate_size, text.hidden_size],
-        ),
-        (
-            "down_proj.weight",
-            vec![text.hidden_size, text.moe_intermediate_size],
-        ),
+        ("gate_proj.weight", vec![intermediate, text.hidden_size]),
+        ("up_proj.weight", vec![intermediate, text.hidden_size]),
+        ("down_proj.weight", vec![text.hidden_size, intermediate]),
     ]
 }
 
@@ -1861,10 +1901,16 @@ impl Qwen36MoeNativeCheckpoint {
         expected_shape: [usize; 2],
         block_shape: [usize; 2],
     ) -> bool {
+        // CUDA runs the native plan in BF16, Metal in F16.
+        let activation = if device.is_metal() {
+            candle_core::DType::F16
+        } else {
+            candle_core::DType::BF16
+        };
         block_shape == [128, 128]
             && crate::kernels::cuda::fp8::provider_supported(
                 device,
-                candle_core::DType::BF16,
+                activation,
                 expected_shape[0],
                 expected_shape[1],
             )
@@ -2196,7 +2242,7 @@ mod tests {
 
     #[test]
     fn native_dense_source_honors_the_trunks_requested_dtype() {
-        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
         use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
 
         let config = forward_config();
@@ -2246,6 +2292,375 @@ mod tests {
         assert_eq!(unconstrained.dtype(), candle_core::DType::BF16);
     }
 
+    /// Effective-gain contract for HF `Qwen3_5MoeRMSNorm`: the checkpoint
+    /// stores zero-centered gains and HF applies `x̂ · (1 + w)`. The fixture's
+    /// stored gain is 0.05, so a unit-RMS input must come out at 1.05 through
+    /// every norm the trunk loads via `rms_norm` — under both the CPU (F32)
+    /// and the CUDA (BF16 activation) plans — while the gated DeltaNet norm
+    /// (`linear_attn.norm`, plain `w`) stays raw. A finiteness-only fixture
+    /// cannot see this: gain 0.05 and gain 1.05 are both finite.
+    #[test]
+    fn shared_expert_plan_uses_the_shared_intermediate_size() {
+        let mut config = forward_config();
+        config.text.shared_expert_intermediate_size = 64;
+        let plan = expected_text_tensor_plan(&config).unwrap();
+        let routed = &plan["model.layers.0.mlp.experts.0.gate_proj.weight"];
+        assert_eq!(routed.shape, vec![32, 32]);
+        let shared_gate = &plan["model.layers.0.mlp.shared_expert.gate_proj.weight"];
+        assert_eq!(shared_gate.shape, vec![64, 32]);
+        let shared_down = &plan["model.layers.0.mlp.shared_expert.down_proj.weight"];
+        assert_eq!(shared_down.shape, vec![32, 64]);
+
+        let mtp = mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap();
+        let mtp_shared = mtp
+            .iter()
+            .find(|spec| spec.name == "mtp.layers.0.mlp.shared_expert.gate_proj.weight")
+            .expect("MTP shared expert");
+        assert_eq!(mtp_shared.shape, vec![64, 32]);
+    }
+
+    #[test]
+    fn native_rms_norms_apply_the_zero_centered_gain() {
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
+        use candle_core::Module;
+
+        let config = forward_config();
+        let dir = TestDir::new("zero-centered-norm");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let device = candle_core::Device::Cpu;
+        let stored = half::bf16::from_f32(0.05).to_f32();
+        let expected = 1.0 + stored;
+
+        let cuda_plan_on_cpu = DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind: crate::backends::DeviceKind::Cuda,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        for (label, profile, activation) in [
+            ("cpu", DeviceProfile::cpu(), candle_core::DType::F32),
+            ("cuda-plan", cuda_plan_on_cpu, candle_core::DType::BF16),
+        ] {
+            let source = Qwen36MoeNativeSource::new(&checkpoint, &profile);
+            for (name, width) in [
+                ("output_norm.weight", config.text.hidden_size),
+                ("blk.0.attn_norm.weight", config.text.hidden_size),
+                ("blk.0.post_attention_norm.weight", config.text.hidden_size),
+                ("blk.3.attn_q_norm.weight", config.text.attention_key_length),
+                ("blk.3.attn_k_norm.weight", config.text.attention_key_length),
+            ] {
+                let norm = source.rms_norm(name, 1e-6, &device).unwrap();
+                assert_eq!(norm.weight().dtype(), candle_core::DType::F32);
+                let x = candle_core::Tensor::ones((1, width), activation, &device).unwrap();
+                let y = norm.forward(&x).unwrap();
+                assert_eq!(y.dtype(), activation, "{label} {name}: dtype");
+                let values = y
+                    .to_dtype(candle_core::DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                // BF16 output rounding near 1.05 is ~4e-3.
+                let tolerance = if activation == candle_core::DType::F32 {
+                    1e-5
+                } else {
+                    8e-3
+                };
+                assert!(
+                    values.iter().all(|v| (v - expected).abs() < tolerance),
+                    "{label} {name}: effective gain must be 1 + w = {expected}, got {:?}",
+                    &values[..values.len().min(4)]
+                );
+            }
+
+            let gated = source
+                .dense(
+                    "blk.0.ssm_norm.weight",
+                    Some(candle_core::DType::F32),
+                    &device,
+                )
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                gated.iter().all(|v| (v - stored).abs() < 1e-7),
+                "{label}: the gated DeltaNet norm must stay raw"
+            );
+        }
+    }
+
+    fn golden_fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen36moe_golden")
+    }
+
+    /// Reference token ids, prompt length, and `[tokens, vocab]` logits
+    /// recorded from HF transformers' `Qwen3_5MoeForCausalLM`.
+    fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
+        let raw = std::fs::read(golden_fixture_dir().join("golden.safetensors")).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&raw).unwrap();
+        let i64s = |name: &str| -> Vec<i64> {
+            tensors
+                .tensor(name)
+                .unwrap()
+                .data()
+                .chunks_exact(8)
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        };
+        let token_ids = i64s("token_ids").into_iter().map(|v| v as u32).collect();
+        let prompt = i64s("prompt_tokens")[0] as usize;
+        let logits = tensors.tensor("logits").unwrap();
+        let vocab = logits.shape()[1];
+        let values: Vec<f32> = logits
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        (
+            token_ids,
+            prompt,
+            values.chunks(vocab).map(<[f32]>::to_vec).collect(),
+        )
+    }
+
+    fn golden_physical_cache(
+        text: &Qwen36MoeTextConfig,
+    ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use std::sync::Arc;
+
+        let bindings: Vec<KvLayerBinding> = (0..text.block_count)
+            .filter(|layer| text.is_full_attention_layer(*layer))
+            .enumerate()
+            .map(|(physical, model_layer)| KvLayerBinding {
+                model_layer: model_layer as u32,
+                physical_layer: physical as u32,
+            })
+            .collect();
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4250),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 8,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: bindings
+                    .iter()
+                    .map(|binding| KvLayerConfig {
+                        binding: *binding,
+                        num_kv_heads: text.attention_head_count_kv as u32,
+                        key_head_dim: text.attention_key_length as u32,
+                        value_head_dim: text.attention_value_length as u32,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8u32)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
+    /// Run the trunk over the golden sequence: prefill the prompt, decode the
+    /// rest token by token (one logits row per position from `prompt - 1`),
+    /// then prefill the whole sequence in one span (its last row).
+    fn golden_trunk_logits(
+        model: &crate::models::architectures::qwen36moe::text::Qwen36TextModel,
+        text: &Qwen36MoeTextConfig,
+        token_ids: &[u32],
+        prompt: usize,
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let row = |logits: candle_core::Tensor| -> Vec<f32> {
+            logits
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let positions: Vec<[usize; 3]> = (0..token_ids.len()).map(|p| [p, p, p]).collect();
+
+        let mut state = model.new_state();
+        let mut cache = golden_physical_cache(text);
+        let mut rows = vec![row(model
+            .prefill_token_ids_physical(
+                &token_ids[..prompt],
+                &positions[..prompt],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap()
+            .expect("prefill logits"))];
+        for position in prompt..token_ids.len() {
+            rows.push(row(model
+                .forward_token_id_at_physical(
+                    token_ids[position],
+                    positions[position],
+                    &mut state,
+                    &mut cache,
+                )
+                .unwrap()));
+        }
+
+        let mut state = model.new_state();
+        let mut cache = golden_physical_cache(text);
+        let full = row(model
+            .prefill_token_ids_physical(token_ids, &positions, &mut state, &mut cache, true)
+            .unwrap()
+            .expect("prefill logits"));
+        (rows, full)
+    }
+
+    fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+        assert_eq!(lhs.len(), rhs.len());
+        lhs.iter()
+            .zip(rhs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn relative_l2(values: &[f32], reference: &[f32]) -> f32 {
+        let error: f32 = values
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let norm: f32 = reference.iter().map(|b| b * b).sum();
+        (error / norm).sqrt()
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index)
+            .unwrap()
+    }
+
+    /// End-to-end value parity against the reference implementation.
+    ///
+    /// The fixture (`scripts/fixtures/generate_qwen36moe_golden.py`) is a tiny
+    /// random-init HF `Qwen3_5MoeForCausalLM` written in the published
+    /// Qwen3.6-35B-A3B-FP8 layout — block-FP8 projections, BF16 dense tensors,
+    /// per-expert names — with random non-zero zero-centered norm gains and
+    /// 2 key / 4 value DeltaNet heads, plus HF's logits for every position of
+    /// a 32-token sequence. Exercised: every native loader value convention
+    /// (zero-centered `1 + w`, grouped value-head order, `A_log`, conv
+    /// orientation, FP8 block scales, per-expert gate/up/down), interleaved
+    /// partial MRoPE, the gated full attention, the DeltaNet sequence and
+    /// decode recurrences, and the routed + shared MoE.
+    ///
+    /// Two residencies: expanded F32 projections must match HF to F32
+    /// tolerance; the production CPU residency (FP8 requantized to packed
+    /// Q8_0) must track it to quantization tolerance.
+    #[test]
+    fn native_trunk_matches_the_hf_reference_logits() {
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            load_text_model_native, qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            &golden_fixture_dir(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let text = checkpoint.config.text.clone();
+        let (token_ids, prompt, reference) = golden_reference();
+        assert_eq!(reference.len(), token_ids.len());
+        assert_eq!(reference[0].len(), text.vocab_size);
+        let device = candle_core::Device::Cpu;
+
+        let exact_source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::ExpandedF32,
+            ProjectionMaterialization::F32,
+        );
+        let exact = Qwen36TextModel::load_with_source(
+            &exact_source,
+            &qwen35_text_config_from_native(&text),
+            &device,
+        )
+        .unwrap();
+        let (rows, full) = golden_trunk_logits(&exact, &text, &token_ids, prompt);
+        for (offset, row) in rows.iter().enumerate() {
+            let position = prompt - 1 + offset;
+            let diff = max_abs_diff(row, &reference[position]);
+            assert!(
+                diff < 2e-3,
+                "expanded-F32 logits at position {position} diverge from HF by {diff}"
+            );
+        }
+        let diff = max_abs_diff(&full, &reference[token_ids.len() - 1]);
+        assert!(
+            diff < 2e-3,
+            "full-sequence prefill diverges from HF by {diff}"
+        );
+
+        let (_, packed, _) = load_text_model_native(
+            &checkpoint,
+            &DeviceProfile::cpu(),
+            &device,
+            &crate::performance::CudaPerformanceConfig::default(),
+            false,
+        )
+        .unwrap();
+        // Candle's CPU Q8_0 matmul also quantizes the activations, so this
+        // residency carries a few percent of relative logit error (more on a
+        // position where the noise flips an expert choice). A loader
+        // convention error is ~100%, far outside these bounds.
+        let (rows, _) = golden_trunk_logits(&packed, &text, &token_ids, prompt);
+        let mut agree = 0usize;
+        let mut total_relative = 0.0f32;
+        for (offset, row) in rows.iter().enumerate() {
+            let position = prompt - 1 + offset;
+            let relative = relative_l2(row, &reference[position]);
+            assert!(
+                relative < 0.25,
+                "packed-Q8 logits at position {position} diverge from HF by {relative} (relative L2)"
+            );
+            total_relative += relative;
+            agree += usize::from(argmax(row) == argmax(&reference[position]));
+        }
+        let mean_relative = total_relative / rows.len() as f32;
+        assert!(
+            mean_relative < 0.08,
+            "packed-Q8 mean relative logit error {mean_relative} exceeds quantization tolerance"
+        );
+        assert!(
+            agree * 5 >= rows.len() * 4,
+            "packed-Q8 greedy tokens agree with HF on only {agree}/{} positions",
+            rows.len()
+        );
+    }
+
     /// Run the shared trunk's prefill + decode under a backend dtype plan and
     /// assert the trunk's activation dtype survives the head with finite
     /// logits. Used by the hardware-gated plan tests: the CPU device cannot
@@ -2253,7 +2668,7 @@ mod tests {
     /// so a mixed-dtype graph must be validated on the backend that runs it.
     fn forward_under_dtype_plan(
         label: &str,
-        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        model: &crate::models::architectures::qwen36moe::text::Qwen36TextModel,
         mut cache: crate::models::shared::attention::physical::PhysicalPagedKvCache,
         activation_dtype: candle_core::DType,
     ) {
@@ -2304,7 +2719,7 @@ mod tests {
         use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
         use crate::models::architectures::qwen36moe::native_model::{
             qwen35_text_config_from_native, Qwen36MoeNativeSource,
         };
@@ -2339,7 +2754,7 @@ mod tests {
         // recurrence.
         let source = Qwen36MoeNativeSource::new(&checkpoint, &device_profile);
         let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+        let model = Qwen36TextModel::load_with_source(&source, &text_config, &device).unwrap();
 
         let DeviceLocation::Metal { gpu_id } = device.location() else {
             panic!("metal test device reported a non-metal location");
@@ -2402,7 +2817,7 @@ mod tests {
         use crate::backends::kv::{CandleAcceleratorKvArena, KvArenaConfig, KvLayerConfig};
         use crate::engine::ModelInstanceId;
         use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::text::Qwen36TextModel;
         use crate::models::architectures::qwen36moe::native_model::{
             qwen35_text_config_from_native, Qwen36MoeNativeSource,
         };
@@ -2434,7 +2849,7 @@ mod tests {
             ProjectionMaterialization::BF16,
         );
         let text_config = qwen35_text_config_from_native(&checkpoint.config.text);
-        let model = Qwen35TextModel::load_with_source(&source, &text_config, &device).unwrap();
+        let model = Qwen36TextModel::load_with_source(&source, &text_config, &device).unwrap();
 
         let DeviceLocation::Cuda { gpu_id } = device.location() else {
             panic!("CUDA test device reported a non-CUDA location");
@@ -3721,7 +4136,7 @@ mod tests {
 
     #[test]
     fn compact_fp8_residency_keeps_raw_bytes_and_decodes_block_scales() {
-        use crate::models::architectures::qwen35::text::Qwen35Projection;
+        use crate::models::architectures::qwen36moe::text::Qwen36Projection;
 
         let mut config = tiny_config();
         // The fp8 projection kernel contract pins 128x128 block scales; the
@@ -3769,7 +4184,7 @@ mod tests {
         let mut input = vec![0f32; 32];
         input[5] = 1.0;
         let x = candle_core::Tensor::from_vec(input, (1, 32), &candle_core::Device::Cpu).unwrap();
-        let y = Qwen35Projection::CompactFp8 {
+        let y = Qwen36Projection::CompactFp8 {
             weights: compact.weights,
             scales: compact.scales,
         }
@@ -3900,7 +4315,7 @@ mod tests {
 
     #[test]
     fn moe_ffn_prefix_resolves_the_same_block_as_the_trunk_layer() {
-        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::text::Qwen36WeightSource;
         use crate::models::architectures::qwen36moe::native_model::{
             Qwen36MoeNativeSource, qwen35_text_config_from_native,
         };
@@ -4218,7 +4633,7 @@ mod tests {
             }]
         };
         let run_to_completion = |model: &crate::models::architectures::qwen36moe::chat::Qwen36MoeChatModel,
-                                 state: &mut crate::models::architectures::qwen35::chat::ChatDecodeState|
+                                 state: &mut crate::models::architectures::qwen36moe::exec::ChatDecodeState|
          -> String {
             let mut text = String::new();
             for _ in 0..64 {

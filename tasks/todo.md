@@ -1,3 +1,515 @@
+# Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
+
+Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
+**Status 2026-10-10:** on `fix-qwen36-serving`, all unmeasured on hardware:
+- Phases 1-2 for CUDA (`ad60fa95`..`b07ae122`), with an end-to-end test of every fused path
+  against the reference trunk (`0467da51`);
+- the Phase 5 expert-major grouped prefill MoE (`7e0937ca`, CUDA; `963ec503`, Metal);
+- most of Phase 6: every fused path runs on Metal and experts stay raw FP8, about 37 GB resident
+  instead of 69 GB (`5594d188`..`23a7a8fe`);
+- the Phase 7 Q8_0 CPU LM head (`8ce1e08a`);
+- fixes from a correctness review of the whole range (`8167d0a9`..`35d9d5b4`; see Review);
+- the rest of Phase 2 (`5833c393`..`197aff9d`): fused attention gate, one greedy readback,
+  packed conv history;
+- Phase 3, piecewise CUDA graph decode for single-row steps (`6f93f515`..`ff3d5027`), hardened
+  after a review of its failure paths (`1f4262d6`).
+
+See the Review section for what to check on the first GPU deploy.
+
+**Revised 2026-10-10: there is no measurement phase.** There is no access to a profiler or to
+same-H100 vLLM/llama.cpp runs, so work starts at Phase 1. Doc §5.1 covers how each phase is
+verified:
+- the app's own tokens/ms/t/s readout on a fixed prompt;
+- structural tests that need no GPU;
+- path counters in diagnostics;
+- a self-check that runs when the model loads on the GPU.
+
+**Symptom / baseline.** H100, Qwen3.6-35B-A3B-FP8, read from the app: 2,049 tokens, 159,879 ms,
+**13 t/s** (77 ms/token). Published references: vLLM **212 tok/s** on one H100 SXM (139-151 on
+H100 NVL); llama.cpp 269-275 tok/s (Q8_0) on an RTX PRO 6000.
+
+**Root cause, counted from code.** Host-dispatch bound. Per token: about 6,200 Candle ops, about
+655 host-to-device copies, **about 82 blocking device-to-host syncs**. About 65% of the overhead
+is `SparseMoeDispatcher::dispatch` (`models/shared/moe.rs:166-216`):
+- it reads the top-k back with `to_vec2` (2 syncs per layer);
+- then it loops over the 8 experts, each with 2 `from_vec` uploads, `index_select`, 3 FP8 GEMVs
+  and an `index_add`.
+
+The rest is unfused GDN (about 49 ops per layer), norms and RoPE, a byte-wise FP8 GEMV, and no
+CUDA graphs. MTP is off, and in its current form it could not help.
+
+**Promotion rule** (replaces "exact-SHA hardware evidence"). A fast path is on by default when:
+- its CPU-reference tests and golden parity are green;
+- the CUDA build compiles in CI;
+- its load-time self-check passes on the deployed GPU;
+- the fixed-prompt check is no slower than the previous deploy.
+
+The kill switch (environment variable) is the rollback.
+
+## Fixed-prompt check (after every deploy that lands a phase)
+- [ ] New thread, model warm. Same long-answer prompt and sampling settings every time.
+- [ ] Record tokens / ms / t/s and the git SHA in the Review table below. Only compare runs with
+      ≥1,000 tokens.
+- [ ] Expected: Phase 1 → 35-50 · Phase 2 → 80-120 · Phase 3 → 150-200+ · Phase 4 → ×1.1-1.4.
+      Well below range: check the diagnostics for a fallback first.
+
+## Phase 1 — Device-resident fused MoE, CUDA (M) — DONE (unmeasured) — gate ≥35 t/s
+- [x] Verification scaffolding:
+  - shared `qwen36moe::fast_path` with `Qwen36FusedPath`, `legacy_requested`, `summarize` and
+    `compare_values` (`92764e69`);
+  - per-path summaries in `runtime_diagnostics` and the load log;
+  - a load-time self-check in every fast path.
+
+  Deviations:
+  - The global readback-counter helper was dropped. Instead, a CPU test asserts that the fused
+    block never enters the host dispatcher (its activation counters stay at 0, while legacy
+    records 3·K).
+  - The TTFT/decode chip is still open.
+- [x] Fused router kernel (softmax, top-8, renorm, folded shared slot). Ids and weights stay on
+      the device (`ad60fa95`).
+- [x] Stacked `w13`/`w2` FP8 residency with the shared expert folded in as slot 257. The
+      per-expert projections become views, so residency does not grow (`1829be3a`).
+- [x] Grouped gate+up+SwiGLU and down+weighted-combine GEMV kernels (`ad60fa95`).
+  - They also serve prefill: about 10× over the per-expert loop at 256-token chunks.
+  - Calls with ≥32 tokens use the expert-major grouped kernels instead (Phase 5, `7e0937ca`).
+- [x] Router GEMV reads BF16 activations and F32 rows directly; MoE is 4 launches per layer
+      (`04de1d6d`).
+- [x] `IZWI_QWEN36_MOE_BACKEND=legacy` (or off/0/false) is the kill switch. The `q8_gguf` control
+      path was dropped: we cannot A/B it without hardware.
+- [x] Checks: grouped CPU reference == per-expert composition; fused == dispatcher for gated,
+      ungated and unfoldable shared experts; rotated-expert self-check is RED; golden parity green;
+      clippy with and without CUDA (fake nvcc); emulator runs at 35B shapes.
+- [ ] On the GPU: self-check passes at load; diagnostics `moe.backend = fused`; fixed-prompt t/s.
+
+## Phase 2 — Fast FP8 GEMV plus decode fusion (M-L) — DONE (unmeasured) — gate ≥80 t/s
+- [x] Vectorized FP8 decode GEMV `qwen38_fp8_mv2_*`: 16-byte loads and the exact
+      byte_perm/shift E4M3→F16 decode. Enabled process-wide only after a device check against the
+      reference kernel (`c53c7a60`, `2cb161d3`).
+- [x] Packed projections: DeltaNet qkv+z and beta+alpha, attention q+k+v. Each pack is verified,
+      and the parts become views (`b07ae122`).
+- [x] GDN decode in 2 launches: a conv step that returns the ring slot, then gating + L2 +
+      register-held delta rule + gated RMSNorm with in-kernel head mapping (`516be34e`,
+      `5dd06355`). The state is a fresh allocation, not updated in place, which keeps state
+      publication transactional.
+- [x] Fused residual add + RMSNorm(1+w) on every trunk norm (`a90b08bb`, `37e4e0fb`). Each
+      layer's trailing add folds into the next layer's norm (`d5d62bac`).
+- [x] Fused q/k norm + partial M-RoPE from device inverse frequencies; no per-layer RoPE upload
+      (`828b1106`, `355893c7`).
+- [x] Fused attention output gate (`5833c393`, `61cf4719`). One kernel reads the gated `q_proj`
+      layout and writes `attn · sigmoid(gate)`, replacing a strided gate copy, a sigmoid and a
+      multiply. CUDA, Metal and a CPU reference; a load self-check; an `attn_gate` diagnostics
+      summary.
+- [x] One readback per greedy token on CUDA (`93d84104`). The device greedy kernel returns
+      `(token, finite)` with the host fallback's own semantics (finite max, lowest index on
+      ties). 2 syncs → 1 per row, and one readback for an all-greedy batch.
+- [x] Conv history as one tensor (`197aff9d`). The fused conv step writes the shifted
+      `[3, conv_dim]` history in the same launch. Staging hands it over by handle instead of
+      stacking 30 rings per token, and restore stops splitting views.
+- Deferred: fused K+V page write (shared KV arena, all models), BF16 GDN state.
+- [x] Every kernel has a CPU reference and/or emulator run, a load-time self-check, and the
+      `IZWI_QWEN36_FUSED_DECODE=legacy` kill switch (norms, q/k RoPE, GEMV and packing share it).
+- [ ] Optional: BF16 GDN state experiment, parity-gated.
+
+## Phase 3 — CUDA graphs plus async scheduling (M) — CORE DONE (unmeasured) — gate ≥150 t/s
+Design 2026-10-10: **piecewise capture**, as vLLM does by default. Everything except attention
+goes into graphs; the parts that need per-step host data stay eager. For B = 1 decode with
+every fused path active, the step becomes 11 graph segments:
+- segment 0: layers 0-2, plus layer 3's norm and packed q/k/v projection;
+- segments 1-9: the previous attention layer's gate, `o_proj`, add+norm and MoE, then three
+  DeltaNet layers, then the next attention layer's norm and q/k/v;
+- segment 10: layer 39's tail and the output norm.
+
+Eager between segments: q/k norm + RoPE (positions are kernel scalars), the paged KV write,
+paged attention (context-dependent strategy), the LM head (cuBLAS) and the greedy readback.
+
+- [x] DeltaNet state through a device address table (`9c2a0d56`). The table-addressed conv and
+      recurrent kernels read their state in/out addresses from a table the host refreshes once
+      per step (one upload). Graphs read the row's current state and write a fresh slab, so
+      there are no state copies and committed state is never mutated. They are bit-identical
+      to the direct kernels in the emulator.
+
+      Instead of a gather node, a segment adopts the previous graph's retained outputs
+      (residual, `q_proj`) in place. Only the attention output is copied in, one launch per
+      segment.
+- [x] Segment runner `kernels::cuda::segment_graph` (`6f93f515`): warm under the htod-cache
+      guard, then thread-local capture with `AUTO_FREE_ON_LAUNCH` over stable inputs, then
+      replay. Fence and leak-on-failure teardown, as `TensorIsland` does.
+- [x] Orchestrator `qwen36moe::decode_graph` (`9dc38069` refactor, `ff3d5027`). Phases:
+      warm → capture + verify → verify → replay. Each verification compares eager vs replay
+      outputs and written state; the step always continues on the eager results. Any failure
+      disables graph decode, with the reason in diagnostics.
+- [x] Switches: `IZWI_QWEN36_CUDA_GRAPHS=0`, `cuda.decode_graphs`, `cuda.mode`. A `cuda_graphs`
+      diagnostics summary. Admission reserves 128 MiB as a deferred claim.
+- [x] Pre-flight: the CUDA end-to-end leg decodes through the graphs against the legacy trunk
+      and checks the phase counters. Off CUDA, the same segments run eagerly and must match the
+      standard decode bit for bit (CPU and Metal).
+- [x] Review of the capture code (`1f4262d6`). It found no wrong-token bug. The failure paths
+      were hardened:
+  - the capture ends through a raw-driver guard, since cudarc's `end_capture` can return a
+    stale context error without ending it;
+  - event tracking is off during capture;
+  - the graph is launched once after instantiation;
+  - failed-capture outputs are leaked, not freed;
+  - a GPU-side step fence orders steps that run on different threads;
+  - only graph failures disable graph decode;
+  - verification scratch is allocated per segment.
+- Known risk: each DeltaNet segment includes the dense beta/alpha projection (cuBLAS). If
+  cuBLAS refuses capture on the H100, `cuda_graphs` reports `capture of segment 0 failed: …`
+  and decode stays eager. The fix is to run those projections through a custom GEMV.
+- Follow-up idea, measure first: cudarc creates 2 events per allocation and waits on and
+  destroys them on every free, about 6 driver calls per tensor, which izwi never needs in
+  single-stream mode. Disabling event tracking process-wide, as mistral.rs does, could cut
+  eager host time noticeably. It is context-global, so it needs its own change and check.
+- Deferred to GPU iteration:
+  - B > 1 buckets;
+  - capturing attention (persistent slot and metadata buffers, a captured partitioned
+    kernel);
+  - async scheduling (launch step n+1 before reading token n; that needs speculative-continue
+    rollback in the engine);
+  - a pinned async token read.
+
+## Phase 4 — MTP (M) — gate ≥1.1× Phase 3 on the fixed prompt, else default off
+- [ ] Batched verification (M = 1+depth) as a full graph.
+- [ ] K-slot GDN and conv state snapshots written by the kernel, replacing the 60 MB copies.
+- [ ] Finish the census and handoff (`MTP_MANIFEST_CENSUS_VERIFIED`); adaptive depth 1-2;
+      acceptance rate in diagnostics.
+
+## Phase 5 — Prefill / TTFT (M-L)
+- [x] Expert-major grouped MoE for calls with ≥32 tokens (`7e0937ca`): one scan/scatter block
+      groups the routed pairs by expert, then each warp holds its weight chunk in registers and
+      loops over that expert's pairs. Each expert's weights are read once per chunk, not once per
+      routed token (about 8× less weight traffic at 256 tokens). Deterministic slot-order combine.
+      The MoE self-check adds a 48-token grouped-vs-per-pair probe.
+- [ ] FP8 tensor-core grouped GEMM on SM90; chunked GDN prefill (FLA chunk 64); larger prefill
+      chunks; hybrid prefix-cache snapshots at message boundaries. Judged by the TTFT chip from 1.0.
+
+## Phase 6 — Metal (M-L) — MOSTLY DONE (unmeasured)
+- [x] Experts stay raw block-FP8 on Metal, not Q8_0 or F16 (`f04cccda`). The MSL kernels decode
+      E4M3 with the same exact integer trick as CUDA. Resident ≈ 36.99 GB instead of 69.3 GB, so a
+      64 GB Mac fits; admission charges the split. The rest of the trunk stays F16.
+- [x] Device-routed MoE on Metal: block-FP8 projection GEMV, router GEMV, softmax/top-k routing,
+      gate+up+SwiGLU, down+combine (`5594d188`), plus the grouped prefill kernels (`963ec503`).
+- [x] Register-resident fused GDN decode with in-kernel grouped/tiled head mapping, fused
+      add+RMSNorm, q/k norm + M-RoPE using `precise::cos/sin` (`af8abfe8`), enabled through the
+      same self-checks and kill switch as CUDA (`23a7a8fe`).
+- [x] Every Metal kernel is tested on an M1 Pro GPU against its CPU reference.
+- [ ] Open:
+  - validate F16 activation overflow on the real weights (the HF golden test runs on CPU);
+  - pack the trunk's F16 projections (only beta/alpha is packed on Metal);
+  - encoder tuning;
+  - the Metal t/s judgement with the real model on a 64 GB Mac.
+
+## Phase 7 — CPU (S-M)
+- [x] Q8_0 `lm_head` on the CPU residency (`8ce1e08a`): about 2 GB → 0.54 GB read per token.
+      Admission charges it as Q8_0. HF golden residency assertions still pass.
+- [ ] Embeddings as Q8_0 (memory only: decode reads one row per token); consistent
+      `CANDLE_NUM_THREADS`.
+- [ ] Grouped MoE (expert-to-token table, fused gate+up, one Rayon dispatch; GEMM per expert for
+      prefill); fused SIMD GDN; parallel cached requant.
+- [ ] Judge with golden parity and the layer bench.
+
+## Phase 8 — Smaller NVIDIA GPUs and 4-bit (M-L)
+- [ ] FP8 kernels on SM80/86/89/120 (bit-trick dequant, `cvt` on SM89+); fix admission for the
+      SM<80 fallback; fix the misleading `projection_backend="q8"`.
+- [ ] Real llama.cpp `qwen35moe` GGUF ingestion (Q4_K_M about 21 GB, Q8_0, MTP GGUFs) for
+      24-32 GB GPUs, smaller Macs and CPU.
+- [ ] Later: expert offload / GPU expert LRU for 8-16 GB GPUs.
+
+## Review
+
+| Date | SHA | Phase landed | Tokens | ms | t/s | Diagnostics notes |
+|---|---|---|---|---|---|---|
+| 2026-10-10 | (pre-plan) | baseline | 2,049 | 159,879 | 13 | legacy MoE, no graphs, MTP off |
+
+### Correctness review of `4e764ffb..8ce1e08a` (2026-10-10)
+
+An independent read-only review cross-checked every kernel against its launch site at the real
+geometry: argument order and types, grid, block and shared-memory sizes, alignment, and
+sync/shuffle divergence. It found no critical or high CUDA bugs. Fixes for what it did find:
+- `8167d0a9`: fused q/k RoPE never enabled on Metal (BF16 probe on an F16-only kernel). A new
+  Metal end-to-end leg resolves every path through production resolution; it fails without the fix.
+- `89168a38`: the fused DeltaNet step now publishes the ring and state only after both kernels
+  succeed.
+- `33d4e26f`: the global CUDA switches (`cuda.mode`, `cuda.fused_decode`,
+  `cuda.packed_projections`) now also turn off the Qwen3.6 fast paths on CUDA.
+- `f0a548a3`: stacked expert views are compared byte for byte with the loaded weights. The MoE
+  self-check reads the same stacks, so it could not catch a bad device copy.
+- `e114cf2c`: CUDA/Metal admission charges the ~1 GiB per-layer expert-stacking transient.
+- `35d9d5b4`: a CUDA end-to-end leg (BF16 fused trunk vs the same-GPU legacy trunk), and grouped
+  MoE in the CUDA kernel test. It is the pre-flight in step 0 below.
+
+Not changed: qwen38 on Metal with an explicit `projection_backend=NativeFp8` now gets the
+Metal FP8 GEMV. Its admission still estimates the F16 expansion, which is conservative.
+
+### First GPU deploy of Phases 1-2: what to check
+
+**0. Pre-flight on the GPU host, before serving.** A kernel fault (illegal address) is a sticky
+CUDA error that would also take down the legacy path, so catch it in a test process first:
+
+```bash
+IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --features cuda --lib -- kernels::cuda qwen36moe
+```
+
+This runs every fused kernel at the real 35B geometry against its CPU reference, then the whole
+fused trunk against the legacy trunk on the GPU, graph decode included. A failure names the path;
+turn it off with the matching switch from step 4.
+
+Look first at `cuda_segment_graph_replays_fresh_inputs`. It is the smallest test of the capture
+recipe: a strided op and intermediates freed inside the capture. If it fails, production graph
+decode will also fail to capture and disable itself. Decode stays correct but eager, so set
+`IZWI_QWEN36_CUDA_GRAPHS=0` to skip the attempts and report the error.
+
+**1. The load log.** It has one line, `Qwen3.6-MoE fused kernel paths`, which reports `moe`,
+`gdn_decode`, `rms_norm`, `qk_rope`, `attn_gate`, `fp8_gemv` and `cuda_graphs`. On an SM80+ GPU
+every `backend` should be `fused`. The same JSON is under `GET /v1/admin/models/{id}` →
+`runtime_diagnostics`.
+
+After a few generated tokens, `cuda_graphs` should show:
+- `"phase": "replay"`;
+- `captures` = `segments` = 11;
+- `verified_segments` = 22;
+- `replays` growing by 11 per token.
+
+If `phase` is `disabled`, `legacy_reasons` says why (capture failure, verification mismatch,
+or a step error). Decode is then eager and correct, just slower; report the reason.
+
+**2. If any path says `legacy`.** The reason string says why:
+- `self-check failed: …` is a kernel bug on that device. The path is safely off; report the
+  message.
+- `…=legacy` means the kill switch is set.
+
+**3. Run the fixed-prompt check.** Estimated range: 80-150 t/s with Phases 1-2 alone; Phase 3
+should add most of the rest of the way to 150-200 if graphs reach `replay`.
+
+**4. Isolate a suspect path with the kill switches.** Each needs a redeploy, no code change:
+- `IZWI_QWEN36_MOE_BACKEND=legacy`
+- `IZWI_QWEN36_FUSED_DECODE=legacy`
+- the global CUDA switches also work: `IZWI_CUDA_FUSED_DECODE=off`,
+  `IZWI_CUDA_PACKED_PROJECTIONS=off`, or `IZWI_CUDA_MODE=off` for everything, the fused MoE
+  included. The diagnostics reason names the switch.
+- graph decode alone: `IZWI_QWEN36_CUDA_GRAPHS=0` or `IZWI_CUDA_DECODE_GRAPHS=off`.
+
+**5. Expected per-token launch budget** (counted from code, not measured): about 520, down from
+about 6,200.
+
+| Area | Launches per token | Breakdown |
+|---|---|---|
+| DeltaNet | 150 | 5 × 30 layers |
+| Attention | ~90 | ~9 × 10 layers |
+| MoE | 160 | 4 × 40 layers |
+| Norms | 80 | |
+| Engine state staging | ~30-60 | |
+| lm_head and argmax | ~6 | |
+
+There are no host syncs inside the MoE.
+
+Since then:
+- the gate fusion removes ~20 launches per token;
+- the packed conv history removes the 30 staging stacks;
+- greedy needs one readback.
+
+With graph decode at `replay`, the host issues about 11 graph launches plus ~10 eager
+operations per attention layer, roughly 120-150 calls per token instead of about 520.
+
+**6. Load time grows slightly** from the self-checks (about 1-2 s on an H100) and from stacking the
+experts (a transient of about 1 GB per layer while loading, now charged in admission). If a
+layer reports `expert stacking failed: stacked expert views differ…`, the device copy is
+corrupt; that layer stays on legacy, so report it.
+
+**7. Prefill.** Calls with ≥32 tokens take the grouped MoE kernels. If the MoE self-check fails
+only on its grouped probe, the reason string says so and both decode and prefill fall back to
+legacy. Long-history turns should show a shorter time to first token than before.
+
+### First Metal run (64 GB+ Mac)
+
+The same load-log line and diagnostics apply. Every `backend` should be `fused`. The admission
+estimate should be about 37 GB. If generations degrade (repetition, garbage), first try
+`IZWI_QWEN36_FUSED_DECODE=legacy`, then `IZWI_QWEN36_MOE_BACKEND=legacy`. F16 activation
+overflow on real weights has not been checked on Metal.
+
+### First CPU run
+
+The admission estimate drops by about 1.5 GB because the LM head is Q8_0.
+
+---
+
+# Plan — Chat turn persistence fails with "Failed to append chat turn message" — 2026-10-10
+
+Symptom (Modal `izwi-cuda`, Qwen3.6-35B-A3B-FP8, thread `e2612e11…`): the stream runs to
+completion, then ends with `{"event":"error","error":"Failed to persist assistant message:
+Failed to append chat turn message"}`. The answer is shown but never saved. An earlier turn in
+the same thread (274 tokens, 34 s) saved fine. The failing turn ran 178 s.
+
+## Root cause (confirmed)
+
+1. **Deferred read-then-write transaction racing a constant writer.**
+   `ChatStore::append_turn_with_system_prompt` (`chat_store.rs:348`) opens a DEFERRED
+   transaction (`db.begin()`), reads the thread and the latest message timestamp (this pins a
+   WAL read snapshot), then INSERTs. If any other connection commits between that read and the
+   INSERT, SQLite refuses the upgrade at once with `SQLITE_BUSY_SNAPSHOT` (extended code 517,
+   "database is locked"). The 3 s `busy_timeout` does not apply to this error. `append_message`
+   (`chat_store.rs:254`) has the same pattern.
+2. **The batch worker writes to the same SQLite file all the time.** `start_batch_runtime_worker`
+   runs on every non-gateway serve (`lib.rs:506`). Each idle slot runs `record_heartbeat("polling")`
+   every 250 ms (`worker.rs:602`), and each call is an autocommit upsert into
+   `runtime_worker_heartbeats` (`store.rs:5381`, `7053`). Production has **29 slots**, roughly
+   **116 commits/s**. There are also two unconditional `BEGIN IMMEDIATE` maintenance transactions
+   every 30 s. With that write rate, each chat turn fails at random. Generation length is not the
+   cause.
+3. **The real error is hidden.** `handlers.rs:462` formats with `{err}`, and anyhow's `Display`
+   prints only the outermost context, which drops the SQLite error. Nothing is logged on the
+   server either, so Modal logs show only `POST … -> 200 OK`.
+4. The batch store already knows about this hazard and uses `BEGIN IMMEDIATE` through
+   `runtime_write_transaction_options()` (`store.rs:7905-7926`). The chat store never adopted it.
+
+Evidence:
+- **DB copy:** `PRAGMA integrity_check` returns `ok` on a copy of `izwi-data:/izwi.sqlite3`
+  (+wal/shm), and a 60 KB assistant insert succeeds on that copy. This rules out corruption,
+  schema, size and content.
+- **Repro:** `scratchpad/busy_snapshot_demo.py` gets DEFERRED → `database is locked` (517)
+  immediately, and IMMEDIATE → OK.
+
+## Fix
+
+- [x] **Shared write-tx helper.** Move `runtime_write_transaction_options()` from
+      `batch_runtime/store.rs` to `db/mod.rs` as `pub(crate) fn write_transaction_options()`,
+      keeping its doc comment. Point the batch store at it (no behaviour change).
+- [x] **Chat store uses IMMEDIATE.** In `chat_store.rs:254` and `:348`, replace `db.begin()` with
+      `db.begin_with_options(write_transaction_options())`. The write lock is then taken before the
+      snapshot, and `busy_timeout` covers waiting on heartbeats. The turn lock and ordering logic
+      stay as they are.
+- [x] **Same bug class elsewhere.** Audit the deferred `begin()` callers that read before they
+      write: `voice_observation_store.rs:79` and the ~19 calls in `studio_project_store.rs`.
+      Switch any that read-then-write to the helper. Leave `batch_runtime/fleet.rs:252` alone
+      unless it is SQLite read-then-write.
+- [x] **Surface and log persistence errors.** In `handlers.rs:462`, log
+      `tracing::error!(thread_id, correlation_id, error = %format!("{err:#}"), …)`. Keep the
+      client message stable and add the chained cause (`{err:#}`). Check the non-stream path
+      (`map_store_or_not_found`) also logs the full chain.
+- [x] **Cut heartbeat write amplification (separate commit).** `record_heartbeat` should write
+      only when the status, stage or lease changes, or when the last write is older than a
+      refresh interval well below `heartbeat_stale_after_ms` (e.g. 5 s). Optionally share one
+      heartbeat across a worker's slots. This takes background commits from ~116/s to under 1/s,
+      which also cuts WAL churn on the Modal Volume.
+
+## Tests / verification
+
+- [x] **Regression test** in `chat_store.rs` tests, using a temp-file WAL DB with a pool of more
+      than 1:
+      - spawn a task that commits a write in a tight loop on another pooled connection;
+      - run `append_turn_with_system_prompt` ~200 times and assert every call succeeds;
+      - first prove the test fails on the current code (deferred), then passes with the fix.
+- [x] Heartbeat throttle tests: an idle slot does not write on every poll; a status change
+      writes at once; liveness stays under the staleness threshold.
+- [x] Run `cargo test -p izwi-server chat_store batch_runtime`, `cargo clippy -D warnings` and
+      `cargo fmt --check`.
+- [ ] Redeploy Modal (`IZWI_GIT_REF=fix-qwen36-serving`) and send 5+ long streaming prompts to
+      one thread. Check that every turn appears in `GET …/messages` and that no persist errors
+      show in the logs.
+
+## Review
+
+Commits on `fix-qwen36-serving`:
+- `5e1e7ff6` fix(chat): IMMEDIATE turn transactions. Adds `db::write_transaction_options()` and
+  removes the private copy in the batch store. The regression test
+  `turns_persist_while_another_connection_commits_continuously` failed on turn 1 before the
+  fix with the exact production error (`Failed to append chat turn message: … (code: 517)
+  database is locked`). It passes 8/8 repeated runs after.
+- `5d93ee00` fix(store): all 18 Studio transactions and the voice observation transaction now
+  use the helper, since every one of them writes. `batch_runtime/fleet.rs` is untouched
+  because its transaction is Postgres-only.
+- `256e377f` fix(chat): storage errors use `{err:#}` and are logged with the thread and
+  correlation ids. The same fix applies to agent handlers and voice realtime session creation.
+  A unit test pins the chained message.
+- `03a03e29` perf(batch-worker): an unchanged heartbeat is re-sent at most once per **1 s**, not
+  the 5 s in the plan. The 5 s figure is the readiness staleness default
+  (`IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS`), so 1 s keeps a safe margin. Changes are still
+  written immediately, and the runner's heartbeat mutex now holds the last written update. A
+  test drives the store's test clock to prove that idle polls skip, a drain writes at once, and
+  the refresh happens after the interval.
+
+Verification:
+- `cargo test -p izwi-server --lib`: 746 passed.
+- `cargo clippy -p izwi-server --all-targets -D warnings`: clean.
+- `rustfmt --check` on every touched file: clean. `cargo fmt --check` still reports drift in
+  files this change does not touch, and that drift pre-dates it.
+- Not done yet: Modal redeploy and live verification. The deploy builds from the
+  `fix-qwen36-serving` remote ref, so it needs a push first.
+
+## Follow-up (infra, not in this fix)
+
+- SQLite in WAL mode lives on a Modal Volume (`/data/izwi.sqlite3`). Volumes auto-commit every
+  few seconds, have no distributed locking, and resolve concurrent writes as last-write-wins
+  (redeploy overlap = two writers). Integrity is fine today, but this is a corruption risk.
+  Options:
+  - keep the live DB on container-local disk and snapshot it to the Volume;
+  - point `IZWI_DATABASE_URL` at managed Postgres, which is already supported.
+  Document the choice in `izwi-deploy-examples/examples/01-modal-cuda`.
+
+# Plan — Separate Qwen3.5 / Qwen3.6 / Qwen3.8 model code — 2026-10-10
+
+Problem: `qwen36moe` runs on the `qwen35` trunk. The 3.6 rollout (#217-#220 plus
+follow-up fixes) added ~2.5k lines to `qwen35` (MTP head, FP8/native weight
+sources, replay checkpoints, value-head order, conv-ring snapshots, etc.), and
+the registry routes BOTH families through one `NativeChatDecodeState::Qwen35`
+variant, so dense Qwen3.5 picked up 3.6 behaviour (e.g. replay journals,
+MTP-aware shared steps). `qwen38` only gained a comment and a dtype guard (#220).
+Baseline "before 3.6" = `691f7a30` (#216).
+
+Decisions:
+- `qwen36moe` owns a private fork of the HEAD trunk: `text.rs`, `cache.rs`,
+  `mtp.rs`, and `exec.rs` (+ `exec/timing.rs`) = HEAD `qwen35/chat.rs` minus the
+  dense `Qwen35ChatModel` + vision. CamelCase `Qwen35*` -> `Qwen36*` in the fork.
+  GGUF metadata keys, kernel names and string literals stay as they are, so 3.6
+  runtime behaviour is unchanged.
+- `qwen35` is restored byte-for-byte to `691f7a30`, minus the MoE plumbing that
+  pointed at the deleted `qwen35moe` module (sparse FFN branch, MoE geometry,
+  `Qwen35Moe35BA3BFp8` thinking arm). No Qwen3.5 MoE model is served any more.
+- `qwen38/text.rs` restored to `691f7a30` (drops the #220 conv-ring dtype guard).
+- Registry/executor: a separate `Qwen36Moe` variant on `NativeChatModel`,
+  `NativeChatDecodeState`, `NativeChatDecodeCheckpoint`, `NativeChatPreparedPrompt`,
+  and `SuspendedReplayCheckpoint`. Dense Qwen3.5 arms go back to their pre-3.6 calls.
+- Out of scope (unchanged): `qwen36moe -> qwen38::native` ingestion primitives
+  (IndexedSafetensors / block-FP8 materialization). This dependency predates 3.6
+  and forking it is ~3k lines of loader + global load state. Shared kernels,
+  tokenizer, catalog id `ModelFamily::Qwen35MoeChat`, and server sampling profile
+  also stay as they are.
+
+- [x] Fork HEAD qwen35 trunk files into qwen36moe; rename; strip dense/vision; repoint qwen36moe imports
+- [x] Restore qwen35 to 691f7a30; remove MoE plumbing; delete qwen35/mtp.rs and chat/timing.rs
+- [x] Restore qwen38/text.rs to 691f7a30
+- [x] Split registry + executor enums (Qwen36Moe variants); dense arms back to pre-3.6 API
+- [x] Verify: `git diff 691f7a30 -- qwen35 qwen38` shows only the intended removals; no cross-family imports
+- [x] Verify: cargo check workspace (all targets), clippy -D warnings, qwen/registry/executor tests, qwen36moe golden fixture
+
+## Review
+
+- `qwen36moe/{text,cache,mtp,exec,exec/timing}.rs` = HEAD qwen35 trunk, `Qwen35*` -> `Qwen36*`.
+  Vision removed from the exec. Prepared prompts were always text-only (`vision_inputs: None`),
+  so an image-pad segment now fails with the same error it hit before. Dense loader,
+  vision prompt helpers, and the dense-only tests are dropped from the fork.
+- `qwen35` vs `691f7a30`: -163/+9 lines, all MoE plumbing for the deleted `qwen35moe`
+  module (sparse FFN branch, `Qwen35MoeFfnGeometry`, `moe_ffn` source method, expert
+  counters, `load_hf` tokenizer path, the MoE thinking-default arm). `qwen38` vs
+  `691f7a30`: one comment (now names `qwen36moe` as the ingestion-primitive consumer).
+- Registry/executor: `NativeChatModel::Qwen36Moe`, plus new `Qwen36Moe` variants on
+  `NativeChatDecodeState`, `NativeChatDecodeCheckpoint`, `NativeChatPreparedPrompt`, and
+  `SuspendedReplayCheckpoint`. Dense 3.5 is back to `begin_shared_step_quantum(cache)` with
+  the MTP rejection, the 4-arg resumable prefill, and no replay/suspension. The Qwen3.8
+  continuous-row path uses its own QWEN38_* domains again; 3.6 has QWEN36_MOE_* domains.
+- Evidence: izwi-core lib 2819 passed / 0 failed (baseline 2797 tests; +32 = forked copies,
+  the 11 tests the 3.6 work had added to qwen35 all moved to qwen36moe). The qwen filter went
+  from 474 to 506 passing, including `native_trunk_matches_the_hf_reference_logits`. The worker
+  `qwen35_moe_process` real-HTTP test passes. Clippy -D warnings is clean (core/server/worker/
+  cli, plus izwi-core `--features metal`). Workspace `cargo check --all-targets` and
+  `git diff --check` are clean.
+- Not verified locally: the CUDA feature build (no nvcc). The cuda-only blocks in the fork
+  were reviewed statically, and every symbol resolves. Run `check-backend-truth.sh
+  cargo-cuda-compile` in CI.
+- Behaviour notes: both families still read `IZWI_QWEN35_*` env knobs (preserved on purpose
+  for 3.6). `ModelFamily::Qwen35MoeChat` and its telemetry label `qwen35_moe_chat` are
+  unchanged (public/API identifiers).
+
 # Plan — DS10 best-effort groundwork (planning only) — 2026-09-28
 
 Scope: the DS10 deferred register, split into a groundwork tier (buildable
@@ -20720,3 +21232,180 @@ Three logical commits resolve the three failing CI gates on `qwen36moe-gdn-dtype
    In `crates/izwi-server/tests/fleet_rig.rs`, replaces the blind 800ms sleep in `spawn_gateway`
    with active `/readyz` polling and early exit detection, and in `scripts/ci/check-backend-truth.sh`,
    runs `fleet_rig` with `-- --test-threads=1` to eliminate inter-test port race conditions.
+
+# Plan — Qwen3.6-35B-A3B-FP8 gibberish: zero-centered RMSNorm `+1.0` — 2026-10-09
+
+Research/analysis/planning session only — NO code changed. Full evidence chain in
+`tasks/qwen36moe-zero-centered-rmsnorm-research-2026-10-09.md`.
+
+Field symptom: `POST /v1/chat/threads/<id>/messages` with `Qwen3.6-35B-A3B-FP8` on
+`https://brizdigital--izwi-cuda-serve.modal.run` returns multilingual token salad
+(mixed Arabic/Korean/Vietnamese/Russian/Thai/Portuguese/German/Polish/Japanese plus
+`_UPPER_SNAKE` code identifiers) from the very first generated token, no
+`` block, different on every request. Model loads fine, all shapes/dtypes/
+finiteness pass.
+
+Root cause (confirmed against the published checkpoint, not inferred): the
+qwen36moe native safetensors loader never applies the zero-centered RMSNorm `+1.0`
+transform. The published checkpoint stores `layers.N.input_layernorm.weight`
+(abs_mean 0.0925) and `layers.N.post_attention_layernorm.weight` (abs_mean 0.2065)
+zero-centered, per HF `1.0 + weight` runtime convention. izwi uses them raw, so every
+per-layer gain is ~10-25x too small, the residual stream degenerates to the raw
+embedding over 40 layers, and `lm_head(rms_norm(embed))` emits the unconditional
+unigram prior — which is exactly multilingual salad under stochastic sampling.
+
+Controls: `Qwen3.8-27B-FP8` stores the same tensors zero-centered (abs_mean 0.0430 /
+0.2173) and its loader *does* apply `+1.0` (`qwen38/text.rs:2873`) and works in
+production. The production Qwen3.5-4B GGUF is immune because llama.cpp bakes the `+1`
+in at conversion. Live deploy is NOT stale: `build_git_sha = 45eae651` = main @ PR #220.
+
+- [ ] C1 `qwen36moe/native_model.rs`: mirror `load_native_zero_centered_norm` —
+      apply `+1.0` to every zero-centered RMSNorm gain, in the F32 staging buffer
+      before the BF16/F16 dense-target materialization (`native_model.rs:157`) so
+      `1.05` does not take a second rounding.
+- [ ] ~~C2~~ SUPERSEDED 2026-10-10 (wrong: convention is set by the HF module class, not by
+      stored magnitude — see the 2026-10-10 plan below). C2 Allow-list, not blanket: census says only `layers.N.input_layernorm`,
+      `layers.N.post_attention_layernorm`, `layers.N.self_attn.{q,k}_norm` and
+      `mtp.layers.0.input_layernorm` are zero-centered. `linear_attn.norm` (0.88),
+      the final norm (1.63), `mtp.norm` (1.93), `mtp.layers.0.post_attention_layernorm`
+      (0.87) and `mtp.layers.0.self_attn.{q,k}_norm` (0.75) must stay raw — mirror
+      llama.cpp's `not name.endswith("linear_attn.norm.weight")` exclusion.
+- [ ] C3 Close the fixture blindness: the native fixture writes norms as
+      `bf16_uniform(0.05)` and only asserts finiteness. Add a value-level assertion
+      that the trunk's effective gain equals `1 + w`.
+- [ ] C4 Fix the stale `catalog/cuda_support.rs:536` reason string ("expands
+      projections to resident BF16, not native FP8 execution") so the next incident
+      is not steered away from the real subsystem.
+- [ ] C5 Census-pin the norm convention for the MTP block before MTP is enabled on a
+      real checkpoint (`MTP_MANIFEST_CENSUS_VERIFIED` should cover norm *values*,
+      not just names/shapes/dtypes).
+- [ ] V1 Zero-GPU decisive check: read `layers.0.input_layernorm.weight` from
+      `/models/Qwen3.6-35B-A3B-FP8` on the Modal volume and confirm abs_mean ~ 0.09.
+      Separates this cause from every alternative.
+- [ ] V2 Control-model A/B (no code cost): load `Qwen3.8-27B-FP8` (already on the
+      volume) on the same container and issue the identical chat. Coherent output
+      isolates the defect to the qwen36moe native path; salad from both models
+      falsifies this analysis and points at shared infra.
+- [ ] V3 Post-fix hardware gate: `IZWI_QWEN36_REAL_CHECKPOINT_E2E=<dir>
+      IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib real_checkpoint`
+      (ASCII ratio > 0.95) and `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p
+      izwi-core --lib kernels::cuda`.
+- [ ] V4 Regression: CPU lib + Metal lane + workspace clippy `-D warnings`; native
+      gain-assertion test; census pin for the norm convention.
+
+## Review (2026-10-09)
+
+Research only; nothing implemented. Highest-leverage items are C1+C2 (the fix) and
+V2 (the control experiment that validates the diagnosis at zero code cost).
+
+# Plan — Qwen3.6-35B-A3B-FP8 gibberish: two native-loader convention defects — 2026-10-10
+
+Research/analysis/planning only — NO code changed. Evidence:
+`tasks/qwen36moe-native-convention-defects-research-2026-10-10.md`. Supersedes the
+2026-10-09 C1/C2 scope.
+
+Root cause: the shared qwen35 trunk assumes llama.cpp GGUF conventions; llama.cpp's
+`conversion/qwen.py` applies two value transforms the qwen36moe native loader skips.
+D1 (fatal) zero-centered RMSNorm `+1`; D2 (severe) linear-attention V heads reordered
+grouped→tiled to match the trunk's tiled `repeat_head_states`.
+
+- [ ] F1 `native_model.rs::rms_norm`: unconditional `+1.0` in F32 before the dense-target
+      cast. `rms_norm()` is called for exactly the HF `Qwen3_5MoeRMSNorm` set (final, attn,
+      post, q/k, all MTP norms); gated `ssm_norm` loads via `dense()` and stays raw. No
+      allow-list.
+- [ ] F2 Native-source V-head permutation (grouped→tiled, K=16, r=2, head_dim 128) for
+      `in_proj_qkv` V rows, `in_proj_z` rows, `in_proj_a/b` rows, `A_log`, `dt_bias`,
+      `conv1d` V channels, `out_proj` columns — dense tensors and raw FP8 weight+scale
+      blocks alike (128-aligned, no requant). Trunk tiled expansion untouched.
+- [ ] F3 Rewrite the false "not reconcilable by any weight permutation" comment at
+      `qwen35/text.rs:2529`; fix the 2026-10-07 note's "refuted" bullet and the stale
+      `catalog/cuda_support.rs:536` reason string.
+- [ ] F4 HF golden-parity test: tiny random-init `Qwen3_5MoeForCausalLM` (2 k / 4 v heads,
+      random non-zero norms, MoE + shared expert, one full-attn layer) + committed logits;
+      izwi CPU native path must match. Red before F1+F2, red with either alone, green after.
+- [ ] F5 Unit tests: effective gain == 1 + w; permutation helper; GDN layer parity
+      (HF layout + repeat_interleave) == (permuted + tiled).
+- [ ] V1 Local: F4/F5 + CPU lib + Metal lane + clippy `-D warnings`; qwen35 GGUF unchanged.
+- [ ] V2 Modal H100: real_checkpoint E2E (ASCII > 0.95) + `kernels::cuda`, redeploy, replay
+      the field request and a short reasoning prompt; expect closed think block + coherent answer.
+- [ ] V3 If coherent-but-off after F1/F2: A/B the residency (native FP8 vs expanded BF16)
+      to clear the real-geometry FP8 kernel.
+
+## Review (2026-10-10)
+
+Research only. Verified against upstream HF `modeling_qwen3_5_moe.py`, vLLM
+`qwen3_next_mtp.py`, and llama.cpp `conversion/qwen.py` (fetched today), plus current code.
+Found that 2026-10-09's C2 allow-list was wrong (it would have left the final norm and MTP norms
+un-shifted) and that 2026-10-07's head-layout "refutation" was wrong (D2 is real).
+
+# Plan — Qwen3.6-35B-A3B-FP8 full native implementation audit — 2026-10-10
+
+Research only — NO code changed. Full audit: `tasks/qwen36moe-native-implementation-audit-2026-10-10.md`.
+Extends the F-list above (F1=D1, F2=D2) with defects found by the five-subsystem audit.
+
+- [x] G0 HF golden-parity fixture + test (tiny random-init Qwen3_5MoeForCausalLM, random
+      non-zero norms, 2k/4v linear heads, MoE+shared, prefill + per-token decode over 32
+      tokens). DONE `c3b7c731` — red without D1 (2.96 logits) or without D2 (2.12), green
+      with both (<2e-3; logit scale ~4).
+- [x] D1 zero-centered norm +1 in `native_model.rs::rms_norm` (F32 gain; mixed-dtype
+      `Qwen35RmsNorm` runs in F32 and casts back = HF math). DONE `9c5f2ba2`.
+- [x] D2 value-head order. DONE `995858b5` — DEVIATION from plan: instead of permuting
+      weights grouped→tiled at load (byte surgery across five residency forms: packed Q8,
+      tiled Q8, expanded, raw FP8, optimized streaming), the weight source declares its
+      order (`linear_v_head_order`: GGUF tiled, native grouped) and the mixer expands q/k
+      to match (`repeat_interleave` for grouped). Exact for every residency, ~30 lines;
+      the compact Metal kernel (hard-coded tiled) is gated to tiled/equal-head layouts.
+- [x] D3 build_mrope cos/sin from F32 angles. DONE `e55875b0`. Qwen3.8 has the identical
+      bug (`qwen38/text.rs:2970`) — out of scope, flagged as a separate task.
+- [x] D4 Qwen3.6 shares the Qwen3.8 thinking profile (= its generation_config). DONE `f62529f8`.
+- [x] D5 MTP snapshot in logical conv-ring order (`ConvRingState::ordered_slots`). DONE
+      `8aeb3d88`. Exposure: MTP head is only built by the qwen36moe native loader.
+- [x] D6 fail-closed tokenizer.json (`daba36d3`); D7 shared-expert plan size (`f1893b62`);
+      D8 MTP bootstrap penalty history (`67a340de`), cuda_support reason + tensor_kind label
+      (`e0c40cee`); false trunk comment rewritten in `995858b5`; 2026-10-07 note annotated.
+- [ ] V local gates (core/server lib, Metal, clippy -D warnings, qwen35 GGUF unchanged);
+      V H100 real_checkpoint + kernels::cuda, redeploy, fresh-thread replay + reasoning + ≥2k prompt;
+      FP8-vs-BF16 residency A/B only if coherent-but-off.
+
+## Review (2026-10-10, audit)
+
+Verified correct: FP8 decode/scale/CUDA kernel/Q8 fallback, tensor mapping, MoE routing
+and experts, full attention (q|gate split, partial NEOX MRoPE, GQA, output gate), GDN maths
+and state lifetime, prompt rendering (byte-identical to official jinja), tokenizer/stops,
+routing, pinned config. Defects: D1/D2 fatal (explain prod), D3 severe on CUDA/Metal,
+D4 quality, D5 latent (MTP), D6–D8 minor, test fixture blind by construction.
+
+## Review (2026-10-10, implementation)
+
+Ten commits on `fix-qwen36-serving` (`9c5f2ba2`..`e0c40cee`), one defect each, every
+behavioral fix with a test shown red on the old code:
+
+| commit | defect | proof |
+|---|---|---|
+| `9c5f2ba2` | D1 zero-centered norm `+1` | effective-gain test (0.05 → 1.05, CPU + CUDA plans) |
+| `995858b5` | D2 DeltaNet value-head order | permutation-equivalence test; golden red without it |
+| `c3b7c731` | HF golden parity | F32 <2e-3 vs HF at all 21 decode rows + full prefill; red by 2.96 (no D1) / 2.12 (no D2) |
+| `e55875b0` | D3 RoPE F32 angles | BF16 cos at pos 4096 was −0.283 vs 0.930 |
+| `f62529f8` | D4 Qwen3.6 sampling profile | profile tests over both Qwen thinking variants |
+| `8aeb3d88` | D5 MTP conv-ring snapshot order | wrapped ring restored [3,1,2] → now [1,2,3] |
+| `daba36d3` | D6 strict tokenizer.json | corrupt file errors instead of falling back |
+| `f1893b62` | D7 shared-expert plan width | plan + MTP plan shapes with differing widths |
+| `67a340de` | D8 MTP bootstrap penalty history | existing MTP determinism tests |
+| `e0c40cee` | D8 stale CUDA reason / tensor_kind label | no behavior change |
+
+Local gates: izwi-core lib 2787 passed (CPU); izwi-core lib with `--features metal` 2837
+passed on this Mac's Metal device; izwi-server lib 743 (one pre-existing flake,
+`batch_runtime::worker::...cancellation_retains_capacity...`, fails 2/10 on unmodified
+`45eae651` too — flagged as a separate task); worker `qwen35_moe_process` green;
+izwi-cli/worker/supervisor check green; clippy `-D warnings -A deprecated` clean on
+izwi-core + izwi-server (all targets) and izwi-core `--features metal`; `git diff --check` clean.
+
+Not verified here (needs the Modal H100 — this laptop cannot hold the 35B checkpoint):
+- `IZWI_QWEN36_REAL_CHECKPOINT_E2E=<dir> IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib real_checkpoint`
+  and `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib kernels::cuda`.
+- Redeploy + replay the field request on a fresh thread (drop the literal `<think>` from the
+  system prompt), a short reasoning prompt, and a ≥2k-token prompt.
+- The block-FP8 CUDA kernel at real geometry stays read-verified only; if output is coherent
+  but off, A/B `projection_backend = "q8"` (expanded BF16) against the native-FP8 default.
+
+Follow-ups flagged: Qwen3.8 has the identical RoPE angle bug (`qwen38/text.rs:2970`).

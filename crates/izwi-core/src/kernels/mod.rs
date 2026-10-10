@@ -13,6 +13,8 @@ pub mod cuda;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_qwen36moe;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

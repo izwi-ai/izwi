@@ -75,9 +75,67 @@ template<class T> __device__ void mm(const T* x,const unsigned char* w,const flo
     if(m<M && n<N) y[(size_t)m*N+n]=T(out[i]);
   }
 }
+// Vectorized decode GEMV (M <= 4): each lane loads 16 E4M3 bytes at a time and
+// decodes them exactly through F16 lanes (byte moved to the high byte, exponent
+// and mantissa shifted down one bit = value * 2^-8; the x256 is applied once per
+// output). Activations are read as 16-byte vectors straight from global memory
+// (L1/L2 resident across the block's warps). One warp per output channel, eight
+// channels per block, F32 accumulation with the block scale applied once per
+// 16-byte chunk. Requires K % 128 == 0 and 16-byte aligned rows.
+__device__ __forceinline__ float fp8_dot4(unsigned w, const float* x) {
+  unsigned lo = __byte_perm(w, 0u, 0x1404);
+  unsigned hi = __byte_perm(w, 0u, 0x3424);
+  lo = (lo & 0x80008000u) | ((lo & 0x7F007F00u) >> 1);
+  hi = (hi & 0x80008000u) | ((hi & 0x7F007F00u) >> 1);
+  const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&lo));
+  const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&hi));
+  float acc = a.x * x[0];
+  acc = fmaf(a.y, x[1], acc);
+  acc = fmaf(b.x, x[2], acc);
+  return fmaf(b.y, x[3], acc);
+}
+template<class T> __device__ __forceinline__ void load16(const T* x, float* out) {
+  const uint4 a = *reinterpret_cast<const uint4*>(x);
+  const uint4 b = *reinterpret_cast<const uint4*>(x + 8);
+  const T* pa = reinterpret_cast<const T*>(&a);
+  const T* pb = reinterpret_cast<const T*>(&b);
+  #pragma unroll
+  for(int i=0;i<8;++i) { out[i]=float(pa[i]); out[8+i]=float(pb[i]); }
+}
+template<class T> __device__ void mv2(const T* x,const unsigned char* w,const float* s,T* y,int M,int N,int K) {
+  const int lane=threadIdx.x&31, n=blockIdx.x*8+(threadIdx.x>>5);
+  if(n>=N) return;
+  const unsigned char* row=w+(size_t)n*K;
+  const float* scales=s+(size_t)(n>>7)*(K>>7);
+  float acc[4]={0,0,0,0};
+  #pragma unroll 4
+  for(int k0=lane*16;k0<K;k0+=512) {
+    const uint4 q=*reinterpret_cast<const uint4*>(row+k0);
+    const float scale=scales[k0>>7];
+    #pragma unroll
+    for(int m=0;m<4;++m) {
+      if(m<M) {
+        float xv[16];
+        load16(x+(size_t)m*K+k0,xv);
+        float part=fp8_dot4(q.x,xv);
+        part+=fp8_dot4(q.y,xv+4);
+        part+=fp8_dot4(q.z,xv+8);
+        part+=fp8_dot4(q.w,xv+12);
+        acc[m]=fmaf(part,scale,acc[m]);
+      }
+    }
+  }
+  #pragma unroll
+  for(int m=0;m<4;++m) {
+    for(int d=16;d;d>>=1) acc[m]+=__shfl_down_sync(0xffffffff,acc[m],d);
+    if(lane==0 && m<M) y[(size_t)m*N+n]=T(acc[m]*256.f);
+  }
+}
 #define EXPORT(T,S) \
 extern "C" __global__ void qwen38_fp8_mv_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mv(x,w,s,y,M,N,K);} \
 extern "C" __global__ void qwen38_fp8_mm_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mm(x,w,s,y,M,N,K);}
 EXPORT(__half,f16)
 EXPORT(__nv_bfloat16,bf16)
+extern "C" __global__ void qwen38_fp8_mv2_f16(const __half*x,const unsigned char*w,const float*s,__half*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
+extern "C" __global__ void qwen38_fp8_mv2_bf16(const __nv_bfloat16*x,const unsigned char*w,const float*s,__nv_bfloat16*y,int M,int N,int K){mv2(x,w,s,y,M,N,K);}
 extern "C" __global__ void qwen38_fp8_mv_f32(const float*x,const unsigned char*w,const float*s,float*y,int M,int N,int K){mv(x,w,s,y,M,N,K);}

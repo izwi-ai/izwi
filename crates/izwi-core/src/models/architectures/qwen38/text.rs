@@ -553,17 +553,6 @@ impl ConvRingState {
                 *next_idx
             )));
         }
-        // The ring holds the conv state arena's F32 dtype for the whole
-        // session; an incoming projection in another dtype would poison the
-        // ring with mixed-dtype slots that later `cat`/multiply fail on.
-        let slot_dtype = slots[*next_idx].dtype();
-        if current.dtype() != slot_dtype {
-            return Err(Error::InferenceError(format!(
-                "Qwen3.8 convolution ring dtype drift: ring {:?}, incoming {:?}",
-                slot_dtype,
-                current.dtype()
-            )));
-        }
         slots[*next_idx] = current.clone();
         *next_idx = (*next_idx + 1) % slots.len();
         Ok(())

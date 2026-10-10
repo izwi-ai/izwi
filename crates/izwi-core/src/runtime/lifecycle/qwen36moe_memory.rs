@@ -3,8 +3,9 @@
 //!
 //! The numbers derive from the loader's own pinned tensor plans, so admission
 //! can never drift from what the checkpoint actually materializes: CPU packs
-//! projections as Q8_0 and keeps dense tensors in F32, Metal expands F16
-//! (Apple GPUs have no FP8 path), and CUDA keeps the checkpoint's raw
+//! projections as Q8_0 and keeps dense tensors in F32, Metal keeps the
+//! experts as raw block-FP8 (decoded in software by the fused MoE kernels) and
+//! expands the rest to F16, and CUDA keeps the checkpoint's raw
 //! block-FP8 bytes resident with per-tensor packed-Q8_0 fallback for tensors
 //! the fp8 projection kernel cannot execute (`projection_residency_policy`).
 //! Scale companions and vision tensors never become resident text-trunk
@@ -15,13 +16,19 @@ use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen36moe::native::{
-    pinned_representation_inventory, resolve_mtp_load_policy, RepresentationElementBucket,
+    pinned_native_config, pinned_representation_inventory, resolve_mtp_load_policy,
+    RepresentationElementBucket,
 };
 use std::path::Path;
 
 const PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const CUDA_DEVICE_CONVERSION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
 const CUDA_HOST_STAGING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Piecewise CUDA graph decode (`qwen36moe::decode_graph`), allocated lazily
+/// on the first decode steps. It covers the 11 segment graph pools (about
+/// 1 MiB each with retained outputs and stable inputs) and the verification
+/// steps' scratch copy of the DeltaNet state (about 63 MiB), with headroom.
+const CUDA_GRAPH_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 
 const Q8_0_BLOCK_ELEMENTS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
@@ -51,15 +58,41 @@ fn bucket_resident_bytes(
             .ok_or_else(overflow)
     };
     match backend {
-        BackendKind::Cpu => q8_bytes
-            .checked_add(dense_bytes(4)?)
-            .ok_or_else(overflow),
-        BackendKind::Metal => (bucket
-            .fp8_elements
-            .checked_add(bucket.dense_elements)
-            .ok_or_else(overflow)?)
-        .checked_mul(2)
-        .ok_or_else(overflow),
+        // The CPU residency also packs the LM head as Q8_0 rather than F32.
+        BackendKind::Cpu => {
+            let head_q8_bytes =
+                bucket.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
+            q8_bytes
+                .checked_add(dense_bytes(4)?)
+                .ok_or_else(overflow)?
+                .checked_sub(
+                    bucket
+                        .lm_head_elements
+                        .checked_mul(4)
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?
+                .checked_add(head_q8_bytes)
+                .ok_or_else(overflow)
+        }
+        // Metal keeps the routed and shared experts as raw block-FP8 bytes
+        // plus F32 scales for the fused MoE kernels and expands the rest of
+        // the trunk (and every dense tensor) to F16.
+        BackendKind::Metal => {
+            let expanded = bucket
+                .fp8_elements
+                .saturating_sub(bucket.expert_fp8_elements)
+                .checked_add(bucket.dense_elements)
+                .ok_or_else(overflow)?
+                .checked_mul(2)
+                .ok_or_else(overflow)?;
+            bucket
+                .expert_fp8_elements
+                .checked_add(bucket.expert_fp8_scale_bytes)
+                .ok_or_else(overflow)?
+                .checked_add(expanded)
+                .ok_or_else(overflow)
+        }
         BackendKind::Cuda => {
             // Native block-FP8 residency: conforming tensors keep raw E4M3FN
             // bytes (1 B/element) plus their F32 block scales; the remainder
@@ -84,6 +117,21 @@ fn bucket_resident_bytes(
                 .ok_or_else(overflow)
         }
     }
+}
+
+/// Load transient of the fused MoE expert stacking on CUDA and Metal, which
+/// keep the experts raw block-FP8. While a layer stacks, its gate and up
+/// stacks and their concatenation coexist with the loaded originals: 4/3 of
+/// one layer's expert bytes and scales. Layers stack one at a time.
+fn expert_stacking_transient_bytes() -> Result<u64> {
+    let inventory = pinned_representation_inventory();
+    let layers = pinned_native_config().text.block_count as u64;
+    let layer_bytes = inventory
+        .expert_fp8_elements
+        .checked_add(inventory.expert_fp8_scale_bytes)
+        .ok_or_else(overflow)?
+        .div_ceil(layers);
+    layer_bytes.div_ceil(3).checked_mul(4).ok_or_else(overflow)
 }
 
 /// Resident bytes of the pinned checkpoint on one backend, plus the MTP
@@ -122,16 +170,20 @@ pub(super) fn representation_memory_estimate(
         .checked_mul(super::PER_TENSOR_INSTANTIATION_SLACK_BYTES)
         .ok_or_else(overflow)?;
     let resident_bytes = resident_bytes(backend, mtp_enabled.then_some(&inventory.mtp))?;
-    let load_peak_bytes = match backend {
-        BackendKind::Cpu | BackendKind::Metal => resident_bytes
-            .checked_add(PORTABLE_CONVERSION_SCRATCH_BYTES)
+    let load_scratch = match backend {
+        BackendKind::Cpu => PORTABLE_CONVERSION_SCRATCH_BYTES,
+        BackendKind::Metal => PORTABLE_CONVERSION_SCRATCH_BYTES
+            .checked_add(expert_stacking_transient_bytes()?)
             .ok_or_else(overflow)?,
-        BackendKind::Cuda => resident_bytes
-            .checked_add(CUDA_DEVICE_CONVERSION_SCRATCH_BYTES)
+        BackendKind::Cuda => CUDA_DEVICE_CONVERSION_SCRATCH_BYTES
+            .checked_add(expert_stacking_transient_bytes()?)
             .ok_or_else(overflow)?,
-    }
-    .checked_add(instantiation_slack)
-    .ok_or_else(overflow)?;
+    };
+    let load_peak_bytes = resident_bytes
+        .checked_add(load_scratch)
+        .ok_or_else(overflow)?
+        .checked_add(instantiation_slack)
+        .ok_or_else(overflow)?;
     Ok(ModelMemoryEstimate {
         load_peak_bytes,
         resident_bytes,
@@ -146,12 +198,31 @@ pub(super) fn resource_plan(
     // draft head's resident bucket joins the reservation only when enabled.
     let mtp_enabled = resolve_mtp_load_policy(backend, &performance.cuda)?
         == crate::models::architectures::qwen36moe::native::Qwen36MoeMtpLoadPolicy::Enabled;
-    let estimate = representation_memory_estimate(backend, mtp_enabled)?;
+    let mut estimate = representation_memory_estimate(backend, mtp_enabled)?;
+    let graphs = if backend == BackendKind::Cuda
+        && performance.cuda.enabled()
+        && performance.cuda.decode_graphs.enabled()
+    {
+        CUDA_GRAPH_DECODE_BYTES
+    } else {
+        0
+    };
+    estimate.resident_bytes = estimate
+        .resident_bytes
+        .checked_add(graphs)
+        .ok_or_else(overflow)?;
+    estimate.load_peak_bytes = estimate
+        .load_peak_bytes
+        .checked_add(graphs)
+        .ok_or_else(overflow)?;
     let mut plan = super::model_resource_plan(backend, estimate);
     if backend == BackendKind::Cuda {
         // Host memory only holds the shard/staging window; the raw block-FP8
         // representation uploads directly to the device.
         plan.load_authorization.host_bytes = ResourceAmount::Known(CUDA_HOST_STAGING_BYTES);
+        // The graph working set is allocated lazily, as qwen38's graph cache:
+        // keep it pending so KV fitting cannot consume the headroom.
+        plan.deferred_resident_authorization.device_bytes = ResourceAmount::Known(graphs);
     }
     Ok(plan)
 }
@@ -244,8 +315,10 @@ mod tests {
         let metal = representation_memory_estimate(BackendKind::Metal, false).unwrap();
         let cuda = representation_memory_estimate(BackendKind::Cuda, false).unwrap();
 
+        assert_eq!(inventory.lm_head_elements, 248_320 * 2048, "untied LM head");
         let expected_cpu = inventory.fp8_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES
-            + inventory.dense_elements * 4;
+            + (inventory.dense_elements - inventory.lm_head_elements) * 4
+            + inventory.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
         assert_eq!(cpu.resident_bytes, expected_cpu);
         // Q8_0 packing keeps CPU serving meaningful; the CPU projection
         // residency is far below an expanded-F32 alternative (~130 GiB).
@@ -256,9 +329,25 @@ mod tests {
         );
         assert!(cpu.load_peak_bytes > cpu.resident_bytes);
 
-        let expected_metal = (inventory.fp8_elements + inventory.dense_elements) * 2;
+        // Metal: raw block-FP8 experts (+ F32 scales) for the fused MoE
+        // kernels, F16 expansion for the rest of the trunk and dense tensors.
+        let expected_metal = inventory.expert_fp8_elements
+            + inventory.expert_fp8_scale_bytes
+            + (inventory.fp8_elements - inventory.expert_fp8_elements + inventory.dense_elements)
+                * 2;
         assert_eq!(metal.resident_bytes, expected_metal);
         assert!(metal.load_peak_bytes > metal.resident_bytes);
+        // The experts dominate the checkpoint, so FP8 experts take Metal from
+        // ~65 GiB (full F16 expansion) to under 40 GiB: a 64 GB Mac fits.
+        assert!(
+            inventory.expert_fp8_elements * 10 > inventory.fp8_elements * 9,
+            "experts are the bulk of the block-FP8 elements"
+        );
+        assert!(
+            metal.resident_bytes < 40 * GIB,
+            "Metal residency {}",
+            metal.resident_bytes
+        );
 
         // CUDA native-FP8 residency: raw E4M3FN bytes (1 B/element) plus F32
         // block scales for the kernel-conforming projections (all of them in
@@ -268,6 +357,15 @@ mod tests {
             + inventory.dense_elements * 2;
         assert_eq!(cuda.resident_bytes, expected_cuda);
         assert!(cuda.load_peak_bytes > cuda.resident_bytes);
+        // Fused-MoE stacking holds 4/3 of one layer's experts (257 x 3
+        // projections of 512 x 2048 FP8 bytes) on top while a layer stacks.
+        let stacking = expert_stacking_transient_bytes().unwrap();
+        assert!(
+            stacking > GIB * 9 / 10 && stacking < GIB * 11 / 10,
+            "stacking transient {stacking}"
+        );
+        assert!(cuda.load_peak_bytes > cuda.resident_bytes + stacking);
+        assert!(metal.load_peak_bytes > metal.resident_bytes + stacking);
         // The compact residency holds ~half of the Metal F16 expansion and
         // stays below even the CPU Q8_0 + F32-dense envelope.
         assert!(
@@ -281,8 +379,13 @@ mod tests {
         // With the MTP load policy enabled, the draft bucket joins the
         // reservation under the same per-backend policy.
         let cpu_mtp = inventory.mtp.fp8_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES
-            + inventory.mtp.dense_elements * 4;
-        let metal_mtp = (inventory.mtp.fp8_elements + inventory.mtp.dense_elements) * 2;
+            + (inventory.mtp.dense_elements - inventory.mtp.lm_head_elements) * 4
+            + inventory.mtp.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
+        let metal_mtp = inventory.mtp.expert_fp8_elements
+            + inventory.mtp.expert_fp8_scale_bytes
+            + (inventory.mtp.fp8_elements - inventory.mtp.expert_fp8_elements
+                + inventory.mtp.dense_elements)
+                * 2;
         let cuda_mtp = inventory.mtp.fp8_elements
             + inventory.mtp.fp8_scale_bytes
             + inventory.mtp.dense_elements * 2;
@@ -319,10 +422,24 @@ mod tests {
             disabled.load_authorization.device_bytes,
             ResourceAmount::Known(bytes) if bytes > 30 * GIB && bytes < 40 * GIB
         ));
+        // Graph decode's lazily allocated working set stays pending, and the
+        // decode-graphs switch drops it.
+        assert_eq!(
+            disabled.deferred_resident_authorization.device_bytes,
+            ResourceAmount::Known(CUDA_GRAPH_DECODE_BYTES)
+        );
+        let mut no_graphs = PerformanceConfig::default();
+        no_graphs.cuda.decode_graphs = crate::performance::OptimizationMode::Off;
+        let no_graphs = resource_plan(BackendKind::Cuda, &no_graphs).unwrap();
+        assert_eq!(
+            no_graphs.deferred_resident_authorization.device_bytes,
+            ResourceAmount::Known(0)
+        );
         let cpu_plan = resource_plan(BackendKind::Cpu, &PerformanceConfig::default()).unwrap();
+        // Q8_0 trunk + Q8_0 LM head + F32 dense state, plus load slack.
         assert!(matches!(
             cpu_plan.load_authorization.host_bytes,
-            ResourceAmount::Known(bytes) if bytes > 40 * GIB
+            ResourceAmount::Known(bytes) if bytes > 35 * GIB && bytes < 45 * GIB
         ));
         assert_eq!(
             cpu_plan.load_authorization.device_bytes,

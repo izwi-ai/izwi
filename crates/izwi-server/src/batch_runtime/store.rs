@@ -8,7 +8,7 @@ use super::types::{
 #[cfg(test)]
 use super::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};
 use crate::{
-    db::{raw, StoreDatabase},
+    db::{raw, write_transaction_options, StoreDatabase},
     ids::new_uuid,
     speech_history_store::{
         sanitize_audio_mime_type, sanitize_optional_text, NewSpeechHistoryRecord,
@@ -18,8 +18,7 @@ use crate::{
 use anyhow::{anyhow, bail, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaWriteRequest};
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, QueryResult, SqliteTransactionMode,
-    TransactionOptions, TransactionTrait, Value,
+    ConnectionTrait, DatabaseConnection, DbBackend, QueryResult, TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -556,7 +555,7 @@ pub struct WorkerHeartbeatUpdate {
     pub diagnostic_json: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegisteredWorkerHeartbeatUpdate {
     pub registration: RuntimeWorkerRegistration,
     pub status: String,
@@ -893,7 +892,7 @@ impl BatchRuntimeStore {
         validate_artifact_cleanup_tenant(tenant_scope)?;
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start artifact cleanup transaction")?;
         lock_artifact_cleanup_capacity(&tx).await?;
@@ -928,7 +927,7 @@ impl BatchRuntimeStore {
         validate_artifact_cleanup_tenant(tenant_scope)?;
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start opaque speech-history deletion transaction")?;
         lock_tts_admission_capacity(&tx).await?;
@@ -1235,7 +1234,7 @@ impl BatchRuntimeStore {
         let request_envelope_json = serialize_provider_write_request(&input.provider_request)?;
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start provider write reservation transaction")?;
         lock_provider_write_capacity(&tx).await?;
@@ -1369,9 +1368,7 @@ impl BatchRuntimeStore {
             "Provider write publication did not match its reservation"
         );
         let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(runtime_write_transaction_options())
-            .await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
         let now = self.now_millis();
         let row = get_provider_write_with(&tx, &reservation.write_id).await?;
         if row.as_ref() != Some(reservation) {
@@ -1493,7 +1490,7 @@ impl BatchRuntimeStore {
 
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start opaque stage artifact publication transaction")?;
         let now = self.now_millis();
@@ -1930,7 +1927,7 @@ impl BatchRuntimeStore {
         let expected_artifact = artifact.clone();
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start speech final audio settlement transaction")?;
         let now = self.now_millis();
@@ -2283,9 +2280,7 @@ impl BatchRuntimeStore {
             return Ok(Vec::new());
         }
         let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(runtime_write_transaction_options())
-            .await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
         let now = self.now_millis();
         let request_length = provider_write_request_length_sql(tx.get_database_backend())?;
         let selection_sql = format!(
@@ -2565,9 +2560,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<()> {
         let tenant = speech_admission_tenant(&json!({"tenant_key": tenant_key}))?;
         let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(runtime_write_transaction_options())
-            .await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
         self.check_tts_admission(&tx, &tenant).await?;
         tx.rollback().await?;
         Ok(())
@@ -2584,9 +2577,7 @@ impl BatchRuntimeStore {
 
     pub async fn create_job(&self, input: NewRuntimeJob) -> anyhow::Result<RuntimeJob> {
         let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(runtime_write_transaction_options())
-            .await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
         let admission_tenant = if input.job_kind == RuntimeJobKind::TtsSpeech {
             let tenant = speech_admission_tenant(&input.request_json)?;
             if !is_terminal_job_status(input.status) {
@@ -2850,7 +2841,7 @@ impl BatchRuntimeStore {
 
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable text TTS acceptance transaction")?;
 
@@ -3323,7 +3314,7 @@ impl BatchRuntimeStore {
     pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<Option<RuntimeJob>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime job retry transaction")?;
         let Some(job) = get_job_with(&tx, job_id).await? else {
@@ -3555,7 +3546,7 @@ impl BatchRuntimeStore {
         lease_expires_at: i64,
     ) -> anyhow::Result<Option<ClaimedStage>> {
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage claim transaction")?;
         let attempt_token = new_uuid();
@@ -3666,7 +3657,7 @@ impl BatchRuntimeStore {
         validate_stage_output_artifact_ids(&output_artifact_ids)?;
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage completion transaction")?;
         let now = self.now_millis();
@@ -3982,7 +3973,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<Option<JobStage>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage failure transaction")?;
         let Some(stage) = get_stage_with(&tx, &lease.stage_id).await? else {
@@ -4052,7 +4043,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<Option<RuntimeJob>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime job cancellation transaction")?;
         let now = self.now_millis();
@@ -4166,7 +4157,7 @@ impl BatchRuntimeStore {
     pub async fn mark_stage_execution_stopping(&self, lease: &StageLease) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start execution-stopping transaction")?;
         let now = self.now_millis();
@@ -4226,7 +4217,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<Option<JobStage>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start stage cancellation finalization transaction")?;
         let now = self.now_millis();
@@ -4284,7 +4275,7 @@ impl BatchRuntimeStore {
                 attempt_token: row.try_get_by_index(3)?,
             };
             let tx = db
-                .begin_with_options(runtime_write_transaction_options())
+                .begin_with_options(write_transaction_options())
                 .await
                 .context("Failed to start expired lease recovery transaction")?;
             let Some(stage) = get_stage_with(&tx, &lease.stage_id).await? else {
@@ -4646,7 +4637,7 @@ impl BatchRuntimeStore {
 
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime artifact publication transaction")?;
         let now = self.now_millis();
@@ -4837,9 +4828,7 @@ impl BatchRuntimeStore {
     /// and GC both conditionally update the job row, fencing their race on every DB.
     pub async fn expired_speech_pcm(&self, before: u64) -> anyhow::Result<Vec<RuntimeArtifact>> {
         let db = self.db.connection().await?;
-        let tx = db
-            .begin_with_options(runtime_write_transaction_options())
-            .await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
         let cutoff = i64::try_from(before)?;
         let sql = RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL.replace(
             "WHERE job_id = ?1 ORDER BY created_at ASC, id ASC",
@@ -4974,7 +4963,7 @@ impl BatchRuntimeStore {
         );
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable idempotency reservation transaction")?;
         lock_durable_idempotency(&tx).await?;
@@ -5128,7 +5117,7 @@ impl BatchRuntimeStore {
 
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable idempotency commit transaction")?;
         let now = nonnegative_timestamp(self.now_millis())?;
@@ -5248,7 +5237,7 @@ impl BatchRuntimeStore {
     pub async fn prune_expired_durable_idempotency(&self, limit: usize) -> anyhow::Result<u64> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable idempotency prune transaction")?;
         lock_durable_idempotency(&tx).await?;
@@ -5757,7 +5746,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<RuntimeReconciliationReport> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin_with_options(runtime_write_transaction_options())
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime reconciliation transaction")?;
         let now = self.now_millis();
@@ -7903,10 +7892,6 @@ fn is_claimable_job_status(status: RuntimeJobStatus) -> bool {
     )
 }
 
-/// All transactions in this store write durable state. SQLite must acquire
-/// its write reservation before reading a snapshot: DEFERRED promotion can
-/// fail immediately with SQLITE_BUSY_SNAPSHOT when concurrent workers renew,
-/// finish, or relinquish leases. Other backends ignore the SQLite option.
 fn speech_admission_tenant(request: &serde_json::Value) -> anyhow::Result<String> {
     match request.get("tenant_key").filter(|value| !value.is_null()) {
         Some(value) => {
@@ -7915,13 +7900,6 @@ fn speech_admission_tenant(request: &serde_json::Value) -> anyhow::Result<String
             Ok(key.iter().map(|byte| format!("{byte:02x}")).collect())
         }
         None => Ok("anonymous".into()),
-    }
-}
-
-fn runtime_write_transaction_options() -> TransactionOptions {
-    TransactionOptions {
-        sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
-        ..TransactionOptions::default()
     }
 }
 

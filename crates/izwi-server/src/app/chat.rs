@@ -56,7 +56,15 @@ impl ChatExecutionRequest {
 
     fn resolved_generation_params(&self) -> GenerationParams {
         let max_new_tokens = self.resolved_max_new_tokens();
-        let mut params = if self.variant == ModelVariant::Qwen3827BFp8 {
+        // Qwen's published sampling profile for its thinking chat models
+        // (the Qwen3.6-35B-A3B-FP8 `generation_config.json` is exactly the
+        // thinking branch). The engine-wide default (T 0.7, top_p 0.9, no
+        // top-k, repetition penalty 1.1 over prompt + output) penalizes
+        // `<|im_end|>`, newlines, and `</think>` on these models.
+        let mut params = if matches!(
+            self.variant,
+            ModelVariant::Qwen3827BFp8 | ModelVariant::Qwen36Moe35BA3BFp8
+        ) {
             let thinking = self.chat_config.enable_thinking.unwrap_or(true);
             GenerationParams {
                 temperature: if thinking { 1.0 } else { 0.7 },
@@ -1424,9 +1432,12 @@ mod tests {
         assert_eq!(params.max_tokens, 32);
     }
 
-    fn qwen38_request(enable_thinking: Option<bool>) -> ChatExecutionRequest {
+    const QWEN_THINKING_VARIANTS: [ModelVariant; 2] =
+        [ModelVariant::Qwen3827BFp8, ModelVariant::Qwen36Moe35BA3BFp8];
+
+    fn qwen_request(variant: ModelVariant, enable_thinking: Option<bool>) -> ChatExecutionRequest {
         ChatExecutionRequest {
-            variant: ModelVariant::Qwen3827BFp8,
+            variant,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
@@ -1450,40 +1461,46 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_uses_thinking_sampling_profile_when_values_are_omitted() {
-        let params = qwen38_request(None).resolved_generation_params();
-        assert_eq!(params.temperature, 1.0);
-        assert_eq!(params.top_p, 0.95);
-        assert_eq!(params.top_k, 20);
-        assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 0.0);
+    fn qwen_thinking_models_use_thinking_sampling_profile_when_values_are_omitted() {
+        for variant in QWEN_THINKING_VARIANTS {
+            let params = qwen_request(variant, None).resolved_generation_params();
+            assert_eq!(params.temperature, 1.0, "{variant:?}");
+            assert_eq!(params.top_p, 0.95, "{variant:?}");
+            assert_eq!(params.top_k, 20, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.0, "{variant:?}");
+            assert_eq!(params.presence_penalty, 0.0, "{variant:?}");
+        }
     }
 
     #[test]
-    fn qwen38_uses_non_thinking_sampling_profile_when_disabled() {
-        let params = qwen38_request(Some(false)).resolved_generation_params();
-        assert_eq!(params.temperature, 0.7);
-        assert_eq!(params.top_p, 0.80);
-        assert_eq!(params.top_k, 20);
-        assert_eq!(params.repetition_penalty, 1.0);
-        assert_eq!(params.presence_penalty, 1.5);
+    fn qwen_thinking_models_use_non_thinking_sampling_profile_when_disabled() {
+        for variant in QWEN_THINKING_VARIANTS {
+            let params = qwen_request(variant, Some(false)).resolved_generation_params();
+            assert_eq!(params.temperature, 0.7, "{variant:?}");
+            assert_eq!(params.top_p, 0.80, "{variant:?}");
+            assert_eq!(params.top_k, 20, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.0, "{variant:?}");
+            assert_eq!(params.presence_penalty, 1.5, "{variant:?}");
+        }
     }
 
     #[test]
-    fn qwen38_explicit_sampling_values_win_over_profile() {
-        let mut request = qwen38_request(Some(true));
-        request.temperature = Some(0.2);
-        request.top_p = Some(0.3);
-        request.top_k = Some(7);
-        request.repetition_penalty = Some(1.2);
-        request.presence_penalty = Some(-0.4);
+    fn qwen_thinking_models_let_explicit_sampling_values_win_over_profile() {
+        for variant in QWEN_THINKING_VARIANTS {
+            let mut request = qwen_request(variant, Some(true));
+            request.temperature = Some(0.2);
+            request.top_p = Some(0.3);
+            request.top_k = Some(7);
+            request.repetition_penalty = Some(1.2);
+            request.presence_penalty = Some(-0.4);
 
-        let params = request.resolved_generation_params();
-        assert_eq!(params.temperature, 0.2);
-        assert_eq!(params.top_p, 0.3);
-        assert_eq!(params.top_k, 7);
-        assert_eq!(params.repetition_penalty, 1.2);
-        assert_eq!(params.presence_penalty, -0.4);
+            let params = request.resolved_generation_params();
+            assert_eq!(params.temperature, 0.2, "{variant:?}");
+            assert_eq!(params.top_p, 0.3, "{variant:?}");
+            assert_eq!(params.top_k, 7, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.2, "{variant:?}");
+            assert_eq!(params.presence_penalty, -0.4, "{variant:?}");
+        }
     }
 
     #[test]

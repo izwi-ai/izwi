@@ -1,11 +1,11 @@
-//! Qwen3.5-MoE chat model loader and text generation.
+//! Qwen3.6-MoE chat model loader and text generation.
 //!
 //! The wrapper is deliberately thin: it owns family-specific loading (the
 //! native block-FP8 bundle, or the synthetic GGUF fixture for CI) and
 //! text-only prompt preparation, while prompt rendering, the hybrid decode
-//! state machinery, and sampling come from the shared
-//! [`Qwen35ChatExec`](crate::models::architectures::qwen35::chat::Qwen35ChatExec)
-//! core the dense `Qwen35ChatModel` drives.
+//! state machinery, and sampling come from this family's
+//! [`Qwen36ChatExec`](crate::models::architectures::qwen36moe::exec::Qwen36ChatExec)
+//! core.
 
 use std::path::Path;
 
@@ -16,11 +16,11 @@ use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState, ChatDecodeStep, Qwen35ChatExec, Qwen35PreparedPrompt, Qwen35TextConfig,
-    Qwen35Tokenizer,
+use crate::models::architectures::qwen36moe::exec::{
+    ChatDecodeState, ChatDecodeStep, Qwen36ChatExec, Qwen36PreparedPrompt, Qwen36TextConfig,
+    Qwen36Tokenizer,
 };
-use crate::models::architectures::qwen35::text::{GgufSource, Qwen35TextModel};
+use crate::models::architectures::qwen36moe::text::{GgufSource, Qwen36TextModel};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
@@ -113,7 +113,7 @@ pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
     kv_storage_provider: Qwen36MoeKvStorageProvider,
     performance: crate::performance::CudaPerformanceConfig,
-    exec: Qwen35ChatExec,
+    exec: Qwen36ChatExec,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
@@ -196,6 +196,23 @@ impl Qwen36MoeChatModel {
                 kv_storage_provider,
             )?
         };
+        let moe = exec.text_model.moe_backend_summary();
+        let gdn_decode = exec.text_model.gdn_decode_summary();
+        let rms_norm = exec.text_model.rms_norm_summary();
+        let qk_rope = exec.text_model.qk_rope_summary();
+        let attn_gate = exec.text_model.attn_gate_summary();
+        let fp8_gemv = exec.text_model.fp8_gemv_summary();
+        let cuda_graphs = exec.text_model.cuda_graphs_summary();
+        tracing::info!(
+            %moe,
+            %gdn_decode,
+            %rms_norm,
+            %qk_rope,
+            %attn_gate,
+            %fp8_gemv,
+            %cuda_graphs,
+            "Qwen3.6-MoE fused kernel paths"
+        );
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -210,17 +227,17 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: &DeviceProfile,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let loader =
             GgufLoader::from_path_with_backend(fixture_path, BackendKind::from(device.kind))?;
         let text_config = parse_fixture_gguf_config(&loader)?;
-        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &loader)?;
-        let text_model = Qwen35TextModel::load_with_source(
+        let tokenizer = Qwen36Tokenizer::load(model_dir, variant, &loader)?;
+        let text_model = Qwen36TextModel::load_with_source(
             &GgufSource::new(&loader),
             &text_config,
             &device.device,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -240,14 +257,14 @@ impl Qwen36MoeChatModel {
         performance: &crate::performance::CudaPerformanceConfig,
         mtp_policy: Qwen36MoeMtpLoadPolicy,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
             model_dir,
             super::native::Qwen36MoeGeometryPolicy::from_env(),
             mtp_policy,
         )?;
-        let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
+        let tokenizer = Qwen36Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model, mtp_head) = load_text_model_native(
             &checkpoint,
             device,
@@ -255,7 +272,7 @@ impl Qwen36MoeChatModel {
             performance,
             mtp_enabled,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -272,7 +289,7 @@ impl Qwen36MoeChatModel {
         self.exec.variant()
     }
 
-    pub fn text_config(&self) -> &Qwen35TextConfig {
+    pub fn text_config(&self) -> &Qwen36TextConfig {
         self.exec.text_config()
     }
 
@@ -315,7 +332,7 @@ impl Qwen36MoeChatModel {
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<Qwen35PreparedPrompt> {
+    ) -> Result<Qwen36PreparedPrompt> {
         if !config.request.media_inputs.is_empty() {
             return Err(Error::InvalidInput(
                 "Qwen3.5/3.6-MoE serving is text-only and does not accept media inputs".to_string(),
@@ -352,7 +369,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         self.start_decode_state_physical_with_mtp(messages, max_new_tokens, config, prepared, cache, None)
@@ -363,7 +380,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
@@ -389,7 +406,7 @@ impl Qwen36MoeChatModel {
 
     pub(crate) fn begin_resumable_prefill_state_physical(
         &self,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
@@ -403,7 +420,7 @@ impl Qwen36MoeChatModel {
     pub(crate) fn continue_resumable_prefill_physical(
         &self,
         state: &mut ChatDecodeState,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         span_start: usize,
         span_end: usize,
     ) -> Result<bool> {
@@ -440,6 +457,13 @@ impl Qwen36MoeChatModel {
                 "projection_backend": format!("{:?}", self.performance.projection_backend),
                 "mtp_enabled": self.performance.mtp.enabled(),
             },
+            "moe": self.exec.text_model.moe_backend_summary(),
+            "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "rms_norm": self.exec.text_model.rms_norm_summary(),
+            "qk_rope": self.exec.text_model.qk_rope_summary(),
+            "attn_gate": self.exec.text_model.attn_gate_summary(),
+            "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
+            "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -521,7 +545,7 @@ impl Qwen36MoeChatModel {
     /// spans before decode resumes.
     pub(crate) fn begin_replay_state_physical(
         &self,
-        saved: &crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint,
+        saved: &crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
@@ -1281,6 +1305,43 @@ pub(crate) mod tests {
         let counters = model.expert_activation_counters();
         assert_eq!(counters.len(), 4);
         assert!(counters.iter().all(|c| c.total_selections() > 0));
+        // The GGUF fixture's quantized experts cannot take the fused block-FP8
+        // path; diagnostics must say so per layer, with the reason.
+        let moe = &model.runtime_diagnostics()["moe"];
+        assert_eq!(moe["backend"], "legacy");
+        assert_eq!(moe["legacy_layers"], 4);
+        assert_eq!(moe["fused_layers"], 0);
+        assert!(moe["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("block-FP8")));
+        // The fixture's linear-attention layers stay on the Candle chain: the
+        // fused DeltaNet decode is CUDA-only.
+        let gdn = &model.runtime_diagnostics()["gdn_decode"];
+        assert_eq!(gdn["backend"], "legacy");
+        assert_eq!(gdn["fused_layers"], 0);
+        assert_eq!(
+            model.runtime_diagnostics()["rms_norm"]["legacy_reasons"][0],
+            "fused RMSNorm runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["qk_rope"]["legacy_reasons"][0],
+            "fused q/k norm + RoPE runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["attn_gate"]["legacy_reasons"][0],
+            "fused attention output gate runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["fp8_gemv"]["legacy_reasons"][0],
+            "vectorized FP8 decode GEMV runs on CUDA only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["cuda_graphs"]["legacy_reasons"][0],
+            "CUDA graph decode runs on CUDA only"
+        );
+        assert!(gdn["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("CUDA and Metal only")));
 
         // Re-run and require identical output (seeded rng, greedy decode).
         let first: Vec<String> = steps.iter().map(|step| step.delta.clone()).collect();

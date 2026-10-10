@@ -17,6 +17,12 @@
 //! `sigmoid(shared_expert_gate(x))` when the checkpoint carries the optional
 //! `[1, hidden]` gate projection, and added to the routed output
 //! unconditionally (same modeling source).
+//!
+//! When every expert is resident as 128x128 block-FP8, the block runs the
+//! device-routed fused kernels instead of the dispatcher loop (see
+//! [`super::fused_moe`]); the dispatcher remains the path for quantized/dense
+//! residencies, the `IZWI_QWEN36_MOE_BACKEND=legacy` switch, and any block
+//! whose load-time self-check fails.
 
 use std::sync::Arc;
 
@@ -31,7 +37,11 @@ use crate::models::shared::moe::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
-use crate::models::architectures::qwen35::text::Qwen35MoeFfnGeometry;
+use crate::models::architectures::qwen36moe::fast_path::Qwen36FusedPath;
+use crate::models::architectures::qwen36moe::fused_moe::{
+    Qwen36MoeBackendRequest, Qwen36MoeFusedExperts, Qwen36MoeStacking, BACKEND_ENV,
+};
+use crate::models::architectures::qwen36moe::text::Qwen36MoeFfnGeometry;
 
 /// Persistent form of one projection inside the sparse block. `Quantized`
 /// keeps quantized residency (GGUF tensors, CPU-packed Q8_0 requants);
@@ -146,6 +156,8 @@ pub(crate) struct Qwen36MoeSparseMlp {
     experts: Qwen36MoeRoutedExperts,
     shared: Qwen36MoeSharedExpert,
     counters: Arc<ExpertActivationCounters>,
+    fused: Option<Qwen36MoeFusedExperts>,
+    backend: Qwen36FusedPath,
 }
 
 impl Qwen36MoeSparseMlp {
@@ -155,7 +167,25 @@ impl Qwen36MoeSparseMlp {
         router: Qwen36MoeLinear,
         experts: Vec<Qwen36MoeExpertWeights>,
         shared: Qwen36MoeSharedExpertWeights,
-        geometry: &Qwen35MoeFfnGeometry,
+        geometry: &Qwen36MoeFfnGeometry,
+    ) -> Result<Self> {
+        Self::from_weights_with_backend(
+            router,
+            experts,
+            shared,
+            geometry,
+            Qwen36MoeBackendRequest::from_env(),
+        )
+    }
+
+    /// [`Self::from_weights`] with an explicit execution-path request instead
+    /// of the `IZWI_QWEN36_MOE_BACKEND` environment switch.
+    pub(crate) fn from_weights_with_backend(
+        router: Qwen36MoeLinear,
+        experts: Vec<Qwen36MoeExpertWeights>,
+        shared: Qwen36MoeSharedExpertWeights,
+        geometry: &Qwen36MoeFfnGeometry,
+        request: Qwen36MoeBackendRequest,
     ) -> Result<Self> {
         if experts.len() != geometry.num_experts {
             return Err(Error::ModelLoadError(format!(
@@ -174,13 +204,60 @@ impl Qwen36MoeSparseMlp {
         })?
         .with_counters(counters.clone());
 
+        let (experts, shared, fused, backend) = match request {
+            Qwen36MoeBackendRequest::Legacy => (
+                experts,
+                shared,
+                None,
+                Qwen36FusedPath::legacy(format!("{BACKEND_ENV}=legacy")),
+            ),
+            Qwen36MoeBackendRequest::Off(reason) => {
+                (experts, shared, None, Qwen36FusedPath::legacy(reason))
+            }
+            Qwen36MoeBackendRequest::Auto => {
+                match Qwen36MoeFusedExperts::stack(&router, experts, shared, geometry) {
+                    Qwen36MoeStacking::Stacked {
+                        fused,
+                        experts,
+                        shared,
+                    } => match fused.self_check(&experts, &shared) {
+                        Ok(()) => (experts, shared, Some(fused), Qwen36FusedPath::Fused),
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason,
+                                "Qwen3.6-MoE fused expert self-check failed; using the per-expert path"
+                            );
+                            (
+                                experts,
+                                shared,
+                                None,
+                                Qwen36FusedPath::legacy(format!("self-check failed: {reason}")),
+                            )
+                        }
+                    },
+                    Qwen36MoeStacking::Unsupported {
+                        experts,
+                        shared,
+                        reason,
+                    } => (experts, shared, None, Qwen36FusedPath::Legacy { reason }),
+                }
+            }
+        };
+
         Ok(Self {
             dispatcher,
             router,
             experts: Qwen36MoeRoutedExperts(experts),
             shared: Qwen36MoeSharedExpert(shared),
             counters,
+            fused,
+            backend,
         })
+    }
+
+    /// Execution path this block resolved to at load.
+    pub(crate) fn backend(&self) -> &Qwen36FusedPath {
+        &self.backend
     }
 
     pub(crate) fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
@@ -199,10 +276,24 @@ impl Qwen36MoeSparseMlp {
         let tokens = batch * sequence;
         let flat = hidden_states.reshape((tokens, hidden))?.contiguous()?;
 
-        let router_logits = self.router.project(&flat)?;
-        let routed = self.dispatcher.dispatch(&flat, &router_logits, &self.experts)?;
-        let shared_output = self.shared.forward(&flat)?;
-        let combined = routed.broadcast_add(&shared_output)?;
+        let combined = match &self.fused {
+            Some(fused) if fused.accepts(&flat) => {
+                let routed = fused.forward(&flat)?;
+                if fused.folds_shared() {
+                    routed
+                } else {
+                    routed.broadcast_add(&self.shared.forward(&flat)?)?
+                }
+            }
+            _ => {
+                let router_logits = self.router.project(&flat)?;
+                let routed = self
+                    .dispatcher
+                    .dispatch(&flat, &router_logits, &self.experts)?;
+                let shared_output = self.shared.forward(&flat)?;
+                routed.broadcast_add(&shared_output)?
+            }
+        };
 
         if rank3(hidden_states) {
             combined.reshape((batch, sequence, hidden)).map_err(Error::from)
@@ -230,7 +321,7 @@ fn rank3(tensor: &Tensor) -> bool {
 pub(crate) fn load_gguf_sparse_mlp(
     loader: &GgufLoader,
     layer: usize,
-    geometry: &Qwen35MoeFfnGeometry,
+    geometry: &Qwen36MoeFfnGeometry,
     device: &Device,
 ) -> Result<Qwen36MoeSparseMlp> {
     let prefix = format!("blk.{layer}");
@@ -360,8 +451,8 @@ mod tests {
     const TOP_K: usize = 2;
     const TOKENS: usize = 3;
 
-    fn geometry(shared_ff: usize) -> Qwen35MoeFfnGeometry {
-        Qwen35MoeFfnGeometry {
+    fn geometry(shared_ff: usize) -> Qwen36MoeFfnGeometry {
+        Qwen36MoeFfnGeometry {
             num_experts: NUM_EXPERTS,
             num_experts_per_tok: TOP_K,
             expert_intermediate_size: FF,
@@ -601,6 +692,311 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error}").contains("geometry expects 4"));
+    }
+
+    mod fused {
+        use super::super::*;
+        use crate::models::architectures::qwen36moe::fused_moe::BACKEND_ENV;
+
+        const H: usize = 256;
+        const I: usize = 128;
+        const E: usize = 6;
+        const K: usize = 2;
+
+        fn geometry(shared_ff: usize) -> Qwen36MoeFfnGeometry {
+            Qwen36MoeFfnGeometry {
+                num_experts: E,
+                num_experts_per_tok: K,
+                expert_intermediate_size: I,
+                shared_expert_intermediate_size: shared_ff,
+            }
+        }
+
+        fn stream(seed: u64) -> impl FnMut() -> u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            }
+        }
+
+        /// Raw block-FP8 projection `[rows, cols]` with finite E4M3 bytes and
+        /// per-block scales, resident on the CPU.
+        fn compact(rows: usize, cols: usize, seed: u64) -> Qwen36MoeLinear {
+            let mut next = stream(seed);
+            let bytes = (0..rows * cols)
+                .map(|_| loop {
+                    let byte = next() as u8;
+                    if byte & 0x7f != 0x7f {
+                        break byte;
+                    }
+                })
+                .collect::<Vec<_>>();
+            let scales = (0..(rows / 128) * (cols / 128))
+                .map(|_| 0.002 + (next() % 1000) as f32 * 2e-6)
+                .collect::<Vec<_>>();
+            Qwen36MoeLinear::CompactFp8 {
+                weights: Tensor::from_vec(bytes, (rows, cols), &Device::Cpu).unwrap(),
+                scales: Tensor::from_vec(scales, (rows / 128, cols / 128), &Device::Cpu).unwrap(),
+            }
+        }
+
+        fn experts() -> Vec<Qwen36MoeExpertWeights> {
+            (0..E as u64)
+                .map(|e| Qwen36MoeExpertWeights {
+                    gate: compact(I, H, 10 + e * 3),
+                    up: compact(I, H, 11 + e * 3),
+                    down: compact(H, I, 12 + e * 3),
+                })
+                .collect()
+        }
+
+        fn shared(ff: usize, gated: bool) -> Qwen36MoeSharedExpertWeights {
+            Qwen36MoeSharedExpertWeights {
+                gate: compact(ff, H, 90),
+                up: compact(ff, H, 91),
+                down: compact(H, ff, 92),
+                output_gate: gated.then(|| {
+                    Qwen36MoeLinear::from_dense(
+                        Tensor::from_vec(
+                            (0..H)
+                                .map(|i| ((i as f32) * 0.37).sin() * 0.05)
+                                .collect::<Vec<_>>(),
+                            (1, H),
+                            &Device::Cpu,
+                        )
+                        .unwrap(),
+                    )
+                }),
+            }
+        }
+
+        fn router() -> Qwen36MoeLinear {
+            Qwen36MoeLinear::from_dense(
+                Tensor::from_vec(
+                    (0..E * H)
+                        .map(|i| ((i as f32) * 0.618).sin() * 0.08)
+                        .collect::<Vec<_>>(),
+                    (E, H),
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn input(tokens: usize) -> Tensor {
+            Tensor::from_vec(
+                (0..tokens * H)
+                    .map(|i| ((i as f32) * 0.754_877_7).sin() * 1.5)
+                    .collect::<Vec<_>>(),
+                (tokens, H),
+                &Device::Cpu,
+            )
+            .unwrap()
+        }
+
+        fn block(
+            request: Qwen36MoeBackendRequest,
+            shared_ff: usize,
+            gated: bool,
+        ) -> Qwen36MoeSparseMlp {
+            Qwen36MoeSparseMlp::from_weights_with_backend(
+                router(),
+                experts(),
+                shared(shared_ff, gated),
+                &geometry(shared_ff),
+                request,
+            )
+            .unwrap()
+        }
+
+        fn values(tensor: &Tensor) -> Vec<f32> {
+            tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        }
+
+        fn assert_matches_legacy(shared_ff: usize, gated: bool) {
+            let fused = block(Qwen36MoeBackendRequest::Auto, shared_ff, gated);
+            let legacy = block(Qwen36MoeBackendRequest::Legacy, shared_ff, gated);
+            assert_eq!(fused.backend(), &Qwen36FusedPath::Fused);
+            assert!(matches!(legacy.backend(), Qwen36FusedPath::Legacy { .. }));
+            for tokens in [1, 4] {
+                let x = input(tokens);
+                let expected = values(&legacy.forward(&x).unwrap());
+                let actual = values(&fused.forward(&x).unwrap());
+                let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (a - e).abs() <= 1e-4 * scale.max(1e-6),
+                        "T={tokens} index {index}: fused {a} vs legacy {e}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn fused_block_matches_the_legacy_dispatcher_with_a_gated_shared_slot() {
+            assert_matches_legacy(I, true);
+        }
+
+        #[test]
+        fn fused_block_matches_the_legacy_dispatcher_with_an_ungated_shared_slot() {
+            assert_matches_legacy(I, false);
+        }
+
+        #[test]
+        fn fused_block_adds_a_shared_expert_it_cannot_fold() {
+            // Shared width differs from the routed width: routed experts stay
+            // fused, the shared expert runs separately and is added.
+            assert_matches_legacy(2 * I, true);
+        }
+
+        #[test]
+        fn fused_block_never_runs_the_host_dispatcher() {
+            let fused = block(Qwen36MoeBackendRequest::Auto, I, true);
+            fused.forward(&input(3)).unwrap();
+            assert_eq!(
+                fused.counters().total_selections(),
+                0,
+                "the fused path must not route through the host dispatcher"
+            );
+            let legacy = block(Qwen36MoeBackendRequest::Legacy, I, true);
+            legacy.forward(&input(3)).unwrap();
+            assert_eq!(legacy.counters().total_selections(), (3 * K) as u64);
+        }
+
+        #[test]
+        fn legacy_switch_and_unsupported_residency_report_their_reason() {
+            let legacy = block(Qwen36MoeBackendRequest::Legacy, I, true);
+            assert!(
+                matches!(legacy.backend(), Qwen36FusedPath::Legacy { reason } if reason.contains(BACKEND_ENV))
+            );
+            let dense_experts = (0..E)
+                .map(|_| Qwen36MoeExpertWeights {
+                    gate: Qwen36MoeLinear::from_dense(
+                        Tensor::zeros((I, H), DType::F32, &Device::Cpu).unwrap(),
+                    ),
+                    up: Qwen36MoeLinear::from_dense(
+                        Tensor::zeros((I, H), DType::F32, &Device::Cpu).unwrap(),
+                    ),
+                    down: Qwen36MoeLinear::from_dense(
+                        Tensor::zeros((H, I), DType::F32, &Device::Cpu).unwrap(),
+                    ),
+                })
+                .collect();
+            let dense = Qwen36MoeSparseMlp::from_weights_with_backend(
+                router(),
+                dense_experts,
+                shared(I, true),
+                &geometry(I),
+                Qwen36MoeBackendRequest::Auto,
+            )
+            .unwrap();
+            assert!(
+                matches!(dense.backend(), Qwen36FusedPath::Legacy { reason } if reason.contains("block-FP8"))
+            );
+        }
+
+        #[cfg(feature = "metal")]
+        #[test]
+        fn metal_fused_block_matches_the_metal_dispatcher_and_the_cpu_block() {
+            let Some(gpu) = crate::backends::metal_device_if_available(0) else {
+                return;
+            };
+            let to_gpu = |linear: Qwen36MoeLinear| match linear {
+                Qwen36MoeLinear::CompactFp8 { weights, scales } => Qwen36MoeLinear::CompactFp8 {
+                    weights: weights.to_device(&gpu).unwrap(),
+                    scales: scales.to_device(&gpu).unwrap(),
+                },
+                Qwen36MoeLinear::Dense(t) => Qwen36MoeLinear::Dense(t.to_device(&gpu).unwrap()),
+                other => other,
+            };
+            let gpu_block = |request| {
+                let experts = experts()
+                    .into_iter()
+                    .map(|e| Qwen36MoeExpertWeights {
+                        gate: to_gpu(e.gate),
+                        up: to_gpu(e.up),
+                        down: to_gpu(e.down),
+                    })
+                    .collect();
+                let shared = shared(I, true);
+                let shared = Qwen36MoeSharedExpertWeights {
+                    gate: to_gpu(shared.gate),
+                    up: to_gpu(shared.up),
+                    down: to_gpu(shared.down),
+                    output_gate: shared.output_gate.map(to_gpu),
+                };
+                Qwen36MoeSparseMlp::from_weights_with_backend(
+                    to_gpu(router()),
+                    experts,
+                    shared,
+                    &geometry(I),
+                    request,
+                )
+                .unwrap()
+            };
+            let fused = gpu_block(Qwen36MoeBackendRequest::Auto);
+            assert_eq!(
+                fused.backend(),
+                &Qwen36FusedPath::Fused,
+                "the Metal self-check must pass"
+            );
+            let legacy = gpu_block(Qwen36MoeBackendRequest::Legacy);
+            let cpu = block(Qwen36MoeBackendRequest::Auto, I, true);
+            for tokens in [1, 4] {
+                let x = input(tokens);
+                let x_gpu = x.to_dtype(DType::F16).unwrap().to_device(&gpu).unwrap();
+                let host = |t: Tensor| {
+                    t.to_dtype(DType::F32)
+                        .unwrap()
+                        .to_device(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let fused_out = host(fused.forward(&x_gpu).unwrap());
+                let legacy_out = host(legacy.forward(&x_gpu).unwrap());
+                let cpu_out = values(&cpu.forward(&x).unwrap());
+                let scale = cpu_out.iter().fold(0f32, |m, v| m.max(v.abs()));
+                for (index, ((f, l), c)) in
+                    fused_out.iter().zip(&legacy_out).zip(&cpu_out).enumerate()
+                {
+                    assert!(
+                        (f - l).abs() <= 0.03 * scale,
+                        "T={tokens} {index}: Metal fused {f} vs Metal legacy {l}"
+                    );
+                    assert!(
+                        (f - c).abs() <= 0.03 * scale,
+                        "T={tokens} {index}: Metal fused {f} vs CPU {c}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn self_check_rejects_a_mismatched_expert_layout() {
+            let Qwen36MoeStacking::Stacked {
+                fused,
+                experts,
+                shared,
+            } = Qwen36MoeFusedExperts::stack(&router(), experts(), shared(I, true), &geometry(I))
+            else {
+                panic!("block-FP8 experts must stack on the CPU");
+            };
+            assert!(fused.self_check(&experts, &shared).is_ok());
+            // Rotating the reference experts makes every routed slot compare
+            // against the wrong weights: the check must not be vacuous.
+            let mut rotated = experts.clone();
+            rotated.rotate_left(1);
+            let error = fused
+                .self_check(&rotated, &shared)
+                .expect_err("a wrong expert layout must fail the self-check");
+            assert!(error.contains("diverges"), "{error}");
+        }
     }
 
     #[test]
