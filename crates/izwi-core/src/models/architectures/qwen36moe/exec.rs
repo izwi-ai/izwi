@@ -96,6 +96,19 @@ impl Qwen36PreparedPrompt {
     }
 }
 
+/// Tokens of a rendered prompt's stable history: everything before its final
+/// `<|im_start|>`, the assistant generation header every render ends with.
+/// The conversation's next turn renders exactly these tokens again (the
+/// template strips past reasoning, so nothing after them is shared), and
+/// `<|im_start|>` is a special token, so the encoding splits there and the
+/// prefix is a token boundary.
+fn history_boundary(prompt_ids: &[u32], im_start: u32) -> Option<usize> {
+    prompt_ids
+        .iter()
+        .rposition(|id| *id == im_start)
+        .filter(|boundary| *boundary > 0)
+}
+
 fn resolve_prepared_prompt<F>(
     prepared: Option<&Qwen36PreparedPrompt>,
     prepare: F,
@@ -935,11 +948,12 @@ impl Qwen36ChatExec {
         }
         let prompt_ids = self.tokenizer.encode_text(&prompt)?;
         let prompt_positions = build_text_positions(prompt_ids.len());
+        let history_boundary = history_boundary(&prompt_ids, self.tokenizer.specials.im_start);
         Ok(Qwen36PreparedPrompt {
             next_text_position: prompt_positions.len(),
             prompt_ids,
             prompt_positions,
-            history_boundary: None,
+            history_boundary,
         })
     }
 
@@ -3532,6 +3546,70 @@ mod tests {
         assert!(render_prompt(&messages, &disable, true)
             .expect("disable thinking")
             .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    /// The declared history boundary is exactly what the next turn shares:
+    /// every turn reproduces the previous turn's tokens up to it, with
+    /// thinking on or off, tools, Unicode and reasoning in the answers.
+    #[test]
+    fn next_turn_shares_the_declared_history_boundary() {
+        let tokenizer = synthetic_qwen35_tokenizer();
+        let im_start = tokenizer.specials.im_start;
+        for (thinking, tools) in [
+            (true, Vec::new()),
+            (false, Vec::new()),
+            (
+                true,
+                vec![serde_json::json!({"type":"function","function":{"name":"lookup"}})],
+            ),
+        ] {
+            let config = ChatGenerationConfig {
+                request: ChatRequestConfig {
+                    enable_thinking: Some(thinking),
+                    tools,
+                    media_inputs: Vec::new(),
+                    ..ChatRequestConfig::default()
+                },
+                ..ChatGenerationConfig::default()
+            };
+            let message = |role, content: &str| ChatMessage {
+                role,
+                content: content.to_string(),
+            };
+            let mut conversation = vec![
+                message(ChatRole::System, "Be precise."),
+                message(ChatRole::User, "First question — café 中文 🌍"),
+            ];
+            let answers = [
+                "<think>\nreasoning one\n</think>\n\nFirst answer.",
+                "reasoning two</think>\nSecond answer ✓",
+            ];
+            let mut previous: Option<(Vec<u32>, usize)> = None;
+            for (turn, answer) in answers.iter().enumerate() {
+                let prompt = render_prompt(&conversation, &config, false).unwrap();
+                let ids = tokenizer.encode_text(&prompt).unwrap();
+                let boundary = history_boundary(&ids, im_start).expect("declared boundary");
+                assert_eq!(ids[boundary], im_start);
+                assert!(tokenizer
+                    .inner
+                    .decode_with_special_tokens(&ids[boundary..])
+                    .unwrap()
+                    .starts_with("<|im_start|>assistant\n"));
+                if let Some((previous_ids, previous_boundary)) = &previous {
+                    assert!(boundary > *previous_boundary);
+                    assert_eq!(
+                        &ids[..*previous_boundary],
+                        &previous_ids[..*previous_boundary],
+                        "turn {turn} (thinking={thinking}) diverges inside the previous history"
+                    );
+                }
+                previous = Some((ids, boundary));
+                conversation.push(message(ChatRole::Assistant, answer));
+                conversation.push(message(ChatRole::User, "Follow-up ✓"));
+            }
+        }
+        assert_eq!(history_boundary(&[im_start, 7, 8], im_start), None);
+        assert_eq!(history_boundary(&[1, 2, 3], im_start), None);
     }
 
     #[test]
