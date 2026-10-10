@@ -261,7 +261,8 @@ fn now_unix_millis() -> u64 {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Chat storage error: {err}"))
+    tracing::error!(error = %format!("{err:#}"), "agent chat storage error");
+    ApiError::internal(format!("Chat storage error: {err:#}"))
 }
 
 fn map_agent_error(err: izwi_agent::AgentError) -> ApiError {
