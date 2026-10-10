@@ -160,6 +160,44 @@ paged attention (context-dependent strategy), the LM head (cuBLAS) and the greed
   destroys them on every free, about 6 driver calls per tensor, which izwi never needs in
   single-stream mode. Disabling event tracking process-wide, as mistral.rs does, could cut
   eager host time noticeably. It is context-global, so it needs its own change and check.
+
+### Phase 3b — long-context decode — DONE (unmeasured; split decode opt-in)
+Measured: 172 t/s at short context; a long second turn averaged 146 t/s, prefill included.
+
+A code survey suggests the H100 build decodes attention through Candle FlashAttention 2, not
+izwi's paged kernel: the server's `cuda` feature pulls in `izwi-core/flash-attn`, and Qwen3.6
+meets every FA eligibility check (64-token pages, first-page offsets 0, head dim 256). With one
+split, B = 1 decode launches only Hq = 16 CTAs on 132 SMs, and each walks the whole context.
+Attention time then grows linearly from the first token. Confirm on the GPU host with the
+`cuda_flash_attention_dispatches` and `cuda_native_attention_dispatches` counters. izwi's own
+partitioned kernel is no better: one query head per block, a block-wide reduction per token,
+and a reduce that walks the partitions serially.
+
+- [x] DeltaNet beta/alpha through the router GEMV (`c7130977`); no cuBLAS left in the segments.
+- [x] Event tracking off in single-stream mode (`b4b5bf42`). Without multi-stream mode the events
+      never order anything, but cost about 4 driver calls per allocation (about 64 allocations
+      per token in the eager attention parts). Left on in multi-stream mode;
+      `IZWI_CUDA_EVENT_TRACKING=1` restores it.
+- [x] Grouped-query split decode kernel, opt-in (`945426b0`), `kernels::cuda::split_decode`:
+  - grid (B × Hkv, partitions): 1 partition per 128 tokens, up to about 512 blocks (Qwen3.6
+    B = 1: 32 partitions at 4K context, 256 from 32K);
+  - one 4-warp block reads each K/V row once for all of its group's query heads (8 for Qwen3.6);
+  - a warp scores 32 keys at a time, one key per lane, so scores need no shuffle reduction,
+    then folds the value rows into per-lane slices of the head dimension (16-byte loads);
+  - a new reduce kernel weights all partitions in one parallel pass;
+  - token ranges come from the device context lengths, so the launch is capturable later.
+
+  Opt in with `IZWI_CUDA_SPLIT_DECODE=1`. The first use of each geometry runs a synthetic probe
+  (page offsets, a shuffled block table, ragged tiles, 4 partitions) against the one-pass kernel,
+  then compares one live call with the current provider (FA2 or native). Any failure turns it
+  off for the arena, with a `CUDA split decode disabled: …` warning. F16/BF16, head dim 128 or
+  256, at most 8 query heads per KV head. Evidence so far: the CUDA emulator matches a float64
+  reference on 7 geometries and catches 3 seeded bugs, and clippy builds for sm_80. No GPU
+  timing yet: A/B it on a long thread.
+- Deferred (needs KV-arena API work, best done with the GPU at hand):
+  - fused RoPE + KV write;
+  - persistent step buffers;
+  - capturing attention inside the segment graphs.
 - Deferred to GPU iteration:
   - B > 1 buckets;
   - capturing attention (persistent slot and metadata buffers, a captured partitioned
@@ -181,7 +219,40 @@ paged attention (context-dependent strategy), the LM head (cuBLAS) and the greed
       routed token (about 8× less weight traffic at 256 tokens). Deterministic slot-order combine.
       The MoE self-check adds a 48-token grouped-vs-per-pair probe.
 - [ ] FP8 tensor-core grouped GEMM on SM90; chunked GDN prefill (FLA chunk 64); larger prefill
-      chunks; hybrid prefix-cache snapshots at message boundaries. Judged by the TTFT chip from 1.0.
+      chunks (Phase 5b).
+
+### Phase 5a — reuse state across chat turns — DONE (unmeasured; opt-in on CUDA)
+Measured: a second turn in a thread re-prefills the whole history, about 3.5 s of a 23.5 s reply.
+The engine already shares hybrid prefixes for Qwen3.8 (DS1.2b/DS1.5): KV pages by chained page
+digest, plus DeltaNet snapshots at page boundaries, forked on attach. qwen36moe is opted out.
+Two shared limits also stop a chain from advancing past turn 1:
+- pages publish only from a request's first prefill span;
+- snapshots publish only at that span's end.
+
+The chat template strips past reasoning, so turn N+1 matches turn N only up to the end of the
+last user message (just before the final `<|im_start|>assistant`).
+
+- [x] Engine: a per-request **snapshot boundary**, declared by the prepared prompt (`1e37c48d`).
+  - The scheduler clips the prefill span that crosses the interval-aligned boundary, so it ends
+    exactly there.
+  - For boundary-declaring requests only, the manager publishes pages from every prefill span
+    within the prompt, and a tensor snapshot only at that boundary.
+  - Other families keep their behaviour exactly.
+- [x] qwen36moe: the prepared prompt declares the history boundary (`f6f1f3aa`). A template
+      test checks that turn N+1 shares turn N's tokens up to it.
+- [x] qwen36moe: opt into hybrid prefix reuse when MTP is off (`de8e3796`).
+  - The contract uses committed pages plus committed snapshots.
+  - The load flag is plumbed through.
+  - Resumable prefill can start at an attached cursor.
+  - Tests: a CPU attach test (attached = fresh, bit-identical), an aliasing test (decode never
+    mutates a published snapshot), and the CPU catalog cell.
+- [x] Engine config: on CUDA, max context reserves every page, so the prefix budget resolved to
+      0 and explicit enablement failed. The prefix budget now sits on top of that reserve
+      (`8c31b606`).
+- Enable on the H100 explicitly (CUDA has no parity evidence yet):
+  `IZWI_ENABLE_PREFIX_CACHING=1`, `IZWI_MANAGED_PREFIX_CACHE_SALT=<secret>`, and
+  `IZWI_MAX_PREFIX_CACHE_PAGES` sized for the threads to keep (64 tokens and about 1.3 MB of KV
+  per page).
 
 ## Phase 6 — Metal (M-L) — MOSTLY DONE (unmeasured)
 - [x] Experts stay raw block-FP8 on Metal, not Q8_0 or F16 (`f04cccda`). The MSL kernels decode
@@ -220,6 +291,32 @@ paged attention (context-dependent strategy), the LM head (cuBLAS) and the greed
 | Date | SHA | Phase landed | Tokens | ms | t/s | Diagnostics notes |
 |---|---|---|---|---|---|---|
 | 2026-10-10 | (pre-plan) | baseline | 2,049 | 159,879 | 13 | legacy MoE, no graphs, MTP off |
+| 2026-10-10 | `55fc45d2` (as deployed, assumed) | 1-3 | 1,547 | 9,011 | 172 | all paths fused; graphs `replay`, 0 eager steps |
+| 2026-10-10 | `55fc45d2` (same thread, turn 2) | 1-3 | 3,435 | 23,536 | 146 | includes re-prefilling the history; longer context |
+
+### Next deploy: Phases 5a and 3b, what to check
+Deploy `945426b0` or later. Both new paths are off by default; turn them on one at a time on the
+same two-turn thread, so each A/B row changes one thing.
+
+1. **Pre-flight**: the step 0 command below now also runs `kernels::cuda::split_decode` (the
+   synthetic probe against the one-pass kernel at three geometries).
+2. **Baseline**: defaults. Turn 1 should stay near 172 t/s (event tracking is now off, which may
+   add a little). Note which attention counter grows: `cuda_flash_attention_dispatches` confirms
+   the FA2 reading in Phase 3b, `cuda_native_attention_dispatches` refutes it.
+3. **Split decode**: restart with `IZWI_CUDA_SPLIT_DECODE=1`. The log should show
+   `CUDA split decode verified against the current attention provider`,
+   `cuda_split_decode_dispatches` should grow, and `last_attention_provider` should read
+   `cuda_split_decode`. A `CUDA split decode disabled: …` warning carries the reason; record it.
+   Compare turn-2 t/s with the baseline; the gain should grow with context length.
+4. **Prefix reuse** (MTP off): restart with `IZWI_ENABLE_PREFIX_CACHING=1`,
+   `IZWI_MANAGED_PREFIX_CACHE_SALT=<secret>` and `IZWI_MAX_PREFIX_CACHE_PAGES=<n>`. The load log
+   says `Qwen3.6-MoE prefix reuse`. On turn 2 of a new thread, cache telemetry `prefix_hits` and
+   `tensor_snapshot_attaches` should rise, and total ms should drop by about the history prefill
+   (about 3.5 s in the 146 t/s run). Each DeltaNet snapshot (about 63 MiB, one per thread turn) is
+   not charged to admission yet, so keep the page budget modest. There is no CUDA parity evidence:
+   if a reused turn reads wrong, turn it off and record the thread.
+5. **Event tracking**: `IZWI_CUDA_EVENT_TRACKING=1` restores cudarc's default, for an A/B on
+   turn 1 if step 2 regressed.
 
 ### Correctness review of `4e764ffb..8ce1e08a` (2026-10-10)
 
