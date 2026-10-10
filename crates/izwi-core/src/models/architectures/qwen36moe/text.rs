@@ -16,6 +16,7 @@ use crate::backends::state::{
 };
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
+use crate::kernels::cuda::norm;
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -45,6 +46,7 @@ pub struct Qwen36TextModel {
     output_norm: Qwen36RmsNorm,
     output: Qwen36Projection,
     finite_diagnostics_enabled: bool,
+    fused_norm_path: Qwen36FusedPath,
 }
 
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
@@ -413,11 +415,43 @@ struct Qwen36GatedRmsNorm {
 pub(crate) struct Qwen36RmsNorm {
     weight: Tensor,
     eps: f64,
+    /// Fused cast-free kernel for 16-bit activations with this F32 gain,
+    /// enabled by [`Qwen36TextModel::resolve_fused_norms`].
+    fused: bool,
 }
 
 impl Qwen36RmsNorm {
     pub(crate) fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+        Self {
+            weight,
+            eps,
+            fused: false,
+        }
+    }
+
+    fn fused_applies(&self, x: &Tensor) -> bool {
+        self.fused
+            && self.weight.dtype() == DType::F32
+            && matches!(x.dtype(), DType::F16 | DType::BF16)
+    }
+
+    /// `(residual + delta, norm(residual + delta))`, fused into one launch
+    /// when enabled; the sum is rounded to the activation dtype either way.
+    fn add_forward(&self, residual: &Tensor, delta: &Tensor) -> Result<(Tensor, Tensor)> {
+        if self.fused_applies(residual)
+            && delta.dtype() == residual.dtype()
+            && delta.dims() == residual.dims()
+        {
+            return Ok(norm::add_rms_norm(
+                residual,
+                delta,
+                &self.weight,
+                self.eps as f32,
+            )?);
+        }
+        let sum = (residual + delta)?;
+        let normalized = self.forward(&sum)?;
+        Ok((sum, normalized))
     }
 
     #[cfg(test)]
@@ -428,6 +462,9 @@ impl Qwen36RmsNorm {
 
 impl Module for Qwen36RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        if self.fused_applies(x) {
+            return norm::rms_norm(x, &self.weight, self.eps as f32);
+        }
         if x.dtype() == self.weight.dtype() {
             return candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32);
         }
@@ -672,14 +709,122 @@ impl Qwen36TextModel {
                 ffn,
             });
         }
-        Ok(Self {
+        let mut model = Self {
             device: device.clone(),
             token_embeddings,
             layers,
             output_norm,
             output,
             finite_diagnostics_enabled,
-        })
+            fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
+        };
+        model.resolve_fused_norms(false);
+        Ok(model)
+    }
+
+    /// Enable the fused RMSNorm kernels on every trunk norm (layer, q/k and
+    /// output norms) after a self-check of the first layer's norm against the
+    /// Candle composition. CUDA only in production (`allow_cpu` exercises the
+    /// portable path in tests); `IZWI_QWEN36_FUSED_DECODE=legacy` keeps the
+    /// cast → rms_norm → cast chain.
+    fn resolve_fused_norms(&mut self, allow_cpu: bool) {
+        let device = self.device.clone();
+        let path = if legacy_requested(FUSED_DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
+        } else if !(device.is_cuda() || (allow_cpu && device.is_cpu())) {
+            Qwen36FusedPath::legacy("fused RMSNorm runs on CUDA only")
+        } else if !norm::supported(&device, DType::BF16) {
+            Qwen36FusedPath::legacy("fused RMSNorm needs SM80+")
+        } else {
+            match self.fused_norm_self_check() {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 fused RMSNorm self-check failed; using the Candle composition"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+        let fused = path.is_fused();
+        self.output_norm.fused = fused;
+        for layer in &mut self.layers {
+            layer.attn_norm.fused = fused;
+            layer.post_attention_norm.fused = fused;
+            if let Qwen36Mixer::Full(attention) = &mut layer.mixer {
+                attention.q_norm.fused = fused;
+                attention.k_norm.fused = fused;
+            }
+        }
+        self.fused_norm_path = path;
+    }
+
+    fn fused_norm_self_check(&self) -> Result<()> {
+        let Some(layer) = self.layers.first() else {
+            return Ok(());
+        };
+        let norm = &layer.attn_norm;
+        if norm.weight.dtype() != DType::F32 {
+            return Err(Error::InferenceError(
+                "trunk norm gains are not F32; nothing to fuse".into(),
+            ));
+        }
+        let hidden = norm.weight.elem_count();
+        let wave = |seed: f32| {
+            (0..3 * hidden)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 3.0)
+                .collect::<Vec<_>>()
+        };
+        let tensor = |seed: f32| -> Result<Tensor> {
+            Ok(Tensor::from_vec(wave(seed), (3, 1, hidden), &Device::Cpu)?
+                .to_dtype(DType::BF16)?
+                .to_device(&self.device)?)
+        };
+        let host = |tensor: &Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?)
+        };
+        let (residual, delta) = (tensor(1.0)?, tensor(2.0)?);
+        let eps = norm.eps as f32;
+        let (sum, fused) = norm::add_rms_norm(&residual, &delta, &norm.weight, eps)?;
+        let expected_sum = (&residual + &delta)?;
+        let unfused = Qwen36RmsNorm {
+            fused: false,
+            ..norm.clone()
+        };
+        let expected = unfused.forward(&expected_sum)?;
+        compare_values(
+            "fused residual sum",
+            &host(&sum)?,
+            &host(&expected_sum)?,
+            1e-6,
+            1e-6,
+        )?;
+        compare_values(
+            "fused add+RMSNorm",
+            &host(&fused)?,
+            &host(&expected)?,
+            0.01,
+            0.02,
+        )?;
+        let plain = norm::rms_norm(&residual, &norm.weight, eps)?;
+        let plain_expected = unfused.forward(&residual)?;
+        compare_values(
+            "fused RMSNorm",
+            &host(&plain)?,
+            &host(&plain_expected)?,
+            0.01,
+            0.02,
+        )?;
+        Ok(())
+    }
+
+    /// Fused RMSNorm resolution, for the admin diagnostics.
+    pub(crate) fn rms_norm_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.fused_norm_path])
     }
 
     /// The device the trunk (and any MTP head) executes on.
@@ -1300,9 +1445,7 @@ impl Qwen36Layer {
                 output
             }
         };
-        let hidden_states = (&residual + &mixed)?;
-        let residual = hidden_states.clone();
-        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
         let hidden_states = self.ffn.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
@@ -1349,9 +1492,7 @@ impl Qwen36Layer {
                 output
             }
         };
-        let hidden_states = (&residual + &mixed)?;
-        let residual = hidden_states.clone();
-        let hidden_states = self.post_attention_norm.forward(&hidden_states)?;
+        let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
         let hidden_states = self.ffn.forward(&hidden_states)?;
         (&residual + &hidden_states).map_err(Error::from)
     }
@@ -3351,6 +3492,43 @@ mod tests {
                 "{label} index {index}: {a} vs {e}"
             );
         }
+    }
+
+    #[test]
+    fn fused_rms_norm_keeps_the_casting_composition_semantics() {
+        use candle_core::Module;
+        let device = &Device::Cpu;
+        let weight = Tensor::from_vec(
+            (0..64)
+                .map(|i| 1.0 + (i as f32 * 0.3).sin() * 0.2)
+                .collect::<Vec<_>>(),
+            64,
+            device,
+        )
+        .unwrap();
+        let mut norm = super::Qwen36RmsNorm::new(weight, 1e-6);
+        let input = |seed: f32| {
+            Tensor::from_vec(
+                (0..128)
+                    .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 3.0)
+                    .collect::<Vec<_>>(),
+                (2, 1, 64),
+                device,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+        };
+        let (residual, delta) = (input(1.0), input(2.0));
+        let (legacy_sum, legacy) = norm.add_forward(&residual, &delta).unwrap();
+        norm.fused = true;
+        let (fused_sum, fused) = norm.add_forward(&residual, &delta).unwrap();
+        assert_eq!(fused.dtype(), DType::BF16, "activation dtype is preserved");
+        assert_eq!(flat(&fused_sum), flat(&legacy_sum));
+        assert_eq!(flat(&fused), flat(&legacy));
+        // F32 activations keep the plain path even when fusion is enabled.
+        let f32_input = residual.to_dtype(DType::F32).unwrap();
+        assert_eq!(norm.forward(&f32_input).unwrap().dtype(), DType::F32);
     }
 
     #[test]

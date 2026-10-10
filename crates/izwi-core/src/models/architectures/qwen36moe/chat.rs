@@ -198,7 +198,8 @@ impl Qwen36MoeChatModel {
         };
         let moe = exec.text_model.moe_backend_summary();
         let gdn_decode = exec.text_model.gdn_decode_summary();
-        tracing::info!(%moe, %gdn_decode, "Qwen3.6-MoE fused kernel paths");
+        let rms_norm = exec.text_model.rms_norm_summary();
+        tracing::info!(%moe, %gdn_decode, %rms_norm, "Qwen3.6-MoE fused kernel paths");
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -445,6 +446,7 @@ impl Qwen36MoeChatModel {
             },
             "moe": self.exec.text_model.moe_backend_summary(),
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "rms_norm": self.exec.text_model.rms_norm_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -1300,6 +1302,10 @@ pub(crate) mod tests {
         let gdn = &model.runtime_diagnostics()["gdn_decode"];
         assert_eq!(gdn["backend"], "legacy");
         assert_eq!(gdn["fused_layers"], 0);
+        assert_eq!(
+            model.runtime_diagnostics()["rms_norm"]["legacy_reasons"][0],
+            "fused RMSNorm runs on CUDA only"
+        );
         assert!(gdn["legacy_reasons"][0]
             .as_str()
             .is_some_and(|reason| reason.contains("CUDA only")));
