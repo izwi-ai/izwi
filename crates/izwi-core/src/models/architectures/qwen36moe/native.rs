@@ -1183,7 +1183,7 @@ pub fn mtp_tensor_plan(
             vec![text.moe_num_experts, hidden],
         );
         for expert in 0..text.moe_num_experts {
-            for (suffix, shape) in expert_projection_shapes(text) {
+            for (suffix, shape) in expert_projection_shapes(text, text.moe_intermediate_size) {
                 push_projection(
                     &mut specs,
                     format!("{prefix}.mlp.experts.{expert}.{suffix}"),
@@ -1192,7 +1192,9 @@ pub fn mtp_tensor_plan(
                 )?;
             }
         }
-        for (suffix, shape) in expert_projection_shapes(text) {
+        for (suffix, shape) in
+            expert_projection_shapes(text, text.shared_expert_intermediate_size)
+        {
             push_projection(
                 &mut specs,
                 format!("{prefix}.mlp.shared_expert.{suffix}"),
@@ -1343,7 +1345,7 @@ pub fn expected_text_tensor_plan(
             ExpectedTensorKind::Dense,
         );
         for expert in 0..text.moe_num_experts {
-            for (suffix, shape) in expert_projection_shapes(text) {
+            for (suffix, shape) in expert_projection_shapes(text, text.moe_intermediate_size) {
                 insert_fp8_projection(
                     &mut plan,
                     format!("{prefix}.mlp.experts.{expert}.{suffix}"),
@@ -1353,7 +1355,9 @@ pub fn expected_text_tensor_plan(
                 );
             }
         }
-        for (suffix, shape) in expert_projection_shapes(text) {
+        for (suffix, shape) in
+            expert_projection_shapes(text, text.shared_expert_intermediate_size)
+        {
             insert_fp8_projection(
                 &mut plan,
                 format!("{prefix}.mlp.shared_expert.{suffix}"),
@@ -1487,20 +1491,17 @@ pub fn expected_text_tensor_plan(
     Ok(plan)
 }
 
-fn expert_projection_shapes(text: &Qwen36MoeTextConfig) -> [(&'static str, Vec<usize>); 3] {
+/// SwiGLU projection shapes for one expert of the given intermediate width
+/// (`moe_intermediate_size` for routed experts,
+/// `shared_expert_intermediate_size` for the shared expert).
+fn expert_projection_shapes(
+    text: &Qwen36MoeTextConfig,
+    intermediate: usize,
+) -> [(&'static str, Vec<usize>); 3] {
     [
-        (
-            "gate_proj.weight",
-            vec![text.moe_intermediate_size, text.hidden_size],
-        ),
-        (
-            "up_proj.weight",
-            vec![text.moe_intermediate_size, text.hidden_size],
-        ),
-        (
-            "down_proj.weight",
-            vec![text.hidden_size, text.moe_intermediate_size],
-        ),
+        ("gate_proj.weight", vec![intermediate, text.hidden_size]),
+        ("up_proj.weight", vec![intermediate, text.hidden_size]),
+        ("down_proj.weight", vec![text.hidden_size, intermediate]),
     ]
 }
 
@@ -2253,6 +2254,26 @@ mod tests {
     /// and the CUDA (BF16 activation) plans — while the gated DeltaNet norm
     /// (`linear_attn.norm`, plain `w`) stays raw. A finiteness-only fixture
     /// cannot see this: gain 0.05 and gain 1.05 are both finite.
+    #[test]
+    fn shared_expert_plan_uses_the_shared_intermediate_size() {
+        let mut config = forward_config();
+        config.text.shared_expert_intermediate_size = 64;
+        let plan = expected_text_tensor_plan(&config).unwrap();
+        let routed = &plan["model.layers.0.mlp.experts.0.gate_proj.weight"];
+        assert_eq!(routed.shape, vec![32, 32]);
+        let shared_gate = &plan["model.layers.0.mlp.shared_expert.gate_proj.weight"];
+        assert_eq!(shared_gate.shape, vec![64, 32]);
+        let shared_down = &plan["model.layers.0.mlp.shared_expert.down_proj.weight"];
+        assert_eq!(shared_down.shape, vec![32, 64]);
+
+        let mtp = mtp_tensor_plan(&config.text, config.block_fp8.block_shape).unwrap();
+        let mtp_shared = mtp
+            .iter()
+            .find(|spec| spec.name == "mtp.layers.0.mlp.shared_expert.gate_proj.weight")
+            .expect("MTP shared expert");
+        assert_eq!(mtp_shared.shape, vec![64, 32]);
+    }
+
     #[test]
     fn native_rms_norms_apply_the_zero_centered_gain() {
         use crate::models::architectures::qwen35::text::Qwen35WeightSource;
