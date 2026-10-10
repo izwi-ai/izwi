@@ -107,3 +107,54 @@
   registry — a peer's row can be staler than a third party's view, so it cannot
   gate the race. Diagnose these by running the lane under realistic CPU load
   (the repo's CI runners are 2 vCPU): an idle machine hid a 1-in-6 flake.
+- A loader that materializes a tensor correctly can still be wrong about its VALUE
+  CONVENTION, and no shape/dtype/finiteness check will ever see it. Qwen3.5/3.6-MoE
+  stores RMSNorm gains zero-centered (HF applies `1.0 + weight` at runtime); the
+  qwen36moe native loader used them raw, attenuating 100 per-layer gains ~10-25x, so
+  the residual stream degenerated to the untouched embedding and the model emitted the
+  unconditional unigram prior as multilingual salad — a symptom that reads exactly like
+  a broken CUDA kernel. Two sessions of kernel/layout/routing audits cleared every
+  prime suspect while the bug sat one `+ 1.0` away in a loader. Rules that follow:
+  (1) when a native safetensors loader and its sibling disagree on a *value transform*
+  (`qwen38/text.rs::load_native_zero_centered_norm` vs `qwen36moe/native_model.rs::rms_norm`),
+  that disagreement is a defect until proven otherwise — diff the transforms, not just
+  the paths; (2) "the trunk works in production" is worthless as coverage when the
+  production path is a different FORMAT (llama.cpp bakes the `+1` in at GGUF
+  conversion, so the GGUF fixture cannot detect its absence); (3) a fixture generated
+  from the plan, or asserting only FINITENESS, cannot catch a gain error — assert
+  effective gain == 1 + w; (4) census the PUBLISHED VALUES, which is cheap: safetensors
+  headers are readable over HTTP Range, so a 37 GB checkpoint's value census costs a
+  few hundred KB. Validate the decoder against 2-3 known-plausible tensors (A_log,
+  dt_bias, conv1d) before believing any reading, and use a sibling checkpoint whose
+  loader is known-good as the control. Two decoder traps: BF16 is the HIGH half of F32
+  (low-half reconstruction yields all-denormal zeros), and `data_offsets` are relative
+  to `8 + header_length`, not byte 0.
+- When a shared trunk was written for GGUF and a NATIVE loader feeds it, enumerate EVERY
+  value transform the llama.cpp converter applies for that arch (`conversion/<family>.py`
+  `modify_tensors` + any mixin bases) and check that the native loader mirrors each one.
+  Qwen3.5/3.6 has four transforms: A_log→-exp, norm +1, conv squeeze, and the V-head grouped→tiled
+  reorder. Two of them were missed. "The GGUF path works on this trunk" proves the
+  convention of the CONVERTED file, never the published one. That fallacy hid the norm
+  bug and then "refuted" the V-head bug. Also: a norm's convention comes from its module
+  CLASS in the reference implementation, not from a magnitude census of its stored values
+  (a trained zero-centered gain can drift to 1.6). And "no weight permutation can
+  reconcile layouts X and Y" claims need a written proof; permuting the other side
+  usually works.
+- When a checkpoint convention disagrees with a shared trunk's assumption, first ask whether the
+  TRUNK can honor the checkpoint's convention cheaply before rewriting weights at load. The
+  Qwen3.6 value-head order fix was ~30 lines as a source-declared expansion order
+  (`linear_v_head_order`) versus byte-level permutation across five residency forms (packed Q8,
+  tiled Q8, expanded, raw FP8, streaming loads). Weight surgery is right only when every
+  consumer (kernels included) hard-codes the convention. Then gate the kernels that do (the
+  compact Metal DeltaNet kernel hard-codes tiled pairing on un-expanded heads).
+- Prove a value-parity fixture is RED before trusting it green: revert each fix in turn and
+  confirm the golden test fails by a margin far above its tolerance (here 2-3 logits vs 2e-3),
+  and validate the reference itself (HF cached decode == full forward) before using it.
+- Do not run rustfmt over whole files to "keep them clean" unless HEAD is verifiably clean
+  in-repo (`git show HEAD:f | rustfmt --check` via stdin can report clean while the in-repo
+  run reformats ~150 lines); unrelated reformat churn buries a fix. Only the files listed in
+  `scripts/ci/check-backend-truth.sh` are format-gated.
+- Splitting a dirty tree into logical commits: stage exact content with
+  `git hash-object -w` + `git update-index --cacheinfo`, test the index state under
+  `git stash push --keep-index`, then restore with `git checkout stash@{0} -- <files>` and
+  drop the stash — `git stash pop` conflicts once the staged hunks are committed.

@@ -20720,3 +20720,180 @@ Three logical commits resolve the three failing CI gates on `qwen36moe-gdn-dtype
    In `crates/izwi-server/tests/fleet_rig.rs`, replaces the blind 800ms sleep in `spawn_gateway`
    with active `/readyz` polling and early exit detection, and in `scripts/ci/check-backend-truth.sh`,
    runs `fleet_rig` with `-- --test-threads=1` to eliminate inter-test port race conditions.
+
+# Plan — Qwen3.6-35B-A3B-FP8 gibberish: zero-centered RMSNorm `+1.0` — 2026-10-09
+
+Research/analysis/planning session only — NO code changed. Full evidence chain in
+`tasks/qwen36moe-zero-centered-rmsnorm-research-2026-10-09.md`.
+
+Field symptom: `POST /v1/chat/threads/<id>/messages` with `Qwen3.6-35B-A3B-FP8` on
+`https://brizdigital--izwi-cuda-serve.modal.run` returns multilingual token salad
+(mixed Arabic/Korean/Vietnamese/Russian/Thai/Portuguese/German/Polish/Japanese plus
+`_UPPER_SNAKE` code identifiers) from the very first generated token, no
+`` block, different on every request. Model loads fine, all shapes/dtypes/
+finiteness pass.
+
+Root cause (confirmed against the published checkpoint, not inferred): the
+qwen36moe native safetensors loader never applies the zero-centered RMSNorm `+1.0`
+transform. The published checkpoint stores `layers.N.input_layernorm.weight`
+(abs_mean 0.0925) and `layers.N.post_attention_layernorm.weight` (abs_mean 0.2065)
+zero-centered, per HF `1.0 + weight` runtime convention. izwi uses them raw, so every
+per-layer gain is ~10-25x too small, the residual stream degenerates to the raw
+embedding over 40 layers, and `lm_head(rms_norm(embed))` emits the unconditional
+unigram prior — which is exactly multilingual salad under stochastic sampling.
+
+Controls: `Qwen3.8-27B-FP8` stores the same tensors zero-centered (abs_mean 0.0430 /
+0.2173) and its loader *does* apply `+1.0` (`qwen38/text.rs:2873`) and works in
+production. The production Qwen3.5-4B GGUF is immune because llama.cpp bakes the `+1`
+in at conversion. Live deploy is NOT stale: `build_git_sha = 45eae651` = main @ PR #220.
+
+- [ ] C1 `qwen36moe/native_model.rs`: mirror `load_native_zero_centered_norm` —
+      apply `+1.0` to every zero-centered RMSNorm gain, in the F32 staging buffer
+      before the BF16/F16 dense-target materialization (`native_model.rs:157`) so
+      `1.05` does not take a second rounding.
+- [ ] ~~C2~~ SUPERSEDED 2026-10-10 (wrong: convention is set by the HF module class, not by
+      stored magnitude — see the 2026-10-10 plan below). C2 Allow-list, not blanket: census says only `layers.N.input_layernorm`,
+      `layers.N.post_attention_layernorm`, `layers.N.self_attn.{q,k}_norm` and
+      `mtp.layers.0.input_layernorm` are zero-centered. `linear_attn.norm` (0.88),
+      the final norm (1.63), `mtp.norm` (1.93), `mtp.layers.0.post_attention_layernorm`
+      (0.87) and `mtp.layers.0.self_attn.{q,k}_norm` (0.75) must stay raw — mirror
+      llama.cpp's `not name.endswith("linear_attn.norm.weight")` exclusion.
+- [ ] C3 Close the fixture blindness: the native fixture writes norms as
+      `bf16_uniform(0.05)` and only asserts finiteness. Add a value-level assertion
+      that the trunk's effective gain equals `1 + w`.
+- [ ] C4 Fix the stale `catalog/cuda_support.rs:536` reason string ("expands
+      projections to resident BF16, not native FP8 execution") so the next incident
+      is not steered away from the real subsystem.
+- [ ] C5 Census-pin the norm convention for the MTP block before MTP is enabled on a
+      real checkpoint (`MTP_MANIFEST_CENSUS_VERIFIED` should cover norm *values*,
+      not just names/shapes/dtypes).
+- [ ] V1 Zero-GPU decisive check: read `layers.0.input_layernorm.weight` from
+      `/models/Qwen3.6-35B-A3B-FP8` on the Modal volume and confirm abs_mean ~ 0.09.
+      Separates this cause from every alternative.
+- [ ] V2 Control-model A/B (no code cost): load `Qwen3.8-27B-FP8` (already on the
+      volume) on the same container and issue the identical chat. Coherent output
+      isolates the defect to the qwen36moe native path; salad from both models
+      falsifies this analysis and points at shared infra.
+- [ ] V3 Post-fix hardware gate: `IZWI_QWEN36_REAL_CHECKPOINT_E2E=<dir>
+      IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib real_checkpoint`
+      (ASCII ratio > 0.95) and `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p
+      izwi-core --lib kernels::cuda`.
+- [ ] V4 Regression: CPU lib + Metal lane + workspace clippy `-D warnings`; native
+      gain-assertion test; census pin for the norm convention.
+
+## Review (2026-10-09)
+
+Research only; nothing implemented. Highest-leverage items are C1+C2 (the fix) and
+V2 (the control experiment that validates the diagnosis at zero code cost).
+
+# Plan — Qwen3.6-35B-A3B-FP8 gibberish: two native-loader convention defects — 2026-10-10
+
+Research/analysis/planning only — NO code changed. Evidence:
+`tasks/qwen36moe-native-convention-defects-research-2026-10-10.md`. Supersedes the
+2026-10-09 C1/C2 scope.
+
+Root cause: the shared qwen35 trunk assumes llama.cpp GGUF conventions; llama.cpp's
+`conversion/qwen.py` applies two value transforms the qwen36moe native loader skips.
+D1 (fatal) zero-centered RMSNorm `+1`; D2 (severe) linear-attention V heads reordered
+grouped→tiled to match the trunk's tiled `repeat_head_states`.
+
+- [ ] F1 `native_model.rs::rms_norm`: unconditional `+1.0` in F32 before the dense-target
+      cast. `rms_norm()` is called for exactly the HF `Qwen3_5MoeRMSNorm` set (final, attn,
+      post, q/k, all MTP norms); gated `ssm_norm` loads via `dense()` and stays raw. No
+      allow-list.
+- [ ] F2 Native-source V-head permutation (grouped→tiled, K=16, r=2, head_dim 128) for
+      `in_proj_qkv` V rows, `in_proj_z` rows, `in_proj_a/b` rows, `A_log`, `dt_bias`,
+      `conv1d` V channels, `out_proj` columns — dense tensors and raw FP8 weight+scale
+      blocks alike (128-aligned, no requant). Trunk tiled expansion untouched.
+- [ ] F3 Rewrite the false "not reconcilable by any weight permutation" comment at
+      `qwen35/text.rs:2529`; fix the 2026-10-07 note's "refuted" bullet and the stale
+      `catalog/cuda_support.rs:536` reason string.
+- [ ] F4 HF golden-parity test: tiny random-init `Qwen3_5MoeForCausalLM` (2 k / 4 v heads,
+      random non-zero norms, MoE + shared expert, one full-attn layer) + committed logits;
+      izwi CPU native path must match. Red before F1+F2, red with either alone, green after.
+- [ ] F5 Unit tests: effective gain == 1 + w; permutation helper; GDN layer parity
+      (HF layout + repeat_interleave) == (permuted + tiled).
+- [ ] V1 Local: F4/F5 + CPU lib + Metal lane + clippy `-D warnings`; qwen35 GGUF unchanged.
+- [ ] V2 Modal H100: real_checkpoint E2E (ASCII > 0.95) + `kernels::cuda`, redeploy, replay
+      the field request and a short reasoning prompt; expect closed think block + coherent answer.
+- [ ] V3 If coherent-but-off after F1/F2: A/B the residency (native FP8 vs expanded BF16)
+      to clear the real-geometry FP8 kernel.
+
+## Review (2026-10-10)
+
+Research only. Verified against upstream HF `modeling_qwen3_5_moe.py`, vLLM
+`qwen3_next_mtp.py`, and llama.cpp `conversion/qwen.py` (fetched today), plus current code.
+Found that 2026-10-09's C2 allow-list was wrong (it would have left the final norm and MTP norms
+un-shifted) and that 2026-10-07's head-layout "refutation" was wrong (D2 is real).
+
+# Plan — Qwen3.6-35B-A3B-FP8 full native implementation audit — 2026-10-10
+
+Research only — NO code changed. Full audit: `tasks/qwen36moe-native-implementation-audit-2026-10-10.md`.
+Extends the F-list above (F1=D1, F2=D2) with defects found by the five-subsystem audit.
+
+- [x] G0 HF golden-parity fixture + test (tiny random-init Qwen3_5MoeForCausalLM, random
+      non-zero norms, 2k/4v linear heads, MoE+shared, prefill + per-token decode over 32
+      tokens). DONE `c3b7c731` — red without D1 (2.96 logits) or without D2 (2.12), green
+      with both (<2e-3; logit scale ~4).
+- [x] D1 zero-centered norm +1 in `native_model.rs::rms_norm` (F32 gain; mixed-dtype
+      `Qwen35RmsNorm` runs in F32 and casts back = HF math). DONE `9c5f2ba2`.
+- [x] D2 value-head order. DONE `995858b5` — DEVIATION from plan: instead of permuting
+      weights grouped→tiled at load (byte surgery across five residency forms: packed Q8,
+      tiled Q8, expanded, raw FP8, optimized streaming), the weight source declares its
+      order (`linear_v_head_order`: GGUF tiled, native grouped) and the mixer expands q/k
+      to match (`repeat_interleave` for grouped). Exact for every residency, ~30 lines;
+      the compact Metal kernel (hard-coded tiled) is gated to tiled/equal-head layouts.
+- [x] D3 build_mrope cos/sin from F32 angles. DONE `e55875b0`. Qwen3.8 has the identical
+      bug (`qwen38/text.rs:2970`) — out of scope, flagged as a separate task.
+- [x] D4 Qwen3.6 shares the Qwen3.8 thinking profile (= its generation_config). DONE `f62529f8`.
+- [x] D5 MTP snapshot in logical conv-ring order (`ConvRingState::ordered_slots`). DONE
+      `8aeb3d88`. Exposure: MTP head is only built by the qwen36moe native loader.
+- [x] D6 fail-closed tokenizer.json (`daba36d3`); D7 shared-expert plan size (`f1893b62`);
+      D8 MTP bootstrap penalty history (`67a340de`), cuda_support reason + tensor_kind label
+      (`e0c40cee`); false trunk comment rewritten in `995858b5`; 2026-10-07 note annotated.
+- [ ] V local gates (core/server lib, Metal, clippy -D warnings, qwen35 GGUF unchanged);
+      V H100 real_checkpoint + kernels::cuda, redeploy, fresh-thread replay + reasoning + ≥2k prompt;
+      FP8-vs-BF16 residency A/B only if coherent-but-off.
+
+## Review (2026-10-10, audit)
+
+Verified correct: FP8 decode/scale/CUDA kernel/Q8 fallback, tensor mapping, MoE routing
+and experts, full attention (q|gate split, partial NEOX MRoPE, GQA, output gate), GDN maths
+and state lifetime, prompt rendering (byte-identical to official jinja), tokenizer/stops,
+routing, pinned config. Defects: D1/D2 fatal (explain prod), D3 severe on CUDA/Metal,
+D4 quality, D5 latent (MTP), D6–D8 minor, test fixture blind by construction.
+
+## Review (2026-10-10, implementation)
+
+Ten commits on `fix-qwen36-serving` (`9c5f2ba2`..`e0c40cee`), one defect each, every
+behavioral fix with a test shown red on the old code:
+
+| commit | defect | proof |
+|---|---|---|
+| `9c5f2ba2` | D1 zero-centered norm `+1` | effective-gain test (0.05 → 1.05, CPU + CUDA plans) |
+| `995858b5` | D2 DeltaNet value-head order | permutation-equivalence test; golden red without it |
+| `c3b7c731` | HF golden parity | F32 <2e-3 vs HF at all 21 decode rows + full prefill; red by 2.96 (no D1) / 2.12 (no D2) |
+| `e55875b0` | D3 RoPE F32 angles | BF16 cos at pos 4096 was −0.283 vs 0.930 |
+| `f62529f8` | D4 Qwen3.6 sampling profile | profile tests over both Qwen thinking variants |
+| `8aeb3d88` | D5 MTP conv-ring snapshot order | wrapped ring restored [3,1,2] → now [1,2,3] |
+| `daba36d3` | D6 strict tokenizer.json | corrupt file errors instead of falling back |
+| `f1893b62` | D7 shared-expert plan width | plan + MTP plan shapes with differing widths |
+| `67a340de` | D8 MTP bootstrap penalty history | existing MTP determinism tests |
+| `e0c40cee` | D8 stale CUDA reason / tensor_kind label | no behavior change |
+
+Local gates: izwi-core lib 2787 passed (CPU); izwi-core lib with `--features metal` 2837
+passed on this Mac's Metal device; izwi-server lib 743 (one pre-existing flake,
+`batch_runtime::worker::...cancellation_retains_capacity...`, fails 2/10 on unmodified
+`45eae651` too — flagged as a separate task); worker `qwen35_moe_process` green;
+izwi-cli/worker/supervisor check green; clippy `-D warnings -A deprecated` clean on
+izwi-core + izwi-server (all targets) and izwi-core `--features metal`; `git diff --check` clean.
+
+Not verified here (needs the Modal H100 — this laptop cannot hold the 35B checkpoint):
+- `IZWI_QWEN36_REAL_CHECKPOINT_E2E=<dir> IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib real_checkpoint`
+  and `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib kernels::cuda`.
+- Redeploy + replay the field request on a fresh thread (drop the literal `<think>` from the
+  system prompt), a short reasoning prompt, and a ≥2k-token prompt.
+- The block-FP8 CUDA kernel at real geometry stays read-verified only; if output is coherent
+  but off, A/B `projection_backend = "q8"` (expanded BF16) against the native-FP8 default.
+
+Follow-ups flagged: Qwen3.8 has the identical RoPE angle bug (`qwen38/text.rs:2970`).
