@@ -113,6 +113,32 @@ fn compact(linear: &Qwen36MoeLinear) -> Option<(&Tensor, &Tensor)> {
     }
 }
 
+fn projections(expert: &Qwen36MoeExpertWeights) -> [&Qwen36MoeLinear; 3] {
+    [&expert.gate, &expert.up, &expert.down]
+}
+
+/// Largest absolute differences between the bytes and scales of two
+/// block-FP8 experts' `[gate, up, down]` projections, as device scalars.
+fn compact_difference(
+    a: [&Qwen36MoeLinear; 3],
+    b: [&Qwen36MoeLinear; 3],
+) -> candle_core::Result<Vec<Tensor>> {
+    let mut diffs = Vec::with_capacity(6);
+    for (x, y) in a.into_iter().zip(b) {
+        let (Some((xw, xs)), Some((yw, ys))) = (compact(x), compact(y)) else {
+            candle_core::bail!("expert projection is not block-FP8 resident");
+        };
+        for (u, v) in [(xw, yw), (xs, ys)] {
+            diffs.push(
+                (u.to_dtype(DType::F32)? - v.to_dtype(DType::F32)?)?
+                    .abs()?
+                    .max_all()?,
+            );
+        }
+    }
+    Ok(diffs)
+}
+
 /// Whether `linear` is a compact block-FP8 projection of `[rows, cols]`.
 fn compact_of(linear: &Qwen36MoeLinear, rows: usize, cols: usize, device: &Device) -> bool {
     compact(linear).is_some_and(|(weights, scales)| {
@@ -310,6 +336,28 @@ impl Qwen36MoeFusedExperts {
         let shared_view = fold_shared
             .then(|| Self::expert_view(&w13, &s13, &w2, &s2, experts.len(), inter))
             .transpose()?;
+        // The self-check's reference reads these views too, so a bad device
+        // copy would corrupt both sides alike. Spot-check the first and last
+        // routed experts and the shared slot against the loaded bytes before
+        // the originals are dropped (one readback per layer).
+        let last = experts.len() - 1;
+        let mut diffs = compact_difference(projections(&views[0]), projections(&experts[0]))?;
+        diffs.extend(compact_difference(
+            projections(&views[last]),
+            projections(&experts[last]),
+        )?);
+        if let Some(view) = &shared_view {
+            diffs.extend(compact_difference(
+                projections(view),
+                [&shared.gate, &shared.up, &shared.down],
+            )?);
+        }
+        let worst = Tensor::stack(&diffs, 0)?.max(0)?.to_scalar::<f32>()?;
+        if worst != 0.0 {
+            candle_core::bail!(
+                "stacked expert views differ from the loaded weights (max |difference| {worst})"
+            );
+        }
         Ok((router, w13, s13, w2, s2, views, shared_view))
     }
 
@@ -582,6 +630,37 @@ mod tests {
             Qwen36MoeBackendRequest::parse(None),
             Qwen36MoeBackendRequest::Auto
         );
+    }
+
+    #[test]
+    fn compact_difference_sees_one_changed_byte_or_scale() {
+        let linear = |bytes: Vec<u8>, scale: f32| Qwen36MoeLinear::CompactFp8 {
+            weights: Tensor::from_vec(bytes, (128, 128), &Device::Cpu).unwrap(),
+            scales: Tensor::from_vec(vec![scale], (1, 1), &Device::Cpu).unwrap(),
+        };
+        let bytes = (0..128 * 128).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let expert = |bytes: &[u8], scale: f32| Qwen36MoeExpertWeights {
+            gate: linear(bytes.to_vec(), 0.5),
+            up: linear(bytes.to_vec(), scale),
+            down: linear(bytes.to_vec(), 0.5),
+        };
+        let worst = |a: &Qwen36MoeExpertWeights, b: &Qwen36MoeExpertWeights| {
+            Tensor::stack(
+                &compact_difference(projections(a), projections(b)).unwrap(),
+                0,
+            )
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+        };
+        let base = expert(&bytes, 0.5);
+        assert_eq!(worst(&base, &expert(&bytes, 0.5)), 0.0);
+        let mut flipped = bytes.clone();
+        flipped[128 * 127 + 5] ^= 1;
+        assert_eq!(worst(&base, &expert(&flipped, 0.5)), 1.0);
+        assert!(worst(&base, &expert(&bytes, 0.25)) > 0.0);
     }
 
     #[test]
