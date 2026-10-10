@@ -55,7 +55,98 @@ pub fn provider_auto_preferred(_device: &Device, _dtype: DType, _n: usize, _k: u
     false
 }
 
+/// Process-wide switch for the vectorized decode GEMV (`qwen38_fp8_mv2_*`).
+/// Off until [`verify_and_enable_vectorized_decode`] has compared it against
+/// the reference decode kernel on a real device; projections keep the
+/// reference kernel otherwise.
+static VECTORIZED_DECODE_VERIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn vectorized_decode_enabled() -> bool {
+    VECTORIZED_DECODE_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeKernel {
+    /// Vectorized GEMV once verified, else the reference kernel.
+    Auto,
+    /// Always the reference byte-wise decode kernel.
+    Reference,
+    /// The vectorized GEMV (errors if the call is not eligible).
+    Vectorized,
+}
+
+/// Compare the vectorized decode GEMV against the reference kernel on
+/// `device` (decode row counts 1..=4, trunk-like K) and enable it for every
+/// compact-FP8 projection in the process on success. Idempotent.
+pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
+    if vectorized_decode_enabled() {
+        return Ok(());
+    }
+    if !device.is_cuda() {
+        candle_core::bail!("the vectorized FP8 decode GEMV runs on CUDA only")
+    }
+    for (n, k) in [(256usize, 2048usize), (64, 512), (192, 4096)] {
+        let raw = (0..n * k)
+            .map(|i| {
+                let mixed = (i.wrapping_mul(0x9E37_79B1) >> 17) as u8;
+                if mixed & 0x7f == 0x7f {
+                    0x38
+                } else {
+                    mixed
+                }
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..n.div_ceil(128) * k.div_ceil(128))
+            .map(|i| 0.001 + (i % 13) as f32 * 3e-4)
+            .collect::<Vec<_>>();
+        let w = Tensor::from_vec(raw, (n, k), &Device::Cpu)?.to_device(device)?;
+        let s = Tensor::from_vec(scales, (n.div_ceil(128), k.div_ceil(128)), &Device::Cpu)?
+            .to_device(device)?;
+        for m in 1..=4usize {
+            for dtype in [DType::BF16, DType::F16] {
+                let x = Tensor::from_vec(
+                    (0..m * k)
+                        .map(|i| ((i as f32) * 0.754_877_7).sin() * 2.0)
+                        .collect::<Vec<_>>(),
+                    (m, k),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?
+                .to_device(device)?;
+                let host = |t: Tensor| -> Result<Vec<f32>> {
+                    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+                };
+                let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+                let vectorized = host(project(&x, &w, &s, DecodeKernel::Vectorized)?)?;
+                let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+                if let Some((index, (a, b))) = vectorized
+                    .iter()
+                    .zip(&reference)
+                    .enumerate()
+                    .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
+                {
+                    candle_core::bail!(
+                        "vectorized FP8 decode GEMV diverges at n={n} k={k} m={m} {dtype:?} index {index}: {a} vs reference {b}"
+                    )
+                }
+            }
+        }
+    }
+    VECTORIZED_DECODE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 pub fn block_fp8_projection(input: &Tensor, weights: &Tensor, scales: &Tensor) -> Result<Tensor> {
+    project(input, weights, scales, DecodeKernel::Auto)
+}
+
+fn project(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    kernel: DecodeKernel,
+) -> Result<Tensor> {
     let (n, k) = weights.dims2()?;
     if input.rank() == 0
         || input.dim(candle_core::D::Minus1)? != k
@@ -76,7 +167,7 @@ pub fn block_fp8_projection(input: &Tensor, weights: &Tensor, scales: &Tensor) -
     input.contiguous()?.apply_op3_no_bwd(
         &weights.contiguous()?,
         &scales.contiguous()?,
-        &Projection { n, k },
+        &Projection { n, k, kernel },
     )
 }
 
@@ -99,6 +190,7 @@ pub(crate) fn decode_e4m3fn(b: u8) -> f32 {
 struct Projection {
     n: usize,
     k: usize,
+    kernel: DecodeKernel,
 }
 impl CustomOp3 for Projection {
     fn name(&self) -> &'static str {
@@ -190,7 +282,7 @@ impl CustomOp3 for Projection {
             sl.start_offset()..sl.start_offset() + self.n.div_ceil(128) * self.k.div_ceil(128),
         );
         macro_rules! run {
-            ($v:ident,$ty:ty,$mv:literal,$mm:literal) => {{
+            ($v:ident,$ty:ty,$mv:literal,$mv2:literal,$mm:literal) => {{
                 let CudaStorageSlice::$v(x) = &x.slice else {
                     unreachable!()
                 };
@@ -198,8 +290,30 @@ impl CustomOp3 for Projection {
                 // SAFETY: every output element is written by the kernel.
                 let mut out = unsafe { device.alloc::<$ty>(m * self.n)? };
                 let small = m <= 4;
+                // 16-byte vector loads need 16-byte aligned activation and
+                // weight rows; K is a multiple of 128 by contract.
+                let aligned = (xl.start_offset() * 2).is_multiple_of(16)
+                    && wl.start_offset().is_multiple_of(16);
+                let vectorized = small
+                    && aligned
+                    && match self.kernel {
+                        DecodeKernel::Auto => vectorized_decode_enabled(),
+                        DecodeKernel::Reference => false,
+                        DecodeKernel::Vectorized => true,
+                    };
+                if self.kernel == DecodeKernel::Vectorized && !vectorized {
+                    candle_core::bail!(
+                        "vectorized FP8 decode GEMV requested for an ineligible call"
+                    )
+                }
                 let f = device.get_or_load_custom_func(
-                    if small { $mv } else { $mm },
+                    if vectorized {
+                        $mv2
+                    } else if small {
+                        $mv
+                    } else {
+                        $mm
+                    },
                     "izwi_qwen38_fp8",
                     super::cuda_ptx::FP8,
                 )?;
@@ -209,7 +323,13 @@ impl CustomOp3 for Projection {
                 b.arg(&s);
                 b.arg(&mut out);
                 candle_core::builder_arg!(b, m as i32, self.n as i32, self.k as i32);
-                let cfg = if small {
+                let cfg = if vectorized {
+                    LaunchConfig {
+                        grid_dim: (self.n.div_ceil(8) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    }
+                } else if small {
                     LaunchConfig {
                         grid_dim: (self.n.div_ceil(8) as u32, m.div_ceil(4) as u32, 1),
                         block_dim: (256, 1, 1),
@@ -229,10 +349,22 @@ impl CustomOp3 for Projection {
         }
         let slice = match &x.slice {
             CudaStorageSlice::F16(_) => {
-                run!(F16, half::f16, "qwen38_fp8_mv_f16", "qwen38_fp8_mm_f16")
+                run!(
+                    F16,
+                    half::f16,
+                    "qwen38_fp8_mv_f16",
+                    "qwen38_fp8_mv2_f16",
+                    "qwen38_fp8_mm_f16"
+                )
             }
             CudaStorageSlice::BF16(_) => {
-                run!(BF16, half::bf16, "qwen38_fp8_mv_bf16", "qwen38_fp8_mm_bf16")
+                run!(
+                    BF16,
+                    half::bf16,
+                    "qwen38_fp8_mv_bf16",
+                    "qwen38_fp8_mv2_bf16",
+                    "qwen38_fp8_mm_bf16"
+                )
             }
             _ => candle_core::bail!("FP8 CUDA activation requires F16/BF16"),
         };
@@ -421,6 +553,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_vectorized_decode_gemv_verifies_and_matches_the_reference() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        verify_and_enable_vectorized_decode(&device).expect("vectorized GEMV self-check");
+        assert!(vectorized_decode_enabled());
+        // Unaligned activation rows (odd start offset) stay on the reference
+        // kernel instead of faulting.
+        let w = Tensor::full(0x38u8, (64, 128), &device).unwrap();
+        let s = Tensor::ones((1, 1), DType::F32, &device).unwrap();
+        let x = Tensor::ones((3, 129), DType::BF16, &device)
+            .unwrap()
+            .narrow(1, 1, 128)
+            .unwrap()
+            .narrow(0, 1, 1)
+            .unwrap();
+        let y = block_fp8_projection(&x, &w, &s).unwrap();
+        let y = y
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(y.iter().all(|v| (*v - 128.0).abs() < 1.0), "{y:?}");
     }
 
     #[cfg(feature = "cuda")]
