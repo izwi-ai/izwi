@@ -16,6 +16,11 @@ pub fn provider_supported(device: &Device, dtype: DType, n: usize, k: usize) -> 
     {
         return false;
     }
+    if device.is_metal() {
+        // `kernels::metal_qwen36moe` decodes E4M3 in software on any Apple
+        // GPU; the Metal plan runs F16 (or F32) activations.
+        return cfg!(feature = "metal") && matches!(dtype, DType::F16);
+    }
     device_is_sm80_or_newer(device)
 }
 
@@ -253,6 +258,19 @@ impl CustomOp3 for Projection {
         };
         Ok((storage, Shape::from(dims)))
     }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        x: &candle_core::MetalStorage,
+        xl: &Layout,
+        w: &candle_core::MetalStorage,
+        wl: &Layout,
+        s: &candle_core::MetalStorage,
+        sl: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        crate::kernels::metal_qwen36moe::fp8_projection(x, xl, w, wl, s, sl, self.n, self.k)
+    }
+
     #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,

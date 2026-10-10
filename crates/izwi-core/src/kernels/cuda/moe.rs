@@ -45,7 +45,7 @@ pub enum SharedSlot {
 }
 
 impl SharedSlot {
-    fn mode(self) -> i32 {
+    pub(crate) fn mode(self) -> i32 {
         match self {
             Self::None => 0,
             Self::Ungated => 1,
@@ -110,7 +110,9 @@ pub fn supported(device: &Device, dtype: DType, hidden: usize, inter: usize, slo
                 && slots * inter * 4 <= MAX_DYNAMIC_SHARED_BYTES
                 && super::fp8::device_is_sm80_or_newer(device)
         }
-        _ => false,
+        // Apple GPUs run the same kernels over raw FP8 bytes with F16
+        // activations (`kernels::metal_qwen36moe`).
+        Device::Metal(_) => cfg!(feature = "metal") && dtype == DType::F16,
     }
 }
 
@@ -192,6 +194,10 @@ pub fn router_logits(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     if x.device().is_cuda() {
         return cuda_impl::router(x, weight, tokens, rows, hidden);
     }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::router_logits(x, weight, tokens, rows, hidden);
+    }
     let _ = (tokens, rows);
     x.to_dtype(DType::F32)?
         .matmul(&weight.t()?)?
@@ -214,6 +220,10 @@ pub fn route(logits: &Tensor, spec: &RouteSpec) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if logits.device().is_cuda() {
         return cuda_impl::route(&logits, tokens, spec);
+    }
+    #[cfg(feature = "metal")]
+    if logits.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::route(&logits, tokens, spec);
     }
     if !logits.device().is_cpu() {
         candle_core::bail!("fused MoE routing has no implementation for this device")
@@ -254,6 +264,19 @@ pub fn fp8_gate_up(
     #[cfg(feature = "cuda")]
     if x.device().is_cuda() {
         return cuda_impl::gate_up(x, routing, slots, w13, s13, experts_total, hidden, inter);
+    }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::gate_up(
+            x,
+            routing,
+            slots,
+            w13,
+            s13,
+            experts_total,
+            hidden,
+            inter,
+        );
     }
     if !x.device().is_cpu() {
         candle_core::bail!("fused MoE gate/up has no implementation for this device")
@@ -306,6 +329,19 @@ pub fn fp8_down(
     #[cfg(feature = "cuda")]
     if act.device().is_cuda() {
         return cuda_impl::down(act, routing, slots, w2, s2, experts_total, hidden, inter);
+    }
+    #[cfg(feature = "metal")]
+    if act.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::down(
+            act,
+            routing,
+            slots,
+            w2,
+            s2,
+            experts_total,
+            hidden,
+            inter,
+        );
     }
     if !act.device().is_cpu() {
         candle_core::bail!("fused MoE down has no implementation for this device")
