@@ -69,7 +69,7 @@ pub fn supported(device: &Device, head_k_dim: usize, head_v_dim: usize, conv_tap
     match device {
         Device::Cpu => true,
         Device::Cuda(_) => super::fp8::device_is_sm80_or_newer(device),
-        _ => false,
+        Device::Metal(_) => cfg!(feature = "metal"),
     }
 }
 
@@ -95,6 +95,10 @@ pub fn conv_decode(x: &Tensor, weight: &Tensor, history: [&Tensor; 3]) -> Result
     #[cfg(feature = "cuda")]
     if x.device().is_cuda() {
         return cuda_impl::conv(x, weight, history, conv_dim);
+    }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::gdn_conv(x, weight, history, conv_dim);
     }
     if !x.device().is_cpu() {
         candle_core::bail!("fused DeltaNet conv decode has no implementation for this device")
@@ -163,6 +167,20 @@ pub fn recurrent_decode(
     #[cfg(feature = "cuda")]
     if conv.device().is_cuda() {
         return cuda_impl::recurrent(
+            conv,
+            z,
+            beta_raw,
+            alpha,
+            dt_bias,
+            a,
+            norm_weight,
+            state,
+            spec,
+        );
+    }
+    #[cfg(feature = "metal")]
+    if conv.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::gdn_decode(
             conv,
             z,
             beta_raw,

@@ -14,12 +14,13 @@ use candle_core::{DType, Device, Result, Tensor, D};
 
 /// Whether the fused norm can serve `x`'s device and dtype with an F32 gain.
 pub fn supported(device: &Device, dtype: DType) -> bool {
-    matches!(dtype, DType::F16 | DType::BF16)
-        && match device {
-            Device::Cpu => true,
-            Device::Cuda(_) => super::fp8::device_is_sm80_or_newer(device),
-            _ => false,
+    match device {
+        Device::Cpu => matches!(dtype, DType::F16 | DType::BF16),
+        Device::Cuda(_) => {
+            matches!(dtype, DType::F16 | DType::BF16) && super::fp8::device_is_sm80_or_newer(device)
         }
+        Device::Metal(_) => cfg!(feature = "metal") && dtype == DType::F16,
+    }
 }
 
 fn check(x: &Tensor, weight: &Tensor) -> Result<usize> {
@@ -50,6 +51,11 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     if x.device().is_cuda() {
         return cuda_impl::launch(x, None, weight, eps, hidden).map(|(_, out)| out);
     }
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() && x.dtype() == DType::F16 {
+        return crate::kernels::metal_qwen36moe::rms_norm(x, None, weight, eps, hidden)
+            .map(|(_, out)| out);
+    }
     let _ = hidden;
     reference(x, weight, eps)
 }
@@ -75,6 +81,12 @@ pub fn add_rms_norm(
     #[cfg(feature = "cuda")]
     if residual.device().is_cuda() {
         let (sum, out) = cuda_impl::launch(delta, Some(residual), weight, eps, hidden)?;
+        return Ok((sum.expect("fused add+RMSNorm returns the sum"), out));
+    }
+    #[cfg(feature = "metal")]
+    if residual.device().is_metal() && residual.dtype() == DType::F16 {
+        let (sum, out) =
+            crate::kernels::metal_qwen36moe::rms_norm(delta, Some(residual), weight, eps, hidden)?;
         return Ok((sum.expect("fused add+RMSNorm returns the sum"), out));
     }
     let _ = hidden;

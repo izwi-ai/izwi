@@ -63,11 +63,13 @@ pub fn supported(device: &Device, dtype: DType, head_dim: usize, rope_dim: usize
         && rope_dim <= head_dim
         && head_dim * 4 <= MAX_DYNAMIC_SHARED_BYTES;
     geometry
-        && matches!(dtype, DType::F16 | DType::BF16)
         && match device {
-            Device::Cpu => true,
-            Device::Cuda(_) => super::fp8::device_is_sm80_or_newer(device),
-            _ => false,
+            Device::Cpu => matches!(dtype, DType::F16 | DType::BF16),
+            Device::Cuda(_) => {
+                matches!(dtype, DType::F16 | DType::BF16)
+                    && super::fp8::device_is_sm80_or_newer(device)
+            }
+            Device::Metal(_) => cfg!(feature = "metal") && dtype == DType::F16 && head_dim <= 1024,
         }
 }
 
@@ -111,6 +113,12 @@ pub fn qk_norm_rope(
     #[cfg(feature = "cuda")]
     if q_proj.device().is_cuda() {
         return cuda_impl::launch(q_proj, k_proj, q_gain, k_gain, inv_freq, spec, position);
+    }
+    #[cfg(feature = "metal")]
+    if q_proj.device().is_metal() {
+        return crate::kernels::metal_qwen36moe::qk_norm_rope(
+            q_proj, k_proj, q_gain, k_gain, inv_freq, spec, position,
+        );
     }
     if !q_proj.device().is_cpu() {
         candle_core::bail!("fused q/k norm + RoPE has no implementation for this device")

@@ -448,6 +448,284 @@ kernel void q36m_combine_f16(
     }
     y[(ulong)token * hidden + h] = half(total);
 }
+
+// ---- Gated DeltaNet single-token decode; see the CUDA kernels. ----
+template <typename T>
+inline void q36m_gdn_conv(
+    device const T* x, device const float* w, device const float* h0, device const float* h1,
+    device const float* h2, device float* out, device float* cur, uint conv_dim, uint c) {
+    if (c >= conv_dim) {
+        return;
+    }
+    const float xc = float(x[c]);
+    device const float* wc = w + (ulong)c * 4;
+    float v = xc * wc[3];
+    v = v + h0[c] * wc[0];
+    v = v + h1[c] * wc[1];
+    v = v + h2[c] * wc[2];
+    out[c] = v / (1.0f + exp(-v));
+    cur[c] = xc;
+}
+
+kernel void q36m_gdn_conv_f16(
+    device const half* x [[buffer(0)]], device const float* w [[buffer(1)]],
+    device const float* h0 [[buffer(2)]], device const float* h1 [[buffer(3)]],
+    device const float* h2 [[buffer(4)]], device float* out [[buffer(5)]],
+    device float* cur [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
+    uint c [[thread_position_in_grid]]) {
+    q36m_gdn_conv<half>(x, w, h0, h1, h2, out, cur, conv_dim, c);
+}
+
+kernel void q36m_gdn_conv_f32(
+    device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+    device const float* h0 [[buffer(2)]], device const float* h1 [[buffer(3)]],
+    device const float* h2 [[buffer(4)]], device float* out [[buffer(5)]],
+    device float* cur [[buffer(6)]], constant uint& conv_dim [[buffer(7)]],
+    uint c [[thread_position_in_grid]]) {
+    q36m_gdn_conv<float>(x, w, h0, h1, h2, out, cur, conv_dim, c);
+}
+
+// One 512-thread threadgroup per value head (128-dim heads).
+template <typename T>
+inline void q36m_gdn_decode(
+    device const float* conv, device const T* z, device const T* beta_raw,
+    device const T* alpha, device const float* dt_bias, device const float* a,
+    device const float* norm_w, device const float* state_in, device float* state_out,
+    device T* y, uint key_heads, uint value_heads, uint grouped, float norm_eps,
+    uint h, uint tid, uint warp, uint lane,
+    threadgroup float* qs, threadgroup float* ks, threadgroup float* red,
+    threadgroup float* part, threadgroup float* stats) {
+    const uint repeats = value_heads / key_heads;
+    const uint kh = grouped != 0 ? h / repeats : h % key_heads;
+    const uint col = (warp & 3) * 32 + lane;
+    const uint rg = warp >> 2;
+    const uint key_width = key_heads * 128;
+    if (tid < 128) {
+        qs[tid] = conv[kh * 128 + tid];
+        ks[tid] = conv[key_width + kh * 128 + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (warp < 8) {
+        const float val = warp < 4 ? qs[warp * 32 + lane] : ks[(warp - 4) * 32 + lane];
+        const float sq = simd_sum(val * val);
+        if (lane == 0) {
+            part[warp] = sq;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        const float qsum = part[0] + part[1] + part[2] + part[3];
+        const float ksum = part[4] + part[5] + part[6] + part[7];
+        stats[0] = 1.0f / (sqrt(qsum + 1e-6f) * sqrt(128.0f));
+        stats[1] = 1.0f / sqrt(ksum + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float qscale = stats[0];
+    const float knorm = stats[1];
+    const float gate_in = float(alpha[h]) + dt_bias[h];
+    const float softplus = max(gate_in, 0.0f) + log(1.0f + exp(-fabs(gate_in)));
+    const float decay = exp(softplus * a[h]);
+    const float beta = 1.0f / (1.0f + exp(-float(beta_raw[h])));
+    const ulong row0 = (ulong)h * 128 + (ulong)rg * 32;
+    device const float* sin_ = state_in + row0 * 128 + col;
+    float s[32];
+    float recalled = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        s[i] = sin_[(ulong)i * 128] * decay;
+        recalled = fma(ks[rg * 32 + i] * knorm, s[i], recalled);
+    }
+    red[rg * 128 + col] = recalled;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float kv = red[col] + red[128 + col] + red[256 + col] + red[384 + col];
+    const float delta = (conv[2 * key_width + h * 128 + col] - kv) * beta;
+    device float* sout = state_out + row0 * 128 + col;
+    float o = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+        const float updated = fma(ks[rg * 32 + i] * knorm, delta, s[i]);
+        sout[(ulong)i * 128] = updated;
+        o = fma(qs[rg * 32 + i] * qscale, updated, o);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[rg * 128 + col] = o;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float out = 0.0f;
+    if (rg == 0) {
+        out = red[col] + red[128 + col] + red[256 + col] + red[384 + col];
+        const float sq = simd_sum(out * out);
+        if (lane == 0) {
+            part[warp] = sq;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (rg == 0) {
+        const float mean_sq = (part[0] + part[1] + part[2] + part[3]) / 128.0f;
+        const float zz = float(z[h * 128 + col]);
+        const float gate = zz / (1.0f + exp(-zz));
+        y[h * 128 + col] = T(out / sqrt(mean_sq + norm_eps) * norm_w[col] * gate);
+    }
+}
+
+#define Q36M_GDN_DECODE(T, S)                                                                      \
+kernel void q36m_gdn_decode_##S(                                                                   \
+    device const float* conv [[buffer(0)]], device const T* z [[buffer(1)]],                      \
+    device const T* beta_raw [[buffer(2)]], device const T* alpha [[buffer(3)]],                  \
+    device const float* dt_bias [[buffer(4)]], device const float* a [[buffer(5)]],               \
+    device const float* norm_w [[buffer(6)]], device const float* state_in [[buffer(7)]],         \
+    device float* state_out [[buffer(8)]], device T* y [[buffer(9)]],                             \
+    constant uint& key_heads [[buffer(10)]], constant uint& value_heads [[buffer(11)]],           \
+    constant uint& grouped [[buffer(12)]], constant float& norm_eps [[buffer(13)]],               \
+    uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],            \
+    uint warp [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {      \
+    threadgroup float qs[128];                                                                     \
+    threadgroup float ks[128];                                                                     \
+    threadgroup float red[512];                                                                    \
+    threadgroup float part[16];                                                                    \
+    threadgroup float stats[2];                                                                    \
+    q36m_gdn_decode<T>(conv, z, beta_raw, alpha, dt_bias, a, norm_w, state_in, state_out, y,      \
+                       key_heads, value_heads, grouped, norm_eps, h, tid, warp, lane, qs, ks,      \
+                       red, part, stats);                                                          \
+}
+
+Q36M_GDN_DECODE(half, f16)
+Q36M_GDN_DECODE(float, f32)
+
+// ---- RMSNorm with an F32 gain (+ optional residual add); one threadgroup per row. ----
+template <typename T>
+inline void q36m_rms_norm(
+    device const T* x, device const T* residual, device const float* w, device T* sum_out,
+    device T* out, uint hidden, float eps, uint row, uint tid, uint threads, uint warp,
+    uint lane, threadgroup float* part, threadgroup float* inv_shared) {
+    const ulong base = (ulong)row * hidden;
+    float ss = 0.0f;
+    for (uint i = tid; i < hidden; i += threads) {
+        float v = float(x[base + i]);
+        if (residual) {
+            const T sum = T(float(residual[base + i]) + v);
+            if (sum_out) {
+                sum_out[base + i] = sum;
+            }
+            v = float(sum);
+        }
+        ss = fma(v, v, ss);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) {
+        part[warp] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < (threads + 31) / 32; ++i) {
+            total += part[i];
+        }
+        inv_shared[0] = 1.0f / sqrt(total / float(hidden) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = inv_shared[0];
+    for (uint i = tid; i < hidden; i += threads) {
+        float v = float(x[base + i]);
+        if (residual) {
+            v = float(T(float(residual[base + i]) + v));
+        }
+        out[base + i] = T(v * inv * w[i]);
+    }
+}
+
+kernel void q36m_rms_norm_f16(
+    device const half* x [[buffer(0)]], device const float* w [[buffer(1)]],
+    device half* out [[buffer(2)]], constant uint& hidden [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[32];
+    threadgroup float inv_shared[1];
+    q36m_rms_norm<half>(x, nullptr, w, nullptr, out, hidden, eps, row, tid, threads, warp, lane,
+                        part, inv_shared);
+}
+
+kernel void q36m_add_rms_norm_f16(
+    device const half* x [[buffer(0)]], device const half* residual [[buffer(1)]],
+    device const float* w [[buffer(2)]], device half* sum_out [[buffer(3)]],
+    device half* out [[buffer(4)]], constant uint& hidden [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[32];
+    threadgroup float inv_shared[1];
+    q36m_rms_norm<half>(x, residual, w, sum_out, out, hidden, eps, row, tid, threads, warp, lane,
+                        part, inv_shared);
+}
+
+// ---- q/k head RMSNorm + partial rotate-half M-RoPE for one token. ----
+kernel void q36m_qk_norm_rope_f16(
+    device const half* q_src [[buffer(0)]], device const half* k_src [[buffer(1)]],
+    device const float* q_gain [[buffer(2)]], device const float* k_gain [[buffer(3)]],
+    device const float* inv_freq [[buffer(4)]], device half* q_out [[buffer(5)]],
+    device half* k_out [[buffer(6)]], constant uint& num_heads [[buffer(7)]],
+    constant uint& head_dim [[buffer(8)]], constant uint& rope_dim [[buffer(9)]],
+    constant uint& pos_t [[buffer(10)]], constant uint& pos_h [[buffer(11)]],
+    constant uint& pos_w [[buffer(12)]], constant uint& sec_h [[buffer(13)]],
+    constant uint& sec_w [[buffer(14)]], constant float& eps [[buffer(15)]],
+    uint head [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]], uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float vals[1024];
+    threadgroup float part[32];
+    threadgroup float inv_shared[1];
+    const bool is_query = head < num_heads;
+    device const half* src = is_query ? q_src + (ulong)head * 2 * head_dim
+                                      : k_src + (ulong)(head - num_heads) * head_dim;
+    device const float* gain = is_query ? q_gain : k_gain;
+    device half* dst = is_query ? q_out + (ulong)head * head_dim
+                                : k_out + (ulong)(head - num_heads) * head_dim;
+    float ss = 0.0f;
+    for (uint i = tid; i < head_dim; i += threads) {
+        const float v = float(src[i]);
+        ss = fma(v, v, ss);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) {
+        part[warp] = ss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < (threads + 31) / 32; ++i) {
+            total += part[i];
+        }
+        inv_shared[0] = 1.0f / sqrt(total / float(head_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = inv_shared[0];
+    for (uint i = tid; i < head_dim; i += threads) {
+        vals[i] = float(half(float(src[i]) * inv * gain[i]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint half_dim = rope_dim >> 1;
+    const bool sectioned = pos_t != pos_h || pos_t != pos_w;
+    for (uint i = tid; i < head_dim; i += threads) {
+        float out = vals[i];
+        if (i < rope_dim) {
+            const uint j = i < half_dim ? i : i - half_dim;
+            uint pos = pos_t;
+            if (sectioned) {
+                if (j % 3 == 1 && j < 3 * sec_h) {
+                    pos = pos_h;
+                } else if (j % 3 == 2 && j < 3 * sec_w) {
+                    pos = pos_w;
+                }
+            }
+            const float angle = float(pos) * inv_freq[j];
+            const float c = float(half(precise::cos(angle)));
+            const float sn = float(half(precise::sin(angle)));
+            out = i < half_dim ? vals[i] * c - vals[i + half_dim] * sn
+                               : vals[i - half_dim] * sn + vals[i] * c;
+        }
+        dst[i] = half(out);
+    }
+}
 "#;
 
 fn pipeline(device: &MetalDevice, name: &'static str) -> Result<ComputePipeline> {
@@ -875,6 +1153,255 @@ pub(crate) fn down(
     Ok(wrap(&device, out, shape, DType::F16))
 }
 
+fn f16_or_f32(dtype: DType, name: &str) -> Result<&'static str> {
+    match dtype {
+        DType::F16 => Ok("f16"),
+        DType::F32 => Ok("f32"),
+        other => bail!("Metal {name} does not support {other:?}"),
+    }
+}
+
+fn kernel_name(prefix: &str, suffix: &str) -> &'static str {
+    match (prefix, suffix) {
+        ("q36m_gdn_conv", "f16") => "q36m_gdn_conv_f16",
+        ("q36m_gdn_conv", _) => "q36m_gdn_conv_f32",
+        ("q36m_gdn_decode", "f16") => "q36m_gdn_decode_f16",
+        (_, _) => "q36m_gdn_decode_f32",
+    }
+}
+
+/// DeltaNet causal-conv decode step (see `kernels::cuda::gdn::conv_decode`).
+pub(crate) fn gdn_conv(
+    x: &Tensor,
+    weight: &Tensor,
+    history: [&Tensor; 3],
+    conv_dim: usize,
+) -> Result<(Tensor, Tensor)> {
+    let device = metal_device(x)?;
+    let suffix = f16_or_f32(x.dtype(), "DeltaNet conv")?;
+    let (x, weight) = (x.contiguous()?, weight.contiguous()?);
+    let h = [
+        history[0].contiguous()?,
+        history[1].contiguous()?,
+        history[2].contiguous()?,
+    ];
+    let xb = bind(&x, "conv input", 2)?;
+    let wb = bind(&weight, "conv weight", 4)?;
+    let hb = [
+        bind(&h[0], "history", 4)?,
+        bind(&h[1], "history", 4)?,
+        bind(&h[2], "history", 4)?,
+    ];
+    let out = device.new_buffer(conv_dim, DType::F32, "q36m-gdn-conv")?;
+    let cur = device.new_buffer(conv_dim, DType::F32, "q36m-gdn-slot")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-gdn-conv");
+    encoder.set_compute_pipeline_state(&pipeline(
+        device.metal_device(),
+        kernel_name("q36m_gdn_conv", suffix),
+    )?);
+    encoder.set_input_buffer(0, Some(xb.buffer()?), xb.offset);
+    encoder.set_input_buffer(1, Some(wb.buffer()?), wb.offset);
+    for (index, bound) in hb.iter().enumerate() {
+        encoder.set_input_buffer(2 + index, Some(bound.buffer()?), bound.offset);
+    }
+    encoder.set_output_buffer(5, Some(&out), 0);
+    encoder.set_output_buffer(6, Some(&cur), 0);
+    encoder.set_bytes(7, &u32_arg(conv_dim, "conv dim")?);
+    encoder.dispatch_threads(grid(conv_dim, 1), grid(256, 1));
+    drop(encoder);
+    drop((xb, wb, hb));
+    Ok((
+        wrap(&device, out, Shape::from(conv_dim), DType::F32),
+        wrap(&device, cur, Shape::from(conv_dim), DType::F32),
+    ))
+}
+
+/// DeltaNet recurrent decode step (see `kernels::cuda::gdn::recurrent_decode`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gdn_decode(
+    conv: &Tensor,
+    z: &Tensor,
+    beta_raw: &Tensor,
+    alpha: &Tensor,
+    dt_bias: &Tensor,
+    a: &Tensor,
+    norm_weight: &Tensor,
+    state: &Tensor,
+    spec: &crate::kernels::cuda::gdn::GdnDecodeSpec,
+) -> Result<(Tensor, Tensor)> {
+    let device = metal_device(conv)?;
+    let dtype = z.dtype();
+    let suffix = f16_or_f32(dtype, "DeltaNet decode")?;
+    let d = crate::kernels::cuda::gdn::HEAD_DIM;
+    let hv = spec.value_heads;
+    let tensors =
+        [conv, z, beta_raw, alpha, dt_bias, a, norm_weight, state].map(Tensor::contiguous);
+    let [conv, z, beta_raw, alpha, dt_bias, a, norm_weight, state] = tensors;
+    let (conv, z, beta_raw, alpha) = (conv?, z?, beta_raw?, alpha?);
+    let (dt_bias, a, norm_weight, state) = (dt_bias?, a?, norm_weight?, state?);
+    let bound = [
+        bind(&conv, "conv", 4)?,
+        bind(&z, "z", 2)?,
+        bind(&beta_raw, "beta", 2)?,
+        bind(&alpha, "alpha", 2)?,
+        bind(&dt_bias, "dt_bias", 4)?,
+        bind(&a, "a", 4)?,
+        bind(&norm_weight, "norm", 4)?,
+        bind(&state, "state", 4)?,
+    ];
+    let next = device.new_buffer(hv * d * d, DType::F32, "q36m-gdn-state")?;
+    let y = device.new_buffer(hv * d, dtype, "q36m-gdn-y")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-gdn-decode");
+    encoder.set_compute_pipeline_state(&pipeline(
+        device.metal_device(),
+        kernel_name("q36m_gdn_decode", suffix),
+    )?);
+    for (index, b) in bound.iter().enumerate() {
+        encoder.set_input_buffer(index, Some(b.buffer()?), b.offset);
+    }
+    encoder.set_output_buffer(8, Some(&next), 0);
+    encoder.set_output_buffer(9, Some(&y), 0);
+    encoder.set_bytes(10, &u32_arg(spec.key_heads, "key heads")?);
+    encoder.set_bytes(11, &u32_arg(hv, "value heads")?);
+    encoder.set_bytes(12, &u32::from(spec.grouped));
+    encoder.set_bytes(13, &spec.norm_eps);
+    encoder.dispatch_thread_groups(grid(hv, 1), grid(512, 1));
+    drop(encoder);
+    drop(bound);
+    Ok((
+        wrap(&device, y, Shape::from(hv * d), dtype),
+        wrap(&device, next, Shape::from((1, hv, d, d)), DType::F32),
+    ))
+}
+
+/// RMSNorm with an F32 gain over F16 activations, optionally fused with the
+/// residual add (see `kernels::cuda::norm`).
+pub(crate) fn rms_norm(
+    x: &Tensor,
+    residual: Option<&Tensor>,
+    weight: &Tensor,
+    eps: f32,
+    hidden: usize,
+) -> Result<(Option<Tensor>, Tensor)> {
+    if x.dtype() != DType::F16 {
+        bail!(
+            "Metal fused RMSNorm needs F16 activations, found {:?}",
+            x.dtype()
+        )
+    }
+    let device = metal_device(x)?;
+    let shape = x.shape().clone();
+    let elements = shape.elem_count();
+    let rows = elements / hidden.max(1);
+    let (x, weight) = (x.contiguous()?, weight.contiguous()?);
+    let residual = residual.map(Tensor::contiguous).transpose()?;
+    let xb = bind(&x, "activations", 2)?;
+    let wb = bind(&weight, "gain", 4)?;
+    let out = device.new_buffer(elements, DType::F16, "q36m-rms-norm")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-rms-norm");
+    let sum = match &residual {
+        None => {
+            encoder
+                .set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_rms_norm_f16")?);
+            encoder.set_input_buffer(0, Some(xb.buffer()?), xb.offset);
+            encoder.set_input_buffer(1, Some(wb.buffer()?), wb.offset);
+            encoder.set_output_buffer(2, Some(&out), 0);
+            encoder.set_bytes(3, &u32_arg(hidden, "hidden")?);
+            encoder.set_bytes(4, &eps);
+            None
+        }
+        Some(residual) => {
+            let rb = bind(residual, "residual", 2)?;
+            let sum = device.new_buffer(elements, DType::F16, "q36m-residual-sum")?;
+            encoder.set_compute_pipeline_state(&pipeline(
+                device.metal_device(),
+                "q36m_add_rms_norm_f16",
+            )?);
+            encoder.set_input_buffer(0, Some(xb.buffer()?), xb.offset);
+            encoder.set_input_buffer(1, Some(rb.buffer()?), rb.offset);
+            encoder.set_input_buffer(2, Some(wb.buffer()?), wb.offset);
+            encoder.set_output_buffer(3, Some(&sum), 0);
+            encoder.set_output_buffer(4, Some(&out), 0);
+            encoder.set_bytes(5, &u32_arg(hidden, "hidden")?);
+            encoder.set_bytes(6, &eps);
+            Some(sum)
+        }
+    };
+    encoder.dispatch_thread_groups(grid(rows, 1), grid(256, 1));
+    drop(encoder);
+    drop((xb, wb));
+    Ok((
+        sum.map(|sum| wrap(&device, sum, shape.clone(), DType::F16)),
+        wrap(&device, out, shape, DType::F16),
+    ))
+}
+
+/// q/k head norm + partial M-RoPE for one token (see `kernels::cuda::rope`).
+pub(crate) fn qk_norm_rope(
+    q_proj: &Tensor,
+    k_proj: &Tensor,
+    q_gain: &Tensor,
+    k_gain: &Tensor,
+    inv_freq: &Tensor,
+    spec: &crate::kernels::cuda::rope::QkNormRopeSpec,
+    position: crate::kernels::cuda::rope::MropePosition,
+) -> Result<(Tensor, Tensor)> {
+    if q_proj.dtype() != DType::F16 || spec.head_dim > 1024 {
+        bail!("Metal fused q/k norm + RoPE needs F16 activations and head_dim <= 1024")
+    }
+    let device = metal_device(q_proj)?;
+    let d = spec.head_dim;
+    let tensors = [q_proj, k_proj, q_gain, k_gain, inv_freq].map(Tensor::contiguous);
+    let [q, k, qg, kg, inv] = tensors;
+    let (q, k, qg, kg, inv) = (q?, k?, qg?, kg?, inv?);
+    let bound = [
+        bind(&q, "q_proj", 2)?,
+        bind(&k, "k_proj", 2)?,
+        bind(&qg, "q gain", 4)?,
+        bind(&kg, "k gain", 4)?,
+        bind(&inv, "inverse frequencies", 4)?,
+    ];
+    let q_out = device.new_buffer(spec.num_heads * d, DType::F16, "q36m-q")?;
+    let k_out = device.new_buffer(spec.num_kv_heads * d, DType::F16, "q36m-k")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-qk-norm-rope");
+    encoder.set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_qk_norm_rope_f16")?);
+    for (index, b) in bound.iter().enumerate() {
+        encoder.set_input_buffer(index, Some(b.buffer()?), b.offset);
+    }
+    encoder.set_output_buffer(5, Some(&q_out), 0);
+    encoder.set_output_buffer(6, Some(&k_out), 0);
+    encoder.set_bytes(7, &u32_arg(spec.num_heads, "heads")?);
+    encoder.set_bytes(8, &u32_arg(d, "head dim")?);
+    encoder.set_bytes(9, &u32_arg(spec.rope_dim, "rope dim")?);
+    encoder.set_bytes(10, &u32_arg(position.temporal, "position")?);
+    encoder.set_bytes(11, &u32_arg(position.height, "position")?);
+    encoder.set_bytes(12, &u32_arg(position.width, "position")?);
+    encoder.set_bytes(13, &u32_arg(position.height_section, "section")?);
+    encoder.set_bytes(14, &u32_arg(position.width_section, "section")?);
+    encoder.set_bytes(15, &spec.eps);
+    encoder.dispatch_thread_groups(grid(spec.num_heads + spec.num_kv_heads, 1), grid(256, 1));
+    drop(encoder);
+    drop(bound);
+    Ok((
+        wrap(
+            &device,
+            q_out,
+            Shape::from((1, 1, spec.num_heads, d)),
+            DType::F16,
+        ),
+        wrap(
+            &device,
+            k_out,
+            Shape::from((1, 1, spec.num_kv_heads, d)),
+            DType::F16,
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::kernels::cuda::fp8::block_fp8_projection;
@@ -1025,6 +1552,179 @@ mod tests {
         let grouped =
             host(&moe::fp8_moe_grouped(&x, &routing, slots, &w13, &s13, &w2, &s2).unwrap());
         assert_close(&grouped, &per_pair, 0.005, "grouped vs per-pair");
+    }
+
+    #[test]
+    fn metal_gdn_decode_matches_the_cpu_reference_at_trunk_geometry() {
+        use crate::kernels::cuda::gdn::{conv_decode, recurrent_decode, GdnDecodeSpec, HEAD_DIM};
+        let Some(gpu) = device() else { return };
+        let d = HEAD_DIM;
+        for grouped in [true, false] {
+            let spec = GdnDecodeSpec {
+                key_heads: 16,
+                value_heads: 32,
+                grouped,
+                norm_eps: 1e-6,
+            };
+            let conv_dim = spec.conv_dim();
+            let t =
+                |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &Device::Cpu).unwrap();
+            let x = t(wave(conv_dim, 1.0, 2.0), &[1, 1, conv_dim])
+                .to_dtype(DType::F16)
+                .unwrap();
+            let w = t(wave(conv_dim * 4, 2.0, 0.5), &[conv_dim, 4]);
+            let h: Vec<Tensor> = (0..3)
+                .map(|i| t(wave(conv_dim, 9.0 + i as f32, 1.0), &[conv_dim, 1]))
+                .collect();
+            let z = t(wave(32 * d, 5.0, 2.0), &[32 * d])
+                .to_dtype(DType::F16)
+                .unwrap();
+            let beta = t(wave(32, 6.0, 2.0), &[32]).to_dtype(DType::F16).unwrap();
+            let alpha = t(wave(32, 7.0, 3.0), &[32]).to_dtype(DType::F16).unwrap();
+            let dt = t(wave(32, 8.0, 1.0), &[32]);
+            let a = t(wave(32, 9.0, 1.0).iter().map(|v| -v.exp()).collect(), &[32]);
+            let norm = t(wave(d, 10.0, 0.2).iter().map(|v| 1.0 + v).collect(), &[d]);
+            let state = t(wave(32 * d * d, 11.0, 0.3), &[1, 32, d, d]);
+            let (cpu_conv, cpu_cur) = conv_decode(&x, &w, [&h[0], &h[1], &h[2]]).unwrap();
+            let (cpu_y, cpu_next) =
+                recurrent_decode(&cpu_conv, &z, &beta, &alpha, &dt, &a, &norm, &state, &spec)
+                    .unwrap();
+            let g = |t: &Tensor| t.to_device(&gpu).unwrap();
+            let (gpu_conv, gpu_cur) =
+                conv_decode(&g(&x), &g(&w), [&g(&h[0]), &g(&h[1]), &g(&h[2])]).unwrap();
+            let (gpu_y, gpu_next) = recurrent_decode(
+                &gpu_conv,
+                &g(&z),
+                &g(&beta),
+                &g(&alpha),
+                &g(&dt),
+                &g(&a),
+                &g(&norm),
+                &g(&state),
+                &spec,
+            )
+            .unwrap();
+            assert_close(&host(&gpu_conv), &host(&cpu_conv), 1e-5, "conv");
+            assert_eq!(host(&gpu_cur), host(&cpu_cur), "ring slot");
+            assert_close(
+                &host(&gpu_y),
+                &host(&cpu_y),
+                1e-2,
+                &format!("y grouped={grouped}"),
+            );
+            assert_close(
+                &host(&gpu_next),
+                &host(&cpu_next),
+                1e-5,
+                &format!("state grouped={grouped}"),
+            );
+        }
+    }
+
+    #[test]
+    fn metal_rms_norm_matches_the_composition() {
+        use crate::kernels::cuda::norm::{add_rms_norm, rms_norm};
+        let Some(gpu) = device() else { return };
+        for (rows, hidden) in [(1usize, 2048usize), (5, 2048), (16, 256)] {
+            let mk = |seed: f32| {
+                Tensor::from_vec(wave(rows * hidden, seed, 3.0), (rows, hidden), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap()
+            };
+            let (r, dl) = (mk(1.0), mk(2.0));
+            let w = Tensor::from_vec(
+                wave(hidden, 3.0, 0.3)
+                    .iter()
+                    .map(|v| 1.0 + v)
+                    .collect::<Vec<_>>(),
+                hidden,
+                &Device::Cpu,
+            )
+            .unwrap();
+            let (cpu_sum, cpu_out) = add_rms_norm(&r, &dl, &w, 1e-6).unwrap();
+            let g = |t: &Tensor| t.to_device(&gpu).unwrap();
+            let (gpu_sum, gpu_out) = add_rms_norm(&g(&r), &g(&dl), &g(&w), 1e-6).unwrap();
+            assert_eq!(host(&gpu_sum), host(&cpu_sum), "sum rows={rows}");
+            assert_close(
+                &host(&gpu_out),
+                &host(&cpu_out),
+                4e-3,
+                &format!("add+norm rows={rows}"),
+            );
+            assert_close(
+                &host(&rms_norm(&g(&r), &g(&w), 1e-6).unwrap()),
+                &host(&rms_norm(&r, &w, 1e-6).unwrap()),
+                4e-3,
+                &format!("norm rows={rows}"),
+            );
+        }
+    }
+
+    #[test]
+    fn metal_qk_norm_rope_matches_the_cpu_reference() {
+        use crate::kernels::cuda::rope::{qk_norm_rope, MropePosition, QkNormRopeSpec};
+        let Some(gpu) = device() else { return };
+        let spec = QkNormRopeSpec {
+            num_heads: 16,
+            num_kv_heads: 2,
+            head_dim: 256,
+            rope_dim: 64,
+            eps: 1e-6,
+        };
+        let q = Tensor::from_vec(wave(16 * 512, 1.0, 2.0), (1, 1, 16, 512), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let k = Tensor::from_vec(wave(2 * 256, 2.0, 2.0), (1, 1, 2, 256), &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let qg = Tensor::from_vec(
+            wave(256, 3.0, 0.2)
+                .iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            256,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let kg = Tensor::from_vec(
+            wave(256, 4.0, 0.2)
+                .iter()
+                .map(|v| 1.0 + v)
+                .collect::<Vec<_>>(),
+            256,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let inv = Tensor::from_vec(
+            (0..32)
+                .map(|j| 10_000_000f32.powf(-2.0 * j as f32 / 64.0))
+                .collect::<Vec<_>>(),
+            32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let g = |t: &Tensor| t.to_device(&gpu).unwrap();
+        for (t, hh, w) in [
+            (5usize, 5usize, 5usize),
+            (100_000, 100_000, 100_000),
+            (7, 3, 11),
+        ] {
+            let position = MropePosition {
+                temporal: t,
+                height: hh,
+                width: w,
+                height_section: 11,
+                width_section: 10,
+            };
+            let (cq, ck) = qk_norm_rope(&q, &k, &qg, &kg, &inv, &spec, position).unwrap();
+            let (gq, gk) =
+                qk_norm_rope(&g(&q), &g(&k), &g(&qg), &g(&kg), &g(&inv), &spec, position).unwrap();
+            assert_close(&host(&gq), &host(&cq), 4e-3, &format!("q at {t}"));
+            assert_close(&host(&gk), &host(&ck), 4e-3, &format!("k at {t}"));
+        }
     }
 
     #[test]
