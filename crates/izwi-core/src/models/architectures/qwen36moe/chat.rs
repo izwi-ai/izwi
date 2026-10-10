@@ -196,6 +196,8 @@ impl Qwen36MoeChatModel {
                 kv_storage_provider,
             )?
         };
+        let moe = exec.text_model.moe_backend_summary();
+        tracing::info!(%moe, "Qwen3.6-MoE sparse-expert execution path");
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -440,6 +442,7 @@ impl Qwen36MoeChatModel {
                 "projection_backend": format!("{:?}", self.performance.projection_backend),
                 "mtp_enabled": self.performance.mtp.enabled(),
             },
+            "moe": self.exec.text_model.moe_backend_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -1281,6 +1284,15 @@ pub(crate) mod tests {
         let counters = model.expert_activation_counters();
         assert_eq!(counters.len(), 4);
         assert!(counters.iter().all(|c| c.total_selections() > 0));
+        // The GGUF fixture's quantized experts cannot take the fused block-FP8
+        // path; diagnostics must say so per layer, with the reason.
+        let moe = &model.runtime_diagnostics()["moe"];
+        assert_eq!(moe["backend"], "legacy");
+        assert_eq!(moe["legacy_layers"], 4);
+        assert_eq!(moe["fused_layers"], 0);
+        assert!(moe["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("block-FP8")));
 
         // Re-run and require identical output (seeded rng, greedy decode).
         let first: Vec<String> = steps.iter().map(|step| step.delta.clone()).collect();
