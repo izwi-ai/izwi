@@ -718,7 +718,7 @@ impl Qwen35Tokenizer {
     /// the vocabulary and `tokenizer_config.json` the specials/template.
     pub(crate) fn load_hf(model_dir: &Path, variant: ModelVariant) -> Result<Self> {
         let config = load_tokenizer_config_file(model_dir)?;
-        let inner = Tokenizer::from_path(model_dir)?;
+        let inner = Tokenizer::from_path_requiring_tokenizer_json(model_dir)?;
         let vocab_size = inner.vocab_size();
 
         let id_for = |token: &str| inner.token_to_id(token);
