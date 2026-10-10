@@ -52,9 +52,23 @@ fn bucket_resident_bytes(
             .ok_or_else(overflow)
     };
     match backend {
-        BackendKind::Cpu => q8_bytes
-            .checked_add(dense_bytes(4)?)
-            .ok_or_else(overflow),
+        // The CPU residency also packs the LM head as Q8_0 rather than F32.
+        BackendKind::Cpu => {
+            let head_q8_bytes =
+                bucket.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
+            q8_bytes
+                .checked_add(dense_bytes(4)?)
+                .ok_or_else(overflow)?
+                .checked_sub(
+                    bucket
+                        .lm_head_elements
+                        .checked_mul(4)
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)?
+                .checked_add(head_q8_bytes)
+                .ok_or_else(overflow)
+        }
         // Metal keeps the routed and shared experts as raw block-FP8 bytes
         // plus F32 scales for the fused MoE kernels and expands the rest of
         // the trunk (and every dense tensor) to F16.
@@ -257,8 +271,10 @@ mod tests {
         let metal = representation_memory_estimate(BackendKind::Metal, false).unwrap();
         let cuda = representation_memory_estimate(BackendKind::Cuda, false).unwrap();
 
+        assert_eq!(inventory.lm_head_elements, 248_320 * 2048, "untied LM head");
         let expected_cpu = inventory.fp8_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES
-            + inventory.dense_elements * 4;
+            + (inventory.dense_elements - inventory.lm_head_elements) * 4
+            + inventory.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
         assert_eq!(cpu.resident_bytes, expected_cpu);
         // Q8_0 packing keeps CPU serving meaningful; the CPU projection
         // residency is far below an expanded-F32 alternative (~130 GiB).
@@ -310,7 +326,8 @@ mod tests {
         // With the MTP load policy enabled, the draft bucket joins the
         // reservation under the same per-backend policy.
         let cpu_mtp = inventory.mtp.fp8_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES
-            + inventory.mtp.dense_elements * 4;
+            + (inventory.mtp.dense_elements - inventory.mtp.lm_head_elements) * 4
+            + inventory.mtp.lm_head_elements.div_ceil(Q8_0_BLOCK_ELEMENTS) * Q8_0_BLOCK_BYTES;
         let metal_mtp = inventory.mtp.expert_fp8_elements
             + inventory.mtp.expert_fp8_scale_bytes
             + (inventory.mtp.fp8_elements - inventory.mtp.expert_fp8_elements
@@ -353,9 +370,10 @@ mod tests {
             ResourceAmount::Known(bytes) if bytes > 30 * GIB && bytes < 40 * GIB
         ));
         let cpu_plan = resource_plan(BackendKind::Cpu, &PerformanceConfig::default()).unwrap();
+        // Q8_0 trunk + Q8_0 LM head + F32 dense state, plus load slack.
         assert!(matches!(
             cpu_plan.load_authorization.host_bytes,
-            ResourceAmount::Known(bytes) if bytes > 40 * GIB
+            ResourceAmount::Known(bytes) if bytes > 35 * GIB && bytes < 45 * GIB
         ));
         assert_eq!(
             cpu_plan.load_authorization.device_bytes,

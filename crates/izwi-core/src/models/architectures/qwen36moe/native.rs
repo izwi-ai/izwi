@@ -157,6 +157,9 @@ pub(crate) struct RepresentationElementBucket {
     /// fused MoE kernels while the rest of the trunk expands to F16.
     pub expert_fp8_elements: u64,
     pub expert_fp8_scale_bytes: u64,
+    /// Dense elements of the LM head, which the CPU residency packs as Q8_0
+    /// instead of keeping F32 (it is ~40% of the CPU decode traffic).
+    pub lm_head_elements: u64,
 }
 
 /// Element inventory of the published checkpoint's persistent representation,
@@ -169,6 +172,7 @@ pub(crate) struct PinnedRepresentationInventory {
     pub fp8_incompatible_elements: u64,
     pub expert_fp8_elements: u64,
     pub expert_fp8_scale_bytes: u64,
+    pub lm_head_elements: u64,
     /// Element inventory of the MTP draft manifest. Admission charges this
     /// bucket only when the MTP load policy makes the draft head resident;
     /// the default load skips `mtp.*` exactly like the vision tower.
@@ -187,9 +191,13 @@ impl PinnedRepresentationInventory {
             fp8_incompatible_elements: self.fp8_incompatible_elements,
             expert_fp8_elements: self.expert_fp8_elements,
             expert_fp8_scale_bytes: self.expert_fp8_scale_bytes,
+            lm_head_elements: self.lm_head_elements,
         }
     }
 }
+
+/// Canonical name of the untied LM head.
+pub(crate) const LM_HEAD_TENSOR: &str = "lm_head.weight";
 
 /// Whether a checkpoint tensor belongs to a routed or the shared expert (the
 /// projections the fused MoE stacks).
@@ -199,11 +207,12 @@ fn is_expert_tensor(name: &str) -> bool {
 
 /// Fold one tensor plan into its resident-representation element counts.
 fn fold_representation_inventory(
-    entries: impl IntoIterator<Item = (bool, ExpectedTensorKind, Vec<usize>)>,
+    entries: impl IntoIterator<Item = (String, ExpectedTensorKind, Vec<usize>)>,
 ) -> RepresentationElementBucket {
     use ExpectedTensorKind::{BlockFp8, BlockFp8Scale, Dense, OptionalDense};
     let mut bucket = RepresentationElementBucket::default();
-    for (expert, kind, shape) in entries {
+    for (name, kind, shape) in entries {
+        let expert = is_expert_tensor(&name);
         bucket.tensor_count += 1;
         let count = shape
             .iter()
@@ -233,7 +242,10 @@ fn fold_representation_inventory(
                 }
             }
             Dense | OptionalDense => {
-                bucket.dense_elements = bucket.dense_elements.saturating_add(count)
+                bucket.dense_elements = bucket.dense_elements.saturating_add(count);
+                if name == LM_HEAD_TENSOR {
+                    bucket.lm_head_elements = bucket.lm_head_elements.saturating_add(count);
+                }
             }
             // Scale companions are consumed during dequantization and never
             // materialize into the persistent representation; they still count
@@ -252,12 +264,12 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         .expect("pinned config produces the validated MTP manifest");
     let trunk = fold_representation_inventory(
         plan.into_iter()
-            .map(|(name, expected)| (is_expert_tensor(&name), expected.kind, expected.shape)),
+            .map(|(name, expected)| (name, expected.kind, expected.shape)),
     );
     let mtp = fold_representation_inventory(
         mtp_plan
             .into_iter()
-            .map(|spec| (is_expert_tensor(&spec.name), spec.kind, spec.shape)),
+            .map(|spec| (spec.name.to_string(), spec.kind, spec.shape)),
     );
     PinnedRepresentationInventory {
         fp8_elements: trunk.fp8_elements,
@@ -267,6 +279,7 @@ pub(crate) fn pinned_representation_inventory() -> PinnedRepresentationInventory
         fp8_incompatible_elements: trunk.fp8_incompatible_elements,
         expert_fp8_elements: trunk.expert_fp8_elements,
         expert_fp8_scale_bytes: trunk.expert_fp8_scale_bytes,
+        lm_head_elements: trunk.lm_head_elements,
         mtp,
     }
 }

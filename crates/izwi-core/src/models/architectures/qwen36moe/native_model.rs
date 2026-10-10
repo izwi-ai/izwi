@@ -279,6 +279,19 @@ impl Qwen36WeightSource for Qwen36MoeNativeSource<'_> {
                 device,
                 self.dense_target,
             )?;
+            // The CPU residency packs its projections as Q8_0; the F32 LM
+            // head would otherwise be ~40% of the CPU decode traffic
+            // (248k x 2048). Admission charges it the same way.
+            if self.residency == Qwen36MoeProjectionResidency::PackedQ8_0
+                && canonical == crate::models::architectures::qwen36moe::native::LM_HEAD_TENSOR
+                && expected[1].is_multiple_of(32)
+            {
+                let packed = candle_core::quantized::QTensor::quantize(
+                    &tensor,
+                    candle_core::quantized::GgmlDType::Q8_0,
+                )?;
+                return Ok(Qwen36Projection::Quantized(QMatMul::from_qtensor(packed)?));
+            }
             return Self::wrap_dense_projection(tensor);
         }
         match self.checkpoint.materialize_projection(
