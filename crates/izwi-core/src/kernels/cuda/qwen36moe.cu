@@ -272,3 +272,164 @@ __device__ void q36_down(
 
 Q36_EXPORT(__half, f16)
 Q36_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Gated DeltaNet single-token decode (Qwen3.6 linear-attention layers).
+//
+// Two launches replace the ~49-op Candle chain per layer: a causal-conv step
+// over the 3-slot history ring, then one block per value head that runs the
+// softplus/sigmoid gating, q/k L2 norms, the delta-rule recurrence (state held
+// in registers) and the gated RMSNorm. Key heads are mapped by index (grouped:
+// v / repeats, tiled: v % key_heads), so no expanded q/k copies are made. The
+// old state is read-only; the next state goes to a fresh allocation, keeping
+// state publication transactional.
+
+// out = silu(h0*w0 + h1*w1 + h2*w2 + x*w3) per channel (history oldest first);
+// cur = float(x), the ring's next slot. w: [conv_dim, 4] F32.
+template <class T>
+__device__ void q36_gdn_conv(
+    const T* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ h0,
+    const float* __restrict__ h1,
+    const float* __restrict__ h2,
+    float* __restrict__ out,
+    float* __restrict__ cur,
+    int conv_dim) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) {
+    return;
+  }
+  const float xc = float(x[c]);
+  const float* wc = w + (size_t)c * 4;
+  float v = xc * wc[3];
+  v = v + h0[c] * wc[0];
+  v = v + h1[c] * wc[1];
+  v = v + h2[c] * wc[2];
+  out[c] = v / (1.f + expf(-v));
+  cur[c] = xc;
+}
+
+// conv: [conv_dim] F32 = q (key_heads*128) | k (key_heads*128) | v (value_heads*128)
+// after conv+silu. z: [value_heads*128]; beta_raw, alpha: [value_heads]
+// (projection outputs, pre-activation); dt_bias, a: [value_heads] F32 with
+// a = -exp(A_log); norm_w: [128] F32. state_in/state_out: [value_heads, 128, 128]
+// F32 (key rows, value columns). y: [value_heads*128] = rmsnorm(o) * w * silu(z).
+// Block: 512 threads; warp w owns value columns (w & 3) * 32 + lane over key
+// rows (w >> 2) * 32 .. +32. Grid: value_heads.
+template <class T>
+__device__ void q36_gdn_decode(
+    const float* __restrict__ conv,
+    const T* __restrict__ z,
+    const T* __restrict__ beta_raw,
+    const T* __restrict__ alpha,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ a,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ state_in,
+    float* __restrict__ state_out,
+    T* __restrict__ y,
+    int key_heads,
+    int value_heads,
+    int grouped,
+    float norm_eps) {
+  __shared__ float qs[128];
+  __shared__ float ks[128];
+  __shared__ float red[4][128];
+  __shared__ float part[8];
+  __shared__ float stats[2];
+  const int h = blockIdx.x;
+  const int repeats = value_heads / key_heads;
+  const int kh = grouped != 0 ? h / repeats : h % key_heads;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int col = (warp & 3) * 32 + lane;
+  const int rg = warp >> 2;
+  const int key_width = key_heads * 128;
+  if (tid < 128) {
+    qs[tid] = conv[kh * 128 + tid];
+    ks[tid] = conv[key_width + kh * 128 + tid];
+  }
+  __syncthreads();
+  if (warp < 8) {
+    const float val = warp < 4 ? qs[warp * 32 + lane] : ks[(warp - 4) * 32 + lane];
+    const float sq = q36_warp_sum(val * val);
+    if (lane == 0) {
+      part[warp] = sq;
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    const float qsum = part[0] + part[1] + part[2] + part[3];
+    const float ksum = part[4] + part[5] + part[6] + part[7];
+    // l2norm(x) = x / sqrt(sum(x^2) + 1e-6); queries also take 1/sqrt(Dk).
+    stats[0] = 1.f / (sqrtf(qsum + 1e-6f) * sqrtf(128.f));
+    stats[1] = 1.f / sqrtf(ksum + 1e-6f);
+  }
+  __syncthreads();
+  const float qscale = stats[0];
+  const float knorm = stats[1];
+  const float gate_in = float(alpha[h]) + dt_bias[h];
+  const float softplus = fmaxf(gate_in, 0.f) + log1pf(expf(-fabsf(gate_in)));
+  const float decay = expf(softplus * a[h]);
+  const float beta = 1.f / (1.f + expf(-float(beta_raw[h])));
+
+  const size_t row0 = (size_t)h * 128 + (size_t)rg * 32;
+  const float* sin = state_in + row0 * 128 + col;
+  float s[32];
+  float recalled = 0.f;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    s[i] = sin[(size_t)i * 128] * decay;
+    recalled = fmaf(ks[rg * 32 + i] * knorm, s[i], recalled);
+  }
+  red[rg][col] = recalled;
+  __syncthreads();
+  const float kv = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+  const float delta = (conv[2 * key_width + h * 128 + col] - kv) * beta;
+  float* sout = state_out + row0 * 128 + col;
+  float o = 0.f;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    const float updated = fmaf(ks[rg * 32 + i] * knorm, delta, s[i]);
+    sout[(size_t)i * 128] = updated;
+    o = fmaf(qs[rg * 32 + i] * qscale, updated, o);
+  }
+  __syncthreads();
+  red[rg][col] = o;
+  __syncthreads();
+  float out = 0.f;
+  if (rg == 0) {
+    out = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+    const float sq = q36_warp_sum(out * out);
+    if (lane == 0) {
+      part[warp] = sq;
+    }
+  }
+  __syncthreads();
+  if (rg == 0) {
+    const float mean_sq = (part[0] + part[1] + part[2] + part[3]) / 128.f;
+    const float zz = float(z[h * 128 + col]);
+    const float gate = zz / (1.f + expf(-zz));
+    y[h * 128 + col] = T(out / sqrtf(mean_sq + norm_eps) * norm_w[col] * gate);
+  }
+}
+
+#define Q36_GDN_EXPORT(T, S)                                                                   \
+  extern "C" __global__ void qwen36moe_gdn_conv_##S(                                           \
+      const T* x, const float* w, const float* h0, const float* h1, const float* h2,          \
+      float* out, float* cur, int conv_dim) {                                                  \
+    q36_gdn_conv<T>(x, w, h0, h1, h2, out, cur, conv_dim);                                     \
+  }                                                                                            \
+  extern "C" __global__ void __launch_bounds__(512) qwen36moe_gdn_decode_##S(                 \
+      const float* conv, const T* z, const T* beta_raw, const T* alpha, const float* dt_bias, \
+      const float* a, const float* norm_w, const float* state_in, float* state_out, T* y,     \
+      int key_heads, int value_heads, int grouped, float norm_eps) {                           \
+    q36_gdn_decode<T>(conv, z, beta_raw, alpha, dt_bias, a, norm_w, state_in, state_out, y,   \
+                      key_heads, value_heads, grouped, norm_eps);                              \
+  }
+
+Q36_GDN_EXPORT(__half, f16)
+Q36_GDN_EXPORT(__nv_bfloat16, bf16)
+Q36_GDN_EXPORT(float, f32)

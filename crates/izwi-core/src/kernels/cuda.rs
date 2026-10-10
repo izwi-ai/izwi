@@ -17,6 +17,7 @@ use crate::kernels::FusedSiluMulResult;
 #[cfg(feature = "cuda")]
 mod epilogues;
 pub mod fp8;
+pub mod gdn;
 pub mod graphs;
 pub mod moe;
 pub mod sampling;
