@@ -228,10 +228,12 @@ impl<'a> Qwen36MoeNativeSource<'a> {
     }
 }
 
+/// Storage kind of a trunk-requested tensor. The trunk only ever requests
+/// weights, never their `weight_scale_inv` companions, so anything that is
+/// not F8_E4M3 storage is a dense tensor.
 fn tensor_kind(dtype: &safetensors::Dtype) -> ExpectedTensorKind {
     match dtype {
         safetensors::Dtype::F8_E4M3 => ExpectedTensorKind::BlockFp8,
-        safetensors::Dtype::BF16 => ExpectedTensorKind::BlockFp8Scale,
         _ => ExpectedTensorKind::Dense,
     }
 }
