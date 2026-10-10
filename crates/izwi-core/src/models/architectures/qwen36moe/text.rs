@@ -1692,6 +1692,17 @@ impl Qwen36Hidden {
 }
 
 impl Qwen36Layer {
+    /// The layer tail after its mixer: residual add + post-attention norm,
+    /// then the feed-forward block, whose output the next layer's norm adds.
+    fn post_mixer(&self, residual: &Tensor, mixed: &Tensor) -> Result<Qwen36Hidden> {
+        let (residual, hidden_states) = self.post_attention_norm.add_forward(residual, mixed)?;
+        let ffn_output = self.ffn.forward(&hidden_states)?;
+        Ok(Qwen36Hidden {
+            residual,
+            pending: Some(ffn_output),
+        })
+    }
+
     fn decode_diagnostic_path(&self) -> &'static str {
         match self.mixer {
             Qwen36Mixer::Linear(_) => "decode.linear_layer_output",
@@ -1786,12 +1797,7 @@ impl Qwen36Layer {
                 output
             }
         };
-        let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
-        let ffn_output = self.ffn.forward(&hidden_states)?;
-        Ok(Qwen36Hidden {
-            residual,
-            pending: Some(ffn_output),
-        })
+        self.post_mixer(&residual, &mixed)
     }
 
     fn forward_physical_decode_batch(
@@ -1835,12 +1841,7 @@ impl Qwen36Layer {
                 output
             }
         };
-        let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
-        let ffn_output = self.ffn.forward(&hidden_states)?;
-        Ok(Qwen36Hidden {
-            residual,
-            pending: Some(ffn_output),
-        })
+        self.post_mixer(&residual, &mixed)
     }
 }
 
@@ -2320,6 +2321,43 @@ impl Qwen36FullAttention {
                 "Qwen3.5 full-attention decode batch dimensions do not match".into(),
             ));
         }
+        let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
+        let output = self.decode_attend(
+            &q_proj,
+            &key_states,
+            &value_states,
+            position_ids,
+            caches,
+            slots,
+            metadata,
+            completions,
+            physical_layer,
+        )?;
+        self.decode_output(&output, &q_proj)
+    }
+
+    /// Decode attention for projected rows: q/k norm + RoPE, the paged KV
+    /// write and paged attention. Returns the ungated attention output
+    /// `[batch, 1, heads * head_dim]` in the activation dtype.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attend(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let batch_size = q_proj.dim(0)?;
+        if caches.len() != batch_size || position_ids.len() != batch_size {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 decode attention rows do not match".into(),
+            ));
+        }
         let first = caches[0];
         if caches.iter().any(|cache| {
             !Arc::ptr_eq(cache.arena(), first.arena())
@@ -2335,7 +2373,6 @@ impl Qwen36FullAttention {
                 "Qwen3.5 decode received an incompatible prepared slot map".into(),
             ));
         }
-        let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
@@ -2383,12 +2420,15 @@ impl Qwen36FullAttention {
             )
         })?;
         completions.collect(completion)?;
-        let output = output.to_dtype(output_dtype)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
-        let output = self.gate_output(&output, &q_proj)?;
+        output
+            .to_dtype(output_dtype)?
+            .reshape((batch_size, 1, self.num_heads * self.head_dim))
+            .map_err(Error::from)
+    }
+
+    /// Gate the attention output and project it back to the hidden size.
+    fn decode_output(&self, output: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        let output = self.gate_output(output, q_proj)?;
         self.o_proj.forward(&output)
     }
 
