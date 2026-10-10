@@ -1024,7 +1024,7 @@ impl Qwen36TextModel {
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<Tensor> {
             let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = self.token_embeddings.forward(&input)?;
+            let mut hidden = Qwen36Hidden::new(self.token_embeddings.forward(&input)?);
             let mut physical_layer = 0usize;
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 let mut layer_states = states
@@ -1036,7 +1036,7 @@ impl Qwen36TextModel {
                 }
                 let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
                 hidden = layer.forward_physical_decode_batch(
-                    &hidden,
+                    hidden,
                     &mut layer_states,
                     position_ids,
                     &cache_refs,
@@ -1045,13 +1045,18 @@ impl Qwen36TextModel {
                     &mut completions,
                     &mut physical_layer,
                 )?;
-                validate_qwen35_finite_tensor(
-                    &hidden,
-                    layer_index,
-                    layer.decode_diagnostic_path(),
-                    self.finite_diagnostics_enabled,
-                )?;
+                if self.finite_diagnostics_enabled {
+                    let full = hidden.materialize()?;
+                    validate_qwen35_finite_tensor(
+                        &full,
+                        layer_index,
+                        layer.decode_diagnostic_path(),
+                        true,
+                    )?;
+                    hidden = Qwen36Hidden::new(full);
+                }
             }
+            let hidden = hidden.materialize()?;
             if physical_layer != sparse_layers.len() {
                 return Err(Error::InferenceError(
                     "Qwen3.5 batched attention did not cover every sparse layer".into(),
@@ -1223,30 +1228,35 @@ impl Qwen36TextModel {
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.ensure_state_initialized(layer_state, &self.device)?;
         }
-        let mut hidden = input.clone();
+        let mut hidden = Qwen36Hidden::new(input.clone());
         let mut physical_layer = 0usize;
         for (layer_index, (layer, layer_state)) in
             self.layers.iter().zip(state.layers.iter_mut()).enumerate()
         {
             hidden = layer.forward_physical(
-                &hidden,
+                hidden,
                 layer_state,
                 position_ids,
                 cache,
                 &mut prepared,
                 &mut physical_layer,
             )?;
-            validate_qwen35_finite_tensor(
-                &hidden,
-                layer_index,
-                if sequence_len == 1 {
-                    layer.decode_diagnostic_path()
-                } else {
-                    layer.prefill_diagnostic_path()
-                },
-                self.finite_diagnostics_enabled,
-            )?;
+            if self.finite_diagnostics_enabled {
+                let full = hidden.materialize()?;
+                validate_qwen35_finite_tensor(
+                    &full,
+                    layer_index,
+                    if sequence_len == 1 {
+                        layer.decode_diagnostic_path()
+                    } else {
+                        layer.prefill_diagnostic_path()
+                    },
+                    true,
+                )?;
+                hidden = Qwen36Hidden::new(full);
+            }
         }
+        let hidden = hidden.materialize()?;
         if physical_layer != sparse_layers.len() {
             return Err(Error::InferenceError(
                 "Qwen3.5 physical attention did not cover every sparse layer".into(),
@@ -1393,6 +1403,41 @@ impl Qwen36TextRuntimeState {
     }
 }
 
+/// The residual stream at a layer boundary, with the previous layer's FFN
+/// output optionally not yet added: the next layer's input norm folds that add
+/// into one fused launch (`Qwen36RmsNorm::add_forward`).
+struct Qwen36Hidden {
+    residual: Tensor,
+    pending: Option<Tensor>,
+}
+
+impl Qwen36Hidden {
+    fn new(residual: Tensor) -> Self {
+        Self {
+            residual,
+            pending: None,
+        }
+    }
+
+    fn materialize(self) -> Result<Tensor> {
+        match self.pending {
+            Some(delta) => (&self.residual + &delta).map_err(Error::from),
+            None => Ok(self.residual),
+        }
+    }
+
+    /// `(residual stream, norm(residual stream))` for the next layer.
+    fn normalized(self, norm: &Qwen36RmsNorm) -> Result<(Tensor, Tensor)> {
+        match self.pending {
+            Some(delta) => norm.add_forward(&self.residual, &delta),
+            None => {
+                let normalized = norm.forward(&self.residual)?;
+                Ok((self.residual, normalized))
+            }
+        }
+    }
+}
+
 impl Qwen36Layer {
     fn decode_diagnostic_path(&self) -> &'static str {
         match self.mixer {
@@ -1458,15 +1503,14 @@ impl Qwen36Layer {
 
     fn forward_physical(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen36Hidden,
         state: &mut Qwen36LayerRuntimeState,
         position_ids: &[[usize; 3]],
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
-    ) -> Result<Tensor> {
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+    ) -> Result<Qwen36Hidden> {
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen36Mixer::Linear(mixer) => {
                 if normalized.dim(1)? == 1 {
@@ -1490,13 +1534,16 @@ impl Qwen36Layer {
             }
         };
         let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
-        let hidden_states = self.ffn.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        let ffn_output = self.ffn.forward(&hidden_states)?;
+        Ok(Qwen36Hidden {
+            residual,
+            pending: Some(ffn_output),
+        })
     }
 
     fn forward_physical_decode_batch(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen36Hidden,
         states: &mut [&mut Qwen36LayerRuntimeState],
         position_ids: &[[usize; 3]],
         caches: &[&PhysicalPagedKvCache],
@@ -1504,9 +1551,9 @@ impl Qwen36Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: &mut usize,
-    ) -> Result<Tensor> {
-        let batch_size = hidden_states.dim(0)?;
-        if hidden_states.dim(1)? != 1
+    ) -> Result<Qwen36Hidden> {
+        let batch_size = hidden.residual.dim(0)?;
+        if hidden.residual.dim(1)? != 1
             || batch_size == 0
             || states.len() != batch_size
             || position_ids.len() != batch_size
@@ -1516,8 +1563,7 @@ impl Qwen36Layer {
                 "Qwen3.5 layer decode batch dimensions do not match".into(),
             ));
         }
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen36Mixer::Linear(mixer) => mixer.forward_decode_batch(&normalized, states)?,
             Qwen36Mixer::Full(mixer) => {
@@ -1537,8 +1583,11 @@ impl Qwen36Layer {
             }
         };
         let (residual, hidden_states) = self.post_attention_norm.add_forward(&residual, &mixed)?;
-        let hidden_states = self.ffn.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        let ffn_output = self.ffn.forward(&hidden_states)?;
+        Ok(Qwen36Hidden {
+            residual,
+            pending: Some(ffn_output),
+        })
     }
 }
 
