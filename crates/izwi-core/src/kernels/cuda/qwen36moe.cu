@@ -886,3 +886,33 @@ __device__ void q36_combine(
 
 Q36_GROUPED_EXPORT(__half, f16)
 Q36_GROUPED_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Gated attention output: out[r, h * D + d] = attn[r, h * D + d] * sigmoid(gate)
+// with gate = q_proj[r, h, D + d], the second half of each head's slice of the
+// gated query projection [rows, heads, 2 * D]. Replaces the strided gate copy,
+// the sigmoid and the multiply with one launch. The sigmoid is evaluated in F32
+// and rounded to T before the product, as the T-dtype composition rounds it;
+// the product is rounded to T. One thread per output element.
+template <class T>
+__device__ void q36_attn_gate(const T* attn, const T* q_proj, T* out, int heads, int head_dim,
+                              int total) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int width = heads * head_dim;
+  const int row = i / width, j = i - row * width;
+  const int head = j / head_dim, d = j - head * head_dim;
+  const float g =
+      float(q_proj[(size_t)row * 2 * width + (size_t)head * 2 * head_dim + head_dim + d]);
+  const T s = T(1.f / (1.f + expf(-g)));
+  out[i] = T(float(attn[i]) * float(s));
+}
+
+#define Q36_GATE_EXPORT(T, S)                                                                    \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_attn_gate_##S(                    \
+      const T* attn, const T* q_proj, T* out, int heads, int head_dim, int total) {             \
+    q36_attn_gate<T>(attn, q_proj, out, heads, head_dim, total);                                \
+  }
+
+Q36_GATE_EXPORT(__half, f16)
+Q36_GATE_EXPORT(__nv_bfloat16, bf16)

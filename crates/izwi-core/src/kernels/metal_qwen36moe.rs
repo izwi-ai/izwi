@@ -726,6 +726,21 @@ kernel void q36m_qk_norm_rope_f16(
         dst[i] = half(out);
     }
 }
+
+// ---- Gated attention output: attn * sigmoid(gate), gate from the gated q_proj. ----
+kernel void q36m_attn_gate_f16(
+    device const half* attn [[buffer(0)]], device const half* q_proj [[buffer(1)]],
+    device half* out [[buffer(2)]], constant uint& heads [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]], constant uint& total [[buffer(5)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i >= total) return;
+    uint width = heads * head_dim;
+    uint row = i / width, j = i - row * width;
+    uint head = j / head_dim, d = j - head * head_dim;
+    float g = float(q_proj[row * 2 * width + head * 2 * head_dim + head_dim + d]);
+    half s = half(1.0f / (1.0f + precise::exp(-g)));
+    out[i] = half(float(attn[i]) * float(s));
+}
 "#;
 
 fn pipeline(device: &MetalDevice, name: &'static str) -> Result<ComputePipeline> {
@@ -1339,6 +1354,43 @@ pub(crate) fn rms_norm(
     ))
 }
 
+/// Gated attention output (see `kernels::cuda::gate`): `attn` `[.., heads *
+/// head_dim]` and the gated `q_proj` `[.., heads, 2 * head_dim]`, both F16.
+pub(crate) fn attn_gate(
+    attn: &Tensor,
+    q_proj: &Tensor,
+    heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if attn.dtype() != DType::F16 || q_proj.dtype() != DType::F16 {
+        bail!(
+            "Metal attention gate needs F16 operands, found {:?} and {:?}",
+            attn.dtype(),
+            q_proj.dtype()
+        )
+    }
+    let device = metal_device(attn)?;
+    let shape = attn.shape().clone();
+    let total = shape.elem_count();
+    let (attn, q_proj) = (attn.contiguous()?, q_proj.contiguous()?);
+    let ab = bind(&attn, "attention output", 2)?;
+    let qb = bind(&q_proj, "gated query projection", 2)?;
+    let out = device.new_buffer(total, DType::F16, "q36m-attn-gate")?;
+    let encoder = device.command_encoder()?;
+    encoder.set_label("q36m-attn-gate");
+    encoder.set_compute_pipeline_state(&pipeline(device.metal_device(), "q36m_attn_gate_f16")?);
+    encoder.set_input_buffer(0, Some(ab.buffer()?), ab.offset);
+    encoder.set_input_buffer(1, Some(qb.buffer()?), qb.offset);
+    encoder.set_output_buffer(2, Some(&out), 0);
+    encoder.set_bytes(3, &u32_arg(heads, "heads")?);
+    encoder.set_bytes(4, &u32_arg(head_dim, "head_dim")?);
+    encoder.set_bytes(5, &u32_arg(total, "elements")?);
+    encoder.dispatch_thread_groups(grid(total.div_ceil(256), 1), grid(256, 1));
+    drop(encoder);
+    drop((ab, qb));
+    Ok(wrap(&device, out, shape, DType::F16))
+}
+
 /// q/k head norm + partial M-RoPE for one token (see `kernels::cuda::rope`).
 pub(crate) fn qk_norm_rope(
     q_proj: &Tensor,
@@ -1657,6 +1709,38 @@ mod tests {
                 &host(&rms_norm(&r, &w, 1e-6).unwrap()),
                 4e-3,
                 &format!("norm rows={rows}"),
+            );
+        }
+    }
+
+    #[test]
+    fn metal_attn_gate_matches_the_composition() {
+        use crate::kernels::cuda::gate::{attn_gate, reference};
+        let Some(gpu) = device() else { return };
+        for (rows, heads, head_dim) in [(1usize, 16usize, 256usize), (3, 2, 100)] {
+            let width = heads * head_dim;
+            let attn =
+                Tensor::from_vec(wave(rows * width, 1.0, 4.0), (rows, 1, width), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap();
+            let q_proj = Tensor::from_vec(
+                wave(rows * 2 * width, 2.0, 8.0),
+                (rows, 1, heads, 2 * head_dim),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+            let expected = reference(&attn, &q_proj, heads, head_dim).unwrap();
+            let g = |t: &Tensor| t.to_device(&gpu).unwrap();
+            let actual = attn_gate(&g(&attn), &g(&q_proj), heads, head_dim).unwrap();
+            assert_eq!(actual.dims(), attn.dims());
+            assert_close(
+                &host(&actual),
+                &host(&expected),
+                4e-3,
+                &format!("gate rows={rows}"),
             );
         }
     }
