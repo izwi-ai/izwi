@@ -41,6 +41,9 @@ use crate::models::architectures::qwen36moe::fast_path::{
 };
 use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
+#[path = "decode_graph.rs"]
+mod decode_graph;
+
 pub struct Qwen36TextModel {
     device: Device,
     token_embeddings: Embedding,
@@ -50,6 +53,9 @@ pub struct Qwen36TextModel {
     finite_diagnostics_enabled: bool,
     fused_norm_path: Qwen36FusedPath,
     fp8_gemv_path: Qwen36FusedPath,
+    /// Piecewise CUDA graph decode for single-row steps, when resolved.
+    decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
+    decode_graphs_path: Qwen36FusedPath,
 }
 
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
@@ -933,6 +939,8 @@ impl Qwen36TextModel {
             finite_diagnostics_enabled,
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
+            decode_graphs: None,
+            decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
         };
         match source.cuda_switches().fused_decode_off {
             Some(reason) => {
@@ -944,6 +952,10 @@ impl Qwen36TextModel {
                 model.resolve_vectorized_fp8_decode();
             }
         }
+        let (graphs, path) =
+            decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false);
+        model.decode_graphs = graphs;
+        model.decode_graphs_path = path;
         Ok(model)
     }
 
@@ -1093,6 +1105,15 @@ impl Qwen36TextModel {
         }))
     }
 
+    /// Piecewise CUDA graph decode: resolution, phase and counters, for the
+    /// admin diagnostics.
+    pub(crate) fn cuda_graphs_summary(&self) -> serde_json::Value {
+        match &self.decode_graphs {
+            Some(graphs) => graphs.summary(),
+            None => super::fast_path::summarize([&self.decode_graphs_path]),
+        }
+    }
+
     /// Fused RMSNorm resolution, for the admin diagnostics.
     pub(crate) fn rms_norm_summary(&self) -> serde_json::Value {
         super::fast_path::summarize([&self.fused_norm_path])
@@ -1161,6 +1182,16 @@ impl Qwen36TextModel {
             }
         }
         self.resolve_fused_norms(true);
+    }
+
+    /// Run single-row decode through the graph segments eagerly off CUDA
+    /// (tests of the segmentation; CUDA resolves this at load).
+    #[cfg(test)]
+    pub(crate) fn enable_segmented_decode_for_tests(&mut self) {
+        let (graphs, path) =
+            decode_graph::Qwen36DecodeGraphs::resolve(self, &Qwen36CudaSwitches::default(), true);
+        self.decode_graphs = graphs;
+        self.decode_graphs_path = path;
     }
 
     /// Fused single-token DeltaNet decode across the linear-attention layers,
@@ -1277,7 +1308,23 @@ impl Qwen36TextModel {
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<Tensor> {
             let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = Qwen36Hidden::new(self.token_embeddings.forward(&input)?);
+            let embedded = self.token_embeddings.forward(&input)?;
+            if let (1, Some(graphs)) = (batch_size, &self.decode_graphs) {
+                let cache = &*caches[0];
+                if let Some(hidden) = graphs.forward(
+                    self,
+                    &embedded,
+                    position_ids[0],
+                    states[0],
+                    cache,
+                    lowered.as_ref(),
+                    &metadata,
+                    &mut completions,
+                )? {
+                    return self.project_hidden_span(&hidden);
+                }
+            }
+            let mut hidden = Qwen36Hidden::new(embedded);
             let mut physical_layer = 0usize;
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 let mut layer_states = states
@@ -4663,6 +4710,18 @@ mod tests {
     }
 
     fn e2e_logits(model: &super::Qwen36TextModel, tokens: &[u32], prompt: usize) -> Vec<Vec<f32>> {
+        e2e_logits_via(model, tokens, prompt, false)
+    }
+
+    /// Prefill `prompt` tokens, then decode the rest one token per step:
+    /// through the batched (continuous) decode path when `batched`, which is
+    /// where graph decode runs, else the scalar path.
+    fn e2e_logits_via(
+        model: &super::Qwen36TextModel,
+        tokens: &[u32],
+        prompt: usize,
+        batched: bool,
+    ) -> Vec<Vec<f32>> {
         let positions: Vec<[usize; 3]> = (0..tokens.len()).map(|p| [p, p, p]).collect();
         let mut state = model.new_state();
         let mut cache = e2e_cache(&model.device);
@@ -4679,16 +4738,26 @@ mod tests {
                 .expect("prefill logits"),
         )];
         for position in prompt..tokens.len() {
-            rows.push(flat(
-                &model
+            let logits = if batched {
+                model
+                    .forward_token_ids_batch_at_physical(
+                        &tokens[position..=position],
+                        &positions[position..=position],
+                        &mut [&mut state],
+                        &mut [&mut cache],
+                    )
+                    .unwrap()
+            } else {
+                model
                     .forward_token_id_at_physical(
                         tokens[position],
                         positions[position],
                         &mut state,
                         &mut cache,
                     )
-                    .unwrap(),
-            ));
+                    .unwrap()
+            };
+            rows.push(flat(&logits));
         }
         rows
     }
@@ -4737,7 +4806,7 @@ mod tests {
         );
         assert_eq!(legacy.moe_backend_summary()["backend"], "legacy");
 
-        assert_tracks_reference(&fused, &legacy, 0.01);
+        assert_tracks_reference(&fused, &legacy, 0.01, false);
     }
 
     /// Prefill 6 tokens, then decode 8: every step within `rel_l2` of the
@@ -4748,10 +4817,11 @@ mod tests {
         fused: &super::Qwen36TextModel,
         reference: &super::Qwen36TextModel,
         rel_l2: f32,
+        batched: bool,
     ) {
-        let tokens: Vec<u32> = (0..14).map(|i| (i * 7 + 3) % E2E_VOCAB as u32).collect();
-        let expected = e2e_logits(reference, &tokens, 6);
-        let actual = e2e_logits(fused, &tokens, 6);
+        let tokens = e2e_tokens();
+        let expected = e2e_logits_via(reference, &tokens, 6, batched);
+        let actual = e2e_logits_via(fused, &tokens, 6, batched);
         for (step, (a, e)) in actual.iter().zip(&expected).enumerate() {
             let err: f32 = a
                 .iter()
@@ -4786,6 +4856,7 @@ mod tests {
                     moe_off: Some("cuda.mode=off"),
                     fused_decode_off: Some("cuda.fused_decode=off"),
                     packed_off: Some("cuda.packed_projections=off"),
+                    graphs_off: Some("cuda.decode_graphs=off"),
                 },
                 ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto)
             },
@@ -4815,6 +4886,11 @@ mod tests {
                 "fp8_gemv",
                 model.fp8_gemv_summary(),
                 "cuda.fused_decode=off",
+            ),
+            (
+                "cuda_graphs",
+                model.cuda_graphs_summary(),
+                "cuda.decode_graphs=off",
             ),
         ] {
             assert_eq!(summary["backend"], "legacy", "{path}: {summary}");
@@ -4869,7 +4945,7 @@ mod tests {
         )
         .unwrap();
         assert_resolved_fused(&fused, false);
-        assert_tracks_reference(&fused, &reference, 0.01);
+        assert_tracks_reference(&fused, &reference, 0.01, false);
     }
 
     /// CUDA runs the production BF16 activations. Candle's CPU backend cannot,
@@ -4892,6 +4968,7 @@ mod tests {
                     moe_off: Some("reference"),
                     fused_decode_off: Some("reference"),
                     packed_off: Some("reference"),
+                    graphs_off: Some("reference"),
                 },
                 act: DType::BF16,
                 ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Legacy)
@@ -4912,7 +4989,89 @@ mod tests {
         )
         .unwrap();
         assert_resolved_fused(&fused, true);
-        assert_tracks_reference(&fused, &reference, 0.03);
+        assert_eq!(fused.cuda_graphs_summary()["backend"], "fused");
+        assert_eq!(reference.cuda_graphs_summary()["backend"], "legacy");
+        // Batched decode is where graph decode runs. Eight decode steps take
+        // the graphs through warm, capture + verify, verify, then five replays.
+        assert_tracks_reference(&fused, &reference, 0.03, true);
+        let graphs = fused.cuda_graphs_summary();
+        let segments = graphs["segments"].as_u64().unwrap();
+        assert_eq!(graphs["phase"], "replay", "{graphs}");
+        assert_eq!(graphs["captures"].as_u64(), Some(segments), "{graphs}");
+        assert_eq!(
+            graphs["verified_segments"].as_u64(),
+            Some(2 * segments),
+            "{graphs}"
+        );
+        assert_eq!(graphs["replays"].as_u64(), Some(5 * segments), "{graphs}");
+    }
+
+    fn e2e_tokens() -> Vec<u32> {
+        (0..14).map(|i| (i * 7 + 3) % E2E_VOCAB as u32).collect()
+    }
+
+    /// Off CUDA, graph decode runs its segments eagerly, so the segmentation
+    /// itself is testable here: the attention split, the state IO and the
+    /// state publication must reproduce the standard batched decode exactly.
+    #[test]
+    fn segmented_decode_matches_the_standard_batched_path() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let load = || {
+            let mut model = super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            model.enable_fused_paths_for_tests();
+            model
+        };
+        let standard = load();
+        assert_eq!(standard.cuda_graphs_summary()["backend"], "legacy");
+        let mut segmented = load();
+        segmented.enable_segmented_decode_for_tests();
+        let graphs = segmented.cuda_graphs_summary();
+        assert_eq!(graphs["backend"], "fused", "{graphs}");
+        // 3 DeltaNet layers + 1 attention layer: one segment closes before the
+        // attention layer, one opens after it.
+        assert_eq!(graphs["segments"], 2);
+        assert_eq!(graphs["capture"], false);
+
+        let tokens = e2e_tokens();
+        let expected = e2e_logits_via(&standard, &tokens, 6, true);
+        let actual = e2e_logits_via(&segmented, &tokens, 6, true);
+        assert_eq!(actual, expected, "segmented decode must be bit-identical");
+        let graphs = segmented.cuda_graphs_summary();
+        assert_eq!(graphs["phase"], "warm", "no capture off CUDA");
+        assert_eq!(graphs["warmups"].as_u64(), Some(2 * 8), "{graphs}");
+        assert_eq!(graphs["eager_steps"], 0);
+    }
+
+    /// The segmentation on the Metal GPU, through its fused kernels.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn segmented_decode_matches_the_standard_batched_path_on_metal() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        let load = || {
+            super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &device,
+            )
+            .unwrap()
+        };
+        let standard = load();
+        let mut segmented = load();
+        segmented.enable_segmented_decode_for_tests();
+        assert_resolved_fused(&segmented, false);
+        let tokens = e2e_tokens();
+        assert_eq!(
+            e2e_logits_via(&segmented, &tokens, 6, true),
+            e2e_logits_via(&standard, &tokens, 6, true)
+        );
     }
 
     #[test]

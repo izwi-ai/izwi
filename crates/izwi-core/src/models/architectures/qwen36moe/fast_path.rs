@@ -33,7 +33,8 @@ impl Qwen36FusedPath {
 /// The global CUDA performance switches as they apply to the Qwen3.6 fast
 /// paths: `cuda.mode=off` turns all of them off, `cuda.fused_decode` the
 /// fused decode kernels (DeltaNet, norms, q/k RoPE, vectorized GEMV) and
-/// `cuda.packed_projections` the packed projections. Like qwen38's, they bind
+/// `cuda.packed_projections` the packed projections, `cuda.decode_graphs` the
+/// piecewise CUDA graph decode. Like qwen38's, they bind
 /// on CUDA only; the `IZWI_QWEN36_*` switches bind on every device. Each field
 /// is the reason its path is off, if it is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub(crate) struct Qwen36CudaSwitches {
     pub(crate) moe_off: Option<&'static str>,
     pub(crate) fused_decode_off: Option<&'static str>,
     pub(crate) packed_off: Option<&'static str>,
+    pub(crate) graphs_off: Option<&'static str>,
 }
 
 impl Qwen36CudaSwitches {
@@ -65,6 +67,7 @@ impl Qwen36CudaSwitches {
                 performance.packed_projections,
                 "cuda.packed_projections=off",
             ),
+            graphs_off: off(performance.decode_graphs, "cuda.decode_graphs=off"),
         }
     }
 }
@@ -175,10 +178,18 @@ mod tests {
         let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
         assert_eq!(switches.fused_decode_off, Some("cuda.fused_decode=off"));
         assert_eq!((switches.moe_off, switches.packed_off), (None, None));
+        assert_eq!(switches.graphs_off, None);
         assert_eq!(
             Qwen36CudaSwitches::from_performance(BackendKind::Metal, &performance),
             Qwen36CudaSwitches::default()
         );
+
+        performance.fused_decode = OptimizationMode::Auto;
+        performance.decode_graphs = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.graphs_off, Some("cuda.decode_graphs=off"));
+        assert_eq!(switches.fused_decode_off, None);
+        performance.decode_graphs = OptimizationMode::Auto;
 
         performance.fused_decode = OptimizationMode::Auto;
         performance.packed_projections = OptimizationMode::Off;
@@ -198,6 +209,7 @@ mod tests {
                 moe_off: Some("cuda.mode=off"),
                 fused_decode_off: Some("cuda.mode=off"),
                 packed_off: Some("cuda.mode=off"),
+                graphs_off: Some("cuda.mode=off"),
             }
         );
     }

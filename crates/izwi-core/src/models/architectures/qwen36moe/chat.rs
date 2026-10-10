@@ -202,6 +202,7 @@ impl Qwen36MoeChatModel {
         let qk_rope = exec.text_model.qk_rope_summary();
         let attn_gate = exec.text_model.attn_gate_summary();
         let fp8_gemv = exec.text_model.fp8_gemv_summary();
+        let cuda_graphs = exec.text_model.cuda_graphs_summary();
         tracing::info!(
             %moe,
             %gdn_decode,
@@ -209,6 +210,7 @@ impl Qwen36MoeChatModel {
             %qk_rope,
             %attn_gate,
             %fp8_gemv,
+            %cuda_graphs,
             "Qwen3.6-MoE fused kernel paths"
         );
         Ok(Self {
@@ -461,6 +463,7 @@ impl Qwen36MoeChatModel {
             "qk_rope": self.exec.text_model.qk_rope_summary(),
             "attn_gate": self.exec.text_model.attn_gate_summary(),
             "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
+            "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -1331,6 +1334,10 @@ pub(crate) mod tests {
         assert_eq!(
             model.runtime_diagnostics()["fp8_gemv"]["legacy_reasons"][0],
             "vectorized FP8 decode GEMV runs on CUDA only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["cuda_graphs"]["legacy_reasons"][0],
+            "CUDA graph decode runs on CUDA only"
         );
         assert!(gdn["legacy_reasons"][0]
             .as_str()

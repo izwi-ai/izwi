@@ -24,6 +24,11 @@ use std::path::Path;
 const PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const CUDA_DEVICE_CONVERSION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
 const CUDA_HOST_STAGING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Piecewise CUDA graph decode (`qwen36moe::decode_graph`), allocated lazily
+/// on the first decode steps. It covers the 11 segment graph pools (about
+/// 1 MiB each with retained outputs and stable inputs) and the verification
+/// steps' scratch copy of the DeltaNet state (about 63 MiB), with headroom.
+const CUDA_GRAPH_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 
 const Q8_0_BLOCK_ELEMENTS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
@@ -193,12 +198,31 @@ pub(super) fn resource_plan(
     // draft head's resident bucket joins the reservation only when enabled.
     let mtp_enabled = resolve_mtp_load_policy(backend, &performance.cuda)?
         == crate::models::architectures::qwen36moe::native::Qwen36MoeMtpLoadPolicy::Enabled;
-    let estimate = representation_memory_estimate(backend, mtp_enabled)?;
+    let mut estimate = representation_memory_estimate(backend, mtp_enabled)?;
+    let graphs = if backend == BackendKind::Cuda
+        && performance.cuda.enabled()
+        && performance.cuda.decode_graphs.enabled()
+    {
+        CUDA_GRAPH_DECODE_BYTES
+    } else {
+        0
+    };
+    estimate.resident_bytes = estimate
+        .resident_bytes
+        .checked_add(graphs)
+        .ok_or_else(overflow)?;
+    estimate.load_peak_bytes = estimate
+        .load_peak_bytes
+        .checked_add(graphs)
+        .ok_or_else(overflow)?;
     let mut plan = super::model_resource_plan(backend, estimate);
     if backend == BackendKind::Cuda {
         // Host memory only holds the shard/staging window; the raw block-FP8
         // representation uploads directly to the device.
         plan.load_authorization.host_bytes = ResourceAmount::Known(CUDA_HOST_STAGING_BYTES);
+        // The graph working set is allocated lazily, as qwen38's graph cache:
+        // keep it pending so KV fitting cannot consume the headroom.
+        plan.deferred_resident_authorization.device_bytes = ResourceAmount::Known(graphs);
     }
     Ok(plan)
 }
@@ -398,6 +422,19 @@ mod tests {
             disabled.load_authorization.device_bytes,
             ResourceAmount::Known(bytes) if bytes > 30 * GIB && bytes < 40 * GIB
         ));
+        // Graph decode's lazily allocated working set stays pending, and the
+        // decode-graphs switch drops it.
+        assert_eq!(
+            disabled.deferred_resident_authorization.device_bytes,
+            ResourceAmount::Known(CUDA_GRAPH_DECODE_BYTES)
+        );
+        let mut no_graphs = PerformanceConfig::default();
+        no_graphs.cuda.decode_graphs = crate::performance::OptimizationMode::Off;
+        let no_graphs = resource_plan(BackendKind::Cuda, &no_graphs).unwrap();
+        assert_eq!(
+            no_graphs.deferred_resident_authorization.device_bytes,
+            ResourceAmount::Known(0)
+        );
         let cpu_plan = resource_plan(BackendKind::Cpu, &PerformanceConfig::default()).unwrap();
         // Q8_0 trunk + Q8_0 LM head + F32 dense state, plus load slack.
         assert!(matches!(
