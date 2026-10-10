@@ -6,6 +6,8 @@
 *.safetensors
 *.bin
 *.gguf
+# Tiny generated test fixtures (a few hundred KB) are tracked.
+!crates/izwi-core/tests/fixtures/**/*.safetensors
 
 # UI
 /ui/node_modules/

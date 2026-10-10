@@ -2330,6 +2330,271 @@ mod tests {
         }
     }
 
+    fn golden_fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen36moe_golden")
+    }
+
+    /// Reference token ids, prompt length, and `[tokens, vocab]` logits
+    /// recorded from HF transformers' `Qwen3_5MoeForCausalLM`.
+    fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
+        let raw = std::fs::read(golden_fixture_dir().join("golden.safetensors")).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&raw).unwrap();
+        let i64s = |name: &str| -> Vec<i64> {
+            tensors
+                .tensor(name)
+                .unwrap()
+                .data()
+                .chunks_exact(8)
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        };
+        let token_ids = i64s("token_ids").into_iter().map(|v| v as u32).collect();
+        let prompt = i64s("prompt_tokens")[0] as usize;
+        let logits = tensors.tensor("logits").unwrap();
+        let vocab = logits.shape()[1];
+        let values: Vec<f32> = logits
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        (
+            token_ids,
+            prompt,
+            values.chunks(vocab).map(<[f32]>::to_vec).collect(),
+        )
+    }
+
+    fn golden_physical_cache(
+        text: &Qwen36MoeTextConfig,
+    ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
+        use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
+        use crate::engine::ModelInstanceId;
+        use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+        use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+        use std::sync::Arc;
+
+        let bindings: Vec<KvLayerBinding> = (0..text.block_count)
+            .filter(|layer| text.is_full_attention_layer(*layer))
+            .enumerate()
+            .map(|(physical, model_layer)| KvLayerBinding {
+                model_layer: model_layer as u32,
+                physical_layer: physical as u32,
+            })
+            .collect();
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(4250),
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let arena = Arc::new(
+            CpuKvArena::new(KvArenaConfig {
+                id,
+                group,
+                page_tokens: 8,
+                capacity_pages: 8,
+                growth: None,
+                dtype: candle_core::DType::F32,
+                layers: bindings
+                    .iter()
+                    .map(|binding| KvLayerConfig {
+                        binding: *binding,
+                        num_kv_heads: text.attention_head_count_kv as u32,
+                        key_head_dim: text.attention_key_length as u32,
+                        value_head_dim: text.attention_value_length as u32,
+                    })
+                    .collect(),
+            })
+            .unwrap(),
+        );
+        let blocks = (0..8u32)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
+    /// Run the trunk over the golden sequence: prefill the prompt, decode the
+    /// rest token by token (one logits row per position from `prompt - 1`),
+    /// then prefill the whole sequence in one span (its last row).
+    fn golden_trunk_logits(
+        model: &crate::models::architectures::qwen35::text::Qwen35TextModel,
+        text: &Qwen36MoeTextConfig,
+        token_ids: &[u32],
+        prompt: usize,
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let row = |logits: candle_core::Tensor| -> Vec<f32> {
+            logits
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let positions: Vec<[usize; 3]> = (0..token_ids.len()).map(|p| [p, p, p]).collect();
+
+        let mut state = model.new_state();
+        let mut cache = golden_physical_cache(text);
+        let mut rows = vec![row(model
+            .prefill_token_ids_physical(
+                &token_ids[..prompt],
+                &positions[..prompt],
+                &mut state,
+                &mut cache,
+                true,
+            )
+            .unwrap()
+            .expect("prefill logits"))];
+        for position in prompt..token_ids.len() {
+            rows.push(row(model
+                .forward_token_id_at_physical(
+                    token_ids[position],
+                    positions[position],
+                    &mut state,
+                    &mut cache,
+                )
+                .unwrap()));
+        }
+
+        let mut state = model.new_state();
+        let mut cache = golden_physical_cache(text);
+        let full = row(model
+            .prefill_token_ids_physical(token_ids, &positions, &mut state, &mut cache, true)
+            .unwrap()
+            .expect("prefill logits"));
+        (rows, full)
+    }
+
+    fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+        assert_eq!(lhs.len(), rhs.len());
+        lhs.iter()
+            .zip(rhs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn relative_l2(values: &[f32], reference: &[f32]) -> f32 {
+        let error: f32 = values
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let norm: f32 = reference.iter().map(|b| b * b).sum();
+        (error / norm).sqrt()
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index)
+            .unwrap()
+    }
+
+    /// End-to-end value parity against the reference implementation.
+    ///
+    /// The fixture (`scripts/fixtures/generate_qwen36moe_golden.py`) is a tiny
+    /// random-init HF `Qwen3_5MoeForCausalLM` written in the published
+    /// Qwen3.6-35B-A3B-FP8 layout — block-FP8 projections, BF16 dense tensors,
+    /// per-expert names — with random non-zero zero-centered norm gains and
+    /// 2 key / 4 value DeltaNet heads, plus HF's logits for every position of
+    /// a 32-token sequence. Exercised: every native loader value convention
+    /// (zero-centered `1 + w`, grouped value-head order, `A_log`, conv
+    /// orientation, FP8 block scales, per-expert gate/up/down), interleaved
+    /// partial MRoPE, the gated full attention, the DeltaNet sequence and
+    /// decode recurrences, and the routed + shared MoE.
+    ///
+    /// Two residencies: expanded F32 projections must match HF to F32
+    /// tolerance; the production CPU residency (FP8 requantized to packed
+    /// Q8_0) must track it to quantization tolerance.
+    #[test]
+    fn native_trunk_matches_the_hf_reference_logits() {
+        use crate::models::architectures::qwen35::text::Qwen35TextModel;
+        use crate::models::architectures::qwen36moe::native_model::{
+            load_text_model_native, qwen35_text_config_from_native, Qwen36MoeNativeSource,
+        };
+
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            &golden_fixture_dir(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let text = checkpoint.config.text.clone();
+        let (token_ids, prompt, reference) = golden_reference();
+        assert_eq!(reference.len(), token_ids.len());
+        assert_eq!(reference[0].len(), text.vocab_size);
+        let device = candle_core::Device::Cpu;
+
+        let exact_source = Qwen36MoeNativeSource::for_plan_tests(
+            &checkpoint,
+            Qwen36MoeProjectionResidency::ExpandedF32,
+            ProjectionMaterialization::F32,
+        );
+        let exact = Qwen35TextModel::load_with_source(
+            &exact_source,
+            &qwen35_text_config_from_native(&text),
+            &device,
+        )
+        .unwrap();
+        let (rows, full) = golden_trunk_logits(&exact, &text, &token_ids, prompt);
+        for (offset, row) in rows.iter().enumerate() {
+            let position = prompt - 1 + offset;
+            let diff = max_abs_diff(row, &reference[position]);
+            assert!(
+                diff < 2e-3,
+                "expanded-F32 logits at position {position} diverge from HF by {diff}"
+            );
+        }
+        let diff = max_abs_diff(&full, &reference[token_ids.len() - 1]);
+        assert!(
+            diff < 2e-3,
+            "full-sequence prefill diverges from HF by {diff}"
+        );
+
+        let (_, packed, _) = load_text_model_native(
+            &checkpoint,
+            &DeviceProfile::cpu(),
+            &device,
+            &crate::performance::CudaPerformanceConfig::default(),
+            false,
+        )
+        .unwrap();
+        // Candle's CPU Q8_0 matmul also quantizes the activations, so this
+        // residency carries a few percent of relative logit error (more on a
+        // position where the noise flips an expert choice). A loader
+        // convention error is ~100%, far outside these bounds.
+        let (rows, _) = golden_trunk_logits(&packed, &text, &token_ids, prompt);
+        let mut agree = 0usize;
+        let mut total_relative = 0.0f32;
+        for (offset, row) in rows.iter().enumerate() {
+            let position = prompt - 1 + offset;
+            let relative = relative_l2(row, &reference[position]);
+            assert!(
+                relative < 0.25,
+                "packed-Q8 logits at position {position} diverge from HF by {relative} (relative L2)"
+            );
+            total_relative += relative;
+            agree += usize::from(argmax(row) == argmax(&reference[position]));
+        }
+        let mean_relative = total_relative / rows.len() as f32;
+        assert!(
+            mean_relative < 0.08,
+            "packed-Q8 mean relative logit error {mean_relative} exceeds quantization tolerance"
+        );
+        assert!(
+            agree * 5 >= rows.len() * 4,
+            "packed-Q8 greedy tokens agree with HF on only {agree}/{} positions",
+            rows.len()
+        );
+    }
+
     /// Run the shared trunk's prefill + decode under a backend dtype plan and
     /// assert the trunk's activation dtype survives the head with finite
     /// logits. Used by the hardware-gated plan tests: the CPU device cannot
