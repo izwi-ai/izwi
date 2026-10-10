@@ -64,8 +64,8 @@ impl Qwen36MoeBackendRequest {
 
 /// One layer's experts stacked for the fused kernels.
 pub(crate) struct Qwen36MoeFusedExperts {
-    /// Router rows, plus the shared-expert gate row when it is folded in.
-    router: Qwen36MoeLinear,
+    /// F32 router rows, plus the shared-expert gate row when it is folded in.
+    router: Tensor,
     spec: RouteSpec,
     hidden: usize,
     inter: usize,
@@ -253,7 +253,7 @@ impl Qwen36MoeFusedExperts {
         };
         Qwen36MoeStacking::Stacked {
             fused: Self {
-                router: Qwen36MoeLinear::from_dense(router_tensor),
+                router: router_tensor,
                 spec,
                 hidden,
                 inter,
@@ -371,7 +371,7 @@ impl Qwen36MoeFusedExperts {
 
     /// Routed (plus folded shared) output for `flat` `[tokens, hidden]`.
     pub(crate) fn forward(&self, flat: &Tensor) -> Result<Tensor> {
-        let logits = self.router.project(flat)?;
+        let logits = moe::router_logits(flat, &self.router)?;
         let routing = moe::route(&logits, &self.spec)?;
         self.combine(flat, &routing)
     }
@@ -385,8 +385,9 @@ impl Qwen36MoeFusedExperts {
     /// Check the fused kernels on this device against independent references
     /// before serving with them:
     ///
-    /// 1. the device router against the portable router on the same logits
-    ///    (identical ids, weights within 1e-4);
+    /// 1. the router GEMV against the dense router projection, then the device
+    ///    router against the portable router on the same logits (identical
+    ///    ids, weights within 1e-4);
     /// 2. the grouped expert kernels against `Σ weight · expert(x)`, computed
     ///    with the per-expert projections the legacy path uses, under the same
     ///    routing.
@@ -424,7 +425,24 @@ impl Qwen36MoeFusedExperts {
             let x = Tensor::from_vec(values, (tokens, self.hidden), &Device::Cpu)?
                 .to_dtype(dtype)?
                 .to_device(&device)?;
-            let logits = self.router.project(&x)?;
+            // Router GEMV against the dense projection it replaces.
+            let logits = moe::router_logits(&x, &self.router)?;
+            let projected = Qwen36MoeLinear::from_dense(self.router.clone())
+                .project(&x)?
+                .to_dtype(DType::F32)?;
+            compare_values(
+                "fused MoE router logits",
+                &logits
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?,
+                &projected
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?,
+                0.01,
+                0.02,
+            )?;
             let routing = moe::route(&logits, &self.spec)?;
             let actual = routing.to_device(&Device::Cpu)?.to_vec2::<f32>()?;
             let expected =

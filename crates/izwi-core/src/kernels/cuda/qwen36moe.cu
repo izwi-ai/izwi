@@ -604,3 +604,47 @@ __device__ void q36_qk_norm_rope(
 
 Q36_QK_EXPORT(__half, f16)
 Q36_QK_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Router GEMV: logits[t, e] = round_T(x[t] . w[e]) as F32. Reads the 16-bit
+// activations and F32 router rows directly, replacing cast -> F32 GEMM ->
+// cast -> cast before routing. Logits are rounded through T so routing sees
+// the same values as a T-dtype router projection. One warp per router row,
+// eight rows per block; grid (ceil(rows / 8), tokens). Requires hidden % 4 == 0.
+template <class T>
+__device__ void q36_router_logits(
+    const T* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ out,
+    int rows,
+    int hidden) {
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * Q36_WARPS + (threadIdx.x >> 5);
+  const int token = blockIdx.y;
+  if (row >= rows) {
+    return;
+  }
+  const float* wr = w + (size_t)row * hidden;
+  const T* xt = x + (size_t)token * hidden;
+  float acc = 0.f;
+  for (int k = lane * 4; k < hidden; k += 32 * 4) {
+    const float4 wv = *reinterpret_cast<const float4*>(wr + k);
+    acc = fmaf(float(xt[k]), wv.x, acc);
+    acc = fmaf(float(xt[k + 1]), wv.y, acc);
+    acc = fmaf(float(xt[k + 2]), wv.z, acc);
+    acc = fmaf(float(xt[k + 3]), wv.w, acc);
+  }
+  acc = q36_warp_sum(acc);
+  if (lane == 0) {
+    out[(size_t)token * rows + row] = float(T(acc));
+  }
+}
+
+#define Q36_ROUTER_EXPORT(T, S)                                                                \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_router_logits_##S(              \
+      const T* x, const float* w, float* out, int rows, int hidden) {                          \
+    q36_router_logits<T>(x, w, out, rows, hidden);                                             \
+  }
+
+Q36_ROUTER_EXPORT(__half, f16)
+Q36_ROUTER_EXPORT(__nv_bfloat16, bf16)

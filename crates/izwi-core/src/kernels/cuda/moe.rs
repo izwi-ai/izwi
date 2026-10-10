@@ -114,6 +114,32 @@ pub fn supported(device: &Device, dtype: DType, hidden: usize, inter: usize, slo
     }
 }
 
+/// Router projection: `x` `[tokens, hidden]` (16-bit activations; F32 on the
+/// CPU reference) against F32 router rows `[rows, hidden]` → F32 logits
+/// `[tokens, rows]`, rounded through the activation dtype so routing sees the
+/// values a projection in that dtype would produce.
+pub fn router_logits(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let (tokens, hidden) = x.dims2()?;
+    let (rows, w_hidden) = weight.dims2()?;
+    if w_hidden != hidden || weight.dtype() != DType::F32 || !hidden.is_multiple_of(4) {
+        candle_core::bail!(
+            "invalid MoE router contract: x {:?}, weight {:?} {:?}",
+            x.dims(),
+            weight.dims(),
+            weight.dtype()
+        )
+    }
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        return cuda_impl::router(x, weight, tokens, rows, hidden);
+    }
+    let _ = (tokens, rows);
+    x.to_dtype(DType::F32)?
+        .matmul(&weight.t()?)?
+        .to_dtype(x.dtype())?
+        .to_dtype(DType::F32)
+}
+
 /// Fused router: `logits` `[tokens, spec.logit_columns()]` (any float dtype,
 /// computed in F32) → routing `[tokens, 2 * slots]` F32 on the same device.
 pub fn route(logits: &Tensor, spec: &RouteSpec) -> Result<Tensor> {
@@ -419,6 +445,60 @@ mod cuda_impl {
     fn i32_arg(value: usize, name: &str) -> Result<i32> {
         i32::try_from(value)
             .map_err(|_| candle_core::Error::Msg(format!("fused MoE {name} {value} exceeds i32")))
+    }
+
+    pub(super) fn router(
+        x: &Tensor,
+        weight: &Tensor,
+        tokens: usize,
+        rows: usize,
+        hidden: usize,
+    ) -> Result<Tensor> {
+        let device = x.device().as_cuda_device()?;
+        let (x, weight) = (x.contiguous()?, weight.contiguous()?);
+        let (x_storage, x_layout) = x.storage_and_layout();
+        let (w_storage, w_layout) = weight.storage_and_layout();
+        if !w_layout.start_offset().is_multiple_of(4) {
+            candle_core::bail!("MoE router rows must start on a 16-byte boundary")
+        }
+        let w = view::<f32>(&w_storage, w_layout, "router weight")?;
+        // SAFETY: one warp writes every (token, row) logit.
+        let out = unsafe { device.alloc::<f32>(tokens * rows)? };
+        let config = LaunchConfig {
+            grid_dim: (
+                (rows as u32).div_ceil(WARPS),
+                u32::try_from(tokens).map_err(|_| candle_core::Error::Msg("router grid".into()))?,
+                1,
+            ),
+            block_dim: (32 * WARPS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! run {
+            ($ty:ty, $name:literal) => {{
+                let xv = view::<$ty>(&x_storage, x_layout, "activations")?;
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&xv);
+                builder.arg(&w);
+                builder.arg(&out);
+                candle_core::builder_arg!(builder, rows as i32, i32_arg(hidden, "hidden")?);
+                // SAFETY: validated shapes; argument order matches the kernel.
+                unsafe { builder.launch(config) }.w()?;
+            }};
+        }
+        match x.dtype() {
+            DType::BF16 => run!(half::bf16, "qwen36moe_router_logits_bf16"),
+            DType::F16 => run!(half::f16, "qwen36moe_router_logits_f16"),
+            other => {
+                candle_core::bail!("MoE router CUDA activations must be F16/BF16, found {other:?}")
+            }
+        }
+        drop((x_storage, w_storage));
+        Ok(wrap(out, device, Shape::from((tokens, rows))))
     }
 
     pub(super) fn route(logits: &Tensor, tokens: usize, spec: &RouteSpec) -> Result<Tensor> {
@@ -804,6 +884,45 @@ mod tests {
             .map(|v| v.exp())
             .sum();
         assert!((routing[1][2] - 4.0f32.exp() / total).abs() < 1e-6);
+    }
+
+    #[test]
+    fn router_logits_round_through_the_activation_dtype() {
+        let x = Tensor::from_vec(
+            (0..2 * 8)
+                .map(|i| (i as f32 * 0.37).sin() * 2.0)
+                .collect::<Vec<_>>(),
+            (2, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let w = Tensor::from_vec(
+            (0..3 * 8)
+                .map(|i| (i as f32 * 0.61).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            (3, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let exact = router_logits(&x, &w).unwrap().to_vec2::<f32>().unwrap();
+        let bf16 = router_logits(&x.to_dtype(DType::BF16).unwrap(), &w)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for (row, (e, b)) in exact.iter().zip(&bf16).enumerate() {
+            for (a, c) in e.iter().zip(b) {
+                assert!(
+                    (a - c).abs() <= a.abs() / 64.0 + 1e-3,
+                    "row {row}: {a} vs {c}"
+                );
+                assert_eq!(
+                    *c,
+                    half::bf16::from_f32(*c).to_f32(),
+                    "BF16-representable logit"
+                );
+            }
+        }
+        assert!(router_logits(&x, &w.narrow(1, 0, 4).unwrap()).is_err());
     }
 
     #[test]
