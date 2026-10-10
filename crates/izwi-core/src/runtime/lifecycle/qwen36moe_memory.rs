@@ -16,7 +16,8 @@ use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
 use crate::models::architectures::qwen36moe::native::{
-    pinned_representation_inventory, resolve_mtp_load_policy, RepresentationElementBucket,
+    pinned_native_config, pinned_representation_inventory, resolve_mtp_load_policy,
+    RepresentationElementBucket,
 };
 use std::path::Path;
 
@@ -113,6 +114,21 @@ fn bucket_resident_bytes(
     }
 }
 
+/// Load transient of the fused MoE expert stacking on CUDA and Metal, which
+/// keep the experts raw block-FP8. While a layer stacks, its gate and up
+/// stacks and their concatenation coexist with the loaded originals: 4/3 of
+/// one layer's expert bytes and scales. Layers stack one at a time.
+fn expert_stacking_transient_bytes() -> Result<u64> {
+    let inventory = pinned_representation_inventory();
+    let layers = pinned_native_config().text.block_count as u64;
+    let layer_bytes = inventory
+        .expert_fp8_elements
+        .checked_add(inventory.expert_fp8_scale_bytes)
+        .ok_or_else(overflow)?
+        .div_ceil(layers);
+    layer_bytes.div_ceil(3).checked_mul(4).ok_or_else(overflow)
+}
+
 /// Resident bytes of the pinned checkpoint on one backend, plus the MTP
 /// draft bucket when the load policy makes the draft head resident.
 fn resident_bytes(
@@ -149,16 +165,20 @@ pub(super) fn representation_memory_estimate(
         .checked_mul(super::PER_TENSOR_INSTANTIATION_SLACK_BYTES)
         .ok_or_else(overflow)?;
     let resident_bytes = resident_bytes(backend, mtp_enabled.then_some(&inventory.mtp))?;
-    let load_peak_bytes = match backend {
-        BackendKind::Cpu | BackendKind::Metal => resident_bytes
-            .checked_add(PORTABLE_CONVERSION_SCRATCH_BYTES)
+    let load_scratch = match backend {
+        BackendKind::Cpu => PORTABLE_CONVERSION_SCRATCH_BYTES,
+        BackendKind::Metal => PORTABLE_CONVERSION_SCRATCH_BYTES
+            .checked_add(expert_stacking_transient_bytes()?)
             .ok_or_else(overflow)?,
-        BackendKind::Cuda => resident_bytes
-            .checked_add(CUDA_DEVICE_CONVERSION_SCRATCH_BYTES)
+        BackendKind::Cuda => CUDA_DEVICE_CONVERSION_SCRATCH_BYTES
+            .checked_add(expert_stacking_transient_bytes()?)
             .ok_or_else(overflow)?,
-    }
-    .checked_add(instantiation_slack)
-    .ok_or_else(overflow)?;
+    };
+    let load_peak_bytes = resident_bytes
+        .checked_add(load_scratch)
+        .ok_or_else(overflow)?
+        .checked_add(instantiation_slack)
+        .ok_or_else(overflow)?;
     Ok(ModelMemoryEstimate {
         load_peak_bytes,
         resident_bytes,
@@ -313,6 +333,15 @@ mod tests {
             + inventory.dense_elements * 2;
         assert_eq!(cuda.resident_bytes, expected_cuda);
         assert!(cuda.load_peak_bytes > cuda.resident_bytes);
+        // Fused-MoE stacking holds 4/3 of one layer's experts (257 x 3
+        // projections of 512 x 2048 FP8 bytes) on top while a layer stacks.
+        let stacking = expert_stacking_transient_bytes().unwrap();
+        assert!(
+            stacking > GIB * 9 / 10 && stacking < GIB * 11 / 10,
+            "stacking transient {stacking}"
+        );
+        assert!(cuda.load_peak_bytes > cuda.resident_bytes + stacking);
+        assert!(metal.load_peak_bytes > metal.resident_bytes + stacking);
         // The compact residency holds ~half of the Metal F16 expansion and
         // stays below even the CPU Q8_0 + F32-dense envelope.
         assert!(
