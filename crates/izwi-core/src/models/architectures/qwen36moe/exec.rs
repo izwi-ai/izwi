@@ -1276,6 +1276,26 @@ impl Qwen36ChatExec {
         drop(text_states);
         drop(caches);
 
+        // An all-greedy CUDA batch reads every row's token back at once.
+        let vocab_size = self.tokenizer.vocab_size;
+        let batch_greedy = if logits.device().is_cuda()
+            && vocab_size > 0
+            && states.iter().all(|state| {
+                state.grammar.is_none()
+                    && !state.config.logprobs
+                    && deterministic_greedy(&state.config)
+            }) {
+            let rows = logits.i((.., 0))?;
+            let rows = if vocab_size < rows.dim(1)? {
+                rows.narrow(1, 0, vocab_size)?
+            } else {
+                rows
+            };
+            Some(device_greedy_rows(&rows)?)
+        } else {
+            None
+        };
+
         let mut sampled = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
             let history = if state.track_history {
@@ -1285,7 +1305,13 @@ impl Qwen36ChatExec {
             };
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
-            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
+            let (token, raw_logprobs) = if let Some(tokens) = &batch_greedy {
+                // A row without a finite logit takes the reporting slow path.
+                match tokens[row] {
+                    Some(token) => (token, None),
+                    None => (argmax_clamped(&row_logits, vocab_size)?, None),
+                }
+            } else if let Some(grammar) = state.grammar.as_mut() {
                 grammar.sample_token(
                     &row_logits,
                     self.tokenizer.vocab_size,
@@ -2856,12 +2882,7 @@ fn sample_next_token(
 
     // Fast path for deterministic greedy decode (bench/default path):
     // avoid copying full logits tensors to CPU each token.
-    let deterministic_greedy = config.temperature <= 1e-5
-        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        && config.presence_penalty.abs() <= f32::EPSILON
-        && config.top_k == 0
-        && config.top_p >= 1.0;
-    if deterministic_greedy {
+    if deterministic_greedy(config) {
         return argmax_clamped(logits, vocab_size);
     }
 
@@ -3097,6 +3118,27 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
         .ok_or_else(|| no_valid_logits_error(values))
 }
 
+/// Plain greedy decode: no temperature, penalties, top-k or top-p.
+fn deterministic_greedy(config: &ChatGenerationConfig) -> bool {
+    config.temperature <= 1e-5
+        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
+        && config.presence_penalty.abs() <= f32::EPSILON
+        && config.top_k == 0
+        && config.top_p >= 1.0
+}
+
+/// Greedy tokens for `[rows, vocab]` logits with one readback. The device
+/// kernel returns each row's highest finite logit, lowest index on ties (the
+/// semantics of [`argmax_values`]), and whether the row had one. `None` marks
+/// a row without a finite logit.
+fn device_greedy_rows(logits: &Tensor) -> Result<Vec<Option<u32>>> {
+    let packed = crate::kernels::cuda::sampling::greedy_rows(logits)?.to_vec2::<u32>()?;
+    Ok(packed
+        .into_iter()
+        .map(|row| (row[1] != 0).then_some(row[0]))
+        .collect())
+}
+
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
         1 => logits.clone(),
@@ -3160,6 +3202,14 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     } else {
         logits
     };
+    if clamped.device().is_cuda() {
+        // One readback instead of argmax + selected-logit reads.
+        if let Some(token) = device_greedy_rows(&clamped.unsqueeze(0)?)?[0] {
+            return Ok(token);
+        }
+        let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        return argmax_values(&values);
+    }
     let selected = argmax(&clamped)?;
     let selected_logit = clamped
         .i(selected as usize)?
@@ -3251,6 +3301,26 @@ mod tests {
     use super::*;
     use crate::models::shared::chat::ChatRequestConfig;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn device_greedy_rows_share_the_host_fallback_semantics() {
+        let rows = [
+            vec![1.0f32, 3.0, 3.0, -2.0],              // tie: lowest index
+            vec![f32::NAN, 0.5, f32::INFINITY, 0.25],  // non-finite skipped
+            vec![-1.0, f32::NEG_INFINITY, -0.5, -0.5], // tie after -inf
+            vec![f32::NAN, f32::INFINITY, f32::NAN, f32::NEG_INFINITY], // none finite
+        ];
+        let logits =
+            Tensor::from_vec(rows.concat(), (rows.len(), 4), &candle_core::Device::Cpu).unwrap();
+        let tokens = device_greedy_rows(&logits).unwrap();
+        for (row, (values, token)) in rows.iter().zip(&tokens).enumerate() {
+            assert_eq!(*token, argmax_values(values).ok(), "row {row}");
+        }
+        assert_eq!(tokens, vec![Some(1), Some(1), Some(2), None]);
+        // BF16 logits (the CUDA trunk dtype) select the same tokens.
+        let bf16 = device_greedy_rows(&logits.to_dtype(DType::BF16).unwrap()).unwrap();
+        assert_eq!(bf16, tokens);
+    }
 
     fn byte_level_char_for_test(byte: u8) -> char {
         let mut bytes: Vec<u8> = (b'!'..=b'~')
