@@ -29,6 +29,7 @@ use candle_nn::ops;
 
 use crate::error::{Error, Result};
 use crate::kernels::cuda::moe::{self, RouteSpec, SharedSlot};
+use crate::models::architectures::qwen36moe::fast_path::{compare_values, legacy_value};
 use crate::models::architectures::qwen36moe::sparse::{
     Qwen36MoeExpertWeights, Qwen36MoeLinear, Qwen36MoeSharedExpertWeights,
 };
@@ -53,18 +54,12 @@ impl Qwen36MoeBackendRequest {
     }
 
     fn parse(value: Option<&str>) -> Self {
-        match value.map(|value| value.trim().to_ascii_lowercase()) {
-            Some(value) if value == "legacy" => Self::Legacy,
-            _ => Self::Auto,
+        if legacy_value(value) {
+            Self::Legacy
+        } else {
+            Self::Auto
         }
     }
-}
-
-/// Execution path a sparse block resolved to, reported in diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Qwen36MoeBackend {
-    Fused,
-    Legacy { reason: String },
 }
 
 /// One layer's experts stacked for the fused kernels.
@@ -493,35 +488,18 @@ fn expert_forward(
     down.project(&(ops::silu(&gate)? * up)?)
 }
 
-/// Relative L2 error at most 3% and every element within 8% of the largest
-/// reference magnitude. The per-expert reference rounds each projection to the
-/// activation dtype; the fused path accumulates the combine in F32. A wrong
+/// The per-expert reference rounds each projection to the activation dtype
+/// while the fused path accumulates the combine in F32, so allow a 3% relative
+/// L2 error and 8% of the largest reference magnitude per element. A wrong
 /// expert, scale block or row produces errors near 100%.
 fn compare(fused: &[Vec<f32>], reference: &[Vec<f32>], tokens: usize) -> Result<()> {
-    let mut err = 0f64;
-    let mut norm = 0f64;
-    let mut max_ref = 0f32;
-    let mut max_err = 0f32;
-    for (got, want) in fused.iter().zip(reference) {
-        for (a, b) in got.iter().zip(want) {
-            if !a.is_finite() {
-                return Err(Error::InferenceError(format!(
-                    "fused MoE produced a non-finite value (T={tokens})"
-                )));
-            }
-            err += f64::from(a - b).powi(2);
-            norm += f64::from(*b).powi(2);
-            max_ref = max_ref.max(b.abs());
-            max_err = max_err.max((a - b).abs());
-        }
-    }
-    let rel_l2 = (err / norm.max(f64::MIN_POSITIVE)).sqrt();
-    if rel_l2 > 0.03 || max_err > 0.08 * max_ref.max(f32::MIN_POSITIVE) {
-        return Err(Error::InferenceError(format!(
-            "fused MoE output diverges from the per-expert reference (T={tokens}): relative L2 {rel_l2:.4}, max error {max_err} vs max |ref| {max_ref}"
-        )));
-    }
-    Ok(())
+    compare_values(
+        &format!("fused MoE (T={tokens})"),
+        &fused.concat(),
+        &reference.concat(),
+        0.03,
+        0.08,
+    )
 }
 
 #[cfg(test)]

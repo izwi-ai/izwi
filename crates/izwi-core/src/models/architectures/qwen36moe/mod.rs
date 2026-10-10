@@ -17,6 +17,7 @@
 pub(crate) mod cache;
 pub mod chat;
 pub mod exec;
+pub(crate) mod fast_path;
 pub(crate) mod fused_moe;
 pub(crate) mod gguf;
 pub(crate) mod mtp;

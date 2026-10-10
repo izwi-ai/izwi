@@ -37,9 +37,9 @@ use crate::models::shared::moe::{
 };
 use crate::models::shared::weights::gguf::GgufLoader;
 
+use crate::models::architectures::qwen36moe::fast_path::Qwen36FusedPath;
 use crate::models::architectures::qwen36moe::fused_moe::{
-    Qwen36MoeBackend, Qwen36MoeBackendRequest, Qwen36MoeFusedExperts, Qwen36MoeStacking,
-    BACKEND_ENV,
+    Qwen36MoeBackendRequest, Qwen36MoeFusedExperts, Qwen36MoeStacking, BACKEND_ENV,
 };
 use crate::models::architectures::qwen36moe::text::Qwen36MoeFfnGeometry;
 
@@ -157,7 +157,7 @@ pub(crate) struct Qwen36MoeSparseMlp {
     shared: Qwen36MoeSharedExpert,
     counters: Arc<ExpertActivationCounters>,
     fused: Option<Qwen36MoeFusedExperts>,
-    backend: Qwen36MoeBackend,
+    backend: Qwen36FusedPath,
 }
 
 impl Qwen36MoeSparseMlp {
@@ -209,9 +209,7 @@ impl Qwen36MoeSparseMlp {
                 experts,
                 shared,
                 None,
-                Qwen36MoeBackend::Legacy {
-                    reason: format!("{BACKEND_ENV}=legacy"),
-                },
+                Qwen36FusedPath::legacy(format!("{BACKEND_ENV}=legacy")),
             ),
             Qwen36MoeBackendRequest::Auto => {
                 match Qwen36MoeFusedExperts::stack(&router, experts, shared, geometry) {
@@ -220,7 +218,7 @@ impl Qwen36MoeSparseMlp {
                         experts,
                         shared,
                     } => match fused.self_check(&experts, &shared) {
-                        Ok(()) => (experts, shared, Some(fused), Qwen36MoeBackend::Fused),
+                        Ok(()) => (experts, shared, Some(fused), Qwen36FusedPath::Fused),
                         Err(reason) => {
                             tracing::warn!(
                                 reason,
@@ -230,9 +228,7 @@ impl Qwen36MoeSparseMlp {
                                 experts,
                                 shared,
                                 None,
-                                Qwen36MoeBackend::Legacy {
-                                    reason: format!("self-check failed: {reason}"),
-                                },
+                                Qwen36FusedPath::legacy(format!("self-check failed: {reason}")),
                             )
                         }
                     },
@@ -240,7 +236,7 @@ impl Qwen36MoeSparseMlp {
                         experts,
                         shared,
                         reason,
-                    } => (experts, shared, None, Qwen36MoeBackend::Legacy { reason }),
+                    } => (experts, shared, None, Qwen36FusedPath::Legacy { reason }),
                 }
             }
         };
@@ -257,7 +253,7 @@ impl Qwen36MoeSparseMlp {
     }
 
     /// Execution path this block resolved to at load.
-    pub(crate) fn backend(&self) -> &Qwen36MoeBackend {
+    pub(crate) fn backend(&self) -> &Qwen36FusedPath {
         &self.backend
     }
 
@@ -820,8 +816,8 @@ mod tests {
         fn assert_matches_legacy(shared_ff: usize, gated: bool) {
             let fused = block(Qwen36MoeBackendRequest::Auto, shared_ff, gated);
             let legacy = block(Qwen36MoeBackendRequest::Legacy, shared_ff, gated);
-            assert_eq!(fused.backend(), &Qwen36MoeBackend::Fused);
-            assert!(matches!(legacy.backend(), Qwen36MoeBackend::Legacy { .. }));
+            assert_eq!(fused.backend(), &Qwen36FusedPath::Fused);
+            assert!(matches!(legacy.backend(), Qwen36FusedPath::Legacy { .. }));
             for tokens in [1, 4] {
                 let x = input(tokens);
                 let expected = values(&legacy.forward(&x).unwrap());
@@ -871,7 +867,7 @@ mod tests {
         fn legacy_switch_and_unsupported_residency_report_their_reason() {
             let legacy = block(Qwen36MoeBackendRequest::Legacy, I, true);
             assert!(
-                matches!(legacy.backend(), Qwen36MoeBackend::Legacy { reason } if reason.contains(BACKEND_ENV))
+                matches!(legacy.backend(), Qwen36FusedPath::Legacy { reason } if reason.contains(BACKEND_ENV))
             );
             let dense_experts = (0..E)
                 .map(|_| Qwen36MoeExpertWeights {
@@ -895,7 +891,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                matches!(dense.backend(), Qwen36MoeBackend::Legacy { reason } if reason.contains("block-FP8"))
+                matches!(dense.backend(), Qwen36FusedPath::Legacy { reason } if reason.contains("block-FP8"))
             );
         }
 

@@ -703,36 +703,10 @@ impl Qwen36TextModel {
     /// admin diagnostics: how many layers run the device-routed fused kernels
     /// and why any others stayed on the per-expert loop.
     pub(crate) fn moe_backend_summary(&self) -> serde_json::Value {
-        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackend;
-        let mut fused = 0usize;
-        let mut legacy = 0usize;
-        let mut reasons: Vec<String> = Vec::new();
-        for layer in &self.layers {
-            let Qwen36FeedForward::Sparse(moe) = &layer.ffn else {
-                continue;
-            };
-            match moe.backend() {
-                Qwen36MoeBackend::Fused => fused += 1,
-                Qwen36MoeBackend::Legacy { reason } => {
-                    legacy += 1;
-                    if !reasons.contains(reason) {
-                        reasons.push(reason.clone());
-                    }
-                }
-            }
-        }
-        let backend = match (fused, legacy) {
-            (0, 0) => "none",
-            (_, 0) => "fused",
-            (0, _) => "legacy",
-            _ => "mixed",
-        };
-        serde_json::json!({
-            "backend": backend,
-            "fused_layers": fused,
-            "legacy_layers": legacy,
-            "legacy_reasons": reasons,
-        })
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.ffn {
+            Qwen36FeedForward::Sparse(moe) => Some(moe.backend()),
+            Qwen36FeedForward::Dense(_) => None,
+        }))
     }
 
     pub(crate) fn forward_token_id_at_physical(
