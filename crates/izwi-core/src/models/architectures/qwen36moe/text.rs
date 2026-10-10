@@ -15,6 +15,7 @@ use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::gate;
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::norm;
 use crate::kernels::cuda::rope::{self, MropePosition, QkNormRopeSpec};
@@ -348,6 +349,9 @@ pub(crate) struct Qwen36FullAttention {
     fused_qk_path: Qwen36FusedPath,
     /// `q_proj` + `k_proj` + `v_proj` packed for one decode GEMV.
     packed_qkv: Option<Qwen36Projection>,
+    /// Output gate `attn * sigmoid(gate)` in one launch, when resolved at load.
+    fused_gate: bool,
+    fused_gate_path: Qwen36FusedPath,
 }
 
 struct Qwen36LinearAttention {
@@ -1040,6 +1044,15 @@ impl Qwen36TextModel {
         }))
     }
 
+    /// Fused attention output gate across the full-attention layers, for the
+    /// admin diagnostics.
+    pub(crate) fn attn_gate_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Full(attention) => Some(&attention.fused_gate_path),
+            Qwen36Mixer::Linear(_) => None,
+        }))
+    }
+
     /// Fused RMSNorm resolution, for the admin diagnostics.
     pub(crate) fn rms_norm_summary(&self) -> serde_json::Value {
         super::fast_path::summarize([&self.fused_norm_path])
@@ -1103,6 +1116,7 @@ impl Qwen36TextModel {
                         &mut attention.v_proj,
                     ]);
                     attention.resolve_fused_qk(&device, true);
+                    attention.resolve_fused_gate(&device, true);
                 }
             }
         }
@@ -1861,6 +1875,8 @@ impl Qwen36FullAttention {
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
             packed_qkv: None,
+            fused_gate: false,
+            fused_gate_path: Qwen36FusedPath::legacy("unresolved"),
         };
         let cuda = source.cuda_switches();
         if fused_device(device, false)
@@ -1874,8 +1890,14 @@ impl Qwen36FullAttention {
             ]);
         }
         match cuda.fused_decode_off {
-            Some(reason) => attention.fused_qk_path = Qwen36FusedPath::legacy(reason),
-            None => attention.resolve_fused_qk(device, false),
+            Some(reason) => {
+                attention.fused_qk_path = Qwen36FusedPath::legacy(reason);
+                attention.fused_gate_path = Qwen36FusedPath::legacy(reason);
+            }
+            None => {
+                attention.resolve_fused_qk(device, false);
+                attention.resolve_fused_gate(device, false);
+            }
         }
         Ok(attention)
     }
@@ -1963,6 +1985,79 @@ impl Qwen36FullAttention {
     /// The M-RoPE position the fused kernel would use, or `None` when the
     /// positions need sections this layer does not declare (the reference
     /// chain reports that error).
+    /// Enable the one-launch output gate after it matches the Candle
+    /// composition on this device. Shares the fused-decode kill switch.
+    fn resolve_fused_gate(&mut self, device: &Device, allow_cpu: bool) {
+        self.fused_gate = false;
+        let dtype = norm_dtype(device);
+        self.fused_gate_path = if legacy_requested(FUSED_DECODE_ENV) {
+            Qwen36FusedPath::legacy(format!("{FUSED_DECODE_ENV}=legacy"))
+        } else if !fused_device(device, allow_cpu) {
+            Qwen36FusedPath::legacy("fused attention output gate runs on CUDA and Metal only")
+        } else if !gate::supported(device, dtype) {
+            Qwen36FusedPath::legacy("fused attention output gate needs SM80+ on CUDA")
+        } else {
+            match self.fused_gate_self_check(device, dtype) {
+                Ok(()) => {
+                    self.fused_gate = true;
+                    Qwen36FusedPath::Fused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.6 fused attention gate self-check failed; using the Candle composition"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    fn fused_gate_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (heads, head_dim) = (self.num_heads, self.head_dim);
+        let width = heads * head_dim;
+        let wave = |n: usize, seed: f32, scale: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+                .collect::<Vec<_>>()
+        };
+        let operand = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor> {
+            Ok(Tensor::from_vec(values, shape, &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(device)?)
+        };
+        // Two rows: the decode batch path gates several rows at once.
+        let attn = operand(wave(2 * width, 0.5, 3.0), &[2, 1, width])?;
+        let q_proj = operand(wave(4 * width, 1.5, 6.0), &[2, 1, heads, 2 * head_dim])?;
+        let host = |tensor: Tensor| -> Result<Vec<f32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<f32>()?)
+        };
+        compare_values(
+            "attention output gate",
+            &host(gate::attn_gate(&attn, &q_proj, heads, head_dim)?)?,
+            &host(gate::reference(&attn, &q_proj, heads, head_dim)?)?,
+            0.01,
+            0.02,
+        )
+    }
+
+    /// `output * sigmoid(gate)`, the gate being the second half of each
+    /// head's slice of the gated `q_proj` `[.., heads, 2 * head_dim]`.
+    fn gate_output(&self, output: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        if self.fused_gate && output.dtype() == q_proj.dtype() {
+            return gate::attn_gate(output, q_proj, self.num_heads, self.head_dim)
+                .map_err(Error::from);
+        }
+        let gate = q_proj
+            .narrow(3, self.head_dim, self.head_dim)?
+            .reshape(output.shape())?;
+        (output * &ops::sigmoid(&gate)?).map_err(Error::from)
+    }
+
     fn fused_position(&self, position_ids: [usize; 3]) -> Option<MropePosition> {
         let sectioned = position_ids[0] != position_ids[1] || position_ids[0] != position_ids[2];
         if sectioned
@@ -2127,11 +2222,6 @@ impl Qwen36FullAttention {
                 ))?,
             )
         };
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            1,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
         let (query_states, key_states) = if seq_len == 1 {
             self.token_qk(&q_proj, &key_states, position_ids[0])?
         } else {
@@ -2166,7 +2256,7 @@ impl Qwen36FullAttention {
             output
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        let output = self.gate_output(&output, &q_proj)?;
         self.o_proj.forward(&output)
     }
 
@@ -2206,11 +2296,6 @@ impl Qwen36FullAttention {
             ));
         }
         let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
@@ -2263,7 +2348,7 @@ impl Qwen36FullAttention {
             1,
             self.num_heads * self.head_dim,
         ))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        let output = self.gate_output(&output, &q_proj)?;
         self.o_proj.forward(&output)
     }
 
@@ -4079,6 +4164,8 @@ mod tests {
             fused_qk: None,
             fused_qk_path: Qwen36FusedPath::legacy("test"),
             packed_qkv: None,
+            fused_gate: false,
+            fused_gate_path: Qwen36FusedPath::legacy("test"),
         }
     }
 
@@ -4562,6 +4649,12 @@ mod tests {
             "{}",
             fused.rms_norm_summary()
         );
+        assert_eq!(
+            fused.attn_gate_summary()["backend"],
+            "fused",
+            "{}",
+            fused.attn_gate_summary()
+        );
         assert_eq!(legacy.moe_backend_summary()["backend"], "legacy");
 
         assert_tracks_reference(&fused, &legacy, 0.01);
@@ -4629,6 +4722,11 @@ mod tests {
             ),
             ("qk_rope", model.qk_rope_summary(), "cuda.fused_decode=off"),
             (
+                "attn_gate",
+                model.attn_gate_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
                 "rms_norm",
                 model.rms_norm_summary(),
                 "cuda.fused_decode=off",
@@ -4658,6 +4756,7 @@ mod tests {
             ("gdn_decode", model.gdn_decode_summary()),
             ("qk_rope", model.qk_rope_summary()),
             ("rms_norm", model.rms_norm_summary()),
+            ("attn_gate", model.attn_gate_summary()),
         ];
         if cuda {
             paths.push(("fp8_gemv", model.fp8_gemv_summary()));
