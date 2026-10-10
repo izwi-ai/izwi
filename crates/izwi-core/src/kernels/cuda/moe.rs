@@ -1406,6 +1406,30 @@ mod tests {
                     .to_vec1::<f32>()
                     .unwrap();
                 assert_close(&actual, &expected, 0.02, &format!("{dtype:?} T={tokens}"));
+                if tokens >= GROUPED_MIN_TOKENS {
+                    let grouped = fp8_moe_grouped(
+                        &x.to_device(&device).unwrap(),
+                        &gpu_routing,
+                        slots,
+                        &w13,
+                        &s13,
+                        &w2,
+                        &s2,
+                    )
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                    assert_close(
+                        &grouped,
+                        &expected,
+                        0.02,
+                        &format!("grouped {dtype:?} T={tokens}"),
+                    );
+                }
             }
         }
     }

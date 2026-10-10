@@ -4146,6 +4146,21 @@ mod tests {
     struct SyntheticFp8Source {
         moe: crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest,
         cuda: Qwen36CudaSwitches,
+        /// Trunk activation dtype (embeddings and dense projections): F16 by
+        /// default, since Candle's CPU backend has no BF16 matmul.
+        act: DType,
+    }
+
+    impl SyntheticFp8Source {
+        fn new(
+            moe: crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest,
+        ) -> Self {
+            Self {
+                moe,
+                cuda: Qwen36CudaSwitches::default(),
+                act: DType::F16,
+            }
+        }
     }
 
     const E2E_HIDDEN: usize = 256;
@@ -4263,16 +4278,13 @@ mod tests {
                 "attn_gate" => e2e_fp8(value_width, h, name),
                 "ssm_out" => e2e_fp8(h, value_width, name),
                 "ssm_beta" | "ssm_alpha" => {
-                    Qwen36Projection::Quantized(QMatMul::Tensor(e2e_dense(4, h, name, DType::F16)))
+                    Qwen36Projection::Quantized(QMatMul::Tensor(e2e_dense(4, h, name, self.act)))
                 }
                 "attn_q" => e2e_fp8(2 * 2 * 128, h, name),
                 "attn_k" | "attn_v" => e2e_fp8(128, h, name),
                 "attn_output" => e2e_fp8(h, 2 * 128, name),
                 "output" => Qwen36Projection::Quantized(QMatMul::Tensor(e2e_dense(
-                    E2E_VOCAB,
-                    h,
-                    name,
-                    DType::F16,
+                    E2E_VOCAB, h, name, self.act,
                 ))),
                 other => panic!("unexpected synthetic projection {name} ({other})"),
             };
@@ -4398,7 +4410,7 @@ mod tests {
         }
 
         fn token_embeddings(&self, device: &Device) -> crate::error::Result<Tensor> {
-            Ok(e2e_dense(E2E_VOCAB, E2E_HIDDEN, "token_embd", DType::F16).to_device(device)?)
+            Ok(e2e_dense(E2E_VOCAB, E2E_HIDDEN, "token_embd", self.act).to_device(device)?)
         }
     }
 
@@ -4417,7 +4429,7 @@ mod tests {
         }];
         let (backend, device_ordinal) = match device.location() {
             DeviceLocation::Cpu => (BackendKind::Cpu, None),
-            DeviceLocation::Cuda { gpu_id } => (BackendKind::Cuda, Some(gpu_id as u32)),
+            DeviceLocation::Cuda { gpu_id } => (BackendKind::Cuda, u32::try_from(gpu_id).ok()),
             DeviceLocation::Metal { gpu_id } => {
                 let gpu_id = gpu_id as u64;
                 (BackendKind::Metal, Some((gpu_id ^ (gpu_id >> 32)) as u32))
@@ -4436,7 +4448,12 @@ mod tests {
             page_tokens: 8,
             capacity_pages: 8,
             growth: None,
-            dtype: DType::F32,
+            // As the existing hardware trunk tests: F16 KV on CUDA, F32 elsewhere.
+            dtype: if device.is_cuda() {
+                DType::F16
+            } else {
+                DType::F32
+            },
             layers: vec![KvLayerConfig {
                 binding: bindings[0],
                 num_kv_heads: 1,
@@ -4514,19 +4531,13 @@ mod tests {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
         let cfg = e2e_config();
         let legacy = super::Qwen36TextModel::load_with_source(
-            &SyntheticFp8Source {
-                moe: Qwen36MoeBackendRequest::Legacy,
-                cuda: Qwen36CudaSwitches::default(),
-            },
+            &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Legacy),
             &cfg,
             &Device::Cpu,
         )
         .unwrap();
         let mut fused = super::Qwen36TextModel::load_with_source(
-            &SyntheticFp8Source {
-                moe: Qwen36MoeBackendRequest::Auto,
-                cuda: Qwen36CudaSwitches::default(),
-            },
+            &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
             &cfg,
             &Device::Cpu,
         )
@@ -4553,12 +4564,18 @@ mod tests {
         );
         assert_eq!(legacy.moe_backend_summary()["backend"], "legacy");
 
-        assert_tracks_reference(&fused, &legacy);
+        assert_tracks_reference(&fused, &legacy, 0.01);
     }
 
-    /// Prefill 6 tokens, then decode 8: every step within 1% relative L2 of
-    /// the reference model's logits and on its argmax.
-    fn assert_tracks_reference(fused: &super::Qwen36TextModel, reference: &super::Qwen36TextModel) {
+    /// Prefill 6 tokens, then decode 8: every step within `rel_l2` of the
+    /// reference model's logits (rounding-order noise is ~1e-3 at F16; a wrong
+    /// expert, head mapping or state hand-off is far above 1%) and on its
+    /// argmax unless the reference's top two are a near tie.
+    fn assert_tracks_reference(
+        fused: &super::Qwen36TextModel,
+        reference: &super::Qwen36TextModel,
+        rel_l2: f32,
+    ) {
         let tokens: Vec<u32> = (0..14).map(|i| (i * 7 + 3) % E2E_VOCAB as u32).collect();
         let expected = e2e_logits(reference, &tokens, 6);
         let actual = e2e_logits(fused, &tokens, 6);
@@ -4570,18 +4587,20 @@ mod tests {
                 .sum::<f32>()
                 .sqrt();
             let norm: f32 = e.iter().map(|y| y * y).sum::<f32>().sqrt();
-            // Observed ~1e-3 (rounding-order noise); a wrong expert, head
-            // mapping or state hand-off is far above 1%.
             assert!(
-                err <= 0.01 * norm,
+                err <= rel_l2 * norm,
                 "step {step}: fused logits diverge (relative L2 {})",
                 err / norm
             );
-            assert_eq!(
-                argmax(a),
-                argmax(e),
-                "step {step}: fused decode picks a different token"
-            );
+            let mut sorted = e.clone();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            if sorted[0] - sorted[1] > 2.0 * err {
+                assert_eq!(
+                    argmax(a),
+                    argmax(e),
+                    "step {step}: fused decode picks a different token"
+                );
+            }
         }
     }
 
@@ -4590,12 +4609,12 @@ mod tests {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
         let model = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
-                moe: Qwen36MoeBackendRequest::Auto,
                 cuda: Qwen36CudaSwitches {
                     moe_off: Some("cuda.mode=off"),
                     fused_decode_off: Some("cuda.fused_decode=off"),
                     packed_off: Some("cuda.packed_projections=off"),
                 },
+                ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto)
             },
             &e2e_config(),
             &Device::Cpu,
@@ -4629,9 +4648,26 @@ mod tests {
         }
     }
 
-    /// The Metal leg loads through production resolution (no test hook): each
-    /// fast path must pass its self-check on the GPU and resolve to fused, and
-    /// the GPU trunk must track the CPU reference.
+    /// The GPU legs load through production resolution, not the test hook:
+    /// each listed fast path must pass its self-check on the device and
+    /// resolve to fused.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn assert_resolved_fused(model: &super::Qwen36TextModel, cuda: bool) {
+        let mut paths = vec![
+            ("moe", model.moe_backend_summary()),
+            ("gdn_decode", model.gdn_decode_summary()),
+            ("qk_rope", model.qk_rope_summary()),
+            ("rms_norm", model.rms_norm_summary()),
+        ];
+        if cuda {
+            paths.push(("fp8_gemv", model.fp8_gemv_summary()));
+        }
+        for (path, summary) in paths {
+            assert_eq!(summary["backend"], "fused", "{path}: {summary}");
+        }
+    }
+
+    /// Metal runs F16 activations, so the reference is the CPU legacy trunk.
     #[cfg(feature = "metal")]
     #[test]
     fn every_fused_path_resolves_and_tracks_the_reference_trunk_on_metal() {
@@ -4642,32 +4678,62 @@ mod tests {
         };
         let cfg = e2e_config();
         let reference = super::Qwen36TextModel::load_with_source(
-            &SyntheticFp8Source {
-                moe: Qwen36MoeBackendRequest::Legacy,
-                cuda: Qwen36CudaSwitches::default(),
-            },
+            &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Legacy),
             &cfg,
             &Device::Cpu,
         )
         .unwrap();
         let fused = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+            &cfg,
+            &device,
+        )
+        .unwrap();
+        assert_resolved_fused(&fused, false);
+        assert_tracks_reference(&fused, &reference, 0.01);
+    }
+
+    /// CUDA runs the production BF16 activations. Candle's CPU backend cannot,
+    /// so the reference is the same trunk on the same GPU with every global
+    /// CUDA switch off, which keeps each legacy path. BF16 rounding-order noise
+    /// is ~8x F16's, hence 3%. (The vectorized FP8 GEMV switch is
+    /// process-wide, so both trunks may share that kernel; it has its own
+    /// device check.)
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn every_fused_path_resolves_and_tracks_the_reference_trunk_on_cuda() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let cfg = e2e_config();
+        let reference = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
-                moe: Qwen36MoeBackendRequest::Auto,
-                cuda: Qwen36CudaSwitches::default(),
+                cuda: Qwen36CudaSwitches {
+                    moe_off: Some("reference"),
+                    fused_decode_off: Some("reference"),
+                    packed_off: Some("reference"),
+                },
+                act: DType::BF16,
+                ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Legacy)
             },
             &cfg,
             &device,
         )
         .unwrap();
-        for (path, summary) in [
-            ("moe", fused.moe_backend_summary()),
-            ("gdn_decode", fused.gdn_decode_summary()),
-            ("qk_rope", fused.qk_rope_summary()),
-            ("rms_norm", fused.rms_norm_summary()),
-        ] {
-            assert_eq!(summary["backend"], "fused", "{path}: {summary}");
-        }
-        assert_tracks_reference(&fused, &reference);
+        assert_eq!(reference.moe_backend_summary()["backend"], "legacy");
+        assert_eq!(reference.gdn_decode_summary()["backend"], "legacy");
+        let fused = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source {
+                act: DType::BF16,
+                ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto)
+            },
+            &cfg,
+            &device,
+        )
+        .unwrap();
+        assert_resolved_fused(&fused, true);
+        assert_tracks_reference(&fused, &reference, 0.03);
     }
 
     #[test]
