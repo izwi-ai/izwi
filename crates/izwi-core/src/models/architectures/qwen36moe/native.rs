@@ -2246,6 +2246,90 @@ mod tests {
         assert_eq!(unconstrained.dtype(), candle_core::DType::BF16);
     }
 
+    /// Effective-gain contract for HF `Qwen3_5MoeRMSNorm`: the checkpoint
+    /// stores zero-centered gains and HF applies `x̂ · (1 + w)`. The fixture's
+    /// stored gain is 0.05, so a unit-RMS input must come out at 1.05 through
+    /// every norm the trunk loads via `rms_norm` — under both the CPU (F32)
+    /// and the CUDA (BF16 activation) plans — while the gated DeltaNet norm
+    /// (`linear_attn.norm`, plain `w`) stays raw. A finiteness-only fixture
+    /// cannot see this: gain 0.05 and gain 1.05 are both finite.
+    #[test]
+    fn native_rms_norms_apply_the_zero_centered_gain() {
+        use crate::models::architectures::qwen35::text::Qwen35WeightSource;
+        use crate::models::architectures::qwen36moe::native_model::Qwen36MoeNativeSource;
+        use candle_core::Module;
+
+        let config = forward_config();
+        let dir = TestDir::new("zero-centered-norm");
+        write_tiny_checkpoint(&config, dir.0.as_path());
+        let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policy(
+            dir.0.as_path(),
+            Qwen36MoeGeometryPolicy::Synthetic,
+        )
+        .unwrap();
+        let device = candle_core::Device::Cpu;
+        let stored = half::bf16::from_f32(0.05).to_f32();
+        let expected = 1.0 + stored;
+
+        let cuda_plan_on_cpu = DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind: crate::backends::DeviceKind::Cuda,
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        for (label, profile, activation) in [
+            ("cpu", DeviceProfile::cpu(), candle_core::DType::F32),
+            ("cuda-plan", cuda_plan_on_cpu, candle_core::DType::BF16),
+        ] {
+            let source = Qwen36MoeNativeSource::new(&checkpoint, &profile);
+            for (name, width) in [
+                ("output_norm.weight", config.text.hidden_size),
+                ("blk.0.attn_norm.weight", config.text.hidden_size),
+                ("blk.0.post_attention_norm.weight", config.text.hidden_size),
+                ("blk.3.attn_q_norm.weight", config.text.attention_key_length),
+                ("blk.3.attn_k_norm.weight", config.text.attention_key_length),
+            ] {
+                let norm = source.rms_norm(name, 1e-6, &device).unwrap();
+                assert_eq!(norm.weight().dtype(), candle_core::DType::F32);
+                let x = candle_core::Tensor::ones((1, width), activation, &device).unwrap();
+                let y = norm.forward(&x).unwrap();
+                assert_eq!(y.dtype(), activation, "{label} {name}: dtype");
+                let values = y
+                    .to_dtype(candle_core::DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                // BF16 output rounding near 1.05 is ~4e-3.
+                let tolerance = if activation == candle_core::DType::F32 {
+                    1e-5
+                } else {
+                    8e-3
+                };
+                assert!(
+                    values.iter().all(|v| (v - expected).abs() < tolerance),
+                    "{label} {name}: effective gain must be 1 + w = {expected}, got {:?}",
+                    &values[..values.len().min(4)]
+                );
+            }
+
+            let gated = source
+                .dense(
+                    "blk.0.ssm_norm.weight",
+                    Some(candle_core::DType::F32),
+                    &device,
+                )
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                gated.iter().all(|v| (v - stored).abs() < 1e-7),
+                "{label}: the gated DeltaNet norm must stay raw"
+            );
+        }
+    }
+
     /// Run the shared trunk's prefill + decode under a backend dtype plan and
     /// assert the trunk's activation dtype survives the head with finite
     /// logits. Used by the hardware-gated plan tests: the CPU device cannot

@@ -281,18 +281,26 @@ impl Qwen35WeightSource for Qwen36MoeNativeSource<'_> {
     }
 
     fn rms_norm(&self, name: &str, eps: f64, device: &Device) -> Result<Qwen35RmsNorm> {
-        // Candle's rmsnorm op requires x and weight in the same dtype on
-        // every backend, and the trunk's activations carry the dense
-        // target's dtype (BF16 CUDA, F16 Metal, F32 CPU). quantized_nn's
-        // RmsNorm always dequantizes its weight to F32, so a BF16/F16
-        // activation plan would die at the first norm — on CUDA through
-        // Map2's "dtype mismatch in binary op". Keep the materialized
-        // activation-dtype tensor instead; the checkpoint stores these
-        // weights in that same dtype, so nothing is requantized.
-        Ok(Qwen35RmsNorm::new(
-            self.materialize_dense_weight(name, device)?,
-            eps,
-        ))
+        // Every norm the trunk loads through this method (final, input,
+        // post-attention, q/k, and all MTP norms) is HF `Qwen3_5MoeRMSNorm`:
+        // zero-initialized and applied as `x̂ · (1 + w)` at runtime. The GGUF
+        // path receives these gains with the `+1` already baked in by
+        // llama.cpp's conversion, so the native source must add it here. The
+        // gated DeltaNet norm (`linear_attn.norm`, `Qwen3_5MoeRMSNormGated`,
+        // ones-initialized, plain `w`) loads through `dense()` and stays raw.
+        //
+        // The shifted gain stays F32 whatever the plan's activation dtype:
+        // `1 + w` rounded to BF16 loses ~0.4% per channel, and the norm runs
+        // in the weight's dtype (see `Qwen35RmsNorm`), matching HF's fp32
+        // norm math.
+        let (canonical, shape, _kind) = self.resolve(name)?;
+        let stored = self.checkpoint.materialize_dense(
+            &canonical,
+            &shape,
+            device,
+            ProjectionMaterialization::F32,
+        )?;
+        Ok(Qwen35RmsNorm::new((stored + 1.0)?, eps))
     }
 
     fn dense(&self, name: &str, dtype: Option<DType>, device: &Device) -> Result<Tensor> {

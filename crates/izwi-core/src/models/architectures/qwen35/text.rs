@@ -361,6 +361,12 @@ struct Qwen35GatedRmsNorm {
 /// pair dies inside the op (on CUDA through Map2's "dtype mismatch in
 /// binary op"). Sources therefore hand over the weight already materialized
 /// in the plan's activation dtype (BF16 CUDA, F16 Metal, F32 CPU/GGUF).
+///
+/// A source may instead hand over an F32 weight under a lower-precision plan
+/// when the weight carries a load-time transform whose rounding matters (the
+/// native checkpoint's zero-centered `1 + w` gains): the norm then runs in F32
+/// and casts back, which is exactly HF `Qwen3_5MoeRMSNorm`'s
+/// `(norm(x.float()) * (1 + w.float())).type_as(x)`.
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen35RmsNorm {
     weight: Tensor,
@@ -371,11 +377,24 @@ impl Qwen35RmsNorm {
     pub(crate) fn new(weight: Tensor, eps: f64) -> Self {
         Self { weight, eps }
     }
+
+    #[cfg(test)]
+    pub(crate) fn weight(&self) -> &Tensor {
+        &self.weight
+    }
 }
 
 impl Module for Qwen35RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+        if x.dtype() == self.weight.dtype() {
+            return candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32);
+        }
+        candle_nn::ops::rms_norm(
+            &x.to_dtype(self.weight.dtype())?,
+            &self.weight,
+            self.eps as f32,
+        )?
+        .to_dtype(x.dtype())
     }
 }
 
