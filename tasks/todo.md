@@ -1,8 +1,16 @@
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
-**Status 2026-10-10:** Phases 1-2 are implemented on `fix-qwen36-serving` (`ad60fa95`..`b07ae122`)
-and are unmeasured on hardware. See the Review section for what to check on the first GPU deploy.
+**Status 2026-10-10:** on `fix-qwen36-serving`, all unmeasured on hardware:
+- Phases 1-2 for CUDA (`ad60fa95`..`b07ae122`), with an end-to-end test of every fused path
+  against the reference trunk (`0467da51`);
+- the Phase 5 expert-major grouped prefill MoE (`7e0937ca`, CUDA; `963ec503`, Metal);
+- most of Phase 6: every fused path runs on Metal and experts stay raw FP8, about 37 GB resident
+  instead of 69 GB (`5594d188`..`23a7a8fe`);
+- the Phase 7 Q8_0 CPU LM head (`8ce1e08a`);
+- fixes from a correctness review of the whole range (`8167d0a9`..`35d9d5b4`; see Review).
+
+See the Review section for what to check on the first GPU deploy.
 
 **Revised 2026-10-10: there is no measurement phase.** There is no access to a profiler or to
 same-H100 vLLM/llama.cpp runs, so work starts at Phase 1. Doc §5.1 covers how each phase is
@@ -59,7 +67,7 @@ The kill switch (environment variable) is the rollback.
       per-expert projections become views, so residency does not grow (`1829be3a`).
 - [x] Grouped gate+up+SwiGLU and down+weighted-combine GEMV kernels (`ad60fa95`).
   - They also serve prefill: about 10× over the per-expert loop at 256-token chunks.
-  - The weight-reusing grouped GEMM moves to Phase 5.
+  - Calls with ≥32 tokens use the expert-major grouped kernels instead (Phase 5, `7e0937ca`).
 - [x] Router GEMV reads BF16 activations and F32 rows directly; MoE is 4 launches per layer
       (`04de1d6d`).
 - [x] `IZWI_QWEN36_MOE_BACKEND=legacy` (or off/0/false) is the kill switch. The `q8_gguf` control
@@ -109,22 +117,35 @@ The kill switch (environment variable) is the rollback.
       acceptance rate in diagnostics.
 
 ## Phase 5 — Prefill / TTFT (M-L)
+- [x] Expert-major grouped MoE for calls with ≥32 tokens (`7e0937ca`): one scan/scatter block
+      groups the routed pairs by expert, then each warp holds its weight chunk in registers and
+      loops over that expert's pairs. Each expert's weights are read once per chunk, not once per
+      routed token (about 8× less weight traffic at 256 tokens). Deterministic slot-order combine.
+      The MoE self-check adds a 48-token grouped-vs-per-pair probe.
 - [ ] FP8 tensor-core grouped GEMM on SM90; chunked GDN prefill (FLA chunk 64); larger prefill
       chunks; hybrid prefix-cache snapshots at message boundaries. Judged by the TTFT chip from 1.0.
 
-## Phase 6 — Metal (M-L)
-- [ ] Q8_0 stacked experts instead of F16 expansion (67.5 → about 37 GiB); validate F16 overflow
-      on real weights.
-- [ ] Device-routed MoE `CustomOp` (`topk_moe`, `mul_mv_id`/`mul_mm_id`, fused gate+up,
-      `moe_reduce`).
-- [ ] Register-resident fused GDN kernel (MLX `gated_delta_step` style) that handles the grouped
-      head order.
-- [ ] Device RoPE table, fused norms, encoder tuning.
-- [ ] Judge on a 16 GB dev Mac: golden parity, plus relative gains on the synthetic real-geometry
-      `qwen36moe_layer_bench`.
+## Phase 6 — Metal (M-L) — MOSTLY DONE (unmeasured)
+- [x] Experts stay raw block-FP8 on Metal, not Q8_0 or F16 (`f04cccda`). The MSL kernels decode
+      E4M3 with the same exact integer trick as CUDA. Resident ≈ 36.99 GB instead of 69.3 GB, so a
+      64 GB Mac fits; admission charges the split. The rest of the trunk stays F16.
+- [x] Device-routed MoE on Metal: block-FP8 projection GEMV, router GEMV, softmax/top-k routing,
+      gate+up+SwiGLU, down+combine (`5594d188`), plus the grouped prefill kernels (`963ec503`).
+- [x] Register-resident fused GDN decode with in-kernel grouped/tiled head mapping, fused
+      add+RMSNorm, q/k norm + M-RoPE using `precise::cos/sin` (`af8abfe8`), enabled through the
+      same self-checks and kill switch as CUDA (`23a7a8fe`).
+- [x] Every Metal kernel is tested on an M1 Pro GPU against its CPU reference.
+- [ ] Open:
+  - validate F16 activation overflow on the real weights (the HF golden test runs on CPU);
+  - pack the trunk's F16 projections (only beta/alpha is packed on Metal);
+  - encoder tuning;
+  - the Metal t/s judgement with the real model on a 64 GB Mac.
 
 ## Phase 7 — CPU (S-M)
-- [ ] Q8_0 `lm_head` and embeddings (−40% bytes per token); consistent `CANDLE_NUM_THREADS`.
+- [x] Q8_0 `lm_head` on the CPU residency (`8ce1e08a`): about 2 GB → 0.54 GB read per token.
+      Admission charges it as Q8_0. HF golden residency assertions still pass.
+- [ ] Embeddings as Q8_0 (memory only: decode reads one row per token); consistent
+      `CANDLE_NUM_THREADS`.
 - [ ] Grouped MoE (expert-to-token table, fused gate+up, one Rayon dispatch; GEMM per expert for
       prefill); fused SIMD GDN; parallel cached requant.
 - [ ] Judge with golden parity and the layer bench.
@@ -142,7 +163,38 @@ The kill switch (environment variable) is the rollback.
 |---|---|---|---|---|---|---|
 | 2026-10-10 | (pre-plan) | baseline | 2,049 | 159,879 | 13 | legacy MoE, no graphs, MTP off |
 
+### Correctness review of `4e764ffb..8ce1e08a` (2026-10-10)
+
+An independent read-only review cross-checked every kernel against its launch site at the real
+geometry: argument order and types, grid, block and shared-memory sizes, alignment, and
+sync/shuffle divergence. It found no critical or high CUDA bugs. Fixes for what it did find:
+- `8167d0a9`: fused q/k RoPE never enabled on Metal (BF16 probe on an F16-only kernel). A new
+  Metal end-to-end leg resolves every path through production resolution; it fails without the fix.
+- `89168a38`: the fused DeltaNet step now publishes the ring and state only after both kernels
+  succeed.
+- `33d4e26f`: the global CUDA switches (`cuda.mode`, `cuda.fused_decode`,
+  `cuda.packed_projections`) now also turn off the Qwen3.6 fast paths on CUDA.
+- `f0a548a3`: stacked expert views are compared byte for byte with the loaded weights. The MoE
+  self-check reads the same stacks, so it could not catch a bad device copy.
+- `e114cf2c`: CUDA/Metal admission charges the ~1 GiB per-layer expert-stacking transient.
+- `35d9d5b4`: a CUDA end-to-end leg (BF16 fused trunk vs the same-GPU legacy trunk), and grouped
+  MoE in the CUDA kernel test. It is the pre-flight in step 0 below.
+
+Not changed: qwen38 on Metal with an explicit `projection_backend=NativeFp8` now gets the
+Metal FP8 GEMV. Its admission still estimates the F16 expansion, which is conservative.
+
 ### First GPU deploy of Phases 1-2: what to check
+
+**0. Pre-flight on the GPU host, before serving.** A kernel fault (illegal address) is a sticky
+CUDA error that would also take down the legacy path, so catch it in a test process first:
+
+```bash
+IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --features cuda --lib -- kernels::cuda qwen36moe
+```
+
+This runs every fused kernel at the real 35B geometry against its CPU reference, then the whole
+fused trunk against the legacy trunk on the GPU. A failure names the path; turn it off with the
+matching switch from step 4.
 
 **1. The load log.** It has one line, `Qwen3.6-MoE fused kernel paths`, which reports `moe`,
 `gdn_decode`, `rms_norm`, `qk_rope` and `fp8_gemv`. On an SM80+ GPU every `backend` should be
@@ -158,6 +210,9 @@ The kill switch (environment variable) is the rollback.
 **4. Isolate a suspect path with the kill switches.** Each needs a redeploy, no code change:
 - `IZWI_QWEN36_MOE_BACKEND=legacy`
 - `IZWI_QWEN36_FUSED_DECODE=legacy`
+- the global CUDA switches also work: `IZWI_CUDA_FUSED_DECODE=off`,
+  `IZWI_CUDA_PACKED_PROJECTIONS=off`, or `IZWI_CUDA_MODE=off` for everything, the fused MoE
+  included. The diagnostics reason names the switch.
 
 **5. Expected per-token launch budget** (counted from code, not measured): about 520, down from
 about 6,200.
@@ -174,7 +229,24 @@ about 6,200.
 There are no host syncs inside the MoE. The two greedy-argmax readbacks remain.
 
 **6. Load time grows slightly** from the self-checks (about 1-2 s on an H100) and from stacking the
-experts (a transient of about 1 GB per layer while loading).
+experts (a transient of about 1 GB per layer while loading, now charged in admission). If a
+layer reports `expert stacking failed: stacked expert views differ…`, the device copy is
+corrupt; that layer stays on legacy, so report it.
+
+**7. Prefill.** Calls with ≥32 tokens take the grouped MoE kernels. If the MoE self-check fails
+only on its grouped probe, the reason string says so and both decode and prefill fall back to
+legacy. Long-history turns should show a shorter time to first token than before.
+
+### First Metal run (64 GB+ Mac)
+
+The same load-log line and diagnostics apply. Every `backend` should be `fused`. The admission
+estimate should be about 37 GB. If generations degrade (repetition, garbage), first try
+`IZWI_QWEN36_FUSED_DECODE=legacy`, then `IZWI_QWEN36_MOE_BACKEND=legacy`. F16 activation
+overflow on real weights has not been checked on Metal.
+
+### First CPU run
+
+The admission estimate drops by about 1.5 GB because the LM head is Q8_0.
 
 ---
 

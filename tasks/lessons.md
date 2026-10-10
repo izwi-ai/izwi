@@ -184,3 +184,5 @@
   kernel source against a float64 reference; and `cargo check/clippy --features cuda` works with
   a fake `nvcc` that prints a 5-line `--version` (cudarc reads line 4) and touches the PTX/object
   outputs the build scripts expect.
+- When porting fast paths to a new device, test each path's load-time resolution on that device through production loading, not only its kernels and a test hook. The Metal kernels passed their GPU tests, but `resolve_fused_qk` probed support with a hard-coded BF16 that the F16-only Metal kernel rejects, so the path silently stayed legacy. A device leg asserting every diagnostics summary is `fused` caught it at once.
+- A load-time self-check that compares a fused path with a "reference" built from the same transformed weights (stacked views, packs) cannot see a bad transform. Check the transform against the original tensors before dropping them.
