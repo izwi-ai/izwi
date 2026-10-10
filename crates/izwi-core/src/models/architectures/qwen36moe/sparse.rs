@@ -211,6 +211,9 @@ impl Qwen36MoeSparseMlp {
                 None,
                 Qwen36FusedPath::legacy(format!("{BACKEND_ENV}=legacy")),
             ),
+            Qwen36MoeBackendRequest::Off(reason) => {
+                (experts, shared, None, Qwen36FusedPath::legacy(reason))
+            }
             Qwen36MoeBackendRequest::Auto => {
                 match Qwen36MoeFusedExperts::stack(&router, experts, shared, geometry) {
                     Qwen36MoeStacking::Stacked {

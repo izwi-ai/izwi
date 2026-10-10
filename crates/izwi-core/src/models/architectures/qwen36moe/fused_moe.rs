@@ -46,6 +46,8 @@ pub(crate) enum Qwen36MoeBackendRequest {
     Auto,
     /// Always the host-routed per-expert loop; no expert stacking.
     Legacy,
+    /// [`Self::Legacy`], requested by a global CUDA switch (the reason).
+    Off(&'static str),
 }
 
 impl Qwen36MoeBackendRequest {

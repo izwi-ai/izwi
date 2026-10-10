@@ -36,7 +36,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::exec::Qwen36TextConfig;
 use crate::models::architectures::qwen36moe::fast_path::{
-    compare_values, legacy_requested, Qwen36FusedPath,
+    compare_values, legacy_requested, Qwen36CudaSwitches, Qwen36FusedPath,
 };
 use crate::models::architectures::qwen36moe::sparse::Qwen36MoeSparseMlp;
 
@@ -729,6 +729,11 @@ pub(crate) trait Qwen36WeightSource {
 
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
+
+    /// Global CUDA switches that keep fast paths off for this load.
+    fn cuda_switches(&self) -> Qwen36CudaSwitches {
+        Qwen36CudaSwitches::default()
+    }
 }
 
 /// GGUF-backed source for the dense Qwen3.5 family and the qwen36moe
@@ -885,8 +890,16 @@ impl Qwen36TextModel {
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
         };
-        model.resolve_fused_norms(false);
-        model.resolve_vectorized_fp8_decode();
+        match source.cuda_switches().fused_decode_off {
+            Some(reason) => {
+                model.fused_norm_path = Qwen36FusedPath::legacy(reason);
+                model.fp8_gemv_path = Qwen36FusedPath::legacy(reason);
+            }
+            None => {
+                model.resolve_fused_norms(false);
+                model.resolve_vectorized_fp8_decode();
+            }
+        }
         Ok(model)
     }
 
@@ -1849,14 +1862,21 @@ impl Qwen36FullAttention {
             fused_qk_path: Qwen36FusedPath::legacy("unresolved"),
             packed_qkv: None,
         };
-        if fused_device(device, false) && !legacy_requested(FUSED_DECODE_ENV) {
+        let cuda = source.cuda_switches();
+        if fused_device(device, false)
+            && !legacy_requested(FUSED_DECODE_ENV)
+            && cuda.packed_off.is_none()
+        {
             attention.packed_qkv = pack_projections(&mut [
                 &mut attention.q_proj,
                 &mut attention.k_proj,
                 &mut attention.v_proj,
             ]);
         }
-        attention.resolve_fused_qk(device, false);
+        match cuda.fused_decode_off {
+            Some(reason) => attention.fused_qk_path = Qwen36FusedPath::legacy(reason),
+            None => attention.resolve_fused_qk(device, false),
+        }
         Ok(attention)
     }
 
@@ -2483,10 +2503,17 @@ impl Qwen36LinearAttention {
             packed_in: None,
             packed_beta_alpha: None,
         };
-        if fused_device(device, false) && !legacy_requested(FUSED_DECODE_ENV) {
+        let cuda = source.cuda_switches();
+        if fused_device(device, false)
+            && !legacy_requested(FUSED_DECODE_ENV)
+            && cuda.packed_off.is_none()
+        {
             mixer.pack_projections();
         }
-        mixer.resolve_fused_decode(cfg.embedding_length, device, false);
+        match cuda.fused_decode_off {
+            Some(reason) => mixer.fused_decode_path = Qwen36FusedPath::legacy(reason),
+            None => mixer.resolve_fused_decode(cfg.embedding_length, device, false),
+        }
         Ok(mixer)
     }
 
@@ -3766,7 +3793,7 @@ mod tests {
     use crate::models::architectures::qwen36moe::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
     };
-    use crate::models::architectures::qwen36moe::fast_path::Qwen36FusedPath;
+    use crate::models::architectures::qwen36moe::fast_path::{Qwen36CudaSwitches, Qwen36FusedPath};
     use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::rotary_emb;
@@ -4118,6 +4145,7 @@ mod tests {
     /// portable reference to run on the CPU.
     struct SyntheticFp8Source {
         moe: crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest,
+        cuda: Qwen36CudaSwitches,
     }
 
     const E2E_HIDDEN: usize = 256;
@@ -4352,9 +4380,21 @@ mod tests {
                 ) * 4.0)?
                     .to_device(device)?,
             );
+            let request = match self.cuda.moe_off {
+                Some(reason) => {
+                    crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest::Off(
+                        reason,
+                    )
+                }
+                None => self.moe,
+            };
             Qwen36MoeSparseMlp::from_weights_with_backend(
-                router, experts, shared, geometry, self.moe,
+                router, experts, shared, geometry, request,
             )
+        }
+
+        fn cuda_switches(&self) -> Qwen36CudaSwitches {
+            self.cuda
         }
 
         fn token_embeddings(&self, device: &Device) -> crate::error::Result<Tensor> {
@@ -4476,6 +4516,7 @@ mod tests {
         let legacy = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
                 moe: Qwen36MoeBackendRequest::Legacy,
+                cuda: Qwen36CudaSwitches::default(),
             },
             &cfg,
             &Device::Cpu,
@@ -4484,6 +4525,7 @@ mod tests {
         let mut fused = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
                 moe: Qwen36MoeBackendRequest::Auto,
+                cuda: Qwen36CudaSwitches::default(),
             },
             &cfg,
             &Device::Cpu,
@@ -4543,6 +4585,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn global_cuda_switches_keep_every_fast_path_off_at_load() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let model = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source {
+                moe: Qwen36MoeBackendRequest::Auto,
+                cuda: Qwen36CudaSwitches {
+                    moe_off: Some("cuda.mode=off"),
+                    fused_decode_off: Some("cuda.fused_decode=off"),
+                    packed_off: Some("cuda.packed_projections=off"),
+                },
+            },
+            &e2e_config(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        for (path, summary, reason) in [
+            ("moe", model.moe_backend_summary(), "cuda.mode=off"),
+            (
+                "gdn_decode",
+                model.gdn_decode_summary(),
+                "cuda.fused_decode=off",
+            ),
+            ("qk_rope", model.qk_rope_summary(), "cuda.fused_decode=off"),
+            (
+                "rms_norm",
+                model.rms_norm_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
+                "fp8_gemv",
+                model.fp8_gemv_summary(),
+                "cuda.fused_decode=off",
+            ),
+        ] {
+            assert_eq!(summary["backend"], "legacy", "{path}: {summary}");
+            assert_eq!(
+                summary["legacy_reasons"],
+                serde_json::json!([reason]),
+                "{path}"
+            );
+        }
+    }
+
     /// The Metal leg loads through production resolution (no test hook): each
     /// fast path must pass its self-check on the GPU and resolve to fused, and
     /// the GPU trunk must track the CPU reference.
@@ -4558,6 +4644,7 @@ mod tests {
         let reference = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
                 moe: Qwen36MoeBackendRequest::Legacy,
+                cuda: Qwen36CudaSwitches::default(),
             },
             &cfg,
             &Device::Cpu,
@@ -4566,6 +4653,7 @@ mod tests {
         let fused = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source {
                 moe: Qwen36MoeBackendRequest::Auto,
+                cuda: Qwen36CudaSwitches::default(),
             },
             &cfg,
             &device,

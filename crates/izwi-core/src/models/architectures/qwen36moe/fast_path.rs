@@ -7,7 +7,9 @@
 //! force the legacy Candle chain without a code change. Diagnostics aggregate
 //! the per-layer outcomes with [`summarize`].
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
+use crate::performance::{CudaPerformanceConfig, OptimizationMode};
 
 /// Execution path a block resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,45 @@ impl Qwen36FusedPath {
 
     pub(crate) fn is_fused(&self) -> bool {
         matches!(self, Self::Fused)
+    }
+}
+
+/// The global CUDA performance switches as they apply to the Qwen3.6 fast
+/// paths: `cuda.mode=off` turns all of them off, `cuda.fused_decode` the
+/// fused decode kernels (DeltaNet, norms, q/k RoPE, vectorized GEMV) and
+/// `cuda.packed_projections` the packed projections. Like qwen38's, they bind
+/// on CUDA only; the `IZWI_QWEN36_*` switches bind on every device. Each field
+/// is the reason its path is off, if it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Qwen36CudaSwitches {
+    pub(crate) moe_off: Option<&'static str>,
+    pub(crate) fused_decode_off: Option<&'static str>,
+    pub(crate) packed_off: Option<&'static str>,
+}
+
+impl Qwen36CudaSwitches {
+    pub(crate) fn from_performance(
+        backend: BackendKind,
+        performance: &CudaPerformanceConfig,
+    ) -> Self {
+        if backend != BackendKind::Cuda {
+            return Self::default();
+        }
+        let off = |mode: OptimizationMode, reason: &'static str| {
+            if !performance.enabled() {
+                Some("cuda.mode=off")
+            } else {
+                (!mode.enabled()).then_some(reason)
+            }
+        };
+        Self {
+            moe_off: (!performance.enabled()).then_some("cuda.mode=off"),
+            fused_decode_off: off(performance.fused_decode, "cuda.fused_decode=off"),
+            packed_off: off(
+                performance.packed_projections,
+                "cuda.packed_projections=off",
+            ),
+        }
     }
 }
 
@@ -120,6 +161,46 @@ pub(crate) fn compare_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_switches_bind_on_cuda_only() {
+        let mut performance = CudaPerformanceConfig::default();
+        for backend in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Cpu] {
+            assert_eq!(
+                Qwen36CudaSwitches::from_performance(backend, &performance),
+                Qwen36CudaSwitches::default()
+            );
+        }
+        performance.fused_decode = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.fused_decode_off, Some("cuda.fused_decode=off"));
+        assert_eq!((switches.moe_off, switches.packed_off), (None, None));
+        assert_eq!(
+            Qwen36CudaSwitches::from_performance(BackendKind::Metal, &performance),
+            Qwen36CudaSwitches::default()
+        );
+
+        performance.fused_decode = OptimizationMode::Auto;
+        performance.packed_projections = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.packed_off, Some("cuda.packed_projections=off"));
+        assert_eq!((switches.moe_off, switches.fused_decode_off), (None, None));
+
+        // `cuda.mode=off` turns everything off, normalized or not.
+        let performance = CudaPerformanceConfig {
+            mode: OptimizationMode::Off,
+            ..CudaPerformanceConfig::default()
+        };
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(
+            switches,
+            Qwen36CudaSwitches {
+                moe_off: Some("cuda.mode=off"),
+                fused_decode_off: Some("cuda.mode=off"),
+                packed_off: Some("cuda.mode=off"),
+            }
+        );
+    }
 
     #[test]
     fn legacy_switch_values() {

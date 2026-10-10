@@ -14,6 +14,8 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen36moe::fast_path::Qwen36CudaSwitches;
+use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
 use crate::models::architectures::qwen36moe::mtp::Qwen36MtpHead;
 use crate::models::architectures::qwen36moe::text::{
     Qwen36LinearVHeadOrder, Qwen36MoeFfnGeometry, Qwen36Projection, Qwen36RmsNorm,
@@ -116,6 +118,7 @@ pub(crate) struct Qwen36MoeNativeSource<'a> {
     /// `residency`.
     expert_residency: Qwen36MoeProjectionResidency,
     dense_target: ProjectionMaterialization,
+    cuda_switches: Qwen36CudaSwitches,
 }
 
 impl<'a> Qwen36MoeNativeSource<'a> {
@@ -135,6 +138,7 @@ impl<'a> Qwen36MoeNativeSource<'a> {
             residency,
             expert_residency: residency,
             dense_target,
+            cuda_switches: Qwen36CudaSwitches::default(),
         }
     }
 
@@ -174,6 +178,10 @@ impl<'a> Qwen36MoeNativeSource<'a> {
             residency,
             expert_residency,
             dense_target,
+            cuda_switches: Qwen36CudaSwitches::from_performance(
+                BackendKind::from(device_profile.kind),
+                performance,
+            ),
         }
     }
 
@@ -446,7 +454,15 @@ impl Qwen36WeightSource for Qwen36MoeNativeSource<'_> {
                 .transpose()?,
         };
 
-        Qwen36MoeSparseMlp::from_weights(router, experts, shared, geometry)
+        let request = match self.cuda_switches.moe_off {
+            Some(reason) => Qwen36MoeBackendRequest::Off(reason),
+            None => Qwen36MoeBackendRequest::from_env(),
+        };
+        Qwen36MoeSparseMlp::from_weights_with_backend(router, experts, shared, geometry, request)
+    }
+
+    fn cuda_switches(&self) -> Qwen36CudaSwitches {
+        self.cuda_switches
     }
 
     fn token_embeddings(&self, device: &Device) -> Result<Tensor> {
