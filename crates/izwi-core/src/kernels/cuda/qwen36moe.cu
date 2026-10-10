@@ -648,3 +648,241 @@ __device__ void q36_router_logits(
 
 Q36_ROUTER_EXPORT(__half, f16)
 Q36_ROUTER_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Expert-major (grouped) MoE for prefill. The per-(token, slot) GEMVs above
+// re-read an expert's full weights for every routed token; at prefill chunk
+// sizes every expert is hit many times. These kernels group the routed pairs
+// by expert on the device and stream each expert's weights once per chunk:
+//   group      : one block; per-expert counts, exclusive scan, scatter of pair
+//                indices (token * slots + slot) into expert-major order.
+//   gate_up    : grid (experts, inter / 8); one warp per output channel keeps
+//                its gate and up weight chunks in registers and loops over the
+//                expert's pairs.
+//   down       : grid (experts, hidden / 8); one warp per output channel writes
+//                the unweighted F32 projection of each routed pair.
+//   combine    : y[t, h] = sum_slot weight * partial[(t * slots + slot), h], in
+//                slot order (deterministic).
+// Pair order within an expert comes from atomics, but every pair's output is
+// computed independently, so results do not depend on it.
+
+#define Q36_GROUP_THREADS 1024
+#define Q36_MAX_GROUPED_EXPERTS 520
+#define Q36_MAX_HIDDEN_CHUNKS 8
+#define Q36_MAX_INTER_CHUNKS 4
+
+extern "C" __global__ void __launch_bounds__(Q36_GROUP_THREADS) qwen36moe_group_pairs(
+    const float* __restrict__ routing,
+    int* __restrict__ offsets,
+    int* __restrict__ sorted_pairs,
+    int tokens,
+    int slots,
+    int experts_total) {
+  __shared__ int counts[Q36_MAX_GROUPED_EXPERTS];
+  __shared__ int fill[Q36_MAX_GROUPED_EXPERTS];
+  for (int e = threadIdx.x; e < experts_total; e += blockDim.x) {
+    counts[e] = 0;
+    fill[e] = 0;
+  }
+  __syncthreads();
+  const int pairs = tokens * slots;
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const int token = p / slots;
+    const int expert = (int)routing[(size_t)token * 2 * slots + (p - token * slots)];
+    if (expert >= 0 && expert < experts_total) {
+      atomicAdd(&counts[expert], 1);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int running = 0;
+    for (int e = 0; e < experts_total; ++e) {
+      offsets[e] = running;
+      running += counts[e];
+    }
+    offsets[experts_total] = running;
+  }
+  __syncthreads();
+  for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+    const int token = p / slots;
+    const int expert = (int)routing[(size_t)token * 2 * slots + (p - token * slots)];
+    if (expert >= 0 && expert < experts_total) {
+      const int slot_index = atomicAdd(&fill[expert], 1);
+      sorted_pairs[offsets[expert] + slot_index] = p;
+    }
+  }
+}
+
+template <class T>
+__device__ __forceinline__ void q36_load16(const T* x, float* out) {
+  const uint4 a = *reinterpret_cast<const uint4*>(x);
+  const uint4 b = *reinterpret_cast<const uint4*>(x + 8);
+  const T* pa = reinterpret_cast<const T*>(&a);
+  const T* pb = reinterpret_cast<const T*>(&b);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    out[i] = float(pa[i]);
+    out[8 + i] = float(pb[i]);
+  }
+}
+
+// Requires hidden % 512 == 0 and hidden / 512 <= Q36_MAX_HIDDEN_CHUNKS.
+template <class T>
+__device__ void q36_gate_up_grouped(
+    const T* __restrict__ x,
+    const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs,
+    const unsigned char* __restrict__ w13,
+    const float* __restrict__ s13,
+    T* __restrict__ act,
+    int slots,
+    int hidden,
+    int inter) {
+  const int expert = blockIdx.x;
+  const int begin = offsets[expert];
+  const int end = offsets[expert + 1];
+  if (begin == end) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int n = blockIdx.y * Q36_WARPS + (threadIdx.x >> 5);
+  if (n >= inter) {
+    return;
+  }
+  const int kblocks = hidden >> 7;
+  const int chunks = hidden >> 9;
+  const unsigned char* wg = w13 + ((size_t)expert * 2 * inter + n) * hidden;
+  const unsigned char* wu = wg + (size_t)inter * hidden;
+  const float* expert_scales = s13 + (size_t)expert * ((2 * inter) >> 7) * kblocks;
+  const float* sg = expert_scales + (size_t)(n >> 7) * kblocks;
+  const float* su = expert_scales + (size_t)((inter + n) >> 7) * kblocks;
+  uint4 qg[Q36_MAX_HIDDEN_CHUNKS];
+  uint4 qu[Q36_MAX_HIDDEN_CHUNKS];
+  float scale_g[Q36_MAX_HIDDEN_CHUNKS];
+  float scale_u[Q36_MAX_HIDDEN_CHUNKS];
+#pragma unroll
+  for (int c = 0; c < Q36_MAX_HIDDEN_CHUNKS; ++c) {
+    if (c < chunks) {
+      const int k0 = lane * 16 + c * 512;
+      qg[c] = *reinterpret_cast<const uint4*>(wg + k0);
+      qu[c] = *reinterpret_cast<const uint4*>(wu + k0);
+      scale_g[c] = sg[k0 >> 7];
+      scale_u[c] = su[k0 >> 7];
+    }
+  }
+  for (int i = begin; i < end; ++i) {
+    const int pair = sorted_pairs[i];
+    const T* xt = x + (size_t)(pair / slots) * hidden;
+    float accg = 0.f;
+    float accu = 0.f;
+#pragma unroll
+    for (int c = 0; c < Q36_MAX_HIDDEN_CHUNKS; ++c) {
+      if (c < chunks) {
+        float xv[16];
+        q36_load16(xt + lane * 16 + c * 512, xv);
+        accg = fmaf(q36_dot16(qg[c], xv), scale_g[c], accg);
+        accu = fmaf(q36_dot16(qu[c], xv), scale_u[c], accu);
+      }
+    }
+    accg = q36_warp_sum(accg) * 256.f;
+    accu = q36_warp_sum(accu) * 256.f;
+    if (lane == 0) {
+      const float silu = accg / (1.f + expf(-accg));
+      act[(size_t)pair * inter + n] = T(silu * accu);
+    }
+  }
+}
+
+// Requires inter % 512 == 0 and inter / 512 <= Q36_MAX_INTER_CHUNKS.
+template <class T>
+__device__ void q36_down_grouped(
+    const T* __restrict__ act,
+    const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs,
+    const unsigned char* __restrict__ w2,
+    const float* __restrict__ s2,
+    float* __restrict__ partial,
+    int hidden,
+    int inter) {
+  const int expert = blockIdx.x;
+  const int begin = offsets[expert];
+  const int end = offsets[expert + 1];
+  if (begin == end) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int h = blockIdx.y * Q36_WARPS + (threadIdx.x >> 5);
+  if (h >= hidden) {
+    return;
+  }
+  const int kblocks = inter >> 7;
+  const int chunks = inter >> 9;
+  const unsigned char* w = w2 + ((size_t)expert * hidden + h) * inter;
+  const float* sc = s2 + ((size_t)expert * (hidden >> 7) + (h >> 7)) * kblocks;
+  uint4 q[Q36_MAX_INTER_CHUNKS];
+  float scale[Q36_MAX_INTER_CHUNKS];
+#pragma unroll
+  for (int c = 0; c < Q36_MAX_INTER_CHUNKS; ++c) {
+    if (c < chunks) {
+      const int k0 = lane * 16 + c * 512;
+      q[c] = *reinterpret_cast<const uint4*>(w + k0);
+      scale[c] = sc[k0 >> 7];
+    }
+  }
+  for (int i = begin; i < end; ++i) {
+    const int pair = sorted_pairs[i];
+    const T* a = act + (size_t)pair * inter;
+    float acc = 0.f;
+#pragma unroll
+    for (int c = 0; c < Q36_MAX_INTER_CHUNKS; ++c) {
+      if (c < chunks) {
+        float av[16];
+        q36_load16(a + lane * 16 + c * 512, av);
+        acc = fmaf(q36_dot16(q[c], av), scale[c], acc);
+      }
+    }
+    acc = q36_warp_sum(acc) * 256.f;
+    if (lane == 0) {
+      partial[(size_t)pair * hidden + h] = acc;
+    }
+  }
+}
+
+template <class T>
+__device__ void q36_combine(
+    const float* __restrict__ partial,
+    const float* __restrict__ routing,
+    T* __restrict__ y,
+    int slots,
+    int hidden) {
+  const int token = blockIdx.x;
+  const int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (h >= hidden) {
+    return;
+  }
+  const float* weights = routing + (size_t)token * 2 * slots + slots;
+  float total = 0.f;
+  for (int s = 0; s < slots; ++s) {
+    total = fmaf(weights[s], partial[((size_t)token * slots + s) * hidden + h], total);
+  }
+  y[(size_t)token * hidden + h] = T(total);
+}
+
+#define Q36_GROUPED_EXPORT(T, S)                                                                 \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_gate_up_grouped_##S(              \
+      const T* x, const int* offsets, const int* sorted_pairs, const unsigned char* w,           \
+      const float* s, T* act, int slots, int hidden, int inter) {                                \
+    q36_gate_up_grouped<T>(x, offsets, sorted_pairs, w, s, act, slots, hidden, inter);           \
+  }                                                                                              \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_down_grouped_##S(                 \
+      const T* act, const int* offsets, const int* sorted_pairs, const unsigned char* w,         \
+      const float* s, float* partial, int hidden, int inter) {                                   \
+    q36_down_grouped<T>(act, offsets, sorted_pairs, w, s, partial, hidden, inter);               \
+  }                                                                                              \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_combine_##S(                      \
+      const float* partial, const float* routing, T* y, int slots, int hidden) {                 \
+    q36_combine<T>(partial, routing, y, slots, hidden);                                          \
+  }
+
+Q36_GROUPED_EXPORT(__half, f16)
+Q36_GROUPED_EXPORT(__nv_bfloat16, bf16)

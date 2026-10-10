@@ -73,6 +73,9 @@ pub(crate) struct Qwen36MoeFusedExperts {
     s13: Tensor,
     w2: Tensor,
     s2: Tensor,
+    /// Expert-major kernels for prefill-sized calls (see
+    /// [`moe::GROUPED_MIN_TOKENS`]); verified by the self-check.
+    grouped: bool,
 }
 
 /// Result of [`Qwen36MoeFusedExperts::stack`]. Unsupported layouts hand the
@@ -253,6 +256,7 @@ impl Qwen36MoeFusedExperts {
         };
         Qwen36MoeStacking::Stacked {
             fused: Self {
+                grouped: moe::grouped_supported(hidden, inter, w13.dim(0).unwrap_or(0)),
                 router: router_tensor,
                 spec,
                 hidden,
@@ -378,6 +382,17 @@ impl Qwen36MoeFusedExperts {
 
     fn combine(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
         let slots = self.spec.slots();
+        if self.grouped && flat.dim(0)? >= moe::GROUPED_MIN_TOKENS {
+            return moe::fp8_moe_grouped(
+                flat, routing, slots, &self.w13, &self.s13, &self.w2, &self.s2,
+            )
+            .map_err(Error::from);
+        }
+        self.combine_per_pair(flat, routing)
+    }
+
+    fn combine_per_pair(&self, flat: &Tensor, routing: &Tensor) -> Result<Tensor> {
+        let slots = self.spec.slots();
         let act = moe::fp8_gate_up(flat, routing, slots, &self.w13, &self.s13)?;
         moe::fp8_down(&act, routing, slots, &self.w2, &self.s2).map_err(Error::from)
     }
@@ -489,6 +504,31 @@ impl Qwen36MoeFusedExperts {
                 }
             }
             compare(&fused, &reference, tokens)?;
+        }
+        if self.grouped {
+            // Prefill-sized call: the expert-major kernels against the
+            // per-pair GEMVs verified above, on the same routing.
+            let tokens = moe::GROUPED_MIN_TOKENS + 16;
+            let values = (0..tokens * self.hidden)
+                .map(|i| ((i as f32) * 0.618_034).sin() * 1.5)
+                .collect::<Vec<_>>();
+            let x = Tensor::from_vec(values, (tokens, self.hidden), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(&device)?;
+            let routing = moe::route(&moe::router_logits(&x, &self.router)?, &self.spec)?;
+            let host = |t: Tensor| -> Result<Vec<f32>> {
+                Ok(t.to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?)
+            };
+            compare_values(
+                "grouped MoE prefill",
+                &host(self.combine(&x, &routing)?)?,
+                &host(self.combine_per_pair(&x, &routing)?)?,
+                0.01,
+                0.02,
+            )?;
         }
         Ok(())
     }

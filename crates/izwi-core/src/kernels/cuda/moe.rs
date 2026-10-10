@@ -114,6 +114,65 @@ pub fn supported(device: &Device, dtype: DType, hidden: usize, inter: usize, slo
     }
 }
 
+/// Routed tokens from which the expert-major grouped kernels replace the
+/// per-(token, slot) GEMVs: below this, the GEMVs' extra weight reads are
+/// cheaper than grouping.
+pub const GROUPED_MIN_TOKENS: usize = 32;
+const MAX_GROUPED_EXPERTS: usize = 520;
+
+/// Whether the grouped prefill kernels support this geometry: hidden and
+/// expert width multiples of 512 (one 16-byte chunk per lane per 512 values),
+/// at most 8 hidden and 4 expert-width chunks held in registers.
+pub fn grouped_supported(hidden: usize, inter: usize, experts_total: usize) -> bool {
+    hidden.is_multiple_of(512)
+        && hidden / 512 <= 8
+        && inter.is_multiple_of(512)
+        && inter / 512 <= 4
+        && experts_total <= MAX_GROUPED_EXPERTS
+}
+
+/// Expert-major routed MoE for prefill: the same result as
+/// [`fp8_gate_up`] followed by [`fp8_down`], streaming each expert's weights
+/// once per call instead of once per routed token.
+pub fn fp8_moe_grouped(
+    x: &Tensor,
+    routing: &Tensor,
+    slots: usize,
+    w13: &Tensor,
+    s13: &Tensor,
+    w2: &Tensor,
+    s2: &Tensor,
+) -> Result<Tensor> {
+    let (tokens, hidden) = x.dims2()?;
+    let (experts_total, rows, _) = w13.dims3()?;
+    let inter = rows / 2;
+    check_routing(routing, tokens, slots)?;
+    if !grouped_supported(hidden, inter, experts_total)
+        || w2.dims3()? != (experts_total, hidden, inter)
+    {
+        candle_core::bail!(
+            "grouped MoE does not support hidden {hidden}, expert width {inter}, {experts_total} experts"
+        )
+    }
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        return cuda_impl::grouped(
+            x,
+            routing,
+            slots,
+            w13,
+            s13,
+            w2,
+            s2,
+            experts_total,
+            hidden,
+            inter,
+        );
+    }
+    let act = fp8_gate_up(x, routing, slots, w13, s13)?;
+    fp8_down(&act, routing, slots, w2, s2)
+}
+
 /// Router projection: `x` `[tokens, hidden]` (16-bit activations; F32 on the
 /// CPU reference) against F32 router rows `[rows, hidden]` → F32 logits
 /// `[tokens, rows]`, rounded through the activation dtype so routing sees the
@@ -445,6 +504,174 @@ mod cuda_impl {
     fn i32_arg(value: usize, name: &str) -> Result<i32> {
         i32::try_from(value)
             .map_err(|_| candle_core::Error::Msg(format!("fused MoE {name} {value} exceeds i32")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn grouped(
+        x: &Tensor,
+        routing: &Tensor,
+        slots: usize,
+        w13: &Tensor,
+        s13: &Tensor,
+        w2: &Tensor,
+        s2: &Tensor,
+        experts_total: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> Result<Tensor> {
+        let device = x.device().as_cuda_device()?;
+        let tokens = x.dim(0)?;
+        let pairs = tokens * slots;
+        let (x, routing, w13, s13, w2, s2) = (
+            x.contiguous()?,
+            routing.contiguous()?,
+            w13.contiguous()?,
+            s13.contiguous()?,
+            w2.contiguous()?,
+            s2.contiguous()?,
+        );
+        let (x_storage, x_layout) = x.storage_and_layout();
+        let (r_storage, r_layout) = routing.storage_and_layout();
+        let (w13_storage, w13_layout) = w13.storage_and_layout();
+        let (s13_storage, s13_layout) = s13.storage_and_layout();
+        let (w2_storage, w2_layout) = w2.storage_and_layout();
+        let (s2_storage, s2_layout) = s2.storage_and_layout();
+        aligned(w13_layout, "w13")?;
+        aligned(w2_layout, "w2")?;
+        if !(x_layout.start_offset() * 2).is_multiple_of(16) {
+            candle_core::bail!("grouped MoE activations must start on a 16-byte boundary")
+        }
+        let r = view::<f32>(&r_storage, r_layout, "routing")?;
+        let w13v = view::<u8>(&w13_storage, w13_layout, "w13")?;
+        let s13v = view::<f32>(&s13_storage, s13_layout, "s13")?;
+        let w2v = view::<u8>(&w2_storage, w2_layout, "w2")?;
+        let s2v = view::<f32>(&s2_storage, s2_layout, "s2")?;
+        // SAFETY: the grouping kernel writes every offset and every routed pair
+        // index (routing ids are in range by contract).
+        let offsets = unsafe { device.alloc::<i32>(experts_total + 1)? };
+        let sorted = unsafe { device.alloc::<i32>(pairs)? };
+        // SAFETY: the down kernel writes every (pair, channel) partial.
+        let partial = unsafe { device.alloc::<f32>(pairs * hidden)? };
+        let group = device.get_or_load_custom_func(
+            "qwen36moe_group_pairs",
+            MODULE,
+            super::super::cuda_ptx::QWEN36MOE,
+        )?;
+        let mut builder = group.builder();
+        builder.arg(&r);
+        builder.arg(&offsets);
+        builder.arg(&sorted);
+        candle_core::builder_arg!(
+            builder,
+            i32_arg(tokens, "tokens")?,
+            slots as i32,
+            experts_total as i32
+        );
+        let single_block = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: argument order matches `qwen36moe_group_pairs`.
+        unsafe { builder.launch(single_block) }.w()?;
+        macro_rules! run {
+            ($ty:ty, $gate_up:literal, $down:literal, $combine:literal) => {{
+                let xv = view::<$ty>(&x_storage, x_layout, "activations")?;
+                // SAFETY: every routed pair's activation row is written.
+                let act = unsafe { device.alloc::<$ty>(pairs * inter)? };
+                // SAFETY: every (token, channel) output is written.
+                let out = unsafe { device.alloc::<$ty>(tokens * hidden)? };
+                let gate_up = device.get_or_load_custom_func(
+                    $gate_up,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = gate_up.builder();
+                builder.arg(&xv);
+                builder.arg(&offsets);
+                builder.arg(&sorted);
+                builder.arg(&w13v);
+                builder.arg(&s13v);
+                builder.arg(&act);
+                candle_core::builder_arg!(builder, slots as i32, hidden as i32, inter as i32);
+                let config = LaunchConfig {
+                    grid_dim: (experts_total as u32, (inter as u32).div_ceil(WARPS), 1),
+                    block_dim: (32 * WARPS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: validated grouped geometry; argument order matches.
+                unsafe { builder.launch(config) }.w()?;
+                let down = device.get_or_load_custom_func(
+                    $down,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = down.builder();
+                builder.arg(&act);
+                builder.arg(&offsets);
+                builder.arg(&sorted);
+                builder.arg(&w2v);
+                builder.arg(&s2v);
+                builder.arg(&partial);
+                candle_core::builder_arg!(builder, hidden as i32, inter as i32);
+                let config = LaunchConfig {
+                    grid_dim: (experts_total as u32, (hidden as u32).div_ceil(WARPS), 1),
+                    block_dim: (32 * WARPS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: validated grouped geometry; argument order matches.
+                unsafe { builder.launch(config) }.w()?;
+                let combine = device.get_or_load_custom_func(
+                    $combine,
+                    MODULE,
+                    super::super::cuda_ptx::QWEN36MOE,
+                )?;
+                let mut builder = combine.builder();
+                builder.arg(&partial);
+                builder.arg(&r);
+                builder.arg(&out);
+                candle_core::builder_arg!(builder, slots as i32, hidden as i32);
+                let config = LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(tokens)
+                            .map_err(|_| candle_core::Error::Msg("combine grid".into()))?,
+                        (hidden as u32).div_ceil(256),
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                // SAFETY: argument order matches the combine kernel.
+                unsafe { builder.launch(config) }.w()?;
+                out
+            }};
+        }
+        let tensor = match x.dtype() {
+            DType::BF16 => wrap(
+                run!(
+                    half::bf16,
+                    "qwen36moe_gate_up_grouped_bf16",
+                    "qwen36moe_down_grouped_bf16",
+                    "qwen36moe_combine_bf16"
+                ),
+                device,
+                Shape::from((tokens, hidden)),
+            ),
+            DType::F16 => wrap(
+                run!(
+                    half::f16,
+                    "qwen36moe_gate_up_grouped_f16",
+                    "qwen36moe_down_grouped_f16",
+                    "qwen36moe_combine_f16"
+                ),
+                device,
+                Shape::from((tokens, hidden)),
+            ),
+            other => {
+                candle_core::bail!("grouped MoE CUDA activations must be F16/BF16, found {other:?}")
+            }
+        };
+        Ok(tensor)
     }
 
     pub(super) fn router(
@@ -923,6 +1150,62 @@ mod tests {
             }
         }
         assert!(router_logits(&x, &w.narrow(1, 0, 4).unwrap()).is_err());
+    }
+
+    #[test]
+    fn grouped_prefill_matches_the_per_pair_path_and_gates_its_geometry() {
+        assert!(grouped_supported(2048, 512, 257));
+        assert!(
+            !grouped_supported(256, 512, 257),
+            "hidden must be a multiple of 512"
+        );
+        assert!(
+            !grouped_supported(2048, 256, 257),
+            "expert width must be a multiple of 512"
+        );
+        assert!(
+            !grouped_supported(8192, 512, 257),
+            "at most 8 hidden chunks per lane"
+        );
+        assert!(
+            !grouped_supported(2048, 512, 600),
+            "expert table fits shared memory"
+        );
+        let spec = RouteSpec {
+            num_experts: 4,
+            top_k: 2,
+            shared: SharedSlot::Ungated,
+            shared_slot_id: 4,
+            norm_topk: true,
+        };
+        let f = fixture(3, 512, 512, 5, spec.logit_columns());
+        let routing = route(&f.logits, &spec).unwrap();
+        let slots = spec.slots();
+        let per_pair = fp8_down(
+            &fp8_gate_up(&f.x, &routing, slots, &f.w13, &f.s13).unwrap(),
+            &routing,
+            slots,
+            &f.w2,
+            &f.s2,
+        )
+        .unwrap();
+        let grouped = fp8_moe_grouped(&f.x, &routing, slots, &f.w13, &f.s13, &f.w2, &f.s2).unwrap();
+        assert_eq!(
+            grouped.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            per_pair.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let narrow = fixture(2, 256, 128, 5, spec.logit_columns());
+        let routing = route(&narrow.logits, &spec).unwrap();
+        assert!(fp8_moe_grouped(
+            &narrow.x,
+            &routing,
+            slots,
+            &narrow.w13,
+            &narrow.s13,
+            &narrow.w2,
+            &narrow.s2
+        )
+        .is_err());
     }
 
     #[test]
