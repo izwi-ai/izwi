@@ -16,6 +16,12 @@ pub fn provider_supported(device: &Device, dtype: DType, n: usize, k: usize) -> 
     {
         return false;
     }
+    device_is_sm80_or_newer(device)
+}
+
+/// Whether `device` is a CUDA device of compute capability 8.0 or newer (the
+/// floor the repo's PTX targets). Cached per Candle device; false off CUDA.
+pub(crate) fn device_is_sm80_or_newer(device: &Device) -> bool {
     #[cfg(feature = "cuda")]
     if let Ok(device) = device.as_cuda_device() {
         use candle_core::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR;

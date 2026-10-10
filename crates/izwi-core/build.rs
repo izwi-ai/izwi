@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/kernels/cuda/qwen35.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/qwen38.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/fp8.cu");
+    println!("cargo:rerun-if-changed=src/kernels/cuda/qwen36moe.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/sampling.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/physical_state.cu");
 
@@ -30,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "src/kernels/cuda/qwen35.cu",
             "src/kernels/cuda/qwen38.cu",
             "src/kernels/cuda/fp8.cu",
+            "src/kernels/cuda/qwen36moe.cu",
             "src/kernels/cuda/sampling.cu",
             "src/kernels/cuda/physical_state.cu",
         ])

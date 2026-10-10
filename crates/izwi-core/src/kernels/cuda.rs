@@ -18,6 +18,7 @@ use crate::kernels::FusedSiluMulResult;
 mod epilogues;
 pub mod fp8;
 pub mod graphs;
+pub mod moe;
 pub mod sampling;
 pub mod timing;
 
