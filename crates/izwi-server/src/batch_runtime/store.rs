@@ -555,7 +555,7 @@ pub struct WorkerHeartbeatUpdate {
     pub diagnostic_json: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegisteredWorkerHeartbeatUpdate {
     pub registration: RuntimeWorkerRegistration,
     pub status: String,
