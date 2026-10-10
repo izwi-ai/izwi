@@ -502,3 +502,105 @@ __device__ void q36_rms_norm(
 
 Q36_NORM_EXPORT(__half, f16)
 Q36_NORM_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Full-attention q/k head norm + partial rotate-half RoPE for one token.
+//
+// Replaces the per-layer chain of q/k contiguous copies, cast -> rms_norm ->
+// cast, the host-built cos/sin upload and cos/sin/cast ops, the rotary op and
+// the pass-through concatenation with one launch. Block b < num_heads handles
+// query head b; the rest handle key heads. Query heads are read from the
+// gated q_proj layout [num_heads, 2 * head_dim] (query half first).
+// Rounding mirrors the reference chain: normalized values, cos and sin are
+// rounded to T before the rotation, and the result is rounded to T. Angles are
+// position * inv_freq in F32 with the interleaved M-RoPE sections
+// (dims 1,4,7,.. < 3*sec_h use the height position, 2,5,8,.. < 3*sec_w the
+// width position) when the three positions differ.
+template <class T>
+__device__ void q36_qk_norm_rope(
+    const T* __restrict__ q_src,
+    const T* __restrict__ k_src,
+    const float* __restrict__ q_gain,
+    const float* __restrict__ k_gain,
+    const float* __restrict__ inv_freq,
+    T* __restrict__ q_out,
+    T* __restrict__ k_out,
+    int num_heads,
+    int head_dim,
+    int rope_dim,
+    int pos_t,
+    int pos_h,
+    int pos_w,
+    int sec_h,
+    int sec_w,
+    float eps) {
+  __shared__ float part[32];
+  __shared__ float inv_shared;
+  const int head = blockIdx.x;
+  const bool is_query = head < num_heads;
+  const T* src = is_query ? q_src + (size_t)head * 2 * head_dim
+                          : k_src + (size_t)(head - num_heads) * head_dim;
+  const float* gain = is_query ? q_gain : k_gain;
+  T* dst = is_query ? q_out + (size_t)head * head_dim
+                    : k_out + (size_t)(head - num_heads) * head_dim;
+  float ss = 0.f;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const float v = float(src[i]);
+    ss = fmaf(v, v, ss);
+  }
+  ss = q36_warp_sum(ss);
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (lane == 0) {
+    part[warp] = ss;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int warps = (blockDim.x + 31) >> 5;
+    float total = lane < warps ? part[lane] : 0.f;
+    total = q36_warp_sum(total);
+    if (lane == 0) {
+      inv_shared = 1.f / sqrtf(total / (float)head_dim + eps);
+    }
+  }
+  __syncthreads();
+  const float inv = inv_shared;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    q36_shared[i] = float(T(float(src[i]) * inv * gain[i]));
+  }
+  __syncthreads();
+  const int half = rope_dim >> 1;
+  const bool sectioned = pos_t != pos_h || pos_t != pos_w;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float out = q36_shared[i];
+    if (i < rope_dim) {
+      const int j = i < half ? i : i - half;
+      int pos = pos_t;
+      if (sectioned) {
+        if (j % 3 == 1 && j < 3 * sec_h) {
+          pos = pos_h;
+        } else if (j % 3 == 2 && j < 3 * sec_w) {
+          pos = pos_w;
+        }
+      }
+      const float angle = (float)pos * inv_freq[j];
+      const float c = float(T(cosf(angle)));
+      const float s = float(T(sinf(angle)));
+      out = i < half ? q36_shared[i] * c - q36_shared[i + half] * s
+                     : q36_shared[i - half] * s + q36_shared[i] * c;
+    }
+    dst[i] = T(out);
+  }
+}
+
+#define Q36_QK_EXPORT(T, S)                                                                      \
+  extern "C" __global__ void __launch_bounds__(256) qwen36moe_qk_norm_rope_##S(                 \
+      const T* q_src, const T* k_src, const float* q_gain, const float* k_gain,                 \
+      const float* inv_freq, T* q_out, T* k_out, int num_heads, int head_dim, int rope_dim,     \
+      int pos_t, int pos_h, int pos_w, int sec_h, int sec_w, float eps) {                        \
+    q36_qk_norm_rope<T>(q_src, k_src, q_gain, k_gain, inv_freq, q_out, k_out, num_heads,        \
+                        head_dim, rope_dim, pos_t, pos_h, pos_w, sec_h, sec_w, eps);             \
+  }
+
+Q36_QK_EXPORT(__half, f16)
+Q36_QK_EXPORT(__nv_bfloat16, bf16)

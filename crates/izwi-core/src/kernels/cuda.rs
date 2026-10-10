@@ -21,6 +21,7 @@ pub mod gdn;
 pub mod graphs;
 pub mod moe;
 pub mod norm;
+pub mod rope;
 pub mod sampling;
 pub mod timing;
 
