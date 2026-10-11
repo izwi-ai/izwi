@@ -174,10 +174,10 @@ partitioned kernel is no better: one query head per block, a block-wide reductio
 and a reduce that walks the partitions serially.
 
 - [x] DeltaNet beta/alpha through the router GEMV (`c7130977`); no cuBLAS left in the segments.
-- [x] Event tracking off in single-stream mode (`b4b5bf42`). Without multi-stream mode the events
-      never order anything, but cost about 4 driver calls per allocation (about 64 allocations
-      per token in the eager attention parts). Left on in multi-stream mode;
-      `IZWI_CUDA_EVENT_TRACKING=1` restores it.
+- Event tracking off (`b4b5bf42`), **reverted** (`07e48fef`) after it broke serving (see the
+  2026-10-11 deploy below). The events are not redundant: Candle runs on the per-thread
+  default stream, so they order frees across threads, and cudarc's slice drop binds the CUDA
+  context only through them. Do not retry without a cross-thread drop proof.
 - [x] Grouped-query split decode kernel (`945426b0`; on by default since `8710ace0`),
       `kernels::cuda::split_decode`:
   - grid (B × Hkv, partitions): 1 partition per 128 tokens, up to about 512 blocks (Qwen3.6
@@ -304,7 +304,7 @@ last user message (just before the final `<|im_start|>assistant`).
 | 2026-10-10 | `55fc45d2` (same thread, turn 2) | 1-3 | 3,435 | 23,536 | 146 | includes re-prefilling the history; longer context |
 
 ### Next deploy: Phases 5a and 3b, what to check
-Deploy `8710ace0` or later. Split decode and prefix reuse are both on by default; A/B each one by
+Deploy `821c17f1` or later. Split decode and prefix reuse are both on by default; A/B each one by
 turning it off on the same two-turn thread, so each row changes one thing.
 
 1. **Pre-flight**: the step 0 command below now also runs `kernels::cuda::split_decode` (the
@@ -323,8 +323,40 @@ turning it off on the same two-turn thread, so each row changes one thing.
    `cuda_flash_attention_dispatches` confirms the FA2 reading in Phase 3b,
    `cuda_native_attention_dispatches` refutes it.
 4. **Prefix reuse off** (`IZWI_ENABLE_PREFIX_CACHING=0`): compare turn-2 total ms with step 2.
-5. **Event tracking**: `IZWI_CUDA_EVENT_TRACKING=1` restores cudarc's default, for an A/B on
-   turn 1 if it regressed from 172 t/s.
+
+### Deploy 2026-10-11 (`24d97633`): a stream failed after two tokens
+The first chat stream after the deploy emitted two deltas, then failed with "executor retry
+budget exhausted after 3 attempts: physical batch workspace admission failed: insufficient live
+physical capacity". The physical capacity read `Unknown` for both host and device.
+
+Cause: `b4b5bf42` turned cudarc's per-allocation event tracking off.
+- Candle's `Device::new_cuda` runs on cudarc's per-thread default stream (`0x2`). izwi runs steps
+  as tokio tasks, so tensors are dropped on threads that may never have bound the context.
+- cudarc's `CudaSlice::drop` binds the context only inside its event waits. Without events it
+  calls `cuMemFreeAsync` on the dropping thread's default stream with no current context, which
+  NVIDIA documents as `CUDA_ERROR_INVALID_CONTEXT`. The free fails, the memory leaks, and the
+  error is latched on the shared `CudaContext`.
+- The capacity sampler's cudarc `mem_get_info` runs `bind_to_thread`, which returns that latched
+  error. The sample failed, capacity read Unknown, and guarded admission refused the batch.
+  The executor's three retries (35 ms of backoff) fell inside the probe's 250 ms retry window.
+
+Fixes:
+- `07e48fef`: revert the event-tracking change; a CUDA test drops a tensor on a fresh thread and
+  requires no latched error.
+- `821c17f1`: the capacity probe calls the driver directly, so a latched error elsewhere neither
+  fails the sample nor gets consumed; probe failures now log the driver error.
+
+Residual risks to watch:
+- cudarc 0.19.8 still latches an error when a slice whose event a graph capture recorded is
+  dropped after that graph is destroyed (cudarc #590, fixed upstream in #591). In izwi that is
+  segment-graph teardown (reset or unload), not steady-state replay. The probe no longer turns
+  it into an admission failure, but the next CUDA call on that context will return it.
+- Guarded admission requires every pending reservation to fit in free device memory. The
+  failing request showed 41.76 GB of Model-class reservations not yet allocated (most likely the
+  managed KV arena's lazy authorization), so device memory no reservation accounts for comes
+  straight out of that margin: prefix snapshots (about 63 MiB each) and split-decode partials (a
+  few MB per call). If the error recurs with a known `physical_available`, compare it against
+  `existing_pending`.
 
 ### Correctness review of `4e764ffb..8ce1e08a` (2026-10-10)
 
