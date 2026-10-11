@@ -1436,6 +1436,98 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// A decode quantum on the whole-step graph pipelines its steps: device
+    /// token selection, with step k+1 queued before token k is read back.
+    /// It must emit what step-by-step decode does and stop where it does,
+    /// discarding the step queued past the end. (The fixture's own trunk is
+    /// too small for the fused paths; its tokenizer drives the synthetic
+    /// block-FP8 trunk instead.)
+    #[test]
+    fn a_pipelined_quantum_matches_step_by_step_decode() {
+        use crate::models::architectures::qwen36moe::text::tests::{
+            e2e_cache, synthetic_fused_model,
+        };
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let decode = |tag: &str, config: &ChatGenerationConfig, quantum: Option<usize>| {
+            let (mut model, dir) = load_fixture(tag);
+            let (text_model, text_config) = synthetic_fused_model(384, quantum.is_some());
+            assert_eq!(text_model.graph_step_ready(), quantum.is_some());
+            model.exec.text_model = text_model;
+            model.exec.text_config = text_config;
+            let cache = e2e_cache(&Device::Cpu);
+            let mut state = model
+                .start_decode_state_physical(&messages, 9, config, None, cache)
+                .expect("decode state");
+            let (mut text, mut calls) = (String::new(), 0usize);
+            while !state.is_finished() {
+                let step = match quantum {
+                    Some(budget) => model.exec.decode_quantum(&mut state, budget),
+                    None => model.exec.decode_step(&mut state),
+                }
+                .expect("decode");
+                text.push_str(&step.delta);
+                calls += 1;
+            }
+            let pipelined = model.exec.text_model.cuda_graphs_summary()["whole_step"]["pipelined"]
+                .as_u64()
+                .unwrap_or(0);
+            std::fs::remove_dir_all(dir).ok();
+            ((state.generated_ids().to_vec(), text), calls, pipelined)
+        };
+        let greedy = generation_config();
+        let (expected, steps, _) = decode("pipelined-reference", &greedy, None);
+        assert!(
+            expected.0.len() > 4,
+            "the fixture must emit several tokens: {expected:?}"
+        );
+        let (actual, quanta, pipelined) = decode("pipelined", &greedy, Some(4));
+        assert_eq!(actual, expected);
+        assert!(quanta < steps, "{quanta} quanta for {steps} steps");
+        // The first token comes from the prefill; each quantum after it
+        // forwards its first token from the host and the rest from the device.
+        assert!(pipelined > 0, "no step took a device-selected token");
+
+        // A stop token mid-quantum finishes the stream with the next step
+        // already queued: that step is discarded and nothing more is emitted.
+        let (ids, _) = &expected;
+        let stop = ids
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(index, token)| !ids[..*index].contains(token))
+            .map(|(_, &token)| token)
+            .expect("a token first emitted mid-stream");
+        let stopping = ChatGenerationConfig {
+            stop_token_ids: vec![stop],
+            ..generation_config()
+        };
+        let (expected, _, _) = decode("pipelined-stop-reference", &stopping, None);
+        let (actual, _, pipelined) = decode("pipelined-stop", &stopping, Some(8));
+        assert!(
+            expected.0.len() < ids.len(),
+            "the stop token ends the stream early"
+        );
+        assert_eq!(actual, expected);
+        assert!(pipelined > 0);
+
+        // Sampled decode draws on the device sampler; it must run to the cap.
+        let sampled = ChatGenerationConfig {
+            temperature: 0.7,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: 7,
+            ..generation_config()
+        };
+        let ((tokens, _), _, pipelined) = decode("pipelined-sampled", &sampled, Some(4));
+        assert!(
+            !tokens.is_empty() && pipelined > 0,
+            "{tokens:?} tokens, {pipelined} pipelined"
+        );
+    }
+
     /// Per-row cache windows over ONE shared arena: the continuous decode
     /// batch requires every row to reference the same arena instance.
     fn shared_physical_caches(

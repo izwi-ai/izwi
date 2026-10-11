@@ -36,6 +36,7 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::text::{Qwen36MoeFfnGeometry, Qwen36TextModel, Qwen36TextRuntimeState};
 
+mod select;
 mod timing;
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
@@ -297,6 +298,11 @@ impl ChatDecodeState {
     /// Whether the session reached a stop condition or its output cap.
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generated_ids(&self) -> &[u32] {
+        &self.generated_ids
     }
 
     /// Tokens still to recompute before decode resumes, when a replay is
@@ -1264,19 +1270,33 @@ impl Qwen36ChatExec {
             }
             token
         };
+        let delta = self.accept_token(state, next)?;
+        let final_text = if state.finished {
+            state.assembled.clone()
+        } else {
+            String::new()
+        };
+
+        Ok(ChatDecodeStep {
+            delta,
+            text: final_text,
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed,
+            finished: state.finished,
+        })
+    }
+
+    /// Publish a sampled token as a decode step does: a stop token finishes
+    /// the stream; any other token is decoded, recorded in the history and
+    /// journal, counted, and becomes the pending input, and the output cap may
+    /// finish the stream. Returns the text delta.
+    fn accept_token(&self, state: &mut ChatDecodeState, next: u32) -> Result<String> {
         if self.is_stop_token(next, &state.config) {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
             state.assembled.push_str(&delta);
-            return Ok(ChatDecodeStep {
-                delta,
-                text: state.assembled.clone(),
-                tokens_generated: state.tokens_generated,
-                input_tokens_committed,
-                finished: true,
-            });
+            return Ok(delta);
         }
-
         let mut delta = self
             .tokenizer
             .decode_token_delta(&mut state.decoder, next)?;
@@ -1293,19 +1313,7 @@ impl Qwen36ChatExec {
             state.assembled.push_str(&suffix);
             delta.push_str(&suffix);
         }
-        let final_text = if state.finished {
-            state.assembled.clone()
-        } else {
-            String::new()
-        };
-
-        Ok(ChatDecodeStep {
-            delta,
-            text: final_text,
-            tokens_generated: state.tokens_generated,
-            input_tokens_committed,
-            finished: state.finished,
-        })
+        Ok(delta)
     }
 
     pub(crate) fn decode_step_batch(
@@ -1697,8 +1705,16 @@ impl Qwen36ChatExec {
         let mut committed = 0usize;
         // Each step replaces the pending logprobs; the quantum reports them all.
         let mut logprobs = Vec::new();
-        for _ in 0..input_budget.max(1) {
+        let budget = input_budget.max(1);
+        let mut iteration = 0usize;
+        while iteration < budget {
+            if let Some(step) = self.decode_quantum_pipelined(state, budget - iteration)? {
+                delta.push_str(&step.delta);
+                committed += step.input_tokens_committed;
+                break;
+            }
             let step = self.decode_step(state)?;
+            iteration += 1;
             logprobs.append(&mut state.pending_logprobs);
             delta.push_str(&step.delta);
             committed += step.input_tokens_committed;
@@ -1714,6 +1730,131 @@ impl Qwen36ChatExec {
             input_tokens_committed: committed,
             finished: state.finished,
         })
+    }
+
+    /// The rest of a quantum with each next step queued before the current
+    /// token is read back (CUDA, whole-step graph replaying). Every step is
+    /// a forward of the pending token and a device-side token choice that
+    /// feeds the next step's input slot. The host reads token k while step
+    /// k+1 runs, then commits step k's KV write and publishes the token as a
+    /// decode step does. A token that finishes the stream discards the
+    /// queued step: its DeltaNet outputs are dropped (they are fresh
+    /// buffers) and its KV slot stays uncommitted. `Ok(None)`: the request
+    /// or the graph cannot pipeline (fewer than two iterations, a grammar,
+    /// logprobs, MTP, no pending token); the caller decodes step by step.
+    fn decode_quantum_pipelined(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<Option<ChatDecodeStep>> {
+        struct Queued {
+            step: crate::models::architectures::qwen36moe::text::EnqueuedGraphStep,
+            token: select::PendingToken,
+            state_after: Qwen36TextRuntimeState,
+        }
+        let model = &self.text_model;
+        let Some(pending) = state.pending_token else {
+            return Ok(None);
+        };
+        // The output cap ends the stream exactly; nothing is queued past it.
+        let budget = budget.min(state.max_new_tokens.saturating_sub(state.tokens_generated));
+        if budget < 2
+            || state.finished
+            || state.replay.is_some()
+            || state.grammar.is_some()
+            || state.config.logprobs
+            || state.mtp_cache.is_some()
+            || state.unconsumed_output.is_some()
+            || !model.graph_step_ready()
+        {
+            return Ok(None);
+        }
+        let greedy = deterministic_greedy(&state.config);
+        let history: &[u32] = if state.track_history {
+            &state.history_ids
+        } else {
+            &[]
+        };
+        let mut selector = select::DeviceSelector::new(
+            model.device(),
+            self.tokenizer.vocab_size,
+            &state.config,
+            greedy,
+            history,
+        )?;
+        let base = state.next_text_position;
+        let Some(first) = model.enqueue_graph_step(
+            Some(pending),
+            base,
+            &mut state.text_state,
+            &state.physical_kv,
+        )?
+        else {
+            return Ok(None);
+        };
+        state.pending_token = None;
+        let token_slot = model.graph_step_token().ok_or_else(|| {
+            Error::InferenceError("the whole-step graph has no step buffer".into())
+        })??;
+        let draw = |rng: &mut SimpleRng| if greedy { 0.0 } else { rng.next_f32() };
+        let uniform = draw(&mut state.rng);
+        let mut current = Queued {
+            token: selector.select(&first.logits, &token_slot, uniform)?,
+            step: first,
+            state_after: state.text_state.clone(),
+        };
+        let mut launched = 1usize;
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        loop {
+            let next = if launched < budget {
+                match model.enqueue_graph_step(
+                    None,
+                    base + launched,
+                    &mut state.text_state,
+                    &state.physical_kv,
+                )? {
+                    Some(step) => {
+                        launched += 1;
+                        let uniform = draw(&mut state.rng);
+                        Some(Queued {
+                            token: selector.select(&step.logits, &token_slot, uniform)?,
+                            step,
+                            state_after: state.text_state.clone(),
+                        })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let token = selector.wait(current.token)?;
+            model.commit_enqueued_step(current.step, &mut state.physical_kv)?;
+            state.next_text_position += 1;
+            committed += 1;
+            delta.push_str(&self.accept_token(state, token)?);
+            match next {
+                // The queued step already forwards this token.
+                Some(next) if !state.finished => {
+                    state.pending_token = None;
+                    current = next;
+                }
+                // The stream ended: discard the queued step.
+                Some(discarded) => {
+                    state.text_state = current.state_after;
+                    drop(discarded);
+                    break;
+                }
+                None => break,
+            }
+        }
+        Ok(Some(ChatDecodeStep {
+            delta,
+            text: state.assembled.clone(),
+            tokens_generated: state.tokens_generated,
+            input_tokens_committed: committed,
+            finished: state.finished,
+        }))
     }
 
     /// Scalar tail: forward the pending token, sample, and write the MTP

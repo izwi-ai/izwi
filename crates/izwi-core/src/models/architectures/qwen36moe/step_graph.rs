@@ -75,6 +75,8 @@ pub(in crate::models::architectures::qwen36moe) struct WholeStepPlan {
     pub(super) captures: AtomicU64,
     pub(super) replays: AtomicU64,
     pub(super) verified: AtomicU64,
+    /// Steps queued with a device-selected input token (pipelined decode).
+    pub(super) pipelined: AtomicU64,
 }
 
 /// Runtime state, held under the decode graphs' runtime lock.
@@ -146,11 +148,23 @@ impl WholeStepPlan {
             captures: AtomicU64::new(0),
             replays: AtomicU64::new(0),
             verified: AtomicU64::new(0),
+            pipelined: AtomicU64::new(0),
         })
     }
 
     pub(super) fn head_in_graph(&self) -> bool {
         self.head_in_graph
+    }
+
+    /// Whether a step may take its input token from the step buffer: the
+    /// graph replays (its warm check needs the token on the host), or the
+    /// body runs eagerly every step.
+    pub(super) fn takes_device_tokens(&self, phase: &Phase) -> bool {
+        match phase {
+            Phase::Disabled(_) => false,
+            Phase::Replay => true,
+            _ => !self.capture,
+        }
     }
 
     pub(super) fn summary(&self, phase: &Phase) -> serde_json::Value {
@@ -165,13 +179,16 @@ impl WholeStepPlan {
             "captures": self.captures.load(Relaxed),
             "replays": self.replays.load(Relaxed),
             "verified": self.verified.load(Relaxed),
+            "pipelined": self.pipelined.load(Relaxed),
         })
     }
 }
 
 /// One decode row's inputs for the whole step.
 pub(super) struct StepRequest<'a> {
-    pub(super) token: u32,
+    /// The input token, or `None` for the one the previous step's device-side
+    /// token selection wrote into the step buffer (pipelined decode).
+    pub(super) token: Option<u32>,
     pub(super) position: usize,
     pub(super) slot: KvSlotRef,
     pub(super) cache: &'a PhysicalPagedKvCache,
@@ -694,8 +711,11 @@ fn step_buffer(
         .ok_or_else(|| segment_error("KV slot index overflow"))?;
     let position = u32::try_from(request.position)
         .map_err(|_| segment_error("decode position exceeds u32"))?;
+    let step = runtime.step.as_mut().expect("step buffer allocated");
     let mut values = vec![0u32; METADATA + 2 + sequence.blocks.len()];
-    values[TOKEN] = request.token;
+    // A device-written token is left alone: matching the mirror keeps it out
+    // of the upload.
+    values[TOKEN] = request.token.unwrap_or(step.mirror[TOKEN]);
     values[POSITION] = position;
     values[SLOT] = slot;
     values[METADATA] = sequence.context_len;
@@ -703,7 +723,20 @@ fn step_buffer(
     for (entry, block) in values[METADATA + 2..].iter_mut().zip(&sequence.blocks) {
         *entry = block.index;
     }
-    let step = runtime.step.as_mut().expect("step buffer allocated");
     step.update(&values)?;
+    if request.token.is_none() {
+        // The device holds a token the host never saw: the next host token
+        // must upload whatever it is.
+        step.mirror[TOKEN] = u32::MAX;
+    }
     Ok(step.tensor.clone())
+}
+
+/// The step buffer's token slot (U32 `[1]`), where token selection writes the
+/// next step's input, once the buffer exists.
+pub(super) fn token_slot(runtime: &WholeStepRuntime) -> Option<Result<Tensor>> {
+    runtime
+        .step
+        .as_ref()
+        .map(|step| step.tensor.narrow(0, TOKEN, 1).map_err(Into::into))
 }

@@ -63,6 +63,28 @@ pub struct Qwen36TextModel {
     max_context_tokens: usize,
 }
 
+/// A single-row decode step queued through the whole-step graph
+/// ([`Qwen36TextModel::enqueue_graph_step`]).
+pub(crate) struct EnqueuedGraphStep {
+    /// `[1, 1, vocab]` on the device (the step's own copy).
+    pub(crate) logits: Tensor,
+    position: usize,
+    /// Taken by the commit. A step dropped uncommitted (a discarded
+    /// speculative step, an error) waits for its KV writes, so their pages
+    /// cannot be reused under them.
+    completions: Option<KvWriteCompletionCollector>,
+}
+
+impl Drop for EnqueuedGraphStep {
+    fn drop(&mut self) {
+        if let Some(completions) = self.completions.take() {
+            if let Err(error) = completions.drain() {
+                tracing::warn!(%error, "draining an uncommitted Qwen3.6 graph step failed");
+            }
+        }
+    }
+}
+
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
 /// pair rebuild consumes them) plus the optional final-row logits.
 pub(crate) struct Qwen36PrefillSpanOutput {
@@ -1312,6 +1334,89 @@ impl Qwen36TextModel {
     /// [`Self::forward_token_ids_batch_at_physical`], where the graphs live.
     pub(crate) fn graph_decode(&self) -> bool {
         self.decode_graphs.is_some()
+    }
+
+    /// Whether a single-row step can be queued with a device-resident input
+    /// token ([`Self::enqueue_graph_step`]): the whole-step graph is replaying.
+    pub(crate) fn graph_step_ready(&self) -> bool {
+        self.decode_graphs
+            .as_ref()
+            .is_some_and(|graphs| graphs.whole_step_replaying())
+    }
+
+    /// The whole-step graph's token slot on the device (U32 `[1]`), where
+    /// token selection writes the next step's input token.
+    pub(crate) fn graph_step_token(&self) -> Option<Result<Tensor>> {
+        self.decode_graphs
+            .as_ref()
+            .and_then(|graphs| graphs.whole_step_token_slot())
+    }
+
+    /// Queue one single-row decode step at `position` through the replaying
+    /// whole-step graph without waiting for it. `token` `None` takes the token
+    /// the previous step's selection wrote into the step buffer. The step's
+    /// DeltaNet state is published into `state`; its KV write is committed
+    /// later, in order, by [`Self::commit_enqueued_step`]. `Ok(None)`: the
+    /// graph did not take the step, and nothing was published.
+    pub(crate) fn enqueue_graph_step(
+        &self,
+        token: Option<u32>,
+        position: usize,
+        state: &mut Qwen36TextRuntimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<Option<EnqueuedGraphStep>> {
+        let Some(graphs) = &self.decode_graphs else {
+            return Ok(None);
+        };
+        self.validate_runtime_state(state)?;
+        let slot = cache.slots_for_queued_append(position, 1)?[0];
+        let lowered = cache.arena().lower_slots(&[slot])?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: vec![cache.sequence_table(position + 1)?],
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(cache.arena().config(), lowered.logical_slots())?;
+        let output = graphs.forward_whole(
+            self,
+            token,
+            position,
+            slot,
+            state,
+            cache,
+            lowered.as_ref(),
+            &metadata,
+            &mut completions,
+        );
+        let logits = match output {
+            Ok(Some(decode_graph::GraphDecodeOutput::Logits(logits))) => logits,
+            Ok(Some(decode_graph::GraphDecodeOutput::Hidden(hidden))) => {
+                self.project_hidden_span(&hidden)?
+            }
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                completions.drain()?;
+                return Err(error);
+            }
+        };
+        Ok(Some(EnqueuedGraphStep {
+            logits,
+            position,
+            completions: Some(completions),
+        }))
+    }
+
+    /// Commit a queued step's KV write (after its token was read back, so the
+    /// write fences have passed).
+    pub(crate) fn commit_enqueued_step(
+        &self,
+        mut step: EnqueuedGraphStep,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let completions = step
+            .completions
+            .take()
+            .ok_or_else(|| Error::InferenceError("graph step committed twice".into()))?;
+        cache.commit_shared_completion(step.position, 1, Arc::new(completions.seal()?))
     }
 
     /// Activation dtype (the token embeddings').
@@ -4198,7 +4303,7 @@ fn recurrent_gated_delta(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
         qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
@@ -4570,6 +4675,7 @@ mod tests {
         /// Trunk activation dtype (embeddings and dense projections): F16 by
         /// default, since Candle's CPU backend has no BF16 matmul.
         act: DType,
+        vocab: usize,
     }
 
     impl SyntheticFp8Source {
@@ -4580,8 +4686,31 @@ mod tests {
                 moe,
                 cuda: Qwen36CudaSwitches::default(),
                 act: DType::F16,
+                vocab: E2E_VOCAB,
             }
         }
+    }
+
+    /// The synthetic trunk over `vocab` tokens with every fused path resolved
+    /// (and, when `step_graph`, single-row decode through the whole-step
+    /// body), and its config: a model a chat fixture's tokenizer can drive.
+    pub(crate) fn synthetic_fused_model(
+        vocab: usize,
+        step_graph: bool,
+    ) -> (super::Qwen36TextModel, super::Qwen36TextConfig) {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let source = SyntheticFp8Source {
+            vocab,
+            ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto)
+        };
+        let config = e2e_config();
+        let mut model =
+            super::Qwen36TextModel::load_with_source(&source, &config, &Device::Cpu).unwrap();
+        model.enable_fused_paths_for_tests();
+        if step_graph {
+            model.enable_step_graph_for_tests();
+        }
+        (model, config)
     }
 
     const E2E_HIDDEN: usize = 256;
@@ -4705,7 +4834,7 @@ mod tests {
                 "attn_k" | "attn_v" => e2e_fp8(128, h, name),
                 "attn_output" => e2e_fp8(h, 2 * 128, name),
                 "output" => Qwen36Projection::Quantized(QMatMul::Tensor(e2e_dense(
-                    E2E_VOCAB, h, name, self.act,
+                    self.vocab, h, name, self.act,
                 ))),
                 other => panic!("unexpected synthetic projection {name} ({other})"),
             };
@@ -4831,11 +4960,11 @@ mod tests {
         }
 
         fn token_embeddings(&self, device: &Device) -> crate::error::Result<Tensor> {
-            Ok(e2e_dense(E2E_VOCAB, E2E_HIDDEN, "token_embd", self.act).to_device(device)?)
+            Ok(e2e_dense(self.vocab, E2E_HIDDEN, "token_embd", self.act).to_device(device)?)
         }
     }
 
-    fn e2e_cache(
+    pub(crate) fn e2e_cache(
         device: &Device,
     ) -> crate::models::shared::attention::physical::PhysicalPagedKvCache {
         use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
@@ -5333,6 +5462,98 @@ mod tests {
         // The segments never ran.
         assert_eq!(graphs["warmups"], 0, "{graphs}");
         assert_eq!(graphs["eager_steps"], 0);
+    }
+
+    /// Pipelined decode: each step is queued before the previous one is
+    /// committed, with its input token written into the step buffer's token
+    /// slot (as device token selection does) instead of passed from the host.
+    /// The logits must match the standard batched decode exactly, and a
+    /// queued step that is discarded (the stream stopped) must leave nothing
+    /// behind: the next decode at its position matches too.
+    #[test]
+    fn queued_steps_with_device_tokens_match_the_standard_decode() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let load = || {
+            let mut model = super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            model.enable_fused_paths_for_tests();
+            model
+        };
+        let standard = load();
+        let mut whole = load();
+        whole.enable_step_graph_for_tests();
+        assert!(whole.graph_step_ready());
+
+        let tokens = e2e_tokens();
+        let prompt = 6;
+        let last = tokens.len() - 1;
+        let expected = e2e_logits_via(&standard, &tokens, prompt, true);
+        let positions: Vec<[usize; 3]> = (0..tokens.len()).map(|p| [p, p, p]).collect();
+        let mut state = whole.new_state();
+        let mut cache = e2e_cache(&whole.device);
+        let mut rows = vec![flat(
+            &whole
+                .prefill_token_ids_physical(
+                    &tokens[..prompt],
+                    &positions[..prompt],
+                    &mut state,
+                    &mut cache,
+                    true,
+                )
+                .unwrap()
+                .expect("prefill logits"),
+        )];
+        let mut queued = whole
+            .enqueue_graph_step(Some(tokens[prompt]), prompt, &mut state, &cache)
+            .unwrap()
+            .expect("the first step is queued");
+        let slot = whole.graph_step_token().expect("step buffer").unwrap();
+        let write_token = |token: u32| {
+            slot.slice_set(&Tensor::new(&[token], &whole.device).unwrap(), 0, 0)
+                .unwrap()
+        };
+        for position in prompt + 1..last {
+            write_token(tokens[position]);
+            let next = whole
+                .enqueue_graph_step(None, position, &mut state, &cache)
+                .unwrap()
+                .expect("queued with the device token");
+            rows.push(flat(&queued.logits));
+            whole.commit_enqueued_step(queued, &mut cache).unwrap();
+            queued = next;
+        }
+        // The stream stops: the step queued at `last` (with the wrong token)
+        // is discarded and its DeltaNet state rolled back.
+        let state_after = state.clone();
+        write_token(tokens[last] ^ 1);
+        let discarded = whole
+            .enqueue_graph_step(None, last, &mut state, &cache)
+            .unwrap()
+            .expect("queued");
+        rows.push(flat(&queued.logits));
+        whole.commit_enqueued_step(queued, &mut cache).unwrap();
+        drop(discarded);
+        state = state_after;
+        assert_eq!(
+            cache.context_len(),
+            last,
+            "a discarded step commits nothing"
+        );
+        rows.push(flat(
+            &whole
+                .forward_token_ids_batch_at_physical(
+                    &tokens[last..=last],
+                    &positions[last..=last],
+                    &mut [&mut state],
+                    &mut [&mut cache],
+                )
+                .unwrap(),
+        ));
+        assert_eq!(rows, expected, "queued decode must be bit-identical");
     }
 
     /// The segmentation on the Metal GPU, through its fused kernels.
