@@ -27,6 +27,7 @@
 mod cache;
 #[cfg(test)]
 pub(crate) use cache::managed::{plan_managed_state_capacity, ManagedStateCapacityRequest};
+pub(crate) use cache::managed::{CUDA_AUTOMATIC_ROWS_GUIDANCE, CUDA_EXPLICIT_ROWS_GUIDANCE};
 mod config;
 mod core;
 pub mod execution;

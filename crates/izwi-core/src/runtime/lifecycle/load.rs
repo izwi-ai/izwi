@@ -196,6 +196,20 @@ struct ManagedChatCapacityPolicy {
     fit_cuda_resident_context: bool,
 }
 
+fn qwen36moe_state_geometry(
+    text: &crate::models::architectures::qwen36moe::native::Qwen36MoeTextConfig,
+) -> HybridStateGeometry {
+    HybridStateGeometry {
+        block_count: text.block_count,
+        full_attention_interval: text.full_attention_interval,
+        ssm_state_size: text.ssm_state_size,
+        ssm_group_count: text.ssm_group_count,
+        ssm_time_step_rank: text.ssm_time_step_rank,
+        ssm_inner_size: text.ssm_time_step_rank * text.ssm_value_head_dim,
+        ssm_conv_kernel: text.ssm_conv_kernel,
+    }
+}
+
 fn managed_chat_capacity_policy(
     variant: ModelVariant,
     backend: BackendKind,
@@ -208,6 +222,122 @@ fn managed_chat_capacity_policy(
             crate::catalog::ModelFamily::Qwen38Chat | crate::catalog::ModelFamily::Qwen35MoeChat
         ) && backend == BackendKind::Cuda,
     }
+}
+
+/// Gated DeltaNet geometry that sizes one sequence's recurrent state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HybridStateGeometry {
+    block_count: usize,
+    full_attention_interval: usize,
+    ssm_state_size: usize,
+    ssm_group_count: usize,
+    ssm_time_step_rank: usize,
+    ssm_inner_size: usize,
+    ssm_conv_kernel: usize,
+}
+
+/// F32 recurrent and convolution state of one sequence, summed over the
+/// linear-attention layers: the bytes the hybrid chat contracts (Qwen3.8,
+/// Qwen3.5/3.6-MoE) authorize per retained or staged row.
+fn hybrid_recurrent_state_bytes_per_sequence(geometry: HybridStateGeometry) -> Result<u64> {
+    let HybridStateGeometry {
+        block_count,
+        full_attention_interval,
+        ssm_state_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_inner_size,
+        ssm_conv_kernel,
+    } = geometry;
+    if full_attention_interval == 0
+        || ssm_conv_kernel == 0
+        || ssm_time_step_rank == 0
+        || !ssm_inner_size.is_multiple_of(ssm_time_step_rank)
+    {
+        return Err(Error::ModelLoadError(
+            "hybrid recurrent state geometry is invalid".into(),
+        ));
+    }
+    let linear_layers = block_count - block_count / full_attention_interval;
+    let recurrent = ssm_time_step_rank
+        .checked_mul(ssm_state_size)
+        .and_then(|elements| elements.checked_mul(ssm_inner_size / ssm_time_step_rank));
+    let convolution = ssm_state_size
+        .checked_mul(ssm_group_count)
+        .and_then(|keys| keys.checked_mul(2))
+        .and_then(|width| width.checked_add(ssm_inner_size))
+        .and_then(|width| width.checked_mul(ssm_conv_kernel - 1));
+    recurrent
+        .and_then(|recurrent| recurrent.checked_add(convolution?))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_mul(linear_layers))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::ModelLoadError("hybrid recurrent state size overflow".into()))
+}
+
+/// Recurrent state the CUDA resident fit must hold right after the weights:
+/// its fewest rows (the staged width when retained rows are automatic, the
+/// operator's rows otherwise), each priced at the model's per-row bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaStateFloor {
+    retained_rows: usize,
+    staged_rows: usize,
+    per_sequence_bytes: u64,
+    automatic_rows: bool,
+}
+
+impl CudaStateFloor {
+    fn bytes(self) -> Result<u64> {
+        self.retained_rows
+            .checked_add(self.staged_rows)
+            .and_then(|rows| u64::try_from(rows).ok())
+            .and_then(|rows| rows.checked_mul(self.per_sequence_bytes))
+            .ok_or_else(|| Error::ModelLoadError("CUDA recurrent state floor overflow".into()))
+    }
+}
+
+/// Price the recurrent state floor before any weight streams. A plan whose
+/// weights, floor state and safety reserve exceed the device can never pass
+/// the resident fit, so it fails here with the fit's guidance. Otherwise the
+/// load authorization also covers the floor, so a resident model in the way
+/// is evicted, or the load refused, before the weights are read.
+fn admit_cuda_state_floor(
+    variant: ModelVariant,
+    plan: &ModelResourcePlan,
+    floor: CudaStateFloor,
+    safety_reserve_bytes: u64,
+    device_capacity: ResourceAmount,
+) -> Result<ResourceVector> {
+    let (ResourceAmount::Known(weights_bytes), ResourceAmount::Known(load_peak_bytes)) = (
+        plan.resident_authorization.device_bytes,
+        plan.load_authorization.device_bytes,
+    ) else {
+        return Err(Error::ModelLoadError(format!(
+            "{variant} CUDA weight plan must be known before state admission"
+        )));
+    };
+    let minimum_state_bytes = floor.bytes()?;
+    let required_bytes = weights_bytes
+        .checked_add(minimum_state_bytes)
+        .and_then(|bytes| bytes.checked_add(safety_reserve_bytes))
+        .ok_or_else(|| Error::ModelLoadError("CUDA state floor overflow".into()))?;
+    if let ResourceAmount::Known(device_bytes) = device_capacity {
+        if required_bytes > device_bytes {
+            let guidance = if floor.automatic_rows {
+                crate::engine::CUDA_AUTOMATIC_ROWS_GUIDANCE
+            } else {
+                crate::engine::CUDA_EXPLICIT_ROWS_GUIDANCE
+            };
+            return Err(Error::ModelLoadError(format!(
+                "CUDA managed context cannot fit the model-authored minimum before loading {variant}: retained_sequences={}, staged_transactions={}, per_sequence_state_bytes={}, minimum_state_bytes={minimum_state_bytes}, weights_bytes={weights_bytes}, safety_reserve={safety_reserve_bytes}, device_capacity={device_bytes}; {guidance}",
+                floor.retained_rows, floor.staged_rows, floor.per_sequence_bytes,
+            )));
+        }
+    }
+    Ok(ResourceVector {
+        device_bytes: ResourceAmount::Known(load_peak_bytes.max(required_bytes)),
+        ..plan.load_authorization
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1314,6 +1444,51 @@ impl ModelLifecycleController {
         Ok(model_resource_plan(backend, estimate))
     }
 
+    /// The recurrent state floor of a model whose CUDA context is fitted
+    /// against resident headroom; `None` for every other load.
+    fn cuda_state_floor(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+    ) -> Result<Option<CudaStateFloor>> {
+        let policy =
+            managed_chat_capacity_policy(variant, self.backend_router.context().backend_kind);
+        if !policy.fit_cuda_resident_context {
+            return Ok(None);
+        }
+        let per_sequence_bytes = match variant {
+            ModelVariant::Qwen3827BFp8 => qwen38_memory::per_sequence_state_bytes(model_path)?,
+            ModelVariant::Qwen36Moe35BA3BFp8 => {
+                use crate::models::architectures::qwen36moe::native as qwen36moe;
+                if qwen36moe::synthetic_geometry_enabled() {
+                    // Fixture loads do not have the pinned 35B geometry.
+                    return Ok(None);
+                }
+                hybrid_recurrent_state_bytes_per_sequence(qwen36moe_state_geometry(
+                    &qwen36moe::pinned_native_config().text,
+                ))?
+            }
+            _ => return Ok(None),
+        };
+        let engine = self.core_engine.config();
+        let staged_rows = match policy.staged_transaction_rows {
+            Some(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
+            None => engine.max_staged_transactions,
+        };
+        let automatic_rows = engine.automatic_row_limits.retained_sequences;
+        let retained_rows = if automatic_rows {
+            staged_rows.min(engine.max_retained_sequences)
+        } else {
+            engine.max_retained_sequences
+        };
+        Ok(Some(CudaStateFloor {
+            retained_rows,
+            staged_rows: staged_rows.min(retained_rows),
+            per_sequence_bytes,
+            automatic_rows,
+        }))
+    }
+
     async fn ensure_portable_memory_before_load(
         &self,
         requested_variant: ModelVariant,
@@ -1567,9 +1742,25 @@ impl ModelLifecycleController {
         let artifacts_ms = load_started.elapsed().as_secs_f64() * 1000.0;
         let admission_started = Instant::now();
 
+        // Price the plan, and refuse one that can never fit, before evicting
+        // anything for it.
+        let mut resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
+        if let Some(floor) = self.cuda_state_floor(variant, &acquired.model_path)? {
+            resource_plan.load_authorization = admit_cuda_state_floor(
+                variant,
+                &resource_plan,
+                floor,
+                self.config.portable_context_reserve_bytes,
+                self.coordinator
+                    .resource_authority()
+                    .snapshot()
+                    .physical
+                    .capacity
+                    .device_bytes,
+            )?;
+        }
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
-        let resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
         let portable_load_bytes = match self.backend_router.context().backend_kind {
             BackendKind::Cpu => resource_plan.load_authorization.host_bytes,
             BackendKind::Metal => resource_plan.load_authorization.unified_bytes,
@@ -3335,6 +3526,127 @@ mod tests {
         let metal_qwen36_moe =
             managed_chat_capacity_policy(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Metal);
         assert!(!metal_qwen36_moe.fit_cuda_resident_context);
+    }
+
+    #[test]
+    fn qwen36_config_state_bytes_match_its_contract() {
+        use super::{hybrid_recurrent_state_bytes_per_sequence, qwen36moe_state_geometry};
+        use crate::models::architectures::qwen36moe::{
+            cache::qwen35_composite_cache_contract_with_mtp, native::pinned_native_config,
+            native_model::qwen35_text_config_from_native,
+        };
+        let native = pinned_native_config();
+        let from_config =
+            hybrid_recurrent_state_bytes_per_sequence(qwen36moe_state_geometry(&native.text))
+                .unwrap();
+        // The bytes the managed planner authorizes per row for the real
+        // contract builder, so the pre-load formula cannot drift from it.
+        let contract = qwen35_composite_cache_contract_with_mtp(
+            &qwen35_text_config_from_native(&native.text),
+            candle_core::DType::BF16,
+            64,
+            false,
+            false,
+        )
+        .unwrap();
+        let plan = crate::backends::state::negotiate_state_plan(
+            &contract,
+            &crate::backends::state::StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let (_, tensor) = crate::engine::plan_managed_state_capacity(
+            &plan,
+            ModelInstanceId::new(36),
+            crate::engine::ManagedStateCapacityRequest {
+                total_paged_pages: 64,
+                logical_token_reach: None,
+                retained_sequence_rows: 1,
+                staged_transaction_rows: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_config, tensor.unwrap().per_sequence_bytes());
+        assert_eq!(from_config, 65_863_680);
+    }
+
+    #[test]
+    fn cuda_state_floor_refuses_an_unfittable_plan_before_weights() {
+        use super::{admit_cuda_state_floor, CudaStateFloor};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const H100_BYTES: u64 = 85_017_624_576;
+        const QWEN38_ROW_BYTES: u64 = 156_893_184;
+        let plan = qwen38_resource_plan(BackendKind::Cuda);
+        let ResourceAmount::Known(weights) = plan.resident_authorization.device_bytes else {
+            panic!("Qwen3.8 CUDA residency must be known");
+        };
+        let floor = |rows, automatic_rows| CudaStateFloor {
+            retained_rows: rows,
+            staged_rows: rows.min(8),
+            per_sequence_bytes: QWEN38_ROW_BYTES,
+            automatic_rows,
+        };
+        let admit = |floor, capacity| {
+            admit_cuda_state_floor(
+                ModelVariant::Qwen3827BFp8,
+                &plan,
+                floor,
+                GIB,
+                ResourceAmount::Known(capacity),
+            )
+        };
+
+        // The decode-width floor fits an H100 and joins the load authorization.
+        let authorization = admit(floor(8, true), H100_BYTES).unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 16 * QWEN38_ROW_BYTES + GIB)
+        );
+        assert_eq!(authorization.host_bytes, plan.load_authorization.host_bytes);
+
+        // The pre-fix automatic rows, now explicit, can never fit.
+        let legacy = CudaStateFloor {
+            retained_rows: 316,
+            staged_rows: 316,
+            per_sequence_bytes: QWEN38_ROW_BYTES,
+            automatic_rows: false,
+        };
+        let message = admit(legacy, H100_BYTES).unwrap_err().to_string();
+        assert!(message.contains("before loading Qwen3.8"), "{message}");
+        assert!(
+            message.contains("minimum_state_bytes=99156492288"),
+            "{message}"
+        );
+        assert!(message.contains("IZWI_MAX_RETAINED_SEQUENCES"), "{message}");
+
+        // Automatic rows on a GPU smaller than the weights name the staged knob.
+        let message = admit(floor(8, true), 24 * GIB).unwrap_err().to_string();
+        assert!(
+            message.contains("IZWI_MAX_STAGED_TRANSACTIONS"),
+            "{message}"
+        );
+        assert!(
+            message.contains("per_sequence_state_bytes=156893184"),
+            "{message}"
+        );
+
+        // Unknown capacity defers to live admission, still pricing the floor.
+        let authorization = admit_cuda_state_floor(
+            ModelVariant::Qwen3827BFp8,
+            &plan,
+            floor(8, true),
+            GIB,
+            ResourceAmount::Unknown,
+        )
+        .unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 16 * QWEN38_ROW_BYTES + GIB)
+        );
     }
 
     #[test]

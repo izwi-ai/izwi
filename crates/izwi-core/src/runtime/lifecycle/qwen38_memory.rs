@@ -4,8 +4,9 @@ use super::{ModelMemoryEstimate, ModelResourcePlan};
 use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
+use crate::models::architectures::qwen38::chat::Qwen38TextConfig;
 use crate::models::architectures::qwen38::native::{
-    native_tensor_scope, NativeTensorScope, Qwen38NativeCheckpoint,
+    native_tensor_scope, NativeTensorScope, Qwen38NativeCheckpoint, Qwen38NativeConfig,
 };
 use crate::performance::{CudaProjectionBackend, PerformanceConfig};
 use candle_core::DType;
@@ -59,6 +60,26 @@ fn weight_bytes(name: &str, dtype: SafeDType, shape: &[usize], native: bool) -> 
     count
         .checked_mul(if f32_math { 4 } else { 2 })
         .ok_or_else(overflow)
+}
+
+fn state_geometry(text: &Qwen38TextConfig) -> super::HybridStateGeometry {
+    super::HybridStateGeometry {
+        block_count: text.block_count,
+        full_attention_interval: text.full_attention_interval,
+        ssm_state_size: text.ssm_state_size,
+        ssm_group_count: text.ssm_group_count,
+        ssm_time_step_rank: text.ssm_time_step_rank,
+        ssm_inner_size: text.ssm_inner_size,
+        ssm_conv_kernel: text.ssm_conv_kernel,
+    }
+}
+
+/// Recurrent state per retained or staged row, from the checkpoint config
+/// alone, so state admission can run before any weight is read.
+pub(super) fn per_sequence_state_bytes(model_path: &Path) -> Result<u64> {
+    super::hybrid_recurrent_state_bytes_per_sequence(state_geometry(
+        &Qwen38NativeConfig::load(model_path)?.text,
+    ))
 }
 
 pub(super) fn resource_plan(
@@ -201,6 +222,38 @@ pub(super) fn resource_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_state_bytes_match_the_27b_contract() {
+        // The pinned Qwen3.8-27B geometry (`native.rs` Pinned27B policy). The
+        // managed planner authorizes 156,893,184 B per row for this contract
+        // (`managed.rs` qwen38_staging_width_cost_is_independent_of_retained_sessions).
+        let text = Qwen38TextConfig {
+            architecture: "qwen3_5".into(),
+            block_count: 64,
+            context_length: 262_144,
+            embedding_length: 5_120,
+            feed_forward_length: 17_408,
+            attention_head_count: 24,
+            attention_head_count_kv: 4,
+            attention_key_length: 256,
+            attention_value_length: 256,
+            rope_dimension_sections: vec![11, 11, 10],
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000_000.0,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            ssm_conv_kernel: 4,
+            ssm_state_size: 128,
+            ssm_group_count: 16,
+            ssm_time_step_rank: 48,
+            ssm_inner_size: 6_144,
+            full_attention_interval: 4,
+        };
+        assert_eq!(
+            super::super::hybrid_recurrent_state_bytes_per_sequence(state_geometry(&text)).unwrap(),
+            156_893_184
+        );
+    }
     #[test]
     fn inventory_prices_compact_weights_and_f32_math_without_source_scale_double_counting() {
         assert_eq!(

@@ -3524,6 +3524,10 @@ struct CudaContiguousPagedGeometry {
     bytes_per_page: u64,
 }
 
+/// Operator guidance shared by the pre-load and resident CUDA state checks.
+pub(crate) const CUDA_EXPLICIT_ROWS_GUIDANCE: &str = "explicit rows are a hard contract, so lower IZWI_MAX_RETAINED_SEQUENCES and IZWI_MAX_STAGED_TRANSACTIONS until (retained + staged) x per_sequence_state_bytes fits, or unset both to fit rows to the model";
+pub(crate) const CUDA_AUTOMATIC_ROWS_GUIDANCE: &str = "rows were automatic and cannot go below the staged width, so free device memory (unload other models or use a larger GPU) or lower IZWI_MAX_STAGED_TRANSACTIONS (keeping IZWI_MAX_RETAINED_SEQUENCES at least as large)";
+
 /// Row limits for `fit_cuda_resident_logical_token_reach`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CudaResidentRowRequest {
@@ -3573,7 +3577,7 @@ fn fit_resident_rows_and_reach(
             let explicit = geometry(rows.retained_sequence_rows)?;
             if explicit.minimum_bytes > budget_bytes {
                 return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum: {}; explicit rows are a hard contract, so lower IZWI_MAX_RETAINED_SEQUENCES and IZWI_MAX_STAGED_TRANSACTIONS until (retained + staged) x per_sequence_state_bytes fits, or unset both to fit rows to the model",
+                    "CUDA managed context cannot fit the model-authored minimum: {}; {CUDA_EXPLICIT_ROWS_GUIDANCE}",
                     explicit.describe(headroom_bytes, safety_reserve_bytes)
                 )));
             }
@@ -3586,7 +3590,7 @@ fn fit_resident_rows_and_reach(
             )?;
             if floor.minimum_bytes > budget_bytes {
                 return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}; rows were automatic and cannot go below the staged width, so free device memory (unload other models or use a larger GPU) or lower IZWI_MAX_STAGED_TRANSACTIONS (keeping IZWI_MAX_RETAINED_SEQUENCES at least as large)",
+                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}; {CUDA_AUTOMATIC_ROWS_GUIDANCE}",
                     floor.describe(headroom_bytes, safety_reserve_bytes)
                 )));
             }
