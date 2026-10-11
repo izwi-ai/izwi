@@ -125,6 +125,22 @@ impl InferenceStateContractProvider for Qwen36MoeChatModel {
     }
 }
 
+/// Decode tokens per engine step for a stream decoding alone on graph
+/// decode (`IZWI_QWEN36_DECODE_QUANTUM`, 1-64; 1 is one token per step).
+pub const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN36_DECODE_QUANTUM";
+const DEFAULT_DECODE_QUANTUM: usize = 8;
+
+fn decode_quantum_tokens() -> usize {
+    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+}
+
+fn decode_quantum_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| (1..=64).contains(tokens))
+        .unwrap_or(DEFAULT_DECODE_QUANTUM)
+}
+
 impl Qwen36MoeChatModel {
     /// Load the Qwen3.6-35B-A3B-FP8 family (qwen3_5_moe architecture) from
     /// its native bundle, or from a synthetic GGUF fixture when one is
@@ -444,13 +460,17 @@ impl Qwen36MoeChatModel {
 
     /// Tokens per decode quantum the scheduler should grant: one more than
     /// the configured MTP draft depth when the draft head is loaded, so a
-    /// speculative round fits the grant; scalar (1) without MTP.
+    /// speculative round fits the grant. Without MTP, graph decode takes
+    /// [`decode_quantum_tokens`] per engine step, so the step's scheduling,
+    /// admission, commit and streaming are paid once per quantum instead of
+    /// once per token (the scheduler only grants it to a stream decoding
+    /// alone); other devices stay scalar (1).
     pub fn preferred_decode_tokens(&self) -> usize {
-        self.exec
-            .mtp_head
-            .as_ref()
-            .map(|head| head.draft_depth() + 1)
-            .unwrap_or(1)
+        match &self.exec.mtp_head {
+            Some(head) => head.draft_depth() + 1,
+            None if self.exec.text_model.graph_decode() => decode_quantum_tokens(),
+            None => 1,
+        }
     }
 
     /// Serving diagnostics for the admin model API: KV storage, performance
@@ -1371,6 +1391,49 @@ pub(crate) mod tests {
 
     fn generation_config() -> ChatGenerationConfig {
         ChatGenerationConfig::default()
+    }
+
+    #[test]
+    fn decode_quantum_switch_defaults_to_eight_and_bounds_its_value() {
+        assert_eq!(decode_quantum_from(None), 8);
+        assert_eq!(decode_quantum_from(Some(" 1 ")), 1);
+        assert_eq!(decode_quantum_from(Some("16")), 16);
+        assert_eq!(decode_quantum_from(Some("0")), 8);
+        assert_eq!(decode_quantum_from(Some("65")), 8);
+        assert_eq!(decode_quantum_from(Some("many")), 8);
+        // No graph decode on the CPU fixture: one token per engine step.
+        let (model, dir) = load_fixture("quantum");
+        assert_eq!(model.preferred_decode_tokens(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A multi-token quantum reports a logprob for every token it emits, not
+    /// only the last step's.
+    #[test]
+    fn a_decode_quantum_keeps_every_steps_logprobs() {
+        let (model, dir) = load_fixture("quantum-logprobs");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            logprobs: true,
+            top_logprobs: 2,
+            ..generation_config()
+        };
+        let cache = physical_cache(&model, &DeviceProfile::cpu());
+        let mut state = model
+            .start_decode_state_physical(&messages, 8, &config, None, cache)
+            .expect("decode state");
+        let step = model.exec.decode_quantum(&mut state, 4).expect("quantum");
+        let emitted = step.tokens_generated;
+        assert!(emitted > 1, "the fixture must emit several tokens");
+        assert_eq!(
+            state.pending_logprobs.len(),
+            emitted,
+            "one logprob per emitted token"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// Per-row cache windows over ONE shared arena: the continuous decode

@@ -1307,6 +1307,13 @@ impl Qwen36TextModel {
         self.decode_graphs_path = path;
     }
 
+    /// Whether single-row decode runs through the decode graphs (CUDA, when
+    /// resolved). Such steps should go through
+    /// [`Self::forward_token_ids_batch_at_physical`], where the graphs live.
+    pub(crate) fn graph_decode(&self) -> bool {
+        self.decode_graphs.is_some()
+    }
+
     /// Activation dtype (the token embeddings').
     fn dtype(&self) -> DType {
         self.token_embeddings.embeddings().dtype()

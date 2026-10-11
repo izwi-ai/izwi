@@ -1201,12 +1201,25 @@ impl Qwen36ChatExec {
 
         let mut input_tokens_committed = 0usize;
         if let Some(pending) = state.pending_token.take() {
-            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
-                pending,
-                [state.next_text_position; 3],
-                &mut state.text_state,
-                &mut state.physical_kv,
-            )?);
+            let position = [state.next_text_position; 3];
+            state.unconsumed_output = Some(if self.text_model.graph_decode() {
+                // The decode graphs live on the batched path.
+                self.text_model
+                    .forward_token_ids_batch_at_physical(
+                        &[pending],
+                        &[position],
+                        &mut [&mut state.text_state],
+                        &mut [&mut state.physical_kv],
+                    )?
+                    .i((0, 0))?
+            } else {
+                self.text_model.forward_token_id_at_physical(
+                    pending,
+                    position,
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                )?
+            });
             state.next_text_position += 1;
             input_tokens_committed = 1;
         }
@@ -1682,14 +1695,18 @@ impl Qwen36ChatExec {
         }
         let mut delta = String::new();
         let mut committed = 0usize;
+        // Each step replaces the pending logprobs; the quantum reports them all.
+        let mut logprobs = Vec::new();
         for _ in 0..input_budget.max(1) {
             let step = self.decode_step(state)?;
+            logprobs.append(&mut state.pending_logprobs);
             delta.push_str(&step.delta);
             committed += step.input_tokens_committed;
             if step.finished {
                 break;
             }
         }
+        state.pending_logprobs = logprobs;
         Ok(ChatDecodeStep {
             delta,
             text: state.assembled.clone(),
