@@ -419,7 +419,8 @@ mod tests {
             48 * 5120 * 2
         );
         // The CPU never resolves the GEMV in production.
-        let cpu = Qwen38ResidencyPolicy::resolve_static(BackendKind::Cpu, &PerformanceConfig::default());
+        let cpu =
+            Qwen38ResidencyPolicy::resolve_static(BackendKind::Cpu, &PerformanceConfig::default());
         assert_eq!(
             bytes(
                 &cpu,

@@ -693,7 +693,12 @@ fn alpha_beta_gemv_tracks_the_dense_projection() {
         "{dtype:?}: alpha and beta rows swapped must fail the probe"
     );
     let mut wide = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F32);
-    wide.resolve_alpha_beta_gemv(&Qwen38CudaSwitches::default(), &Device::Cpu, DType::F32, true);
+    wide.resolve_alpha_beta_gemv(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F32,
+        true,
+    );
     assert!(wide.alpha_beta_rows.is_none());
     assert_eq!(
         wide.alpha_beta_gemv_path,
@@ -1474,4 +1479,3 @@ fn cuda_qk_norm_rope_kv_matches_chain_qwen38_geometry() {
         );
     }
 }
-

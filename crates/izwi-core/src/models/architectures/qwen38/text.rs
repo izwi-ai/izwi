@@ -11,9 +11,8 @@ use std::sync::Arc;
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
 use super::fast_path::{
-    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath,
-    FUSED_AB_GEMV_ENV, FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV,
-    FUSED_QK_ROPE_ENV,
+    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_AB_GEMV_ENV,
+    FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
@@ -3099,11 +3098,8 @@ impl Qwen38FullAttention {
             let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
             let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
             for row in 0..batch_size {
-                let plan = self.prepare_mrope_plan(
-                    &[position_ids[row]],
-                    q_proj.device(),
-                    q_proj.dtype(),
-                )?;
+                let plan =
+                    self.prepare_mrope_plan(&[position_ids[row]], q_proj.device(), q_proj.dtype())?;
                 let q_row = query_states.i(row)?.unsqueeze(0)?;
                 let k_row = key_states.i(row)?.unsqueeze(0)?;
                 let (q_row, k_row) = self.apply_rope_plan(&q_row, &k_row, &plan)?;
@@ -3694,7 +3690,12 @@ impl Qwen38LinearAttention {
 
     /// The router GEMV over `rows` against the dense alpha/beta projection
     /// for two `dtype` rows on `device`.
-    fn alpha_beta_gemv_self_check(&self, rows: &Tensor, device: &Device, dtype: DType) -> Result<()> {
+    fn alpha_beta_gemv_self_check(
+        &self,
+        rows: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
         let hidden = rows.dim(1)?;
         let probe = Tensor::from_vec(
             self_check_wave(2 * hidden, 13.0, 1.5),

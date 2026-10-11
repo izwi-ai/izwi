@@ -3602,11 +3602,7 @@ mod tests {
         // The master switch also turns the alpha/beta GEMV (and its rows) off.
         assert_eq!(
             qwen38_representation_memory_estimate(BackendKind::Cuda, &cuda_off).resident_bytes,
-            cuda.resident_bytes
-                - MTP_FP8 / 32 * 34
-                - MTP_DENSE * 2
-                - MTP_F32 * 4
-                - TRUNK_DENSE * 4
+            cuda.resident_bytes - MTP_FP8 / 32 * 34 - MTP_DENSE * 2 - MTP_F32 * 4 - TRUNK_DENSE * 4
         );
     }
 

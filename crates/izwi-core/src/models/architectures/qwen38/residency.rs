@@ -248,8 +248,11 @@ pub(crate) fn mtp_loaded_for(backend: BackendKind, performance: &PerformanceConf
 /// Environment switches whose true value (`1`, `true`, `yes`, `on`) asks for
 /// the MTP head explicitly: the global CUDA MTP switch and the Qwen3.8 alias.
 /// `auto` or unset lets CUDA prefer graph decode.
-pub(crate) const MTP_EXPLICIT_ENVS: [&str; 3] =
-    ["IZWI_CUDA_MTP", "IZWI_PERFORMANCE_CUDA_MTP", "IZWI_QWEN38_MTP"];
+pub(crate) const MTP_EXPLICIT_ENVS: [&str; 3] = [
+    "IZWI_CUDA_MTP",
+    "IZWI_PERFORMANCE_CUDA_MTP",
+    "IZWI_QWEN38_MTP",
+];
 
 fn mtp_explicitly_requested() -> bool {
     MTP_EXPLICIT_ENVS
@@ -502,7 +505,10 @@ impl Qwen38ResidencyPolicy {
             } else if !cuda.decode_graphs.enabled() {
                 Some("cuda.decode_graphs=off".into())
             } else if !cuda.fused_decode.enabled() {
-                Some("CUDA graph decode needs the fused decode kernels (cuda.fused_decode=off)".into())
+                Some(
+                    "CUDA graph decode needs the fused decode kernels (cuda.fused_decode=off)"
+                        .into(),
+                )
             } else if legacy_requested(DECODE_GRAPHS_ENV) {
                 Some(format!("{DECODE_GRAPHS_ENV}=legacy"))
             } else {

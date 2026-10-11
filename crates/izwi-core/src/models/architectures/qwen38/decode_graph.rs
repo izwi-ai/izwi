@@ -1077,7 +1077,8 @@ impl Qwen38LinearAttention {
                 history_out,
                 state_out,
             } => {
-                let (conv, next_history) = qwen38_conv_decode(&mixed_qkv, &self.conv_kernel, history)?;
+                let (conv, next_history) =
+                    qwen38_conv_decode(&mixed_qkv, &self.conv_kernel, history)?;
                 let (y, next) = gdn::recurrent_decode(
                     &conv,
                     &z,
@@ -1161,7 +1162,8 @@ fn run_segment(
     match segment.closes_before {
         Some(index) => {
             let (residual, normalized) = hidden.normalized(&layers[index].attn_norm)?;
-            let (q_proj, keys, values) = full_attention(model, index)?.decode_projections(&normalized)?;
+            let (q_proj, keys, values) =
+                full_attention(model, index)?.decode_projections(&normalized)?;
             Ok(vec![residual, q_proj, keys, values])
         }
         None => Ok(vec![hidden.materialize()?]),
@@ -1205,8 +1207,7 @@ impl StateInputs {
             if ring.history_len().ok() != Some(gdn::CONV_TAPS - 1)
                 || !ring.is_f32()
                 || recurrent.dtype() != DType::F32
-                || recurrent.elem_count()
-                    != mixer.num_v_heads * mixer.head_k_dim * mixer.head_v_dim
+                || recurrent.elem_count() != mixer.num_v_heads * mixer.head_k_dim * mixer.head_v_dim
             {
                 return Ok(None);
             }

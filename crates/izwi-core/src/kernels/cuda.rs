@@ -3941,8 +3941,7 @@ mod qwen38_dtype_device_tests {
                 .unwrap()
         };
         let weight = Tensor::from_vec(values(conv_dim * 4, 1.0), (conv_dim, 4), &device).unwrap();
-        let history =
-            Tensor::from_vec(values(conv_dim * 3, 2.0), (conv_dim, 3), &device).unwrap();
+        let history = Tensor::from_vec(values(conv_dim * 3, 2.0), (conv_dim, 3), &device).unwrap();
         let history_before = host(&history);
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let input = Tensor::from_vec(values(conv_dim, 3.0), (1, 1, conv_dim), &device)
@@ -3978,15 +3977,25 @@ mod qwen38_dtype_device_tests {
             assert_eq!(host(&output), host(&direct), "{dtype:?} output");
             assert_eq!(host(&next), host(&direct_next), "{dtype:?} next history");
             let target = host(&target);
-            assert!(target[..32].iter().chain(&target[32 + 3 * conv_dim..]).all(|v| *v == 7.0));
-            assert_eq!(host(&history), history_before, "{dtype:?} read-only history");
+            assert!(target[..32]
+                .iter()
+                .chain(&target[32 + 3 * conv_dim..])
+                .all(|v| *v == 7.0));
+            assert_eq!(
+                host(&history),
+                history_before,
+                "{dtype:?} read-only history"
+            );
         }
         // The contract refuses a wrong weight shape before any launch.
         let input = Tensor::zeros((1, 1, conv_dim), DType::BF16, &device).unwrap();
         assert!(qwen38_causal_conv_decode_table(
             &input,
             &weight.narrow(0, 0, 8).unwrap(),
-            gdn::StateTable { address: 0, slot: 0 },
+            gdn::StateTable {
+                address: 0,
+                slot: 0
+            },
         )
         .is_err());
     }

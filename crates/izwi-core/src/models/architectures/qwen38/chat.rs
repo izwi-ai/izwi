@@ -1071,11 +1071,12 @@ impl Qwen38ChatModel {
     /// pipelining chooses tokens with the device sampler, so it needs the
     /// device sampler the step-by-step decode uses.
     fn pipelining_refusal(&self) -> Option<String> {
-        if crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV)
-        {
+        if crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV) {
             Some(format!("{DECODE_PIPELINE_ENV}=legacy"))
         } else if !self.device_sampling_enabled() {
-            Some("pipelined decode chooses tokens with the CUDA device sampler, which is off".into())
+            Some(
+                "pipelined decode chooses tokens with the CUDA device sampler, which is off".into(),
+            )
         } else {
             None
         }

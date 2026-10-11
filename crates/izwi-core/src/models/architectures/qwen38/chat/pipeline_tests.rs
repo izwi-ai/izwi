@@ -217,7 +217,12 @@ fn a_pipelined_quantum_matches_step_by_step_decode() {
 
     let expected = decode(&model, &checkpoint, &greedy, 1, 10);
     assert_eq!(pipelined(&model), 0, "a one-token quantum never pipelines");
-    assert_eq!(expected.ids.len(), 10, "the fixture runs to the cap: {:?}", expected.ids);
+    assert_eq!(
+        expected.ids.len(),
+        10,
+        "the fixture runs to the cap: {:?}",
+        expected.ids
+    );
     let actual = decode(&model, &checkpoint, &greedy, 4, 10);
     assert_eq!(actual.ids, expected.ids);
     assert_eq!(actual.text, expected.text);
@@ -244,10 +249,19 @@ fn a_pipelined_quantum_matches_step_by_step_decode() {
     };
     let expected_stop = decode(&model, &checkpoint, &stopping, 1, 10);
     let actual_stop = decode(&model, &checkpoint, &stopping, 8, 10);
-    assert!(expected_stop.ids.len() < ids.len(), "the stop token ends early");
+    assert!(
+        expected_stop.ids.len() < ids.len(),
+        "the stop token ends early"
+    );
     assert_eq!(expected_stop.ids.last(), Some(&stop));
-    assert_eq!((actual_stop.ids, actual_stop.text), (expected_stop.ids, expected_stop.text));
-    assert_eq!(actual_stop.context, expected_stop.context, "the discarded step committed nothing");
+    assert_eq!(
+        (actual_stop.ids, actual_stop.text),
+        (expected_stop.ids, expected_stop.text)
+    );
+    assert_eq!(
+        actual_stop.context, expected_stop.context,
+        "the discarded step committed nothing"
+    );
     assert!(pipelined(&model) > after_greedy);
 
     // Greedy with a repetition penalty: the device history counts every
@@ -319,7 +333,10 @@ fn a_pipelined_quantum_matches_step_by_step_decode() {
         assert_eq!(emitted, entries, "one logprob per emitted token");
     }
     let quantum = model.cuda_graphs_diagnostics()["decode_quantum"].clone();
-    assert!(quantum["pipelined_quanta"].as_u64().unwrap() > 0, "{quantum}");
+    assert!(
+        quantum["pipelined_quanta"].as_u64().unwrap() > 0,
+        "{quantum}"
+    );
     assert_eq!(quantum["granted_max"].as_u64(), Some(24), "{quantum}");
 }
 

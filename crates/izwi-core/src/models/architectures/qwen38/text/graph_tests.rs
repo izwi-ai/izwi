@@ -286,7 +286,11 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
     let mut no_mtp = PerformanceConfig::default();
     no_mtp.cuda.mtp = OptimizationMode::Off;
     let planned = Qwen38ResidencyPolicy::cuda_native_fp8_for_tests(&no_mtp);
-    assert!(planned.graph_decode_planned(), "{}", planned.graph_decode_refusal());
+    assert!(
+        planned.graph_decode_planned(),
+        "{}",
+        planned.graph_decode_refusal()
+    );
     assert_eq!(
         planned.graph_capacity_bytes(&text, &no_mtp).unwrap(),
         reserve
@@ -310,7 +314,11 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
         "{}",
         auto.mtp_decision()
     );
-    assert!(auto.graph_decode_planned(), "{}", auto.graph_decode_refusal());
+    assert!(
+        auto.graph_decode_planned(),
+        "{}",
+        auto.graph_decode_refusal()
+    );
     assert_eq!(auto.graph_capacity_bytes(&text, &default).unwrap(), reserve);
     // ...an explicit request keeps the head, and graph decode stays off...
     let explicit =
@@ -357,10 +365,19 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
     // The static CUDA estimate keeps Q8_0, which graph decode cannot capture.
     let q8 = Qwen38ResidencyPolicy::resolve_static(crate::backends::BackendKind::Cuda, &no_mtp);
     assert!(q8.graph_decode_refusal().contains("native block-FP8"));
-    assert_eq!(q8.graph_capacity_bytes(&text, &no_mtp).unwrap(), TENSOR_ISLAND_CACHE_BYTES);
-    for backend in [crate::backends::BackendKind::Cpu, crate::backends::BackendKind::Metal] {
+    assert_eq!(
+        q8.graph_capacity_bytes(&text, &no_mtp).unwrap(),
+        TENSOR_ISLAND_CACHE_BYTES
+    );
+    for backend in [
+        crate::backends::BackendKind::Cpu,
+        crate::backends::BackendKind::Metal,
+    ] {
         let policy = Qwen38ResidencyPolicy::resolve_static(backend, &no_mtp);
-        assert_eq!(policy.graph_decode_refusal(), "CUDA graph decode runs on CUDA only");
+        assert_eq!(
+            policy.graph_decode_refusal(),
+            "CUDA graph decode runs on CUDA only"
+        );
         assert_eq!(policy.graph_capacity_bytes(&text, &no_mtp).unwrap(), 0);
     }
 }
@@ -389,7 +406,11 @@ fn whole_step_decode_matches_the_standard_batched_path() {
     assert_eq!(actual_state, expected_state, "published state");
     let graphs = whole.cuda_graphs_summary();
     assert_eq!(graphs["whole_step"]["phase"], "warm", "no capture off CUDA");
-    assert_eq!(graphs["whole_step"]["warmups"].as_u64(), Some(8), "{graphs}");
+    assert_eq!(
+        graphs["whole_step"]["warmups"].as_u64(),
+        Some(8),
+        "{graphs}"
+    );
     assert_eq!(graphs["warmups"], 0, "the segments never ran: {graphs}");
     assert_eq!(graphs["eager_steps"], 0);
 
@@ -548,7 +569,11 @@ fn cuda_whole_step_graph_reaches_replay_and_tracks_the_eager_decode() {
         assert!(error < 5e-2, "row {index}: relative L2 {error}");
         agree += usize::from(argmax(row) == argmax(expected));
     }
-    assert!(agree + 1 >= actual.len(), "greedy agreement {agree}/{}", actual.len());
+    assert!(
+        agree + 1 >= actual.len(),
+        "greedy agreement {agree}/{}",
+        actual.len()
+    );
     let summary = graphs.cuda_graphs_summary();
     let whole = &summary["whole_step"];
     assert_eq!(whole["phase"], "replay", "{summary}");
@@ -766,7 +791,11 @@ fn queued_steps_with_device_tokens_match_the_standard_decode() {
     whole.commit_enqueued_step(queued, &mut cache).unwrap();
     drop(discarded);
     state = state_after;
-    assert_eq!(cache.context_len(), base + last, "a discarded step commits nothing");
+    assert_eq!(
+        cache.context_len(),
+        base + last,
+        "a discarded step commits nothing"
+    );
     let output = whole
         .forward_token_ids_batch_at_physical(
             &DECODE[last..],

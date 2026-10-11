@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use candle_core::{DType, Device, Module, Tensor};
 
-use super::super::{Qwen38FullAttention, Qwen38Hidden, Qwen38Mixer, Qwen38Projection, Qwen38TextModel};
+use super::super::{
+    Qwen38FullAttention, Qwen38Hidden, Qwen38Mixer, Qwen38Projection, Qwen38TextModel,
+};
 use super::{host, segment_error, LinearStateIo, Phase, StateInputs, StateOutputs};
 use crate::backends::kv::{KvSlotMap, KvWriteCompletion, KvWriteCompletionCollector};
 use crate::error::Result;
@@ -121,7 +123,10 @@ impl WholeStepPlan {
     /// The whole-step plan for `model`, or why it does not apply. The decode
     /// graphs' own prerequisites (fused DeltaNet, capturable projections)
     /// are already met.
-    pub(super) fn resolve(model: &Qwen38TextModel, capture: bool) -> std::result::Result<Self, String> {
+    pub(super) fn resolve(
+        model: &Qwen38TextModel,
+        capture: bool,
+    ) -> std::result::Result<Self, String> {
         if legacy_requested(STEP_GRAPH_ENV) {
             return Err(format!("{STEP_GRAPH_ENV}=legacy"));
         }

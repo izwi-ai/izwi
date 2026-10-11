@@ -5360,11 +5360,8 @@ mod tests {
                 request.params.max_tokens = 64;
                 assert!(scheduler.add_request(&request));
                 let epoch = scheduler.get_sequence_id(&id).unwrap();
-                let mut profile = ExecutionProfile::fail_closed(
-                    BackendKind::Cuda,
-                    None,
-                    ExecutionMode::Sequence,
-                );
+                let mut profile =
+                    ExecutionProfile::fail_closed(BackendKind::Cuda, None, ExecutionMode::Sequence);
                 profile.prefill = PrefillMode::Full;
                 profile.incremental_decode = true;
                 profile.decode_batch = NativeBatchMode::Continuous;
