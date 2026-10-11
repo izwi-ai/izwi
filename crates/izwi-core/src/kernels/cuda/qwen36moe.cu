@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <mma.h>
 #include <math.h>
 
 // Qwen3.6-MoE device-routed sparse-expert kernels over 128x128 block-scaled
@@ -977,6 +978,288 @@ __device__ void q36_combine(
 
 Q36_GROUPED_EXPORT(__half, f16)
 Q36_GROUPED_EXPORT(__nv_bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Tensor-core grouped MoE for prefill. The warp-per-channel kernels above keep
+// each expert's weights in registers but spend CUDA-core FMAs and a warp
+// reduction on every (pair, channel) dot product; at prefill chunk sizes the
+// expert FLOPs dominate. Here each expert's grouped rows are cut into tiles of
+// 64 (`qwen36moe_group_tiles`), and each block computes a 64-row x 64-column
+// tile on the tensor cores (16x16x16 WMMA, F16/BF16 inputs, F32 accumulation):
+//   gate_up_mma : 32 gate + the matching 32 up columns, SwiGLU in the epilogue;
+//                 activations are written in grouped (expert-major) row order.
+//   down_mma    : 64 hidden columns over a tile's contiguous activation rows,
+//                 F32 partials scattered back to (token * slots + slot).
+// E4M3 weights decode exactly into F16 bits as value * 2^-8 (sign to bit 15,
+// exponent and mantissa shifted into place); BF16 holds that value exactly
+// too. The 256 is folded into each 128x128 block scale, applied once per K
+// block of 128 to the F32 partial sums, as the reference kernels do.
+
+#define Q36_MMA_ROWS 64
+#define Q36_MMA_K 128
+
+// One thread: tile i covers grouped rows [tile_row, tile_row + 64) of
+// tile_expert (clipped to the expert's end); tiles past the last are -1.
+extern "C" __global__ void qwen36moe_group_tiles(
+    const int* __restrict__ offsets,
+    int* __restrict__ tile_expert,
+    int* __restrict__ tile_row,
+    int experts_total,
+    int max_tiles) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int tile = 0;
+  for (int e = 0; e < experts_total; ++e) {
+    for (int row = offsets[e]; row < offsets[e + 1] && tile < max_tiles; row += Q36_MMA_ROWS) {
+      tile_expert[tile] = e;
+      tile_row[tile] = row;
+      ++tile;
+    }
+  }
+  for (; tile < max_tiles; ++tile) {
+    tile_expert[tile] = -1;
+    tile_row[tile] = 0;
+  }
+}
+
+template <class T>
+__device__ __forceinline__ T q36_e4m3_scaled(unsigned char b);
+
+template <>
+__device__ __forceinline__ __half q36_e4m3_scaled<__half>(unsigned char b) {
+  return __ushort_as_half((unsigned short)(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7)));
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 q36_e4m3_scaled<__nv_bfloat16>(unsigned char b) {
+  return __float2bfloat16(__half2float(q36_e4m3_scaled<__half>(b)));
+}
+
+// Decode 64 weight rows x 128 bytes into `b` (row n's 128 values contiguous:
+// column-major for the K x N right-hand operand). `row_source(n)` points at
+// row n's bytes for this K block.
+template <class T, class RowSource>
+__device__ __forceinline__ void q36_mma_load_weights(T* b, RowSource row_source) {
+  for (int i = threadIdx.x; i < 64 * 8; i += blockDim.x) {
+    const int n = i >> 3;
+    const int c = (i & 7) << 4;
+    const uint4 q = *reinterpret_cast<const uint4*>(row_source(n) + c);
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&q);
+    T* destination = b + n * Q36_MMA_K + c;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      destination[j] = q36_e4m3_scaled<T>(bytes[j]);
+    }
+  }
+}
+
+// One K block: each warp multiplies its 16 rows of `a` by the 64 columns of
+// `b` into four fresh accumulators.
+template <class T>
+__device__ __forceinline__ void q36_mma_kblock(
+    const T* a,
+    const T* b,
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>* part) {
+  using namespace nvcuda;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    wmma::fill_fragment(part[j], 0.f);
+  }
+  for (int kk = 0; kk < Q36_MMA_K; kk += 16) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> af;
+    wmma::load_matrix_sync(af, a + warp * 16 * Q36_MMA_K + kk, Q36_MMA_K);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> bf;
+      wmma::load_matrix_sync(bf, b + j * 16 * Q36_MMA_K + kk, Q36_MMA_K);
+      wmma::mma_sync(part[j], af, bf, part[j]);
+    }
+  }
+}
+
+// grid (inter / 32, max_tiles), 128 threads. act rows are grouped rows.
+// Requires hidden % 128 == 0, inter % 128 == 0, 16-byte aligned rows.
+template <class T>
+__device__ void q36_gate_up_mma(
+    const T* __restrict__ x,
+    const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs,
+    const int* __restrict__ tile_expert,
+    const int* __restrict__ tile_row,
+    const unsigned char* __restrict__ w13,
+    const float* __restrict__ s13,
+    T* __restrict__ act,
+    int slots,
+    int hidden,
+    int inter) {
+  using namespace nvcuda;
+  __shared__ __align__(128) unsigned char smem[2 * Q36_MMA_ROWS * Q36_MMA_K * sizeof(T)];
+  __shared__ int source_row[Q36_MMA_ROWS];
+  const int expert = tile_expert[blockIdx.y];
+  if (expert < 0) {
+    return;
+  }
+  T* a = reinterpret_cast<T*>(smem);
+  T* b = a + Q36_MMA_ROWS * Q36_MMA_K;
+  const int row0 = tile_row[blockIdx.y];
+  const int rows = min(Q36_MMA_ROWS, offsets[expert + 1] - row0);
+  const int n0 = blockIdx.x * 32;
+  const int warp = threadIdx.x >> 5;
+  for (int r = threadIdx.x; r < Q36_MMA_ROWS; r += blockDim.x) {
+    source_row[r] = r < rows ? sorted_pairs[row0 + r] / slots : -1;
+  }
+  const int kblocks = hidden >> 7;
+  const float* expert_scales = s13 + (size_t)expert * ((2 * inter) >> 7) * kblocks;
+  const float* gate_scales = expert_scales + (size_t)(n0 >> 7) * kblocks;
+  const float* up_scales = expert_scales + (size_t)((inter + n0) >> 7) * kblocks;
+  const unsigned char* gate_rows = w13 + ((size_t)expert * 2 * inter + n0) * hidden;
+  const unsigned char* up_rows = gate_rows + (size_t)inter * hidden;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> total[4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> part[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    wmma::fill_fragment(total[j], 0.f);
+  }
+  for (int kb = 0; kb < kblocks; ++kb) {
+    const int k0 = kb << 7;
+    __syncthreads();
+    for (int i = threadIdx.x; i < Q36_MMA_ROWS * 16; i += blockDim.x) {
+      const int r = i >> 4;
+      const int c = (i & 15) << 3;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (source_row[r] >= 0) {
+        v = *reinterpret_cast<const uint4*>(x + (size_t)source_row[r] * hidden + k0 + c);
+      }
+      *reinterpret_cast<uint4*>(a + r * Q36_MMA_K + c) = v;
+    }
+    q36_mma_load_weights<T>(b, [&](int n) {
+      return (n < 32 ? gate_rows + (size_t)n * hidden : up_rows + (size_t)(n - 32) * hidden) + k0;
+    });
+    __syncthreads();
+    q36_mma_kblock<T>(a, b, part);
+    const float gate_scale = gate_scales[kb] * 256.f;
+    const float up_scale = up_scales[kb] * 256.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float scale = j < 2 ? gate_scale : up_scale;
+      for (int e = 0; e < total[j].num_elements; ++e) {
+        total[j].x[e] = fmaf(part[j].x[e], scale, total[j].x[e]);
+      }
+    }
+  }
+  __syncthreads();
+  float* out = reinterpret_cast<float*>(smem);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    wmma::store_matrix_sync(out + warp * 16 * 64 + j * 16, total[j], 64, wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < Q36_MMA_ROWS * 32; i += blockDim.x) {
+    const int r = i >> 5;
+    const int c = i & 31;
+    if (r < rows) {
+      const float gate = out[r * 64 + c];
+      const float up = out[r * 64 + 32 + c];
+      act[(size_t)(row0 + r) * inter + n0 + c] = T(gate / (1.f + expf(-gate)) * up);
+    }
+  }
+}
+
+// grid (hidden / 64, max_tiles), 128 threads. Reads grouped act rows; writes
+// partial[(token * slots + slot) * hidden + h]. Requires inter % 128 == 0,
+// hidden % 64 == 0.
+template <class T>
+__device__ void q36_down_mma(
+    const T* __restrict__ act,
+    const int* __restrict__ offsets,
+    const int* __restrict__ sorted_pairs,
+    const int* __restrict__ tile_expert,
+    const int* __restrict__ tile_row,
+    const unsigned char* __restrict__ w2,
+    const float* __restrict__ s2,
+    float* __restrict__ partial,
+    int hidden,
+    int inter) {
+  using namespace nvcuda;
+  __shared__ __align__(128) unsigned char smem[2 * Q36_MMA_ROWS * Q36_MMA_K * sizeof(T)];
+  const int expert = tile_expert[blockIdx.y];
+  if (expert < 0) {
+    return;
+  }
+  T* a = reinterpret_cast<T*>(smem);
+  T* b = a + Q36_MMA_ROWS * Q36_MMA_K;
+  const int row0 = tile_row[blockIdx.y];
+  const int rows = min(Q36_MMA_ROWS, offsets[expert + 1] - row0);
+  const int n0 = blockIdx.x * 64;
+  const int warp = threadIdx.x >> 5;
+  const int kblocks = inter >> 7;
+  const float* scales = s2 + ((size_t)expert * (hidden >> 7) + (n0 >> 7)) * kblocks;
+  const unsigned char* weight_rows = w2 + ((size_t)expert * hidden + n0) * inter;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> total[4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> part[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    wmma::fill_fragment(total[j], 0.f);
+  }
+  for (int kb = 0; kb < kblocks; ++kb) {
+    const int k0 = kb << 7;
+    __syncthreads();
+    for (int i = threadIdx.x; i < Q36_MMA_ROWS * 16; i += blockDim.x) {
+      const int r = i >> 4;
+      const int c = (i & 15) << 3;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (r < rows) {
+        v = *reinterpret_cast<const uint4*>(act + (size_t)(row0 + r) * inter + k0 + c);
+      }
+      *reinterpret_cast<uint4*>(a + r * Q36_MMA_K + c) = v;
+    }
+    q36_mma_load_weights<T>(b, [&](int n) { return weight_rows + (size_t)n * inter + k0; });
+    __syncthreads();
+    q36_mma_kblock<T>(a, b, part);
+    const float scale = scales[kb] * 256.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      for (int e = 0; e < total[j].num_elements; ++e) {
+        total[j].x[e] = fmaf(part[j].x[e], scale, total[j].x[e]);
+      }
+    }
+  }
+  __syncthreads();
+  float* out = reinterpret_cast<float*>(smem);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    wmma::store_matrix_sync(out + warp * 16 * 64 + j * 16, total[j], 64, wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < Q36_MMA_ROWS * 64; i += blockDim.x) {
+    const int r = i >> 6;
+    const int c = i & 63;
+    if (r < rows) {
+      partial[(size_t)sorted_pairs[row0 + r] * hidden + n0 + c] = out[r * 64 + c];
+    }
+  }
+}
+
+#define Q36_MMA_EXPORT(T, S)                                                                     \
+  extern "C" __global__ void __launch_bounds__(128) qwen36moe_gate_up_mma_##S(                  \
+      const T* x, const int* offsets, const int* sorted_pairs, const int* tile_expert,          \
+      const int* tile_row, const unsigned char* w, const float* s, T* act, int slots,           \
+      int hidden, int inter) {                                                                   \
+    q36_gate_up_mma<T>(x, offsets, sorted_pairs, tile_expert, tile_row, w, s, act, slots,        \
+                       hidden, inter);                                                           \
+  }                                                                                              \
+  extern "C" __global__ void __launch_bounds__(128) qwen36moe_down_mma_##S(                     \
+      const T* act, const int* offsets, const int* sorted_pairs, const int* tile_expert,        \
+      const int* tile_row, const unsigned char* w, const float* s, float* partial, int hidden,  \
+      int inter) {                                                                               \
+    q36_down_mma<T>(act, offsets, sorted_pairs, tile_expert, tile_row, w, s, partial, hidden,   \
+                    inter);                                                                      \
+  }
+
+Q36_MMA_EXPORT(__half, f16)
+Q36_MMA_EXPORT(__nv_bfloat16, bf16)
 
 // ---------------------------------------------------------------------------
 // Gated attention output: out[r, h * D + d] = attn[r, h * D + d] * sigmoid(gate)

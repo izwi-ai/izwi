@@ -133,6 +133,132 @@ pub fn grouped_supported(hidden: usize, inter: usize, experts_total: usize) -> b
         && experts_total <= MAX_GROUPED_EXPERTS
 }
 
+/// Which grouped expert kernels run a CUDA prefill call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedKernel {
+    /// The tensor-core tiles once [`verify_and_enable_grouped_mma`] has
+    /// passed on this process's device, else the warp-per-channel kernels.
+    Auto,
+    /// One warp per output channel over each expert's rows (CUDA cores).
+    Warp,
+    /// 64x64 tensor-core tiles over each expert's rows.
+    TensorCore,
+}
+
+/// Process-wide switch for the tensor-core grouped kernels, off until
+/// [`verify_and_enable_grouped_mma`] has compared them with the warp kernels
+/// on a real device.
+static GROUPED_MMA_VERIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn grouped_mma_enabled() -> bool {
+    GROUPED_MMA_VERIFIED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compare the tensor-core grouped kernels with the warp-per-channel ones on
+/// `device` at the model's hidden and expert widths (synthetic block-FP8
+/// experts, F16 and BF16 activations, two experts holding more than one
+/// 64-row tile and a partial tile), and enable them for every grouped call in
+/// the process on success. Idempotent.
+pub fn verify_and_enable_grouped_mma(device: &Device, hidden: usize, inter: usize) -> Result<()> {
+    if grouped_mma_enabled() {
+        return Ok(());
+    }
+    if !device.is_cuda() {
+        candle_core::bail!("the tensor-core grouped MoE kernels run on CUDA only")
+    }
+    const EXPERTS: usize = 5;
+    const SLOTS: usize = 3;
+    const TOKENS: usize = 90;
+    if !grouped_supported(hidden, inter, EXPERTS) {
+        candle_core::bail!("grouped MoE does not support hidden {hidden}, expert width {inter}")
+    }
+    let bytes = |n: usize, salt: usize| {
+        (0..n)
+            .map(|i| {
+                let mixed = ((i ^ salt).wrapping_mul(0x9E37_79B1) >> 17) as u8;
+                // Finite, moderate E4M3 values (exponent field <= 9).
+                if mixed & 0x7f == 0x7f || (mixed >> 3) & 15 > 9 {
+                    0x38
+                } else {
+                    mixed
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let scales = |n: usize, salt: usize| {
+        (0..n)
+            .map(|i| 0.002 + ((i + salt) % 7) as f32 * 0.002)
+            .collect::<Vec<_>>()
+    };
+    let w13 = Tensor::from_vec(
+        bytes(EXPERTS * 2 * inter * hidden, 1),
+        (EXPERTS, 2 * inter, hidden),
+        device,
+    )?;
+    let s13 = Tensor::from_vec(
+        scales(EXPERTS * (2 * inter / 128) * (hidden / 128), 3),
+        (EXPERTS, 2 * inter / 128, hidden / 128),
+        device,
+    )?;
+    let w2 = Tensor::from_vec(
+        bytes(EXPERTS * hidden * inter, 2),
+        (EXPERTS, hidden, inter),
+        device,
+    )?;
+    let s2 = Tensor::from_vec(
+        scales(EXPERTS * (hidden / 128) * (inter / 128), 5),
+        (EXPERTS, hidden / 128, inter / 128),
+        device,
+    )?;
+    // Expert 0 takes every token (two tiles), expert 4 the first 70 (two
+    // tiles, the second partial), experts 1-3 the rest.
+    let routing = (0..TOKENS)
+        .flat_map(|t| {
+            [
+                0.0,
+                (1 + t % 3) as f32,
+                if t < 70 { 4.0 } else { 2.0 },
+                0.5,
+                0.3,
+                0.2,
+            ]
+        })
+        .collect::<Vec<f32>>();
+    let routing = Tensor::from_vec(routing, (TOKENS, 2 * SLOTS), device)?;
+    for dtype in [DType::BF16, DType::F16] {
+        let x = Tensor::from_vec(
+            (0..TOKENS * hidden)
+                .map(|i| ((i as f32) * 0.754_877_7).sin() * 1.5)
+                .collect::<Vec<_>>(),
+            (TOKENS, hidden),
+            device,
+        )?
+        .to_dtype(dtype)?;
+        let run = |kernel| -> Result<Vec<f32>> {
+            fp8_moe_grouped_with(&x, &routing, SLOTS, &w13, &s13, &w2, &s2, kernel)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        let reference = run(GroupedKernel::Warp)?;
+        let tensor_core = run(GroupedKernel::TensorCore)?;
+        let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+        if let Some((index, (a, b))) = tensor_core
+            .iter()
+            .zip(&reference)
+            .enumerate()
+            .find(|(_, (a, b))| !a.is_finite() || (*a - *b).abs() > 0.02 * scale)
+        {
+            candle_core::bail!(
+                "tensor-core grouped MoE diverges at {dtype:?} index {index}: {a} vs warp kernels {b}"
+            )
+        }
+    }
+    GROUPED_MMA_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// Expert-major routed MoE for prefill: the same result as
 /// [`fp8_gate_up`] followed by [`fp8_down`], streaming each expert's weights
 /// once per call instead of once per routed token.
@@ -144,6 +270,20 @@ pub fn fp8_moe_grouped(
     s13: &Tensor,
     w2: &Tensor,
     s2: &Tensor,
+) -> Result<Tensor> {
+    fp8_moe_grouped_with(x, routing, slots, w13, s13, w2, s2, GroupedKernel::Auto)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fp8_moe_grouped_with(
+    x: &Tensor,
+    routing: &Tensor,
+    slots: usize,
+    w13: &Tensor,
+    s13: &Tensor,
+    w2: &Tensor,
+    s2: &Tensor,
+    kernel: GroupedKernel,
 ) -> Result<Tensor> {
     let (tokens, hidden) = x.dims2()?;
     let (experts_total, rows, _) = w13.dims3()?;
@@ -158,6 +298,11 @@ pub fn fp8_moe_grouped(
     }
     #[cfg(feature = "cuda")]
     if x.device().is_cuda() {
+        let tensor_core = match kernel {
+            GroupedKernel::Auto => grouped_mma_enabled(),
+            GroupedKernel::Warp => false,
+            GroupedKernel::TensorCore => true,
+        };
         return cuda_impl::grouped(
             x,
             routing,
@@ -169,8 +314,10 @@ pub fn fp8_moe_grouped(
             experts_total,
             hidden,
             inter,
+            tensor_core,
         );
     }
+    let _ = kernel;
     #[cfg(feature = "metal")]
     if x.device().is_metal() {
         return crate::kernels::metal_qwen36moe::grouped(
@@ -569,6 +716,7 @@ mod cuda_impl {
         experts_total: usize,
         hidden: usize,
         inter: usize,
+        tensor_core: bool,
     ) -> Result<Tensor> {
         let device = x.device().as_cuda_device()?;
         let tokens = x.dim(0)?;
@@ -625,53 +773,133 @@ mod cuda_impl {
         };
         // SAFETY: argument order matches `qwen36moe_group_pairs`.
         unsafe { builder.launch(single_block) }.w()?;
+        // Tensor-core tiles: each expert's grouped rows in tiles of 64; the
+        // bound covers one partial tile per expert.
+        let max_tiles = pairs.div_ceil(64) + experts_total;
+        let tiles = if tensor_core {
+            // SAFETY: the tile kernel writes every entry up to `max_tiles`.
+            let tile_expert = unsafe { device.alloc::<i32>(max_tiles)? };
+            let tile_row = unsafe { device.alloc::<i32>(max_tiles)? };
+            let tile = device.get_or_load_custom_func(
+                "qwen36moe_group_tiles",
+                MODULE,
+                super::super::cuda_ptx::QWEN36MOE,
+            )?;
+            let mut builder = tile.builder();
+            builder.arg(&offsets);
+            builder.arg(&tile_expert);
+            builder.arg(&tile_row);
+            candle_core::builder_arg!(builder, experts_total as i32, i32_arg(max_tiles, "tiles")?);
+            let config = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: argument order matches `qwen36moe_group_tiles`.
+            unsafe { builder.launch(config) }.w()?;
+            Some((tile_expert, tile_row))
+        } else {
+            None
+        };
+        let tile_grid = u32::try_from(max_tiles)
+            .map_err(|_| candle_core::Error::Msg("grouped MoE tile grid".into()))?;
         macro_rules! run {
-            ($ty:ty, $gate_up:literal, $down:literal, $combine:literal) => {{
+            ($ty:ty, $gate_up:literal, $down:literal, $combine:literal, $gate_up_mma:literal, $down_mma:literal) => {{
                 let xv = view::<$ty>(&x_storage, x_layout, "activations")?;
                 // SAFETY: every routed pair's activation row is written.
                 let act = unsafe { device.alloc::<$ty>(pairs * inter)? };
                 // SAFETY: every (token, channel) output is written.
                 let out = unsafe { device.alloc::<$ty>(tokens * hidden)? };
-                let gate_up = device.get_or_load_custom_func(
-                    $gate_up,
-                    MODULE,
-                    super::super::cuda_ptx::QWEN36MOE,
-                )?;
-                let mut builder = gate_up.builder();
-                builder.arg(&xv);
-                builder.arg(&offsets);
-                builder.arg(&sorted);
-                builder.arg(&w13v);
-                builder.arg(&s13v);
-                builder.arg(&act);
-                candle_core::builder_arg!(builder, slots as i32, hidden as i32, inter as i32);
-                let config = LaunchConfig {
-                    grid_dim: (experts_total as u32, (inter as u32).div_ceil(WARPS), 1),
-                    block_dim: (32 * WARPS, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                // SAFETY: validated grouped geometry; argument order matches.
-                unsafe { builder.launch(config) }.w()?;
-                let down = device.get_or_load_custom_func(
-                    $down,
-                    MODULE,
-                    super::super::cuda_ptx::QWEN36MOE,
-                )?;
-                let mut builder = down.builder();
-                builder.arg(&act);
-                builder.arg(&offsets);
-                builder.arg(&sorted);
-                builder.arg(&w2v);
-                builder.arg(&s2v);
-                builder.arg(&partial);
-                candle_core::builder_arg!(builder, hidden as i32, inter as i32);
-                let config = LaunchConfig {
-                    grid_dim: (experts_total as u32, (hidden as u32).div_ceil(WARPS), 1),
-                    block_dim: (32 * WARPS, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                // SAFETY: validated grouped geometry; argument order matches.
-                unsafe { builder.launch(config) }.w()?;
+                if let Some((tile_expert, tile_row)) = &tiles {
+                    // Activations land in grouped row order; the down tiles
+                    // read them contiguously and scatter partials by pair.
+                    let gate_up = device.get_or_load_custom_func(
+                        $gate_up_mma,
+                        MODULE,
+                        super::super::cuda_ptx::QWEN36MOE,
+                    )?;
+                    let mut builder = gate_up.builder();
+                    builder.arg(&xv);
+                    builder.arg(&offsets);
+                    builder.arg(&sorted);
+                    builder.arg(tile_expert);
+                    builder.arg(tile_row);
+                    builder.arg(&w13v);
+                    builder.arg(&s13v);
+                    builder.arg(&act);
+                    candle_core::builder_arg!(builder, slots as i32, hidden as i32, inter as i32);
+                    let config = LaunchConfig {
+                        grid_dim: ((inter / 32) as u32, tile_grid, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // SAFETY: validated grouped geometry (multiples of 512);
+                    // argument order matches the tensor-core gate/up kernel.
+                    unsafe { builder.launch(config) }.w()?;
+                    let down = device.get_or_load_custom_func(
+                        $down_mma,
+                        MODULE,
+                        super::super::cuda_ptx::QWEN36MOE,
+                    )?;
+                    let mut builder = down.builder();
+                    builder.arg(&act);
+                    builder.arg(&offsets);
+                    builder.arg(&sorted);
+                    builder.arg(tile_expert);
+                    builder.arg(tile_row);
+                    builder.arg(&w2v);
+                    builder.arg(&s2v);
+                    builder.arg(&partial);
+                    candle_core::builder_arg!(builder, hidden as i32, inter as i32);
+                    let config = LaunchConfig {
+                        grid_dim: ((hidden / 64) as u32, tile_grid, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // SAFETY: as above, for the tensor-core down kernel.
+                    unsafe { builder.launch(config) }.w()?;
+                } else {
+                    let gate_up = device.get_or_load_custom_func(
+                        $gate_up,
+                        MODULE,
+                        super::super::cuda_ptx::QWEN36MOE,
+                    )?;
+                    let mut builder = gate_up.builder();
+                    builder.arg(&xv);
+                    builder.arg(&offsets);
+                    builder.arg(&sorted);
+                    builder.arg(&w13v);
+                    builder.arg(&s13v);
+                    builder.arg(&act);
+                    candle_core::builder_arg!(builder, slots as i32, hidden as i32, inter as i32);
+                    let config = LaunchConfig {
+                        grid_dim: (experts_total as u32, (inter as u32).div_ceil(WARPS), 1),
+                        block_dim: (32 * WARPS, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // SAFETY: validated grouped geometry; argument order matches.
+                    unsafe { builder.launch(config) }.w()?;
+                    let down = device.get_or_load_custom_func(
+                        $down,
+                        MODULE,
+                        super::super::cuda_ptx::QWEN36MOE,
+                    )?;
+                    let mut builder = down.builder();
+                    builder.arg(&act);
+                    builder.arg(&offsets);
+                    builder.arg(&sorted);
+                    builder.arg(&w2v);
+                    builder.arg(&s2v);
+                    builder.arg(&partial);
+                    candle_core::builder_arg!(builder, hidden as i32, inter as i32);
+                    let config = LaunchConfig {
+                        grid_dim: (experts_total as u32, (hidden as u32).div_ceil(WARPS), 1),
+                        block_dim: (32 * WARPS, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    // SAFETY: validated grouped geometry; argument order matches.
+                    unsafe { builder.launch(config) }.w()?;
+                }
                 let combine = device.get_or_load_custom_func(
                     $combine,
                     MODULE,
@@ -703,7 +931,9 @@ mod cuda_impl {
                     half::bf16,
                     "qwen36moe_gate_up_grouped_bf16",
                     "qwen36moe_down_grouped_bf16",
-                    "qwen36moe_combine_bf16"
+                    "qwen36moe_combine_bf16",
+                    "qwen36moe_gate_up_mma_bf16",
+                    "qwen36moe_down_mma_bf16"
                 ),
                 device,
                 Shape::from((tokens, hidden)),
@@ -713,7 +943,9 @@ mod cuda_impl {
                     half::f16,
                     "qwen36moe_gate_up_grouped_f16",
                     "qwen36moe_down_grouped_f16",
-                    "qwen36moe_combine_f16"
+                    "qwen36moe_combine_f16",
+                    "qwen36moe_gate_up_mma_f16",
+                    "qwen36moe_down_mma_f16"
                 ),
                 device,
                 Shape::from((tokens, hidden)),
@@ -1327,6 +1559,19 @@ mod tests {
         assert!(fp8_gate_up(&x, &routing, 2, &f.w13, &bad_scales).is_err());
         assert!(!supported(&Device::Cpu, DType::BF16, 100, 128, 2));
         assert!(supported(&Device::Cpu, DType::BF16, 128, 128, 2));
+    }
+
+    /// The tensor-core grouped kernels against the warp-per-channel ones at
+    /// the trunk's hidden and expert widths (the same check the model runs at
+    /// load), then enabled for the process.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tensor_core_grouped_moe_matches_the_warp_kernels_at_trunk_geometry() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        verify_and_enable_grouped_mma(&device, 2048, 512).unwrap();
+        assert!(grouped_mma_enabled());
     }
 
     #[cfg(feature = "cuda")]

@@ -56,6 +56,9 @@ pub struct Qwen36TextModel {
     fp8_gemv_path: Qwen36FusedPath,
     /// Chunked DeltaNet prefill kernels (`gdn_prefill`), and why not.
     gdn_prefill_path: Qwen36FusedPath,
+    /// Tensor-core grouped MoE kernels for prefill (`moe_prefill`), and why
+    /// not.
+    moe_prefill_path: Qwen36FusedPath,
     /// Piecewise CUDA graph decode for single-row steps, when resolved.
     decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
     decode_graphs_path: Qwen36FusedPath,
@@ -1056,6 +1059,7 @@ impl Qwen36TextModel {
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
             gdn_prefill_path: Qwen36FusedPath::legacy("unresolved"),
+            moe_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
             lm_head_path,
@@ -1073,6 +1077,7 @@ impl Qwen36TextModel {
                 model.resolve_chunked_gdn_prefill();
             }
         }
+        model.resolve_grouped_mma(cfg, source.cuda_switches().moe_off);
         let (graphs, path) =
             decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false, true);
         model.decode_graphs = graphs;
@@ -1144,6 +1149,49 @@ impl Qwen36TextModel {
     /// Chunked DeltaNet prefill resolution, for the admin diagnostics.
     pub(crate) fn gdn_prefill_summary(&self) -> serde_json::Value {
         super::fast_path::summarize([&self.gdn_prefill_path])
+    }
+
+    /// Run prefill-sized fused MoE calls on the tensor-core grouped kernels
+    /// (process-wide) after they match the warp-per-channel grouped kernels
+    /// on this device at the checkpoint's hidden and expert widths.
+    /// `IZWI_QWEN36_GROUPED_MMA=legacy` keeps the warp kernels.
+    fn resolve_grouped_mma(&mut self, cfg: &Qwen36TextConfig, moe_off: Option<&'static str>) {
+        let fused_moe = self.layers.iter().any(|layer| match &layer.ffn {
+            Qwen36FeedForward::Sparse(moe) => *moe.backend() == Qwen36FusedPath::Fused,
+            Qwen36FeedForward::Dense(_) => false,
+        });
+        self.moe_prefill_path = if let Some(reason) = moe_off {
+            Qwen36FusedPath::legacy(reason)
+        } else if legacy_requested(GROUPED_MMA_ENV) {
+            Qwen36FusedPath::legacy(format!("{GROUPED_MMA_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("tensor-core grouped MoE runs on CUDA only")
+        } else if !fused_moe {
+            Qwen36FusedPath::legacy("no layer runs the fused MoE")
+        } else {
+            let Some(geometry) = &cfg.moe_ffn else {
+                return;
+            };
+            match crate::kernels::cuda::moe::verify_and_enable_grouped_mma(
+                &self.device,
+                cfg.embedding_length,
+                geometry.expert_intermediate_size,
+            ) {
+                Ok(()) => Qwen36FusedPath::Fused,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "tensor-core grouped MoE self-check failed; keeping the warp kernels"
+                    );
+                    Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                }
+            }
+        };
+    }
+
+    /// Tensor-core grouped MoE resolution, for the admin diagnostics.
+    pub(crate) fn moe_prefill_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.moe_prefill_path])
     }
 
     /// Block-FP8 LM head resolution, for the admin diagnostics.
@@ -4244,6 +4292,9 @@ fn qwen35_env_bool(name: &str, default: bool) -> bool {
 /// Kill switch for the chunked DeltaNet prefill kernels.
 pub const CHUNKED_GDN_ENV: &str = "IZWI_QWEN36_CHUNKED_GDN";
 
+/// Kill switch for the tensor-core grouped MoE prefill kernels.
+pub const GROUPED_MMA_ENV: &str = "IZWI_QWEN36_GROUPED_MMA";
+
 /// Shortest prefill span the chunked recurrence takes; shorter spans (MTP
 /// verification, small resumes) stay on the sequential kernel, whose single
 /// launch costs less than the chunked pair there.
@@ -5305,6 +5356,7 @@ pub(crate) mod tests {
                 model.gdn_prefill_summary(),
                 "cuda.fused_decode=off",
             ),
+            ("moe_prefill", model.moe_prefill_summary(), "cuda.mode=off"),
             (
                 "cuda_graphs",
                 model.cuda_graphs_summary(),
@@ -5936,11 +5988,11 @@ pub(crate) mod tests {
         ));
     }
 
-    /// The chunked DeltaNet prefill kernels are CUDA-only: off CUDA every
-    /// DeltaNet layer keeps the sequential recurrence, and the diagnostics
-    /// say why.
+    /// The chunked DeltaNet and tensor-core MoE prefill kernels are
+    /// CUDA-only: off CUDA every DeltaNet layer keeps the sequential
+    /// recurrence, and the diagnostics say why for both.
     #[test]
-    fn chunked_gdn_prefill_stays_off_outside_cuda() {
+    fn prefill_kernels_stay_off_outside_cuda() {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
         let model = super::Qwen36TextModel::load_with_source(
             &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
@@ -5948,14 +6000,15 @@ pub(crate) mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let summary = model.gdn_prefill_summary();
-        assert_eq!(summary["backend"], "legacy", "{summary}");
-        assert!(
-            summary["legacy_reasons"][0]
-                .as_str()
-                .is_some_and(|reason| reason.contains("CUDA only")),
-            "{summary}"
-        );
+        for summary in [model.gdn_prefill_summary(), model.moe_prefill_summary()] {
+            assert_eq!(summary["backend"], "legacy", "{summary}");
+            assert!(
+                summary["legacy_reasons"][0]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("CUDA only")),
+                "{summary}"
+            );
+        }
         assert!(model.layers.iter().all(|layer| match &layer.mixer {
             super::Qwen36Mixer::Linear(linear) => !linear.chunked_recurrence,
             super::Qwen36Mixer::Full(_) => true,
