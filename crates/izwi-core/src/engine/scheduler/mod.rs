@@ -5335,6 +5335,59 @@ mod tests {
         }
     }
 
+    /// Qwen3.8 CUDA graph decode without MTP reports `(8, true, false)`
+    /// (`speculative_decode_profile`; pinned by the model's own test). Trace
+    /// the continuous grant with production chat settings: an exact-solo
+    /// streaming or interactive row keeps the whole 8-token quantum after its
+    /// soft SLA has passed, and the same row without the sustained flag
+    /// collapses to one token.
+    #[test]
+    fn qwen38_graph_decode_quantum_is_granted_past_the_soft_sla() {
+        for workload in [WorkloadClass::Streaming, WorkloadClass::Interactive] {
+            for (sustained, expected) in [(true, 8), (false, 1)] {
+                let mut scheduler = Scheduler::new(SchedulerConfig {
+                    max_batch_size: 4,
+                    max_tokens_per_step: 64,
+                    min_tokens_per_step: 1,
+                    policy: SchedulingPolicy::FCFS,
+                    enable_chunked_prefill: false,
+                    enable_adaptive_batching: false,
+                    ..Default::default()
+                });
+                let id = format!("qwen38-graph-quantum-{workload:?}-{sustained}");
+                let mut request = build_request(TaskType::Chat, &id, Priority::Normal);
+                request.workload_class = workload;
+                request.params.max_tokens = 64;
+                assert!(scheduler.add_request(&request));
+                let epoch = scheduler.get_sequence_id(&id).unwrap();
+                let mut profile = ExecutionProfile::fail_closed(
+                    BackendKind::Cuda,
+                    None,
+                    ExecutionMode::Sequence,
+                );
+                profile.prefill = PrefillMode::Full;
+                profile.incremental_decode = true;
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.preferred_decode_tokens = 8;
+                profile.sustained_decode_quantum = sustained;
+                profile.speculative_decode_batch = false;
+                profile.resolved_from_loaded_model = true;
+                assert!(scheduler
+                    .update_execution_profile(&SessionKey::new(id.clone(), epoch), &profile));
+                assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+                scheduler.update_after_step(&id, request.num_prompt_tokens(), 1, 1.0);
+                scheduler.requests.get_mut(&id).unwrap().deadline_at =
+                    Instant::now() - Duration::from_millis(750);
+                let scheduled = scheduler.schedule();
+                assert_eq!(scheduled.decode_requests.len(), 1);
+                assert_eq!(
+                    scheduled.decode_requests[0].num_tokens, expected,
+                    "workload={workload:?}, sustained={sustained}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sustained_cuda_quantum_yields_to_peers_and_respects_output_and_hard_deadline() {
         let mut scheduler = Scheduler::new(SchedulerConfig {

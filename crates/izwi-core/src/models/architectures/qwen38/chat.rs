@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod attach_tests;
 mod device_sampling;
+mod pipeline;
+#[cfg(test)]
+mod pipeline_tests;
 #[cfg(test)]
 pub(crate) mod recovery_tests;
 mod timing;
@@ -12,6 +15,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, IndexOp, Tensor, D};
@@ -66,6 +70,83 @@ const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
 const DEFAULT_MTP_ENABLED: bool = true;
 const DEFAULT_MTP_DRAFT_TOKENS: usize = 1;
 const MAX_MTP_DRAFT_TOKENS: usize = 3;
+/// Decode tokens per engine step under CUDA graph decode without MTP
+/// (`IZWI_QWEN38_DECODE_QUANTUM`, 1-64; 1 is one token per step).
+pub(crate) const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN38_DECODE_QUANTUM";
+const DEFAULT_DECODE_QUANTUM: usize = 8;
+/// Kill switch for pipelined graph decode (`legacy`, `off`, `0`, `false`):
+/// a graph-decode quantum then runs its steps one at a time.
+pub(crate) const DECODE_PIPELINE_ENV: &str = "IZWI_QWEN38_DECODE_PIPELINE";
+
+fn decode_quantum_tokens() -> usize {
+    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+}
+
+fn decode_quantum_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| (1..=64).contains(tokens))
+        .unwrap_or(DEFAULT_DECODE_QUANTUM)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEVICE_SAMPLING_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: sample through the device sampler's portable references off CUDA
+/// in this thread (step by step and pipelined alike) until the guard drops.
+#[cfg(test)]
+pub(crate) fn force_device_sampling_for_tests() -> ForcedDeviceSampling {
+    DEVICE_SAMPLING_FOR_TESTS.with(|forced| forced.set(true));
+    ForcedDeviceSampling
+}
+
+#[cfg(test)]
+pub(crate) struct ForcedDeviceSampling;
+
+#[cfg(test)]
+impl Drop for ForcedDeviceSampling {
+    fn drop(&mut self) {
+        DEVICE_SAMPLING_FOR_TESTS.with(|forced| forced.set(false));
+    }
+}
+
+/// Graph-decode quanta the scheduler granted, for `cuda_graphs.decode_quantum`
+/// in the diagnostics: whether the multi-token quantum actually reached the
+/// model, and how wide.
+#[derive(Debug, Default)]
+pub(crate) struct GraphQuantumCounters {
+    quanta: AtomicU64,
+    tokens: AtomicU64,
+    pipelined_quanta: AtomicU64,
+    last_granted: AtomicU64,
+    max_granted: AtomicU64,
+}
+
+impl GraphQuantumCounters {
+    fn record(&self, granted: usize, committed: usize, pipelined: bool) {
+        let granted = granted as u64;
+        self.quanta.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tokens
+            .fetch_add(committed as u64, AtomicOrdering::Relaxed);
+        if pipelined {
+            self.pipelined_quanta.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.last_granted.store(granted, AtomicOrdering::Relaxed);
+        self.max_granted.fetch_max(granted, AtomicOrdering::Relaxed);
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "quanta": self.quanta.load(AtomicOrdering::Relaxed),
+            "input_tokens": self.tokens.load(AtomicOrdering::Relaxed),
+            "pipelined_quanta": self.pipelined_quanta.load(AtomicOrdering::Relaxed),
+            "granted_last": self.last_granted.load(AtomicOrdering::Relaxed),
+            "granted_max": self.max_granted.load(AtomicOrdering::Relaxed),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Qwen38MtpPolicy {
@@ -812,6 +893,7 @@ pub struct Qwen38ChatModel {
     mtp_policy: Qwen38MtpPolicy,
     mtp_head: Option<Qwen38MtpHead>,
     prefix_caching: bool,
+    graph_quantum: GraphQuantumCounters,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -939,6 +1021,7 @@ impl Qwen38ChatModel {
             mtp_policy,
             mtp_head,
             prefix_caching: prefix_reuse,
+            graph_quantum: GraphQuantumCounters::default(),
         })
     }
 
@@ -947,6 +1030,20 @@ impl Qwen38ChatModel {
             && self.performance.cuda.enabled()
             && self.performance.cuda.mtp_quantum.enabled()
             && self.mtp_policy.enabled()
+    }
+
+    /// Whether this model's multi-token quantum outlives the request's soft
+    /// scheduling SLA: the CUDA MTP quantum, or the graph-decode quantum
+    /// (no MTP head). An interactive or streaming request passes that SLA
+    /// (0.65-0.75 s at normal priority) early in almost every stream, after
+    /// which the scheduler would grant one token per step for the rest of
+    /// it. The quantum still yields to waiting or co-batched work and to hard
+    /// deadlines, and the scheduler grants it only to a loaded CUDA model.
+    pub(crate) fn sustained_decode_quantum(&self) -> bool {
+        self.sustained_cuda_mtp_quantum()
+            || (self.mtp_head.is_none()
+                && self.text_model.graph_decode()
+                && self.preferred_decode_tokens() > 1)
     }
 
     /// Device bytes the decode graphs may hold: the figure admission
@@ -959,9 +1056,27 @@ impl Qwen38ChatModel {
     }
 
     fn device_sampling_enabled(&self) -> bool {
+        #[cfg(test)]
+        if DEVICE_SAMPLING_FOR_TESTS.with(std::cell::Cell::get) {
+            return true;
+        }
         self.device_kind == BackendKind::Cuda
             && self.performance.cuda.enabled()
             && self.performance.cuda.device_sampling.enabled()
+    }
+
+    /// Why a graph-decode quantum may not pipeline its steps, if it may not:
+    /// pipelining chooses tokens with the device sampler, so it needs the
+    /// device sampler the step-by-step decode uses.
+    fn pipelining_refusal(&self) -> Option<String> {
+        if crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV)
+        {
+            Some(format!("{DECODE_PIPELINE_ENV}=legacy"))
+        } else if !self.device_sampling_enabled() {
+            Some("pipelined decode chooses tokens with the CUDA device sampler, which is off".into())
+        } else {
+            None
+        }
     }
 
     fn sample_next_token(
@@ -1179,7 +1294,7 @@ impl Qwen38ChatModel {
                 "full_model_capture": false,
                 "runtime_validated": false,
             },
-            "cuda_graphs": self.text_model.cuda_graphs_summary(),
+            "cuda_graphs": self.cuda_graphs_diagnostics(),
             "optimization_evidence": optimization_evidence,
             "fast_paths": {
                 "target": self.text_model.fast_path_diagnostics(),
@@ -1266,17 +1381,25 @@ impl Qwen38ChatModel {
             && self.performance.cuda.mtp_in_continuous.enabled()
     }
 
+    /// Decode inputs this model would like per engine step: the MTP round
+    /// width with an MTP head; the graph-decode quantum
+    /// (`IZWI_QWEN38_DECODE_QUANTUM`, default 8) under CUDA graph decode;
+    /// otherwise one.
     pub(crate) fn preferred_decode_tokens(&self) -> usize {
-        self.mtp_policy.draft_tokens().map_or(1, |draft_tokens| {
-            if self.device_kind == BackendKind::Cuda
-                && self.performance.cuda.enabled()
-                && self.performance.cuda.mtp_adaptive
-            {
-                4
-            } else {
-                draft_tokens.saturating_add(1)
+        match self.mtp_policy.draft_tokens() {
+            Some(draft_tokens) => {
+                if self.device_kind == BackendKind::Cuda
+                    && self.performance.cuda.enabled()
+                    && self.performance.cuda.mtp_adaptive
+                {
+                    4
+                } else {
+                    draft_tokens.saturating_add(1)
+                }
             }
-        })
+            None if self.text_model.graph_decode() => decode_quantum_tokens(),
+            None => 1,
+        }
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -2438,7 +2561,17 @@ impl Qwen38ChatModel {
         if self.mtp_head.is_some() {
             return self.decode_mtp_quantum(state, input_budget.max(1));
         }
+        if self.text_model.graph_decode() {
+            return self.decode_graph_quantum(state, input_budget.max(1));
+        }
+        // One step per call without graph decode, as before it.
+        self.decode_scalar_step(state)
+    }
 
+    /// One scalar decode step: forward the pending token (through graph
+    /// decode when it resolved, on the batched single-row path), sample the
+    /// next token from the output, publish it.
+    fn decode_scalar_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         let mut input_tokens_committed = 0;
         if let Some(pending) = state.pending_token.take() {
             let position = [state.next_text_position; 3];
@@ -2498,6 +2631,188 @@ impl Qwen38ChatModel {
         state.pending_token = Some(next);
         let delta = self.publish_token(state, next)?;
         Ok(self.decode_step_result(state, delta, input_tokens_committed))
+    }
+
+    /// A graph-decode quantum: up to `budget` decode steps in one engine call.
+    /// Once the whole-step graph replays they are pipelined (step k+1 queued
+    /// before token k is read back); until then, or when the request cannot
+    /// pipeline, they run one at a time. Reports one logprob per emitted
+    /// token.
+    fn decode_graph_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        let mut pipelined = false;
+        // Each step replaces the pending logprobs; the quantum reports them all.
+        let mut logprobs = Vec::new();
+        let mut iteration = 0usize;
+        while iteration < budget && !state.finished {
+            if let Some(step) = self.decode_quantum_pipelined(state, budget - iteration)? {
+                delta.push_str(&step.delta);
+                committed += step.input_tokens_committed;
+                pipelined = true;
+                break;
+            }
+            let step = self.decode_scalar_step(state)?;
+            iteration += 1;
+            logprobs.append(&mut state.pending_logprobs);
+            delta.push_str(&step.delta);
+            committed += step.input_tokens_committed;
+            if step.finished {
+                break;
+            }
+        }
+        state.pending_logprobs = logprobs;
+        self.graph_quantum.record(budget, committed, pipelined);
+        Ok(self.decode_step_result(state, delta, committed))
+    }
+
+    /// The rest of a quantum with each next step queued before the current
+    /// token is read back (the whole-step graph replaying). Every step
+    /// forwards the pending token and chooses the next one on the device
+    /// (`pipeline::DeviceSelector`, the step-by-step device sampler's
+    /// choice), which feeds the next step's input slot. The host reads token
+    /// k while step k+1 runs, then commits step k's KV write and publishes
+    /// the token as a scalar step does. A token that finishes the stream
+    /// discards the queued step: its DeltaNet outputs are dropped (they are
+    /// fresh buffers, and the row's state goes back to the one after the
+    /// committed step) and its KV slot stays uncommitted (the step waits for
+    /// its writes when dropped). `Ok(None)`: the request or the graph cannot
+    /// pipeline (fewer than two steps left, logprobs, replay, an MTP head, no
+    /// pending token, the device sampler off, or the graph not replaying);
+    /// the caller decodes step by step.
+    fn decode_quantum_pipelined(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<Option<ChatDecodeStep>> {
+        struct Queued {
+            step: super::text::EnqueuedGraphStep,
+            token: pipeline::PendingToken,
+            state_after: Qwen38TextRuntimeState,
+        }
+        let model = &self.text_model;
+        let Some(pending) = state.pending_token else {
+            return Ok(None);
+        };
+        // The output cap ends the stream exactly; nothing is queued past it.
+        let budget = budget.min(state.max_new_tokens.saturating_sub(state.tokens_generated));
+        if budget < 2
+            || state.finished
+            || state.replay.is_some()
+            || state.config.logprobs
+            || self.mtp_head.is_some()
+            || state.unconsumed_output.is_some()
+            || state.bootstrap_token.is_some()
+            || self.pipelining_refusal().is_some()
+            || !model.graph_step_ready()
+        {
+            return Ok(None);
+        }
+        let history: &[u32] = if state.track_history {
+            &state.history_ids
+        } else {
+            &[]
+        };
+        let mut selector = pipeline::DeviceSelector::new(
+            model.device(),
+            self.tokenizer.vocab_size,
+            &state.config,
+            state.track_history,
+            history,
+        )?;
+        let base = state.next_text_position;
+        let Some(first) = model.enqueue_graph_step(
+            Some(pending),
+            base,
+            &mut state.text_state,
+            &state.physical_kv,
+        )?
+        else {
+            return Ok(None);
+        };
+        state.pending_token = None;
+        state.pending_logprobs.clear();
+        let token_slot = model.graph_step_token().ok_or_else(|| {
+            Error::InferenceError("the Qwen3.8 whole-step graph has no step buffer".into())
+        })??;
+        let draw = |rng: &mut SimpleRng, draws: bool| if draws { rng.next_f32() } else { 0.0 };
+        let uniform = draw(&mut state.rng, selector.draws());
+        let mut current = Queued {
+            token: selector.select(&first.logits, &token_slot, uniform)?,
+            step: first,
+            state_after: state.text_state.clone(),
+        };
+        let mut launched = 1usize;
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        loop {
+            let next = if launched < budget {
+                match model.enqueue_graph_step(
+                    None,
+                    base + launched,
+                    &mut state.text_state,
+                    &state.physical_kv,
+                )? {
+                    Some(step) => {
+                        launched += 1;
+                        let uniform = draw(&mut state.rng, selector.draws());
+                        Some(Queued {
+                            token: selector.select(&step.logits, &token_slot, uniform)?,
+                            step,
+                            state_after: state.text_state.clone(),
+                        })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let token = selector.wait(current.token)?;
+            model.commit_enqueued_step(current.step, &mut state.physical_kv)?;
+            state.next_text_position += 1;
+            committed += 1;
+            // Publish as the scalar step does.
+            if state.track_history {
+                state.history_ids.push(token);
+            }
+            state.pending_token = Some(token);
+            delta.push_str(&self.publish_token(state, token)?);
+            match next {
+                // The queued step already forwards this token.
+                Some(next) if !state.finished => {
+                    state.pending_token = None;
+                    current = next;
+                }
+                // The stream ended: discard the queued step.
+                Some(discarded) => {
+                    state.text_state = current.state_after;
+                    drop(discarded);
+                    break;
+                }
+                None => break,
+            }
+        }
+        Ok(Some(self.decode_step_result(state, delta, committed)))
+    }
+
+    /// `cuda_graphs` in the diagnostics: graph decode's resolution, phase and
+    /// counters, and the decode quantum it asks the scheduler for.
+    fn cuda_graphs_diagnostics(&self) -> serde_json::Value {
+        let mut summary = self.text_model.cuda_graphs_summary();
+        let mut quantum = self.graph_quantum.summary();
+        quantum["preferred"] = serde_json::json!(self.preferred_decode_tokens());
+        quantum["sustained"] = serde_json::json!(self.sustained_decode_quantum());
+        quantum["switch"] = serde_json::json!(DECODE_QUANTUM_ENV);
+        quantum["pipelining"] = match self.pipelining_refusal() {
+            None => serde_json::json!({ "backend": "fused" }),
+            Some(reason) => serde_json::json!({ "backend": "legacy", "reason": reason }),
+        };
+        summary["decode_quantum"] = quantum;
+        summary
     }
 
     fn decode_step_result(

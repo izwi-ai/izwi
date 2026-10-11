@@ -519,6 +519,97 @@ impl Qwen38DecodeGraphs {
         }
     }
 
+    /// Whether a step can go through the whole-step graph with a
+    /// device-resident input token: the graph is replaying (or, off CUDA in
+    /// tests, the eager body runs every step).
+    pub(super) fn whole_step_replaying(&self) -> bool {
+        let Ok(plan) = &self.whole else {
+            return false;
+        };
+        self.runtime
+            .lock()
+            .map(|runtime| plan.takes_device_tokens(&runtime.whole.phase))
+            .unwrap_or(false)
+    }
+
+    /// The whole-step graph's token slot (see `step_graph::token_slot`).
+    pub(super) fn whole_step_token_slot(&self) -> Option<Result<Tensor>> {
+        let runtime = self.runtime.lock().ok()?;
+        step_graph::token_slot(&runtime.whole)
+    }
+
+    /// Queue one step through the replaying whole-step graph without falling
+    /// back, its input token `token` or (`None`) the one token selection
+    /// already wrote into the step buffer. `Ok(None)`: the whole-step graph
+    /// did not take the step (busy, not replaying, or it failed and turned
+    /// itself off), and nothing was published.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_whole(
+        &self,
+        model: &Qwen38TextModel,
+        token: Option<u32>,
+        position: usize,
+        slot: KvSlotRef,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &PhysicalPagedKvCache,
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+    ) -> Result<Option<GraphDecodeOutput>> {
+        let Ok(plan) = &self.whole else {
+            return Ok(None);
+        };
+        let Ok(mut runtime) = self.runtime.try_lock() else {
+            return Ok(None);
+        };
+        if !plan.takes_device_tokens(&runtime.whole.phase) {
+            return Ok(None);
+        }
+        let device = model.device.clone();
+        for (layer, layer_state) in model.layers.iter().zip(state.layers.iter_mut()) {
+            layer.ensure_state_initialized(layer_state, &device)?;
+        }
+        let Some(inputs) = StateInputs::gather(model, state)? else {
+            return Ok(None);
+        };
+        runtime.fence.order_after_previous(&device)?;
+        let request = step_graph::StepRequest {
+            token,
+            position,
+            slot,
+            cache,
+            slots,
+            metadata,
+        };
+        let mut no_reference =
+            || -> Result<Tensor> { Err(segment_error("a replaying step has no warm check")) };
+        let done = step_graph::run(
+            plan,
+            &mut runtime.whole,
+            self,
+            model,
+            &request,
+            &inputs,
+            completions,
+            &mut no_reference,
+        );
+        let marked = runtime.fence.mark_step_end(&device);
+        let Some(done) = done? else {
+            return Ok(None);
+        };
+        marked?;
+        drop(runtime);
+        done.published.publish(model, state)?;
+        if token.is_none() {
+            plan.pipelined.fetch_add(1, Relaxed);
+        }
+        Ok(Some(if plan.head_in_graph() {
+            GraphDecodeOutput::Logits(done.output)
+        } else {
+            GraphDecodeOutput::Hidden(done.output)
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn step(
         &self,

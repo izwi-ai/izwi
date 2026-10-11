@@ -97,6 +97,29 @@ pub(super) struct Qwen38TextPrefillOutput {
     pub logits: Option<Tensor>,
 }
 
+/// One decode step queued through the replaying whole-step graph: its logits
+/// are on the device and its KV write is not committed yet
+/// ([`Qwen38TextModel::commit_enqueued_step`]).
+pub(super) struct EnqueuedGraphStep {
+    /// `[1, 1, vocab]` on the device (the step's own copy).
+    pub(super) logits: Tensor,
+    position: usize,
+    /// Taken by the commit. A step dropped uncommitted (a discarded
+    /// pipelined step, an error) waits for its KV writes, so their pages
+    /// cannot be reused under them.
+    completions: Option<KvWriteCompletionCollector>,
+}
+
+impl Drop for EnqueuedGraphStep {
+    fn drop(&mut self) {
+        if let Some(completions) = self.completions.take() {
+            if let Err(error) = completions.drain() {
+                tracing::warn!(%error, "draining an uncommitted Qwen3.8 graph step failed");
+            }
+        }
+    }
+}
+
 pub(super) struct Qwen38TextDecodeBatchOutput {
     /// The pre-norm hidden rows, or `None` when the whole-step CUDA graph
     /// ran the LM head inside the graph (only single rows without an MTP
@@ -1841,6 +1864,98 @@ impl Qwen38TextModel {
     /// graphs live.
     pub(super) fn graph_decode(&self) -> bool {
         self.decode_graphs.is_some()
+    }
+
+    /// Whether a single-row step can be queued with a device-resident input
+    /// token ([`Self::enqueue_graph_step`]): the whole-step graph is
+    /// replaying.
+    pub(super) fn graph_step_ready(&self) -> bool {
+        self.decode_graphs
+            .as_ref()
+            .is_some_and(|graphs| graphs.whole_step_replaying())
+    }
+
+    /// The whole-step graph's token slot on the device (U32 `[1]`), where
+    /// token selection writes the next step's input token.
+    pub(super) fn graph_step_token(&self) -> Option<Result<Tensor>> {
+        self.decode_graphs
+            .as_ref()
+            .and_then(|graphs| graphs.whole_step_token_slot())
+    }
+
+    /// Queue one single-row decode step at `position` through the replaying
+    /// whole-step graph without waiting for it. `token` `None` takes the token
+    /// the previous step's selection wrote into the step buffer. The step's
+    /// DeltaNet state is published into `state`; its KV write is committed
+    /// later, in order, by [`Self::commit_enqueued_step`]. `Ok(None)`: the
+    /// graph did not take the step, and nothing was published.
+    pub(super) fn enqueue_graph_step(
+        &self,
+        token: Option<u32>,
+        position: usize,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<Option<EnqueuedGraphStep>> {
+        let Some(graphs) = &self.decode_graphs else {
+            return Ok(None);
+        };
+        self.validate_runtime_state(state)?;
+        let slot = cache.slots_for_queued_append(position, 1)?[0];
+        let lowered = cache.arena().lower_slots(&[slot])?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: vec![cache.sequence_table(position + 1)?],
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(cache.arena().config(), lowered.logical_slots())?;
+        let output = graphs.forward_whole(
+            self,
+            token,
+            position,
+            slot,
+            state,
+            cache,
+            lowered.as_ref(),
+            &metadata,
+            &mut completions,
+        );
+        let logits = match output {
+            Ok(Some(decode_graph::GraphDecodeOutput::Logits(logits))) => Ok(logits),
+            Ok(Some(decode_graph::GraphDecodeOutput::Hidden(hidden))) => {
+                self.project_target_hidden_span(&hidden)
+            }
+            Ok(None) => {
+                completions.drain()?;
+                return Ok(None);
+            }
+            Err(error) => Err(error),
+        };
+        match logits {
+            Ok(logits) => Ok(Some(EnqueuedGraphStep {
+                logits,
+                position,
+                completions: Some(completions),
+            })),
+            Err(error) => match completions.drain() {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3.8 queued graph step failed: {error}; write-fence drain also failed: {drain}"
+                ))),
+            },
+        }
+    }
+
+    /// Commit a queued step's KV write (after its token was read back, so the
+    /// write fences have passed), in order.
+    pub(super) fn commit_enqueued_step(
+        &self,
+        mut step: EnqueuedGraphStep,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let completions = step
+            .completions
+            .take()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 graph step committed twice".into()))?;
+        cache.commit_shared_completion(step.position, 1, Arc::new(completions.seal()?))
     }
 
     /// `cuda_graphs` in the admin diagnostics: resolution, phase and counters.

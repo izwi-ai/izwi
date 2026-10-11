@@ -663,3 +663,86 @@ fn cuda_whole_step_graph_recaptures_after_kv_growth() {
     assert_eq!(whole["verified"].as_u64(), Some(4), "{summary}");
     assert_eq!(whole["replays"].as_u64(), Some(3), "{summary}");
 }
+
+/// Pipelined decode at the trunk: each step is queued before the previous
+/// one is committed, its input token written into the step buffer's token
+/// slot (as device token selection does) instead of passed from the host.
+/// The logits must match the standard batched decode exactly, and a queued
+/// step that is discarded (the stream stopped) leaves nothing behind: its
+/// drop waits for its writes, nothing is committed, and the next decode at
+/// its position matches too.
+#[test]
+fn queued_steps_with_device_tokens_match_the_standard_decode() {
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let standard = fused_model(&checkpoint);
+    let mut whole = fused_model(&checkpoint);
+    whole.enable_step_graph_for_tests();
+    assert!(whole.graph_step_ready());
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F16);
+    let (expected, expected_state) = decode_rows(&standard, &arena, 0, &DECODE);
+
+    let positions = (0..PROMPT.len() + DECODE.len())
+        .map(|position| [position; 3])
+        .collect::<Vec<_>>();
+    let mut state = whole.new_state();
+    let mut cache = arena.session(1);
+    let logits = whole
+        .prefill_token_ids_physical(
+            &PROMPT,
+            &positions[..PROMPT.len()],
+            &mut state,
+            &mut cache,
+            true,
+        )
+        .unwrap()
+        .expect("prefill logits");
+    let mut rows = vec![host_values(&logits).unwrap()];
+    let base = PROMPT.len();
+    let last = DECODE.len() - 1;
+    let mut queued = whole
+        .enqueue_graph_step(Some(DECODE[0]), base, &mut state, &cache)
+        .unwrap()
+        .expect("the first step is queued");
+    let slot = whole.graph_step_token().expect("step buffer").unwrap();
+    let write_token = |token: u32| {
+        slot.slice_set(&Tensor::new(&[token], &Device::Cpu).unwrap(), 0, 0)
+            .unwrap()
+    };
+    for (step, &token) in DECODE.iter().enumerate().take(last).skip(1) {
+        write_token(token);
+        let next = whole
+            .enqueue_graph_step(None, base + step, &mut state, &cache)
+            .unwrap()
+            .expect("queued with the device token");
+        rows.push(host_values(&queued.logits).unwrap());
+        whole.commit_enqueued_step(queued, &mut cache).unwrap();
+        queued = next;
+    }
+    // The stream stops: the step queued at `last` (with the wrong token) is
+    // discarded and its DeltaNet state rolled back.
+    let state_after = state.clone();
+    write_token(DECODE[last] ^ 1);
+    let discarded = whole
+        .enqueue_graph_step(None, base + last, &mut state, &cache)
+        .unwrap()
+        .expect("queued");
+    rows.push(host_values(&queued.logits).unwrap());
+    whole.commit_enqueued_step(queued, &mut cache).unwrap();
+    drop(discarded);
+    state = state_after;
+    assert_eq!(cache.context_len(), base + last, "a discarded step commits nothing");
+    let output = whole
+        .forward_token_ids_batch_at_physical(
+            &DECODE[last..],
+            &positions[base + last..],
+            &mut [&mut state],
+            &mut [&mut cache],
+        )
+        .unwrap();
+    rows.push(host_values(&output.logits).unwrap());
+    assert_eq!(rows, expected, "queued decode must be bit-identical");
+    assert_eq!(state_values(&state), expected_state);
+    let pipelined = whole.cuda_graphs_summary()["whole_step"]["pipelined"].clone();
+    assert_eq!(pipelined.as_u64(), Some(last as u64), "{pipelined}");
+}
