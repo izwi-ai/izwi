@@ -145,6 +145,8 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         output: dense(8, 4, 0.11),
         finite_diagnostics_enabled: false,
         fused_norm_path: Default::default(),
+        decode_graphs: None,
+        decode_graphs_path: Default::default(),
     }
 }
 fn cache() -> PhysicalPagedKvCache {

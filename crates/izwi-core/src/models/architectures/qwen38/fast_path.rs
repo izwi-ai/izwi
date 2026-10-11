@@ -30,6 +30,11 @@ pub(crate) const FUSED_ATTN_GATE_ENV: &str = "IZWI_QWEN38_FUSED_ATTN_GATE";
 /// Kill switch for the DeltaNet alpha/beta projection through the router GEMV
 /// (the dense `in_proj_a`/`in_proj_b` matrices then go through cuBLAS).
 pub(crate) const FUSED_AB_GEMV_ENV: &str = "IZWI_QWEN38_FUSED_AB_GEMV";
+/// Qwen3.8-only kill switch for CUDA graph decode (`legacy`, `off`, `0`,
+/// `false`): decode runs the eager fused path. The global
+/// `cuda.decode_graphs=off` (`IZWI_CUDA_DECODE_GRAPHS=off`, alias
+/// `IZWI_QWEN38_DECODE_GRAPHS=off`) turns graph decode off for every family.
+pub(crate) const DECODE_GRAPHS_ENV: &str = "IZWI_QWEN38_CUDA_GRAPHS";
 
 /// Execution path a fast path resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,11 +75,13 @@ impl Qwen38FastPath {
 
 /// The global CUDA performance switches as they apply to the Qwen3.8 fast
 /// paths. They bind on CUDA only; the `IZWI_QWEN38_FUSED_*` switches bind on
-/// every device. `cuda.mode=off` turns everything off and
-/// `cuda.fused_decode=off` the fused decode kernels.
+/// every device. `cuda.mode=off` turns everything off,
+/// `cuda.fused_decode=off` the fused decode kernels (and with them graph
+/// decode, which needs them), and `cuda.decode_graphs=off` graph decode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Qwen38CudaSwitches {
     pub(crate) fused_decode_off: Option<&'static str>,
+    pub(crate) decode_graphs_off: Option<&'static str>,
 }
 
 impl Qwen38CudaSwitches {
@@ -92,8 +99,11 @@ impl Qwen38CudaSwitches {
                 (!mode.enabled()).then_some(reason)
             }
         };
+        let fused_decode_off = off(performance.fused_decode, "cuda.fused_decode=off");
         Self {
-            fused_decode_off: off(performance.fused_decode, "cuda.fused_decode=off"),
+            fused_decode_off,
+            decode_graphs_off: off(performance.decode_graphs, "cuda.decode_graphs=off")
+                .or(fused_decode_off),
         }
     }
 
@@ -256,6 +266,19 @@ mod tests {
         performance.fused_decode = OptimizationMode::Off;
         let switches = Qwen38CudaSwitches::from_performance(BackendKind::Cuda, &performance);
         assert_eq!(switches.fused_decode_off, Some("cuda.fused_decode=off"));
+        // Graph decode needs the fused decode kernels.
+        assert_eq!(switches.decode_graphs_off, Some("cuda.fused_decode=off"));
+        let graphs_off = CudaPerformanceConfig {
+            decode_graphs: OptimizationMode::Off,
+            ..CudaPerformanceConfig::default()
+        };
+        let switches = Qwen38CudaSwitches::from_performance(BackendKind::Cuda, &graphs_off);
+        assert_eq!(switches.decode_graphs_off, Some("cuda.decode_graphs=off"));
+        assert_eq!(switches.fused_decode_off, None);
+        assert_eq!(
+            Qwen38CudaSwitches::from_performance(BackendKind::Metal, &graphs_off),
+            Qwen38CudaSwitches::default()
+        );
         assert_eq!(
             Qwen38CudaSwitches::from_performance(BackendKind::Metal, &performance),
             Qwen38CudaSwitches::default()
@@ -268,16 +291,16 @@ mod tests {
             mode: OptimizationMode::Off,
             ..CudaPerformanceConfig::default()
         };
-        assert_eq!(
-            Qwen38CudaSwitches::from_performance(BackendKind::Cuda, &performance).fused_decode_off,
-            Some("cuda.mode=off")
-        );
+        let switches = Qwen38CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.fused_decode_off, Some("cuda.mode=off"));
+        assert_eq!(switches.decode_graphs_off, Some("cuda.mode=off"));
     }
 
     #[test]
     fn decode_gate_orders_switch_global_and_device_reasons() {
         let off = Qwen38CudaSwitches {
             fused_decode_off: Some("cuda.fused_decode=off"),
+            ..Qwen38CudaSwitches::default()
         };
         let unset = "IZWI_QWEN38_FAST_PATH_GATE_TEST_UNSET";
         assert_eq!(

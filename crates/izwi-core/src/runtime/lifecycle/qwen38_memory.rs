@@ -22,7 +22,6 @@ use std::path::Path;
 
 const METADATA_RESERVE: u64 = 128 * 1024 * 1024;
 const DEVICE_ALIGNMENT_RESERVE: u64 = 64 * 1024 * 1024;
-const GRAPH_CACHE_PER_STACK: u64 = 8 * 1024 * 1024;
 
 fn overflow() -> Error {
     Error::ModelLoadError("Qwen3.8 selected representation inventory overflow".into())
@@ -170,11 +169,9 @@ pub(super) fn resource_plan(
         }
         return Ok(plan);
     }
-    let graphs = if performance.cuda.enabled() && performance.cuda.decode_graphs.enabled() {
-        GRAPH_CACHE_PER_STACK * if mtp { 2 } else { 1 }
-    } else {
-        0
-    };
+    // CUDA graph decode's working memory when the policy plans it, else the
+    // bounded TensorIsland caches (the same figure the chat model reports).
+    let graphs = policy.graph_capacity_bytes(&checkpoint.config.text, performance)?;
     let resident_bytes = weights
         .checked_add(DEVICE_ALIGNMENT_RESERVE)
         .and_then(|n| n.checked_add(graphs))

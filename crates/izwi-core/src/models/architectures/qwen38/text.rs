@@ -47,7 +47,7 @@ use crate::kernels::{
     try_qwen38_silu_mul_decode, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
-use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::{KvDecodeBatchMetadata, KvSlotRef};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
@@ -55,6 +55,9 @@ use crate::models::shared::memory::accounting::{
 use crate::models::shared::telemetry::{
     record_prefill_sequence_span, record_rope_kernel, record_rope_manual,
 };
+
+#[path = "decode_graph.rs"]
+mod decode_graph;
 
 pub struct Qwen38TextModel {
     device: Device,
@@ -75,6 +78,10 @@ pub struct Qwen38TextModel {
     finite_diagnostics_enabled: bool,
     /// Fused residual add + RMSNorm over every trunk norm.
     fused_norm_path: Qwen38FastPath,
+    /// Piecewise CUDA graph decode of single rows (`decode_graph.rs`), when
+    /// it resolved at load, and why not otherwise.
+    decode_graphs: Option<decode_graph::Qwen38DecodeGraphs>,
+    decode_graphs_path: Qwen38FastPath,
 }
 
 /// One target-model prefill pass retained for MTP prompt alignment.
@@ -1148,8 +1155,12 @@ impl Qwen38TextModel {
             output,
             finite_diagnostics_enabled: qwen38_env_bool("IZWI_QWEN38_FINITE_DIAGNOSTICS", false),
             fused_norm_path: Qwen38FastPath::default(),
+            decode_graphs: None,
+            decode_graphs_path: Qwen38FastPath::default(),
         };
-        model.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
+        let switches = Qwen38CudaSwitches::for_device(device, performance);
+        model.resolve_fast_paths(&switches, false);
+        model.resolve_decode_graphs(&switches, false);
         Ok(model)
     }
 
@@ -1269,46 +1280,40 @@ impl Qwen38TextModel {
                 .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
                 .collect::<Result<Vec<_>>>()?,
         };
+        if let (1, Some(graphs)) = (batch_size, &self.decode_graphs) {
+            if let Some(output) = self.graph_decode_row(
+                graphs,
+                token_ids[0],
+                position_ids[0],
+                combined_slots[0],
+                states[0],
+                caches[0],
+                lowered.as_ref(),
+                &metadata,
+                sparse_layers.len(),
+            )? {
+                return Ok(output);
+            }
+        }
+        let first = &*caches[0];
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<(Tensor, Tensor)> {
-            let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = Qwen38Hidden::new(self.token_embeddings.forward(&input)?);
-            let mut physical_layer = 0usize;
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                let mut layer_states = states
-                    .iter_mut()
-                    .map(|state| &mut state.layers[layer_index])
-                    .collect::<Vec<_>>();
-                for layer_state in layer_states.iter_mut() {
-                    layer.ensure_state_initialized(layer_state, &self.device)?;
-                }
-                let cache_refs = caches
-                    .iter()
-                    .map(|cache| &**cache)
-                    .collect::<Vec<&PhysicalPagedKvCache>>();
-                hidden = layer.forward_physical_decode_batch(
-                    hidden,
-                    &mut layer_states,
-                    position_ids,
-                    &cache_refs,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
-                    &mut physical_layer,
-                )?;
-                hidden = self.validate_layer_output(
-                    hidden,
-                    layer_index,
-                    layer.decode_diagnostic_path(),
-                )?;
-            }
-            if physical_layer != sparse_layers.len() {
-                return Err(Error::InferenceError(
-                    "Qwen3.8 batched attention did not cover every sparse layer".into(),
-                ));
-            }
-            let hidden = hidden.materialize()?;
+            let embedded = self.embed_decode_token_ids(token_ids)?;
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&PhysicalPagedKvCache>>();
+            let hidden = self.standard_decode_hidden(
+                embedded,
+                position_ids,
+                states,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                sparse_layers.len(),
+            )?;
             let logits = self.project_target_hidden_span(&hidden)?;
             Ok((hidden, logits))
         })();
@@ -1331,6 +1336,136 @@ impl Qwen38TextModel {
             hidden_states: hidden,
             logits,
         })
+    }
+
+    /// The standard (uncaptured) decode of a batch of rows: every layer in
+    /// turn, attention through the arena. Returns the pre-norm hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn standard_decode_hidden(
+        &self,
+        embedded: Tensor,
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen38TextRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        attention_layers: usize,
+    ) -> Result<Tensor> {
+        let mut hidden = Qwen38Hidden::new(embedded);
+        let mut physical_layer = 0usize;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let mut layer_states = states
+                .iter_mut()
+                .map(|state| &mut state.layers[layer_index])
+                .collect::<Vec<_>>();
+            for layer_state in layer_states.iter_mut() {
+                layer.ensure_state_initialized(layer_state, &self.device)?;
+            }
+            hidden = layer.forward_physical_decode_batch(
+                hidden,
+                &mut layer_states,
+                position_ids,
+                caches,
+                slots,
+                metadata,
+                completions,
+                &mut physical_layer,
+            )?;
+            hidden =
+                self.validate_layer_output(hidden, layer_index, layer.decode_diagnostic_path())?;
+        }
+        if physical_layer != attention_layers {
+            return Err(Error::InferenceError(
+                "Qwen3.8 batched attention did not cover every sparse layer".into(),
+            ));
+        }
+        hidden.materialize()
+    }
+
+    /// One row through graph decode, its KV writes collected apart and
+    /// committed only when the graphs took the step. `Ok(None)`: the graphs
+    /// did not take it (nothing was published, and any KV write they queued
+    /// was waited for), so the caller runs the standard decode, which
+    /// rewrites the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_decode_row(
+        &self,
+        graphs: &decode_graph::Qwen38DecodeGraphs,
+        token: u32,
+        position: [usize; 3],
+        slot: KvSlotRef,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        attention_layers: usize,
+    ) -> Result<Option<Qwen38TextDecodeBatchOutput>> {
+        let start = cache.context_len();
+        let embedded = self.embed_decode_token_ids(&[token])?;
+        let view: &PhysicalPagedKvCache = cache;
+        let mut completions =
+            KvWriteCompletionCollector::new(view.arena().config(), slots.logical_slots())?;
+        // The warm check: the standard decode on a copy of the row state, its
+        // writes collected and sealed apart.
+        let reference_state = state.clone();
+        let mut reference = || -> Result<Tensor> {
+            let mut reference_state = reference_state.clone();
+            let mut collector =
+                KvWriteCompletionCollector::new(view.arena().config(), slots.logical_slots())?;
+            let hidden = self.standard_decode_hidden(
+                embedded.clone(),
+                &[position],
+                &mut [&mut reference_state],
+                &[view],
+                slots,
+                metadata,
+                &mut collector,
+                attention_layers,
+            );
+            let sealed = collector.seal();
+            let logits = self.project_target_hidden_span(&hidden?)?;
+            sealed?;
+            Ok(logits)
+        };
+        let output = graphs.forward(
+            self,
+            token,
+            &embedded,
+            position,
+            slot,
+            state,
+            view,
+            slots,
+            metadata,
+            &mut completions,
+            &mut reference,
+        );
+        let (hidden_states, logits) = match output {
+            Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
+                match self.project_target_hidden_span(&hidden) {
+                    Ok(logits) => (hidden, logits),
+                    Err(error) => {
+                        return match completions.drain() {
+                            Ok(()) => Err(error),
+                            Err(drain) => Err(Error::InferenceError(format!(
+                                "Qwen3.8 graph decode head failed: {error}; write-fence drain also failed: {drain}"
+                            ))),
+                        }
+                    }
+                }
+            }
+            None => {
+                completions.drain()?;
+                return Ok(None);
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        cache.commit_shared_completion(start, 1, completion)?;
+        Ok(Some(Qwen38TextDecodeBatchOutput {
+            hidden_states,
+            logits,
+        }))
     }
 
     pub(super) fn forward_token_id_hidden_at_physical(
@@ -1653,6 +1788,48 @@ impl Qwen38TextModel {
             "kv_write": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[1])),
             "attn_gate": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[2])),
         })
+    }
+
+    /// Resolve graph decode after the fast paths it needs. When it resolves,
+    /// the `TensorIsland` regions retire: a capture cannot nest inside
+    /// another.
+    fn resolve_decode_graphs(&mut self, switches: &Qwen38CudaSwitches, allow_eager: bool) {
+        let (graphs, path) = decode_graph::Qwen38DecodeGraphs::resolve(self, switches, allow_eager);
+        if graphs.is_some() {
+            for layer in &mut self.layers {
+                layer.graphs_enabled = false;
+                layer.mlp.graphs_enabled = false;
+            }
+        }
+        self.decode_graphs = graphs;
+        self.decode_graphs_path = path;
+    }
+
+    /// Run single-row decode through the graph segments eagerly off CUDA
+    /// (tests of the segmentation; CUDA resolves this at load). Call after
+    /// the fast paths resolve.
+    #[cfg(test)]
+    pub(super) fn enable_segmented_decode_for_tests(&mut self) {
+        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true);
+    }
+
+    /// Whether single-row decode runs through the decode graphs. Such steps
+    /// go through [`Self::forward_token_ids_batch_at_physical`], where the
+    /// graphs live.
+    pub(super) fn graph_decode(&self) -> bool {
+        self.decode_graphs.is_some()
+    }
+
+    /// `cuda_graphs` in the admin diagnostics: resolution, phase and counters.
+    pub(super) fn cuda_graphs_summary(&self) -> serde_json::Value {
+        match &self.decode_graphs {
+            Some(graphs) => graphs.summary(),
+            None => {
+                let mut summary = summarize([&self.decode_graphs_path]);
+                summary["phase"] = serde_json::json!("off");
+                summary
+            }
+        }
     }
 
     /// Packing outcome of every block-FP8 projection group of the trunk.
@@ -2663,12 +2840,69 @@ impl Qwen38FullAttention {
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
     ) -> Result<Tensor> {
+        if hidden_states.dim(1)? != 1 {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 full-attention decode batch dimensions do not match".into(),
+            ));
+        }
+        let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
+        let output = self.decode_attend(
+            &q_proj,
+            &key_states,
+            &value_states,
+            position_ids,
+            caches,
+            slots,
+            metadata,
+            completions,
+            physical_layer,
+        )?;
+        self.decode_output(&output, &q_proj)
+    }
+
+    /// The q/k/v projections of decode rows `[B, 1, hidden]`: `q_proj`
+    /// `[B, 1, heads, 2 * head_dim]` (query and gate halves of each head),
+    /// keys and values `[B, 1, kv_heads, head_dim]`.
+    pub(super) fn decode_projections(
+        &self,
+        hidden_states: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let batch_size = hidden_states.dim(0)?;
-        if hidden_states.dim(1)? != 1
-            || batch_size == 0
-            || position_ids.len() != batch_size
-            || caches.len() != batch_size
-        {
+        let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
+        let q_proj = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
+            .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
+        let key_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        let value_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        Ok((q_proj, key_states, value_states))
+    }
+
+    /// Attention for one decode token per row from its projections: q/k
+    /// norm and RoPE at each row's position, the K/V write through the arena
+    /// and the paged decode. Returns the attention output `[B, 1, heads *
+    /// head_dim]` in the activation dtype, before the output gate.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_attend(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let batch_size = q_proj.dim(0)?;
+        if batch_size == 0 || position_ids.len() != batch_size || caches.len() != batch_size {
             return Err(Error::InvalidInput(
                 "Qwen3.8 full-attention decode batch dimensions do not match".into(),
             ));
@@ -2689,25 +2923,12 @@ impl Qwen38FullAttention {
             ));
         }
 
-        let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
-        let q_proj = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
-            .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
-        let key_states = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
-        let value_states = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
         let fused = position_ids
             .iter()
-            .map(|position| self.fused_qk_for(&q_proj, &key_states, *position))
+            .map(|position| self.fused_qk_for(q_proj, key_states, *position))
             .collect::<Option<Vec<_>>>();
         if let Some(rows) = fused {
             // One launch per row with host positions; the arena writes K/V.
@@ -2731,7 +2952,7 @@ impl Qwen38FullAttention {
                 );
             }
         } else {
-            if hidden_states.device().is_cuda() {
+            if q_proj.device().is_cuda() {
                 for _ in 0..batch_size {
                     record_cuda_qk_rope_chain();
                 }
@@ -2742,8 +2963,8 @@ impl Qwen38FullAttention {
             for row in 0..batch_size {
                 let plan = self.prepare_mrope_plan(
                     &[position_ids[row]],
-                    hidden_states.device(),
-                    hidden_states.dtype(),
+                    q_proj.device(),
+                    q_proj.dtype(),
                 )?;
                 let q_row = query_states.i(row)?.unsqueeze(0)?;
                 let k_row = key_states.i(row)?.unsqueeze(0)?;
@@ -2797,7 +3018,12 @@ impl Qwen38FullAttention {
             1,
             self.num_heads * self.head_dim,
         ))?;
-        let output = self.gate_output(&output, &q_proj)?;
+        Ok(output)
+    }
+
+    /// The attention tail: the output gate, then `o_proj`.
+    pub(super) fn decode_output(&self, attended: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        let output = self.gate_output(attended, q_proj)?;
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
@@ -6097,3 +6323,6 @@ mod golden_tests;
 
 #[cfg(test)]
 mod fp8_residency_tests;
+
+#[cfg(test)]
+mod graph_tests;

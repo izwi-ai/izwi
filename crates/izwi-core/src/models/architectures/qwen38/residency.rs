@@ -28,8 +28,10 @@ use std::sync::Mutex;
 use candle_core::{DType, Device, Tensor};
 use safetensors::Dtype as SafeDType;
 
+use super::chat::Qwen38TextConfig;
 use super::fast_path::{
-    compare_values, legacy_requested, summarize, Qwen38FastPath, FUSED_AB_GEMV_ENV,
+    compare_values, legacy_requested, summarize, Qwen38FastPath, DECODE_GRAPHS_ENV,
+    FUSED_AB_GEMV_ENV,
 };
 use super::native::{
     resident_tensor_specs, IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType,
@@ -215,6 +217,8 @@ pub(crate) struct Qwen38ResidencyPolicy {
     /// F32 rows for the router GEMV (`text.rs::resolve_alpha_beta_gemv`), so
     /// admission charges those rows beside the dense weights.
     alpha_beta_gemv: bool,
+    /// CUDA: why a switch keeps graph decode off, if one does.
+    graph_switch_off: Option<String>,
     identity: Option<Identity>,
 }
 
@@ -435,6 +439,17 @@ impl Qwen38ResidencyPolicy {
                 && cuda.fused_decode.enabled()
                 && matches!(activation, DType::F16 | DType::BF16)
                 && !legacy_requested(FUSED_AB_GEMV_ENV),
+            graph_switch_off: if !cuda.enabled() {
+                Some("cuda.mode=off".into())
+            } else if !cuda.decode_graphs.enabled() {
+                Some("cuda.decode_graphs=off".into())
+            } else if !cuda.fused_decode.enabled() {
+                Some("CUDA graph decode needs the fused decode kernels (cuda.fused_decode=off)".into())
+            } else if legacy_requested(DECODE_GRAPHS_ENV) {
+                Some(format!("{DECODE_GRAPHS_ENV}=legacy"))
+            } else {
+                None
+            },
             identity: None,
         }
     }
@@ -575,6 +590,76 @@ impl Qwen38ResidencyPolicy {
 
     pub(crate) fn mtp_loaded(&self) -> bool {
         self.mtp
+    }
+
+    /// Whether CUDA graph decode may resolve at load (`text/decode_graph.rs`):
+    /// CUDA with the master, fused-decode and decode-graph switches on,
+    /// native block-FP8 projections (Candle's Q8_0 QMatMul cannot be
+    /// captured), no MTP head (graph decode covers the non-MTP decode), and
+    /// `IZWI_QWEN38_CUDA_GRAPHS` not `legacy`. Admission reserves the graph
+    /// working memory exactly when this holds, and the loader resolves graph
+    /// decode only when it holds, so a load never uses memory admission did
+    /// not grant. The load-time self-checks can still keep it off.
+    pub(crate) fn graph_decode_planned(&self) -> bool {
+        self.graph_decode_refusal_reason().is_none()
+    }
+
+    /// Why graph decode is not planned, for diagnostics.
+    pub(crate) fn graph_decode_refusal(&self) -> String {
+        self.graph_decode_refusal_reason()
+            .unwrap_or_else(|| "planned".into())
+    }
+
+    fn graph_decode_refusal_reason(&self) -> Option<String> {
+        if self.backend != BackendKind::Cuda {
+            Some("CUDA graph decode runs on CUDA only".into())
+        } else if let Some(reason) = &self.graph_switch_off {
+            Some(reason.clone())
+        } else if self.mtp {
+            Some("CUDA graph decode covers decode without MTP, and the MTP head is loaded".into())
+        } else if !matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. }) {
+            Some(format!(
+                "CUDA graph decode needs native block-FP8 projections ({})",
+                self.fallback.as_deref().unwrap_or("not selected")
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Device bytes the decode graphs may hold: CUDA graph decode's working
+    /// memory when this policy plans it (its graphs replace the bounded
+    /// `TensorIsland` regions, which retire when it resolves), otherwise the
+    /// bounded region cache of each CUDA stack (the trunk, and the MTP head
+    /// when it loads). Admission charges it and the chat model reports it.
+    pub(crate) fn graph_capacity_bytes(
+        &self,
+        text: &Qwen38TextConfig,
+        performance: &PerformanceConfig,
+    ) -> Result<u64> {
+        if self.graph_decode_planned() {
+            return graph_decode_reserve_bytes(text);
+        }
+        Ok(
+            if self.backend == BackendKind::Cuda
+                && performance.cuda.enabled()
+                && performance.cuda.decode_graphs.enabled()
+            {
+                TENSOR_ISLAND_CACHE_BYTES * if self.mtp { 2 } else { 1 }
+            } else {
+                0
+            },
+        )
+    }
+
+    /// A CUDA policy with native block-FP8 projections, resolved without a
+    /// device (tests of the graph-decode plan and its admission).
+    #[cfg(test)]
+    pub(crate) fn cuda_native_fp8_for_tests(performance: &PerformanceConfig) -> Self {
+        let mut policy = Self::base(BackendKind::Cuda, DType::BF16, performance);
+        policy.plan = Qwen38ProjectionPlan::NativeFp8 { explicit: false };
+        policy.fallback = None;
+        policy
     }
 
     /// Whether the FP8 kernels run the vectorized decode GEMV.
@@ -1124,6 +1209,60 @@ pub(crate) fn fp8_row_dot(
         })
         .sum()
 }
+
+/// Fixed device bytes graph decode keeps beside its state slabs: the segment
+/// and whole-step graph pools, the device state table and step buffer, and
+/// the logits and token-selection buffers.
+pub(crate) const GRAPH_DECODE_FIXED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// One graph-decode state slab: every DeltaNet layer's next `[C, 3]` conv
+/// history and `[Hv, Dk, Dv]` recurrent state, F32 (156,893,184 B for the
+/// 27B trunk, the same bytes as one row's recurrent state).
+pub(crate) fn graph_decode_slab_bytes(text: &Qwen38TextConfig) -> Result<u64> {
+    let invalid = || Error::ModelLoadError("Qwen3.8 graph decode state geometry is invalid".into());
+    if text.full_attention_interval == 0
+        || text.ssm_conv_kernel == 0
+        || text.ssm_time_step_rank == 0
+        || !text.ssm_inner_size.is_multiple_of(text.ssm_time_step_rank)
+    {
+        return Err(invalid());
+    }
+    let linear_layers = text.block_count - text.block_count / text.full_attention_interval;
+    let conv_dim = text
+        .ssm_state_size
+        .checked_mul(text.ssm_group_count)
+        .and_then(|keys| keys.checked_mul(2))
+        .and_then(|keys| keys.checked_add(text.ssm_inner_size))
+        .ok_or_else(invalid)?;
+    let history = conv_dim
+        .checked_mul(text.ssm_conv_kernel - 1)
+        .ok_or_else(invalid)?;
+    let recurrent = text
+        .ssm_time_step_rank
+        .checked_mul(text.ssm_state_size)
+        .and_then(|rows| rows.checked_mul(text.ssm_inner_size / text.ssm_time_step_rank))
+        .ok_or_else(invalid)?;
+    history
+        .checked_add(recurrent)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_mul(linear_layers))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(overflow)
+}
+
+/// Device working memory CUDA graph decode needs beyond the row's own
+/// recurrent state: three state slabs (the next step's slab, written while the
+/// row still holds the current one; a scratch slab for capture verification;
+/// a second step queued by pipelined decode) plus the fixed graph pools.
+pub(crate) fn graph_decode_reserve_bytes(text: &Qwen38TextConfig) -> Result<u64> {
+    graph_decode_slab_bytes(text)?
+        .checked_mul(3)
+        .and_then(|slabs| slabs.checked_add(GRAPH_DECODE_FIXED_BYTES))
+        .ok_or_else(overflow)
+}
+
+/// The bounded `TensorIsland` region cache of one stack (trunk or MTP head).
+pub(crate) const TENSOR_ISLAND_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Prices of the pinned 27B checkpoint (static estimate) or any checkpoint.
 pub(crate) fn price_specs<'a>(

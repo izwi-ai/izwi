@@ -949,15 +949,13 @@ impl Qwen38ChatModel {
             && self.mtp_policy.enabled()
     }
 
+    /// Device bytes the decode graphs may hold: the figure admission
+    /// charged (`Qwen38ResidencyPolicy::graph_capacity_bytes`).
     pub(crate) fn graph_cache_capacity_bytes(&self) -> u64 {
-        if self.device_kind == BackendKind::Cuda
-            && self.performance.cuda.enabled()
-            && self.performance.cuda.decode_graphs.enabled()
-        {
-            (8 * 1024 * 1024) * (1 + u64::from(self.mtp_head.is_some()))
-        } else {
-            0
-        }
+        self.text_model
+            .residency()
+            .graph_capacity_bytes(&self.text_config, &self.performance)
+            .unwrap_or(0)
     }
 
     fn device_sampling_enabled(&self) -> bool {
@@ -1170,6 +1168,7 @@ impl Qwen38ChatModel {
                 "regions": ["residual_add_then_rms_norm", "explicit_native_fp8_gate_up_silu_down"],
                 "max_verification_rows": 4,
                 "target_layer_limit": 8,
+                "retired_by_cuda_graph_decode": self.text_model.graph_decode(),
                 "target_counters": self.text_model.graph_diagnostics(),
                 "mtp_counters": self.mtp_head.as_ref().map(Qwen38MtpHead::graph_diagnostics),
                 "maximum_cache_bytes": self.graph_cache_capacity_bytes(),
@@ -1180,6 +1179,7 @@ impl Qwen38ChatModel {
                 "full_model_capture": false,
                 "runtime_validated": false,
             },
+            "cuda_graphs": self.text_model.cuda_graphs_summary(),
             "optimization_evidence": optimization_evidence,
             "fast_paths": {
                 "target": self.text_model.fast_path_diagnostics(),
@@ -2439,12 +2439,26 @@ impl Qwen38ChatModel {
 
         let mut input_tokens_committed = 0;
         if let Some(pending) = state.pending_token.take() {
-            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
-                pending,
-                [state.next_text_position; 3],
-                &mut state.text_state,
-                &mut state.physical_kv,
-            )?);
+            let position = [state.next_text_position; 3];
+            state.unconsumed_output = Some(if self.text_model.graph_decode() {
+                // Graph decode lives on the batched single-row path.
+                self.text_model
+                    .forward_token_ids_batch_at_physical(
+                        &[pending],
+                        &[position],
+                        &mut [&mut state.text_state],
+                        &mut [&mut state.physical_kv],
+                    )?
+                    .logits
+                    .i((0, 0))?
+            } else {
+                self.text_model.forward_token_id_at_physical(
+                    pending,
+                    position,
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                )?
+            });
             state.next_text_position += 1;
             input_tokens_committed = 1;
         }
