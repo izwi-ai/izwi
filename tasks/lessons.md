@@ -205,3 +205,16 @@
   branch the research was done on (`git rev-list --count A..B`, `git cat-file -e B:path`). The
   Qwen3.8 plan assumed kernels that existed only on an unmerged branch; the new branch sat at
   `main` without them until main was updated.
+- Candle compiles its Metal kernels with fast math, so F32 `cos`/`sin` on the Metal device are not
+  exact: errors are ~1e-4 at position 4K and ~1e-2 at 262K. Precision-critical tables such as RoPE
+  cos/sin belong on the host, uploaded once. "Compute in F32" does not make a device kernel exact;
+  check it against an F64 host reference on each device.
+- A fake `nvcc` for compile-only CUDA checks must honour every output flag the build scripts pass
+  (`-o`, `--output-directory`/`-odir`). One that ignored `--output-directory` dropped zero-byte
+  `.ptx` files into the cargo registry's candle-kernels source and into the crate. Those would be
+  embedded as empty kernels in a later real CUDA build. After any fake-nvcc run, check for
+  zero-byte `*.ptx` under `~/.cargo/registry/src` and `crates/`.
+- Parallel worktree agents each build their own `target/` (7–10 GB here), and the session
+  scratchpad has a ~10 GB quota shared with other sessions. Check free disk and scratch usage before
+  fanning out, keep large logs under `target/`, and remove a worktree as soon as its commits are
+  cherry-picked. Two agents hit ENOSPC mid-verification on 2026-10-11.

@@ -6,67 +6,106 @@ Branch `perf-qwen38` (base `main` @ `abf3f26f`). Evidence and per-phase detail a
 
 **Decision (user, 2026-10-11).** Qwen3.6 and Qwen3.8 stay separate. Fast paths are ported into
 `q38/`'s own trunk, which may call the generic kernels under `kernels/`. Qwen3.6 orchestration is a
-reference, not a dependency, and Qwen3.6 numerics must not change.
+reference, not a dependency; Qwen3.6 numerics are unchanged.
 
 **Root causes (confirmed in code).**
 - **Load refusal.**
-  - CUDA automatic rows = device memory ÷ 256 MiB, which is 316 retained + 316 staged on an
-    80 GB H100.
-  - The CUDA fit charges 156.9 MB/sequence of recurrent state for all of them: 99.2 GB > 85 GB.
+  - CUDA automatic rows = device memory ÷ 256 MiB (316 retained + 316 staged on an 80 GB H100).
+  - The CUDA fit charged 156.9 MB/sequence of recurrent state for all of them: 99.2 GB > 85 GB.
   - Result: "CUDA managed context cannot fit the model-authored minimum" on every CUDA GPU.
 - **Slowness.**
-  - Auto runs Q8_0, not FP8, and Q8 blocks graphs.
-  - Per token: ~2,200 eager launches and allocations, plus 3 syncs.
-  - MTP rounds add a 144 MiB state copy and host-side full-vocab verify.
-  - The bar: vLLM runs 77–79 t/s on an H100 at concurrency 1.
-
-Ops workaround until Phase 0 deploys: `IZWI_MAX_RETAINED_SEQUENCES=16`,
-`IZWI_MAX_STAGED_TRANSACTIONS=8`, `IZWI_MODAL_GPU=H100`, `IZWI_GIT_REF=<full SHA>`.
+  - Auto ran Q8_0, not FP8, and Q8 blocked graphs.
+  - Per token: ~2,200 eager launches/allocations plus 3 syncs.
+  - MTP rounds added a 144 MiB state copy and host-side full-vocab verify.
+  - Bar: vLLM runs 77–79 t/s on an H100 at concurrency 1.
 
 Phase 0 — admission
-- [ ] 1 Automatic staged rows = physical decode width (A2).
-- [ ] 2 Automatic CUDA rows shrink to fit the model's state; CPU admission-matrix test (A1 + A6).
-- [ ] 3 Refuse an unfittable CUDA state plan before streaming weights (A3).
-- [ ] 4 Per-backend Qwen3.8 memory figures in the catalog (A5).
+- [x] 1 Automatic staged rows = step launch width (`18640294`). Batch formation no longer prepares
+      rows it cannot launch.
+- [x] 2 Automatic CUDA rows fitted to the model's state, ≤ `IZWI_CUDA_STATE_BUDGET_FRACTION` (0.25)
+      of the post-weight budget, with the CPU admission matrix (`7f207479`). Rows on an 80 GB H100:
+      - Qwen3.8: 67 retained + 8 staged, 11.8 GB of state.
+      - Qwen3.6: 172 + 8, 11.9 GB of state (was 41.6 GB).
+- [x] 3 Unfittable CUDA state plans are refused before weights stream (`e3483b63`).
+- [x] 4 (deviation from the plan) The catalog's 80 GiB figure is displayed nowhere. The one real
+      consumer was the Metal OOM retry, now fixed to use the per-backend load peak (`662c2b2f`).
 
 Phase 1 — correctness and harness
-- [ ] 5 Qwen3.8 HF golden-parity fixture + generator (G0).
-- [ ] 6 M-RoPE tables from F32 angles (C1).
-- [ ] 7 Zero-centered norm gains kept in F32 (C2).
-- [ ] 8 Conv-ring dtype guard restored (C3).
-- [ ] 9 MTP replay, quantum width, projection backend and host-sync counters (T0).
+- [x] 5 Qwen3.8 HF golden-parity fixture and generator (`9152317d`). CPU 5.9e-5 against a 2e-3
+      bound; the Metal leg is at the F16 floor.
+- [x] 6 M-RoPE cos/sin from F32 angles, with the trig on the host (Metal fast math is imprecise)
+      (`1714ecb9`).
+- [x] 7 Zero-centered norm gains kept in F32 (`e26d7178`).
+- [x] 8 Conv-ring dtype guard restored (`e62cbedc`).
+- [ ] 9 T0 telemetry: partly covered by the per-path `fast_paths`/`cuda_graphs` diagnostics and the
+      KV host-synchronization counters. Still open: the census found the MTP call site passes 0 to
+      `mtp_target_replay_tokens_total`; verify and feed it.
 
 Phase 2 — CUDA port into q38/
-- [ ] 10 Native block-FP8 projections by default on CUDA (mv2 self-check, FP8 packing, FP8
-      admission bytes).
-- [ ] 11 FP8 LM head on CUDA.
-- [ ] 12 Fused GDN decode (`kernels/cuda/gdn.rs`, in-place `StateTable`).
-- [ ] 13 Fused add + RMSNorm.
-- [ ] 14 Fused q/k norm + RoPE + KV write; fused gated output.
+- [x] 13 Fused add + RMSNorm, plus the `qwen38/fast_path.rs` scaffolding (`d6b26c65`).
+- [x] 12 Fused GDN decode: q38 conv with BF16/F16 entries plus `gdn::recurrent_decode` (`d26b2944`).
+- [x] 14 Fused q/k norm + RoPE + KV write; fused gated output (`e53ad096`).
+- [x] 10 Native block-FP8 projections by default on CUDA, with the unified residency policy
+      (`qwen38/residency.rs`), gated before admission and self-checked at load (`fb08201a`).
+- [x] 11 FP8 LM head on CUDA (`4a1351d4`).
 
-Phases 6/7 — Metal and CPU residency
-- [ ] 15 Metal KV writes stop synchronizing the device per write (shared).
-- [ ] 16 Raw block-FP8 residency on Metal.
-- [ ] 17 Q8_0 residency on CPU.
+Phases 6/7 — Metal and CPU
+- [x] 15 Metal KV epoch fences: 1 host sync per step instead of 16 (`0acc5f3a`).
+- [x] 16 Raw block-FP8 residency on Metal: 54.65 → 31.0 GB (`a838eac9`).
+- [x] 17 Q8_0 residency on CPU: 109.3 → 33.0 GB (`4d7f003c`). Logits sit 4.4% from F32 on the FP8
+      fixture; the golden test is pinned to `expanded`.
 
 Phase 3 — graphs
-- [ ] 18 Segment graphs for Qwen3.8 decode layers.
-- [ ] 19 Whole-step CUDA graph.
-- [ ] 20 Multi-token quanta + pipelining on the non-MTP path.
+- [x] A DeltaNet α/β projection through the router GEMV (`544ba8fd`).
+- [x] B Table-addressed Qwen3.8 conv decode (`c1d956bf`).
+- [x] 18 Piecewise (segment) CUDA graphs (`81af8570`).
+- [x] 19 Whole-step CUDA graph (`7c2b2058`).
+- [x] 20 Multi-token quanta plus pipelining on graph decode (`2f24a3b3`).
+- [x] 21 MTP `auto` → off on CUDA when graph decode is planned (`e38eb5c9`). **Needs the H100 A/B**;
+      roll back with `IZWI_QWEN38_MTP=1`.
+- [x] style: rustfmt the format-gated `kernels/cuda.rs` (`dd600ba8`).
 
 Later
-- [ ] Phase 4: MTP on the graph path (k+1 state slots, graphed verify, device speculative
-      sampling, quantized draft LM head).
+- [ ] Phase 4: MTP on the graph path (k+1 state slots, graphed verify, device speculative sampling,
+      quantized draft LM head).
 - [ ] Phase 5: chunked GDN prefill, FP8 tensor-core GEMM for M>8, CUDA prefix reuse for Qwen3.8,
       optional FP8 KV.
-- [ ] Phase 8: GGUF path via qwen35.
-- [ ] A4: lease accounting for state and snapshots.
+- [ ] Phase 8: GGUF path via qwen35 (24 GB GPUs, 32 GB Macs).
+- [ ] A4: lease accounting for state and snapshots (the H1 incident class).
+- [ ] T0 remainder (see item 9).
 
 Hardware checks on the next H100 deploy (cannot run here):
-- Qwen3.8 reaches Ready with no row variables.
-- `kv_cache.models[]` shows fitted rows.
-- Fixed-prompt t/s with MTP on and off, compared with the 10–20 t/s baseline.
-- `projection_backend = native_fp8` and every fused counter engaged.
+- Qwen3.8 reaches Ready with no row variables; `kv_cache.models[]` shows 67/8 rows.
+- `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib --features cuda`. This covers the
+  fused-kernel parity, the FP8 kernel gate, segments/whole-step reaching replay and the KV-growth
+  recapture.
+- Diagnostics:
+  - `fast_paths` all `fused`;
+  - `projection_backend` native FP8;
+  - `cuda_graphs.whole_step.phase = replay`;
+  - `pipelined > 0`;
+  - `decode_quantum.granted_max = 8`.
+- Fixed prompt: default (graph decode) vs `IZWI_QWEN38_MTP=1` vs `IZWI_CUDA_PROJECTION_BACKEND=q8`.
+  Record tokens, ms, t/s and the GPU type. Expected ~70–85 t/s against the 10–20 t/s baseline.
+- TTFT at about 1.2k prompt tokens (prefill moved from Q8 MMQ to the FP8 WMMA kernel).
+
+## Review (2026-10-12)
+
+Twenty-four commits on `perf-qwen38` (`5573126c..dd600ba8`). Each lane ran per commit; the lead
+re-ran the whole set on the integrated head:
+- `izwi-core` lib on CPU, `--features metal` and `izwi-server` lib;
+- `izwi-serving-worker` backend_parity on Metal;
+- clippy `-D warnings -A deprecated` (workspace, Metal, and CUDA with a fake nvcc);
+- the CI rustfmt gate and `git diff --check`.
+
+Known flakes, unrelated to this branch and filed separately:
+- `izwi-server` `cancellation_retains_capacity_until_non_cooperative_executor_teardown` (timing,
+  under load);
+- `qwen38` `replay_of_partial_prefill_preserves_known_mtp_successor` ("Checkpoint shard changed");
+- intermittent SIGSEGV in the Metal test binary (suspected `set_var`/`getenv` races).
+
+No CUDA path has executed on a GPU. Every CUDA fast path self-checks at load or warmup and falls
+back, with a diagnostics reason, on mismatch.
 
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
