@@ -3031,6 +3031,7 @@ impl RuntimeService {
         // Zero means automatic administrative capacity, not zero usable rows.
         // This is only an upper bound: each loaded model fits exact physical state.
         // Automatic staged rows are resolved below from the launch width.
+        let automatic_retained_sequences = config.max_retained_sequences == 0;
         let automatic_staged_transactions = config.max_staged_transactions == 0;
         let automatic_rows = if selected_backend_kind == BackendKind::Cuda {
             backend_context
@@ -3071,6 +3072,7 @@ impl RuntimeService {
         core_config.max_physical_in_flight = config.max_physical_in_flight;
         core_config.max_retained_sequences = config.max_retained_sequences.max(1);
         core_config.max_staged_transactions = config.max_staged_transactions.max(1);
+        core_config.automatic_row_limits.retained_sequences = automatic_retained_sequences;
         core_config.max_queued_requests = config.max_queued_requests.max(1);
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
@@ -9677,6 +9679,9 @@ mod tests {
             single_sequence_token_capacity: 160,
             aggregate_token_capacity: 160,
             full_context_sequence_capacity: 1,
+            retained_sequence_capacity: None,
+            staged_transaction_capacity: None,
+            tensor_bytes_per_sequence: None,
             incremental_claim_sessions: 0,
             arenas: vec![arena(allocated_pages)],
         };
@@ -10162,6 +10167,7 @@ mod tests {
         assert_eq!(automatic.config().max_staged_transactions, 2);
         let core = automatic.core_engine.config();
         assert_eq!(core.max_staged_transactions, 2);
+        assert!(core.automatic_row_limits.retained_sequences);
         assert!(core.automatic_row_limits.staged_transactions);
 
         let explicit = RuntimeService::new(EngineConfig {

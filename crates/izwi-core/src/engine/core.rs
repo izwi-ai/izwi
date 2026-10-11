@@ -5268,24 +5268,23 @@ impl EngineCore {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
             })?,
         );
-        let logical_token_reach = if fit_cuda_resident_context {
-            let maximum_tokens = logical_context_tokens.ok_or_else(|| {
-                Error::ModelLoadError(
-                    "CUDA managed state requires a positive loaded-model context limit".into(),
-                )
-            })?;
-            Some(
-                self.managed_kv_cache
+        let (logical_token_reach, retained_sequence_rows, staged_transaction_rows) =
+            if fit_cuda_resident_context {
+                let context = logical_context_tokens.ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "CUDA managed state requires a positive loaded-model context limit".into(),
+                    )
+                })?;
+                let context = u64::try_from(context)
+                    .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
+                let incremental = self.config.cuda_incremental_chat_enabled();
+                let automatic_rows = self.config.automatic_row_limits.retained_sequences;
+                let fit = self
+                    .managed_kv_cache
                     .fit_cuda_resident_logical_token_reach(
                         model_instance,
                         contract,
-                        Self::cuda_pool_upper_bound(
-                            u64::try_from(maximum_tokens).map_err(|_| {
-                                Error::ModelLoadError("model context exceeds u64".into())
-                            })?,
-                            retained_sequence_rows,
-                            self.config.cuda_incremental_chat_enabled(),
-                        )?,
+                        |rows| Self::cuda_pool_upper_bound(context, rows, incremental),
                         self.config
                             .portable_context_reserve_bytes
                             .checked_add(decode_workspace_reserve_bytes)
@@ -5295,19 +5294,41 @@ impl EngineCore {
                                 )
                             })?,
                         self.config.block_size,
-                        retained_sequence_rows,
-                        staged_transaction_rows,
+                        crate::engine::cache::managed::CudaResidentRowRequest {
+                            retained_sequence_rows,
+                            staged_transaction_rows,
+                            automatic_state_budget_fraction: automatic_rows
+                                .then_some(self.config.cuda_state_budget_fraction),
+                        },
+                    )?;
+                info!(
+                    ?model_instance,
+                    automatic_rows,
+                    retained_sequence_rows = fit.retained_sequence_rows,
+                    staged_transaction_rows = fit.staged_transaction_rows,
+                    per_sequence_state_bytes = fit.per_sequence_state_bytes,
+                    resident_state_bytes = fit.resident_state_bytes,
+                    logical_token_reach = fit.logical_token_reach,
+                    "Fitted CUDA resident state rows and context"
+                );
+                (
+                    Some(fit.logical_token_reach),
+                    fit.retained_sequence_rows,
+                    fit.staged_transaction_rows,
+                )
+            } else {
+                (
+                    self.resolve_managed_token_reach_for_contract(
+                        backend,
+                        model_instance,
+                        contract,
+                        logical_context_tokens,
+                        1,
                     )?,
-            )
-        } else {
-            self.resolve_managed_token_reach_for_contract(
-                backend,
-                model_instance,
-                contract,
-                logical_context_tokens,
-                1,
-            )?
-        };
+                    retained_sequence_rows,
+                    staged_transaction_rows,
+                )
+            };
         let runtime = self
             .managed_kv_cache
             .bind_request_with_capacity_policy(

@@ -229,6 +229,13 @@ pub struct ManagedKvModelRuntimeSnapshot {
     pub aggregate_token_capacity: u64,
     /// Number of maximum-reach sequences the fitted page pools can admit.
     pub full_context_sequence_capacity: u64,
+    /// Retained sequence rows backed by recurrent tensor state. `None` for
+    /// paged-only plans, whose sequences are bounded by pages alone.
+    pub retained_sequence_capacity: Option<u32>,
+    /// Recurrent tensor-state rows that may be staged at once.
+    pub staged_transaction_capacity: Option<u32>,
+    /// Recurrent tensor state of one retained or staged row.
+    pub tensor_bytes_per_sequence: Option<u64>,
     /// Active sessions admitted with bounded next-step claims.
     pub incremental_claim_sessions: u64,
     pub arenas: Vec<ManagedKvArenaRuntimeSnapshot>,
@@ -622,18 +629,30 @@ impl ManagedKvCacheManager {
     /// Fit a CUDA logical reach whose complete paged backing is materialized
     /// before Ready publication. This turns the live-capacity observation into
     /// physical ownership instead of a revocable promise to grow later.
+    ///
+    /// Explicit rows are a hard contract. Automatic retained rows shrink to
+    /// the largest count whose recurrent state fits the configured share of
+    /// the budget, never below the staged (decode) width; the rest of the
+    /// budget backs KV pages.
     pub(crate) fn fit_cuda_resident_logical_token_reach(
         &self,
         model_instance: ModelInstanceId,
         contract: &InferenceStateContract,
-        maximum_tokens: u64,
+        maximum_tokens_for_rows: impl Fn(u32) -> Result<u64>,
         safety_reserve_bytes: u64,
         page_tokens_hint: usize,
-        retained_sequence_rows: u32,
-        staged_transaction_rows: u32,
-    ) -> Result<u64> {
+        rows: CudaResidentRowRequest,
+    ) -> Result<CudaResidentFit> {
+        let requested = |logical_token_reach| CudaResidentFit {
+            logical_token_reach,
+            retained_sequence_rows: rows.retained_sequence_rows,
+            staged_transaction_rows: rows.staged_transaction_rows,
+            per_sequence_state_bytes: 0,
+            resident_state_bytes: 0,
+        };
+        let maximum_tokens = maximum_tokens_for_rows(rows.retained_sequence_rows)?;
         if self.worker_backend != BackendKind::Cuda || maximum_tokens == 0 {
-            return Ok(maximum_tokens);
+            return Ok(requested(maximum_tokens));
         }
         let Some(authority) = self.resource_authority.as_ref() else {
             return Err(Error::ModelLoadError(
@@ -647,7 +666,6 @@ impl ManagedKvCacheManager {
                 "CUDA managed context fitting requires known device capacity".into(),
             ));
         };
-        let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
         let state_plan = negotiate_state_plan(
@@ -659,66 +677,14 @@ impl ManagedKvCacheManager {
                 storage_dtype_hint: None,
             },
         )?;
-        let (maximum_allocation, _) = plan_managed_state_capacity(
+        fit_resident_rows_and_reach(
             &state_plan,
             model_instance,
-            ManagedStateCapacityRequest {
-                total_paged_pages: u32::MAX,
-                logical_token_reach: Some(maximum_tokens),
-                retained_sequence_rows,
-                staged_transaction_rows,
-            },
-        )?;
-        let steady_resources = managed_state_resources(
-            BackendKind::Cuda,
-            maximum_allocation.maximum_resources(&state_plan)?,
-        )?;
-        let steady_bytes = known_resource_bytes(steady_resources.device_bytes, "device")?;
-        let paged = state_plan
-            .paged_attention
-            .iter()
-            .map(|paged| CudaContiguousPagedGeometry {
-                page_tokens: paged.page_tokens,
-                bytes_per_page: paged.bytes_per_page,
-            })
-            .collect::<Vec<_>>();
-        let maximum_paged_bytes =
-            state_plan
-                .paged_attention
-                .iter()
-                .try_fold(0_u64, |total, paged| {
-                    let maximum_blocks = maximum_allocation
-                        .group_capacity(paged.group, paged.domain)?
-                        .strategy
-                        .maximum_blocks();
-                    total
-                        .checked_add(
-                            paged
-                                .bytes_per_page
-                                .checked_mul(u64::from(maximum_blocks))
-                                .ok_or_else(|| {
-                                    Error::ModelLoadError("CUDA KV byte plan overflow".into())
-                                })?,
-                        )
-                        .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))
-                })?;
-        let fixed_state_bytes = steady_bytes
-            .checked_sub(maximum_paged_bytes)
-            .ok_or_else(|| Error::ModelLoadError("CUDA fixed state byte plan underflow".into()))?;
-        let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
-        let minimum_bytes =
-            cuda_resident_required_bytes(minimum_tokens, &paged, fixed_state_bytes)?;
-        if minimum_bytes > budget_bytes {
-            return Err(Error::ModelLoadError(format!(
-                "CUDA managed context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, resident_state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
-            )));
-        }
-        fit_cuda_resident_token_reach(
-            maximum_tokens,
+            maximum_tokens_for_rows,
+            headroom_bytes,
+            safety_reserve_bytes,
             page_tokens_hint,
-            &paged,
-            fixed_state_bytes,
-            budget_bytes,
+            rows,
         )
     }
 
@@ -900,6 +866,7 @@ impl ManagedKvCacheManager {
                     })
                     .collect::<Vec<_>>();
                 arenas.sort_by_key(|arena| (arena.generation, arena.group_id));
+                let tensor_capacity = state.runtime.tensor_state().map(|arena| arena.capacity());
                 ManagedKvModelRuntimeSnapshot {
                     model_instance: *model_instance,
                     plan_fingerprint: state.runtime.plan.fingerprint().to_string(),
@@ -920,6 +887,12 @@ impl ManagedKvCacheManager {
                         &state.runtime.plan,
                         state.runtime.maximum_sequence_tokens(),
                     ),
+                    retained_sequence_capacity: tensor_capacity
+                        .map(|capacity| capacity.sequence_capacity()),
+                    staged_transaction_capacity: tensor_capacity
+                        .map(|capacity| capacity.transaction_capacity()),
+                    tensor_bytes_per_sequence: tensor_capacity
+                        .map(|capacity| capacity.per_sequence_bytes()),
                     incremental_claim_sessions: usize_to_u64(
                         state.incremental_claim_sessions.len(),
                     ),
@@ -3551,6 +3524,221 @@ struct CudaContiguousPagedGeometry {
     bytes_per_page: u64,
 }
 
+/// Row limits for `fit_cuda_resident_logical_token_reach`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CudaResidentRowRequest {
+    pub(crate) retained_sequence_rows: u32,
+    pub(crate) staged_transaction_rows: u32,
+    /// `Some(share)` when retained rows are automatic: their recurrent state
+    /// may take at most this share of the post-weight budget.
+    pub(crate) automatic_state_budget_fraction: Option<f64>,
+}
+
+/// Rows and logical reach chosen by the CUDA resident fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CudaResidentFit {
+    pub(crate) logical_token_reach: u64,
+    pub(crate) retained_sequence_rows: u32,
+    pub(crate) staged_transaction_rows: u32,
+    /// Recurrent tensor state of one row; zero for paged-only plans.
+    pub(crate) per_sequence_state_bytes: u64,
+    /// Recurrent tensor state reserved for every retained and staged row.
+    pub(crate) resident_state_bytes: u64,
+}
+
+/// Choose retained rows and the logical reach for one resolved plan. Only
+/// the plan's geometry is read, so CPU tests can drive the CUDA policy.
+fn fit_resident_rows_and_reach(
+    state_plan: &ResolvedStatePlan,
+    model_instance: ModelInstanceId,
+    maximum_tokens_for_rows: impl Fn(u32) -> Result<u64>,
+    headroom_bytes: u64,
+    safety_reserve_bytes: u64,
+    page_tokens_hint: u32,
+    rows: CudaResidentRowRequest,
+) -> Result<CudaResidentFit> {
+    let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+    let geometry = |retained_sequence_rows: u32| {
+        cuda_resident_geometry(
+            state_plan,
+            model_instance,
+            maximum_tokens_for_rows(retained_sequence_rows)?,
+            page_tokens_hint,
+            retained_sequence_rows,
+            rows.staged_transaction_rows.min(retained_sequence_rows),
+        )
+    };
+    let chosen = match rows.automatic_state_budget_fraction {
+        None => {
+            let explicit = geometry(rows.retained_sequence_rows)?;
+            if explicit.minimum_bytes > budget_bytes {
+                return Err(Error::ModelLoadError(format!(
+                    "CUDA managed context cannot fit the model-authored minimum: {}; explicit rows are a hard contract, so lower IZWI_MAX_RETAINED_SEQUENCES and IZWI_MAX_STAGED_TRANSACTIONS until (retained + staged) x per_sequence_state_bytes fits, or unset both to fit rows to the model",
+                    explicit.describe(headroom_bytes, safety_reserve_bytes)
+                )));
+            }
+            explicit
+        }
+        Some(fraction) => {
+            let floor = geometry(
+                rows.staged_transaction_rows
+                    .min(rows.retained_sequence_rows),
+            )?;
+            if floor.minimum_bytes > budget_bytes {
+                return Err(Error::ModelLoadError(format!(
+                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}; rows were automatic and cannot go below the staged width, so free device memory (unload other models or use a larger GPU) or lower IZWI_MAX_STAGED_TRANSACTIONS (keeping IZWI_MAX_RETAINED_SEQUENCES at least as large)",
+                    floor.describe(headroom_bytes, safety_reserve_bytes)
+                )));
+            }
+            let state_cap = (budget_bytes as f64 * fraction) as u64;
+            let fits = |candidate: &CudaResidentGeometry| {
+                candidate.resident_state_bytes <= state_cap
+                    && candidate.minimum_bytes <= budget_bytes
+            };
+            // The floor is the decode width: it may exceed the share but
+            // must stay usable. Above it, take the most rows that fit.
+            let mut chosen = floor;
+            if fits(&floor) {
+                let (mut low, mut high) =
+                    (floor.retained_sequence_rows, rows.retained_sequence_rows);
+                while low < high {
+                    let middle = low + (high - low).div_ceil(2);
+                    let candidate = geometry(middle)?;
+                    if fits(&candidate) {
+                        low = middle;
+                        chosen = candidate;
+                    } else {
+                        high = middle - 1;
+                    }
+                }
+            }
+            chosen
+        }
+    };
+    let paged = state_plan
+        .paged_attention
+        .iter()
+        .map(|paged| CudaContiguousPagedGeometry {
+            page_tokens: paged.page_tokens,
+            bytes_per_page: paged.bytes_per_page,
+        })
+        .collect::<Vec<_>>();
+    Ok(CudaResidentFit {
+        logical_token_reach: fit_cuda_resident_token_reach(
+            chosen.maximum_tokens,
+            page_tokens_hint,
+            &paged,
+            chosen.resident_state_bytes,
+            budget_bytes,
+        )?,
+        retained_sequence_rows: chosen.retained_sequence_rows,
+        staged_transaction_rows: chosen.staged_transaction_rows,
+        per_sequence_state_bytes: chosen.per_sequence_state_bytes,
+        resident_state_bytes: chosen.resident_state_bytes,
+    })
+}
+
+/// Fixed state and minimum resident footprint of one candidate row count.
+#[derive(Debug, Clone, Copy)]
+struct CudaResidentGeometry {
+    retained_sequence_rows: u32,
+    staged_transaction_rows: u32,
+    maximum_tokens: u64,
+    per_sequence_state_bytes: u64,
+    resident_state_bytes: u64,
+    minimum_tokens: u64,
+    minimum_bytes: u64,
+}
+
+impl CudaResidentGeometry {
+    fn describe(&self, headroom_bytes: u64, safety_reserve_bytes: u64) -> String {
+        format!(
+            "retained_sequences={}, staged_transactions={}, per_sequence_state_bytes={}, resident_state_bytes={}, minimum_tokens={}, minimum_bytes={}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}",
+            self.retained_sequence_rows,
+            self.staged_transaction_rows,
+            self.per_sequence_state_bytes,
+            self.resident_state_bytes,
+            self.minimum_tokens,
+            self.minimum_bytes,
+        )
+    }
+}
+
+/// Price one row count: the fixed (non-paged) state the allocation plan
+/// authorizes for retained plus staged rows, and that state plus one page per
+/// paged domain. Only plan geometry is read, so a CPU-negotiated plan of the
+/// same contract prices the same bytes in tests.
+fn cuda_resident_geometry(
+    state_plan: &ResolvedStatePlan,
+    model_instance: ModelInstanceId,
+    maximum_tokens: u64,
+    page_tokens: u32,
+    retained_sequence_rows: u32,
+    staged_transaction_rows: u32,
+) -> Result<CudaResidentGeometry> {
+    let (maximum_allocation, tensor_capacity) = plan_managed_state_capacity(
+        state_plan,
+        model_instance,
+        ManagedStateCapacityRequest {
+            total_paged_pages: u32::MAX,
+            logical_token_reach: Some(maximum_tokens),
+            retained_sequence_rows,
+            staged_transaction_rows,
+        },
+    )?;
+    let paged = state_plan
+        .paged_attention
+        .iter()
+        .map(|paged| CudaContiguousPagedGeometry {
+            page_tokens: paged.page_tokens,
+            bytes_per_page: paged.bytes_per_page,
+        })
+        .collect::<Vec<_>>();
+    let steady_resources = managed_state_resources(
+        state_plan.backend,
+        maximum_allocation.maximum_resources(state_plan)?,
+    )?;
+    let steady_bytes = match state_plan.backend {
+        BackendKind::Cuda => known_resource_bytes(steady_resources.device_bytes, "device"),
+        BackendKind::Metal => known_resource_bytes(steady_resources.unified_bytes, "unified"),
+        BackendKind::Cpu => known_resource_bytes(steady_resources.host_bytes, "host"),
+    }?;
+    let maximum_paged_bytes =
+        state_plan
+            .paged_attention
+            .iter()
+            .try_fold(0_u64, |total, paged| {
+                let maximum_blocks = maximum_allocation
+                    .group_capacity(paged.group, paged.domain)?
+                    .strategy
+                    .maximum_blocks();
+                total
+                    .checked_add(
+                        paged
+                            .bytes_per_page
+                            .checked_mul(u64::from(maximum_blocks))
+                            .ok_or_else(|| {
+                                Error::ModelLoadError("CUDA KV byte plan overflow".into())
+                            })?,
+                    )
+                    .ok_or_else(|| Error::ModelLoadError("CUDA KV byte plan overflow".into()))
+            })?;
+    let resident_state_bytes = steady_bytes
+        .checked_sub(maximum_paged_bytes)
+        .ok_or_else(|| Error::ModelLoadError("CUDA fixed state byte plan underflow".into()))?;
+    let minimum_tokens = u64::from(page_tokens).min(maximum_tokens);
+    Ok(CudaResidentGeometry {
+        retained_sequence_rows,
+        staged_transaction_rows,
+        maximum_tokens,
+        per_sequence_state_bytes: tensor_capacity
+            .map_or(0, |capacity| capacity.per_sequence_bytes()),
+        resident_state_bytes,
+        minimum_tokens,
+        minimum_bytes: cuda_resident_required_bytes(minimum_tokens, &paged, resident_state_bytes)?,
+    })
+}
+
 /// Price the worst admission-barrier replacement across independently grown
 /// paged arenas. Every arena may already be at its final steady backing when
 /// another arena grows, but only the arena currently being replaced retains an
@@ -5694,6 +5882,256 @@ mod tests {
             fit_cuda_contiguous_token_reach(262_144, 64, &paged, TENSOR_BYTES, budget,).unwrap(),
             65_536
         );
+    }
+
+    /// Run the CUDA resident row and context policy for one model on a device
+    /// of `device_bytes` whose resident weights are already materialized.
+    /// Negotiating a CUDA plan needs the CUDA build; the policy reads only
+    /// plan geometry, which a CPU plan of the same contract reproduces.
+    fn cuda_admission_fit(
+        contract: &InferenceStateContract,
+        device_bytes: u64,
+        weights_bytes: u64,
+        safety_reserve_bytes: u64,
+        rows: CudaResidentRowRequest,
+    ) -> Result<CudaResidentFit> {
+        let state_plan = negotiate_state_plan(
+            contract,
+            &StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )?;
+        fit_resident_rows_and_reach(
+            &state_plan,
+            ModelInstanceId::new(3_838),
+            |rows| Ok(262_144 * u64::from(rows)),
+            device_bytes.saturating_sub(CUDA_CONTEXT_BYTES + weights_bytes),
+            safety_reserve_bytes,
+            64,
+            rows,
+        )
+    }
+
+    /// Driver context and allocator pools present before any weight loads.
+    const CUDA_CONTEXT_BYTES: u64 = 512 * 1024 * 1024;
+
+    #[test]
+    fn cuda_admission_matrix_fits_automatic_rows_to_hybrid_recurrent_state() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const H100_BYTES: u64 = 85_017_624_576;
+        const DECODE_WIDTH: u32 = 8;
+        const STATE_SHARE: f64 = 0.25;
+        use crate::models::architectures::qwen36moe::{
+            cache::qwen35_composite_cache_contract_with_mtp, native::pinned_native_config,
+            native_model::qwen35_text_config_from_native,
+        };
+        let qwen36 = qwen35_composite_cache_contract_with_mtp(
+            &qwen35_text_config_from_native(&pinned_native_config().text),
+            DType::BF16,
+            64,
+            false,
+            false,
+        )
+        .unwrap();
+        let workspace = |per_row| {
+            crate::engine::continuous_chat_workspace_per_row(per_row)
+                .unwrap()
+                .workspace_bytes()
+                .unwrap()
+                * u64::from(DECODE_WIDTH)
+        };
+        // CUDA resident weights from the load-time plans: Qwen3.8 Q8_0 + BF16
+        // (`qwen38_representation_memory_estimate`) and Qwen3.6 block FP8
+        // including its graph pool (`qwen36moe_memory::resource_plan`). Decode
+        // reserves: Qwen3.8's adaptive-MTP row, and a generous bound for
+        // Qwen3.6's small rows.
+        let models = [
+            (
+                "Qwen3.8",
+                qwen38_27b_tensor_contract(),
+                32_407_348_704_u64,
+                156_893_184_u64,
+                workspace(475_144_192),
+            ),
+            (
+                "Qwen3.6",
+                qwen36,
+                35_337_864_704,
+                65_863_680,
+                workspace(64 * 1024 * 1024),
+            ),
+        ];
+        // The CPU plans driving the policy carry the CUDA page geometry:
+        // 64-token BF16-width pages (Qwen3.8 16 layers x 4 KV heads, Qwen3.6
+        // 10 layers x 2 KV heads, head dim 256).
+        for ((_, contract, ..), kv_bytes_per_token) in models.iter().zip([65_536, 20_480]) {
+            let plan = negotiate_state_plan(
+                contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(64),
+                    storage_dtype_hint: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(plan.paged_attention.len(), 1);
+            assert_eq!(plan.paged_attention[0].page_tokens, 64);
+            assert_eq!(
+                plan.paged_attention[0].bytes_per_page,
+                64 * kv_bytes_per_token
+            );
+        }
+        for (name, contract, weights, per_sequence, decode_reserve) in &models {
+            for device_bytes in [24 * GIB, 40 * GIB, 48 * GIB, H100_BYTES, 141 * GIB] {
+                let gib = device_bytes / GIB;
+                let safety = GIB + decode_reserve;
+                // The memory-derived automatic ceiling (device / 256 MiB).
+                let ceiling = u32::try_from(device_bytes / (256 * 1024 * 1024)).unwrap();
+                let fit = cuda_admission_fit(
+                    contract,
+                    device_bytes,
+                    *weights,
+                    safety,
+                    CudaResidentRowRequest {
+                        retained_sequence_rows: ceiling,
+                        staged_transaction_rows: DECODE_WIDTH,
+                        automatic_state_budget_fraction: Some(STATE_SHARE),
+                    },
+                );
+                let headroom = device_bytes.saturating_sub(CUDA_CONTEXT_BYTES + weights);
+                let floor_state = per_sequence * u64::from(2 * DECODE_WIDTH);
+                if headroom < safety + floor_state + 8 * 1024 * 1024 {
+                    let error = fit.expect_err("weights leave no room for the decode width");
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("IZWI_MAX_STAGED_TRANSACTIONS"),
+                        "{message}"
+                    );
+                    assert!(
+                        message.contains(&format!("per_sequence_state_bytes={per_sequence}")),
+                        "{message}"
+                    );
+                    continue;
+                }
+                let fit = fit.unwrap_or_else(|error| panic!("{name} at {gib} GiB: {error}"));
+                let budget = headroom - safety;
+                let state_cap = (budget as f64 * STATE_SHARE) as u64;
+                let rows = fit.retained_sequence_rows;
+                assert!(rows >= DECODE_WIDTH, "{name} at {gib} GiB kept {rows} rows");
+                assert!(rows <= ceiling);
+                assert_eq!(fit.staged_transaction_rows, DECODE_WIDTH);
+                assert_eq!(fit.per_sequence_state_bytes, *per_sequence);
+                assert_eq!(
+                    fit.resident_state_bytes,
+                    per_sequence * u64::from(rows + DECODE_WIDTH)
+                );
+                // Above the decode width, state stays within its share and
+                // takes the most rows that do.
+                assert!(
+                    rows == DECODE_WIDTH || fit.resident_state_bytes <= state_cap,
+                    "{name} at {gib} GiB reserved {} of {state_cap}",
+                    fit.resident_state_bytes
+                );
+                assert!(
+                    rows == ceiling
+                        || per_sequence * u64::from(rows + 1 + DECODE_WIDTH) > state_cap,
+                    "{name} at {gib} GiB left rows unused"
+                );
+                assert!(fit.logical_token_reach >= 64);
+            }
+        }
+
+        // The pre-fix resolution charged every memory-derived row as both
+        // retained and staged state, refusing Qwen3.8 on every device.
+        for device_bytes in [40 * GIB, 48 * GIB, H100_BYTES, 141 * GIB] {
+            let ceiling = u32::try_from(device_bytes / (256 * 1024 * 1024)).unwrap();
+            let (_, contract, weights, _, decode_reserve) = &models[0];
+            let error = cuda_admission_fit(
+                contract,
+                device_bytes,
+                *weights,
+                GIB + decode_reserve,
+                CudaResidentRowRequest {
+                    retained_sequence_rows: ceiling,
+                    staged_transaction_rows: ceiling,
+                    automatic_state_budget_fraction: None,
+                },
+            )
+            .expect_err("explicit rows are a hard contract");
+            assert!(
+                error.to_string().contains("IZWI_MAX_RETAINED_SEQUENCES"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_retained_rows_wait_for_a_released_session() {
+        // A request holds one retained row from its first prepare until its
+        // terminal release; rows are never kept between requests. With every
+        // row held, a new session gets Backpressure, which the engine defers
+        // and retries rather than failing, and it binds once a holder ends.
+        let model = ModelInstanceId::new(606);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_model_state_with_capacity(
+                model,
+                BackendKind::Cpu,
+                ManagedStateCapacityRequest {
+                    total_paged_pages: 12,
+                    logical_token_reach: None,
+                    retained_sequence_rows: 2,
+                    staged_transaction_rows: 1,
+                },
+                32,
+                &hybrid_snapshot_contract(),
+            )
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let request = prefix_request(model, (0..32_u32).collect());
+        let commit = |manager: &mut ManagedKvCacheManager, plan: u64, session: &SessionKey| {
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    plan,
+                    session,
+                    &sequence_work(0, 32),
+                    Some(&request),
+                )?
+                .expect("managed reservation");
+            arena.stage_replace(
+                PhysicalStateTransactionId::new(plan).unwrap(),
+                StateDomainId::new(2),
+                0,
+                32,
+                hybrid_tensor_values(&[1.0; 4]),
+            )?;
+            manager.finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )
+        };
+        let holders = [
+            SessionKey::new("row-holder-a".into(), 1),
+            SessionKey::new("row-holder-b".into(), 1),
+        ];
+        commit(&mut manager, 71, &holders[0]).unwrap();
+        commit(&mut manager, 72, &holders[1]).unwrap();
+
+        let waiter = SessionKey::new("row-waiter".into(), 1);
+        let error = commit(&mut manager, 73, &waiter).unwrap_err();
+        assert!(
+            matches!(&error, Error::Backpressure(reason) if reason.contains("sequence capacity")),
+            "{error}"
+        );
+        manager.release_session(&holders[0]).unwrap();
+        commit(&mut manager, 74, &waiter).unwrap();
+        assert_eq!(arena.occupancy().unwrap().active_sequences, 2);
     }
 
     #[test]

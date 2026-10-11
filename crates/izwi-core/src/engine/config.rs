@@ -61,6 +61,9 @@ pub(crate) fn tts_explicit_output_limit(
 /// Managed-state row limits resolved by the runtime instead of the operator.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AutomaticRowLimits {
+    /// `max_retained_sequences` was zero and resolved to the administrative
+    /// ceiling. CUDA resident fitting may then retain fewer rows.
+    pub(crate) retained_sequences: bool,
     /// `max_staged_transactions` was zero and resolved to the step launch width.
     pub(crate) staged_transactions: bool,
 }
@@ -197,6 +200,12 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_cuda_incremental_chat")]
     pub enable_cuda_incremental_chat: bool,
 
+    /// Share of the post-weight CUDA budget that retained recurrent state may
+    /// take when retained rows are automatic; the rest backs KV pages. Set
+    /// with IZWI_CUDA_STATE_BUDGET_FRACTION in (0, 1]; default 0.25.
+    #[serde(default = "default_cuda_state_budget_fraction")]
+    pub cuda_state_budget_fraction: f64,
+
     /// Threshold for chunked prefill (tokens)
     #[serde(default = "default_chunked_prefill_threshold")]
     pub chunked_prefill_threshold: usize,
@@ -316,6 +325,33 @@ fn default_cuda_incremental_chat() -> bool {
 
 fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
     value.is_none_or(|value| matches!(value, "1" | "true" | "on"))
+}
+
+pub(crate) const DEFAULT_CUDA_STATE_BUDGET_FRACTION: f64 = 0.25;
+
+fn default_cuda_state_budget_fraction() -> f64 {
+    cuda_state_budget_fraction_from_env(
+        std::env::var("IZWI_CUDA_STATE_BUDGET_FRACTION")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn cuda_state_budget_fraction_from_env(value: Option<&str>) -> f64 {
+    let Some(value) = value else {
+        return DEFAULT_CUDA_STATE_BUDGET_FRACTION;
+    };
+    match value.trim().parse::<f64>() {
+        Ok(fraction) if fraction > 0.0 && fraction <= 1.0 => fraction,
+        _ => {
+            tracing::warn!(
+                value,
+                default = DEFAULT_CUDA_STATE_BUDGET_FRACTION,
+                "Ignoring IZWI_CUDA_STATE_BUDGET_FRACTION outside (0, 1]"
+            );
+            DEFAULT_CUDA_STATE_BUDGET_FRACTION
+        }
+    }
 }
 
 fn default_chunked_prefill() -> bool {
@@ -467,6 +503,7 @@ impl Default for EngineCoreConfig {
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_chunked_prefill(),
             enable_cuda_incremental_chat: default_cuda_incremental_chat(),
+            cuda_state_budget_fraction: default_cuda_state_budget_fraction(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
@@ -606,6 +643,24 @@ mod managed_kv_default_tests {
         }
         for value in ["0", "false", "off", "", "invalid"] {
             assert!(!super::cuda_incremental_chat_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn cuda_state_budget_fraction_accepts_only_a_positive_share() {
+        use super::{cuda_state_budget_fraction_from_env, DEFAULT_CUDA_STATE_BUDGET_FRACTION};
+        assert_eq!(
+            cuda_state_budget_fraction_from_env(None),
+            DEFAULT_CUDA_STATE_BUDGET_FRACTION
+        );
+        assert_eq!(cuda_state_budget_fraction_from_env(Some(" 0.4 ")), 0.4);
+        assert_eq!(cuda_state_budget_fraction_from_env(Some("1")), 1.0);
+        for value in ["0", "-0.1", "1.5", "NaN", "", "quarter"] {
+            assert_eq!(
+                cuda_state_budget_fraction_from_env(Some(value)),
+                DEFAULT_CUDA_STATE_BUDGET_FRACTION,
+                "{value:?}"
+            );
         }
     }
 

@@ -188,6 +188,26 @@ Set it to `1` or remove the variable to restore the default.
 Other model families keep their existing admission policy until they implement the
 published-sequence replay contract.
 
+Hybrid models (Qwen3.8 and Qwen3.6) keep a fixed block of recurrent state for every
+conversation they hold at once (about 157 MB per conversation for Qwen3.8 and 66 MB for
+Qwen3.6). When `IZWI_MAX_RETAINED_SEQUENCES` is unset, the server sizes this
+automatically at load: recurrent state may use up to a quarter of the memory left after
+the weights, and the rest holds the KV cache. It never keeps fewer conversations than the
+decode width (8 on CUDA). On an 80 GB H100 that is about 67 conversations for Qwen3.8 and
+about 170 for Qwen3.6. Further requests wait for a slot and start as soon as one finishes.
+The load log line `Fitted CUDA resident state rows and context` and the
+`retained_sequence_capacity` field under `kv_cache.models[]` in `/v1/metrics` show the
+chosen size. To give recurrent state a different share, set a value between 0 and 1:
+
+```bash
+export IZWI_CUDA_STATE_BUDGET_FRACTION=0.4
+```
+
+Setting `IZWI_MAX_RETAINED_SEQUENCES` explicitly turns the automatic sizing off. The
+server then reserves exactly that many conversations, plus `IZWI_MAX_STAGED_TRANSACTIONS`
+in-flight copies (by default the decode width), and refuses the load with the byte
+figures if they do not fit.
+
 Use separate conversations, or independent `/v1/chat/completions` requests, for
 concurrent answers. Sends to the same conversation remain ordered. The playground
 allows one active stream per mounted view; separate tabs can use separate conversations.
