@@ -153,5 +153,10 @@ pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
     use std::sync::{Mutex, OnceLock};
 
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let lock = LOCK.get_or_init(|| Mutex::new(()));
+    // The lock orders tests that touch the process environment; it guards no
+    // data. A test that panics while holding it must fail alone, not poison
+    // every later test into a PoisonError.
+    lock.clear_poison();
+    lock
 }
