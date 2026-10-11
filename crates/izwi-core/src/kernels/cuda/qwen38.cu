@@ -229,12 +229,17 @@ extern "C" __global__ void qwen38_gated_rms_norm_decode_bf16(
 // the weight, history and packed output stay F32. A 16-bit input converts
 // exactly to F32, so every entry computes the same values as the F32 entry on
 // the cast input.
+// One thread per output element: the first `conv_dim` threads write the
+// activated output, the rest the next three-slot history. The direct entries
+// pass one packed buffer for both; the table-addressed entries below pass the
+// history addresses from a device state table. Both run this exact body.
 template <class T>
-__device__ void qwen38_causal_conv_decode(
+__device__ void qwen38_causal_conv_decode_into(
     const T* __restrict__ input,
     const float* __restrict__ weight,
     const float* __restrict__ history,
-    float* __restrict__ packed_output,
+    float* __restrict__ output,
+    float* __restrict__ next_history,
     int conv_dim) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   const int total_elements = conv_dim * 4;
@@ -248,7 +253,7 @@ __device__ void qwen38_causal_conv_decode(
                 + history[history_base + 1] * weight[weight_base + 1]
                 + history[history_base + 2] * weight[weight_base + 2]
                 + float(input[channel]) * weight[weight_base + 3];
-    packed_output[channel] = value / (1.0f + expf(-value));
+    output[channel] = value / (1.0f + expf(-value));
     return;
   }
 
@@ -256,8 +261,19 @@ __device__ void qwen38_causal_conv_decode(
   const int channel = state_index / 3;
   const int slot = state_index - channel * 3;
   const int history_base = channel * 3;
-  packed_output[conv_dim + state_index] =
+  next_history[state_index] =
       slot < 2 ? history[history_base + slot + 1] : float(input[channel]);
+}
+
+template <class T>
+__device__ void qwen38_causal_conv_decode(
+    const T* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ history,
+    float* __restrict__ packed_output,
+    int conv_dim) {
+  qwen38_causal_conv_decode_into<T>(
+      input, weight, history, packed_output, packed_output + conv_dim, conv_dim);
 }
 
 extern "C" __global__ void qwen38_causal_conv_decode_f32(
@@ -286,6 +302,29 @@ extern "C" __global__ void qwen38_causal_conv_decode_f16(
     int conv_dim) {
   qwen38_causal_conv_decode<__half>(input, weight, history, packed_output, conv_dim);
 }
+
+// Table-addressed entries for CUDA graph replay. A captured graph bakes kernel
+// arguments, but each decode step reads the previous history and writes a
+// fresh one at new addresses. These entries read both from the per-layer
+// device state table the host refreshes before each replay (the
+// `kernels/cuda/gdn.rs` StateTable layout, six entries per layer):
+//   table[slot + 0] : history [C, 3] F32, oldest first (read)
+//   table[slot + 3] : next history [C, 3] F32 (written)
+// Entries 1 and 2 are unused here; 4 and 5 address the recurrent state for
+// the table-addressed recurrence. The activated output goes to `output`.
+#define QWEN38_CONV_TABLE_EXPORT(T, S)                                                   \
+  extern "C" __global__ void qwen38_causal_conv_decode_table_##S(                        \
+      const T* __restrict__ input, const float* __restrict__ weight,                     \
+      const unsigned long long* __restrict__ table, int slot, float* __restrict__ output, \
+      int conv_dim) {                                                                    \
+    const unsigned long long* entries = table + slot;                                    \
+    qwen38_causal_conv_decode_into<T>(input, weight, (const float*)entries[0], output,   \
+                                      (float*)entries[3], conv_dim);                     \
+  }
+
+QWEN38_CONV_TABLE_EXPORT(float, f32)
+QWEN38_CONV_TABLE_EXPORT(__nv_bfloat16, bf16)
+QWEN38_CONV_TABLE_EXPORT(__half, f16)
 
 // Qwen3.8 single-token Gated DeltaNet recurrence for F32 tensors.
 //

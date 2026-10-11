@@ -471,6 +471,98 @@ pub fn try_qwen38_causal_conv_decode(
     Some((output, next_history))
 }
 
+/// [`try_qwen38_causal_conv_decode`] with the history in and out taken from a
+/// device state table ([`gdn::StateTable`]: entry 0 is the `[C, 3]` F32
+/// history, oldest first; entry 3 receives the next history): the CUDA-graph
+/// form, whose captured launch does not bake per-step state addresses. Runs
+/// the direct kernel's body. Returns the activated output `[C]` F32.
+#[cfg(feature = "cuda")]
+pub fn qwen38_causal_conv_decode_table(
+    input: &Tensor,
+    weight: &Tensor,
+    table: gdn::StateTable,
+) -> candle_core::Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+    let conv_dim = input.elem_count();
+    if !cuda_tensor_supported(input)
+        || !input.device().same_device(weight.device())
+        || !matches!(input.dtype(), DType::F32 | DType::BF16 | DType::F16)
+        || weight.dtype() != DType::F32
+        || weight.dims() != [conv_dim, 4]
+        || conv_dim == 0
+        || conv_dim
+            .checked_mul(4)
+            .is_none_or(|elements| elements > i32::MAX as usize)
+    {
+        candle_core::bail!(
+            "invalid Qwen3.8 table conv decode contract: input {:?} {:?}, weight {:?} {:?}",
+            input.dims(),
+            input.dtype(),
+            weight.dims(),
+            weight.dtype()
+        )
+    }
+    let device = input.device().as_cuda_device()?;
+    let input = input.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    let (candle_core::Storage::Cuda(input_storage), candle_core::Storage::Cuda(weight_storage)) =
+        (&*input_storage, &*weight_storage)
+    else {
+        candle_core::bail!("Qwen3.8 table conv decode needs CUDA tensors")
+    };
+    let CudaStorageSlice::F32(weight_slice) = &weight_storage.slice else {
+        candle_core::bail!("Qwen3.8 table conv decode weight must be F32")
+    };
+    let Some((weight_start, weight_end)) = weight_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 table conv decode weight must be contiguous")
+    };
+    let Some((input_start, input_end)) = input_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 table conv decode input must be contiguous")
+    };
+    let weight_view = weight_slice.slice(weight_start..weight_end);
+    // SAFETY: one thread writes each output channel.
+    let output = unsafe { device.alloc::<f32>(conv_dim)? };
+    let config = LaunchConfig::for_num_elems((conv_dim * 4) as u32);
+    macro_rules! launch {
+        ($slice:expr, $name:literal) => {{
+            let input_view = $slice.slice(input_start..input_end);
+            let function = device.get_or_load_custom_func(
+                $name,
+                "izwi_qwen38_causal_conv_decode",
+                cuda_ptx::QWEN38,
+            )?;
+            let mut builder = function.builder();
+            builder.arg(&input_view);
+            builder.arg(&weight_view);
+            candle_core::builder_arg!(builder, table.address, table.slot as i32);
+            builder.arg(&output);
+            candle_core::builder_arg!(builder, conv_dim as i32);
+            // SAFETY: argument order and types match the kernel; the table
+            // entries are F32 buffers of the documented sizes.
+            unsafe { builder.launch(config) }.w()?;
+        }};
+    }
+    match &input_storage.slice {
+        CudaStorageSlice::F32(slice) => launch!(slice, "qwen38_causal_conv_decode_table_f32"),
+        CudaStorageSlice::BF16(slice) => launch!(slice, "qwen38_causal_conv_decode_table_bf16"),
+        CudaStorageSlice::F16(slice) => launch!(slice, "qwen38_causal_conv_decode_table_f16"),
+        _ => candle_core::bail!("Qwen3.8 table conv decode input must be F32, BF16 or F16"),
+    }
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+            output,
+            device.clone(),
+        )),
+        conv_dim,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
 fn try_qwen_hybrid_causal_conv_sequence(
     input: &Tensor,
     weight: &Tensor,
@@ -3824,6 +3916,81 @@ pub(crate) fn cuda_test_device() -> Option<candle_core::Device> {
 #[cfg(all(test, feature = "cuda"))]
 mod qwen38_dtype_device_tests {
     use super::*;
+
+    /// The table-addressed conv runs the direct kernel's body: the same
+    /// output, and the same next history written where table entry 3 points,
+    /// for every input dtype at the 27B width. The history it reads (entry
+    /// 0) is untouched, and so is the rest of the table's target buffer.
+    #[test]
+    fn cuda_qwen38_table_conv_decode_matches_the_direct_kernel() {
+        let Some(device) = cuda_test_device() else {
+            return;
+        };
+        let conv_dim = 10_240;
+        let values = |n: usize, seed: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 1.5)
+                .collect::<Vec<f32>>()
+        };
+        let host = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let weight = Tensor::from_vec(values(conv_dim * 4, 1.0), (conv_dim, 4), &device).unwrap();
+        let history =
+            Tensor::from_vec(values(conv_dim * 3, 2.0), (conv_dim, 3), &device).unwrap();
+        let history_before = host(&history);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let input = Tensor::from_vec(values(conv_dim, 3.0), (1, 1, conv_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let (direct, direct_next) =
+                try_qwen38_causal_conv_decode(&input, &weight, &history).expect("direct kernel");
+            // The next history lands in the middle of a larger buffer.
+            let target = Tensor::full(7f32, 3 * conv_dim + 64, &device).unwrap();
+            let next = target.narrow(0, 32, 3 * conv_dim).unwrap();
+            let mut table =
+                segment_graph::DeviceTable::new(&device, 2 * gdn::TABLE_ENTRIES).unwrap();
+            let entries = [
+                gdn::f32_address(&history).unwrap(),
+                0,
+                0,
+                gdn::f32_address(&next).unwrap(),
+                0,
+                0,
+            ];
+            table.write(gdn::TABLE_ENTRIES, &entries).unwrap();
+            let output = qwen38_causal_conv_decode_table(
+                &input,
+                &weight,
+                gdn::StateTable {
+                    address: table.address(),
+                    slot: gdn::TABLE_ENTRIES,
+                },
+            )
+            .unwrap();
+            assert_eq!(output.dims(), [conv_dim]);
+            assert_eq!(host(&output), host(&direct), "{dtype:?} output");
+            assert_eq!(host(&next), host(&direct_next), "{dtype:?} next history");
+            let target = host(&target);
+            assert!(target[..32].iter().chain(&target[32 + 3 * conv_dim..]).all(|v| *v == 7.0));
+            assert_eq!(host(&history), history_before, "{dtype:?} read-only history");
+        }
+        // The contract refuses a wrong weight shape before any launch.
+        let input = Tensor::zeros((1, 1, conv_dim), DType::BF16, &device).unwrap();
+        assert!(qwen38_causal_conv_decode_table(
+            &input,
+            &weight.narrow(0, 0, 8).unwrap(),
+            gdn::StateTable { address: 0, slot: 0 },
+        )
+        .is_err());
+    }
+
     #[test]
     fn cuda_qwen38_f16_bf16_epilogues_execute_for_verification_rows() {
         let Some(device) = cuda_test_device() else {
