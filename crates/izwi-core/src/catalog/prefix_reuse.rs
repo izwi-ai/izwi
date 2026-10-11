@@ -3,11 +3,12 @@
 //!
 //! A prefix-reuse flip that passes on one backend lane but not another is
 //! enabled only on the lanes with evidence. This table is the record of that
-//! evidence: default-on (Auto) serving engages reuse only for cells whose
-//! evidence level proves committed-page parity on the active backend. An
-//! explicit operator enablement bypasses the table — the operator asked for
-//! it and owns the risk — while [`PrefixReuseMode::Disabled`] keeps reuse off
-//! regardless of evidence.
+//! evidence: default-on (Auto) serving engages reuse only for `Supported`
+//! cells, which normally carry evidence of committed-page parity on the
+//! active backend; a cell supported ahead of its evidence says so in its
+//! evidence level. An explicit operator enablement bypasses the table — the
+//! operator asked for it and owns the risk — while
+//! [`PrefixReuseMode::Disabled`] keeps reuse off regardless of evidence.
 
 use serde::{Deserialize, Serialize};
 
@@ -182,7 +183,9 @@ impl ModelFamily {
             // Phase 5a: hybrid qwen3.6-MoE shares committed pages and DeltaNet
             // snapshots at the prepared prompt's declared history boundary, so
             // each chat turn attaches at the previous turn's history. The CPU
-            // fixture suite is the evidence; no Metal or CUDA parity leg yet.
+            // fixture suite is the evidence. CUDA is default-on by operator
+            // decision (2026-10-11) before its attach leg has run; the GPU
+            // pre-flight runs it. The Metal leg passes but Metal stays opt-in.
             Self::Qwen35MoeChat => match backend {
                 BackendKind::Cpu => supported(
                     PrefixReuseEvidenceLevel::FixtureSuite,
@@ -192,9 +195,9 @@ impl ModelFamily {
                     PrefixReuseEvidenceLevel::ContractDeclared,
                     "contract declares committed pages and snapshots; no Metal lane parity leg yet",
                 ),
-                BackendKind::Cuda => not_enabled(
-                    PrefixReuseEvidenceLevel::NotRun,
-                    "no CUDA lane parity evidence; enable explicitly (IZWI_ENABLE_PREFIX_CACHING) to measure",
+                BackendKind::Cuda => supported(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "default-on by operator decision ahead of CUDA evidence; the GPU pre-flight runs the qwen36moe device attach test (cuda_attached_prefill_matches_the_fresh_run); IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
             Self::Lfm2Chat => excluded(
@@ -296,18 +299,23 @@ mod tests {
     // so it is inert; the inventory test above covers its fail-closed behavior.
 
     #[test]
-    fn qwen36moe_hybrid_prefix_reuse_engages_on_the_cpu_lane_only() {
+    fn qwen36moe_hybrid_prefix_reuse_engages_on_cpu_and_cuda() {
         let variant = ModelVariant::Qwen36Moe35BA3BFp8;
         assert!(variant.prefix_reuse_support(BackendKind::Cpu).engages());
         assert!(!variant.prefix_reuse_support(BackendKind::Metal).engages());
+        // CUDA is default-on ahead of its evidence, and says so.
         let cuda = variant.prefix_reuse_support(BackendKind::Cuda);
-        assert!(!cuda.engages());
-        assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::NotRun);
-        // Explicit operator enablement still engages it on CUDA.
+        assert!(cuda.engages());
+        assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::ContractDeclared);
         assert!(prefix_reuse_engages(
             variant,
             BackendKind::Cuda,
-            PrefixReuseMode::Explicit
+            PrefixReuseMode::CatalogAuto
+        ));
+        assert!(!prefix_reuse_engages(
+            variant,
+            BackendKind::Cuda,
+            PrefixReuseMode::Disabled
         ));
     }
 
