@@ -2708,8 +2708,16 @@ impl ModelLifecycleController {
                     Ok("0" | "false") | Err(_) => false,
                     Ok(value) => return Err(Error::ConfigError(format!("invalid IZWI_FISH_NATIVE_BATCHING={value}; expected true or false"))),
                 };
+                // Automatic staged rows are sized for tensor-width launches. Fish
+                // fits its own autoregressive width (no tensor arena backs its
+                // transactions), so it reads an automatic limit as automatic.
+                let fish_limits = if self.core_engine.config().automatic_row_limits.staged_transactions {
+                    std::borrow::Cow::Owned(crate::config::EngineConfig { max_staged_transactions: 0, ..self.config.clone() })
+                } else {
+                    std::borrow::Cow::Borrowed(&self.config)
+                };
                 let capacity = crate::runtime::fish_capacity::ResolvedFishServingCapacity::resolve(
-                    model.config(), &self.config, headroom, native_batching,
+                    model.config(), &fish_limits, headroom, native_batching,
                 )?;
                 tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
                 bundle_draft.seal_fish_capacity(capacity.clone())?;

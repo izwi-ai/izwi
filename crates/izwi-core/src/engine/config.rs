@@ -58,6 +58,13 @@ pub(crate) fn tts_explicit_output_limit(
     variant.tts_max_output_frames_hint().unwrap_or(configured)
 }
 
+/// Managed-state row limits resolved by the runtime instead of the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AutomaticRowLimits {
+    /// `max_staged_transactions` was zero and resolved to the step launch width.
+    pub(crate) staged_transactions: bool,
+}
+
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
@@ -92,6 +99,12 @@ pub struct EngineCoreConfig {
     /// Maximum simultaneously staged managed-state transactions.
     #[serde(default = "default_max_staged_transactions")]
     pub max_staged_transactions: usize,
+
+    /// Row limits the operator left automatic. An automatic limit is a
+    /// runtime-sized default rather than an operator contract, so a model
+    /// that fits its own rows may differ from it.
+    #[serde(skip)]
+    pub(crate) automatic_row_limits: AutomaticRowLimits,
 
     /// Maximum admitted jobs in the runtime inference queue.
     #[serde(default = "default_max_queued_requests")]
@@ -433,6 +446,7 @@ impl Default for EngineCoreConfig {
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
+            automatic_row_limits: AutomaticRowLimits::default(),
             max_queued_requests: default_max_queued_requests(),
             max_seq_len: default_max_seq_len(),
             portable_context_auto: false,

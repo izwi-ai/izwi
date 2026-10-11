@@ -369,24 +369,51 @@ impl PhysicalBatchAssembly {
         Some(workspace)
     }
 
+    fn matches_shape(
+        &self,
+        lane: &BatchLaneKey,
+        mode: NativeBatchMode,
+        budget: &BatchBudget,
+        output_visibility: super::OutputVisibility,
+        shape_policy: StageShapePolicy,
+        launch_policy: PhysicalLaunchPolicy,
+    ) -> bool {
+        self.physical_batch.lane == *lane
+            && self.physical_batch.mode == mode
+            && self.physical_batch.budget == *budget
+            && self.output_visibility == output_visibility
+            && self.shape_policy == shape_policy
+            && self.launch_policy == launch_policy
+    }
+
+    /// Structural precondition of `try_push` for a row of this cost. Element
+    /// and workspace budgets need the prepared row; `try_push` checks them.
+    fn may_accept(&self, cost: &WorkCost) -> bool {
+        self.physical_batch.rows.len() < self.physical_batch.budget.max_rows
+            && !self.isolates_multi_token_quanta(cost)
+    }
+
+    fn isolates_multi_token_quanta(&self, cost: &WorkCost) -> bool {
+        // Shared continuous envelopes are N rows by exactly one token.
+        // Model-authored multi-token quanta are isolated so membership can
+        // change only after their bounded transaction commits.
+        self.physical_batch.mode == NativeBatchMode::Continuous
+            && !self.physical_batch.rows.is_empty()
+            && (cost.logical_units > 1
+                || self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|existing| existing.cost.logical_units > 1))
+    }
+
     fn try_push(
         &mut self,
         request: Arc<EngineCoreRequest>,
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
     ) -> bool {
-        if self.physical_batch.mode == NativeBatchMode::Continuous
-            && !self.physical_batch.rows.is_empty()
-            && (row.cost.logical_units > 1
-                || self
-                    .physical_batch
-                    .rows
-                    .iter()
-                    .any(|existing| existing.cost.logical_units > 1))
-        {
-            // Shared continuous envelopes are N rows by exactly one token.
-            // Model-authored multi-token quanta are isolated so membership can
-            // change only after their bounded transaction commits.
+        if self.isolates_multi_token_quanta(&row.cost) {
             return false;
         }
         let mut candidate = self.physical_batch.clone();
@@ -2670,6 +2697,19 @@ impl EngineCore {
             .map(|request| request.id.clone())
             .collect::<HashSet<_>>();
         let mut assemblies: Vec<PhysicalBatchAssembly> = Vec::new();
+        // Preparing a row begins its managed-state transaction, but only the
+        // first `available_candidates` assemblies launch this step. A row that
+        // could only open a later assembly is deferred before preparation, so
+        // formation never stages more transactions than one step launches
+        // (candidate limit x batch width), the bound automatic staged rows use.
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let available_candidates = candidate_limit
+            .saturating_sub(self.in_flight_dispatches.len())
+            .min(max_candidates);
 
         for scheduled in scheduled {
             if !available.contains(&scheduled.request_id) {
@@ -2735,6 +2775,24 @@ impl EngineCore {
                     // entry and are governed by their independent rollout.
                     budget.max_rows = 1;
                 }
+            }
+            let joins_launchable_assembly = budget.max_rows > 1
+                && assemblies
+                    .iter()
+                    .take(available_candidates)
+                    .any(|assembly| {
+                        assembly.matches_shape(
+                            &lane,
+                            plan.batch_mode,
+                            &budget,
+                            output_visibility,
+                            shape_policy,
+                            launch_policy,
+                        ) && assembly.may_accept(&cost)
+                    });
+            if assemblies.len() >= available_candidates && !joins_launchable_assembly {
+                transaction_deferred.push(scheduled.clone());
+                continue;
             }
             let planned_work = plan.work.clone();
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
@@ -2817,13 +2875,14 @@ impl EngineCore {
             let mut pending = Some((request, executable, row));
             if budget.max_rows > 1 {
                 for assembly in &mut assemblies {
-                    if assembly.physical_batch.lane != lane
-                        || assembly.physical_batch.mode != plan.batch_mode
-                        || assembly.physical_batch.budget != budget
-                        || assembly.output_visibility != output_visibility
-                        || assembly.shape_policy != shape_policy
-                        || assembly.launch_policy != launch_policy
-                    {
+                    if !assembly.matches_shape(
+                        &lane,
+                        plan.batch_mode,
+                        &budget,
+                        output_visibility,
+                        shape_policy,
+                        launch_policy,
+                    ) {
                         continue;
                     }
                     let Some((request, scheduled, row)) = pending.take() else {
@@ -2874,14 +2933,6 @@ impl EngineCore {
             }
         }
 
-        let candidate_limit = self
-            .config
-            .resolved_physical_execution_capacity()
-            .candidate_dispatch_limit
-            .get();
-        let available_candidates = candidate_limit
-            .saturating_sub(self.in_flight_dispatches.len())
-            .min(max_candidates);
         let mut prepared = Vec::with_capacity(assemblies.len().min(available_candidates));
         for (index, assembly) in assemblies.into_iter().enumerate() {
             if index >= available_candidates {
@@ -5349,10 +5400,18 @@ impl EngineCore {
         retained_rows: usize,
         staged_rows: usize,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        // An automatic staged limit is sized for tensor-width launches, not an
+        // operator ceiling; a model that fits its own launch width (Fish) is
+        // bounded by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
         if retained_rows == 0
             || staged_rows == 0
             || retained_rows > self.config.max_retained_sequences
-            || staged_rows > self.config.max_staged_transactions
+            || staged_rows > staged_ceiling
         {
             return Err(Error::ModelLoadError(
                 "model row limits exceed configured capacity".into(),
@@ -10195,6 +10254,78 @@ mod tests {
         assert!(core.active_managed_cache.is_empty());
         assert!(core.active_stream_batches.is_empty());
         drop(decode);
+    }
+
+    #[tokio::test]
+    async fn formation_stages_transactions_only_for_rows_the_step_launches() {
+        let model_instance = ModelInstanceId::new(993);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 4,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                block_size: 16,
+                max_blocks: 8,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        let ids = ["launch-a", "launch-b", "launch-c", "launch-d"];
+        for (id, token) in ids.into_iter().zip(11..) {
+            let request = managed_test_request(&mut core, model_instance, id, vec![token]);
+            core.add_request(request).expect("add managed request");
+        }
+
+        // Four scalar rows are scheduled, and a serial step launches one.
+        let prepared = core
+            .prepare_step()
+            .await
+            .expect("prepare")
+            .expect("one launch");
+        assert_eq!(prepared.recovery().batch_ids().len(), 1);
+        assert_eq!(core.active_managed_cache.len(), 1);
+        let snapshot = core.managed_kv_cache.runtime_snapshot();
+        assert_eq!(snapshot.totals.coordinator.active_transactions, 1);
+        assert_eq!(
+            snapshot.counters.transaction_aborts, 0,
+            "rows the step cannot launch must not stage a managed transaction"
+        );
+        drop(prepared);
+    }
+
+    #[test]
+    fn automatic_staged_rows_do_not_cap_a_model_fitted_staging_width() {
+        let contract = crate::kv::test_contract();
+        let core_with = |automatic| {
+            let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+            let mut config = EngineCoreConfig {
+                max_retained_sequences: 8,
+                max_staged_transactions: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            };
+            config.automatic_row_limits.staged_transactions = automatic;
+            EngineCore::new_with_unified_executor(config, executor).unwrap()
+        };
+
+        let load = |core: &mut EngineCore, model, retained, staged| {
+            core.load_managed_model_state_with_row_limits(
+                ModelInstanceId::new(model),
+                &contract,
+                None,
+                retained,
+                staged,
+            )
+        };
+
+        assert!(load(&mut core_with(false), 46, 8, 6).is_err());
+        let mut automatic = core_with(true);
+        load(&mut automatic, 47, 8, 6)
+            .expect("an automatic staged limit must not cap a model-fitted width");
+        assert!(load(&mut automatic, 48, 9, 6).is_err());
     }
 
     #[tokio::test]

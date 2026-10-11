@@ -122,6 +122,23 @@ fn effective_physical_execution_parallelism(
     }
 }
 
+/// Automatic staged-transaction rows. A sequence stages at most one managed
+/// transaction, from batch formation until its step commits, and one engine
+/// step launches at most `candidate_dispatch_limit` physical batches of at
+/// most `tensor_width` rows (formation defers rows it cannot launch before
+/// staging them). The memory-derived row ceiling bounds retained sessions
+/// only; staged rows past the launch width are reserved state never used.
+fn automatic_staged_transaction_rows(
+    tensor_width: usize,
+    candidate_dispatch_limit: usize,
+    retained_rows: usize,
+) -> usize {
+    tensor_width
+        .max(1)
+        .saturating_mul(candidate_dispatch_limit.max(1))
+        .min(retained_rows.max(1))
+}
+
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         return (*msg).to_string();
@@ -3013,6 +3030,8 @@ impl RuntimeService {
         let selected_backend_kind = backend_context.backend_kind;
         // Zero means automatic administrative capacity, not zero usable rows.
         // This is only an upper bound: each loaded model fits exact physical state.
+        // Automatic staged rows are resolved below from the launch width.
+        let automatic_staged_transactions = config.max_staged_transactions == 0;
         let automatic_rows = if selected_backend_kind == BackendKind::Cuda {
             backend_context
                 .device
@@ -3026,7 +3045,6 @@ impl RuntimeService {
         for rows in [
             &mut config.max_scheduler_batch_size,
             &mut config.max_retained_sequences,
-            &mut config.max_staged_transactions,
         ] {
             if *rows == 0 {
                 *rows = automatic_rows;
@@ -3083,6 +3101,19 @@ impl RuntimeService {
         core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
+        if automatic_staged_transactions {
+            let staged = automatic_staged_transaction_rows(
+                worker_config.max_tensor_batch_size,
+                core_config
+                    .resolved_physical_execution_capacity()
+                    .candidate_dispatch_limit
+                    .get(),
+                core_config.max_retained_sequences,
+            );
+            config.max_staged_transactions = staged;
+            core_config.max_staged_transactions = staged;
+            core_config.automatic_row_limits.staged_transactions = true;
+        }
         worker_config.models_dir = config.models_dir.clone();
         worker_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         worker_config.kv_page_size = config.kv_page_size.max(1);
@@ -10109,6 +10140,40 @@ mod tests {
             .coordinator_job_for_request(&plain_tts)
             .expect("coordinator job");
         assert_eq!(plain_tts_spec.resources, expected_plain_tts);
+    }
+
+    #[test]
+    fn automatic_staged_rows_resolve_to_the_step_launch_width() {
+        // CUDA: width 8, one candidate, 316 memory-derived rows on an H100.
+        assert_eq!(automatic_staged_transaction_rows(8, 1, 316), 8);
+        // Shadow/concurrent candidates each hold their own launched rows.
+        assert_eq!(automatic_staged_transaction_rows(8, 4, 316), 32);
+        // Staged rows never exceed retained rows.
+        assert_eq!(automatic_staged_transaction_rows(8, 1, 4), 4);
+
+        let automatic = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_retained_sequences: 0,
+            max_staged_transactions: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(automatic.config().max_retained_sequences, 8);
+        assert_eq!(automatic.config().max_staged_transactions, 2);
+        let core = automatic.core_engine.config();
+        assert_eq!(core.max_staged_transactions, 2);
+        assert!(core.automatic_row_limits.staged_transactions);
+
+        let explicit = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_staged_transactions: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(explicit.config().max_staged_transactions, 3);
+        let core = explicit.core_engine.config();
+        assert_eq!(core.max_staged_transactions, 3);
+        assert!(!core.automatic_row_limits.staged_transactions);
     }
 
     #[test]
