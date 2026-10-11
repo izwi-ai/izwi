@@ -208,6 +208,86 @@ and a reduce that walks the partitions serially.
     rollback in the engine);
   - a pinned async token read.
 
+### Phase 3c — whole-step graph, pipelined quanta, FP8 LM head (plan 2026-10-11)
+Measured on `821c17f1`: 166-167 t/s steady (about 6.0 ms per token) against a realistic
+3-4 ms floor. Three changes, in this order:
+
+**FP8 LM head (item 4).** The BF16 head reads about 1 GB per token (28% of all bytes).
+- [x] Host block quantizer: E4M3FN with round-to-nearest-even and saturation, one F32 scale per
+      128×128 block (`amax / 448`), the checkpoint's own format. It runs on the host, so the
+      device never holds both copies.
+- [x] Loader: on CUDA the head becomes `Qwen36Projection::CompactFp8` and runs through the existing
+      `block_fp8_projection` GEMV (248,320 = 1,940 × 128 rows; 2,048 = 16 × 128 columns).
+  - A host quality gate compares FP8 and BF16 logits on probe rows. A device check then
+    compares the uploaded head with the host reference. Either failure keeps BF16, with a
+    warning.
+  - Admission charges the FP8 bytes plus scales when the switch is on.
+  - Switch `IZWI_QWEN36_FP8_LM_HEAD=0`; an `lm_head` diagnostics summary.
+  - Done in `84df863b`.
+
+**One CUDA graph per decode step (item 2).** Today 11 captured segments alternate with eager
+attention (q/k norm + RoPE, the KV write, paged decode) and an eager LM head.
+- [x] Split decode with device-adaptive partitions (`2fdd12c2`). Each row caps its partition count from its
+      device context length, so one launch geometry serves every length (graph-safe).
+- [x] A fused q/k norm + RoPE + KV-slot write kernel (`413cab51`) that reads the position and slot from a
+      device step buffer.
+- [x] KV arena API for writes a graph performs (`5cc98d51`): the layer tensors and backing generation,
+      marking pages dirty, and per-layer `KvWriteCompletion`s with one fence. That keeps page
+      zeroing and the engine receipts intact.
+- [x] The whole-step graph (`ef79c605`): the token embedding (id from the step buffer), every layer, the final
+      norm and the LM head, captured once, with the same warm → capture → verify → replay phases
+      and graph-only fallback to the piecewise segments. It is recaptured when the arena grows
+      or the block table outgrows the step buffer. Off CUDA it runs eagerly and must equal the
+      standard decode bit for bit.
+
+**Pipelined decode quanta (item 3).** Each token is a full engine step today
+(`preferred_decode_tokens() == 1`): scheduling, admission, dispatch, commit and streaming.
+- [x] Multi-token quanta for solo streams on the whole-step graph (8 tokens, `IZWI_QWEN36_DECODE_QUANTUM`).
+      The engine already reserves KV per quantum, accepts early stops, and streams the quantum's
+      text as one delta. Fix: logprobs keep only the last token's entry in a multi-token
+      quantum. Done in `d75d1931`.
+- [x] Device token selection after each graph. Greedy and sampled (the Qwen3.8 device sampler:
+      penalties from device history counts, temperature, top-k, top-p, host-drawn uniforms)
+      write the token into the next step's input slot and copy it to pinned host memory
+      asynchronously. Grammar and logprob requests keep the host sampler.
+- [x] Pipelining inside the quantum: queue step k+1 (inputs, graph, selection) before reading
+      token k. If token k stops the stream, step k+1 is discarded. Its KV slot is not
+      committed, and its DeltaNet outputs are not published (they are fresh buffers).
+      Done in `2c2684ee`, with device selection.
+
+**Review (2026-10-11).**
+- Every CUDA path was verified off-GPU, and none is measured yet:
+  - clang syntax checks and a CPU CUDA emulator for the kernels;
+  - a fake-nvcc clippy build;
+  - CPU and Metal tests. The whole-step body and the queued, device-token steps match the
+    standard decode bit for bit on the CPU. A chat-level test drives `decode_quantum` through
+    the pipeline (greedy, a mid-quantum stop token, sampled).
+- On the GPU, each feature checks itself and falls back:
+  - the FP8 head has a host quality gate and a device check, and keeps BF16 on failure;
+  - the whole-step graph has a warm check against the standard decode and a replay verify, and
+    falls back to the segments on failure;
+  - the pipeline stops at the first step the graph does not take, and the quantum finishes step
+    by step.
+
+**Deploy checklist.**
+- [ ] Pre-flight on the H100: `cargo test -p izwi-core --features cuda --lib qwen36moe`.
+  `every_fused_path_resolves_and_tracks_the_reference_trunk_on_cuda` asserts the whole-step
+  replay (captures 1, verified 2, replays 5).
+- [ ] After a warm request, check the diagnostics:
+  - `lm_head.backend == "fused"` (the block-FP8 head);
+  - `cuda_graphs.whole_step.phase == "replay"`, with no `disabled_reason`;
+  - `cuda_graphs.whole_step.pipelined` growing with every request.
+- [ ] Re-run the three earlier measurements (cold start, the same prompt, different prompts)
+  against 166-167 t/s.
+- [ ] A/B one change at a time with the switches:
+  - `IZWI_QWEN36_FP8_LM_HEAD=0` (BF16 head);
+  - `IZWI_QWEN36_STEP_GRAPH=0` (segments only);
+  - `IZWI_QWEN36_DECODE_QUANTUM=1` (one token per engine step, which also turns off the
+    pipelining);
+  - `IZWI_CUDA_DECODE_GRAPHS=off` (no graphs).
+- [ ] Check sampled output quality, since chat defaults sample: on graph decode, the pipelined
+  path samples with the device sampler instead of the host sampler.
+
 ## Phase 4 — MTP (M) — gate ≥1.1× Phase 3 on the fixed prompt, else default off
 - [ ] Batched verification (M = 1+depth) as a full graph.
 - [ ] K-slot GDN and conv state snapshots written by the kernel, replacing the 60 MB copies.
