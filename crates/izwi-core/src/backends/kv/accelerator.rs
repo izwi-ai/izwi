@@ -545,11 +545,11 @@ fn update_resident_byte_gauge(gauge: &AtomicU64, before: usize, after: usize) {
     }
 }
 
-/// Opt-in state of the CUDA split decode kernel for one arena.
+/// State of the CUDA split decode kernel for one arena.
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
 struct CudaSplitDecodeGate {
-    /// Requested and not yet failed a check.
+    /// Not switched off and not yet failed a check.
     enabled: bool,
     /// `(dtype, query heads, KV heads, head dim)` that passed the first-use
     /// checks.
@@ -721,7 +721,9 @@ impl CandleAcceleratorKvArena {
             metal_native_attention_dispatches: AtomicU64::new(0),
             #[cfg(feature = "cuda")]
             cuda_split_decode: Mutex::new(CudaSplitDecodeGate::new(
-                backend == BackendKind::Cuda && crate::kernels::cuda::split_decode::requested(),
+                backend == BackendKind::Cuda
+                    && optimized_provider_enabled
+                    && crate::kernels::cuda::split_decode::enabled(),
             )),
             cuda_graph_warmups: AtomicU64::new(0),
             cuda_graph_captures: AtomicU64::new(0),
@@ -749,6 +751,15 @@ impl CandleAcceleratorKvArena {
             evictions: self.attention_plan_cache_evictions.load(Ordering::Relaxed),
             device_uploads: self.attention_plan_device_uploads.load(Ordering::Relaxed),
             resident_bytes: self.attention_plan_resident_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Pins decode to FlashAttention or the native kernel, for tests that
+    /// certify those providers.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn disable_cuda_split_decode(&self) {
+        if let Ok(mut gate) = self.cuda_split_decode.lock() {
+            gate.enabled = false;
         }
     }
 
@@ -1389,10 +1400,11 @@ impl CandleAcceleratorKvArena {
         self.cuda_provider_paged_decode(layer, &args, &device_metadata)
     }
 
-    /// The opt-in split decode kernel (`IZWI_CUDA_SPLIT_DECODE=1`). The first
-    /// call for each geometry runs the synthetic self-check and compares its
-    /// output with the current provider's; any failure turns the kernel off for
-    /// this arena and leaves the provider in place.
+    /// The split decode kernel, on by default (`IZWI_CUDA_SPLIT_DECODE=0` or
+    /// `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER` turns it off). The first call for
+    /// each geometry runs the synthetic self-check and compares its output
+    /// with the current provider's; any failure turns the kernel off for this
+    /// arena and leaves the provider in place.
     #[cfg(feature = "cuda")]
     fn cuda_split_paged_decode(
         &self,
@@ -3620,6 +3632,7 @@ mod tests {
             };
             let cuda_arena =
                 CandleAcceleratorKvArena::new_mutation_only(cuda_config, device.clone())?;
+            cuda_arena.disable_cuda_split_decode();
             let cpu_arena = super::super::CpuKvArena::new(cpu_config)?;
             let cuda_block = |index| CacheBlockRef {
                 arena: cuda_arena_id,
