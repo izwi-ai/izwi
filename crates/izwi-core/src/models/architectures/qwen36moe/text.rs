@@ -58,6 +58,9 @@ pub struct Qwen36TextModel {
     decode_graphs_path: Qwen36FusedPath,
     /// Whether the LM head is block FP8 (`lm_head`), and why not.
     lm_head_path: Qwen36FusedPath,
+    /// Longest context the checkpoint serves (the whole-step graph sizes its
+    /// block table from it).
+    max_context_tokens: usize,
 }
 
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
@@ -1027,6 +1030,7 @@ impl Qwen36TextModel {
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
             lm_head_path,
+            max_context_tokens: cfg.context_length,
         };
         match source.cuda_switches().fused_decode_off {
             Some(reason) => {
@@ -1039,7 +1043,7 @@ impl Qwen36TextModel {
             }
         }
         let (graphs, path) =
-            decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false);
+            decode_graph::Qwen36DecodeGraphs::resolve(&model, &source.cuda_switches(), false, true);
         model.decode_graphs = graphs;
         model.decode_graphs_path = path;
         Ok(model)
@@ -1279,10 +1283,96 @@ impl Qwen36TextModel {
     /// (tests of the segmentation; CUDA resolves this at load).
     #[cfg(test)]
     pub(crate) fn enable_segmented_decode_for_tests(&mut self) {
-        let (graphs, path) =
-            decode_graph::Qwen36DecodeGraphs::resolve(self, &Qwen36CudaSwitches::default(), true);
+        let (graphs, path) = decode_graph::Qwen36DecodeGraphs::resolve(
+            self,
+            &Qwen36CudaSwitches::default(),
+            true,
+            false,
+        );
         self.decode_graphs = graphs;
         self.decode_graphs_path = path;
+    }
+
+    /// Run single-row decode through the whole-step body eagerly off CUDA
+    /// (tests of the step body; CUDA resolves this at load).
+    #[cfg(test)]
+    pub(crate) fn enable_step_graph_for_tests(&mut self) {
+        let (graphs, path) = decode_graph::Qwen36DecodeGraphs::resolve(
+            self,
+            &Qwen36CudaSwitches::default(),
+            true,
+            true,
+        );
+        self.decode_graphs = graphs;
+        self.decode_graphs_path = path;
+    }
+
+    /// Activation dtype (the token embeddings').
+    fn dtype(&self) -> DType {
+        self.token_embeddings.embeddings().dtype()
+    }
+
+    fn first_attention_layer(&self) -> Result<&Qwen36Layer> {
+        self.layers
+            .iter()
+            .find(|layer| matches!(layer.mixer, Qwen36Mixer::Full(_)))
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 model has no full-attention layer".into())
+            })
+    }
+
+    /// The standard (uncaptured) decode of a batch of rows: every layer in
+    /// turn, attention through the arena. Returns the pre-norm hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn standard_decode_hidden(
+        &self,
+        embedded: Tensor,
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen36TextRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        attention_layers: usize,
+    ) -> Result<Tensor> {
+        let mut hidden = Qwen36Hidden::new(embedded);
+        let mut physical_layer = 0usize;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let mut layer_states = states
+                .iter_mut()
+                .map(|state| &mut state.layers[layer_index])
+                .collect::<Vec<_>>();
+            for state in layer_states.iter_mut() {
+                layer.ensure_state_initialized(state, &self.device)?;
+            }
+            hidden = layer.forward_physical_decode_batch(
+                hidden,
+                &mut layer_states,
+                position_ids,
+                caches,
+                slots,
+                metadata,
+                completions,
+                &mut physical_layer,
+            )?;
+            if self.finite_diagnostics_enabled {
+                let full = hidden.materialize()?;
+                validate_qwen35_finite_tensor(
+                    &full,
+                    layer_index,
+                    layer.decode_diagnostic_path(),
+                    true,
+                )?;
+                hidden = Qwen36Hidden::new(full);
+            }
+        }
+        let hidden = hidden.materialize()?;
+        if physical_layer != attention_layers {
+            return Err(Error::InferenceError(
+                "Qwen3.5 batched attention did not cover every sparse layer".into(),
+            ));
+        }
+        Ok(hidden)
     }
 
     /// Fused single-token DeltaNet decode across the linear-attention layers,
@@ -1402,57 +1492,60 @@ impl Qwen36TextModel {
             let embedded = self.token_embeddings.forward(&input)?;
             if let (1, Some(graphs)) = (batch_size, &self.decode_graphs) {
                 let cache = &*caches[0];
-                if let Some(hidden) = graphs.forward(
+                // The whole-step graph's warm check: the standard decode on a
+                // copy of the row state, its writes collected and sealed apart.
+                let mut reference_state = states[0].clone();
+                let mut reference = || -> Result<Tensor> {
+                    let mut collector = KvWriteCompletionCollector::new(
+                        first.arena().config(),
+                        lowered.logical_slots(),
+                    )?;
+                    let hidden = self.standard_decode_hidden(
+                        embedded.clone(),
+                        position_ids,
+                        &mut [&mut reference_state],
+                        &[cache],
+                        lowered.as_ref(),
+                        &metadata,
+                        &mut collector,
+                        sparse_layers.len(),
+                    );
+                    let sealed = collector.seal();
+                    let logits = self.project_hidden_span(&hidden?)?;
+                    sealed?;
+                    Ok(logits)
+                };
+                match graphs.forward(
                     self,
+                    token_ids[0],
                     &embedded,
                     position_ids[0],
+                    slots[0],
                     states[0],
                     cache,
                     lowered.as_ref(),
                     &metadata,
                     &mut completions,
+                    &mut reference,
                 )? {
-                    return self.project_hidden_span(&hidden);
+                    Some(decode_graph::GraphDecodeOutput::Logits(logits)) => return Ok(logits),
+                    Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
+                        return self.project_hidden_span(&hidden)
+                    }
+                    None => {}
                 }
             }
-            let mut hidden = Qwen36Hidden::new(embedded);
-            let mut physical_layer = 0usize;
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                let mut layer_states = states
-                    .iter_mut()
-                    .map(|state| &mut state.layers[layer_index])
-                    .collect::<Vec<_>>();
-                for state in layer_states.iter_mut() {
-                    layer.ensure_state_initialized(state, &self.device)?;
-                }
-                let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
-                hidden = layer.forward_physical_decode_batch(
-                    hidden,
-                    &mut layer_states,
-                    position_ids,
-                    &cache_refs,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
-                    &mut physical_layer,
-                )?;
-                if self.finite_diagnostics_enabled {
-                    let full = hidden.materialize()?;
-                    validate_qwen35_finite_tensor(
-                        &full,
-                        layer_index,
-                        layer.decode_diagnostic_path(),
-                        true,
-                    )?;
-                    hidden = Qwen36Hidden::new(full);
-                }
-            }
-            let hidden = hidden.materialize()?;
-            if physical_layer != sparse_layers.len() {
-                return Err(Error::InferenceError(
-                    "Qwen3.5 batched attention did not cover every sparse layer".into(),
-                ));
-            }
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let hidden = self.standard_decode_hidden(
+                embedded,
+                position_ids,
+                states,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                sparse_layers.len(),
+            )?;
             self.project_hidden_span(&hidden)
         })();
         let logits = match execution {
@@ -4769,9 +4862,10 @@ mod tests {
             page_tokens: 8,
             capacity_pages: 8,
             growth: None,
-            // As the existing hardware trunk tests: F16 KV on CUDA, F32 elsewhere.
+            // The production CUDA KV dtype (the BF16 activations'), which the
+            // whole-step graph writes directly; F32 elsewhere.
             dtype: if device.is_cuda() {
-                DType::F16
+                DType::BF16
             } else {
                 DType::F32
             },
@@ -5114,7 +5208,32 @@ mod tests {
         assert_eq!(fused.cuda_graphs_summary()["backend"], "fused");
         assert_eq!(reference.cuda_graphs_summary()["backend"], "legacy");
         // Batched decode is where graph decode runs. Eight decode steps take
-        // the graphs through warm, capture + verify, verify, then five replays.
+        // the whole-step graph through warm (checked against the standard
+        // decode), capture + verify, verify, then five replays.
+        assert_tracks_reference(&fused, &reference, 0.03, true);
+        let graphs = fused.cuda_graphs_summary();
+        let whole = &graphs["whole_step"];
+        assert_eq!(whole["phase"], "replay", "{graphs}");
+        assert_eq!(whole["captures"].as_u64(), Some(1), "{graphs}");
+        assert_eq!(whole["verified"].as_u64(), Some(2), "{graphs}");
+        assert_eq!(whole["replays"].as_u64(), Some(5), "{graphs}");
+        assert_eq!(
+            graphs["warmups"].as_u64(),
+            Some(0),
+            "the segments never ran"
+        );
+
+        // The segments, with the whole-step graph off.
+        let mut fused = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source {
+                act: DType::BF16,
+                ..SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto)
+            },
+            &cfg,
+            &device,
+        )
+        .unwrap();
+        fused.enable_segmented_decode_for_tests();
         assert_tracks_reference(&fused, &reference, 0.03, true);
         let graphs = fused.cuda_graphs_summary();
         let segments = graphs["segments"].as_u64().unwrap();
@@ -5166,6 +5285,46 @@ mod tests {
         let graphs = segmented.cuda_graphs_summary();
         assert_eq!(graphs["phase"], "warm", "no capture off CUDA");
         assert_eq!(graphs["warmups"].as_u64(), Some(2 * 8), "{graphs}");
+        assert_eq!(graphs["eager_steps"], 0);
+    }
+
+    /// The whole-step body, run eagerly off CUDA with the arena's attention:
+    /// the token read from the step buffer, every layer through one body and
+    /// the state publication must reproduce the standard batched decode
+    /// exactly, step after step. (On CUDA the same body runs with the fused
+    /// RoPE/KV-write and split-decode kernels and is captured.)
+    #[test]
+    fn whole_step_decode_matches_the_standard_batched_path() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let load = || {
+            let mut model = super::Qwen36TextModel::load_with_source(
+                &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+                &e2e_config(),
+                &Device::Cpu,
+            )
+            .unwrap();
+            model.enable_fused_paths_for_tests();
+            model
+        };
+        let standard = load();
+        let mut whole = load();
+        whole.enable_step_graph_for_tests();
+        let graphs = whole.cuda_graphs_summary();
+        assert_eq!(graphs["whole_step"]["phase"], "warm", "{graphs}");
+
+        let tokens = e2e_tokens();
+        let expected = e2e_logits_via(&standard, &tokens, 6, true);
+        let actual = e2e_logits_via(&whole, &tokens, 6, true);
+        assert_eq!(actual, expected, "whole-step decode must be bit-identical");
+        let graphs = whole.cuda_graphs_summary();
+        assert_eq!(graphs["whole_step"]["phase"], "warm", "no capture off CUDA");
+        assert_eq!(
+            graphs["whole_step"]["warmups"].as_u64(),
+            Some(8),
+            "{graphs}"
+        );
+        // The segments never ran.
+        assert_eq!(graphs["warmups"], 0, "{graphs}");
         assert_eq!(graphs["eager_steps"], 0);
     }
 

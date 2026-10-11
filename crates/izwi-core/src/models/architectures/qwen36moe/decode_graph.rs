@@ -49,14 +49,24 @@ use crate::backends::kv::{KvSlotMap, KvWriteCompletionCollector};
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn;
 use crate::kernels::cuda::segment_graph::{DeviceTable, SegmentGraph, SegmentInput};
-use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::{KvDecodeBatchMetadata, KvSlotRef};
 use crate::models::architectures::qwen36moe::fast_path::{
     compare_values, legacy_requested, Qwen36CudaSwitches, Qwen36FusedPath,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
+#[path = "step_graph.rs"]
+mod step_graph;
+
 /// Environment switch for graph decode (`legacy`, `off`, `0`, `false`).
 pub(super) const GRAPHS_ENV: &str = "IZWI_QWEN36_CUDA_GRAPHS";
+
+/// What a graph-decoded step returns: logits when the LM head ran inside the
+/// whole-step graph, otherwise the pre-norm hidden for the caller's head.
+pub(super) enum GraphDecodeOutput {
+    Hidden(Tensor),
+    Logits(Tensor),
+}
 
 /// Where one DeltaNet layer reads its state and writes the next one.
 pub(super) enum LinearStateIo {
@@ -108,6 +118,8 @@ struct Runtime {
     phase: Phase,
     graphs: Vec<SegmentGraph>,
     table: Option<DeviceTable>,
+    /// The whole-step graph, tried before the segments when planned.
+    whole: step_graph::WholeStepRuntime,
     /// Recorded after each step's queued work. The next step's stream waits
     /// on it: consecutive steps may run on different threads, whose
     /// per-thread streams are not ordered, while they share the table and
@@ -192,6 +204,8 @@ pub(super) struct Qwen36DecodeGraphs {
     linear_count: usize,
     /// Capture graphs (CUDA). Otherwise every step runs the segments eagerly.
     capture: bool,
+    /// The whole-step graph, or why it does not apply.
+    whole: std::result::Result<step_graph::WholeStepPlan, String>,
     runtime: Mutex<Runtime>,
     warmups: AtomicU64,
     captures: AtomicU64,
@@ -235,6 +249,7 @@ impl Qwen36DecodeGraphs {
         model: &Qwen36TextModel,
         switches: &Qwen36CudaSwitches,
         allow_eager: bool,
+        whole_step: bool,
     ) -> (Option<Self>, Qwen36FusedPath) {
         let device = &model.device;
         let refuse = |reason: String| (None, Qwen36FusedPath::legacy(reason));
@@ -274,16 +289,23 @@ impl Qwen36DecodeGraphs {
         }
         let segments = plan_segments(&model.layers);
         let graphs = segments.iter().map(|_| SegmentGraph::default()).collect();
+        let whole = if whole_step {
+            step_graph::WholeStepPlan::resolve(model, device.is_cuda())
+        } else {
+            Err("not requested".into())
+        };
         (
             Some(Self {
                 segments,
                 linear_ordinal,
                 linear_count,
                 capture: device.is_cuda(),
+                whole,
                 runtime: Mutex::new(Runtime {
                     phase: Phase::Warm,
                     graphs,
                     table: None,
+                    whole: step_graph::WholeStepRuntime::new(),
                     #[cfg(feature = "cuda")]
                     fence: None,
                 }),
@@ -300,11 +322,17 @@ impl Qwen36DecodeGraphs {
     /// Diagnostics: phase, counters and the reason graph decode was turned
     /// off at runtime, if it was.
     pub(super) fn summary(&self) -> serde_json::Value {
-        let phase = self
-            .runtime
-            .lock()
-            .map(|runtime| runtime.phase.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().phase.clone());
+        let (phase, whole_phase) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (runtime.phase.clone(), runtime.whole.phase.clone())
+        };
+        let whole_step = match &self.whole {
+            Ok(plan) => plan.summary(&whole_phase),
+            Err(reason) => serde_json::json!({ "phase": "off", "disabled_reason": reason }),
+        };
         let disabled = match &phase {
             Phase::Disabled(reason) => Some(reason.clone()),
             _ => None,
@@ -320,30 +348,46 @@ impl Qwen36DecodeGraphs {
             "replays": self.replays.load(Relaxed),
             "verified_segments": self.verified_segments.load(Relaxed),
             "eager_steps": self.eager_steps.load(Relaxed),
+            "whole_step": whole_step,
         })
     }
 
-    /// Run one decode row (`embedded` `[1, 1, hidden]`) through the segments.
-    /// Returns the pre-norm hidden, or `None` when graph decode does not take
-    /// the step (disabled, busy, or a state it cannot address); the caller
-    /// then runs the eager path.
+    /// Run one decode row through the whole-step graph when it applies, else
+    /// through the segments (`embedded` `[1, 1, hidden]` is `token`'s
+    /// embedding). Returns `None` when graph decode does not take the step
+    /// (disabled, busy, or a state it cannot address); the caller then runs
+    /// the eager path. `reference` computes the standard decode's logits for
+    /// the whole-step graph's warm check.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
         &self,
         model: &Qwen36TextModel,
+        token: u32,
         embedded: &Tensor,
         position: [usize; 3],
+        slot: KvSlotRef,
         state: &mut Qwen36TextRuntimeState,
         cache: &PhysicalPagedKvCache,
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
-    ) -> Result<Option<Tensor>> {
+        reference: &mut dyn FnMut() -> Result<Tensor>,
+    ) -> Result<Option<GraphDecodeOutput>> {
         let Ok(mut runtime) = self.runtime.try_lock() else {
             self.eager_steps.fetch_add(1, Relaxed);
             return Ok(None);
         };
-        if matches!(runtime.phase, Phase::Disabled(_)) {
+        let whole = match &self.whole {
+            Ok(plan)
+                if !matches!(runtime.whole.phase, Phase::Disabled(_))
+                    && position[0] == position[1]
+                    && position[0] == position[2] =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        };
+        if whole.is_none() && matches!(runtime.phase, Phase::Disabled(_)) {
             self.eager_steps.fetch_add(1, Relaxed);
             return Ok(None);
         }
@@ -356,6 +400,47 @@ impl Qwen36DecodeGraphs {
             return Ok(None);
         };
         runtime.order_after_previous(&device)?;
+        if let Some(plan) = whole {
+            let request = step_graph::StepRequest {
+                token,
+                position: position[0],
+                slot,
+                cache,
+                slots,
+                metadata,
+            };
+            match step_graph::run(
+                plan,
+                &mut runtime.whole,
+                self,
+                model,
+                &request,
+                &inputs,
+                completions,
+                reference,
+            ) {
+                Ok(Some(done)) => {
+                    runtime.mark_step_end(&device)?;
+                    drop(runtime);
+                    done.published.publish(model, state)?;
+                    return Ok(Some(if plan.head_in_graph() {
+                        GraphDecodeOutput::Logits(done.output)
+                    } else {
+                        GraphDecodeOutput::Hidden(done.output)
+                    }));
+                }
+                Ok(None) => {}
+                Err(StepError::Graph(error)) => runtime.whole.disable(error.to_string()),
+                Err(StepError::Other(error)) => {
+                    let _ = runtime.mark_step_end(&device);
+                    return Err(error);
+                }
+            }
+            if matches!(runtime.phase, Phase::Disabled(_)) {
+                self.eager_steps.fetch_add(1, Relaxed);
+                return Ok(None);
+            }
+        }
         let step = self.run_step(
             &mut runtime,
             model,
@@ -398,7 +483,7 @@ impl Qwen36DecodeGraphs {
         }
         drop(runtime);
         published.publish(model, state)?;
-        Ok(Some(hidden))
+        Ok(Some(GraphDecodeOutput::Hidden(hidden)))
     }
 
     /// The segment loop for one step. Returns the pre-norm hidden, the phase
@@ -538,22 +623,35 @@ impl Qwen36DecodeGraphs {
         outputs: &StateOutputs,
         device: &Device,
     ) -> Result<Vec<Option<LinearStateIo>>> {
-        #[cfg(feature = "cuda")]
         if device.is_cuda() {
-            let entries = self.linear_count * gdn::TABLE_ENTRIES;
-            if runtime.table.as_ref().map(DeviceTable::entries) != Some(entries) {
-                runtime.table = Some(DeviceTable::new(device, entries)?);
+            let values = self.table_values(inputs, outputs)?;
+            if runtime.table.as_ref().map(DeviceTable::entries) != Some(values.len()) {
+                runtime.table = Some(DeviceTable::new(device, values.len())?);
             }
             let table = runtime.table.as_mut().expect("table allocated");
-            let mut values = Vec::with_capacity(entries);
-            for (layer, ordinal) in self.linear_ordinal.iter().enumerate() {
-                if ordinal.is_some() {
-                    values.extend(table_entries(inputs, outputs, layer)?);
-                }
-            }
             table.write(0, &values)?;
-            let address = table.address();
-            return Ok(self
+            return self.table_io(table.address());
+        }
+        self.direct_io(model, inputs, outputs)
+    }
+
+    /// Every DeltaNet layer's six table entries, `inputs` to `outputs`, in
+    /// table order (CUDA).
+    fn table_values(&self, inputs: &StateInputs, outputs: &StateOutputs) -> Result<Vec<u64>> {
+        let mut values = Vec::with_capacity(self.linear_count * gdn::TABLE_ENTRIES);
+        for (layer, ordinal) in self.linear_ordinal.iter().enumerate() {
+            if ordinal.is_some() {
+                values.extend(table_entries(inputs, outputs, layer)?);
+            }
+        }
+        Ok(values)
+    }
+
+    /// Table-addressed IO for every DeltaNet layer, the table at `address`.
+    fn table_io(&self, address: u64) -> Result<Vec<Option<LinearStateIo>>> {
+        #[cfg(feature = "cuda")]
+        {
+            Ok(self
                 .linear_ordinal
                 .iter()
                 .map(|ordinal| {
@@ -564,9 +662,22 @@ impl Qwen36DecodeGraphs {
                         })
                     })
                 })
-                .collect());
+                .collect())
         }
-        let _ = (runtime, device);
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = address;
+            Err(segment_error("device tables need CUDA"))
+        }
+    }
+
+    /// Explicit-tensor IO for every DeltaNet layer (devices without tables).
+    fn direct_io(
+        &self,
+        model: &Qwen36TextModel,
+        inputs: &StateInputs,
+        outputs: &StateOutputs,
+    ) -> Result<Vec<Option<LinearStateIo>>> {
         (0..model.layers.len())
             .map(|layer| {
                 Ok(
