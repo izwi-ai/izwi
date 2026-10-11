@@ -44,13 +44,14 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 use super::cache::qwen38_composite_cache_contract_with_mtp;
 use super::mtp::{AdaptiveMtp, Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
 use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
+use super::residency::Qwen38ResidencyPolicy;
 use super::telemetry::{
     record_cuda_kv_provider, record_mtp_nonfinite_draft_fallback, record_mtp_policy,
     record_mtp_round, record_mtp_round_timing, record_mtp_scalar_target_token,
     record_sampling_bounded_cuda, record_sampling_device_argmax, record_sampling_host,
     snapshot as qwen38_optimization_telemetry_snapshot,
 };
-use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
+use super::text::{Qwen38TextModel, Qwen38TextRuntimeState};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
@@ -813,55 +814,24 @@ pub struct Qwen38ChatModel {
     prefix_caching: bool,
 }
 
-fn qwen38_fp8_execution_mode(
-    projection_representation: Qwen38ProjectionRepresentation,
-) -> &'static str {
-    match projection_representation {
-        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
-        | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => {
-            "native_block_fp8_explicit_with_compact_q8_fallback"
-        }
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
-        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
-        Qwen38ProjectionRepresentation::ExpandedF32
-        | Qwen38ProjectionRepresentation::ExpandedF16
-        | Qwen38ProjectionRepresentation::ExpandedBf16 => "expanded_fallback",
-    }
-}
-
-fn qwen38_fp8_fallback_reason(
-    projection_representation: Qwen38ProjectionRepresentation,
-) -> &'static str {
-    match projection_representation {
-        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16 | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => "explicit native FP8 provider; unsupported shapes remain compact Q8; Auto retains tuned Q8 until device performance is established",
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
-        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
-            "CUDA applies weight_scale_inv during scale-aware FP8 dequantization and then requantizes projections to Q8_0 for Candle execution; native FP8 execution is not runtime-certified"
-        }
-        Qwen38ProjectionRepresentation::ExpandedF32
-        | Qwen38ProjectionRepresentation::ExpandedF16
-        | Qwen38ProjectionRepresentation::ExpandedBf16 => {
-            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Qwen38RepresentationDiagnostics {
     resident_representation: &'static str,
-    fp8_execution_mode: &'static str,
-    fallback_reason: &'static str,
+    fp8_execution_mode: String,
+    fallback_reason: String,
     runtime_compute_dtype: &'static str,
 }
 
+/// Diagnostics of the residency policy a model was loaded under.
 fn qwen38_representation_diagnostics(
-    projection_representation: Qwen38ProjectionRepresentation,
+    policy: &Qwen38ResidencyPolicy,
 ) -> Qwen38RepresentationDiagnostics {
+    let representation = policy.representation();
     Qwen38RepresentationDiagnostics {
-        resident_representation: projection_representation.as_str(),
-        fp8_execution_mode: qwen38_fp8_execution_mode(projection_representation),
-        fallback_reason: qwen38_fp8_fallback_reason(projection_representation),
-        runtime_compute_dtype: projection_representation.compute_dtype(),
+        resident_representation: representation.as_str(),
+        fp8_execution_mode: policy.execution_mode(),
+        fallback_reason: policy.fallback_reason(),
+        runtime_compute_dtype: representation.compute_dtype(),
     }
 }
 
@@ -897,37 +867,42 @@ impl Qwen38ChatModel {
         }
         let checkpoint =
             Qwen38NativeCheckpoint::open_with_options(model_dir, &performance.loading)?;
-        let mtp_enabled = if device.device.is_cuda() {
-            performance.cuda.enabled() && performance.cuda.mtp.enabled()
-        } else {
-            performance.cuda.mtp.enabled()
-        };
-        let mtp_policy = if mtp_enabled {
+        let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
+        let text_config = checkpoint.config.text.clone();
+        let projection_materialization = qwen38_projection_materialization(&device)?;
+        // The same resolution load admission priced (cached device gates).
+        let residency = Qwen38ResidencyPolicy::resolve(
+            &device.device,
+            projection_materialization,
+            performance,
+            &checkpoint.tensors,
+            &checkpoint.config,
+        );
+        let mtp_policy = if residency.mtp_loaded() {
             Qwen38MtpPolicy::Enabled {
                 draft_tokens: performance.cuda.mtp_draft_tokens,
             }
         } else {
             Qwen38MtpPolicy::Disabled
         };
-        let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
-        let text_config = checkpoint.config.text.clone();
-        let projection_materialization = qwen38_projection_materialization(&device)?;
-        let text_model = Qwen38TextModel::load_native_with_performance(
+        let text_model = Qwen38TextModel::load_native_with_policy(
             &checkpoint.tensors,
             &checkpoint.config,
             &device.device,
             projection_materialization,
             &performance.cuda,
+            &residency,
         )?;
         let mtp_head = match mtp_policy {
             Qwen38MtpPolicy::Disabled => None,
-            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native_with_performance(
+            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native_with_policy(
                 &checkpoint.tensors,
                 &checkpoint.config,
                 &checkpoint.mtp,
                 &device.device,
                 projection_materialization,
                 &performance.cuda,
+                &residency,
             )?),
         };
         record_mtp_policy(mtp_policy.enabled());
@@ -945,7 +920,7 @@ impl Qwen38ChatModel {
             revision = QWEN38_27B_FP8_REVISION,
             tensors = checkpoint.tensors.tensor_count(),
             resident_representation = projection_representation.as_str(),
-            fp8_execution_mode = qwen38_fp8_execution_mode(projection_representation),
+            fp8_execution_mode = %residency.execution_mode(),
             mtp_enabled = mtp_policy.enabled(),
             mtp_draft_tokens = mtp_policy.draft_tokens(),
             "Loaded native Qwen3.8 text checkpoint"
@@ -1083,15 +1058,12 @@ impl Qwen38ChatModel {
     }
 
     pub fn runtime_compute_dtype(&self) -> Option<&'static str> {
-        Some(
-            qwen38_representation_diagnostics(self.text_model.projection_representation())
-                .runtime_compute_dtype,
-        )
+        Some(self.text_model.projection_representation().compute_dtype())
     }
 
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
-        let projection_representation = self.text_model.projection_representation();
-        let representation = qwen38_representation_diagnostics(projection_representation);
+        let representation = qwen38_representation_diagnostics(self.text_model.residency());
+        let residency_paths = self.text_model.residency().diagnostics();
         let optimization_counters = qwen38_optimization_telemetry_snapshot();
         let draft_acceptance_rate = ratio_or_none(
             optimization_counters.mtp_accepted_draft_tokens_total,
@@ -1204,6 +1176,7 @@ impl Qwen38ChatModel {
                 "ownership": "model_owned_serialized_graphs_with_stable_inputs_outputs_and_weights",
                 "fallback": "shape_or_capture_failure_negative_cached_eager_region",
                 "q8_mlp_capture": "excluded_unretainable_candle_global_scratch",
+                "packed_fp8_mlp_capture": "deferred_to_phase3",
                 "full_model_capture": false,
                 "runtime_validated": false,
             },
@@ -1211,6 +1184,15 @@ impl Qwen38ChatModel {
             "fast_paths": {
                 "target": self.text_model.fast_path_diagnostics(),
                 "mtp": self.mtp_head.as_ref().map(Qwen38MtpHead::fast_path_diagnostics),
+                "fp8_projections": residency_paths["fp8_projections"],
+                "fp8_gemv": residency_paths["fp8_gemv"],
+                "fp8_packing": super::fast_path::summarize(
+                    self.text_model.fp8_packing().iter().chain(
+                        self.mtp_head
+                            .iter()
+                            .flat_map(|head| head.fp8_packing().iter()),
+                    ),
+                ),
                 "self_check_failures_total": optimization_counters.fast_path_self_check_failures_total,
                 "resolution": "load_time_self_check_at_checkpoint_geometry",
                 "runtime_validated": false,
@@ -4144,71 +4126,68 @@ mod tests {
     }
 
     #[test]
-    fn cuda_diagnostics_identify_q8_0_fallback_without_changing_portable_modes() {
-        let cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16;
+    fn diagnostics_follow_the_residency_policy_on_every_backend() {
+        use super::super::residency::Qwen38ResidencyPolicy;
+        use super::super::text::Qwen38ProjectionRepresentation;
+        let performance = crate::performance::PerformanceConfig::default();
+        // CUDA without its device gates (the static estimate) keeps Q8_0.
+        let cuda = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cuda,
+            &performance,
+        ));
         assert_eq!(
-            cuda_representation.as_str(),
+            cuda.resident_representation,
             "q8_0_requantized_projections_with_dense_bf16"
         );
-        assert_eq!(
-            qwen38_fp8_execution_mode(cuda_representation),
-            "q8_0_compressed_fallback"
+        assert_eq!(cuda.runtime_compute_dtype, "bf16");
+        assert!(
+            cuda.fp8_execution_mode.starts_with("q8_0_fallback:"),
+            "{}",
+            cuda.fp8_execution_mode
         );
-        assert!(qwen38_fp8_fallback_reason(cuda_representation).contains("weight_scale_inv"));
-        assert!(qwen38_fp8_fallback_reason(cuda_representation)
-            .contains("native FP8 execution is not runtime-certified"));
-        let f16_cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseF16;
+        assert!(cuda.fallback_reason.contains("weight_scale_inv"));
         assert_eq!(
-            f16_cuda_representation.as_str(),
+            Qwen38ProjectionRepresentation::PackedQ8WithDenseF16.as_str(),
             "q8_0_requantized_projections_with_dense_f16"
         );
-        assert_eq!(f16_cuda_representation.compute_dtype(), "f16");
         assert_eq!(
-            qwen38_fp8_execution_mode(f16_cuda_representation),
-            "q8_0_compressed_fallback"
+            Qwen38ProjectionRepresentation::PackedQ8WithDenseF16.compute_dtype(),
+            "f16"
         );
-        let f16_diagnostics = qwen38_representation_diagnostics(f16_cuda_representation);
-        assert_eq!(
-            f16_diagnostics.resident_representation,
-            "q8_0_requantized_projections_with_dense_f16"
-        );
-        assert_eq!(f16_diagnostics.runtime_compute_dtype, "f16");
-        let bf16_diagnostics = qwen38_representation_diagnostics(cuda_representation);
-        assert_eq!(
-            bf16_diagnostics.resident_representation,
-            "q8_0_requantized_projections_with_dense_bf16"
-        );
-        assert_eq!(bf16_diagnostics.runtime_compute_dtype, "bf16");
 
-        assert_eq!(
-            Qwen38ProjectionRepresentation::ExpandedF32.as_str(),
-            "expanded_f32"
+        // Native block FP8 reports its self-checked mode.
+        let native = qwen38_representation_diagnostics(
+            &Qwen38ResidencyPolicy::forced_native_fp8_for_tests(ProjectionMaterialization::BF16),
         );
         assert_eq!(
-            Qwen38ProjectionRepresentation::ExpandedF16.as_str(),
-            "expanded_f16"
+            native.resident_representation,
+            "native_block_fp8_with_q8_fallback_dense_bf16"
         );
         assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF32),
-            "expanded_fallback"
+            native.fp8_execution_mode,
+            "native_block_fp8_auto_self_checked"
         );
+        assert!(native.fallback_reason.contains("not runtime-certified"));
+
+        // CPU and Metal keep their expanded plans.
+        for (backend, representation, dtype) in [
+            (BackendKind::Cpu, "expanded_f32", "f32"),
+            (BackendKind::Metal, "expanded_f16", "f16"),
+        ] {
+            let portable = qwen38_representation_diagnostics(
+                &Qwen38ResidencyPolicy::resolve_static(backend, &performance),
+            );
+            assert_eq!(portable.resident_representation, representation);
+            assert_eq!(portable.runtime_compute_dtype, dtype);
+            assert_eq!(portable.fp8_execution_mode, "expanded_fallback");
+            assert_eq!(
+                portable.fallback_reason,
+                "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
+            );
+        }
         assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF16),
-            "expanded_fallback"
-        );
-        assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedBf16),
-            "expanded_fallback"
-        );
-        let expanded_reason =
-            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path";
-        assert_eq!(
-            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF32),
-            expanded_reason
-        );
-        assert_eq!(
-            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF16),
-            expanded_reason
+            Qwen38ProjectionRepresentation::ExpandedBf16.as_str(),
+            "expanded_bf16"
         );
     }
 

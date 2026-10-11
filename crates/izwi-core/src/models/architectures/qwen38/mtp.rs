@@ -10,11 +10,11 @@ use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38MtpInventory, Qwen38NativeConfig,
     QWEN38_MTP_TENSOR_COUNT,
 };
+use super::residency::Qwen38ResidencyPolicy;
 use super::text::{
-    load_native_projection, load_native_zero_centered_norm, native_fp8_selected,
-    native_projection_representation, norm_self_check, resolve_norm_path, Qwen38FullAttention,
-    Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38RopeInputs,
-    Qwen38TextModel,
+    load_native_projection, load_native_zero_centered_norm, norm_self_check, resolve_norm_path,
+    Qwen38FullAttention, Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation,
+    Qwen38RmsNorm, Qwen38RopeInputs, Qwen38TextModel, Qwen38WeightLoader,
 };
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
@@ -305,6 +305,8 @@ pub(crate) struct Qwen38MtpHead {
     activation_dtype: DType,
     /// Fused residual add + RMSNorm over the head's own norms.
     fused_norm_path: Qwen38FastPath,
+    /// One entry per block-FP8 projection group: packed, or why not.
+    fp8_packing: Vec<Qwen38FastPath>,
 }
 
 impl Qwen38MtpHead {
@@ -334,6 +336,31 @@ impl Qwen38MtpHead {
         target: ProjectionMaterialization,
         performance: &crate::performance::CudaPerformanceConfig,
     ) -> Result<Self> {
+        let mut config = crate::performance::PerformanceConfig::default();
+        config.cuda = performance.clone();
+        let policy = Qwen38ResidencyPolicy::resolve(device, target, &config, tensors, native);
+        Self::load_native_with_policy(
+            tensors,
+            native,
+            inventory,
+            device,
+            target,
+            performance,
+            &policy,
+        )
+    }
+
+    /// Load under the residency `policy` the text trunk was loaded under: the
+    /// head's projections take the same forms and checks.
+    pub(crate) fn load_native_with_policy(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        inventory: &Qwen38MtpInventory,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &crate::performance::CudaPerformanceConfig,
+        policy: &Qwen38ResidencyPolicy,
+    ) -> Result<Self> {
         if native.mtp.num_hidden_layers != 1 || native.mtp.use_dedicated_embeddings {
             return Err(Error::ModelLoadError(format!(
                 "Unsupported Qwen3.8 MTP topology: layers={}, dedicated_embeddings={}",
@@ -356,23 +383,10 @@ impl Qwen38MtpHead {
         let eps = cfg.attention_layer_norm_rms_epsilon;
         let model_layer = u32::try_from(cfg.block_count)
             .map_err(|_| Error::ModelLoadError("Qwen3.8 MTP layer id exceeds u32".into()))?;
+        let loader = Qwen38WeightLoader::new(tensors, policy, device, block, target);
         let mut head = Self {
             device: device.clone(),
-            projection_representation: if native_fp8_selected(
-                device,
-                target,
-                [hidden, cfg.feed_forward_length],
-                performance,
-            ) {
-                match target {
-                    ProjectionMaterialization::F16 => {
-                        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
-                    }
-                    _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
-                }
-            } else {
-                native_projection_representation(device, target)
-            },
+            projection_representation: policy.representation(),
             hidden_size: hidden,
             model_layer,
             pre_fc_norm_embedding: load_native_zero_centered_norm(
@@ -389,15 +403,7 @@ impl Qwen38MtpHead {
                 eps,
                 device,
             )?,
-            fc: load_native_projection(
-                tensors,
-                "mtp.fc.weight",
-                [hidden, fused],
-                block,
-                target,
-                device,
-                performance,
-            )?,
+            fc: load_native_projection(&loader, "mtp.fc.weight", [hidden, fused])?,
             input_layernorm: load_native_zero_centered_norm(
                 tensors,
                 &format!("{prefix}.input_layernorm.weight"),
@@ -405,15 +411,7 @@ impl Qwen38MtpHead {
                 eps,
                 device,
             )?,
-            attention: Qwen38FullAttention::load_native(
-                tensors,
-                device,
-                prefix,
-                cfg,
-                block,
-                target,
-                performance,
-            )?,
+            attention: Qwen38FullAttention::load_native(&loader, prefix, cfg)?,
             post_attention_layernorm: load_native_zero_centered_norm(
                 tensors,
                 &format!("{prefix}.post_attention_layernorm.weight"),
@@ -421,7 +419,7 @@ impl Qwen38MtpHead {
                 eps,
                 device,
             )?,
-            mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target, performance)?,
+            mlp: Qwen38Mlp::load_native(&loader, prefix, cfg, performance)?,
             norm: load_native_zero_centered_norm(tensors, "mtp.norm.weight", hidden, eps, device)?,
             activation_dtype: match target {
                 ProjectionMaterialization::F32 => DType::F32,
@@ -429,7 +427,9 @@ impl Qwen38MtpHead {
                 ProjectionMaterialization::BF16 => DType::BF16,
             },
             fused_norm_path: Qwen38FastPath::default(),
+            fp8_packing: Vec::new(),
         };
+        head.fp8_packing = loader.into_packing();
         head.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
         Ok(head)
     }
@@ -477,6 +477,11 @@ impl Qwen38MtpHead {
             "kv_write": summarize([kv_write]),
             "attn_gate": summarize([attn_gate]),
         })
+    }
+
+    /// Packing outcome of every block-FP8 projection group of the head.
+    pub(crate) fn fp8_packing(&self) -> &[Qwen38FastPath] {
+        &self.fp8_packing
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {
@@ -792,7 +797,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct FixtureTensor {
+    pub(crate) struct FixtureTensor {
         name: String,
         dtype: SafeDType,
         shape: Vec<usize>,
@@ -878,6 +883,345 @@ pub(crate) mod tests {
             &scale_shape,
             vec![1.0; scale_shape[0] * scale_shape[1]],
         ));
+    }
+
+    /// Deterministic pseudo-random values in [-1, 1).
+    fn fixture_uniform(seed: u64, len: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// Roughly Gaussian values with standard deviation `std`.
+    fn fixture_normal(seed: u64, len: usize, std: f32) -> Vec<f32> {
+        let parts: Vec<Vec<f32>> = (0..4)
+            .map(|part| fixture_uniform(seed * 4 + part, len))
+            .collect();
+        (0..len)
+            .map(|i| parts.iter().map(|part| part[i]).sum::<f32>() * std * 0.866)
+            .collect()
+    }
+
+    /// A block-FP8 projection with mixed bytes and a distinct scale in every
+    /// block on both axes: Gaussian weights, scaled per block, quantized to
+    /// the checkpoint layout (E4M3FN bytes, BF16 `weight_scale_inv`).
+    pub(crate) fn push_random_fp8_projection(
+        tensors: &mut Vec<FixtureTensor>,
+        name: impl Into<String>,
+        shape: [usize; 2],
+        block: [usize; 2],
+        seed: u64,
+    ) {
+        let name = name.into();
+        let [n, k] = shape;
+        let std = 1.0 / (k as f32).sqrt();
+        let column_blocks = k.div_ceil(block[1]);
+        let values: Vec<f32> = fixture_normal(seed, n * k, std)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let index = (i / k / block[0]) * column_blocks + (i % k) / block[1];
+                v * (0.6 + 0.13 * (index % 7) as f32)
+            })
+            .collect();
+        assert_eq!(
+            block,
+            [128, 128],
+            "the checkpoint quantizer uses 128x128 blocks"
+        );
+        let (bytes, scales) =
+            crate::kernels::cuda::fp8::quantize_block_fp8(&values, n, k, |v| v).unwrap();
+        tensors.push(FixtureTensor {
+            name: name.clone(),
+            dtype: SafeDType::F8_E4M3,
+            shape: shape.to_vec(),
+            data: bytes,
+        });
+        tensors.push(dense(
+            name.replace(".weight", ".weight_scale_inv"),
+            &[n.div_ceil(block[0]), column_blocks],
+            scales,
+        ));
+    }
+
+    pub(crate) fn write_fixture(dir: &Path, tensors: &[FixtureTensor], shard: &str) {
+        let views = tensors
+            .iter()
+            .map(|tensor| {
+                (
+                    tensor.name.clone(),
+                    TensorView::new(tensor.dtype, tensor.shape.clone(), &tensor.data).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        safetensors::serialize_to_file(&views, &None, &dir.join(shard)).unwrap();
+        let weight_map = tensors
+            .iter()
+            .map(|tensor| (tensor.name.clone(), json!(shard)))
+            .collect::<serde_json::Map<_, _>>();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&json!({ "weight_map": weight_map })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// `config.json` of the FP8-geometry fixture: Qwen3.8's structure at
+    /// sizes the 128x128 block-FP8 kernels accept (hidden 256; three
+    /// DeltaNet layers with 2 key / 6 value heads of 128 and one attention
+    /// layer with 2 query heads of 256 and one KV head; FFN 512; vocab 512;
+    /// interleaved [11, 11, 10] M-RoPE over 64 rotary dims; one MTP layer).
+    pub(crate) fn fp8_geometry_config_json() -> Vec<u8> {
+        let rope = json!({
+            "mrope_interleaved": true,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000.0,
+            "rope_type": "default"
+        });
+        let mut text = json!({
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "attn_output_gate": true,
+                "bos_token_id": 1,
+                "dtype": "bfloat16",
+                "eos_token_id": 2,
+                "full_attention_interval": 4,
+                "head_dim": 256,
+                "hidden_act": "silu",
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "layer_types": [
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention"
+                ],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 6,
+                "linear_value_head_dim": 128,
+                "mamba_ssm_dtype": "float32",
+                "max_position_embeddings": 512,
+                "model_type": "qwen3_5_text",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false,
+                "num_attention_heads": 2,
+                "num_hidden_layers": 4,
+                "num_key_value_heads": 1,
+                "output_gate_type": "swish",
+                "partial_rotary_factor": 0.25,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": false,
+                "use_cache": true,
+                "vocab_size": 512
+        });
+        text["rope_parameters"] = rope;
+        json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "language_model_only": false,
+            "model_type": "qwen3_5",
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128]
+            },
+            "text_config": text
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Write the FP8-geometry fixture (config, one shard, index) to `dir`:
+    /// every projection a random block-FP8 matrix with distinct block scales
+    /// ([`push_random_fp8_projection`]), random zero-centered norm gains and
+    /// DeltaNet parameters, and the 22-tensor MTP manifest. Open it with
+    /// `Qwen38NativeCheckpoint::open_synthetic` (or with the synthetic
+    /// geometry opt-in for production loading).
+    pub(crate) fn write_fp8_geometry_checkpoint(dir: &Path) -> Qwen38NativeConfig {
+        let raw = fp8_geometry_config_json();
+        fs::write(dir.join("config.json"), &raw).unwrap();
+        let config = crate::models::architectures::qwen38::native::Qwen38NativeConfig::from_json_synthetic_for_tests(&raw);
+        let text = &config.text;
+        let (hidden, ff, vocab) = (
+            text.embedding_length,
+            text.feed_forward_length,
+            config.vocab_size,
+        );
+        let block = config.block_fp8.block_shape;
+        let mut seed = 1000u64;
+        let mut next = || {
+            seed += 1;
+            seed
+        };
+        let norm = |name: String, width: usize, seed: u64| {
+            dense(
+                name,
+                &[width],
+                fixture_uniform(seed, width)
+                    .iter()
+                    .map(|v| v * 0.1)
+                    .collect(),
+            )
+        };
+        let mut tensors = vec![
+            dense(
+                "model.language_model.embed_tokens.weight",
+                &[vocab, hidden],
+                fixture_normal(next(), vocab * hidden, 1.0),
+            ),
+            dense(
+                "lm_head.weight",
+                &[vocab, hidden],
+                fixture_normal(next(), vocab * hidden, 0.25),
+            ),
+            norm("model.language_model.norm.weight".into(), hidden, next()),
+        ];
+        let conv_dim = text.ssm_state_size * text.ssm_group_count * 2 + text.ssm_inner_size;
+        let heads = text.ssm_time_step_rank;
+        let q_width = text.attention_head_count * text.attention_key_length * 2;
+        let kv_width = text.attention_head_count_kv * text.attention_key_length;
+        let attention =
+            |tensors: &mut Vec<FixtureTensor>, prefix: &str, next: &mut dyn FnMut() -> u64| {
+                let head = text.attention_key_length;
+                tensors.push(norm(
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    head,
+                    next(),
+                ));
+                tensors.push(norm(
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    head,
+                    next(),
+                ));
+                for (name, shape) in [
+                    ("q_proj", [q_width, hidden]),
+                    ("k_proj", [kv_width, hidden]),
+                    ("v_proj", [kv_width, hidden]),
+                    (
+                        "o_proj",
+                        [
+                            hidden,
+                            text.attention_head_count * text.attention_value_length,
+                        ],
+                    ),
+                ] {
+                    push_random_fp8_projection(
+                        tensors,
+                        format!("{prefix}.self_attn.{name}.weight"),
+                        shape,
+                        block,
+                        next(),
+                    );
+                }
+            };
+        let mlp =
+            |tensors: &mut Vec<FixtureTensor>, prefix: &str, next: &mut dyn FnMut() -> u64| {
+                tensors.push(norm(
+                    format!("{prefix}.input_layernorm.weight"),
+                    hidden,
+                    next(),
+                ));
+                tensors.push(norm(
+                    format!("{prefix}.post_attention_layernorm.weight"),
+                    hidden,
+                    next(),
+                ));
+                for (name, shape) in [
+                    ("gate_proj", [ff, hidden]),
+                    ("up_proj", [ff, hidden]),
+                    ("down_proj", [hidden, ff]),
+                ] {
+                    push_random_fp8_projection(
+                        tensors,
+                        format!("{prefix}.mlp.{name}.weight"),
+                        shape,
+                        block,
+                        next(),
+                    );
+                }
+            };
+        for (index, kind) in config.layer_types.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{index}");
+            mlp(&mut tensors, &prefix, &mut next);
+            match kind {
+                Qwen38LayerType::FullAttention => attention(&mut tensors, &prefix, &mut next),
+                Qwen38LayerType::LinearAttention => {
+                    let linear = format!("{prefix}.linear_attn");
+                    tensors.push(dense(
+                        format!("{linear}.A_log"),
+                        &[heads],
+                        fixture_uniform(next(), heads),
+                    ));
+                    tensors.push(dense(
+                        format!("{linear}.dt_bias"),
+                        &[heads],
+                        fixture_uniform(next(), heads),
+                    ));
+                    tensors.push(dense(
+                        format!("{linear}.conv1d.weight"),
+                        &[conv_dim, 1, text.ssm_conv_kernel],
+                        fixture_normal(next(), conv_dim * text.ssm_conv_kernel, 0.4),
+                    ));
+                    for name in ["in_proj_a", "in_proj_b"] {
+                        tensors.push(dense(
+                            format!("{linear}.{name}.weight"),
+                            &[heads, hidden],
+                            fixture_normal(next(), heads * hidden, 1.0 / (hidden as f32).sqrt()),
+                        ));
+                    }
+                    let head_v = text.ssm_inner_size / heads;
+                    tensors.push(dense(
+                        format!("{linear}.norm.weight"),
+                        &[head_v],
+                        fixture_uniform(next(), head_v)
+                            .iter()
+                            .map(|v| 1.0 + 0.1 * v)
+                            .collect(),
+                    ));
+                    for (name, shape) in [
+                        ("in_proj_qkv", [conv_dim, hidden]),
+                        ("in_proj_z", [text.ssm_inner_size, hidden]),
+                        ("out_proj", [hidden, text.ssm_inner_size]),
+                    ] {
+                        push_random_fp8_projection(
+                            &mut tensors,
+                            format!("{linear}.{name}.weight"),
+                            shape,
+                            block,
+                            next(),
+                        );
+                    }
+                }
+            }
+        }
+        let prefix = "mtp.layers.0";
+        mlp(&mut tensors, prefix, &mut next);
+        attention(&mut tensors, prefix, &mut next);
+        tensors.push(dense(
+            "mtp.fc.weight",
+            &[hidden, hidden * 2],
+            fixture_normal(
+                next(),
+                hidden * hidden * 2,
+                1.0 / (2.0 * hidden as f32).sqrt(),
+            ),
+        ));
+        for name in [
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ] {
+            tensors.push(norm(name.into(), hidden, next()));
+        }
+        write_fixture(dir, &tensors, "model.safetensors");
+        config
     }
 
     pub(crate) fn write_tiny_checkpoint(dir: &Path, config: &Qwen38NativeConfig) {

@@ -137,6 +137,12 @@ impl Qwen38NativeConfig {
         Self::from_json_with_policy(raw, geometry_policy_from_env())
     }
 
+    /// Parse fixture geometry under the synthetic policy (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_json_synthetic_for_tests(raw: &[u8]) -> Self {
+        Self::from_json_with_policy(raw, Qwen38GeometryPolicy::Synthetic).unwrap()
+    }
+
     fn from_json_with_policy(raw: &[u8], policy: Qwen38GeometryPolicy) -> Result<Self> {
         let config = parse_hf_config(raw)?;
         if policy == Qwen38GeometryPolicy::Synthetic {
@@ -546,6 +552,259 @@ fn config_error(field: &str, detail: impl std::fmt::Display) -> Error {
     ))
 }
 
+/// The published Qwen3.8-27B-FP8 `config.json`, as the pinned policy accepts
+/// it. Static admission prices this geometry without reading a checkpoint.
+pub(crate) fn pinned_27b_config_json() -> Vec<u8> {
+    let layer_types = (0..64)
+        .map(|index| {
+            if (index + 1) % 4 == 0 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "language_model_only": false,
+        "model_type": "qwen3_5",
+        "tie_word_embeddings": false,
+        "text_config": {
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_output_gate": true,
+            "bos_token_id": 248044,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "layer_types": layer_types,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "model_type": "qwen3_5_text",
+            "mtp_num_hidden_layers": 1,
+            "mtp_use_dedicated_embeddings": false,
+            "num_attention_heads": 24,
+            "num_hidden_layers": 64,
+            "num_key_value_heads": 4,
+            "output_gate_type": "swish",
+            "partial_rotary_factor": 0.25,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default"
+            },
+            "tie_word_embeddings": false,
+            "use_cache": true,
+            "vocab_size": 248320
+        },
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        }
+    }))
+    .expect("the pinned Qwen3.8 config serializes")
+}
+
+/// The validated Qwen3.8-27B-FP8 configuration.
+pub(crate) fn pinned_27b_config() -> Qwen38NativeConfig {
+    validate_hf_config(
+        parse_hf_config(&pinned_27b_config_json()).expect("the pinned config parses"),
+        Qwen38GeometryPolicy::Pinned27B,
+    )
+    .expect("the pinned config satisfies the pinned policy")
+}
+
+/// One checkpoint tensor the native loader reads: name, storage dtype, shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Qwen38TensorSpec {
+    pub name: String,
+    pub dtype: SafeDType,
+    pub shape: Vec<usize>,
+}
+
+/// Every tensor the native loader reads for `config`, with its published
+/// storage dtype and shape: the text trunk, the final norm, the LM head, the
+/// block-FP8 scale companions and, when `mtp`, the 22-tensor MTP manifest.
+/// Vision tensors are never loaded and are absent. Static admission prices
+/// this list; a census test pins it to real checkpoints.
+pub(crate) fn resident_tensor_specs(
+    config: &Qwen38NativeConfig,
+    mtp: bool,
+) -> Result<Vec<Qwen38TensorSpec>> {
+    let text = &config.text;
+    let block = config.block_fp8.block_shape;
+    let hidden = text.embedding_length;
+    let mut specs = Vec::new();
+    let dense = |specs: &mut Vec<Qwen38TensorSpec>, name: String, shape: Vec<usize>| {
+        specs.push(Qwen38TensorSpec {
+            name,
+            dtype: SafeDType::BF16,
+            shape,
+        });
+    };
+    let projection =
+        |specs: &mut Vec<Qwen38TensorSpec>, name: String, shape: [usize; 2]| -> Result<()> {
+            let scale_shape = block_scale_shape(shape, block)?;
+            specs.push(Qwen38TensorSpec {
+                name: scale_name_for_weight(&name)?,
+                dtype: SafeDType::BF16,
+                shape: scale_shape.to_vec(),
+            });
+            specs.push(Qwen38TensorSpec {
+                name,
+                dtype: SafeDType::F8_E4M3,
+                shape: shape.to_vec(),
+            });
+            Ok(())
+        };
+    dense(
+        &mut specs,
+        "model.language_model.embed_tokens.weight".into(),
+        vec![config.vocab_size, hidden],
+    );
+    dense(
+        &mut specs,
+        "model.language_model.norm.weight".into(),
+        vec![hidden],
+    );
+    dense(
+        &mut specs,
+        "lm_head.weight".into(),
+        vec![config.vocab_size, hidden],
+    );
+    let conv_dim = text.ssm_state_size * text.ssm_group_count * 2 + text.ssm_inner_size;
+    let head_v_dim = text.ssm_inner_size / text.ssm_time_step_rank.max(1);
+    let q_width = text.attention_head_count * text.attention_key_length * 2;
+    let kv_width = text.attention_head_count_kv * text.attention_key_length;
+    for (index, layer_type) in config.layer_types.iter().enumerate() {
+        let prefix = format!("model.language_model.layers.{index}");
+        dense(
+            &mut specs,
+            format!("{prefix}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        dense(
+            &mut specs,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        let ff = text.feed_forward_length;
+        projection(
+            &mut specs,
+            format!("{prefix}.mlp.gate_proj.weight"),
+            [ff, hidden],
+        )?;
+        projection(
+            &mut specs,
+            format!("{prefix}.mlp.up_proj.weight"),
+            [ff, hidden],
+        )?;
+        projection(
+            &mut specs,
+            format!("{prefix}.mlp.down_proj.weight"),
+            [hidden, ff],
+        )?;
+        match layer_type {
+            Qwen38LayerType::LinearAttention => {
+                let linear = format!("{prefix}.linear_attn");
+                let heads = text.ssm_time_step_rank;
+                dense(&mut specs, format!("{linear}.A_log"), vec![heads]);
+                dense(&mut specs, format!("{linear}.dt_bias"), vec![heads]);
+                dense(
+                    &mut specs,
+                    format!("{linear}.conv1d.weight"),
+                    vec![conv_dim, 1, text.ssm_conv_kernel],
+                );
+                dense(
+                    &mut specs,
+                    format!("{linear}.in_proj_a.weight"),
+                    vec![heads, hidden],
+                );
+                dense(
+                    &mut specs,
+                    format!("{linear}.in_proj_b.weight"),
+                    vec![heads, hidden],
+                );
+                dense(
+                    &mut specs,
+                    format!("{linear}.norm.weight"),
+                    vec![head_v_dim],
+                );
+                projection(
+                    &mut specs,
+                    format!("{linear}.in_proj_qkv.weight"),
+                    [conv_dim, hidden],
+                )?;
+                projection(
+                    &mut specs,
+                    format!("{linear}.in_proj_z.weight"),
+                    [text.ssm_inner_size, hidden],
+                )?;
+                projection(
+                    &mut specs,
+                    format!("{linear}.out_proj.weight"),
+                    [hidden, text.ssm_inner_size],
+                )?;
+            }
+            Qwen38LayerType::FullAttention => {
+                let attention = format!("{prefix}.self_attn");
+                let head = text.attention_key_length;
+                dense(&mut specs, format!("{attention}.q_norm.weight"), vec![head]);
+                dense(&mut specs, format!("{attention}.k_norm.weight"), vec![head]);
+                projection(
+                    &mut specs,
+                    format!("{attention}.q_proj.weight"),
+                    [q_width, hidden],
+                )?;
+                projection(
+                    &mut specs,
+                    format!("{attention}.k_proj.weight"),
+                    [kv_width, hidden],
+                )?;
+                projection(
+                    &mut specs,
+                    format!("{attention}.v_proj.weight"),
+                    [kv_width, hidden],
+                )?;
+                projection(
+                    &mut specs,
+                    format!("{attention}.o_proj.weight"),
+                    [
+                        hidden,
+                        text.attention_head_count * text.attention_value_length,
+                    ],
+                )?;
+            }
+        }
+    }
+    if mtp {
+        specs.extend(
+            mtp_tensor_specs(config)?
+                .into_iter()
+                .map(|spec| Qwen38TensorSpec {
+                    name: spec.name,
+                    dtype: spec.dtype,
+                    shape: spec.shape,
+                }),
+        );
+    }
+    Ok(specs)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTensorScope {
     Text,
@@ -707,6 +966,12 @@ impl IndexedSafetensors {
 
     pub fn tensor_count(&self) -> usize {
         self.weight_map.len()
+    }
+
+    /// The canonical checkpoint directory (the identity residency decisions
+    /// and their poisoning are keyed by).
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
     }
 
     pub fn contains_tensor(&self, name: &str) -> bool {

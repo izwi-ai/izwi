@@ -381,6 +381,190 @@ impl IndexedSafetensors {
             block_shape,
         })
     }
+
+    /// Several block-FP8 projections as ONE raw projection, rows in the given
+    /// order: the parts' bytes are concatenated on the host and uploaded once,
+    /// and their F32 scale rows are concatenated beside them. Every part but
+    /// the last must hold whole row blocks, so each scale row still covers
+    /// exactly one part's rows; the inner dimension must agree. A single part
+    /// is the same validation and upload as [`Self::materialize_block_fp8_raw`],
+    /// run in parallel.
+    ///
+    /// Validation accepts and rejects exactly what the single-tensor method
+    /// does: a NaN byte (`b & 0x7f == 0x7f`) fails, and so does a block whose
+    /// largest finite value times its scale overflows F32. Scales must be
+    /// finite and non-negative. The concatenated bytes are bounded by the
+    /// loader's host staging budget.
+    pub fn materialize_block_fp8_raw_group(
+        &self,
+        projections: &[(&str, [usize; 2])],
+        block_shape: [usize; 2],
+        device: &Device,
+    ) -> Result<RawBlockFp8Projection> {
+        #[cfg(feature = "cuda")]
+        super::upload::ensure_context_healthy(device)?;
+        let Some((_, first)) = projections.first() else {
+            return Err(Error::ModelLoadError(
+                "Native block-FP8 projection group cannot be empty".into(),
+            ));
+        };
+        let inner = first[1];
+        let mut rows = 0usize;
+        for (index, (name, shape)) in projections.iter().enumerate() {
+            if shape[1] != inner || shape.contains(&0) {
+                return Err(Error::ModelLoadError(format!(
+                    "Block-FP8 group part `{name}` has shape {shape:?}, expected [_, {inner}]"
+                )));
+            }
+            if index + 1 < projections.len() && !shape[0].is_multiple_of(block_shape[0]) {
+                return Err(Error::ModelLoadError(format!(
+                    "Block-FP8 group part `{name}` has {} rows, not a multiple of the {}-row scale block",
+                    shape[0], block_shape[0]
+                )));
+            }
+            rows = rows.checked_add(shape[0]).ok_or_else(|| {
+                Error::ModelLoadError("Block-FP8 group row count overflow".into())
+            })?;
+        }
+        let shape = [rows, inner];
+        let scale_shape = block_scale_shape(shape, block_shape)?;
+        let total = rows
+            .checked_mul(inner)
+            .ok_or_else(|| Error::ModelLoadError("Block-FP8 group byte count overflow".into()))?;
+        if self.options.enabled() && total > self.options.max_staging_bytes {
+            return Err(Error::ModelLoadError(format!(
+                "Block-FP8 group of {total} bytes exceeds the {} byte host staging budget",
+                self.options.max_staging_bytes
+            )));
+        }
+        let _staging = self
+            .loading
+            .staging
+            .lock()
+            .map_err(|_| Error::ModelLoadError("Load staging lock poisoned".into()))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|e| Error::ModelLoadError(format!("Block-FP8 group staging: {e}")))?;
+        let mut scales = Vec::with_capacity(scale_shape[0] * scale_shape[1]);
+        for (name, part_shape) in projections {
+            let scale_name = scale_name_for_weight(name)?;
+            let part_scale_shape = block_scale_shape(*part_shape, block_shape)?;
+            let part_scales = self.with_tensor_view(
+                &scale_name,
+                Some(SafeDType::BF16),
+                Some(&part_scale_shape),
+                |v| decode_bf16_le(v.data(), &scale_name),
+            )?;
+            validate_scales(&part_scales)?;
+            self.with_tensor_view(name, Some(SafeDType::F8_E4M3), Some(part_shape), |v| {
+                validate_block_fp8_bytes(
+                    v.data(),
+                    *part_shape,
+                    &part_scales,
+                    part_scale_shape,
+                    block_shape,
+                )
+                .map_err(|detail| {
+                    Error::ModelLoadError(format!("Block-FP8 tensor `{name}`: {detail}"))
+                })?;
+                bytes.extend_from_slice(v.data());
+                Ok(())
+            })?;
+            scales.extend_from_slice(&part_scales);
+        }
+        if bytes.len() != total || scales.len() != scale_shape[0] * scale_shape[1] {
+            return Err(Error::ModelLoadError(
+                "Block-FP8 group concatenation length mismatch".into(),
+            ));
+        }
+        let weights = Tensor::from_vec(bytes, &shape, device)?;
+        let scales = Tensor::from_vec(scales, &scale_shape, device)?;
+        Ok(RawBlockFp8Projection {
+            weights,
+            scales,
+            shape,
+            scale_shape,
+            block_shape,
+        })
+    }
+
+    /// The original checkpoint bytes of `rows` (in that order, concatenated)
+    /// and the tensor's complete decoded F32 scale grid. Load-time self-checks
+    /// build their host references from these, never from a transformed copy.
+    pub fn block_fp8_rows(
+        &self,
+        weight_name: &str,
+        shape: [usize; 2],
+        block_shape: [usize; 2],
+        rows: &[usize],
+    ) -> Result<(Vec<u8>, Vec<f32>)> {
+        let scale_name = scale_name_for_weight(weight_name)?;
+        let scale_shape = block_scale_shape(shape, block_shape)?;
+        let scales = self.with_tensor_view(
+            &scale_name,
+            Some(SafeDType::BF16),
+            Some(&scale_shape),
+            |v| decode_bf16_le(v.data(), &scale_name),
+        )?;
+        let bytes =
+            self.with_tensor_view(weight_name, Some(SafeDType::F8_E4M3), Some(&shape), |v| {
+                let mut out = Vec::with_capacity(rows.len() * shape[1]);
+                for &row in rows {
+                    if row >= shape[0] {
+                        return Err(Error::ModelLoadError(format!(
+                            "Row {row} outside `{weight_name}` {shape:?}"
+                        )));
+                    }
+                    out.extend_from_slice(&v.data()[row * shape[1]..(row + 1) * shape[1]]);
+                }
+                Ok(out)
+            })?;
+        Ok((bytes, scales))
+    }
+}
+
+/// Parallel validation of raw block-FP8 bytes with exactly the accept set of
+/// [`IndexedSafetensors::materialize_block_fp8_raw`]: no NaN byte, and no
+/// element whose value times its block scale overflows. E4M3FN magnitude is
+/// monotonic in the low seven bits for finite bytes, so each block's check is
+/// its largest byte magnitude times its scale.
+pub(super) fn validate_block_fp8_bytes(
+    data: &[u8],
+    shape: [usize; 2],
+    scales: &[f32],
+    scale_shape: [usize; 2],
+    block_shape: [usize; 2],
+) -> std::result::Result<(), String> {
+    use rayon::prelude::*;
+    let [rows, cols] = shape;
+    if data.len() != rows * cols || scales.len() != scale_shape[0] * scale_shape[1] {
+        return Err("payload or scale length mismatch".into());
+    }
+    let row_block_bytes = block_shape[0] * cols;
+    data.par_chunks(row_block_bytes)
+        .enumerate()
+        .try_for_each(|(row_block, chunk)| {
+            let mut magnitudes = vec![0u8; scale_shape[1]];
+            for (offset, &b) in chunk.iter().enumerate() {
+                let magnitude = b & 0x7f;
+                if magnitude == 0x7f {
+                    let index = row_block * row_block_bytes + offset;
+                    return Err(format!("NaN E4M3FN byte at element {index}"));
+                }
+                let column_block = (offset % cols) / block_shape[1];
+                magnitudes[column_block] = magnitudes[column_block].max(magnitude);
+            }
+            for (column_block, &magnitude) in magnitudes.iter().enumerate() {
+                let scale = scales[row_block * scale_shape[1] + column_block];
+                if !(decode_e4m3fn(magnitude) * scale).is_finite() {
+                    return Err(format!(
+                        "block [{row_block}, {column_block}] overflows: scale {scale}"
+                    ));
+                }
+            }
+            Ok(())
+        })
 }
 
 pub(super) fn validate_scales(scales: &[f32]) -> Result<()> {
@@ -705,6 +889,53 @@ mod tests {
         assert_eq!(raw.block_shape, [1, 2]);
         assert_eq!(raw.scale_shape, [2, 1]);
     }
+    /// The parallel group validation accepts and rejects exactly what the
+    /// single-tensor materializer does, for every byte value and for a
+    /// scale that overflows only with a large byte.
+    #[test]
+    fn fast_nan_scan_matches_per_byte_validation() {
+        let d = TestDir::new("fp8-scan");
+        for byte in 0u16..256 {
+            for scale in [1.0f32, 1e36] {
+                let byte = byte as u8;
+                let weights = vec![byte; 256];
+                let scales = bf16_bytes(&[scale, scale]);
+                let path = d.path().join(format!("{byte}-{scale}.safetensors"));
+                write_safetensors(
+                    &path,
+                    &[
+                        ("x.weight", SafeDType::F8_E4M3, vec![2, 128], &weights),
+                        ("x.weight_scale_inv", SafeDType::BF16, vec![2, 1], &scales),
+                    ],
+                );
+                let shard = path.file_name().unwrap().to_str().unwrap().to_string();
+                write_index(
+                    d.path(),
+                    serde_json::json!({"x.weight": shard, "x.weight_scale_inv": shard}),
+                );
+                let source = IndexedSafetensors::open(d.path()).unwrap();
+                let single = source
+                    .materialize_block_fp8_raw("x.weight", [2, 128], [1, 128], &Device::Cpu)
+                    .is_ok();
+                let group = source
+                    .materialize_block_fp8_raw_group(
+                        &[("x.weight", [2, 128])],
+                        [1, 128],
+                        &Device::Cpu,
+                    )
+                    .is_ok();
+                assert_eq!(single, group, "byte {byte:#04x} scale {scale}");
+                if byte & 0x7f == 0x7f {
+                    assert!(!group, "NaN byte {byte:#04x} must be rejected");
+                }
+            }
+        }
+        // A large scale overflows only through the largest byte magnitude.
+        let scales = [1e36f32];
+        assert!(validate_block_fp8_bytes(&[0x00, 0x08], [1, 2], &scales, [1, 1], [1, 2]).is_ok());
+        assert!(validate_block_fp8_bytes(&[0x00, 0x7e], [1, 2], &scales, [1, 1], [1, 2]).is_err());
+    }
+
     #[test]
     fn mappings_are_bounded_headers_retained_and_mutation_rejected() {
         let d = TestDir::new("shard-retention");

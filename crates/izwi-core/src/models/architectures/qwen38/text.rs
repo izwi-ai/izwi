@@ -6,7 +6,6 @@ const GRAPH_LAYER_LIMIT: usize = 8;
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding, Linear};
-use safetensors::Dtype as SafeDType;
 use std::sync::Arc;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
@@ -18,11 +17,13 @@ use super::fast_path::{
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
 };
+use super::residency::{fp8_row_dot, probe_activations, Qwen38ResidencyPolicy, Qwen38WeightForm};
 use super::telemetry::{
-    record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition,
-    record_cuda_head_expansion_materialization, record_cuda_kernel, record_cuda_projection,
-    record_cuda_qk_rope_chain, record_cuda_rms_norm_composition, record_cuda_rope,
-    record_cuda_state_initial_allocation, record_fused_attn_gate, record_fused_qk_norm_rope,
+    record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition, record_cuda_fp8_gemv,
+    record_cuda_fp8_packed_projection, record_cuda_head_expansion_materialization,
+    record_cuda_kernel, record_cuda_projection, record_cuda_qk_rope_chain,
+    record_cuda_rms_norm_composition, record_cuda_rope, record_cuda_state_initial_allocation,
+    record_fast_path_self_check_failure, record_fused_attn_gate, record_fused_qk_norm_rope,
     record_fused_rms_norm, CudaKernelPath, CudaProjectionPath,
 };
 use crate::backends::kv::{
@@ -56,6 +57,10 @@ use crate::models::shared::telemetry::{
 pub struct Qwen38TextModel {
     device: Device,
     projection_representation: Qwen38ProjectionRepresentation,
+    /// The residency policy the trunk was loaded under.
+    residency: Qwen38ResidencyPolicy,
+    /// One entry per block-FP8 projection group: packed, or why not.
+    fp8_packing: Vec<Qwen38FastPath>,
     token_embeddings: Embedding,
     layers: Vec<Qwen38Layer>,
     output_norm: Qwen38RmsNorm,
@@ -625,9 +630,23 @@ pub(super) struct Qwen38Mlp {
 }
 
 pub(super) enum Qwen38Projection {
-    NativeFp8(super::native::RawBlockFp8Projection),
+    /// The checkpoint's block-FP8 bytes and F32 block scales, executed by the
+    /// compact FP8 kernels with the decode kernel chosen at load.
+    NativeFp8 {
+        raw: super::native::RawBlockFp8Projection,
+        kernel: Qwen38Fp8Kernel,
+    },
     Quantized(QMatMul),
     Dense(Linear),
+}
+
+/// Decode kernel of a native block-FP8 projection, fixed at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Qwen38Fp8Kernel {
+    /// The reference GEMV (and the prefill GEMM above four rows).
+    Reference,
+    /// The vectorized GEMV on eligible decode calls (CUDA, verified at load).
+    Vectorized,
 }
 
 enum Qwen38ProjectionGroup {
@@ -760,14 +779,26 @@ impl Module for Qwen38Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         if input.device().is_cuda() {
             record_cuda_projection(match self {
-                Self::NativeFp8(_) => CudaProjectionPath::NativeFp8,
+                Self::NativeFp8 { .. } => CudaProjectionPath::NativeFp8,
                 Self::Quantized(_) => CudaProjectionPath::Q8,
                 Self::Dense(_) => CudaProjectionPath::Dense,
             });
         }
         match self {
-            Self::NativeFp8(raw) => {
-                crate::kernels::cuda::fp8::block_fp8_projection(input, &raw.weights, &raw.scales)
+            Self::NativeFp8 { raw, kernel } => {
+                let vectorized = *kernel == Qwen38Fp8Kernel::Vectorized;
+                if input.device().is_cuda() {
+                    let rows = input.elem_count() / raw.shape[1].max(1);
+                    if rows <= 4 {
+                        record_cuda_fp8_gemv(vectorized);
+                    }
+                }
+                crate::kernels::cuda::fp8::block_fp8_projection_selecting(
+                    input,
+                    &raw.weights,
+                    &raw.scales,
+                    vectorized,
+                )
             }
             Self::Quantized(projection) => projection.forward(input),
             Self::Dense(projection) => projection.forward(input),
@@ -783,6 +814,11 @@ impl Qwen38ProjectionGroup {
                 .map(|projection| projection.forward(input).map_err(Error::from))
                 .collect(),
             Self::Packed { projection, widths } => {
+                if input.device().is_cuda()
+                    && matches!(projection, Qwen38Projection::NativeFp8 { .. })
+                {
+                    record_cuda_fp8_packed_projection();
+                }
                 let output = projection.forward(input)?;
                 split_projection_output(&output, widths)
             }
@@ -943,6 +979,8 @@ impl Qwen38TextModel {
         Self::load_native_with_performance(tensors, native, device, target, &performance.cuda)
     }
 
+    /// Load under the residency policy `performance` resolves for `device`
+    /// (the CUDA performance section; the other sections at their defaults).
     pub fn load_native_with_performance(
         tensors: &IndexedSafetensors,
         native: &Qwen38NativeConfig,
@@ -950,23 +988,31 @@ impl Qwen38TextModel {
         target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let mut config = crate::performance::PerformanceConfig::default();
+        config.cuda = performance.clone();
+        let policy = Qwen38ResidencyPolicy::resolve(device, target, &config, tensors, native);
+        Self::load_native_with_policy(tensors, native, device, target, performance, &policy)
+    }
+
+    /// Load under an already resolved residency `policy`: the one load
+    /// admission priced.
+    pub(crate) fn load_native_with_policy(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
+        policy: &Qwen38ResidencyPolicy,
+    ) -> Result<Self> {
         let cfg = &native.text;
-        let projection_representation = if native_fp8_selected(
+        let loader = Qwen38WeightLoader::new(
+            tensors,
+            policy,
             device,
+            native.block_fp8.block_shape,
             target,
-            [cfg.embedding_length, cfg.feed_forward_length],
-            performance,
-        ) {
-            match target {
-                ProjectionMaterialization::F16 => {
-                    Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
-                }
-                _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
-            }
-        } else {
-            native_projection_representation(device, target)
-        };
-        let block = native.block_fp8.block_shape;
+        );
+        let projection_representation = policy.representation();
         let embedding_weights = tensors.materialize_dense_tensor(
             "model.language_model.embed_tokens.weight",
             &[native.vocab_size, cfg.embedding_length],
@@ -982,13 +1028,9 @@ impl Qwen38TextModel {
             device,
         )?;
         let output = load_native_projection(
-            tensors,
+            &loader,
             "lm_head.weight",
             [native.vocab_size, cfg.embedding_length],
-            block,
-            target,
-            device,
-            performance,
         )?;
 
         let graphs = Arc::new(TensorIsland::default());
@@ -1009,31 +1051,14 @@ impl Qwen38TextModel {
                 cfg.attention_layer_norm_rms_epsilon,
                 device,
             )?;
-            let mut mlp =
-                Qwen38Mlp::load_native(tensors, device, &prefix, cfg, block, target, performance)?;
+            let mut mlp = Qwen38Mlp::load_native(&loader, &prefix, cfg, performance)?;
             let mixer = match layer_type {
                 Qwen38LayerType::FullAttention => {
-                    Qwen38Mixer::Full(Qwen38FullAttention::load_native(
-                        tensors,
-                        device,
-                        &prefix,
-                        cfg,
-                        block,
-                        target,
-                        performance,
-                    )?)
+                    Qwen38Mixer::Full(Qwen38FullAttention::load_native(&loader, &prefix, cfg)?)
                 }
-                Qwen38LayerType::LinearAttention => {
-                    Qwen38Mixer::Linear(Qwen38LinearAttention::load_native(
-                        tensors,
-                        device,
-                        &prefix,
-                        cfg,
-                        block,
-                        target,
-                        performance,
-                    )?)
-                }
+                Qwen38LayerType::LinearAttention => Qwen38Mixer::Linear(
+                    Qwen38LinearAttention::load_native(&loader, &prefix, cfg, performance)?,
+                ),
             };
             mlp.graphs = graphs.clone();
             mlp.graph_generation = layer_idx as u64;
@@ -1054,6 +1079,8 @@ impl Qwen38TextModel {
         let mut model = Self {
             device: device.clone(),
             projection_representation,
+            residency: policy.clone(),
+            fp8_packing: loader.into_packing(),
             token_embeddings,
             layers,
             output_norm,
@@ -1063,6 +1090,11 @@ impl Qwen38TextModel {
         };
         model.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
         Ok(model)
+    }
+
+    /// The residency policy this trunk was loaded under.
+    pub(crate) fn residency(&self) -> &Qwen38ResidencyPolicy {
+        &self.residency
     }
 
     pub(super) fn graph_diagnostics(&self) -> serde_json::Value {
@@ -1549,6 +1581,11 @@ impl Qwen38TextModel {
         })
     }
 
+    /// Packing outcome of every block-FP8 projection group of the trunk.
+    pub(super) fn fp8_packing(&self) -> &[Qwen38FastPath] {
+        &self.fp8_packing
+    }
+
     fn full_attention_layers(&self) -> impl Iterator<Item = &Qwen38FullAttention> {
         self.layers.iter().filter_map(|layer| match &layer.mixer {
             Qwen38Mixer::Full(attention) => Some(attention),
@@ -1808,14 +1845,12 @@ impl Qwen38Layer {
 
 impl Qwen38Mlp {
     pub(super) fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let device = loader.device;
         let gate_name = format!("{prefix}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}.mlp.up_proj.weight");
         Ok(Self {
@@ -1828,24 +1863,16 @@ impl Qwen38Mlp {
                 && performance.enabled()
                 && performance.fused_decode.enabled(),
             gate_up: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&gate_name, [cfg.feed_forward_length, cfg.embedding_length]),
                     (&up_name, [cfg.feed_forward_length, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             down: load_native_projection(
-                tensors,
+                loader,
                 &format!("{prefix}.mlp.down_proj.weight"),
                 [cfg.embedding_length, cfg.feed_forward_length],
-                block,
-                target,
-                device,
-                performance,
             )?,
         })
     }
@@ -1897,7 +1924,7 @@ impl Qwen38Mlp {
         }
         let mut owners = Vec::with_capacity(6);
         for projection in projections.iter().chain(std::iter::once(&self.down)) {
-            let Qwen38Projection::NativeFp8(raw) = projection else {
+            let Qwen38Projection::NativeFp8 { raw, .. } = projection else {
                 return None;
             };
             owners.push(raw.weights.clone());
@@ -1954,14 +1981,11 @@ impl Qwen38Mlp {
 
 impl Qwen38FullAttention {
     pub(super) fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
-        performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let (tensors, device) = (loader.tensors, loader.device);
         let q_width = cfg
             .attention_head_count
             .checked_mul(cfg.attention_key_length)
@@ -1976,28 +2000,20 @@ impl Qwen38FullAttention {
         let v_name = format!("{prefix}.self_attn.v_proj.weight");
         Ok(Self {
             qkv_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&q_name, [q_width, cfg.embedding_length]),
                     (&k_name, [kv_width, cfg.embedding_length]),
                     (&v_name, [kv_width, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             o_proj: load_native_projection(
-                tensors,
+                loader,
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 [
                     cfg.embedding_length,
                     cfg.attention_head_count * cfg.attention_value_length,
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             q_norm: load_native_zero_centered_norm(
                 tensors,
@@ -2809,14 +2825,12 @@ impl Qwen38FullAttention {
 
 impl Qwen38LinearAttention {
     fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let (tensors, device) = (loader.tensors, loader.device);
         let num_k_heads = cfg.ssm_group_count;
         let num_v_heads = cfg.ssm_time_step_rank;
         let head_k_dim = cfg.ssm_state_size;
@@ -2870,26 +2884,18 @@ impl Qwen38LinearAttention {
                 && performance.enabled()
                 && performance.fused_decode.enabled(),
             qkv_z_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&qkv_name, [conv_dim, cfg.embedding_length]),
                     (&z_name, [cfg.ssm_inner_size, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             alpha_beta_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&alpha_name, [num_v_heads, cfg.embedding_length]),
                     (&beta_name, [num_v_heads, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             dt_bias,
             a,
@@ -2897,13 +2903,9 @@ impl Qwen38LinearAttention {
             conv_kernel_slices,
             norm,
             out_proj: load_native_projection(
-                tensors,
+                loader,
                 &format!("{linear}.out_proj.weight"),
                 [cfg.embedding_length, cfg.ssm_inner_size],
-                block,
-                target,
-                device,
-                performance,
             )?,
             num_k_heads,
             num_v_heads,
@@ -3837,138 +3839,362 @@ impl Qwen38GatedRmsNorm {
     }
 }
 
-pub(super) fn native_fp8_selected(
-    device: &Device,
-    target: ProjectionMaterialization,
-    shape: [usize; 2],
-    performance: &CudaPerformanceConfig,
-) -> bool {
-    use crate::kernels::cuda::fp8::{provider_auto_preferred, provider_supported};
-    use crate::performance::CudaProjectionBackend;
-    let dtype = match target {
-        ProjectionMaterialization::F32 => DType::F32,
-        ProjectionMaterialization::F16 => DType::F16,
-        ProjectionMaterialization::BF16 => DType::BF16,
-    };
-    performance.enabled()
-        && match performance.projection_backend {
-            CudaProjectionBackend::Q8 => false,
-            CudaProjectionBackend::Auto => {
-                provider_auto_preferred(device, dtype, shape[0], shape[1])
+/// Load-scoped state shared by every projection one model load
+/// materializes: the checkpoint, the residency policy, the device, and the
+/// bookkeeping of the load-time FP8 checks and packing.
+pub(super) struct Qwen38WeightLoader<'a> {
+    pub(super) tensors: &'a IndexedSafetensors,
+    pub(super) policy: &'a Qwen38ResidencyPolicy,
+    pub(super) device: &'a Device,
+    pub(super) block: [usize; 2],
+    pub(super) target: ProjectionMaterialization,
+    /// Projection kinds (layer index removed) whose resident FP8 form has
+    /// passed the check against the original checkpoint bytes.
+    checked: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// One entry per block-FP8 projection group: packed, or why not.
+    packing: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// Tests: corrupt the scales of every FP8 projection this loader
+    /// materializes, to prove the load-time check fails closed.
+    #[cfg(test)]
+    pub(super) corrupt_fp8_scales: std::cell::Cell<bool>,
+}
+
+/// Activation rows of the load-time FP8 check: decode, verification and a
+/// prefill-sized span, so every kernel the projection runs is compared.
+const FP8_CHECK_ROWS: [usize; 3] = [1, 4, 16];
+/// Output-row stride of the load-time FP8 check (plus every pack boundary).
+const FP8_CHECK_ROW_STRIDE: usize = 61;
+
+impl<'a> Qwen38WeightLoader<'a> {
+    pub(super) fn new(
+        tensors: &'a IndexedSafetensors,
+        policy: &'a Qwen38ResidencyPolicy,
+        device: &'a Device,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Self {
+        Self {
+            tensors,
+            policy,
+            device,
+            block,
+            target,
+            checked: Default::default(),
+            packing: Default::default(),
+            #[cfg(test)]
+            corrupt_fp8_scales: Default::default(),
+        }
+    }
+
+    pub(super) fn into_packing(self) -> Vec<Qwen38FastPath> {
+        self.packing.into_inner()
+    }
+
+    fn fp8_kernel(&self) -> Qwen38Fp8Kernel {
+        if self.device.is_cuda() && self.policy.fp8_vectorized() {
+            Qwen38Fp8Kernel::Vectorized
+        } else {
+            Qwen38Fp8Kernel::Reference
+        }
+    }
+
+    /// The parts' bytes as one raw block-FP8 projection on the device.
+    fn materialize_fp8(&self, parts: &[(&str, [usize; 2])]) -> Result<Qwen38Projection> {
+        let raw = self
+            .tensors
+            .materialize_block_fp8_raw_group(parts, self.block, self.device)?;
+        #[cfg(test)]
+        let raw = if self.corrupt_fp8_scales.get() {
+            super::native::RawBlockFp8Projection {
+                scales: (&raw.scales * 1.5)?,
+                ..raw
             }
-            CudaProjectionBackend::NativeFp8 => {
-                provider_supported(device, dtype, shape[0], shape[1])
+        } else {
+            raw
+        };
+        Ok(Qwen38Projection::NativeFp8 {
+            raw,
+            kernel: self.fp8_kernel(),
+        })
+    }
+
+    /// Check a resident FP8 projection (one part, or a pack of `parts` in
+    /// row order) against a host reference built from the ORIGINAL per-part
+    /// checkpoint bytes and scales, never from the uploaded copy: sampled
+    /// output rows, every pack boundary, at 1, 4 and 16 activation rows.
+    /// Runs once per projection kind (layer index removed).
+    pub(super) fn fp8_self_check(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: &Qwen38Projection,
+    ) -> Result<()> {
+        let kind = parts
+            .iter()
+            .map(|(name, _)| projection_kind(name))
+            .collect::<Vec<_>>()
+            .join("+");
+        if self.checked.borrow().contains(&kind) {
+            return Ok(());
+        }
+        fp8_projection_check(
+            self.tensors,
+            parts,
+            self.block,
+            projection,
+            self.target.dtype(),
+            self.device,
+        )
+        .map_err(|error| Error::ModelLoadError(format!("{kind}: {error}")))?;
+        self.checked.borrow_mut().insert(kind);
+        Ok(())
+    }
+}
+
+/// `model.language_model.layers.7.mlp.down_proj.weight` -> `mlp.down_proj`;
+/// MTP names keep an `mtp:` tag.
+fn projection_kind(name: &str) -> String {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    let (tag, rest) = if let Some(rest) = stem.strip_prefix("mtp.layers.") {
+        ("mtp:", rest)
+    } else if let Some(rest) = stem.strip_prefix("model.language_model.layers.") {
+        ("", rest)
+    } else {
+        return stem.to_string();
+    };
+    format!(
+        "{tag}{}",
+        rest.split_once('.').map_or(rest, |(_, rest)| rest)
+    )
+}
+
+/// The comparison behind [`Qwen38WeightLoader::fp8_self_check`]. Tolerance:
+/// 1% relative L2 and 2% of the largest reference magnitude per element,
+/// NaN-safe; the reference multiplies the same activation-dtype-rounded
+/// inputs the device sees.
+pub(super) fn fp8_projection_check(
+    tensors: &IndexedSafetensors,
+    parts: &[(&str, [usize; 2])],
+    block: [usize; 2],
+    projection: &Qwen38Projection,
+    activation: DType,
+    device: &Device,
+) -> Result<()> {
+    let k = parts
+        .first()
+        .map(|(_, shape)| shape[1])
+        .ok_or_else(|| Error::ModelLoadError("empty FP8 check".into()))?;
+    let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
+    let mut rows: std::collections::BTreeSet<usize> =
+        (0..total).step_by(FP8_CHECK_ROW_STRIDE).collect();
+    let mut offset = 0usize;
+    for (_, shape) in parts {
+        for row in [
+            offset.wrapping_sub(1),
+            offset,
+            offset + 1,
+            offset + 127,
+            offset + 128,
+        ] {
+            if row < total {
+                rows.insert(row);
             }
         }
-}
-
-pub(super) fn native_projection_representation(
-    device: &Device,
-    target: ProjectionMaterialization,
-) -> Qwen38ProjectionRepresentation {
-    if device.is_cuda() {
-        return match target {
-            ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::PackedQ8WithDenseF16,
-            ProjectionMaterialization::BF16 => {
-                Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16
+        offset += shape[0];
+    }
+    rows.insert(total - 1);
+    // (global row, part bytes row, scales of the part, row block in the part)
+    let scale_cols = k.div_ceil(block[1]);
+    let mut references = Vec::with_capacity(rows.len());
+    let mut offset = 0usize;
+    for (name, shape) in parts {
+        let local: Vec<usize> = rows
+            .range(offset..offset + shape[0])
+            .map(|row| row - offset)
+            .collect();
+        if !local.is_empty() {
+            let (bytes, scales) = tensors.block_fp8_rows(name, *shape, block, &local)?;
+            let scales = std::sync::Arc::new(scales);
+            for (index, row) in local.iter().enumerate() {
+                references.push((
+                    bytes[index * k..(index + 1) * k].to_vec(),
+                    scales.clone(),
+                    row / block[0],
+                ));
             }
-            ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
-        };
+        }
+        offset += shape[0];
     }
-    match target {
-        ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
-        ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::ExpandedF16,
-        ProjectionMaterialization::BF16 => Qwen38ProjectionRepresentation::ExpandedBf16,
+    let sampled: Vec<usize> = rows.into_iter().collect();
+    for (seed, m) in FP8_CHECK_ROWS.into_iter().enumerate() {
+        let x = probe_activations(m, k, activation, 101 + seed as u64);
+        let input = Tensor::from_vec(x.clone(), (1, m, k), &Device::Cpu)?
+            .to_dtype(activation)?
+            .to_device(device)?;
+        let output = projection
+            .forward(&input)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        if output.len() != m * total {
+            return Err(Error::ModelLoadError(format!(
+                "FP8 check produced {} values, expected {}",
+                output.len(),
+                m * total
+            )));
+        }
+        let mut actual = Vec::with_capacity(m * sampled.len());
+        let mut expected = Vec::with_capacity(m * sampled.len());
+        for (row_index, activations) in x.chunks(k).enumerate() {
+            for (row, (bytes, scales, row_block)) in sampled.iter().zip(&references) {
+                actual.push(output[row_index * total + row]);
+                expected.push(fp8_row_dot(
+                    bytes,
+                    scales,
+                    *row_block,
+                    scale_cols,
+                    block[1],
+                    activations,
+                ));
+            }
+        }
+        compare_values(
+            &format!("block-FP8 check at {m} rows"),
+            &actual,
+            &expected,
+            0.01,
+            0.02,
+        )?;
     }
+    Ok(())
 }
 
+/// Load one projection in the form the residency policy chose. A native FP8
+/// projection is checked against the original checkpoint bytes before it is
+/// published; a mismatch fails the load and poisons the policy, so the retry
+/// resolves (and admission prices) the fallback.
 pub(super) fn load_native_projection(
-    tensors: &IndexedSafetensors,
+    loader: &Qwen38WeightLoader<'_>,
     name: &str,
     shape: [usize; 2],
-    block: [usize; 2],
-    target: ProjectionMaterialization,
-    device: &Device,
-    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38Projection> {
-    if device.is_cuda() && tensors.tensor_info(name)?.dtype == SafeDType::F8_E4M3 {
-        if native_fp8_selected(device, target, shape, performance) {
-            return tensors
-                .materialize_block_fp8_raw(name, shape, block, device)
-                .map(Qwen38Projection::NativeFp8);
+    let tensors = loader.tensors;
+    let info = tensors.tensor_info(name)?;
+    match loader
+        .policy
+        .projection_form(info.dtype, shape, loader.block)
+    {
+        Qwen38WeightForm::RawFp8 => {
+            let projection = loader.materialize_fp8(&[(name, shape)])?;
+            if let Err(error) = loader.fp8_self_check(&[(name, shape)], &projection) {
+                record_fast_path_self_check_failure();
+                let reason = error.to_string();
+                loader.policy.poison_projections(&reason);
+                tracing::warn!(%reason, "Qwen3.8 native FP8 load-time check failed");
+                return Err(Error::ModelLoadError(format!(
+                    "Qwen3.8 native block-FP8 self_check_failed: {reason}. The next load keeps Q8_0 projections; set IZWI_QWEN38_FP8_PROJECTIONS=legacy (or IZWI_CUDA_PROJECTION_BACKEND=q8) to skip native FP8"
+                )));
+            }
+            Ok(projection)
         }
-        return tensors
-            .materialize_q8_projection(name, shape, block, device)
-            .map(Qwen38Projection::Quantized);
+        Qwen38WeightForm::Q8_0 => tensors
+            .materialize_q8_projection(name, shape, loader.block, loader.device)
+            .map(Qwen38Projection::Quantized),
+        Qwen38WeightForm::Dense(_) => tensors
+            .materialize_projection(name, shape, loader.block, loader.target, loader.device)
+            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None))),
     }
-    tensors
-        .materialize_projection(name, shape, block, target, device)
-        .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))
 }
 
+/// Load row-compatible projections as one packed matrix when the residency
+/// policy packs their (shared) form, else separately. A block-FP8 pack needs
+/// whole 128-row scale blocks in every part but the last; it is checked
+/// against the original per-part bytes, and a pack that fails is dropped and
+/// rebuilt from separate parts (the same bytes).
 fn load_native_projection_group(
-    tensors: &IndexedSafetensors,
+    loader: &Qwen38WeightLoader<'_>,
     projections: &[(&str, [usize; 2])],
-    block: [usize; 2],
-    target: ProjectionMaterialization,
-    device: &Device,
-    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38ProjectionGroup> {
+    let tensors = loader.tensors;
     let load_separate = || {
         projections
             .iter()
-            .map(|(name, shape)| {
-                load_native_projection(tensors, name, *shape, block, target, device, performance)
-            })
+            .map(|(name, shape)| load_native_projection(loader, name, *shape))
             .collect::<Result<Vec<_>>>()
             .map(Qwen38ProjectionGroup::Separate)
     };
-    if !(device.is_cuda()
-        && performance.enabled()
-        && performance.packed_projections.enabled()
-        && projection_group_geometry_compatible(projections))
-    {
+    let forms = projections
+        .iter()
+        .map(|(name, shape)| {
+            tensors.tensor_info(name).map(|info| {
+                loader
+                    .policy
+                    .projection_form(info.dtype, *shape, loader.block)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fp8 = forms.first() == Some(&Qwen38WeightForm::RawFp8);
+    let packable =
+        loader.policy.packing_allowed(&forms) && projection_group_geometry_compatible(projections);
+    if !packable {
+        if forms.contains(&Qwen38WeightForm::RawFp8) {
+            loader.packing.borrow_mut().push(Qwen38FastPath::legacy(
+                if forms.iter().all(|f| *f == forms[0]) {
+                    "packing off"
+                } else {
+                    "mixed resident forms"
+                },
+            ));
+        }
         return load_separate();
     }
-
-    let all_fp8 = projections.iter().all(|(name, _)| {
-        tensors
-            .tensor_info(name)
-            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
-    });
-    let any_fp8 = projections.iter().any(|(name, _)| {
-        tensors
-            .tensor_info(name)
-            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
-    });
-    // Do not merge different persistent representations. The separate path
-    // remains the safe fallback for unusual checkpoint variants.
-    if any_fp8 && !all_fp8 {
-        return load_separate();
-    }
-
-    // A direct native provider owns exact source blocks; use separate
-    // projections when their row boundaries cannot safely share one scale grid.
-    if all_fp8
-        && projections
-            .iter()
-            .any(|(_, shape)| native_fp8_selected(device, target, *shape, performance))
-    {
-        return load_separate();
-    }
-    let projection = if device.is_cuda() && all_fp8 {
-        tensors
-            .materialize_q8_projection_group(projections, block, device)
-            .map(Qwen38Projection::Quantized)?
-    } else {
-        tensors
-            .materialize_projection_group(projections, block, target, device)
-            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))?
+    let widths = projections.iter().map(|(_, shape)| shape[0]).collect();
+    let projection = match forms[0] {
+        Qwen38WeightForm::RawFp8 => {
+            let aligned = projections
+                .iter()
+                .take(projections.len() - 1)
+                .all(|(_, shape)| shape[0].is_multiple_of(loader.block[0]));
+            if !aligned {
+                loader.packing.borrow_mut().push(Qwen38FastPath::legacy(
+                    "a part does not end on a 128-row scale block",
+                ));
+                return load_separate();
+            }
+            let packed = loader.materialize_fp8(projections).and_then(|projection| {
+                loader.fp8_self_check(projections, &projection)?;
+                Ok(projection)
+            });
+            match packed {
+                Ok(projection) => {
+                    loader.packing.borrow_mut().push(Qwen38FastPath::Fused);
+                    projection
+                }
+                Err(error) => {
+                    record_fast_path_self_check_failure();
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.8 packed block-FP8 projection failed its check; loading the parts separately"
+                    );
+                    loader
+                        .packing
+                        .borrow_mut()
+                        .push(Qwen38FastPath::legacy(format!(
+                            "self_check_failed: {error}"
+                        )));
+                    return load_separate();
+                }
+            }
+        }
+        Qwen38WeightForm::Q8_0 => tensors
+            .materialize_q8_projection_group(projections, loader.block, loader.device)
+            .map(Qwen38Projection::Quantized)?,
+        Qwen38WeightForm::Dense(_) => tensors
+            .materialize_projection_group(projections, loader.block, loader.target, loader.device)
+            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))?,
     };
-    Ok(Qwen38ProjectionGroup::Packed {
-        projection,
-        widths: projections.iter().map(|(_, shape)| shape[0]).collect(),
-    })
+    debug_assert!(fp8 == matches!(projection, Qwen38Projection::NativeFp8 { .. }));
+    Ok(Qwen38ProjectionGroup::Packed { projection, widths })
 }
 
 fn projection_group_geometry_compatible(projections: &[(&str, [usize; 2])]) -> bool {
@@ -5527,3 +5753,6 @@ mod verification_tests;
 
 #[cfg(test)]
 mod golden_tests;
+
+#[cfg(test)]
+mod fp8_residency_tests;

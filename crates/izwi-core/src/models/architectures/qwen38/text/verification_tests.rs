@@ -103,6 +103,11 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
     Qwen38TextModel {
         device: device.clone(),
         projection_representation: Qwen38ProjectionRepresentation::ExpandedF32,
+        residency: Qwen38ResidencyPolicy::resolve_static(
+            crate::backends::BackendKind::Cpu,
+            &crate::performance::PerformanceConfig::default(),
+        ),
+        fp8_packing: Vec::new(),
         token_embeddings: Embedding::new(
             Tensor::from_vec(
                 (0..32).map(|i| ((i * 3 % 11) as f32 - 5.0) * 0.1).collect(),
@@ -340,18 +345,21 @@ fn cancellation_restores_checkpoint_and_verification_budget_is_bounded() {
 #[test]
 fn native_mlp_graph_closure_matches_eager_and_retains_every_intermediate() {
     fn raw(n: usize, k: usize) -> Qwen38Projection {
-        Qwen38Projection::NativeFp8(super::super::native::RawBlockFp8Projection {
-            weights: Tensor::from_vec(
-                (0..n * k).map(|i| 0x30u8 + (i % 8) as u8).collect(),
-                (n, k),
-                &Device::Cpu,
-            )
-            .unwrap(),
-            scales: Tensor::full(0.02f32, (1, 1), &Device::Cpu).unwrap(),
-            shape: [n, k],
-            scale_shape: [1, 1],
-            block_shape: [128, 128],
-        })
+        Qwen38Projection::NativeFp8 {
+            raw: super::super::native::RawBlockFp8Projection {
+                weights: Tensor::from_vec(
+                    (0..n * k).map(|i| 0x30u8 + (i % 8) as u8).collect(),
+                    (n, k),
+                    &Device::Cpu,
+                )
+                .unwrap(),
+                scales: Tensor::full(0.02f32, (1, 1), &Device::Cpu).unwrap(),
+                shape: [n, k],
+                scale_shape: [1, 1],
+                block_shape: [128, 128],
+            },
+            kernel: Qwen38Fp8Kernel::Reference,
+        }
     }
     let mlp = Qwen38Mlp {
         graphs: Arc::new(TensorIsland::default()),

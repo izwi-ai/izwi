@@ -54,8 +54,10 @@ pub(crate) fn device_is_sm80_or_newer(device: &Device) -> bool {
     false
 }
 
-/// Until exact-device measurements establish a winning route, Auto retains Q8.
-/// Explicit native-FP8 selection can use the structurally supported provider.
+/// No device-independent recommendation: a family that defaults to the
+/// compact provider gates it with its own device checks (Qwen3.8 does so in
+/// its residency policy, with [`verify_decode_kernels_at`] and a real-weight
+/// probe). Explicit native-FP8 selection can use the supported provider.
 pub fn provider_auto_preferred(_device: &Device, _dtype: DType, _n: usize, _k: usize) -> bool {
     false
 }
@@ -79,6 +81,10 @@ enum DecodeKernel {
     Reference,
     /// The vectorized GEMV (errors if the call is not eligible).
     Vectorized,
+    /// The vectorized GEMV for an eligible call (at most four aligned rows),
+    /// the reference kernels otherwise. The caller owns the verification, so
+    /// the process-wide flag is neither read nor set.
+    VectorizedWhenEligible,
 }
 
 /// Compare the vectorized decode GEMV against the reference kernel on
@@ -88,6 +94,15 @@ pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
     if vectorized_decode_enabled() {
         return Ok(());
     }
+    verify_vectorized_decode(device)?;
+    VECTORIZED_DECODE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The check behind [`verify_and_enable_vectorized_decode`], without touching
+/// the process-wide flag: a family that selects the kernel per call (through
+/// [`block_fp8_projection_selecting`]) keeps its own verdict.
+pub fn verify_vectorized_decode(device: &Device) -> Result<()> {
     if !device.is_cuda() {
         candle_core::bail!("the vectorized FP8 decode GEMV runs on CUDA only")
     }
@@ -138,12 +153,150 @@ pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
             }
         }
     }
-    VECTORIZED_DECODE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// Outcome of [`verify_decode_kernels_at`]: the reference kernels (`mv` for
+/// up to four rows, `mm` above) must pass for the call to succeed; the
+/// vectorized GEMV's verdict is reported separately so a caller can keep the
+/// reference decode when only the vectorized kernel disagrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeKernelGate {
+    pub vectorized: std::result::Result<(), String>,
+}
+
+/// Compare every compact-FP8 kernel on `device` with the portable reference
+/// at a caller-chosen inner dimension `k` (the checkpoint's real K values) and
+/// `n_rows` synthetic output channels: the vectorized GEMV and the reference
+/// GEMV at one to four activation rows, the prefill kernel at 5, 8 and 17.
+/// Weights mix every finite E4M3 byte and every 128x128 block has its own
+/// scale; activations are rounded to `dtype` before the host reference runs,
+/// so the comparison sees only kernel error. Tolerance: 1% relative L2 and 2%
+/// of the largest reference magnitude per element (NaN-safe). Sets no flag.
+pub fn verify_decode_kernels_at(
+    device: &Device,
+    dtype: DType,
+    n_rows: usize,
+    k: usize,
+) -> Result<DecodeKernelGate> {
+    if n_rows == 0 || k == 0 {
+        candle_core::bail!("FP8 kernel gate needs a non-empty geometry")
+    }
+    let raw = (0..n_rows * k)
+        .map(|i| {
+            let mixed = (i.wrapping_mul(0x9E37_79B1) >> 17) as u8;
+            if mixed & 0x7f == 0x7f {
+                mixed ^ 0x41
+            } else {
+                mixed
+            }
+        })
+        .collect::<Vec<_>>();
+    let scale_shape = (n_rows.div_ceil(128), k.div_ceil(128));
+    let scales = (0..scale_shape.0 * scale_shape.1)
+        .map(|i| 1e-3 * (1.0 + (i % 17) as f32 * 0.37))
+        .collect::<Vec<_>>();
+    let host_w = Tensor::from_vec(raw, (n_rows, k), &Device::Cpu)?;
+    let host_s = Tensor::from_vec(scales, scale_shape, &Device::Cpu)?;
+    let w = host_w.to_device(device)?;
+    let s = host_s.to_device(device)?;
+    let host = |t: Tensor| -> Result<Vec<f32>> {
+        t.to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let compare = |label: &str,
+                   actual: &[f32],
+                   expected: &[f32]|
+     -> std::result::Result<(), String> {
+        let mut err = 0f64;
+        let mut norm = 0f64;
+        let mut max_ref = 0f32;
+        let mut max_err = 0f32;
+        for (a, e) in actual.iter().zip(expected) {
+            let diff = (a - e).abs();
+            let diff = if diff.is_finite() {
+                diff
+            } else {
+                f32::INFINITY
+            };
+            err += f64::from(diff).powi(2);
+            norm += f64::from(*e).powi(2);
+            max_ref = max_ref.max(e.abs());
+            max_err = max_err.max(diff);
+        }
+        let relative = (err / norm.max(f64::MIN_POSITIVE)).sqrt();
+        if actual.len() != expected.len()
+            || !relative.is_finite()
+            || relative > 0.01
+            || max_err > 0.02 * max_ref.max(f32::MIN_POSITIVE)
+        {
+            return Err(format!(
+                "{label} at n={n_rows} k={k} {dtype:?}: relative L2 {relative:.4}, max error {max_err} vs max |ref| {max_ref}"
+            ));
+        }
+        Ok(())
+    };
+    let mut vectorized = Ok(());
+    for m in [1usize, 2, 3, 4, 5, 8, 17] {
+        let x = Tensor::from_vec(
+            (0..m * k)
+                .map(|i| ((i as f32 + 0.5) * 0.754_877_7).sin() * 2.0)
+                .collect::<Vec<_>>(),
+            (m, k),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?;
+        let expected = host(project(
+            &x.to_dtype(DType::F32)?,
+            &host_w,
+            &host_s,
+            DecodeKernel::Reference,
+        )?)?;
+        let x = x.to_device(device)?;
+        let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+        let kernel = if m <= 4 {
+            "reference GEMV"
+        } else {
+            "prefill GEMM"
+        };
+        compare(&format!("FP8 {kernel} m={m}"), &reference, &expected)
+            .map_err(candle_core::Error::Msg)?;
+        if m <= 4 && vectorized.is_ok() {
+            vectorized = match project(&x, &w, &s, DecodeKernel::Vectorized).and_then(host) {
+                Ok(actual) => compare(&format!("FP8 vectorized GEMV m={m}"), &actual, &expected),
+                Err(error) => Err(format!("FP8 vectorized GEMV m={m}: {error}")),
+            };
+        }
+    }
+    Ok(DecodeKernelGate { vectorized })
 }
 
 pub fn block_fp8_projection(input: &Tensor, weights: &Tensor, scales: &Tensor) -> Result<Tensor> {
     project(input, weights, scales, DecodeKernel::Auto)
+}
+
+/// [`block_fp8_projection`] with the decode kernel chosen per call instead of
+/// by the process-wide flag: `vectorized` runs the vectorized GEMV on eligible
+/// calls (at most four aligned rows) and the reference kernels otherwise;
+/// `false` always runs the reference kernels.
+pub fn block_fp8_projection_selecting(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    vectorized: bool,
+) -> Result<Tensor> {
+    project(
+        input,
+        weights,
+        scales,
+        if vectorized {
+            DecodeKernel::VectorizedWhenEligible
+        } else {
+            DecodeKernel::Reference
+        },
+    )
 }
 
 fn project(
@@ -400,7 +553,7 @@ impl CustomOp3 for Projection {
                     && match self.kernel {
                         DecodeKernel::Auto => vectorized_decode_enabled(),
                         DecodeKernel::Reference => false,
-                        DecodeKernel::Vectorized => true,
+                        DecodeKernel::Vectorized | DecodeKernel::VectorizedWhenEligible => true,
                     };
                 if self.kernel == DecodeKernel::Vectorized && !vectorized {
                     candle_core::bail!(
@@ -697,6 +850,118 @@ mod tests {
         let s = Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap();
         assert!(block_fp8_projection(&x, &w, &s).is_err());
     }
+    #[test]
+    fn selecting_projection_and_kernel_gate_run_on_the_portable_reference() {
+        let (n, k) = (128usize, 256usize);
+        let w = Tensor::from_vec(
+            (0..n * k)
+                .map(|i| [0x38u8, 0xb4, 0x41, 0x0c][i % 4])
+                .collect::<Vec<_>>(),
+            (n, k),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let s = Tensor::from_vec(vec![0.5f32, 2.0], (1, 2), &Device::Cpu).unwrap();
+        let x = Tensor::from_vec(
+            (0..3 * k)
+                .map(|i| (i % 9) as f32 * 0.1 - 0.4)
+                .collect::<Vec<_>>(),
+            (3, k),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let reference = block_fp8_projection(&x, &w, &s)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for vectorized in [false, true] {
+            assert_eq!(
+                block_fp8_projection_selecting(&x, &w, &s, vectorized)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap(),
+                reference
+            );
+        }
+        // The gate compares the device kernels with the portable reference;
+        // on the CPU both are the reference, so it must pass at any K.
+        for k in [128usize, 384] {
+            let gate = verify_decode_kernels_at(&Device::Cpu, DType::F32, 192, k).unwrap();
+            assert_eq!(gate.vectorized, Ok(()));
+        }
+        assert!(verify_decode_kernels_at(&Device::Cpu, DType::F32, 0, 128).is_err());
+        assert!(verify_vectorized_decode(&Device::Cpu).is_err());
+    }
+
+    /// The kernel gate Qwen3.8 runs before admitting native FP8, at the
+    /// checkpoint's real inner dimensions, without touching the process flag.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fp8_kernel_gate_passes_at_qwen38_k() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        for k in [5120usize, 6144, 17408] {
+            let gate = verify_decode_kernels_at(&device, DType::BF16, 1024, k)
+                .unwrap_or_else(|e| panic!("reference kernels at K={k}: {e}"));
+            assert_eq!(gate.vectorized, Ok(()), "vectorized GEMV at K={k}");
+        }
+        verify_vectorized_decode(&device).unwrap();
+    }
+
+    /// Per-call kernel selection: the vectorized and the reference GEMV agree
+    /// at decode row counts, and prefill rows take the GEMM either way.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_selecting_reference_vs_vectorized_match() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        let (n, k) = (1024usize, 5120usize);
+        let raw: Vec<u8> = (0..n * k)
+            .map(|i| match (i.wrapping_mul(0x9E37_79B1) >> 17) as u8 {
+                b if b & 0x7f == 0x7f => 0x38,
+                b => b,
+            })
+            .collect();
+        let w = Tensor::from_vec(raw, (n, k), &device).unwrap();
+        let s = Tensor::from_vec(
+            (0..8 * 40)
+                .map(|i| 1e-3 * (1 + i % 11) as f32)
+                .collect::<Vec<_>>(),
+            (8, 40),
+            &device,
+        )
+        .unwrap();
+        for m in [1usize, 3, 4, 9] {
+            let x = Tensor::from_vec(
+                (0..m * k)
+                    .map(|i| ((i as f32) * 0.37).sin())
+                    .collect::<Vec<_>>(),
+                (m, k),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+            let host = |vectorized| {
+                block_fp8_projection_selecting(&x, &w, &s, vectorized)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let (reference, vectorized) = (host(false), host(true));
+            let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+            for (a, b) in vectorized.iter().zip(&reference) {
+                assert!((a - b).abs() <= 0.02 * scale, "m={m}: {a} vs {b}");
+            }
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_projection_decode_verify_prefill_match_portable_reference() {

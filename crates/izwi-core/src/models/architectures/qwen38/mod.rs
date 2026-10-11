@@ -9,5 +9,6 @@ pub mod chat;
 mod fast_path;
 pub(crate) mod mtp;
 pub mod native;
+pub(crate) mod residency;
 mod telemetry;
 mod text;

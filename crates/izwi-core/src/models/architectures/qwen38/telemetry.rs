@@ -14,6 +14,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_q8_projection_calls_total: u64,
     pub cuda_native_fp8_projection_calls_total: u64,
     pub cuda_dense_projection_calls_total: u64,
+    pub cuda_fp8_gemv_vectorized_calls_total: u64,
+    pub cuda_fp8_gemv_reference_calls_total: u64,
+    pub cuda_fp8_packed_projection_calls_total: u64,
     pub cuda_attention_dtype_casts_total: u64,
     pub cuda_bf16_kv_provider_selected_total: u64,
     pub cuda_f16_kv_fallback_selected_total: u64,
@@ -95,6 +98,9 @@ counters!(
     CUDA_Q8_PROJECTION_CALLS,
     CUDA_NATIVE_FP8_PROJECTION_CALLS,
     CUDA_DENSE_PROJECTION_CALLS,
+    CUDA_FP8_GEMV_VECTORIZED_CALLS,
+    CUDA_FP8_GEMV_REFERENCE_CALLS,
+    CUDA_FP8_PACKED_PROJECTION_CALLS,
     CUDA_ATTENTION_DTYPE_CASTS,
     CUDA_BF16_KV_PROVIDER_SELECTED,
     CUDA_F16_KV_FALLBACK_SELECTED,
@@ -196,6 +202,21 @@ pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
         CudaProjectionPath::Q8 => CUDA_Q8_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
         CudaProjectionPath::Dense => CUDA_DENSE_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+/// One CUDA block-FP8 decode call (at most four rows): through the
+/// vectorized GEMV, or the reference GEMV.
+pub(crate) fn record_cuda_fp8_gemv(vectorized: bool) {
+    if vectorized {
+        CUDA_FP8_GEMV_VECTORIZED_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FP8_GEMV_REFERENCE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA call of a packed block-FP8 projection group.
+pub(crate) fn record_cuda_fp8_packed_projection() {
+    CUDA_FP8_PACKED_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_cuda_attention_dtype_casts(count: usize) {
@@ -427,6 +448,9 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_q8_projection_calls_total: load!(CUDA_Q8_PROJECTION_CALLS),
         cuda_native_fp8_projection_calls_total: load!(CUDA_NATIVE_FP8_PROJECTION_CALLS),
         cuda_dense_projection_calls_total: load!(CUDA_DENSE_PROJECTION_CALLS),
+        cuda_fp8_gemv_vectorized_calls_total: load!(CUDA_FP8_GEMV_VECTORIZED_CALLS),
+        cuda_fp8_gemv_reference_calls_total: load!(CUDA_FP8_GEMV_REFERENCE_CALLS),
+        cuda_fp8_packed_projection_calls_total: load!(CUDA_FP8_PACKED_PROJECTION_CALLS),
         cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
         cuda_bf16_kv_provider_selected_total: load!(CUDA_BF16_KV_PROVIDER_SELECTED),
         cuda_f16_kv_fallback_selected_total: load!(CUDA_F16_KV_FALLBACK_SELECTED),

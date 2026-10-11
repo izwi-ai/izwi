@@ -140,9 +140,9 @@ streaming sequence.
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
-capabilities. Its CUDA deployment uses a
-[scale-aware Q8_0 compressed fallback](/support-matrix#qwen38-cuda-weight-residency),
-not native FP8 execution.
+capabilities. On CUDA its projections run as
+[native block FP8](/support-matrix#qwen38-cuda-weight-residency) by default, with a
+scale-aware Q8_0 fallback.
 
 ---
 

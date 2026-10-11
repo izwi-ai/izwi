@@ -92,20 +92,34 @@ and realtime route families. Detailed preview behavior is documented in the
 
 ### Qwen3.8 CUDA weight residency
 
-`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the source
-artifact, but the current CUDA path does not execute native FP8 matrix
-multiplication. It applies each projection's `weight_scale_inv`, requantizes
-the projection to resident Candle Q8_0 weights, and retains source-dense tensors
-as BF16. Runtime diagnostics identify this as
-`resident_representation: q8_0_requantized_projections_with_dense_bf16` and
-`fp8_execution_mode: q8_0_compressed_fallback`.
+`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the resident
+format on CUDA by default. Projections stay as the checkpoint's E4M3 bytes plus one
+F32 scale per 128x128 block (about 24.7 GB), and the compact FP8 kernels apply
+`weight_scale_inv` inside every matrix multiplication with 16-bit activations
+(software FP8 decode, not FP8 Tensor Core arithmetic). Row-compatible projections
+are packed into one matrix. Runtime diagnostics report
+`resident_representation: native_block_fp8_with_q8_fallback_dense_bf16` and
+`fp8_execution_mode: native_block_fp8_auto_self_checked`.
 
-This compressed fallback is designed to fit 40/48 GB-class CUDA devices with a
-resource-fitted context, subject to actual free VRAM and allocator headroom. It
-must not be described as native FP8 execution or as CUDA-certified until the
-corresponding NVIDIA evidence is retained. The earlier fully expanded BF16
-weight plan required an 80 GB-class device; CPU and Metal continue to use their
-expanded F32 and F16 representations respectively.
+The runtime enables this only after checks on the device, before load admission:
+every projection shape must fit the kernel contract, the kernels must match a
+reference at the checkpoint's real inner dimensions, and a probe on real weights
+read from the checkpoint must match a host reference built from the same bytes.
+The load then checks each kind of projection, packs included, against the original
+checkpoint bytes. If any check fails, the model loads with the compressed Q8_0
+fallback instead (`weight_scale_inv` applied, then requantized to resident Candle
+Q8_0, about 26.2 GB), reported as `q8_0_requantized_projections_with_dense_bf16`
+and `fp8_execution_mode: q8_0_fallback:<reason>`. A check that fails during
+loading fails that load, and the next load uses Q8_0 with matching memory
+admission. Set `IZWI_CUDA_PROJECTION_BACKEND=q8` or
+`IZWI_QWEN38_FP8_PROJECTIONS=legacy` to choose Q8_0, and
+`IZWI_QWEN38_FP8_GEMV=legacy` to keep the reference decode kernel.
+
+Both representations are designed to fit 40/48 GB-class CUDA devices with a
+resource-fitted context, subject to actual free VRAM and allocator headroom. Native
+block FP8 is not CUDA-certified until the corresponding NVIDIA evidence is
+retained. CPU and Metal continue to use their expanded F32 and F16 representations
+respectively.
 
 ### Qwen3.8 multi-token prediction defaults
 
