@@ -3462,6 +3462,9 @@ mod tests {
             5_120 + 64 * 2 * 5_120 + 16 * 2 * 256 + 48 * (128 + 48 + 48 + 10_240 * 4);
         pub const MTP_DENSE: u64 = 5_120 * 10_240;
         pub const MTP_F32: u64 = 5 * 5_120 + 2 * 256;
+        /// F32 block scales of raw block FP8 (one per 128x128 block).
+        pub const TRUNK_SCALES: u64 = 48 * 23_360 + 16 * 22_720;
+        pub const MTP_SCALES: u64 = 22_720;
         /// The source checkpoint's BF16 elements also include a 460,730,096
         /// element vision tower the text runtime never loads.
         pub const VISION: u64 = 460_730_096;
@@ -3497,11 +3500,33 @@ mod tests {
             "census accounts for every BF16 checkpoint element"
         );
 
-        // CPU expands everything to F32, Metal to F16 (F32 gains and math).
+        // CPU expands everything to F32 (F32 gains and math).
         assert_eq!(cpu.resident_bytes, (fp8 + dense) * 4 + f32_bytes);
         assert_eq!(cpu.resident_bytes, 109_282_791_424);
-        assert_eq!(metal.resident_bytes, (fp8 + dense) * 2 + f32_bytes);
-        assert_eq!(metal.resident_bytes, 54_646_738_944);
+        // Metal keeps raw block FP8 (bytes + F32 block scales) with F16 dense
+        // tensors and the 1 GiB F16 prefill scratch; a build without the
+        // Metal kernels expands to F16.
+        let scratch =
+            crate::models::architectures::qwen38::residency::METAL_FP8_PREFILL_DEQUANT_BYTES;
+        let metal_native = fp8 + (TRUNK_SCALES + MTP_SCALES) * 4 + dense * 2 + f32_bytes + scratch;
+        let metal_expanded = (fp8 + dense) * 2 + f32_bytes;
+        if cfg!(feature = "metal") {
+            assert_eq!(metal.resident_bytes, metal_native);
+            assert_eq!(metal.resident_bytes, 31_027_303_168);
+            // Fits a 48 GB Mac's 32.4 GiB budget (with a little context);
+            // a 32 GB Mac's 21.6 GiB budget refuses it.
+            const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+            assert!((metal.load_peak_bytes as f64) < 32.4 * GIB);
+            assert!((metal.load_peak_bytes as f64) > 21.6 * GIB);
+            let plan = qwen38_resource_plan(BackendKind::Metal);
+            assert_eq!(
+                plan.deferred_resident_authorization.unified_bytes,
+                ResourceAmount::Known(scratch)
+            );
+        } else {
+            assert_eq!(metal.resident_bytes, metal_expanded);
+        }
+        assert_eq!(metal_expanded, 54_646_738_944);
         // CUDA's static arm prices Q8_0 (34 bytes per 32 elements).
         assert_eq!(cuda.resident_bytes, fp8 / 32 * 34 + dense * 2 + f32_bytes);
         assert_eq!(cuda.resident_bytes, 31_491_231_744);
@@ -3535,9 +3560,21 @@ mod tests {
         // projections, fc and norms are not charged.
         let mut no_mtp = crate::performance::PerformanceConfig::default();
         no_mtp.cuda.mtp = crate::performance::OptimizationMode::Off;
+        let mtp_metal = if cfg!(feature = "metal") {
+            MTP_FP8 + MTP_SCALES * 4 + MTP_DENSE * 2 + MTP_F32 * 4
+        } else {
+            (MTP_FP8 + MTP_DENSE) * 2 + MTP_F32 * 4
+        };
         assert_eq!(
             qwen38_representation_memory_estimate(BackendKind::Metal, &no_mtp).resident_bytes,
-            metal.resident_bytes - (MTP_FP8 + MTP_DENSE) * 2 - MTP_F32 * 4
+            metal.resident_bytes - mtp_metal
+        );
+        // `metal.projection_backend = "expanded"` prices the F16 expansion.
+        let mut expanded = crate::performance::PerformanceConfig::default();
+        expanded.metal.projection_backend = crate::performance::MetalProjectionBackend::Expanded;
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Metal, &expanded).resident_bytes,
+            metal_expanded
         );
         // Off CUDA the CUDA master switch does not govern MTP; on CUDA it does.
         let mut cuda_off = crate::performance::PerformanceConfig::default();
@@ -3777,8 +3814,9 @@ mod tests {
         let performance = crate::performance::PerformanceConfig::default();
         let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance);
 
-        // Qwen3.8 expands to F16 on Metal (about 51.9 GiB), far below the
-        // 80 GiB catalog figure that used to veto every retry on a 96 GB Mac.
+        // Qwen3.8 on Metal (raw block FP8, about 29.9 GiB at load; 51.9 GiB
+        // expanded to F16) sits far below the 80 GiB catalog figure that used
+        // to veto every retry on a 96 GB Mac.
         let qwen38_metal = peak(ModelVariant::Qwen3827BFp8, BackendKind::Metal);
         assert_eq!(
             qwen38_metal,

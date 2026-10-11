@@ -1187,6 +1187,13 @@ impl Qwen38ChatModel {
                 "fp8_projections": residency_paths["fp8_projections"],
                 "fp8_gemv": residency_paths["fp8_gemv"],
                 "fp8_lm_head": self.text_model.fp8_lm_head_diagnostics(),
+                "metal_fp8_gemv": super::fast_path::summarize(
+                    self.text_model.fp8_gemv_checks().iter().chain(
+                        self.mtp_head
+                            .iter()
+                            .flat_map(|head| head.fp8_gemv_checks().iter()),
+                    ),
+                ),
                 "fp8_packing": super::fast_path::summarize(
                     self.text_model.fp8_packing().iter().chain(
                         self.mtp_head
@@ -1196,6 +1203,13 @@ impl Qwen38ChatModel {
                 ),
                 "self_check_failures_total": optimization_counters.fast_path_self_check_failures_total,
                 "resolution": "load_time_self_check_at_checkpoint_geometry",
+                "runtime_validated": false,
+            },
+            "metal": {
+                "projection_backend": self.performance.metal.projection_backend,
+                "gemv_max_rows": 8,
+                "prefill": "dequantize_to_transient_f16_then_matmul",
+                "prefill_scratch_bytes": self.text_model.residency().prefill_scratch_bytes(),
                 "runtime_validated": false,
             },
             "vision_enabled": false,
@@ -4170,22 +4184,48 @@ mod tests {
         );
         assert!(native.fallback_reason.contains("not runtime-certified"));
 
-        // CPU and Metal keep their expanded plans.
-        for (backend, representation, dtype) in [
-            (BackendKind::Cpu, "expanded_f32", "f32"),
-            (BackendKind::Metal, "expanded_f16", "f16"),
-        ] {
-            let portable = qwen38_representation_diagnostics(
-                &Qwen38ResidencyPolicy::resolve_static(backend, &performance),
-            );
-            assert_eq!(portable.resident_representation, representation);
-            assert_eq!(portable.runtime_compute_dtype, dtype);
-            assert_eq!(portable.fp8_execution_mode, "expanded_fallback");
+        // The CPU keeps its expanded plan.
+        let cpu = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cpu,
+            &performance,
+        ));
+        assert_eq!(cpu.resident_representation, "expanded_f32");
+        assert_eq!(cpu.runtime_compute_dtype, "f32");
+        assert_eq!(cpu.fp8_execution_mode, "expanded_fallback");
+        assert_eq!(
+            cpu.fallback_reason,
+            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
+        );
+        // Metal keeps raw block FP8 in a Metal build, and expands to F16
+        // when told to (or without the Metal kernels).
+        let metal = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Metal,
+            &performance,
+        ));
+        if cfg!(feature = "metal") {
             assert_eq!(
-                portable.fallback_reason,
-                "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
+                metal.resident_representation,
+                "native_block_fp8_with_dense_f16"
             );
+            assert_eq!(
+                metal.fp8_execution_mode,
+                "native_block_fp8_auto_self_checked"
+            );
+            assert!(metal.fallback_reason.contains("transient F16"));
+        } else {
+            assert_eq!(metal.resident_representation, "expanded_f16");
+            assert!(metal.fallback_reason.contains("need a Metal build"));
         }
+        assert_eq!(metal.runtime_compute_dtype, "f16");
+        let mut expanded = crate::performance::PerformanceConfig::default();
+        expanded.metal.projection_backend = crate::performance::MetalProjectionBackend::Expanded;
+        let metal = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Metal,
+            &expanded,
+        ));
+        assert_eq!(metal.resident_representation, "expanded_f16");
+        assert_eq!(metal.fp8_execution_mode, "expanded_fallback");
+        assert_eq!(metal.fallback_reason, "metal.projection_backend=expanded");
         assert_eq!(
             Qwen38ProjectionRepresentation::ExpandedBf16.as_str(),
             "expanded_bf16"

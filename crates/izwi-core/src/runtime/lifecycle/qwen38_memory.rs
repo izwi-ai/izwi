@@ -44,7 +44,9 @@ pub(super) fn static_estimate(
             .iter()
             .map(|spec| (spec.name.as_str(), spec.dtype, spec.shape.as_slice())),
         config.block_fp8.block_shape,
-    )?;
+    )?
+    .checked_add(policy.prefill_scratch_bytes())
+    .ok_or_else(overflow)?;
     let scratch = match backend {
         BackendKind::Cuda => super::QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
         BackendKind::Cpu | BackendKind::Metal => super::QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
@@ -62,6 +64,11 @@ pub(super) fn static_resource_plan(
     performance: &PerformanceConfig,
 ) -> Result<ModelResourcePlan> {
     let mut plan = super::model_resource_plan(backend, static_estimate(backend, performance)?);
+    if backend == BackendKind::Metal {
+        plan.deferred_resident_authorization.unified_bytes = ResourceAmount::Known(
+            Qwen38ResidencyPolicy::resolve_static(backend, performance).prefill_scratch_bytes(),
+        );
+    }
     if backend == BackendKind::Cuda {
         plan.load_authorization.host_bytes =
             ResourceAmount::Known(super::QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES);
@@ -126,7 +133,11 @@ pub(super) fn resource_plan(
             .ok_or_else(overflow)?;
     }
     if backend != BackendKind::Cuda {
-        let resident_bytes = weights;
+        // Metal FP8 prefill expands a projection to a transient F16 matrix:
+        // resident (lazily allocated, so also a pending claim) beside the
+        // weights.
+        let prefill_scratch = policy.prefill_scratch_bytes();
+        let resident_bytes = weights.checked_add(prefill_scratch).ok_or_else(overflow)?;
         let estimate = ModelMemoryEstimate {
             resident_bytes,
             load_peak_bytes: resident_bytes
@@ -140,7 +151,12 @@ pub(super) fn resource_plan(
             mtp,
             "Selected Qwen3.8 weight inventory"
         );
-        return Ok(super::model_resource_plan(backend, estimate));
+        let mut plan = super::model_resource_plan(backend, estimate);
+        if backend == BackendKind::Metal {
+            plan.deferred_resident_authorization.unified_bytes =
+                ResourceAmount::Known(prefill_scratch);
+        }
+        return Ok(plan);
     }
     let graphs = if performance.cuda.enabled() && performance.cuda.decode_graphs.enabled() {
         GRAPH_CACHE_PER_STACK * if mtp { 2 } else { 1 }
@@ -473,5 +489,80 @@ mod tests {
                 &config,
             );
         assert_eq!(loader_policy.plan(), Qwen38ProjectionPlan::Q8);
+    }
+
+    /// Metal admission resolves the policy the Metal loader uses: raw block
+    /// FP8 plus the F16 prefill scratch (also a pending claim), the F16
+    /// expansion when `metal.projection_backend = "expanded"`, and the
+    /// expansion again once a load-time check poisons the checkpoint.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_admission_prices_raw_fp8_and_the_expansion_once_poisoned() {
+        use crate::models::architectures::qwen38::mtp::tests::{
+            write_fp8_geometry_checkpoint, TestDir,
+        };
+        use crate::models::architectures::qwen38::native::ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY;
+        use crate::models::architectures::qwen38::residency::{
+            Qwen38ProjectionPlan, METAL_FP8_PREFILL_DEQUANT_BYTES,
+        };
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct Synthetic;
+        impl Drop for Synthetic {
+            fn drop(&mut self) {
+                std::env::remove_var(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY);
+            }
+        }
+        std::env::set_var(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY, "1");
+        let _synthetic = Synthetic;
+        let dir = TestDir::new("admission-metal-fp8");
+        let config = write_fp8_geometry_checkpoint(dir.path());
+        let unified = |plan: &ModelResourcePlan| match plan.resident_authorization.unified_bytes {
+            ResourceAmount::Known(bytes) => bytes,
+            ResourceAmount::Unknown => panic!("Metal residency must be known"),
+        };
+        let native_plan =
+            resource_plan(dir.path(), &device, &PerformanceConfig::default()).unwrap();
+        assert_eq!(
+            native_plan.deferred_resident_authorization.unified_bytes,
+            ResourceAmount::Known(METAL_FP8_PREFILL_DEQUANT_BYTES)
+        );
+        let native = unified(&native_plan);
+        let mut expanded_config = PerformanceConfig::default();
+        expanded_config.metal.projection_backend =
+            crate::performance::MetalProjectionBackend::Expanded;
+        let expanded = unified(&resource_plan(dir.path(), &device, &expanded_config).unwrap());
+        // FP8 elements (trunk + MTP) and their block scales, as in the CPU test.
+        let (hidden, ff) = (256u64, 512u64);
+        let mlp = 3 * ff * hidden;
+        let fp8 =
+            3 * (mlp + 2048 * hidden + hidden * 768) + 2 * (mlp + 1536 * hidden + hidden * 512);
+        let scales = |n: u64, k: u64| n.div_ceil(128) * k.div_ceil(128);
+        let scale_grid = 5 * (2 * scales(ff, hidden) + scales(hidden, ff))
+            + 3 * (scales(1280, hidden) + scales(768, hidden) + scales(hidden, 768))
+            + 2 * (scales(1024, hidden) + 2 * scales(256, hidden) + scales(hidden, 512));
+        assert_eq!(
+            expanded + METAL_FP8_PREFILL_DEQUANT_BYTES + scale_grid * 4,
+            native + fp8
+        );
+        let policy = Qwen38ResidencyPolicy::resolve(
+            &device,
+            crate::models::architectures::qwen38::native::ProjectionMaterialization::F16,
+            &PerformanceConfig::default(),
+            &crate::models::architectures::qwen38::native::IndexedSafetensors::open(dir.path())
+                .unwrap(),
+            &config,
+        );
+        assert_eq!(
+            policy.plan(),
+            Qwen38ProjectionPlan::NativeFp8 { explicit: false }
+        );
+        policy.poison_projections("forced Metal mismatch");
+        let poisoned = resource_plan(dir.path(), &device, &PerformanceConfig::default()).unwrap();
+        assert_eq!(unified(&poisoned), expanded);
     }
 }

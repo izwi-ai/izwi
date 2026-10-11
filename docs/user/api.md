@@ -897,8 +897,10 @@ fallback is requested, the representation is
 `q8_0_fallback:<reason>`; `fallback_reason` explains the choice either way. The
 per-path outcomes appear under `fast_paths.fp8_projections`, `fast_paths.fp8_gemv`,
 `fast_paths.fp8_packing` and `fast_paths.fp8_lm_head` (the block-FP8 LM head, a
-deliberate precision reduction, with its observed gate error). CPU and Metal continue to report `expanded_f32` and
-`expanded_f16` respectively.
+deliberate precision reduction, with its observed gate error). On Metal the
+representation is `native_block_fp8_with_dense_f16` (or `expanded_f16` with
+`IZWI_METAL_PROJECTION_BACKEND=expanded`), with the per-kind GEMV checks under
+`fast_paths.metal_fp8_gemv`; the CPU continues to report `expanded_f32`.
 
 | Method | Path | Notes |
 |--------|------|-------|

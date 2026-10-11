@@ -24,7 +24,7 @@ use super::telemetry::{
     record_cuda_kernel, record_cuda_lm_head, record_cuda_projection, record_cuda_qk_rope_chain,
     record_cuda_rms_norm_composition, record_cuda_rope, record_cuda_state_initial_allocation,
     record_fast_path_self_check_failure, record_fused_attn_gate, record_fused_qk_norm_rope,
-    record_fused_rms_norm, CudaKernelPath, CudaProjectionPath,
+    record_fused_rms_norm, record_metal_fp8_projection, CudaKernelPath, CudaProjectionPath,
 };
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -61,6 +61,8 @@ pub struct Qwen38TextModel {
     residency: Qwen38ResidencyPolicy,
     /// One entry per block-FP8 projection group: packed, or why not.
     fp8_packing: Vec<Qwen38FastPath>,
+    /// Metal: one entry per checked FP8 projection kind (GEMV or rerouted).
+    fp8_gemv_checks: Vec<Qwen38FastPath>,
     /// The LM head as block FP8 (or why not), with the host gate's
     /// relative L2 error against the BF16 head.
     fp8_lm_head: (Qwen38FastPath, Option<f64>),
@@ -208,6 +210,7 @@ pub enum Qwen38ProjectionRepresentation {
     PackedQ8WithDenseBf16,
     NativeFp8WithQ8FallbackF16,
     NativeFp8WithQ8FallbackBf16,
+    NativeFp8WithDenseF16,
 }
 
 impl Qwen38ProjectionRepresentation {
@@ -215,6 +218,7 @@ impl Qwen38ProjectionRepresentation {
         match self {
             Self::NativeFp8WithQ8FallbackF16 => "native_block_fp8_with_q8_fallback_dense_f16",
             Self::NativeFp8WithQ8FallbackBf16 => "native_block_fp8_with_q8_fallback_dense_bf16",
+            Self::NativeFp8WithDenseF16 => "native_block_fp8_with_dense_f16",
             Self::ExpandedF32 => "expanded_f32",
             Self::ExpandedF16 => "expanded_f16",
             Self::ExpandedBf16 => "expanded_bf16",
@@ -226,9 +230,10 @@ impl Qwen38ProjectionRepresentation {
     pub const fn compute_dtype(self) -> &'static str {
         match self {
             Self::ExpandedF32 => "f32",
-            Self::ExpandedF16 | Self::PackedQ8WithDenseF16 | Self::NativeFp8WithQ8FallbackF16 => {
-                "f16"
-            }
+            Self::ExpandedF16
+            | Self::PackedQ8WithDenseF16
+            | Self::NativeFp8WithQ8FallbackF16
+            | Self::NativeFp8WithDenseF16 => "f16",
             Self::ExpandedBf16
             | Self::PackedQ8WithDenseBf16
             | Self::NativeFp8WithQ8FallbackBf16 => "bf16",
@@ -650,7 +655,14 @@ pub(super) enum Qwen38Fp8Kernel {
     Reference,
     /// The vectorized GEMV on eligible decode calls (CUDA, verified at load).
     Vectorized,
+    /// Metal: always expand to F16 and multiply (the GEMV failed its check
+    /// for this projection kind, or `IZWI_QWEN38_FP8_GEMV=legacy`).
+    DequantOnly,
 }
+
+/// Metal runs the FP8 GEMV up to this many activation rows; a longer span
+/// expands the weights to a transient F16 matrix for one matrix multiply.
+const METAL_FP8_GEMV_MAX_ROWS: usize = 8;
 
 enum Qwen38ProjectionGroup {
     Separate(Vec<Qwen38Projection>),
@@ -790,6 +802,17 @@ impl Module for Qwen38Projection {
         match self {
             Self::NativeFp8 { raw, kernel } => {
                 let vectorized = *kernel == Qwen38Fp8Kernel::Vectorized;
+                if input.device().is_metal() {
+                    let rows = input.elem_count() / raw.shape[1].max(1);
+                    if *kernel == Qwen38Fp8Kernel::DequantOnly || rows > METAL_FP8_GEMV_MAX_ROWS {
+                        record_metal_fp8_projection(false);
+                        let dense =
+                            crate::kernels::metal_fp8::dequantize_f16(&raw.weights, &raw.scales)?
+                                .to_dtype(input.dtype())?;
+                        return Linear::new(dense, None).forward(input);
+                    }
+                    record_metal_fp8_projection(true);
+                }
                 if input.device().is_cuda() {
                     let rows = input.elem_count() / raw.shape[1].max(1);
                     if rows <= 4 {
@@ -1076,11 +1099,13 @@ impl Qwen38TextModel {
                 mlp,
             });
         }
+        let (fp8_packing, fp8_gemv_checks) = loader.into_outcomes();
         let mut model = Self {
             device: device.clone(),
             projection_representation,
             residency: policy.clone(),
-            fp8_packing: loader.into_packing(),
+            fp8_packing,
+            fp8_gemv_checks,
             fp8_lm_head,
             token_embeddings,
             layers,
@@ -1593,6 +1618,11 @@ impl Qwen38TextModel {
     /// Packing outcome of every block-FP8 projection group of the trunk.
     pub(super) fn fp8_packing(&self) -> &[Qwen38FastPath] {
         &self.fp8_packing
+    }
+
+    /// Metal: the GEMV check outcome of every FP8 projection kind.
+    pub(super) fn fp8_gemv_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_gemv_checks
     }
 
     /// `fast_paths.fp8_lm_head`: the head's form and its observed error.
@@ -3875,6 +3905,11 @@ pub(super) struct Qwen38WeightLoader<'a> {
     checked: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// One entry per block-FP8 projection group: packed, or why not.
     packing: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// Metal: one entry per checked FP8 projection kind: the GEMV passed,
+    /// or the kind was rerouted through dequantize + matmul.
+    gemv: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// Metal: projection kinds whose GEMV failed its check.
+    dequant_kinds: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// Tests: corrupt the scales of every FP8 projection this loader
     /// materializes, to prove the load-time check fails closed.
     #[cfg(test)]
@@ -3903,20 +3938,92 @@ impl<'a> Qwen38WeightLoader<'a> {
             target,
             checked: Default::default(),
             packing: Default::default(),
+            gemv: Default::default(),
+            dequant_kinds: Default::default(),
             #[cfg(test)]
             corrupt_fp8_scales: Default::default(),
         }
     }
 
     pub(super) fn into_packing(self) -> Vec<Qwen38FastPath> {
-        self.packing.into_inner()
+        self.into_outcomes().0
+    }
+
+    /// (packing per FP8 group, Metal GEMV check per FP8 kind).
+    pub(super) fn into_outcomes(self) -> (Vec<Qwen38FastPath>, Vec<Qwen38FastPath>) {
+        (self.packing.into_inner(), self.gemv.into_inner())
     }
 
     fn fp8_kernel(&self) -> Qwen38Fp8Kernel {
         if self.device.is_cuda() && self.policy.fp8_vectorized() {
             Qwen38Fp8Kernel::Vectorized
+        } else if self.device.is_metal() && self.policy.fp8_dequant_only() {
+            Qwen38Fp8Kernel::DequantOnly
         } else {
             Qwen38Fp8Kernel::Reference
+        }
+    }
+
+    fn kind(parts: &[(&str, [usize; 2])]) -> String {
+        parts
+            .iter()
+            .map(|(name, _)| projection_kind(name))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// Check a freshly materialized FP8 projection (see
+    /// [`Self::fp8_self_check`]). On Metal a mismatch first reroutes the
+    /// projection kind through dequantize + matmul (the GEMV may be the
+    /// culprit) and checks again; only a second mismatch fails.
+    pub(super) fn checked_fp8(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Result<Qwen38Projection> {
+        let kind = Self::kind(parts);
+        let fresh = !self.checked.borrow().contains(&kind);
+        match self.fp8_self_check(parts, &projection) {
+            Ok(()) => {
+                if fresh && self.device.is_metal() {
+                    self.gemv.borrow_mut().push(match &projection {
+                        Qwen38Projection::NativeFp8 {
+                            kernel: Qwen38Fp8Kernel::DequantOnly,
+                            ..
+                        } => Qwen38FastPath::legacy(format!(
+                            "{}=legacy",
+                            super::residency::FP8_GEMV_ENV
+                        )),
+                        _ => Qwen38FastPath::Fused,
+                    });
+                }
+                Ok(projection)
+            }
+            Err(error) if self.device.is_metal() => {
+                let Qwen38Projection::NativeFp8 { raw, kernel } = projection else {
+                    return Err(error);
+                };
+                if kernel == Qwen38Fp8Kernel::DequantOnly {
+                    return Err(error);
+                }
+                let rerouted = Qwen38Projection::NativeFp8 {
+                    raw,
+                    kernel: Qwen38Fp8Kernel::DequantOnly,
+                };
+                self.fp8_self_check(parts, &rerouted).map_err(|second| {
+                    Error::ModelLoadError(format!(
+                        "{error}; with dequantize + matmul only: {second}"
+                    ))
+                })?;
+                record_fast_path_self_check_failure();
+                tracing::warn!(%error, kind, "Qwen3.8 Metal FP8 GEMV failed its check; this projection kind runs dequantize + matmul");
+                self.dequant_kinds.borrow_mut().insert(kind);
+                self.gemv.borrow_mut().push(Qwen38FastPath::legacy(format!(
+                    "self_check_failed: {error}"
+                )));
+                Ok(rerouted)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -3934,10 +4041,12 @@ impl<'a> Qwen38WeightLoader<'a> {
         } else {
             raw
         };
-        Ok(Qwen38Projection::NativeFp8 {
-            raw,
-            kernel: self.fp8_kernel(),
-        })
+        let kernel = if self.dequant_kinds.borrow().contains(&Self::kind(parts)) {
+            Qwen38Fp8Kernel::DequantOnly
+        } else {
+            self.fp8_kernel()
+        };
+        Ok(Qwen38Projection::NativeFp8 { raw, kernel })
     }
 
     /// Check a resident FP8 projection (one part, or a pack of `parts` in
@@ -3950,11 +4059,7 @@ impl<'a> Qwen38WeightLoader<'a> {
         parts: &[(&str, [usize; 2])],
         projection: &Qwen38Projection,
     ) -> Result<()> {
-        let kind = parts
-            .iter()
-            .map(|(name, _)| projection_kind(name))
-            .collect::<Vec<_>>()
-            .join("+");
+        let kind = Self::kind(parts);
         if self.checked.borrow().contains(&kind) {
             return Ok(());
         }
@@ -4108,16 +4213,22 @@ pub(super) fn load_native_projection(
     {
         Qwen38WeightForm::RawFp8 => {
             let projection = loader.materialize_fp8(&[(name, shape)])?;
-            if let Err(error) = loader.fp8_self_check(&[(name, shape)], &projection) {
-                record_fast_path_self_check_failure();
-                let reason = error.to_string();
-                loader.policy.poison_projections(&reason);
-                tracing::warn!(%reason, "Qwen3.8 native FP8 load-time check failed");
-                return Err(Error::ModelLoadError(format!(
-                    "Qwen3.8 native block-FP8 self_check_failed: {reason}. The next load keeps Q8_0 projections; set IZWI_QWEN38_FP8_PROJECTIONS=legacy (or IZWI_CUDA_PROJECTION_BACKEND=q8) to skip native FP8"
-                )));
-            }
-            Ok(projection)
+            loader
+                .checked_fp8(&[(name, shape)], projection)
+                .map_err(|error| {
+                    record_fast_path_self_check_failure();
+                    let reason = error.to_string();
+                    loader.policy.poison_projections(&reason);
+                    tracing::warn!(%reason, "Qwen3.8 native FP8 load-time check failed");
+                    let remedy = if loader.device.is_metal() {
+                        "The next load expands projections to F16; set IZWI_METAL_PROJECTION_BACKEND=expanded to skip native FP8 on Metal"
+                    } else {
+                        "The next load keeps Q8_0 projections; set IZWI_QWEN38_FP8_PROJECTIONS=legacy (or IZWI_CUDA_PROJECTION_BACKEND=q8) to skip native FP8"
+                    };
+                    Error::ModelLoadError(format!(
+                        "Qwen3.8 native block-FP8 self_check_failed: {reason}. {remedy}"
+                    ))
+                })
         }
         Qwen38WeightForm::Q8_0 => tensors
             .materialize_q8_projection(name, shape, loader.block, loader.device)
@@ -4224,10 +4335,9 @@ fn load_native_projection_group(
                 ));
                 return load_separate();
             }
-            let packed = loader.materialize_fp8(projections).and_then(|projection| {
-                loader.fp8_self_check(projections, &projection)?;
-                Ok(projection)
-            });
+            let packed = loader
+                .materialize_fp8(projections)
+                .and_then(|projection| loader.checked_fp8(projections, projection));
             match packed {
                 Ok(projection) => {
                     loader.packing.borrow_mut().push(Qwen38FastPath::Fused);

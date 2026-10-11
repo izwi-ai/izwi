@@ -37,7 +37,7 @@ use super::text::Qwen38ProjectionRepresentation;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kernels::cuda::fp8;
-use crate::performance::{CudaProjectionBackend, PerformanceConfig};
+use crate::performance::{CudaProjectionBackend, MetalProjectionBackend, PerformanceConfig};
 
 /// Kill switch for native block-FP8 projections (`legacy`/`off`/`0`/`false`):
 /// Qwen3.8 keeps Q8_0 on CUDA. Qwen3.6 is unaffected.
@@ -53,6 +53,10 @@ pub(crate) const FP8_BLOCK: [usize; 2] = [128, 128];
 const KERNEL_GATE_ROWS: usize = 1024;
 /// Rows of the real-weight probe (two scale rows).
 const PROBE_ROWS: usize = 256;
+/// Metal prefill expands a raw block-FP8 projection to a transient F16
+/// matrix: two power-of-two allocator buckets for the largest packed group
+/// (the 27B gate_up is 34816 x 5120, 356 MB in F16).
+pub(crate) const METAL_FP8_PREFILL_DEQUANT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Resident form of one checkpoint tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +89,9 @@ enum Fp8Device {
     Probe(Device),
     /// No device can run it (or none was given).
     Unavailable,
+    /// Metal without the device at hand (static estimate): the Metal FP8
+    /// GEMV's contract, F16 activations, in a Metal build.
+    StaticMetal,
     /// The portable reference kernel stands in (tests on the CPU).
     #[cfg(test)]
     Forced,
@@ -246,8 +253,50 @@ impl Qwen38ResidencyPolicy {
         policy.identity = Some(identity);
         if backend == BackendKind::Cuda || (backend == BackendKind::Cpu && cpu_native_forced()) {
             policy.resolve_native(device, performance, tensors, config);
+        } else if backend == BackendKind::Metal {
+            policy.resolve_metal(device, config);
         }
         policy
+    }
+
+    /// Metal: raw block FP8 unless `metal.projection_backend = "expanded"`,
+    /// the kill switch, or an earlier load's failed check says otherwise, and
+    /// (on Auto) only when every FP8 geometry fits the Metal FP8 GEMV. There
+    /// are no device gates before admission here: the load-time check against
+    /// the original checkpoint bytes runs on every projection kind, and a GEMV
+    /// mismatch reroutes that kind through the dequantize + matmul path.
+    fn resolve_metal(&mut self, device: &Device, config: &Qwen38NativeConfig) {
+        let Qwen38ProjectionPlan::NativeFp8 { explicit } = self.plan else {
+            return;
+        };
+        let expanded = |policy: &mut Self, reason: String| {
+            policy.plan = Qwen38ProjectionPlan::Expanded;
+            policy.fallback = Some(reason);
+            policy.packing = false;
+            policy.fp8_gemv = Qwen38FastPath::legacy("native block FP8 not selected");
+        };
+        if let Some(reason) = poisoned(self.identity.as_ref()).projections {
+            return expanded(
+                self,
+                format!("self_check_failed (poisoned by an earlier load): {reason}"),
+            );
+        }
+        self.fp8_device = Fp8Device::Probe(device.clone());
+        let block = config.block_fp8.block_shape;
+        let shapes = match fp8_geometries(config, self.mtp, self.packing) {
+            Ok(shapes) => shapes,
+            Err(error) => return expanded(self, format!("FP8 geometry: {error}")),
+        };
+        let unsupported: Vec<_> = shapes
+            .iter()
+            .filter(|shape| !self.fp8_fits(**shape, block))
+            .collect();
+        if unsupported.len() == shapes.len() || (!unsupported.is_empty() && !explicit) {
+            expanded(
+                self,
+                format!("Metal FP8 kernel contract does not cover {unsupported:?}"),
+            );
+        }
     }
 
     /// The policy without a device or checkpoint, for the static estimate of
@@ -271,27 +320,62 @@ impl Qwen38ResidencyPolicy {
 
     fn base(backend: BackendKind, activation: DType, performance: &PerformanceConfig) -> Self {
         let cuda = &performance.cuda;
+        let expanded_reason =
+            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path";
         let (plan, fallback) = match backend {
             BackendKind::Cuda => (Qwen38ProjectionPlan::Q8, None),
-            BackendKind::Metal | BackendKind::Cpu => (
-                Qwen38ProjectionPlan::Expanded,
-                Some(
-                    "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
-                        .to_string(),
+            BackendKind::Cpu => (Qwen38ProjectionPlan::Expanded, Some(expanded_reason.into())),
+            BackendKind::Metal => match performance.metal.projection_backend {
+                MetalProjectionBackend::Expanded => (
+                    Qwen38ProjectionPlan::Expanded,
+                    Some("metal.projection_backend=expanded".into()),
                 ),
-            ),
+                _ if legacy_requested(FP8_PROJECTIONS_ENV) => (
+                    Qwen38ProjectionPlan::Expanded,
+                    Some(format!("{FP8_PROJECTIONS_ENV}=legacy")),
+                ),
+                _ if !cfg!(feature = "metal") || activation != DType::F16 => (
+                    Qwen38ProjectionPlan::Expanded,
+                    Some(
+                        "the Metal block-FP8 kernels need a Metal build and F16 activations".into(),
+                    ),
+                ),
+                requested => (
+                    Qwen38ProjectionPlan::NativeFp8 {
+                        explicit: requested == MetalProjectionBackend::NativeFp8,
+                    },
+                    None,
+                ),
+            },
         };
+        let metal_native =
+            backend == BackendKind::Metal && matches!(plan, Qwen38ProjectionPlan::NativeFp8 { .. });
         Self {
             backend,
             activation,
             plan,
             fallback,
-            fp8_device: Fp8Device::Unavailable,
-            fp8_gemv: Qwen38FastPath::legacy("native block FP8 not selected"),
-            packing: backend == BackendKind::Cuda
-                && cuda.enabled()
-                && cuda.packed_projections.enabled(),
-            fp8_lm_head: Qwen38FastPath::legacy("native block FP8 not selected"),
+            fp8_device: if metal_native {
+                Fp8Device::StaticMetal
+            } else {
+                Fp8Device::Unavailable
+            },
+            fp8_gemv: if !metal_native {
+                Qwen38FastPath::legacy("native block FP8 not selected")
+            } else if legacy_requested(FP8_GEMV_ENV) {
+                Qwen38FastPath::legacy(format!("{FP8_GEMV_ENV}=legacy"))
+            } else {
+                Qwen38FastPath::Fused
+            },
+            packing: metal_native
+                || backend == BackendKind::Cuda
+                    && cuda.enabled()
+                    && cuda.packed_projections.enabled(),
+            fp8_lm_head: Qwen38FastPath::legacy(if metal_native {
+                "the Metal LM head stays F16"
+            } else {
+                "native block FP8 not selected"
+            }),
             mtp: mtp_loaded_for(backend, performance),
             identity: None,
         }
@@ -423,23 +507,6 @@ impl Qwen38ResidencyPolicy {
         policy
     }
 
-    /// Tests: the same policy with packing switched off.
-    #[cfg(test)]
-    pub(crate) fn without_packing(mut self) -> Self {
-        self.packing = false;
-        self
-    }
-
-    /// Tests: a policy tied to `checkpoint` on the CPU, so poisoning applies.
-    #[cfg(test)]
-    pub(crate) fn with_identity_for_tests(mut self, checkpoint: &std::path::Path) -> Self {
-        self.identity = Some(Identity {
-            device: format!("{:?}", Device::Cpu.location()),
-            checkpoint: checkpoint.to_path_buf(),
-        });
-        self
-    }
-
     pub(crate) fn backend(&self) -> BackendKind {
         self.backend
     }
@@ -457,6 +524,26 @@ impl Qwen38ResidencyPolicy {
         self.fp8_gemv.is_fused()
     }
 
+    /// Metal: whether every FP8 projection skips the GEMV (dequantize +
+    /// matmul for every row count), from `IZWI_QWEN38_FP8_GEMV=legacy`.
+    pub(crate) fn fp8_dequant_only(&self) -> bool {
+        self.backend == BackendKind::Metal
+            && matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
+            && !self.fp8_gemv.is_fused()
+    }
+
+    /// Lazily allocated model-owned scratch the resident estimate includes:
+    /// the transient F16 expansion of Metal FP8 prefill.
+    pub(crate) fn prefill_scratch_bytes(&self) -> u64 {
+        if self.backend == BackendKind::Metal
+            && matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
+        {
+            METAL_FP8_PREFILL_DEQUANT_BYTES
+        } else {
+            0
+        }
+    }
+
     /// Whether a `[n, k]` block-FP8 projection with `block` scales runs on
     /// the compact FP8 kernels here.
     fn fp8_fits(&self, [n, k]: [usize; 2], block: [usize; 2]) -> bool {
@@ -464,6 +551,15 @@ impl Qwen38ResidencyPolicy {
             && match &self.fp8_device {
                 Fp8Device::Probe(device) => fp8::provider_supported(device, self.activation, n, k),
                 Fp8Device::Unavailable => false,
+                Fp8Device::StaticMetal => {
+                    cfg!(feature = "metal")
+                        && self.activation == DType::F16
+                        && n > 0
+                        && k > 0
+                        && n.is_multiple_of(64)
+                        && k.is_multiple_of(128)
+                        && n.checked_mul(k).is_some_and(|v| v <= i32::MAX as usize)
+                }
                 #[cfg(test)]
                 Fp8Device::Forced => {
                     n > 0 && k > 0 && n.is_multiple_of(64) && k.is_multiple_of(128)
@@ -502,7 +598,11 @@ impl Qwen38ResidencyPolicy {
         let Some(first) = forms.first() else {
             return false;
         };
-        self.packing && forms.iter().all(|form| form == first)
+        // Metal packs only raw block-FP8 groups (dense groups stay separate,
+        // as they always have there).
+        self.packing
+            && forms.iter().all(|form| form == first)
+            && (self.backend != BackendKind::Metal || *first == Qwen38WeightForm::RawFp8)
     }
 
     /// The resident form of the `[vocab, hidden]` LM head (BF16 in the
@@ -527,6 +627,11 @@ impl Qwen38ResidencyPolicy {
     pub(crate) fn representation(&self) -> Qwen38ProjectionRepresentation {
         use Qwen38ProjectionRepresentation as R;
         match (self.plan, self.activation) {
+            (Qwen38ProjectionPlan::NativeFp8 { .. }, DType::F16)
+                if self.backend == BackendKind::Metal =>
+            {
+                R::NativeFp8WithDenseF16
+            }
             (Qwen38ProjectionPlan::NativeFp8 { .. }, DType::F16) => R::NativeFp8WithQ8FallbackF16,
             (Qwen38ProjectionPlan::NativeFp8 { .. }, DType::F32) => R::ExpandedF32,
             (Qwen38ProjectionPlan::NativeFp8 { .. }, _) => R::NativeFp8WithQ8FallbackBf16,
@@ -559,6 +664,7 @@ impl Qwen38ResidencyPolicy {
     /// Why the projections run as they do, for diagnostics.
     pub(crate) fn fallback_reason(&self) -> String {
         match self.plan {
+            Qwen38ProjectionPlan::NativeFp8 { .. } if self.backend == BackendKind::Metal => "block-FP8 projections stay resident on Metal as the checkpoint's E4M3 bytes; up to 8 rows run the FP8 GEMV and longer spans expand to a transient F16 matrix for one matrix multiplication, after a load-time check of every projection kind against the original checkpoint bytes; the LM head and dense tensors stay F16".into(),
             Qwen38ProjectionPlan::NativeFp8 { .. } => "block-FP8 projections stay resident as the checkpoint's E4M3 bytes and run on the compact FP8 kernels (16-bit activations, software FP8 decode) after device gates and a load-time check against the original checkpoint bytes; not runtime-certified on CUDA hardware".into(),
             Qwen38ProjectionPlan::Q8 => format!(
                 "CUDA applies weight_scale_inv and requantizes projections to Q8_0: {}",

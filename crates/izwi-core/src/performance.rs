@@ -27,6 +27,7 @@ macro_rules! selector {
 selector!(OptimizationMode { Off => "off" });
 selector!(CudaProjectionBackend { Q8 => "q8", NativeFp8 => "native_fp8" });
 selector!(LoadingIoStrategy { Mmap => "mmap", Sequential => "sequential" });
+selector!(MetalProjectionBackend { Expanded => "expanded", NativeFp8 => "native_fp8" });
 impl OptimizationMode {
     pub const fn enabled(self) -> bool {
         matches!(self, Self::Auto)
@@ -38,6 +39,7 @@ impl OptimizationMode {
 pub struct PerformanceConfig {
     pub cuda: CudaPerformanceConfig,
     pub loading: LoadingPerformanceConfig,
+    pub metal: MetalPerformanceConfig,
     // A clone carries the same snapshot. Serialization intentionally starts a
     // new configuration lifetime and excludes process-local resolution state.
     #[serde(skip)]
@@ -50,7 +52,7 @@ pub struct PerformanceConfig {
 // already captured its environment. Round trips preserve the public contract.
 impl PartialEq for PerformanceConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.cuda == other.cuda && self.loading == other.loading
+        self.cuda == other.cuda && self.loading == other.loading && self.metal == other.metal
     }
 }
 impl Eq for PerformanceConfig {}
@@ -131,6 +133,17 @@ impl LoadingPerformanceConfig {
     }
 }
 
+/// Metal policy. Only model families with a Metal-specific residency read it
+/// (today Qwen3.8).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetalPerformanceConfig {
+    /// Block-FP8 projection residency on Metal: `auto` and `native_fp8` keep
+    /// the checkpoint's raw block-FP8 bytes resident (after a load-time
+    /// check), `expanded` expands them to F16 at load.
+    pub projection_backend: MetalProjectionBackend,
+}
+
 /// A partial layer: omitted siblings never reset earlier sources.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -139,8 +152,22 @@ pub struct PerformanceConfigOverrides {
     pub cuda: CudaPerformanceConfigOverrides,
     #[serde(skip_serializing_if = "LoadingPerformanceConfigOverrides::is_empty")]
     pub loading: LoadingPerformanceConfigOverrides,
+    #[serde(skip_serializing_if = "MetalPerformanceConfigOverrides::is_empty")]
+    pub metal: MetalPerformanceConfigOverrides,
     #[serde(skip)]
     environment_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetalPerformanceConfigOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_backend: Option<MetalProjectionBackend>,
+}
+impl MetalPerformanceConfigOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.projection_backend.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +360,9 @@ impl PerformanceConfig {
         if let Some(value) = &overrides.loading.cache_dir {
             self.loading.cache_dir = Some(value.clone());
         }
+        if let Some(value) = overrides.metal.projection_backend {
+            self.metal.projection_backend = value;
+        }
         if let Some(error) = &overrides.environment_error {
             self.environment_error = Some(error.clone());
         }
@@ -366,6 +396,9 @@ impl From<&PerformanceConfig> for PerformanceConfigOverrides {
                 cache_max_bytes: Some(config.loading.cache_max_bytes),
                 cache_dir: config.loading.cache_dir.clone(),
             },
+            metal: MetalPerformanceConfigOverrides {
+                projection_backend: Some(config.metal.projection_backend),
+            },
             environment_error: None,
         }
     }
@@ -373,7 +406,10 @@ impl From<&PerformanceConfig> for PerformanceConfigOverrides {
 
 impl PerformanceConfigOverrides {
     pub fn is_empty(&self) -> bool {
-        self.cuda.is_empty() && self.loading.is_empty() && self.environment_error.is_none()
+        self.cuda.is_empty()
+            && self.loading.is_empty()
+            && self.metal.is_empty()
+            && self.environment_error.is_none()
     }
 
     /// Compatibility wrapper retains invalid environment values as a deferred
@@ -600,6 +636,13 @@ impl PerformanceConfigOverrides {
                 )
             }
             "loading.cache_dir" => self.loading.cache_dir = Some(PathBuf::from(value)),
+            "metal.projection_backend" => {
+                self.metal.projection_backend = Some(
+                    value
+                        .parse::<MetalProjectionBackend>()
+                        .map_err(|error| Error::ConfigError(format!("{key}: {error}")))?,
+                )
+            }
             _ => {
                 return Err(Error::ConfigError(format!(
                     "unsupported performance key: {key}"
@@ -861,6 +904,15 @@ pub const ENVIRONMENT_BINDINGS: &[PerformanceEnvironmentBinding] = &[
         ],
         mode: false,
     },
+    PerformanceEnvironmentBinding {
+        key: "metal.projection_backend",
+        canonical: "IZWI_METAL_PROJECTION_BACKEND",
+        aliases: &[
+            "IZWI_PERFORMANCE_METAL_PROJECTION_BACKEND",
+            "IZWI_QWEN38_METAL_PROJECTION_BACKEND",
+        ],
+        mode: false,
+    },
 ];
 
 /// User configuration path shared by CLI and standalone server startup.
@@ -1037,6 +1089,50 @@ mod tests {
     }
 
     #[test]
+    fn metal_projection_backend_binds_from_env_toml_and_set_value() {
+        assert_eq!(
+            PerformanceConfig::default().metal.projection_backend,
+            MetalProjectionBackend::Auto
+        );
+        let env = layer(&[("IZWI_METAL_PROJECTION_BACKEND", "expanded")]);
+        assert_eq!(
+            env.metal.projection_backend,
+            Some(MetalProjectionBackend::Expanded)
+        );
+        let alias = layer(&[("IZWI_QWEN38_METAL_PROJECTION_BACKEND", "native_fp8")]);
+        assert_eq!(
+            alias.metal.projection_backend,
+            Some(MetalProjectionBackend::NativeFp8)
+        );
+        let mut config = PerformanceConfig::default();
+        config.apply_overrides(&env);
+        assert_eq!(
+            config.metal.projection_backend,
+            MetalProjectionBackend::Expanded
+        );
+        // The CUDA master switch does not govern Metal.
+        config.cuda.mode = OptimizationMode::Off;
+        assert_eq!(
+            config.normalized().metal.projection_backend,
+            MetalProjectionBackend::Expanded
+        );
+        let parsed: PerformanceConfig =
+            toml::from_str("[metal]\nprojection_backend = \"native_fp8\"").unwrap();
+        assert_eq!(
+            parsed.metal.projection_backend,
+            MetalProjectionBackend::NativeFp8
+        );
+        let mut overrides = PerformanceConfigOverrides::default();
+        overrides
+            .set_value("metal.projection_backend", "expanded")
+            .unwrap();
+        assert!(!overrides.is_empty());
+        assert!(overrides
+            .set_value("metal.projection_backend", "bf16")
+            .is_err());
+    }
+
+    #[test]
     fn each_environment_key_is_read_at_most_once() {
         let mut reads = std::collections::HashSet::new();
         PerformanceConfigOverrides::from_lookup(|key| {
@@ -1073,6 +1169,7 @@ mod tests {
             ("IZWI_LOADING_MAX_STAGING_BYTES", "0"),
             ("IZWI_LOADING_IO_STRATEGY", "random"),
             ("IZWI_CUDA_PROJECTION_BACKEND", "bf16"),
+            ("IZWI_METAL_PROJECTION_BACKEND", "q8"),
         ] {
             assert!(
                 PerformanceConfigOverrides::from_lookup(

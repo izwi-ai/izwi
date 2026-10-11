@@ -85,6 +85,7 @@ pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use performance::{
     CudaPerformanceConfig, CudaPerformanceConfigOverrides, CudaProjectionBackend,
     LoadingIoStrategy, LoadingPerformanceConfig, LoadingPerformanceConfigOverrides,
+    MetalPerformanceConfig, MetalPerformanceConfigOverrides, MetalProjectionBackend,
     OptimizationMode, PerformanceConfig, PerformanceConfigOverrides,
 };
 pub use runtime::{

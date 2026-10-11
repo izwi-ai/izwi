@@ -125,8 +125,23 @@ and BF16 logits on probe rows across the vocabulary before the head is used, and
 Both representations are designed to fit 40/48 GB-class CUDA devices with a
 resource-fitted context, subject to actual free VRAM and allocator headroom. Native
 block FP8 is not CUDA-certified until the corresponding NVIDIA evidence is
-retained. CPU and Metal continue to use their expanded F32 and F16 representations
-respectively.
+retained.
+
+### Qwen3.8 Metal weight residency
+
+On Apple Silicon, `Qwen3.8-27B-FP8` also keeps its projections as the checkpoint's
+block-FP8 bytes (about 28.9 GiB resident including a 1 GiB prefill scratch, against
+about 51 GiB for the F16 expansion), so 48 GB and 64 GB Macs can load it. Decode
+rows (up to 8) run an FP8 matrix-vector kernel that decodes E4M3 in software with
+F32 accumulation; longer prefill spans expand each projection to a transient F16
+matrix for one matrix multiplication. The LM head and the other dense tensors stay
+F16. Every kind of projection is checked against the original checkpoint bytes at
+load; a projection whose matrix-vector kernel disagrees runs the expansion instead,
+and a check that still fails fails that load, after which the next load expands to
+F16. Diagnostics report `resident_representation: native_block_fp8_with_dense_f16`.
+Set `IZWI_METAL_PROJECTION_BACKEND=expanded` (or `[runtime.performance.metal]
+projection_backend = "expanded"`) to expand to F16 at load. The CPU continues to
+use its expanded F32 representation.
 
 ### Qwen3.8 multi-token prediction defaults
 

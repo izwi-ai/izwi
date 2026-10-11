@@ -744,3 +744,283 @@ fn cuda_synthetic_lm_head_passes_the_gate_and_the_device_check() {
     .expect("a dense random head passes both checks");
     assert!(head.gate_relative_l2 < 0.08);
 }
+
+/// Production resolution on Metal: raw block FP8 with F16 activations,
+/// packed groups, every projection kind checked against the original bytes;
+/// decode rows run the FP8 GEMV and prefill spans the F16 expansion. The
+/// trunk tracks the CPU expanded F32 load and the Metal expanded F16 load.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_native_fp8_tracks_cpu_f32_and_metal_expanded_loads() {
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        eprintln!("metal device unavailable; qwen38 FP8 metal leg not run");
+        return;
+    };
+    let _guard = super::super::fast_path::counters_lock();
+    let (_dir, checkpoint) = fixture();
+    let f16 = ProjectionMaterialization::F16;
+    let performance = PerformanceConfig::default();
+    let policy = Qwen38ResidencyPolicy::resolve(
+        &device,
+        f16,
+        &performance,
+        &checkpoint.tensors,
+        &checkpoint.config,
+    );
+    assert_eq!(
+        policy.plan(),
+        Qwen38ProjectionPlan::NativeFp8 { explicit: false },
+        "{}",
+        policy.fallback_reason()
+    );
+    let before = crate::models::architectures::qwen38::telemetry::snapshot();
+    let native = Qwen38TextModel::load_native_with_policy(
+        &checkpoint.tensors,
+        &checkpoint.config,
+        &device,
+        f16,
+        &performance.cuda,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(
+        native.projection_representation(),
+        Qwen38ProjectionRepresentation::NativeFp8WithDenseF16
+    );
+    assert_eq!(
+        native.projection_representation().as_str(),
+        "native_block_fp8_with_dense_f16"
+    );
+    let forms = fp8_projection_forms(&native);
+    assert!(forms.iter().all(|(native, _)| *native), "{forms:?}");
+    assert_eq!(summarize(native.fp8_packing())["fused_layers"], 8);
+    let gemv = summarize(native.fp8_gemv_checks());
+    assert_eq!(gemv["backend"], "fused", "{gemv}");
+    // The LM head stays dense F16 on Metal.
+    assert!(matches!(native.output, Qwen38Projection::Dense(_)));
+
+    let mut expanded_performance = PerformanceConfig::default();
+    expanded_performance.metal.projection_backend =
+        crate::performance::MetalProjectionBackend::Expanded;
+    let expanded_policy = Qwen38ResidencyPolicy::resolve(
+        &device,
+        f16,
+        &expanded_performance,
+        &checkpoint.tensors,
+        &checkpoint.config,
+    );
+    assert_eq!(expanded_policy.plan(), Qwen38ProjectionPlan::Expanded);
+    let metal_expanded = Qwen38TextModel::load_native_with_policy(
+        &checkpoint.tensors,
+        &checkpoint.config,
+        &device,
+        f16,
+        &performance.cuda,
+        &expanded_policy,
+    )
+    .unwrap();
+    assert_eq!(
+        metal_expanded.projection_representation(),
+        Qwen38ProjectionRepresentation::ExpandedF16
+    );
+    let cpu = ProjectionMaterialization::F32;
+    let cpu_expanded = load(&checkpoint, cpu, &resolve(&checkpoint, cpu, &performance)).unwrap();
+
+    let cpu_arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
+    let (reference, tokens) = fixture_rows(&cpu_expanded, &cpu_arena, 0, None);
+    let arena = GoldenArena::new(&checkpoint.config, &device, DType::F16);
+    let (rows, _) = fixture_rows(&native, &arena, 0, Some(&tokens));
+    let (expanded_rows, _) = fixture_rows(&metal_expanded, &arena, 1, Some(&tokens));
+    let (mut worst_cpu, mut worst_expanded) = (0f32, 0f32);
+    for (index, ((row, cpu), expanded)) in
+        rows.iter().zip(&reference).zip(&expanded_rows).enumerate()
+    {
+        let against_cpu = relative_l2(row, cpu);
+        let against_expanded = relative_l2(row, expanded);
+        assert!(against_cpu <= 1e-2, "row {index}: vs CPU F32 {against_cpu}");
+        assert!(
+            against_expanded <= 5e-3,
+            "row {index}: vs Metal expanded {against_expanded}"
+        );
+        assert_eq!(argmax(row), argmax(cpu), "row {index}: greedy token");
+        worst_cpu = worst_cpu.max(against_cpu);
+        worst_expanded = worst_expanded.max(against_expanded);
+    }
+    eprintln!(
+        "qwen38 metal native FP8: worst relative L2 {worst_cpu:e} vs CPU F32, {worst_expanded:e} vs Metal expanded F16"
+    );
+    let after = crate::models::architectures::qwen38::telemetry::snapshot();
+    assert!(after.metal_fp8_gemv_calls_total > before.metal_fp8_gemv_calls_total);
+    assert!(
+        after.metal_fp8_dequant_matmul_calls_total > before.metal_fp8_dequant_matmul_calls_total
+    );
+}
+
+/// On Metal the load-time check sees a pack built in the wrong part order
+/// and a wrong block scale (RED), and `IZWI_QWEN38_FP8_GEMV=legacy` routes
+/// every projection through the F16 expansion with the same results.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        return;
+    };
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_dir, checkpoint) = fixture();
+    let block = checkpoint.config.block_fp8.block_shape;
+    let prefix = "model.language_model.layers.0.mlp";
+    let (gate, up) = (
+        format!("{prefix}.gate_proj.weight"),
+        format!("{prefix}.up_proj.weight"),
+    );
+    let parts: [(&str, [usize; 2]); 2] = [(&gate, [512, 256]), (&up, [512, 256])];
+    let pack = |order: &[(&str, [usize; 2])], kernel| Qwen38Projection::NativeFp8 {
+        raw: checkpoint
+            .tensors
+            .materialize_block_fp8_raw_group(order, block, &device)
+            .unwrap(),
+        kernel,
+    };
+    let check = |projection: &Qwen38Projection| {
+        fp8_projection_check(
+            &checkpoint.tensors,
+            &parts,
+            block,
+            projection,
+            DType::F16,
+            &device,
+        )
+    };
+    for kernel in [Qwen38Fp8Kernel::Reference, Qwen38Fp8Kernel::DequantOnly] {
+        check(&pack(&parts, kernel)).expect("the true pack passes");
+        assert!(check(&pack(&[parts[1], parts[0]], kernel)).is_err());
+        let Qwen38Projection::NativeFp8 { mut raw, kernel } = pack(&parts, kernel) else {
+            unreachable!()
+        };
+        let mut scales = raw
+            .scales
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        scales[5] *= 3.0;
+        raw.scales = Tensor::from_vec(scales, &raw.scale_shape, &device).unwrap();
+        assert!(check(&Qwen38Projection::NativeFp8 { raw, kernel }).is_err());
+    }
+
+    std::env::set_var(FP8_GEMV_ENV, "legacy");
+    let policy = Qwen38ResidencyPolicy::resolve(
+        &device,
+        ProjectionMaterialization::F16,
+        &PerformanceConfig::default(),
+        &checkpoint.tensors,
+        &checkpoint.config,
+    );
+    std::env::remove_var(FP8_GEMV_ENV);
+    let model = Qwen38TextModel::load_native_with_policy(
+        &checkpoint.tensors,
+        &checkpoint.config,
+        &device,
+        ProjectionMaterialization::F16,
+        &PerformanceConfig::default().cuda,
+        &policy,
+    )
+    .unwrap();
+    assert!(model.layers.iter().all(|layer| matches!(
+        layer.mlp.down,
+        Qwen38Projection::NativeFp8 {
+            kernel: Qwen38Fp8Kernel::DequantOnly,
+            ..
+        }
+    )));
+    assert_eq!(summarize(model.fp8_gemv_checks())["backend"], "legacy");
+}
+
+/// The generic Metal FP8 GEMV at the 27B projection shapes (decode rows) and
+/// the F16 expansion + matmul at prefill row counts, against a host
+/// reference from the same bytes on sampled output rows.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_fp8_kernels_match_the_host_reference_at_qwen38_shapes() {
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        return;
+    };
+    let pattern: Vec<u8> = (0..4093u32)
+        .map(|i| match (i.wrapping_mul(0x9E37_79B1) >> 11) as u8 {
+            b if b & 0x7f == 0x7f => b ^ 0x22,
+            b => b,
+        })
+        .collect();
+    let run = |[n, k]: [usize; 2], rows: &[usize]| {
+        let mut bytes = Vec::with_capacity(n * k);
+        while bytes.len() < n * k {
+            let take = pattern.len().min(n * k - bytes.len());
+            bytes.extend_from_slice(&pattern[..take]);
+        }
+        let scale_shape = [n.div_ceil(128), k.div_ceil(128)];
+        let scales: Vec<f32> = (0..scale_shape[0] * scale_shape[1])
+            .map(|i| 2e-4 * (1.0 + (i % 17) as f32 * 0.21))
+            .collect();
+        let projection = Qwen38Projection::NativeFp8 {
+            raw: super::super::native::RawBlockFp8Projection {
+                weights: Tensor::from_slice(&bytes, (n, k), &device).unwrap(),
+                scales: Tensor::from_slice(&scales, (scale_shape[0], scale_shape[1]), &device)
+                    .unwrap(),
+                shape: [n, k],
+                scale_shape,
+                block_shape: [128, 128],
+            },
+            kernel: Qwen38Fp8Kernel::Reference,
+        };
+        let sampled: Vec<usize> = (0..n).step_by(61).chain([n - 1]).collect();
+        for &m in rows {
+            let x = probe_activations(m, k, DType::F16, m as u64);
+            let input = Tensor::from_vec(x.clone(), (1, m, k), &device)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap();
+            let output = projection
+                .forward(&input)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            for (row, activations) in x.chunks(k).enumerate() {
+                for &channel in &sampled {
+                    actual.push(output[row * n + channel]);
+                    expected.push(fp8_row_dot(
+                        &bytes[channel * k..(channel + 1) * k],
+                        &scales,
+                        channel / 128,
+                        scale_shape[1],
+                        128,
+                        activations,
+                    ));
+                }
+            }
+            compare_values(&format!("[{n}, {k}] m={m}"), &actual, &expected, 0.01, 0.02).unwrap();
+        }
+    };
+    for shape in [
+        [17408, 5120],
+        [5120, 17408],
+        [16384, 5120],
+        [14336, 5120],
+        [5120, 6144],
+        [34816, 5120],
+    ] {
+        run(shape, &[1, 2, 3, 4]);
+    }
+    run([1024, 5120], &[9, 64, 256]);
+}

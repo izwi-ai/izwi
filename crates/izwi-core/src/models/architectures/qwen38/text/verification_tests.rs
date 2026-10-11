@@ -108,6 +108,7 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
             &crate::performance::PerformanceConfig::default(),
         ),
         fp8_packing: Vec::new(),
+        fp8_gemv_checks: Vec::new(),
         fp8_lm_head: (Qwen38FastPath::legacy("not loaded"), None),
         token_embeddings: Embedding::new(
             Tensor::from_vec(

@@ -307,6 +307,8 @@ pub(crate) struct Qwen38MtpHead {
     fused_norm_path: Qwen38FastPath,
     /// One entry per block-FP8 projection group: packed, or why not.
     fp8_packing: Vec<Qwen38FastPath>,
+    /// Metal: the GEMV check outcome of every FP8 projection kind.
+    fp8_gemv_checks: Vec<Qwen38FastPath>,
 }
 
 impl Qwen38MtpHead {
@@ -428,8 +430,9 @@ impl Qwen38MtpHead {
             },
             fused_norm_path: Qwen38FastPath::default(),
             fp8_packing: Vec::new(),
+            fp8_gemv_checks: Vec::new(),
         };
-        head.fp8_packing = loader.into_packing();
+        (head.fp8_packing, head.fp8_gemv_checks) = loader.into_outcomes();
         head.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
         Ok(head)
     }
@@ -482,6 +485,11 @@ impl Qwen38MtpHead {
     /// Packing outcome of every block-FP8 projection group of the head.
     pub(crate) fn fp8_packing(&self) -> &[Qwen38FastPath] {
         &self.fp8_packing
+    }
+
+    /// Metal: the GEMV check outcome of every FP8 projection kind.
+    pub(crate) fn fp8_gemv_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_gemv_checks
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {

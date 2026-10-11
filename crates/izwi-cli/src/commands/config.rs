@@ -42,6 +42,7 @@ fn default_config_contents() -> Result<String> {
 # Opt out: izwi config set runtime.performance.cuda.mode off\n\
 # Loading opt-out: izwi config set runtime.performance.loading.mode off\n\
 # Each feature accepts auto/off. projection_backend: auto/q8/native_fp8.\n\
+# metal.projection_backend (Qwen3.8 on Metal): auto/expanded/native_fp8.\n\
 # io_strategy: auto/mmap/sequential; mtp_draft_tokens: 1..3.\n\
 # workers=0 chooses automatically; staging and cache limits are bytes.\n\
 # Precedence: defaults < TOML < environment < CLI.\n\
