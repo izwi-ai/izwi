@@ -3742,10 +3742,11 @@ impl NativeChatModel {
                 model.mtp_in_continuous_enabled(),
             ),
             // Solo speculative quanta plus, with a loaded head, the DS9.4
-            // continuous envelope; sustained-CUDA quanta stay qwen3.8-only.
+            // continuous envelope; the graph-decode quantum (no MTP head) is
+            // sustained past the soft SLA.
             Self::Qwen36Moe(model) => (
                 model.preferred_decode_tokens(),
-                false,
+                model.sustained_decode_quantum(),
                 model.speculative_batch_enabled(),
             ),
             Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {

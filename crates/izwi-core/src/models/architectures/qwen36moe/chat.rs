@@ -473,6 +473,16 @@ impl Qwen36MoeChatModel {
         }
     }
 
+    /// Whether the graph-decode quantum outlives the request's soft
+    /// scheduling SLA. An interactive or streaming request passes that SLA
+    /// (0.65-0.75 s at normal priority) early in almost every stream, after
+    /// which the scheduler would grant one token per step for the rest of
+    /// it. The quantum still yields to waiting or co-batched work and to hard
+    /// deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.exec.mtp_head.is_none() && self.preferred_decode_tokens() > 1
+    }
+
     /// Serving diagnostics for the admin model API: KV storage, performance
     /// policy, and the MTP draft state.
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
@@ -1404,6 +1414,7 @@ pub(crate) mod tests {
         // No graph decode on the CPU fixture: one token per engine step.
         let (model, dir) = load_fixture("quantum");
         assert_eq!(model.preferred_decode_tokens(), 1);
+        assert!(!model.sustained_decode_quantum());
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1457,6 +1468,8 @@ pub(crate) mod tests {
             assert_eq!(text_model.graph_step_ready(), quantum.is_some());
             model.exec.text_model = text_model;
             model.exec.text_config = text_config;
+            // Graph decode asks for its quantum past the soft SLA.
+            assert_eq!(model.sustained_decode_quantum(), quantum.is_some());
             let cache = e2e_cache(&Device::Cpu);
             let mut state = model
                 .start_decode_state_physical(&messages, 9, config, None, cache)
