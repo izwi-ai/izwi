@@ -2956,8 +2956,21 @@ fn build_mrope(
         }
     }
 
-    let emb = Tensor::from_vec(interleaved, (1, 1, half_dim), device)?.to_dtype(dtype)?;
-    Ok((emb.cos()?, emb.sin()?))
+    // Take cos/sin of the F32 angles and cast only the results, as HF does
+    // (`emb.cos()` / `emb.sin()` in fp32, then `.to(x.dtype)`). Rounding the
+    // angle to the plan dtype first puts BF16's 8-bit mantissa on
+    // `position * inv_freq` (at theta 1e7 the fastest pairs drift ~0.1 rad
+    // within a few hundred tokens and rotate randomly by ~4K) and overflows
+    // an F16 angle to inf (NaN cos/sin) past position 65504. The trigonometry
+    // runs on the host because Candle compiles its Metal kernels with fast
+    // math, whose F32 cos/sin miss by ~1e-4 at position 4K and ~1e-2 at 262K.
+    let trig = interleaved
+        .iter()
+        .map(|angle| angle.cos())
+        .chain(interleaved.iter().map(|angle| angle.sin()))
+        .collect::<Vec<_>>();
+    let trig = Tensor::from_vec(trig, (2, 1, 1, half_dim), device)?.to_dtype(dtype)?;
+    Ok((trig.i(0)?, trig.i(1)?))
 }
 
 fn build_mrope_plan(
@@ -3860,6 +3873,78 @@ mod tests {
             assert!((cos_vals[0][0][idx] - expected_theta.cos()).abs() < 1e-5);
             assert!((sin_vals[0][0][idx] - expected_theta.sin()).abs() < 1e-5);
         }
+    }
+
+    /// Half-precision plans (BF16 CUDA, F16 Metal) must round cos/sin, never
+    /// the angle: at long positions a BF16 angle is phase noise and an F16
+    /// angle overflows to inf. Each `(dtype, tolerance)` plan built on
+    /// `device` must match the cos/sin of the exact F32 angle.
+    fn assert_mrope_plan_rounds_only_cos_sin(device: &Device, plans: &[(DType, f64)]) {
+        // Qwen3.8-27B rotary geometry: 64 rotary dims, theta 1e7.
+        let rope_dim = 64;
+        let inv_freqs = build_rope_inv_freqs(rope_dim, 10_000_000.0).unwrap();
+        let positions = [4_096usize, 30_000, 70_000, 262_143];
+        let position_ids = positions.map(|position| [position; 3]);
+        for &(dtype, tolerance) in plans {
+            let plan = build_mrope_plan(
+                rope_dim,
+                &position_ids,
+                &[11, 11, 10],
+                &inv_freqs,
+                device,
+                dtype,
+            )
+            .unwrap();
+            for (values, trig) in [
+                (plan.cos.as_ref().unwrap(), f64::cos as fn(f64) -> f64),
+                (plan.sin.as_ref().unwrap(), f64::sin),
+            ] {
+                assert_eq!(values.dtype(), dtype);
+                let values = values
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    let (row, pair) = (index / inv_freqs.len(), index % inv_freqs.len());
+                    // The exact F32 angle HF and the plan both compute.
+                    let angle = positions[row] as f32 * inv_freqs[pair];
+                    let expected = trig(f64::from(angle));
+                    assert!(
+                        (f64::from(*value) - expected).abs() < tolerance,
+                        "{dtype:?} position {} pair {pair}: {value} vs {expected}",
+                        positions[row]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mrope_plan_keeps_long_position_angles_in_f32() {
+        assert_mrope_plan_rounds_only_cos_sin(
+            &Device::Cpu,
+            &[
+                (DType::F32, 1e-5),
+                // Half an ulp near 1, plus slack: 2^-9 for BF16, 2^-12 for F16.
+                (DType::BF16, 4e-3),
+                (DType::F16, 1e-3),
+            ],
+        );
+    }
+
+    /// The Metal plan's tables must match too: Candle's fast-math Metal
+    /// cos/sin would already miss the F32 tolerance at position 4096.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn mrope_plan_keeps_long_position_angles_in_f32_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; qwen38 mrope metal leg not run");
+            return;
+        };
+        assert_mrope_plan_rounds_only_cos_sin(&device, &[(DType::F32, 1e-5), (DType::F16, 1e-3)]);
     }
 
     #[test]
