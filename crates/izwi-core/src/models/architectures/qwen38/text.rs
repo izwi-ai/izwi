@@ -4088,3 +4088,6 @@ mod tests {
 
 #[cfg(test)]
 mod verification_tests;
+
+#[cfg(test)]
+mod golden_tests;

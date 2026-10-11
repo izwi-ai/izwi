@@ -119,6 +119,10 @@ pub struct Qwen38NativeConfig {
 
 impl Qwen38NativeConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
+        Self::load_with_policy(model_dir, geometry_policy_from_env())
+    }
+
+    fn load_with_policy(model_dir: &Path, policy: Qwen38GeometryPolicy) -> Result<Self> {
         let path = model_dir.join(CONFIG_FILE);
         let raw = fs::read(&path).map_err(|err| {
             Error::ModelLoadError(format!(
@@ -126,11 +130,14 @@ impl Qwen38NativeConfig {
                 path.display()
             ))
         })?;
-        Self::from_json(&raw)
+        Self::from_json_with_policy(&raw, policy)
     }
 
     pub fn from_json(raw: &[u8]) -> Result<Self> {
-        let policy = geometry_policy_from_env();
+        Self::from_json_with_policy(raw, geometry_policy_from_env())
+    }
+
+    fn from_json_with_policy(raw: &[u8], policy: Qwen38GeometryPolicy) -> Result<Self> {
         let config = parse_hf_config(raw)?;
         if policy == Qwen38GeometryPolicy::Synthetic {
             tracing::warn!(
@@ -1166,7 +1173,27 @@ impl Qwen38NativeCheckpoint {
     }
 
     pub fn open_with_options(model_dir: &Path, options: &LoadingPerformanceConfig) -> Result<Self> {
-        let config = Qwen38NativeConfig::load(model_dir)?;
+        Self::open_with_policy(model_dir, options, geometry_policy_from_env())
+    }
+
+    /// Open a synthetic-geometry fixture through the production validation,
+    /// without mutating the process environment, so parallel tests never race
+    /// on [`ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`].
+    #[cfg(test)]
+    pub(crate) fn open_synthetic(model_dir: &Path) -> Result<Self> {
+        Self::open_with_policy(
+            model_dir,
+            &LoadingPerformanceConfig::default(),
+            Qwen38GeometryPolicy::Synthetic,
+        )
+    }
+
+    fn open_with_policy(
+        model_dir: &Path,
+        options: &LoadingPerformanceConfig,
+        policy: Qwen38GeometryPolicy,
+    ) -> Result<Self> {
+        let config = Qwen38NativeConfig::load_with_policy(model_dir, policy)?;
         let tensors = IndexedSafetensors::open_with_options(model_dir, options)?;
         tensors.validate_required_text_tensor_names(&config)?;
         let mtp = tensors.validate_mtp_tensor_manifest(&config)?;
