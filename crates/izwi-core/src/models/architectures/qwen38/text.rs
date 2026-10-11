@@ -11,13 +11,17 @@ use std::sync::Arc;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
+use super::fast_path::{
+    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_NORM_ENV,
+};
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
 };
 use super::telemetry::{
     record_cuda_attention_dtype_casts, record_cuda_head_expansion_materialization,
-    record_cuda_kernel, record_cuda_projection, record_cuda_rope,
-    record_cuda_state_initial_allocation, CudaKernelPath, CudaProjectionPath,
+    record_cuda_kernel, record_cuda_projection, record_cuda_rms_norm_composition, record_cuda_rope,
+    record_cuda_state_initial_allocation, record_fused_rms_norm, CudaKernelPath,
+    CudaProjectionPath,
 };
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -27,6 +31,7 @@ use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::norm;
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
@@ -51,6 +56,8 @@ pub struct Qwen38TextModel {
     output_norm: Qwen38RmsNorm,
     output: Qwen38Projection,
     finite_diagnostics_enabled: bool,
+    /// Fused residual add + RMSNorm over every trunk norm.
+    fused_norm_path: Qwen38FastPath,
 }
 
 /// One target-model prefill pass retained for MTP prompt alignment.
@@ -624,9 +631,30 @@ enum Qwen38ProjectionGroup {
 pub(super) struct Qwen38RmsNorm {
     weight: Tensor,
     eps: f64,
+    /// One-launch kernel (`kernels/cuda/norm.rs`) for 16-bit activations with
+    /// this F32 gain, enabled by [`Qwen38TextModel::resolve_fast_paths`].
+    fused: bool,
 }
 
 impl Qwen38RmsNorm {
+    fn new(weight: Tensor, eps: f64) -> Self {
+        Self {
+            weight,
+            eps,
+            fused: false,
+        }
+    }
+
+    pub(super) fn set_fused(&mut self, fused: bool) {
+        self.fused = fused;
+    }
+
+    fn fused_applies(&self, input: &Tensor) -> bool {
+        self.fused
+            && self.weight.dtype() == DType::F32
+            && matches!(input.dtype(), DType::F16 | DType::BF16)
+    }
+
     /// Normalize `input`, also returning the F32 temporaries a half-precision
     /// input needs, which a captured graph region must retain.
     fn forward_retaining(&self, input: &Tensor) -> candle_core::Result<(Tensor, Vec<Tensor>)> {
@@ -638,11 +666,79 @@ impl Qwen38RmsNorm {
         let normalized = candle_nn::ops::rms_norm(&wide, &self.weight, self.eps as f32)?;
         Ok((normalized.to_dtype(input.dtype())?, vec![wide, normalized]))
     }
+
+    /// `(residual + delta, norm(residual + delta))`: one launch when fused,
+    /// otherwise the add and the composition. The sum is rounded to the
+    /// activation dtype before the norm either way.
+    pub(super) fn add_forward(
+        &self,
+        residual: &Tensor,
+        delta: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.fused_applies(residual)
+            && delta.dtype() == residual.dtype()
+            && delta.dims() == residual.dims()
+        {
+            record_fused_rms_norm(true);
+            return Ok(norm::add_rms_norm(
+                residual,
+                delta,
+                &self.weight,
+                self.eps as f32,
+            )?);
+        }
+        let sum = (residual + delta)?;
+        let normalized = self.forward(&sum)?;
+        Ok((sum, normalized))
+    }
 }
 
 impl Module for Qwen38RmsNorm {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        if self.fused_applies(input) {
+            record_fused_rms_norm(false);
+            return norm::rms_norm(input, &self.weight, self.eps as f32);
+        }
+        if input.device().is_cuda() {
+            record_cuda_rms_norm_composition();
+        }
         self.forward_retaining(input).map(|(output, _)| output)
+    }
+}
+
+/// The residual stream at a layer boundary, with the previous layer's MLP
+/// output optionally not yet added: the next norm folds that add into its
+/// launch ([`Qwen38RmsNorm::add_forward`]).
+struct Qwen38Hidden {
+    residual: Tensor,
+    pending: Option<Tensor>,
+}
+
+impl Qwen38Hidden {
+    fn new(residual: Tensor) -> Self {
+        Self {
+            residual,
+            pending: None,
+        }
+    }
+
+    /// The pre-norm hidden state with any pending add applied.
+    fn materialize(self) -> Result<Tensor> {
+        match self.pending {
+            Some(delta) => (&self.residual + &delta).map_err(Error::from),
+            None => Ok(self.residual),
+        }
+    }
+
+    /// `(residual stream, norm(residual stream))` for the next layer.
+    fn normalized(self, norm: &Qwen38RmsNorm) -> Result<(Tensor, Tensor)> {
+        match self.pending {
+            Some(delta) => norm.add_forward(&self.residual, &delta),
+            None => {
+                let normalized = norm.forward(&self.residual)?;
+                Ok((self.residual, normalized))
+            }
+        }
     }
 }
 
@@ -853,7 +949,7 @@ impl Qwen38TextModel {
                 mlp,
             });
         }
-        Ok(Self {
+        let mut model = Self {
             device: device.clone(),
             projection_representation,
             token_embeddings,
@@ -861,7 +957,10 @@ impl Qwen38TextModel {
             output_norm,
             output,
             finite_diagnostics_enabled: qwen38_env_bool("IZWI_QWEN38_FINITE_DIAGNOSTICS", false),
-        })
+            fused_norm_path: Qwen38FastPath::default(),
+        };
+        model.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
+        Ok(model)
     }
 
     pub(super) fn graph_diagnostics(&self) -> serde_json::Value {
@@ -979,7 +1078,7 @@ impl Qwen38TextModel {
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<(Tensor, Tensor)> {
             let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = self.token_embeddings.forward(&input)?;
+            let mut hidden = Qwen38Hidden::new(self.token_embeddings.forward(&input)?);
             let mut physical_layer = 0usize;
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 let mut layer_states = states
@@ -994,7 +1093,7 @@ impl Qwen38TextModel {
                     .map(|cache| &**cache)
                     .collect::<Vec<&PhysicalPagedKvCache>>();
                 hidden = layer.forward_physical_decode_batch(
-                    &hidden,
+                    hidden,
                     &mut layer_states,
                     position_ids,
                     &cache_refs,
@@ -1003,11 +1102,10 @@ impl Qwen38TextModel {
                     &mut completions,
                     &mut physical_layer,
                 )?;
-                validate_qwen38_finite_tensor(
-                    &hidden,
+                hidden = self.validate_layer_output(
+                    hidden,
                     layer_index,
                     layer.decode_diagnostic_path(),
-                    self.finite_diagnostics_enabled,
                 )?;
             }
             if physical_layer != sparse_layers.len() {
@@ -1015,6 +1113,7 @@ impl Qwen38TextModel {
                     "Qwen3.8 batched attention did not cover every sparse layer".into(),
                 ));
             }
+            let hidden = hidden.materialize()?;
             let logits = self.project_target_hidden_span(&hidden)?;
             Ok((hidden, logits))
         })();
@@ -1234,13 +1333,13 @@ impl Qwen38TextModel {
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.ensure_state_initialized(layer_state, &self.device)?;
         }
-        let mut hidden = input.clone();
+        let mut hidden = Qwen38Hidden::new(input.clone());
         let mut physical_layer = 0usize;
         for (layer_index, (layer, layer_state)) in
             self.layers.iter().zip(state.layers.iter_mut()).enumerate()
         {
             hidden = layer.forward_physical(
-                &hidden,
+                hidden,
                 layer_state,
                 &mrope_plan,
                 cache,
@@ -1248,15 +1347,14 @@ impl Qwen38TextModel {
                 &mut physical_layer,
                 verification.as_mut().map(|layers| &mut layers[layer_index]),
             )?;
-            validate_qwen38_finite_tensor(
-                &hidden,
+            hidden = self.validate_layer_output(
+                hidden,
                 layer_index,
                 if sequence_len == 1 {
                     layer.decode_diagnostic_path()
                 } else {
                     layer.prefill_diagnostic_path()
                 },
-                self.finite_diagnostics_enabled,
             )?;
         }
         if physical_layer != sparse_layers.len() {
@@ -1264,8 +1362,26 @@ impl Qwen38TextModel {
                 "Qwen3.8 physical attention did not cover every sparse layer".into(),
             ));
         }
+        let hidden = hidden.materialize()?;
         cache.commit_prepared(prepared)?;
         Ok(hidden)
+    }
+
+    /// Finite-value diagnostics over a layer's output. Only when they are
+    /// enabled does the pending residual add materialize here instead of in
+    /// the next norm.
+    fn validate_layer_output(
+        &self,
+        hidden: Qwen38Hidden,
+        layer_index: usize,
+        path: &'static str,
+    ) -> Result<Qwen38Hidden> {
+        if !self.finite_diagnostics_enabled {
+            return Ok(hidden);
+        }
+        let hidden = hidden.materialize()?;
+        validate_qwen38_finite_tensor(&hidden, layer_index, path, true)?;
+        Ok(Qwen38Hidden::new(hidden))
     }
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -1290,6 +1406,66 @@ impl Qwen38TextModel {
             self.finite_diagnostics_enabled,
         )?;
         Ok(logits)
+    }
+
+    /// Resolve the fused fast paths at load: CUDA in production, while
+    /// `allow_cpu` resolves them against the portable CPU references in tests.
+    /// Each path turns on only after its self-check on this device passes.
+    pub(super) fn resolve_fast_paths(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
+        self.resolve_fused_norms(switches, allow_cpu);
+    }
+
+    /// Resolve every fast path against the portable CPU references (tests
+    /// only): production resolution enables them on CUDA alone.
+    #[cfg(test)]
+    pub(super) fn enable_fast_paths_for_tests(&mut self) {
+        self.resolve_fast_paths(&Qwen38CudaSwitches::default(), true);
+    }
+
+    /// Fast-path resolutions for the admin diagnostics.
+    pub(super) fn fast_path_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rms_norm": summarize([&self.fused_norm_path]),
+        })
+    }
+
+    /// The plan's activation dtype (the embedding table's).
+    fn activation_dtype(&self) -> DType {
+        self.token_embeddings.embeddings().dtype()
+    }
+
+    /// Fused residual add + RMSNorm on every trunk norm (layer, q/k and
+    /// output norms), after a self-check of layer 0's input norm and the first
+    /// q norm against the composition. `IZWI_QWEN38_FUSED_NORM=legacy` keeps
+    /// the cast, norm, cast chain.
+    fn resolve_fused_norms(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
+        let dtype = self.activation_dtype();
+        let path = resolve_norm_path(switches, &self.device, allow_cpu, dtype, || {
+            let mut norms = Vec::with_capacity(2);
+            if let Some(layer) = self.layers.first() {
+                norms.push(&layer.attn_norm);
+            }
+            if let Some(attention) = self.layers.iter().find_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Full(attention) => Some(attention),
+                Qwen38Mixer::Linear(_) => None,
+            }) {
+                norms.push(&attention.q_norm);
+            }
+            norms
+                .into_iter()
+                .try_for_each(|norm| norm_self_check(norm, &self.device, dtype))
+        });
+        let fused = path.is_fused();
+        self.output_norm.fused = fused;
+        for layer in &mut self.layers {
+            layer.attn_norm.fused = fused;
+            layer.post_attention_norm.fused = fused;
+            if let Qwen38Mixer::Full(attention) = &mut layer.mixer {
+                attention.q_norm.fused = fused;
+                attention.k_norm.fused = fused;
+            }
+        }
+        self.fused_norm_path = path;
     }
 
     fn validate_runtime_state(&self, state: &Qwen38TextRuntimeState) -> Result<()> {
@@ -1368,6 +1544,10 @@ impl Qwen38Layer {
     }
 
     fn residual_norm(&self, residual: &Tensor, mixed: &Tensor) -> Result<(Tensor, Tensor)> {
+        if self.post_attention_norm.fused_applies(residual) {
+            // One launch already; the graph region would only wrap it.
+            return self.post_attention_norm.add_forward(residual, mixed);
+        }
         if self.graphs_enabled
             && residual
                 .dims3()
@@ -1411,18 +1591,28 @@ impl Qwen38Layer {
         Ok((sum, normalized))
     }
 
+    /// The layer tail after its mixer: residual add + post-attention norm,
+    /// then the MLP, whose output the next norm adds.
+    fn post_mixer(&self, residual: &Tensor, mixed: &Tensor) -> Result<Qwen38Hidden> {
+        let (residual, hidden_states) = self.residual_norm(residual, mixed)?;
+        let mlp_output = self.mlp.forward(&hidden_states)?;
+        Ok(Qwen38Hidden {
+            residual,
+            pending: Some(mlp_output),
+        })
+    }
+
     fn forward_physical(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen38Hidden,
         state: &mut Qwen38LayerRuntimeState,
         mrope_plan: &Qwen38MropePlan,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
         verification: Option<&mut Option<Qwen38LinearVerification>>,
-    ) -> Result<Tensor> {
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+    ) -> Result<Qwen38Hidden> {
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen38Mixer::Linear(mixer) => {
                 if normalized.dim(1)? == 1 {
@@ -1445,14 +1635,13 @@ impl Qwen38Layer {
                 output
             }
         };
-        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        self.post_mixer(&residual, &mixed)
     }
 
-    pub(super) fn forward_physical_decode_batch(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_physical_decode_batch(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen38Hidden,
         states: &mut [&mut Qwen38LayerRuntimeState],
         position_ids: &[[usize; 3]],
         caches: &[&PhysicalPagedKvCache],
@@ -1460,9 +1649,9 @@ impl Qwen38Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: &mut usize,
-    ) -> Result<Tensor> {
-        let batch_size = hidden_states.dim(0)?;
-        if hidden_states.dim(1)? != 1
+    ) -> Result<Qwen38Hidden> {
+        let batch_size = hidden.residual.dim(0)?;
+        if hidden.residual.dim(1)? != 1
             || batch_size == 0
             || states.len() != batch_size
             || position_ids.len() != batch_size
@@ -1472,8 +1661,7 @@ impl Qwen38Layer {
                 "Qwen3.8 layer decode batch dimensions do not match".into(),
             ));
         }
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen38Mixer::Linear(mixer) => mixer.forward_decode_batch(&normalized, states)?,
             Qwen38Mixer::Full(mixer) => {
@@ -1492,9 +1680,7 @@ impl Qwen38Layer {
                 output
             }
         };
-        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        self.post_mixer(&residual, &mixed)
     }
 }
 
@@ -1937,6 +2123,15 @@ impl Qwen38FullAttention {
 
     pub(super) fn cache_geometry(&self) -> (usize, usize, usize) {
         (self.num_kv_heads, self.head_dim, self.head_dim)
+    }
+
+    pub(super) fn q_norm(&self) -> &Qwen38RmsNorm {
+        &self.q_norm
+    }
+
+    pub(super) fn set_fused_norms(&mut self, fused: bool) {
+        self.q_norm.set_fused(fused);
+        self.k_norm.set_fused(fused);
     }
 
     fn apply_rope_plan(
@@ -2896,7 +3091,107 @@ pub(super) fn load_native_zero_centered_norm(
         device,
     )?;
     let weight = (weight + 1.0)?;
-    Ok(Qwen38RmsNorm { weight, eps })
+    Ok(Qwen38RmsNorm::new(weight, eps))
+}
+
+/// Resolve the fused norm path for `dtype` activations on `device`, running
+/// `self_check` only when everything else allows the kernel.
+pub(super) fn resolve_norm_path(
+    switches: &Qwen38CudaSwitches,
+    device: &Device,
+    allow_cpu: bool,
+    dtype: DType,
+    self_check: impl FnOnce() -> Result<()>,
+) -> Qwen38FastPath {
+    if let Some(path) = decode_gate(FUSED_NORM_ENV, switches, device, allow_cpu) {
+        path
+    } else if !matches!(dtype, DType::F16 | DType::BF16) {
+        Qwen38FastPath::legacy(format!(
+            "fused RMSNorm needs 16-bit activations, the plan computes in {dtype:?}"
+        ))
+    } else if !norm::supported(device, dtype) {
+        Qwen38FastPath::legacy("fused RMSNorm needs SM80+")
+    } else {
+        match self_check() {
+            Ok(()) => Qwen38FastPath::Fused,
+            Err(error) => Qwen38FastPath::self_check_failed("RMSNorm", &error),
+        }
+    }
+}
+
+/// Compare the fused add + RMSNorm and plain RMSNorm with `norm`'s own gain
+/// against the composition (`forward_retaining`) on `device`, over three
+/// `dtype` rows: the rounded residual sum exactly, the outputs to rounding.
+pub(super) fn norm_self_check(norm: &Qwen38RmsNorm, device: &Device, dtype: DType) -> Result<()> {
+    norm_self_check_with_gain(norm, &norm.weight, device, dtype)
+}
+
+/// [`norm_self_check`] with `gain` handed to the fused kernels; the
+/// composition always uses the norm's own gain.
+fn norm_self_check_with_gain(
+    norm: &Qwen38RmsNorm,
+    gain: &Tensor,
+    device: &Device,
+    dtype: DType,
+) -> Result<()> {
+    if norm.weight.dtype() != DType::F32 {
+        return Err(Error::InferenceError(
+            "the norm gain is not F32; nothing to fuse".into(),
+        ));
+    }
+    let hidden = norm.weight.elem_count();
+    let tensor = |seed: f32| -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            self_check_wave(3 * hidden, seed, 3.0),
+            (3, 1, hidden),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?)
+    };
+    let (residual, delta) = (tensor(1.0)?, tensor(2.0)?);
+    let eps = norm.eps as f32;
+    let (sum, fused) = norm::add_rms_norm(&residual, &delta, gain, eps)?;
+    let expected_sum = (&residual + &delta)?;
+    let (expected, _) = norm.forward_retaining(&expected_sum)?;
+    compare_values(
+        "fused residual sum",
+        &host_values(&sum)?,
+        &host_values(&expected_sum)?,
+        1e-6,
+        1e-6,
+    )?;
+    compare_values(
+        "fused add+RMSNorm",
+        &host_values(&fused)?,
+        &host_values(&expected)?,
+        0.01,
+        0.02,
+    )?;
+    let plain = norm::rms_norm(&residual, gain, eps)?;
+    let (plain_expected, _) = norm.forward_retaining(&residual)?;
+    compare_values(
+        "fused RMSNorm",
+        &host_values(&plain)?,
+        &host_values(&plain_expected)?,
+        0.01,
+        0.02,
+    )
+}
+
+/// Deterministic self-check input: `scale * sin((i + seed) * phi)`.
+fn self_check_wave(len: usize, seed: f32, scale: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+        .collect()
+}
+
+/// All values of `tensor` as host F32.
+fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
+    Ok(tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?)
 }
 
 fn normalize_conv_kernel(
@@ -4239,6 +4534,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod fast_path_tests;
 #[cfg(test)]
 mod verification_tests;
 

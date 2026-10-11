@@ -3,16 +3,17 @@
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use candle_core::{Device, Module, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 
+use super::fast_path::{summarize, Qwen38CudaSwitches, Qwen38FastPath};
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38MtpInventory, Qwen38NativeConfig,
     QWEN38_MTP_TENSOR_COUNT,
 };
 use super::text::{
     load_native_projection, load_native_zero_centered_norm, native_fp8_selected,
-    native_projection_representation, Qwen38FullAttention, Qwen38Mlp, Qwen38Projection,
-    Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38TextModel,
+    native_projection_representation, norm_self_check, resolve_norm_path, Qwen38FullAttention,
+    Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38TextModel,
 };
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
@@ -299,6 +300,10 @@ pub(crate) struct Qwen38MtpHead {
     post_attention_layernorm: Qwen38RmsNorm,
     mlp: Qwen38Mlp,
     norm: Qwen38RmsNorm,
+    /// The plan's activation dtype.
+    activation_dtype: DType,
+    /// Fused residual add + RMSNorm over the head's own norms.
+    fused_norm_path: Qwen38FastPath,
 }
 
 impl Qwen38MtpHead {
@@ -350,7 +355,7 @@ impl Qwen38MtpHead {
         let eps = cfg.attention_layer_norm_rms_epsilon;
         let model_layer = u32::try_from(cfg.block_count)
             .map_err(|_| Error::ModelLoadError("Qwen3.8 MTP layer id exceeds u32".into()))?;
-        Ok(Self {
+        let mut head = Self {
             device: device.clone(),
             projection_representation: if native_fp8_selected(
                 device,
@@ -417,11 +422,54 @@ impl Qwen38MtpHead {
             )?,
             mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target, performance)?,
             norm: load_native_zero_centered_norm(tensors, "mtp.norm.weight", hidden, eps, device)?,
-        })
+            activation_dtype: match target {
+                ProjectionMaterialization::F32 => DType::F32,
+                ProjectionMaterialization::F16 => DType::F16,
+                ProjectionMaterialization::BF16 => DType::BF16,
+            },
+            fused_norm_path: Qwen38FastPath::default(),
+        };
+        head.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
+        Ok(head)
     }
 
     pub(crate) fn graph_diagnostics(&self) -> serde_json::Value {
         self.mlp.graph_diagnostics()
+    }
+
+    /// Resolve the head's fast paths on its own weights, like
+    /// [`Qwen38TextModel::resolve_fast_paths`] does for the trunk.
+    pub(crate) fn resolve_fast_paths(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
+        let dtype = self.activation_dtype;
+        let path = resolve_norm_path(switches, &self.device, allow_cpu, dtype, || {
+            norm_self_check(&self.input_layernorm, &self.device, dtype)?;
+            norm_self_check(self.attention.q_norm(), &self.device, dtype)
+        });
+        let fused = path.is_fused();
+        for norm in [
+            &mut self.pre_fc_norm_embedding,
+            &mut self.pre_fc_norm_hidden,
+            &mut self.input_layernorm,
+            &mut self.post_attention_layernorm,
+            &mut self.norm,
+        ] {
+            norm.set_fused(fused);
+        }
+        self.attention.set_fused_norms(fused);
+        self.fused_norm_path = path;
+    }
+
+    /// Resolve against the portable CPU references (tests only).
+    #[cfg(test)]
+    pub(crate) fn enable_fast_paths_for_tests(&mut self) {
+        self.resolve_fast_paths(&Qwen38CudaSwitches::default(), true);
+    }
+
+    /// Fast-path resolutions for the admin diagnostics.
+    pub(crate) fn fast_path_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rms_norm": summarize([&self.fused_norm_path]),
+        })
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {
@@ -466,7 +514,6 @@ impl Qwen38MtpHead {
         )?;
         let mut prepared = cache.prepare_append(cache.context_len(), token_count)?;
         let result = (|| -> Result<Tensor> {
-            let residual = hidden_states.clone();
             let normalized = self.input_layernorm.forward(&hidden_states)?;
             let attended = self.attention.forward_physical(
                 &normalized,
@@ -475,12 +522,11 @@ impl Qwen38MtpHead {
                 &mut prepared,
                 0,
             )?;
-            let hidden_states = (&residual + &attended)?;
-            let residual = hidden_states.clone();
-            let normalized = self.post_attention_layernorm.forward(&hidden_states)?;
+            let (residual, normalized) = self
+                .post_attention_layernorm
+                .add_forward(&hidden_states, &attended)?;
             let mlp = self.mlp.forward(&normalized)?;
-            let hidden_states = (&residual + &mlp)?;
-            self.norm.forward(&hidden_states).map_err(Error::from)
+            Ok(self.norm.add_forward(&residual, &mlp)?.1)
         })();
         match result {
             Ok(hidden_states) => {
@@ -576,7 +622,6 @@ impl Qwen38MtpHead {
             let predecessor = self.pre_fc_norm_hidden.forward(predecessor_hidden)?;
             let fused = Tensor::cat(&[&embedding, &predecessor], 2)?;
             let hidden_states = self.fc.forward(&fused)?;
-            let residual = hidden_states.clone();
             let normalized = self.input_layernorm.forward(&hidden_states)?;
             let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
             let attended = self.attention.forward_physical_decode_batch(
@@ -588,12 +633,11 @@ impl Qwen38MtpHead {
                 &mut completions,
                 0,
             )?;
-            let hidden_states = residual.broadcast_add(&attended)?;
-            let residual = hidden_states.clone();
-            let normalized = self.post_attention_layernorm.forward(&hidden_states)?;
+            let (residual, normalized) = self
+                .post_attention_layernorm
+                .add_forward(&hidden_states, &attended)?;
             let mlp = self.mlp.forward(&normalized)?;
-            let hidden_states = residual.broadcast_add(&mlp)?;
-            self.norm.forward(&hidden_states).map_err(Error::from)
+            Ok(self.norm.add_forward(&residual, &mlp)?.1)
         })();
         let hidden_states = match execution {
             Ok(hidden) => hidden,
@@ -1242,6 +1286,96 @@ pub(crate) mod tests {
         assert_eq!(Qwen38MtpDepth::new(1).unwrap().get(), 1);
         assert_eq!(Qwen38MtpDepth::new(3).unwrap().get(), 3);
         assert!(Qwen38MtpDepth::new(4).is_err());
+    }
+
+    /// The head resolves its own norms on its own weights; with them fused
+    /// (CPU reference), the pair and batched paths track the composition.
+    #[test]
+    fn mtp_norms_resolve_fused_and_track_the_composition() {
+        let _guard = crate::models::architectures::qwen38::fast_path::counters_lock();
+        let dir = TestDir::new("fused-norms");
+        let config = tiny_config();
+        write_tiny_checkpoint(dir.path(), &config);
+        let tensors = IndexedSafetensors::open(dir.path()).unwrap();
+        let inventory = tensors.validate_mtp_tensor_manifest(&config).unwrap();
+        let load = || {
+            Qwen38MtpHead::load_native(
+                &tensors,
+                &config,
+                &inventory,
+                &Device::Cpu,
+                ProjectionMaterialization::F16,
+            )
+            .unwrap()
+        };
+        let legacy = load();
+        let mut fused = load();
+        assert_eq!(
+            legacy.fast_path_diagnostics()["rms_norm"]["backend"],
+            "legacy"
+        );
+        fused.enable_fast_paths_for_tests();
+        let summary = &fused.fast_path_diagnostics()["rms_norm"];
+        assert_eq!(summary["backend"], "fused", "{summary}");
+
+        let values = |seed: f32, rows: usize| {
+            Tensor::from_vec(
+                (0..rows * 4)
+                    .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 2.0)
+                    .collect::<Vec<_>>(),
+                (rows, 4),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let close = |actual: &Tensor, expected: &Tensor| {
+            let host = |t: &Tensor| {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            crate::models::architectures::qwen38::fast_path::compare_values(
+                "MTP fused norms",
+                &host(actual),
+                &host(expected),
+                0.02,
+                0.03,
+            )
+            .unwrap();
+        };
+        let pairs = Qwen38MtpPairBatch::new(
+            values(1.0, 2).unsqueeze(0).unwrap(),
+            values(2.0, 2).unsqueeze(0).unwrap(),
+            vec![[0, 0, 0], [1, 1, 1]],
+        )
+        .unwrap();
+        let expected = legacy
+            .forward_pairs(&pairs, &mut tiny_cache(&config))
+            .unwrap();
+        let actual = fused
+            .forward_pairs(&pairs, &mut tiny_cache(&config))
+            .unwrap();
+        close(&actual, &expected);
+
+        let embeddings = values(3.0, 2).unsqueeze(1).unwrap();
+        let predecessors = values(4.0, 2).unsqueeze(1).unwrap();
+        let batch = |head: &Qwen38MtpHead| {
+            let mut caches = tiny_shared_caches(&config, 2);
+            let mut cache_refs = caches.iter_mut().collect::<Vec<_>>();
+            head.forward_steps_batch(
+                &embeddings,
+                &predecessors,
+                &[[0, 0, 0], [0, 0, 0]],
+                &mut cache_refs,
+            )
+            .unwrap()
+        };
+        close(&batch(&fused), &batch(&legacy));
     }
 }
 

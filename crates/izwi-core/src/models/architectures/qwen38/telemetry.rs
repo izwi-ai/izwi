@@ -45,6 +45,10 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_causal_conv_decode_fallback_total: u64,
     pub cuda_rope_kernel_success_total: u64,
     pub cuda_rope_manual_fallback_total: u64,
+    pub cuda_fused_rms_norm_total: u64,
+    pub cuda_fused_add_rms_norm_total: u64,
+    pub cuda_rms_norm_composition_total: u64,
+    pub fast_path_self_check_failures_total: u64,
     pub sampling_device_argmax_total: u64,
     pub sampling_bounded_cuda_attempts_total: u64,
     pub sampling_bounded_cuda_success_total: u64,
@@ -114,6 +118,10 @@ counters!(
     CUDA_CAUSAL_CONV_DECODE_FALLBACK,
     CUDA_ROPE_KERNEL_SUCCESS,
     CUDA_ROPE_MANUAL_FALLBACK,
+    CUDA_FUSED_RMS_NORM,
+    CUDA_FUSED_ADD_RMS_NORM,
+    CUDA_RMS_NORM_COMPOSITION,
+    FAST_PATH_SELF_CHECK_FAILURES,
     SAMPLING_DEVICE_ARGMAX,
     SAMPLING_BOUNDED_CUDA_ATTEMPTS,
     SAMPLING_BOUNDED_CUDA_SUCCESS,
@@ -250,6 +258,28 @@ pub(crate) fn record_cuda_rope(selected: bool) {
     }
 }
 
+/// One norm through the fused kernel: `add` when it also performed the
+/// preceding residual add. Production resolves the fused norms on CUDA only;
+/// the portable reference that tests resolve counts here too.
+pub(crate) fn record_fused_rms_norm(add: bool) {
+    if add {
+        CUDA_FUSED_ADD_RMS_NORM.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FUSED_RMS_NORM.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA norm through the Candle composition (cast, norm, cast for a
+/// half-precision activation).
+pub(crate) fn record_cuda_rms_norm_composition() {
+    CUDA_RMS_NORM_COMPOSITION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A fused fast path disagreed with its composition at load and stayed off.
+pub(crate) fn record_fast_path_self_check_failure() {
+    FAST_PATH_SELF_CHECK_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_sampling_device_argmax() {
     SAMPLING_DEVICE_ARGMAX.fetch_add(1, Ordering::Relaxed);
 }
@@ -384,6 +414,10 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_causal_conv_decode_fallback_total: load!(CUDA_CAUSAL_CONV_DECODE_FALLBACK),
         cuda_rope_kernel_success_total: load!(CUDA_ROPE_KERNEL_SUCCESS),
         cuda_rope_manual_fallback_total: load!(CUDA_ROPE_MANUAL_FALLBACK),
+        cuda_fused_rms_norm_total: load!(CUDA_FUSED_RMS_NORM),
+        cuda_fused_add_rms_norm_total: load!(CUDA_FUSED_ADD_RMS_NORM),
+        cuda_rms_norm_composition_total: load!(CUDA_RMS_NORM_COMPOSITION),
+        fast_path_self_check_failures_total: load!(FAST_PATH_SELF_CHECK_FAILURES),
         sampling_device_argmax_total: load!(SAMPLING_DEVICE_ARGMAX),
         sampling_bounded_cuda_attempts_total: load!(SAMPLING_BOUNDED_CUDA_ATTEMPTS),
         sampling_bounded_cuda_success_total: load!(SAMPLING_BOUNDED_CUDA_SUCCESS),

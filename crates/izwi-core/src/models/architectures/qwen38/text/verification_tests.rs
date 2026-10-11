@@ -18,10 +18,7 @@ fn dense(output: usize, input: usize, scale: f32) -> Qwen38Projection {
     ))
 }
 fn norm(width: usize) -> Qwen38RmsNorm {
-    Qwen38RmsNorm {
-        weight: Tensor::ones(width, DType::F32, &Device::Cpu).unwrap(),
-        eps: 1e-6,
-    }
+    Qwen38RmsNorm::new(Tensor::ones(width, DType::F32, &Device::Cpu).unwrap(), 1e-6)
 }
 fn mlp() -> Qwen38Mlp {
     Qwen38Mlp {
@@ -130,6 +127,7 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         output_norm: norm(4),
         output: dense(8, 4, 0.11),
         finite_diagnostics_enabled: false,
+        fused_norm_path: Default::default(),
     }
 }
 fn cache() -> PhysicalPagedKvCache {

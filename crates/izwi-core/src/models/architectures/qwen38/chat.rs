@@ -1208,6 +1208,13 @@ impl Qwen38ChatModel {
                 "runtime_validated": false,
             },
             "optimization_evidence": optimization_evidence,
+            "fast_paths": {
+                "target": self.text_model.fast_path_diagnostics(),
+                "mtp": self.mtp_head.as_ref().map(Qwen38MtpHead::fast_path_diagnostics),
+                "self_check_failures_total": optimization_counters.fast_path_self_check_failures_total,
+                "resolution": "load_time_self_check_at_checkpoint_geometry",
+                "runtime_validated": false,
+            },
             "vision_enabled": false,
         })
     }

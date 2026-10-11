@@ -31,13 +31,13 @@ const SESSIONS: u32 = 4;
 /// Prefill spans for the chunked-continuation leg.
 const PROMPT_CHUNKS: [usize; 2] = [5, 7];
 
-fn fixture_dir() -> std::path::PathBuf {
+pub(super) fn fixture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen38_golden")
 }
 
 /// Reference token ids, prompt length, and `[tokens, vocab]` logits recorded
 /// from HF transformers' `Qwen3_5ForCausalLM`.
-fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
+pub(super) fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
     let raw = std::fs::read(fixture_dir().join("golden.safetensors")).unwrap();
     let tensors = safetensors::SafeTensors::deserialize(&raw).unwrap();
     let i64s = |name: &str| -> Vec<i64> {
@@ -69,7 +69,7 @@ fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
     )
 }
 
-fn load_golden_model(
+pub(super) fn load_golden_model(
     checkpoint: &Qwen38NativeCheckpoint,
     device: &Device,
     target: ProjectionMaterialization,
@@ -86,7 +86,7 @@ fn load_golden_model(
 
 /// One paged KV arena shared by every session of a leg, so the batched decode
 /// rows can share it the way continuous batching does.
-struct GoldenArena {
+pub(super) struct GoldenArena {
     arena: Arc<dyn KvArena>,
     id: KvArenaId,
     group: KvGroupId,
@@ -94,7 +94,7 @@ struct GoldenArena {
 }
 
 impl GoldenArena {
-    fn new(config: &Qwen38NativeConfig, device: &Device, dtype: DType) -> Self {
+    pub(super) fn new(config: &Qwen38NativeConfig, device: &Device, dtype: DType) -> Self {
         let bindings: Vec<KvLayerBinding> = config
             .layer_types
             .iter()
@@ -108,13 +108,15 @@ impl GoldenArena {
             .collect();
         let backend = if device.is_metal() {
             BackendKind::Metal
+        } else if device.is_cuda() {
+            BackendKind::Cuda
         } else {
             BackendKind::Cpu
         };
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(3811),
             backend,
-            device_ordinal: device.is_metal().then_some(0),
+            device_ordinal: (!device.is_cpu()).then_some(0),
             generation: 1,
         };
         let group = KvGroupId::new(1);
@@ -136,8 +138,8 @@ impl GoldenArena {
                 .collect(),
         };
         let arena: Arc<dyn KvArena> = match backend {
-            #[cfg(feature = "metal")]
-            BackendKind::Metal => Arc::new(
+            #[cfg(any(feature = "metal", feature = "cuda"))]
+            BackendKind::Metal | BackendKind::Cuda => Arc::new(
                 crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
                     arena_config,
                     device.clone(),
@@ -154,7 +156,7 @@ impl GoldenArena {
         }
     }
 
-    fn session(&self, index: u32) -> PhysicalPagedKvCache {
+    pub(super) fn session(&self, index: u32) -> PhysicalPagedKvCache {
         assert!(index < SESSIONS);
         let blocks = (index * PAGES_PER_SESSION..(index + 1) * PAGES_PER_SESSION)
             .map(|block| CacheBlockRef {
@@ -170,10 +172,10 @@ impl GoldenArena {
 
 /// One trunk logits row, tagged with the execution path and the sequence
 /// position whose HF reference row it must match.
-struct GoldenRow {
-    path: &'static str,
-    position: usize,
-    logits: Vec<f32>,
+pub(super) struct GoldenRow {
+    pub(super) path: &'static str,
+    pub(super) position: usize,
+    pub(super) logits: Vec<f32>,
 }
 
 fn logits_rows(logits: &Tensor) -> Vec<Vec<f32>> {
@@ -194,7 +196,7 @@ fn logits_rows(logits: &Tensor) -> Vec<Vec<f32>> {
 /// - chunked prefill of the prompt, then scalar decode of the rest;
 /// - the whole sequence as one prefill span (every row);
 /// - a ragged two-row batched decode (rows prefilled to different lengths).
-fn golden_trunk_rows(
+pub(super) fn golden_trunk_rows(
     model: &Qwen38TextModel,
     arena: &GoldenArena,
     token_ids: &[u32],
@@ -322,7 +324,7 @@ fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 /// `|values - reference|_2 / |reference|_2`, infinite on any non-finite value.
-fn relative_l2(values: &[f32], reference: &[f32]) -> f32 {
+pub(super) fn relative_l2(values: &[f32], reference: &[f32]) -> f32 {
     assert_eq!(values.len(), reference.len());
     let error: f32 = values
         .iter()
@@ -338,7 +340,7 @@ fn relative_l2(values: &[f32], reference: &[f32]) -> f32 {
     }
 }
 
-fn argmax(values: &[f32]) -> usize {
+pub(super) fn argmax(values: &[f32]) -> usize {
     values
         .iter()
         .enumerate()

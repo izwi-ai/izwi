@@ -6,6 +6,7 @@
 
 mod cache;
 pub mod chat;
+mod fast_path;
 pub(crate) mod mtp;
 pub mod native;
 mod telemetry;
