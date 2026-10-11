@@ -453,6 +453,43 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
     }
 }
 
+/// Static load peak that decides whether a Metal OOM retry can fit. The
+/// catalog's `memory_required_gb` is one coarse figure for every backend (80
+/// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
+/// these checkpoints use the per-backend representation estimate that load
+/// admission prices instead.
+fn retry_load_peak_bytes(
+    variant: ModelVariant,
+    backend: BackendKind,
+    performance: &crate::performance::PerformanceConfig,
+) -> u64 {
+    let catalog = || model_memory_estimate(variant).load_peak_bytes;
+    match variant {
+        ModelVariant::Qwen3827BFp8
+            if !crate::models::architectures::qwen38::native::synthetic_geometry_enabled() =>
+        {
+            qwen38_representation_memory_estimate(backend).load_peak_bytes
+        }
+        ModelVariant::Qwen36Moe35BA3BFp8
+            if !crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() =>
+        {
+            let peak = qwen36moe_memory::resource_plan(backend, performance).map(|plan| {
+                let peak = plan.load_authorization;
+                match backend {
+                    BackendKind::Cpu => peak.host_bytes,
+                    BackendKind::Metal => peak.unified_bytes,
+                    BackendKind::Cuda => peak.device_bytes,
+                }
+            });
+            match peak {
+                Ok(ResourceAmount::Known(bytes)) => bytes,
+                _ => catalog(),
+            }
+        }
+        _ => catalog(),
+    }
+}
+
 fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>) -> Result<()> {
     if path.is_file() {
         files.push(path.to_path_buf());
@@ -1675,7 +1712,7 @@ impl ModelLifecycleController {
         // OOM and would burn another GGUF read + F16 materialization + fence
         // (tens of seconds) before poisoning. Skip straight to the poison.
         let backend = self.backend_router.context().backend_kind;
-        let required_bytes = model_memory_estimate(variant).load_peak_bytes;
+        let required_bytes = retry_load_peak_bytes(variant, backend, &self.config.performance);
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
@@ -3708,6 +3745,32 @@ mod tests {
             )
             .expect_err("CUDA load must reserve the complete 8 GiB host conversion window");
         assert!(matches!(error, Error::Overloaded(_)));
+    }
+
+    #[test]
+    fn metal_oom_retry_judges_hybrid_checkpoints_by_their_backend_load_peak() {
+        use super::retry_load_peak_bytes;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let _env_guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let performance = crate::performance::PerformanceConfig::default();
+        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance);
+
+        // Qwen3.8 expands to F16 on Metal (about 52.75 GiB), far below the
+        // 80 GiB catalog figure that used to veto every retry on a 96 GB Mac.
+        let qwen38_metal = peak(ModelVariant::Qwen3827BFp8, BackendKind::Metal);
+        assert_eq!(
+            qwen38_metal,
+            qwen38_representation_memory_estimate(BackendKind::Metal).load_peak_bytes
+        );
+        assert!(qwen38_metal < 54 * GIB);
+        assert!(peak(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Metal) < 140 * GIB);
+        // Variants without a representation plan keep the catalog estimate.
+        assert_eq!(
+            peak(ModelVariant::Kokoro82M, BackendKind::Metal),
+            model_memory_estimate(ModelVariant::Kokoro82M).load_peak_bytes
+        );
     }
 
     #[test]
