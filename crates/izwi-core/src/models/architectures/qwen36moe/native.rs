@@ -2410,8 +2410,10 @@ mod tests {
                 .tensor(name)
                 .unwrap()
                 .data()
-                .chunks_exact(8)
-                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| i64::from_le_bytes(*b))
                 .collect()
         };
         let token_ids = i64s("token_ids").into_iter().map(|v| v as u32).collect();
@@ -2420,8 +2422,10 @@ mod tests {
         let vocab = logits.shape()[1];
         let values: Vec<f32> = logits
             .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         (
             token_ids,
