@@ -895,8 +895,9 @@ device gates and checks against the checkpoint bytes. When those gates fail or a
 fallback is requested, the representation is
 `q8_0_requantized_projections_with_dense_bf16` and `fp8_execution_mode` is
 `q8_0_fallback:<reason>`; `fallback_reason` explains the choice either way. The
-per-path outcomes appear under `fast_paths.fp8_projections`, `fast_paths.fp8_gemv`
-and `fast_paths.fp8_packing`. CPU and Metal continue to report `expanded_f32` and
+per-path outcomes appear under `fast_paths.fp8_projections`, `fast_paths.fp8_gemv`,
+`fast_paths.fp8_packing` and `fast_paths.fp8_lm_head` (the block-FP8 LM head, a
+deliberate precision reduction, with its observed gate error). CPU and Metal continue to report `expanded_f32` and
 `expanded_f16` respectively.
 
 | Method | Path | Notes |

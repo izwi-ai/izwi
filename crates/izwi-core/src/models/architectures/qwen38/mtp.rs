@@ -950,6 +950,15 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A dense BF16 fixture tensor of Gaussian values (tests of other modules).
+    pub(crate) fn fixture_dense_for_tests(
+        name: &str,
+        shape: [usize; 2],
+        std: f32,
+    ) -> FixtureTensor {
+        dense(name, &shape, fixture_normal(77, shape[0] * shape[1], std))
+    }
+
     pub(crate) fn write_fixture(dir: &Path, tensors: &[FixtureTensor], shard: &str) {
         let views = tensors
             .iter()

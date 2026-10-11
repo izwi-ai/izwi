@@ -115,6 +115,13 @@ admission. Set `IZWI_CUDA_PROJECTION_BACKEND=q8` or
 `IZWI_QWEN38_FP8_PROJECTIONS=legacy` to choose Q8_0, and
 `IZWI_QWEN38_FP8_GEMV=legacy` to keep the reference decode kernel.
 
+With native block FP8, the LM head (2.54 GB in BF16) is also quantized at load to
+the same block-FP8 format (1.27 GB), which the target logits and every MTP draft
+read. This is a deliberate precision reduction: a host quality gate compares FP8
+and BF16 logits on probe rows across the vocabulary before the head is used, and
+`fast_paths.fp8_lm_head` reports the observed error. Logits stay BF16. Set
+`IZWI_QWEN38_FP8_LM_HEAD=legacy` to keep the BF16 head.
+
 Both representations are designed to fit 40/48 GB-class CUDA devices with a
 resource-fitted context, subject to actual free VRAM and allocator headroom. Native
 block FP8 is not CUDA-certified until the corresponding NVIDIA evidence is

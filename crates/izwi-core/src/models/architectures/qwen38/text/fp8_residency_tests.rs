@@ -14,7 +14,8 @@ use crate::models::architectures::qwen38::mtp::tests::{write_fp8_geometry_checkp
 use crate::models::architectures::qwen38::mtp::Qwen38MtpHead;
 use crate::models::architectures::qwen38::native::Qwen38NativeCheckpoint;
 use crate::models::architectures::qwen38::residency::{
-    force_cpu_native_fp8_for_tests, Qwen38ProjectionPlan, FP8_GEMV_ENV, FP8_PROJECTIONS_ENV,
+    force_cpu_native_fp8_for_tests, Qwen38ProjectionPlan, FP8_GEMV_ENV, FP8_LM_HEAD_ENV,
+    FP8_PROJECTIONS_ENV,
 };
 use crate::performance::{CudaProjectionBackend, OptimizationMode, PerformanceConfig};
 
@@ -165,6 +166,19 @@ fn fp8_projection_forms(model: &Qwen38TextModel) -> Vec<(bool, bool)> {
 /// expanded load to F32 rounding on every prompt row and decode step.
 #[test]
 fn forced_native_fp8_trunk_tracks_the_expanded_f32_load() {
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The block-FP8 LM head is a deliberate precision reduction with its own
+    // test; keep the head dense so the trunk comparison stays exact.
+    std::env::set_var(FP8_LM_HEAD_ENV, "legacy");
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var(FP8_LM_HEAD_ENV);
+        }
+    }
+    let _restore = Restore;
     let (_dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::F32;
     let performance = PerformanceConfig::default();
@@ -238,6 +252,95 @@ fn forced_native_fp8_trunk_tracks_the_expanded_f32_load() {
             if packing { 2 } else { 0 }
         );
     }
+}
+
+/// The block-FP8 LM head beside native FP8 projections: quantized at load
+/// from the BF16 mapping, gated, and a deliberate precision reduction that
+/// stays within a few percent of the dense head's logits.
+#[test]
+fn forced_fp8_lm_head_quantizes_checks_and_tracks_the_dense_head() {
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::F32;
+    let performance = PerformanceConfig::default();
+    let expanded = load(
+        &checkpoint,
+        target,
+        &resolve(&checkpoint, target, &performance),
+    )
+    .unwrap();
+    assert_eq!(expanded.fp8_lm_head_diagnostics()["backend"], "legacy");
+    let _forced = force_cpu_native_fp8_for_tests();
+    let policy = resolve(&checkpoint, target, &performance);
+    assert_eq!(policy.lm_head_form([512, 256]), Qwen38WeightForm::RawFp8);
+    let native = load(&checkpoint, target, &policy).unwrap();
+    let Qwen38Projection::NativeFp8 { raw, .. } = &native.output else {
+        panic!("the LM head must be block FP8");
+    };
+    assert_eq!(raw.shape, [512, 256]);
+    assert_eq!(raw.scale_shape, [4, 2]);
+    let diagnostics = native.fp8_lm_head_diagnostics();
+    assert_eq!(diagnostics["backend"], "fused", "{diagnostics}");
+    let gate = diagnostics["gate_relative_l2"].as_f64().unwrap();
+    assert!(gate > 1e-3 && gate < 0.08, "gate relative L2 {gate}");
+    assert!(diagnostics["precision"]
+        .as_str()
+        .unwrap()
+        .contains("deliberately reduced"));
+
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
+    let (reference, tokens) = fixture_rows(&expanded, &arena, 0, None);
+    let (rows, _) = fixture_rows(&native, &arena, 1, Some(&tokens));
+    let mut worst = 0f32;
+    let mut agree = 0usize;
+    for (index, (row, reference)) in rows.iter().zip(&reference).enumerate() {
+        let error = relative_l2(row, reference);
+        assert!(error < 0.05, "row {index}: relative L2 {error}");
+        worst = worst.max(error);
+        agree += usize::from(argmax(row) == argmax(reference));
+    }
+    eprintln!(
+        "qwen38 CPU FP8 LM head vs dense: worst relative L2 {worst:e}, greedy agreement {agree}/{}",
+        rows.len()
+    );
+    assert!(
+        agree * 10 >= rows.len() * 9,
+        "greedy agreement {agree}/{}",
+        rows.len()
+    );
+    assert!(worst > 1e-4, "the FP8 head must actually be in use");
+
+    // The kill switch and a poisoned head keep the dense head.
+    std::env::set_var(FP8_LM_HEAD_ENV, "legacy");
+    let killed = resolve(&checkpoint, target, &performance);
+    std::env::remove_var(FP8_LM_HEAD_ENV);
+    assert_eq!(
+        killed.lm_head_form([512, 256]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert!(matches!(
+        killed.plan(),
+        Qwen38ProjectionPlan::NativeFp8 { .. }
+    ));
+    policy.poison_lm_head("forced head mismatch");
+    let poisoned = resolve(&checkpoint, target, &performance);
+    assert_eq!(
+        poisoned.lm_head_form([512, 256]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert!(matches!(
+        poisoned.plan(),
+        Qwen38ProjectionPlan::NativeFp8 { .. }
+    ));
+    let model = load(&checkpoint, target, &poisoned).unwrap();
+    assert!(matches!(model.output, Qwen38Projection::Dense(_)));
+    let diagnostics = model.fp8_lm_head_diagnostics();
+    assert!(diagnostics["legacy_reasons"][0]
+        .as_str()
+        .unwrap()
+        .contains("forced head mismatch"));
 }
 
 /// The load-time check compares a resident FP8 projection with the ORIGINAL
@@ -414,6 +517,7 @@ fn projection_plan_policy_matrix() {
     assert!(auto.fp8_vectorized());
     assert!(auto.packing_allowed(&[Qwen38WeightForm::RawFp8; 2]));
     assert_eq!(auto.execution_mode(), "native_block_fp8_auto_self_checked");
+    assert_eq!(auto.lm_head_form([512, 256]), Qwen38WeightForm::RawFp8);
 
     let mut explicit = PerformanceConfig::default();
     explicit.cuda.projection_backend = CudaProjectionBackend::NativeFp8;
@@ -433,6 +537,10 @@ fn projection_plan_policy_matrix() {
     let mut q8 = PerformanceConfig::default();
     q8.cuda.projection_backend = CudaProjectionBackend::Q8;
     assert_eq!(q8_reason(&q8), "q8_0_fallback:cuda.projection_backend=q8");
+    assert_eq!(
+        resolve(&checkpoint, target, &q8).lm_head_form([512, 256]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
     std::env::set_var(FP8_PROJECTIONS_ENV, "legacy");
     let killed = q8_reason(&PerformanceConfig::default());
     std::env::remove_var(FP8_PROJECTIONS_ENV);
@@ -583,12 +691,56 @@ fn cuda_resolve_picks_native_fp8_on_auto_and_packed_groups_match_original_parts(
     let (reference, tokens) = fixture_rows(&expanded, &cpu_arena, 0, None);
     let arena = GoldenArena::new(&checkpoint.config, &device, DType::BF16);
     let (rows, _) = fixture_rows(&native, &arena, 0, Some(&tokens));
+    // BF16 activations plus the deliberately reduced block-FP8 LM head.
+    let mut agree = 0usize;
     for (index, (row, reference)) in rows.iter().zip(&reference).enumerate() {
         let error = relative_l2(row, reference);
-        assert!(error < 2e-2, "row {index}: relative L2 {error}");
-        assert_eq!(argmax(row), argmax(reference), "row {index}: greedy token");
+        assert!(error < 5e-2, "row {index}: relative L2 {error}");
+        agree += usize::from(argmax(row) == argmax(reference));
     }
+    assert!(
+        agree * 10 >= rows.len() * 9,
+        "greedy agreement {agree}/{}",
+        rows.len()
+    );
+    assert_eq!(native.fp8_lm_head_diagnostics()["backend"], "fused");
     let counters = crate::models::architectures::qwen38::telemetry::snapshot();
+    assert!(counters.cuda_fp8_lm_head_calls_total > 0);
     assert!(counters.cuda_fp8_gemv_vectorized_calls_total > 0);
     assert!(counters.cuda_fp8_packed_projection_calls_total > 0);
+}
+
+/// A synthetic `[1024, 5120]` BF16 head quantizes and passes both checks on
+/// CUDA through the production quantizer.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_synthetic_lm_head_passes_the_gate_and_the_device_check() {
+    use crate::models::architectures::qwen38::mtp::tests::{
+        fixture_dense_for_tests, write_fixture,
+    };
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let dir = TestDir::new("cuda-fp8-head");
+    write_fixture(
+        dir.path(),
+        &[fixture_dense_for_tests(
+            "lm_head.weight",
+            [1024, 5120],
+            0.05,
+        )],
+        "model.safetensors",
+    );
+    let tensors = IndexedSafetensors::open(dir.path()).unwrap();
+    let head = super::super::lm_head::quantize_lm_head_from_checkpoint(
+        &tensors,
+        "lm_head.weight",
+        [1024, 5120],
+        &device,
+        DType::BF16,
+        Qwen38Fp8Kernel::Vectorized,
+    )
+    .unwrap()
+    .expect("a dense random head passes both checks");
+    assert!(head.gate_relative_l2 < 0.08);
 }

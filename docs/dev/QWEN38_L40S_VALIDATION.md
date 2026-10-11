@@ -40,6 +40,7 @@ TTFT at about 1.2k prompt tokens).
 | Projection provider | `projection_backend = "auto"` | `IZWI_CUDA_PROJECTION_BACKEND=q8` |
 | Qwen3.8 native FP8 projections | gated auto | `IZWI_QWEN38_FP8_PROJECTIONS=legacy` |
 | Qwen3.8 vectorized FP8 GEMV | gated auto | `IZWI_QWEN38_FP8_GEMV=legacy` |
+| Qwen3.8 block-FP8 LM head | with native FP8 | `IZWI_QWEN38_FP8_LM_HEAD=legacy` |
 | Packed projections | `packed_projections = "auto"` | `IZWI_CUDA_PACKED_PROJECTIONS=off` |
 | Fused decode | `fused_decode = "auto"` | `IZWI_CUDA_FUSED_DECODE=off` |
 | KV precision | BF16 on observed CUDA capability 8.0+ | `IZWI_QWEN38_CUDA_BF16_KV=0` |

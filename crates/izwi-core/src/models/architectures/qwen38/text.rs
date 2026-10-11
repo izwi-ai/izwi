@@ -21,7 +21,7 @@ use super::residency::{fp8_row_dot, probe_activations, Qwen38ResidencyPolicy, Qw
 use super::telemetry::{
     record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition, record_cuda_fp8_gemv,
     record_cuda_fp8_packed_projection, record_cuda_head_expansion_materialization,
-    record_cuda_kernel, record_cuda_projection, record_cuda_qk_rope_chain,
+    record_cuda_kernel, record_cuda_lm_head, record_cuda_projection, record_cuda_qk_rope_chain,
     record_cuda_rms_norm_composition, record_cuda_rope, record_cuda_state_initial_allocation,
     record_fast_path_self_check_failure, record_fused_attn_gate, record_fused_qk_norm_rope,
     record_fused_rms_norm, CudaKernelPath, CudaProjectionPath,
@@ -61,6 +61,9 @@ pub struct Qwen38TextModel {
     residency: Qwen38ResidencyPolicy,
     /// One entry per block-FP8 projection group: packed, or why not.
     fp8_packing: Vec<Qwen38FastPath>,
+    /// The LM head as block FP8 (or why not), with the host gate's
+    /// relative L2 error against the BF16 head.
+    fp8_lm_head: (Qwen38FastPath, Option<f64>),
     token_embeddings: Embedding,
     layers: Vec<Qwen38Layer>,
     output_norm: Qwen38RmsNorm,
@@ -1027,11 +1030,8 @@ impl Qwen38TextModel {
             cfg.attention_layer_norm_rms_epsilon,
             device,
         )?;
-        let output = load_native_projection(
-            &loader,
-            "lm_head.weight",
-            [native.vocab_size, cfg.embedding_length],
-        )?;
+        let (output, fp8_lm_head) =
+            load_lm_head(&loader, [native.vocab_size, cfg.embedding_length])?;
 
         let graphs = Arc::new(TensorIsland::default());
         let mut layers = Vec::with_capacity(cfg.block_count);
@@ -1081,6 +1081,7 @@ impl Qwen38TextModel {
             projection_representation,
             residency: policy.clone(),
             fp8_packing: loader.into_packing(),
+            fp8_lm_head,
             token_embeddings,
             layers,
             output_norm,
@@ -1358,6 +1359,14 @@ impl Qwen38TextModel {
     /// Project an already normalized MTP hidden span through the target LM
     /// head without applying the target model's output norm.
     pub(super) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head_forward(hidden)
+    }
+
+    /// The LM head, shared by the target logits and every MTP draft.
+    fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        if hidden.device().is_cuda() {
+            record_cuda_lm_head(matches!(self.output, Qwen38Projection::NativeFp8 { .. }));
+        }
         self.output.forward(hidden).map_err(Error::from)
     }
 
@@ -1532,7 +1541,7 @@ impl Qwen38TextModel {
             "output.norm",
             self.finite_diagnostics_enabled,
         )?;
-        let logits = self.output.forward(&hidden)?;
+        let logits = self.lm_head_forward(&hidden)?;
         validate_qwen38_finite_tensor(
             &logits,
             self.layers.len(),
@@ -1584,6 +1593,19 @@ impl Qwen38TextModel {
     /// Packing outcome of every block-FP8 projection group of the trunk.
     pub(super) fn fp8_packing(&self) -> &[Qwen38FastPath] {
         &self.fp8_packing
+    }
+
+    /// `fast_paths.fp8_lm_head`: the head's form and its observed error.
+    pub(super) fn fp8_lm_head_diagnostics(&self) -> serde_json::Value {
+        let (path, gate_error) = &self.fp8_lm_head;
+        let mut summary = summarize([path]);
+        summary["gate_relative_l2"] = serde_json::json!(gate_error);
+        summary["precision"] = serde_json::json!(if path.is_fused() {
+            "deliberately reduced: the BF16 head is quantized to block FP8 (E4M3, F32 scale per 128x128 block); logits stay in the activation dtype"
+        } else {
+            "checkpoint BF16 head in the activation dtype"
+        });
+        summary
     }
 
     fn full_attention_layers(&self) -> impl Iterator<Item = &Qwen38FullAttention> {
@@ -4103,6 +4125,47 @@ pub(super) fn load_native_projection(
         Qwen38WeightForm::Dense(_) => tensors
             .materialize_projection(name, shape, loader.block, loader.target, loader.device)
             .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None))),
+    }
+}
+
+/// Load the LM head in the form the residency policy chose. A block-FP8 head
+/// that fails its quality gate or device check fails the load closed and
+/// poisons the head's FP8 form, so the retry admits and loads the dense head.
+fn load_lm_head(
+    loader: &Qwen38WeightLoader<'_>,
+    shape: [usize; 2],
+) -> Result<(Qwen38Projection, (Qwen38FastPath, Option<f64>))> {
+    let name = "lm_head.weight";
+    if loader.policy.lm_head_form(shape) != Qwen38WeightForm::RawFp8 {
+        let reason = match loader.policy.fp8_lm_head() {
+            Qwen38FastPath::Legacy { reason } => reason.clone(),
+            Qwen38FastPath::Fused => "outside the FP8 kernel contract".into(),
+        };
+        return Ok((
+            load_native_projection(loader, name, shape)?,
+            (Qwen38FastPath::legacy(reason), None),
+        ));
+    }
+    match super::lm_head::quantize_lm_head_from_checkpoint(
+        loader.tensors,
+        name,
+        shape,
+        loader.device,
+        loader.target.dtype(),
+        loader.fp8_kernel(),
+    )? {
+        Ok(head) => Ok((
+            head.projection,
+            (Qwen38FastPath::Fused, Some(head.gate_relative_l2)),
+        )),
+        Err(reason) => {
+            record_fast_path_self_check_failure();
+            loader.policy.poison_lm_head(&reason);
+            tracing::warn!(%reason, "Qwen3.8 block-FP8 LM head failed its checks");
+            Err(Error::ModelLoadError(format!(
+                "Qwen3.8 block-FP8 LM head self_check_failed: {reason}. The next load keeps the dense head; set IZWI_QWEN38_FP8_LM_HEAD=legacy to skip it"
+            )))
+        }
     }
 }
 

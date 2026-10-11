@@ -44,6 +44,7 @@ use crate::performance::{CudaProjectionBackend, PerformanceConfig};
 pub(crate) const FP8_PROJECTIONS_ENV: &str = "IZWI_QWEN38_FP8_PROJECTIONS";
 /// Kill switch for the vectorized FP8 decode GEMV: the reference GEMV runs.
 pub(crate) const FP8_GEMV_ENV: &str = "IZWI_QWEN38_FP8_GEMV";
+pub(crate) use super::lm_head::FP8_LM_HEAD_ENV;
 
 /// The checkpoint's block-scale geometry the FP8 kernels index.
 pub(crate) const FP8_BLOCK: [usize; 2] = [128, 128];
@@ -145,6 +146,7 @@ struct Identity {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Poison {
     projections: Option<String>,
+    lm_head: Option<String>,
 }
 
 /// Cached device gate results: `Err` when the reference kernels or the
@@ -184,6 +186,8 @@ pub(crate) struct Qwen38ResidencyPolicy {
     fp8_gemv: Qwen38FastPath,
     /// Pack row-compatible projections into one matrix.
     packing: bool,
+    /// The LM head quantized to block FP8 (with native FP8 projections).
+    fp8_lm_head: Qwen38FastPath,
     mtp: bool,
     identity: Option<Identity>,
 }
@@ -287,6 +291,7 @@ impl Qwen38ResidencyPolicy {
             packing: backend == BackendKind::Cuda
                 && cuda.enabled()
                 && cuda.packed_projections.enabled(),
+            fp8_lm_head: Qwen38FastPath::legacy("native block FP8 not selected"),
             mtp: mtp_loaded_for(backend, performance),
             identity: None,
         }
@@ -380,6 +385,15 @@ impl Qwen38ResidencyPolicy {
         };
         self.plan = Qwen38ProjectionPlan::NativeFp8 { explicit };
         self.fallback = None;
+        self.fp8_lm_head = if legacy_requested(FP8_LM_HEAD_ENV) {
+            Qwen38FastPath::legacy(format!("{FP8_LM_HEAD_ENV}=legacy"))
+        } else if let Some(reason) = poisoned(self.identity.as_ref()).lm_head {
+            Qwen38FastPath::legacy(format!(
+                "self_check_failed (poisoned by an earlier load): {reason}"
+            ))
+        } else {
+            Qwen38FastPath::Fused
+        };
         self.fp8_gemv = if legacy_requested(FP8_GEMV_ENV) {
             Qwen38FastPath::legacy(format!("{FP8_GEMV_ENV}=legacy"))
         } else if !cuda.fused_decode.enabled() {
@@ -405,6 +419,7 @@ impl Qwen38ResidencyPolicy {
         policy.fp8_device = Fp8Device::Forced;
         policy.fp8_gemv = Qwen38FastPath::Fused;
         policy.packing = true;
+        policy.fp8_lm_head = Qwen38FastPath::Fused;
         policy
     }
 
@@ -490,9 +505,23 @@ impl Qwen38ResidencyPolicy {
         self.packing && forms.iter().all(|form| form == first)
     }
 
-    /// The LM head's resident form.
-    pub(crate) fn lm_head_form(&self) -> Qwen38WeightForm {
-        Qwen38WeightForm::Dense(self.activation)
+    /// The resident form of the `[vocab, hidden]` LM head (BF16 in the
+    /// checkpoint): block FP8 quantized at load beside native FP8
+    /// projections, otherwise the activation dtype.
+    pub(crate) fn lm_head_form(&self, shape: [usize; 2]) -> Qwen38WeightForm {
+        if matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
+            && self.fp8_lm_head.is_fused()
+            && self.fp8_fits(shape, FP8_BLOCK)
+        {
+            Qwen38WeightForm::RawFp8
+        } else {
+            Qwen38WeightForm::Dense(self.activation)
+        }
+    }
+
+    /// The FP8 LM head's resolution, for diagnostics.
+    pub(crate) fn fp8_lm_head(&self) -> &Qwen38FastPath {
+        &self.fp8_lm_head
     }
 
     pub(crate) fn representation(&self) -> Qwen38ProjectionRepresentation {
@@ -560,19 +589,26 @@ impl Qwen38ResidencyPolicy {
     /// this device and checkpoint keeps the projections off native FP8, so a
     /// retry admits and loads the fallback with exact accounting.
     pub(crate) fn poison_projections(&self, reason: &str) {
+        self.poison(|poison| poison.projections = Some(reason.to_string()));
+    }
+
+    /// Fail closed after the FP8 LM head's checks: later resolutions for this
+    /// device and checkpoint keep the head in the activation dtype.
+    pub(crate) fn poison_lm_head(&self, reason: &str) {
+        self.poison(|poison| poison.lm_head = Some(reason.to_string()));
+    }
+
+    fn poison(&self, apply: impl FnOnce(&mut Poison)) {
         let Some(identity) = &self.identity else {
             return;
         };
         let mut poisoned = lock(&POISONED);
         if let Some((_, poison)) = poisoned.iter_mut().find(|(key, _)| key == identity) {
-            poison.projections = Some(reason.to_string());
+            apply(poison);
         } else {
-            poisoned.push((
-                identity.clone(),
-                Poison {
-                    projections: Some(reason.to_string()),
-                },
-            ));
+            let mut poison = Poison::default();
+            apply(&mut poison);
+            poisoned.push((identity.clone(), poison));
         }
     }
 
@@ -595,7 +631,9 @@ impl Qwen38ResidencyPolicy {
             })?;
             self.projection_form(dtype, [n, k], block)
         } else if name == "lm_head.weight" {
-            self.lm_head_form()
+            let [n, k] = <[usize; 2]>::try_from(shape)
+                .map_err(|_| Error::ModelLoadError("Qwen3.8 LM head is not a matrix".into()))?;
+            self.lm_head_form([n, k])
         } else if keeps_f32(name) {
             Qwen38WeightForm::Dense(DType::F32)
         } else {

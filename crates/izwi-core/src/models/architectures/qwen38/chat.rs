@@ -1186,6 +1186,7 @@ impl Qwen38ChatModel {
                 "mtp": self.mtp_head.as_ref().map(Qwen38MtpHead::fast_path_diagnostics),
                 "fp8_projections": residency_paths["fp8_projections"],
                 "fp8_gemv": residency_paths["fp8_gemv"],
+                "fp8_lm_head": self.text_model.fp8_lm_head_diagnostics(),
                 "fp8_packing": super::fast_path::summarize(
                     self.text_model.fp8_packing().iter().chain(
                         self.mtp_head

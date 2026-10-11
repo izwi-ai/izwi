@@ -192,8 +192,25 @@ pub(super) fn resource_plan(
     } else {
         super::QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES
     };
-    plan.load_authorization.host_bytes =
-        ResourceAmount::Known(scratch.checked_add(METADATA_RESERVE).ok_or_else(overflow)?);
+    // A block-FP8 LM head is quantized on the host: its bytes are staged once
+    // (plus per-thread 128-row F32 temporaries inside the staging cap).
+    let lm_head = [
+        checkpoint.config.vocab_size,
+        checkpoint.config.text.embedding_length,
+    ];
+    let lm_head_staging = if policy.lm_head_form(lm_head) == Qwen38WeightForm::RawFp8 {
+        (lm_head[0] as u64)
+            .checked_mul(lm_head[1] as u64)
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    plan.load_authorization.host_bytes = ResourceAmount::Known(
+        scratch
+            .checked_add(METADATA_RESERVE)
+            .and_then(|n| n.checked_add(lm_head_staging))
+            .ok_or_else(overflow)?,
+    );
     plan.resident_authorization.host_bytes = ResourceAmount::Known(METADATA_RESERVE);
     // The bounded graph cache is allocated lazily. Do not mark it physically
     // materialized before state/context fitting: that would let KV consume its
@@ -417,8 +434,14 @@ mod tests {
         let scale_grid = 5 * (2 * scales(ff, hidden) + scales(hidden, ff))
             + 3 * (scales(1280, hidden) + scales(768, hidden) + scales(hidden, 768))
             + 2 * (scales(1024, hidden) + 2 * scales(256, hidden) + scales(hidden, 512));
-        // Expanded F32 (4 bytes) vs raw FP8 (1 byte + 4 per block scale).
-        assert_eq!(expanded - native, fp8 * 3 - scale_grid * 4);
+        // Expanded F32 (4 bytes) vs raw FP8 (1 byte + 4 per block scale);
+        // the [512, 256] LM head goes from F32 to block FP8 as well.
+        let head = 512 * 256;
+        let head_fp8 = head + scales(512, 256) * 4;
+        assert_eq!(
+            expanded - native,
+            fp8 * 3 - scale_grid * 4 + head * 4 - head_fp8
+        );
 
         let policy =
             crate::models::architectures::qwen38::residency::Qwen38ResidencyPolicy::resolve(
@@ -435,7 +458,11 @@ mod tests {
         );
         policy.poison_projections("forced load-time mismatch");
         let q8 = resident(&resource_plan(dir.path(), &device, &performance).unwrap());
-        assert_eq!(q8 - native, fp8 / 32 * 34 - fp8 - scale_grid * 4);
+        // Q8_0 projections keep the head dense (F32 on the CPU).
+        assert_eq!(
+            q8 - native,
+            fp8 / 32 * 34 - fp8 - scale_grid * 4 + head * 4 - head_fp8
+        );
         let loader_policy =
             crate::models::architectures::qwen38::residency::Qwen38ResidencyPolicy::resolve(
                 &device,
