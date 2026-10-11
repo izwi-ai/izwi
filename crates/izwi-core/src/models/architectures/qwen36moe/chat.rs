@@ -499,6 +499,7 @@ impl Qwen36MoeChatModel {
             },
             "moe": self.exec.text_model.moe_backend_summary(),
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
             "rms_norm": self.exec.text_model.rms_norm_summary(),
             "qk_rope": self.exec.text_model.qk_rope_summary(),
             "attn_gate": self.exec.text_model.attn_gate_summary(),

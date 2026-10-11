@@ -23,6 +23,7 @@ use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
 };
+use crate::kernels::cuda::{try_chunked_deltanet_recurrence, verify_chunked_deltanet};
 use crate::kv::v2::{StateComponentId, StateDomainId};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
@@ -53,6 +54,8 @@ pub struct Qwen36TextModel {
     finite_diagnostics_enabled: bool,
     fused_norm_path: Qwen36FusedPath,
     fp8_gemv_path: Qwen36FusedPath,
+    /// Chunked DeltaNet prefill kernels (`gdn_prefill`), and why not.
+    gdn_prefill_path: Qwen36FusedPath,
     /// Piecewise CUDA graph decode for single-row steps, when resolved.
     decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
     decode_graphs_path: Qwen36FusedPath,
@@ -471,6 +474,9 @@ struct Qwen36LinearAttention {
     v_head_order: Qwen36LinearVHeadOrder,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    /// Prefill spans run the chunked recurrence kernels (resolved at load,
+    /// see [`Qwen36TextModel::resolve_chunked_gdn_prefill`]).
+    chunked_recurrence: bool,
     /// Fused single-token decode kernels, when resolved at load (see
     /// [`Qwen36LinearAttention::resolve_fused_decode`]).
     fused_decode: Option<GdnDecodeSpec>,
@@ -1049,6 +1055,7 @@ impl Qwen36TextModel {
             finite_diagnostics_enabled,
             fused_norm_path: Qwen36FusedPath::legacy("unresolved"),
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
+            gdn_prefill_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
             lm_head_path,
@@ -1058,10 +1065,12 @@ impl Qwen36TextModel {
             Some(reason) => {
                 model.fused_norm_path = Qwen36FusedPath::legacy(reason);
                 model.fp8_gemv_path = Qwen36FusedPath::legacy(reason);
+                model.gdn_prefill_path = Qwen36FusedPath::legacy(reason);
             }
             None => {
                 model.resolve_fused_norms(false);
                 model.resolve_vectorized_fp8_decode();
+                model.resolve_chunked_gdn_prefill();
             }
         }
         let (graphs, path) =
@@ -1091,6 +1100,50 @@ impl Qwen36TextModel {
                 }
             }
         };
+    }
+
+    /// Run DeltaNet prefill spans through the chunked recurrence kernels after
+    /// they match the sequential kernel on this device at the model's head
+    /// geometry. `IZWI_QWEN36_CHUNKED_GDN=legacy` keeps the sequential kernel.
+    fn resolve_chunked_gdn_prefill(&mut self) {
+        let geometry = self.layers.iter().find_map(|layer| match &layer.mixer {
+            Qwen36Mixer::Linear(linear) => {
+                Some((linear.num_v_heads, linear.head_k_dim, linear.head_v_dim))
+            }
+            Qwen36Mixer::Full(_) => None,
+        });
+        self.gdn_prefill_path = if legacy_requested(CHUNKED_GDN_ENV) {
+            Qwen36FusedPath::legacy(format!("{CHUNKED_GDN_ENV}=legacy"))
+        } else if !self.device.is_cuda() {
+            Qwen36FusedPath::legacy("chunked DeltaNet prefill runs on CUDA only")
+        } else {
+            match geometry {
+                None => Qwen36FusedPath::legacy("the model has no DeltaNet layer"),
+                Some((heads, key_dim, value_dim)) => {
+                    match verify_chunked_deltanet(&self.device, heads, key_dim, value_dim) {
+                        Ok(()) => Qwen36FusedPath::Fused,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "chunked DeltaNet prefill self-check failed; keeping the sequential kernel"
+                            );
+                            Qwen36FusedPath::legacy(format!("self-check failed: {error}"))
+                        }
+                    }
+                }
+            }
+        };
+        let chunked = self.gdn_prefill_path == Qwen36FusedPath::Fused;
+        for layer in &mut self.layers {
+            if let Qwen36Mixer::Linear(linear) = &mut layer.mixer {
+                linear.chunked_recurrence = chunked;
+            }
+        }
+    }
+
+    /// Chunked DeltaNet prefill resolution, for the admin diagnostics.
+    pub(crate) fn gdn_prefill_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.gdn_prefill_path])
     }
 
     /// Block-FP8 LM head resolution, for the admin diagnostics.
@@ -3006,6 +3059,7 @@ impl Qwen36LinearAttention {
             v_head_order: source.linear_v_head_order(),
             tiled_recurrence_enabled: qwen35_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen35_tiled_recurrence_tile_size_override(),
+            chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("unresolved"),
             packed_in: None,
@@ -3622,7 +3676,11 @@ impl Qwen36LinearAttention {
         // may only reach it once q/k are expanded below.
         let compact_heads_compatible = self.num_v_heads == self.num_k_heads
             || self.v_head_order == Qwen36LinearVHeadOrder::Tiled;
-        let fused_sequence = if self.tiled_recurrence_enabled && compact_heads_compatible {
+        let chunked_span = self.chunked_recurrence && seq_len >= CHUNKED_GDN_MIN_TOKENS;
+        let fused_sequence = if self.tiled_recurrence_enabled
+            && compact_heads_compatible
+            && !chunked_span
+        {
             try_tiled_deltanet_recurrence(
                 &query,
                 &key,
@@ -3650,7 +3708,14 @@ impl Qwen36LinearAttention {
                     self.expand_key_heads_seq(&key)?,
                 )
             };
-            if self.tiled_recurrence_enabled {
+            let chunked = if chunked_span {
+                try_chunked_deltanet_recurrence(&query, &key, &value, &g, &beta, &current_state)
+            } else {
+                None
+            };
+            if let Some(chunked) = chunked {
+                chunked
+            } else if self.tiled_recurrence_enabled {
                 if let Some(fused_sequence) = try_tiled_deltanet_recurrence(
                     &query,
                     &key,
@@ -4176,6 +4241,14 @@ fn qwen35_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Kill switch for the chunked DeltaNet prefill kernels.
+pub const CHUNKED_GDN_ENV: &str = "IZWI_QWEN36_CHUNKED_GDN";
+
+/// Shortest prefill span the chunked recurrence takes; shorter spans (MTP
+/// verification, small resumes) stay on the sequential kernel, whose single
+/// launch costs less than the chunked pair there.
+const CHUNKED_GDN_MIN_TOKENS: usize = 32;
+
 fn qwen35_tiled_recurrence_enabled() -> bool {
     qwen35_env_bool("IZWI_QWEN35_TILED_RECURRENCE", true)
 }
@@ -4380,6 +4453,7 @@ pub(crate) mod tests {
             v_head_order: Qwen36LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
@@ -4515,6 +4589,7 @@ pub(crate) mod tests {
             v_head_order: order,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
@@ -5226,6 +5301,11 @@ pub(crate) mod tests {
                 "cuda.fused_decode=off",
             ),
             (
+                "gdn_prefill",
+                model.gdn_prefill_summary(),
+                "cuda.fused_decode=off",
+            ),
+            (
                 "cuda_graphs",
                 model.cuda_graphs_summary(),
                 "cuda.decode_graphs=off",
@@ -5856,6 +5936,32 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The chunked DeltaNet prefill kernels are CUDA-only: off CUDA every
+    /// DeltaNet layer keeps the sequential recurrence, and the diagnostics
+    /// say why.
+    #[test]
+    fn chunked_gdn_prefill_stays_off_outside_cuda() {
+        use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
+        let model = super::Qwen36TextModel::load_with_source(
+            &SyntheticFp8Source::new(Qwen36MoeBackendRequest::Auto),
+            &e2e_config(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let summary = model.gdn_prefill_summary();
+        assert_eq!(summary["backend"], "legacy", "{summary}");
+        assert!(
+            summary["legacy_reasons"][0]
+                .as_str()
+                .is_some_and(|reason| reason.contains("CUDA only")),
+            "{summary}"
+        );
+        assert!(model.layers.iter().all(|layer| match &layer.mixer {
+            super::Qwen36Mixer::Linear(linear) => !linear.chunked_recurrence,
+            super::Qwen36Mixer::Full(_) => true,
+        }));
+    }
+
     #[test]
     fn linear_attention_computes_in_f32_under_bf16_activations() {
         // Mirror the CUDA native plan in miniature: CompactFp8 projections
@@ -5904,6 +6010,7 @@ pub(crate) mod tests {
             v_head_order: Qwen36LinearVHeadOrder::Tiled,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            chunked_recurrence: false,
             fused_decode: None,
             fused_decode_path: Qwen36FusedPath::legacy("test"),
             packed_in: None,
