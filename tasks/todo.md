@@ -300,8 +300,52 @@ attention (q/k norm + RoPE, the KV write, paged decode) and an eager LM head.
       loops over that expert's pairs. Each expert's weights are read once per chunk, not once per
       routed token (about 8× less weight traffic at 256 tokens). Deterministic slot-order combine.
       The MoE self-check adds a 48-token grouped-vs-per-pair probe.
-- [ ] FP8 tensor-core grouped GEMM on SM90; chunked GDN prefill (FLA chunk 64); larger prefill
-      chunks (Phase 5b).
+- [x] Phase 5b, below: chunked GDN prefill, tensor-core grouped MoE, wider prefill spans.
+
+### Phase 5b — prefill kernels and span width — DONE (unmeasured; self-checked at load)
+Before: a lone prompt prefilled in 192-token engine steps (the chunk threshold), which Qwen3.6
+split again into 256-token forwards. In each forward:
+- the DeltaNet recurrence ran token by token on 32 blocks;
+- the grouped MoE re-read nearly all 256 experts' weights (about 32 GB per step across the
+  trunk) and did its arithmetic on CUDA cores.
+
+- [x] Chunked Gated DeltaNet prefill (`3411f7e9`), FLA's `chunk_gated_delta_rule`, chunk 64:
+  - a prepare kernel builds every chunk's gamma, A and P at once;
+  - a scan kernel walks the chunks with the state in shared memory, 8 value-column blocks per
+    head (256 blocks).
+  - Used for spans of 32 or more tokens. At load it must match the sequential kernel on the
+    device (three chunks, the last partial). `gdn_prefill` in the diagnostics;
+    `IZWI_QWEN36_CHUNKED_GDN=legacy` turns it off.
+  - The CPU emulator agrees with the sequential kernel to 1e-7 relative.
+- [x] Tensor-core grouped MoE (`7940fc8b`):
+  - each expert's grouped rows are tiled by 64, and each 64x64 output tile runs on 16x16x16
+    WMMA (BF16/F16 inputs, F32 sums);
+  - E4M3 decodes exactly to F16 as value * 2^-8, with the 256 folded into the block scale;
+  - SwiGLU runs in the gate/up epilogue; the down kernel scatters partials for the existing
+    combine.
+  - This is W8A16. Native FP8 MMA needs a separate sm_89+ PTX module, which is follow-up work.
+  - At load it is compared with the warp kernels at the trunk widths, then enabled
+    process-wide. `moe_prefill` in the diagnostics; `IZWI_QWEN36_GROUPED_MMA=legacy`.
+  - The emulator matches an exact reference within BF16/F16 rounding, as closely as the warp
+    kernels do.
+- [x] Wider prefill spans (`3719b9ab`):
+  - `ExecutionProfile::preferred_prefill_tokens` applies only to a request prefilling alone:
+    nothing decoding, nothing else running or waiting. The step budget stretches to it.
+  - Qwen3.6 prefers 1,024 when either prefill kernel is active, and forwards the span whole.
+  - With any peer present, the engine's threshold applies unchanged.
+  - `IZWI_QWEN35_PREFILL_CHUNK_SIZE` still overrides the forward size.
+
+**Deploy checklist (Phase 5b).**
+- [ ] GPU pre-flight: `cargo test -p izwi-core --features cuda --lib` covers
+  `tiled_recurrence_sequence_matches_delta_rule_reference_at_trunk_geometry` (now with the
+  chunked path) and `cuda_tensor_core_grouped_moe_matches_the_warp_kernels_at_trunk_geometry`.
+- [ ] Diagnostics after load: `gdn_prefill.backend == "fused"` and
+  `moe_prefill.backend == "fused"`. Otherwise `legacy_reasons` names the failed check.
+- [ ] Time to first token on a long first turn (4K+ tokens) and on a thread's second turn,
+  before and after. A/B with `IZWI_QWEN36_CHUNKED_GDN=legacy`,
+  `IZWI_QWEN36_GROUPED_MMA=legacy`, and `IZWI_QWEN35_PREFILL_CHUNK_SIZE=256`.
+- [ ] Decode with a concurrent new prompt: the decoding stream's inter-token time must not
+  spike. A peer keeps the engine's threshold, so it should not.
 
 ### Phase 5a — reuse state across chat turns — DONE (unmeasured; default-on on CUDA)
 Measured: a second turn in a thread re-prefills the whole history, about 3.5 s of a 23.5 s reply.
