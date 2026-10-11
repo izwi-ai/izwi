@@ -1154,7 +1154,11 @@ pub(crate) mod tests {
         };
         let snapshot_before = snapshot_values(published);
 
-        // Fresh reference over private pages.
+        // Fresh reference over private pages. It prefills across the same
+        // span boundary as the publisher and the attached session, so every
+        // forward has the same shape on both sides: CPU matmuls may round a
+        // row differently with the row count (x86 does, aarch64 happens not
+        // to), which would turn the exact check into a check of the BLAS.
         let fresh_base = pages(total);
         let mut reference = exec
             .begin_resumable_prefill_state_physical(
@@ -1165,8 +1169,11 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, 0, fork)
+            .unwrap());
         assert!(exec
-            .continue_resumable_prefill_physical(&mut reference, &prepared, 0, total)
+            .continue_resumable_prefill_physical(&mut reference, &prepared, fork, total)
             .unwrap());
         let reference_state = reference.linear_state_values();
         assert!(!reference_state.is_empty());
