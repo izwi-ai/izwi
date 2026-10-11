@@ -783,6 +783,91 @@ impl PhysicalPagedKvCache {
         Ok(output)
     }
 
+    /// Decode one token whose rotated key and value a fused kernel writes
+    /// straight into this layer's paged cache, then attend against the same
+    /// pages.
+    ///
+    /// `write(keys, values)` receives the layer's caches, `[pages,
+    /// page_tokens, kv_heads, head_dim]` in the arena's storage, enqueues the
+    /// write of the prepared slot, and returns the queries `[1, heads, dim]`.
+    /// The arena accounts for that write exactly as for
+    /// [`Self::write_and_attend`]: the pages turn dirty, the write is fenced
+    /// and ordered before the decode, and its completion joins `prepared`.
+    /// Mutations stay serialized while `write` runs, so the caches cannot grow
+    /// or be swapped under it.
+    ///
+    /// Returns `Ok(None)` without running `write` when the arena cannot take
+    /// such writes (CPU arenas, or K/V stored in a dtype other than the
+    /// activations'); the caller then uses [`Self::write_and_attend`] with the
+    /// same `prepared` step, which nothing has touched.
+    pub(crate) fn write_fused_and_attend(
+        &self,
+        layer_idx: usize,
+        prepared: &mut PreparedPhysicalPagedStep,
+        softmax_scale: f32,
+        write: &mut dyn FnMut(&Tensor, &Tensor) -> Result<Tensor>,
+    ) -> Result<Option<Tensor>> {
+        if prepared.arena != self.arena.id()
+            || prepared.logical_generation != self.logical_generation
+            || prepared.start_pos != self.context_len
+            || prepared.token_count != 1
+            || prepared.slots.len() != 1
+        {
+            return Err(Error::InvalidInput(
+                "physical paged fused write received a stale, incompatible or multi-token prepared step"
+                    .into(),
+            ));
+        }
+        let binding = self.layer_binding(layer_idx)?;
+        let mut queries = None;
+        let mut entered = false;
+        let completions = match self.arena.with_graph_writes(
+            &[binding],
+            prepared.slots.as_ref(),
+            0,
+            &mut |caches| {
+                entered = true;
+                let (keys, values) = caches.layers.first().ok_or_else(|| {
+                    Error::InferenceError("graph write returned no cache for the layer".into())
+                })?;
+                queries = Some(write(keys, values)?);
+                Ok(())
+            },
+        ) {
+            Ok(completions) => completions,
+            // Refused before anything ran: the arena does not take graph writes.
+            Err(_) if !entered => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let [completion]: [_; 1] = completions.try_into().map_err(|_| {
+            Error::InferenceError("physical paged fused write returned extra completions".into())
+        })?;
+        if completion.arena() != self.arena.id()
+            || completion.layer() != binding
+            || completion.slots() != 1
+        {
+            return Err(Error::InferenceError(
+                "physical paged fused write returned a mismatched backend completion".into(),
+            ));
+        }
+        let queries = queries.ok_or_else(|| {
+            Error::InferenceError("physical paged fused write produced no queries".into())
+        })?;
+        let (output, completion) = submit_ordered_after_write(completion, || {
+            self.arena.paged_decode(
+                binding,
+                PagedKvDecodeArgs {
+                    queries: &queries,
+                    batch: &prepared.decode,
+                    softmax_scale,
+                    softcap: None,
+                },
+            )
+        })?;
+        prepared.completions.collect(completion)?;
+        Ok(Some(output))
+    }
+
     /// Append with a layer-specific visible window. The block table and write
     /// slots remain absolute; only each query's attention view is narrowed.
     pub(crate) fn write_and_attend_with_window(
@@ -1392,5 +1477,162 @@ mod tests {
         assert!(error.to_string().contains("stale prepared step"));
         assert_eq!(cache.context_len(), 0);
         assert!(cache.take_completed_writes().is_empty());
+    }
+
+    #[test]
+    fn fused_write_declines_on_a_cpu_arena_and_leaves_the_step_usable() {
+        let mut cache = prefix_test_cache(1);
+        let mut prepared = cache.prepare_append(0, 1).unwrap();
+        let mut called = false;
+        let declined = cache
+            .write_fused_and_attend(0, &mut prepared, 1.0, &mut |_, _| {
+                called = true;
+                Err(Error::InferenceError(
+                    "the CPU arena must not run this".into(),
+                ))
+            })
+            .unwrap();
+        assert!(declined.is_none());
+        assert!(!called);
+        // The untouched step still serves the ordinary path for every layer.
+        let token = Tensor::ones((1, 1, 2), DType::F32, &Device::Cpu).unwrap();
+        for layer in 0..2 {
+            cache
+                .write_and_attend(layer, &mut prepared, &token, &token, &token, 1.0)
+                .unwrap();
+        }
+        cache.commit_prepared(prepared).unwrap();
+        assert_eq!(cache.context_len(), 1);
+        // Multi-token steps are refused outright.
+        let mut span = cache.prepare_append(1, 2).unwrap();
+        assert!(cache
+            .write_fused_and_attend(0, &mut span, 1.0, &mut |_, _| unreachable!())
+            .is_err());
+    }
+
+    /// On an accelerator arena the fused write runs inside the arena's
+    /// graph-write bookkeeping: the output, the pages later tokens attend to,
+    /// and the dispatch counts match `write_and_attend`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_write_matches_write_and_attend_on_a_metal_arena() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        let (kv_heads, heads, dim, page_tokens) = (2usize, 4usize, 8usize, 4u32);
+        let cache = |instance: u64| {
+            let arena_id = KvArenaId {
+                model_instance: ModelInstanceId::new(instance),
+                backend: BackendKind::Metal,
+                device_ordinal: Some(0),
+                generation: 1,
+            };
+            let group = KvGroupId::new(1);
+            let binding = KvLayerBinding {
+                model_layer: 0,
+                physical_layer: 0,
+            };
+            let arena = Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    KvArenaConfig {
+                        id: arena_id,
+                        group,
+                        page_tokens,
+                        capacity_pages: 2,
+                        growth: None,
+                        dtype: DType::F16,
+                        layers: vec![KvLayerConfig {
+                            binding,
+                            num_kv_heads: kv_heads as u32,
+                            key_head_dim: dim as u32,
+                            value_head_dim: dim as u32,
+                        }],
+                    },
+                    device.clone(),
+                )
+                .unwrap(),
+            );
+            let blocks = (0..2)
+                .map(|index| CacheBlockRef {
+                    arena: arena_id,
+                    group,
+                    index,
+                    slot_generation: 1,
+                })
+                .collect();
+            PhysicalPagedKvCache::new(arena, vec![binding], blocks, 0).unwrap()
+        };
+        let (mut plain, mut fused) = (cache(41), cache(42));
+        let tensor = |rows: usize, seed: f32| {
+            Tensor::from_vec(
+                (0..rows * dim)
+                    .map(|i| ((i as f32 + seed) * 0.754_877_7).sin())
+                    .collect::<Vec<_>>(),
+                (1, rows, dim),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&device)
+            .unwrap()
+        };
+        let host = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for token in 0..6 {
+            let seed = 10.0 * token as f32;
+            let (q, k, v) = (
+                tensor(heads, seed),
+                tensor(kv_heads, seed + 1.0),
+                tensor(kv_heads, seed + 2.0),
+            );
+            let mut step = plain.prepare_append(token, 1).unwrap();
+            let expected = plain
+                .write_and_attend(0, &mut step, &q, &k, &v, 0.35)
+                .unwrap();
+            plain.commit_prepared(step).unwrap();
+
+            let slot = fused.slots_for_append(token, 1).unwrap()[0];
+            let flat = (slot.block.index * page_tokens + slot.offset) as usize;
+            let mut step = fused.prepare_append(token, 1).unwrap();
+            let actual = fused
+                .write_fused_and_attend(0, &mut step, 0.35, &mut |keys, values| {
+                    let rows = keys.dim(0)? * keys.dim(1)?;
+                    keys.reshape((rows, kv_heads, dim))?.slice_set(
+                        &k.reshape((1, kv_heads, dim))?,
+                        0,
+                        flat,
+                    )?;
+                    values.reshape((rows, kv_heads, dim))?.slice_set(
+                        &v.reshape((1, kv_heads, dim))?,
+                        0,
+                        flat,
+                    )?;
+                    Ok(q.clone())
+                })
+                .unwrap()
+                .expect("accelerator arenas take fused writes");
+            fused.commit_prepared(step).unwrap();
+            assert_eq!(host(&actual), host(&expected), "token {token}");
+        }
+        let (plain_stats, fused_stats) = (
+            plain.arena().operation_stats(),
+            fused.arena().operation_stats(),
+        );
+        assert_eq!(fused_stats.slot_write_dispatches, 6);
+        assert_eq!(
+            fused_stats.slot_write_dispatches,
+            plain_stats.slot_write_dispatches
+        );
+        assert_eq!(
+            fused_stats.paged_decode_dispatches,
+            plain_stats.paged_decode_dispatches
+        );
     }
 }

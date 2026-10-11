@@ -21,6 +21,12 @@ use crate::performance::{CudaPerformanceConfig, OptimizationMode};
 pub(crate) const FUSED_NORM_ENV: &str = "IZWI_QWEN38_FUSED_NORM";
 /// Kill switch for the fused DeltaNet (GDN) decode.
 pub(crate) const FUSED_GDN_ENV: &str = "IZWI_QWEN38_FUSED_GDN";
+/// Kill switch for the fused q/k norm + partial M-RoPE.
+pub(crate) const FUSED_QK_ROPE_ENV: &str = "IZWI_QWEN38_FUSED_QK_ROPE";
+/// Kill switch for the K/V write from the fused q/k launch.
+pub(crate) const FUSED_KV_WRITE_ENV: &str = "IZWI_QWEN38_FUSED_KV_WRITE";
+/// Kill switch for the one-launch attention output gate.
+pub(crate) const FUSED_ATTN_GATE_ENV: &str = "IZWI_QWEN38_FUSED_ATTN_GATE";
 
 /// Execution path a fast path resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]

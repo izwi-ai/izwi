@@ -81,12 +81,19 @@ fn production_resolution_keeps_every_fast_path_legacy_off_cuda() {
 }
 
 #[test]
-fn fused_norms_track_the_composition_end_to_end() {
+fn fused_fast_paths_track_the_composition_end_to_end() {
     let _guard = counters_lock();
     let (_, legacy) = golden_f16(false);
     let (_, fused) = golden_f16(true);
-    let summary = &fused.fast_path_diagnostics()["rms_norm"];
-    assert_eq!(summary["backend"], "fused", "{summary}");
+    let diagnostics = fused.fast_path_diagnostics();
+    for name in ["rms_norm", "qk_rope", "kv_write", "attn_gate"] {
+        assert_eq!(
+            diagnostics[name]["backend"], "fused",
+            "{name}: {diagnostics}"
+        );
+    }
+    // The fixture's 32-wide DeltaNet heads do not fit the 128-wide kernel.
+    assert_eq!(diagnostics["gdn_decode"]["backend"], "legacy");
     assert!(fused.output_norm.fused);
     assert!(fused.layers.iter().all(|layer| {
         layer.attn_norm.fused
@@ -98,9 +105,9 @@ fn fused_norms_track_the_composition_end_to_end() {
     }));
 
     let before = telemetry::snapshot();
-    assert_fused_tracks_legacy(&legacy, &legacy, "norm baseline");
+    assert_fused_tracks_legacy(&legacy, &legacy, "composition baseline");
     let legacy_done = telemetry::snapshot();
-    assert_fused_tracks_legacy(&legacy, &fused, "fused norms");
+    assert_fused_tracks_legacy(&legacy, &fused, "fused fast paths");
     let fused_done = telemetry::snapshot();
     // The legacy runs never touch the fused kernels; the fused run does, for
     // both the plain norms and the residual adds folded into them.
@@ -112,6 +119,16 @@ fn fused_norms_track_the_composition_end_to_end() {
         legacy_done.cuda_fused_rms_norm_total,
         before.cuda_fused_rms_norm_total
     );
+    assert_eq!(
+        legacy_done.cuda_fused_qk_norm_rope_total,
+        before.cuda_fused_qk_norm_rope_total
+    );
+    assert_eq!(
+        legacy_done.cuda_fused_attn_gate_total,
+        before.cuda_fused_attn_gate_total
+    );
+    assert!(fused_done.cuda_fused_qk_norm_rope_total > legacy_done.cuda_fused_qk_norm_rope_total);
+    assert!(fused_done.cuda_fused_attn_gate_total > legacy_done.cuda_fused_attn_gate_total);
     assert!(fused_done.cuda_fused_add_rms_norm_total > legacy_done.cuda_fused_add_rms_norm_total);
     assert!(fused_done.cuda_fused_rms_norm_total > legacy_done.cuda_fused_rms_norm_total);
 }
@@ -207,6 +224,9 @@ fn fused_norm_switch_forces_the_composition() {
 const FAST_PATH_SWITCHES: &[&str] = &[
     super::super::fast_path::FUSED_NORM_ENV,
     super::super::fast_path::FUSED_GDN_ENV,
+    super::super::fast_path::FUSED_QK_ROPE_ENV,
+    super::super::fast_path::FUSED_KV_WRITE_ENV,
+    super::super::fast_path::FUSED_ATTN_GATE_ENV,
 ];
 
 /// Load with every `IZWI_QWEN38_FUSED_*` switch set to `legacy`: today's
@@ -300,7 +320,12 @@ fn cuda_golden_trunk_with_fast_paths_tracks_the_composition_and_hf() {
     let legacy = load_with_fast_paths_legacy(load);
     let fused = load();
     let diagnostics = fused.fast_path_diagnostics();
-    assert_eq!(diagnostics["rms_norm"]["backend"], "fused", "{diagnostics}");
+    for name in ["rms_norm", "qk_rope", "kv_write", "attn_gate"] {
+        assert_eq!(
+            diagnostics[name]["backend"], "fused",
+            "{name}: {diagnostics}"
+        );
+    }
     for (name, summary) in legacy.fast_path_diagnostics().as_object().unwrap() {
         assert_eq!(summary["backend"], "legacy", "{name}: {summary}");
     }
@@ -913,4 +938,432 @@ fn cuda_fused_gdn_matches_legacy_q38_kernels_48_heads() {
         0.01,
         0.03,
     );
+}
+
+/// Deterministic pseudo-random values in `[-scale, scale]` (xorshift): test
+/// weights without the structured cancellation a sinusoid gives a long dot
+/// product.
+fn noise(len: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+/// A full-attention block at the 27B attention geometry (24 query and 4 KV
+/// heads of 256, 64 rotary dims in [11, 11, 10] interleaved sections, theta
+/// 1e7) over a `hidden`-wide residual, with deterministic weights in `dtype`
+/// and F32 zero-centered head-norm gains.
+fn attention_block(hidden: usize, device: &Device, dtype: DType) -> Qwen38FullAttention {
+    let (heads, kv_heads, dim, rope_dim) = (24usize, 4usize, 256usize, 64usize);
+    let scale = 2.0 / (hidden as f32).sqrt();
+    let dense = |out: usize, input: usize, seed: f32, scale: f32| {
+        Qwen38Projection::Dense(Linear::new(
+            Tensor::from_vec(
+                noise(out * input, seed as u64, scale),
+                (out, input),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+            .to_device(device)
+            .unwrap(),
+            None,
+        ))
+    };
+    let gain = |seed: f32| {
+        Qwen38RmsNorm::new(
+            Tensor::from_vec(
+                self_check_wave(dim, seed, 0.2)
+                    .iter()
+                    .map(|w| 1.0 + w)
+                    .collect::<Vec<_>>(),
+                dim,
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_device(device)
+            .unwrap(),
+            1e-6,
+        )
+    };
+    Qwen38FullAttention {
+        qkv_proj: Qwen38ProjectionGroup::Separate(vec![
+            dense(heads * dim * 2, hidden, 1.0, scale),
+            dense(kv_heads * dim, hidden, 2.0, scale),
+            dense(kv_heads * dim, hidden, 3.0, scale),
+        ]),
+        o_proj: dense(
+            hidden,
+            heads * dim,
+            4.0,
+            ((heads * dim) as f32).sqrt().recip(),
+        ),
+        q_norm: gain(5.0),
+        k_norm: gain(6.0),
+        num_heads: heads,
+        num_kv_heads: kv_heads,
+        head_dim: dim,
+        rope_dim,
+        rope_theta: 10_000_000.0,
+        mrope_sections: vec![11, 11, 10],
+        rope_kernel_enabled: qwen38_rope_kernel_enabled(device),
+        rope_inv_freqs: build_rope_inv_freqs(rope_dim, 10_000_000.0).unwrap(),
+        fused_qk: None,
+        fused_qk_path: Qwen38FastPath::default(),
+        fused_kv_write: false,
+        fused_kv_write_path: Qwen38FastPath::default(),
+        fused_gate: false,
+        fused_gate_path: Qwen38FastPath::default(),
+    }
+}
+
+/// `rows` single-layer paged caches over one arena on `device` (CPU arena
+/// off the accelerators), sized for the attention block.
+fn attention_caches(
+    device: &Device,
+    dtype: DType,
+    rows: u32,
+    instance: u64,
+) -> Vec<PhysicalPagedKvCache> {
+    use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    const PAGES_PER_ROW: u32 = 2;
+    let backend = if device.is_cuda() {
+        BackendKind::Cuda
+    } else if device.is_metal() {
+        BackendKind::Metal
+    } else {
+        BackendKind::Cpu
+    };
+    let id = KvArenaId {
+        model_instance: ModelInstanceId::new(instance),
+        backend,
+        device_ordinal: (!device.is_cpu()).then_some(0),
+        generation: 1,
+    };
+    let group = KvGroupId::new(1);
+    let binding = KvLayerBinding {
+        model_layer: 3,
+        physical_layer: 0,
+    };
+    let config = KvArenaConfig {
+        id,
+        group,
+        page_tokens: 8,
+        capacity_pages: PAGES_PER_ROW * rows,
+        growth: None,
+        dtype,
+        layers: vec![KvLayerConfig {
+            binding,
+            num_kv_heads: 4,
+            key_head_dim: 256,
+            value_head_dim: 256,
+        }],
+    };
+    let arena: Arc<dyn KvArena> = if device.is_cpu() {
+        Arc::new(CpuKvArena::new(config).unwrap())
+    } else {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        {
+            Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    config,
+                    device.clone(),
+                )
+                .unwrap(),
+            )
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        unreachable!("accelerator devices need an accelerator build")
+    };
+    (0..rows)
+        .map(|row| {
+            let blocks = (row * PAGES_PER_ROW..(row + 1) * PAGES_PER_ROW)
+                .map(|index| CacheBlockRef {
+                    arena: id,
+                    group,
+                    index,
+                    slot_generation: 1,
+                })
+                .collect();
+            PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap()
+        })
+        .collect()
+}
+
+/// One attention forward over `inputs` `[1, tokens, hidden]` at `positions`,
+/// committed to `cache`, through production's per-forward rotary inputs.
+fn attend(
+    attention: &Qwen38FullAttention,
+    inputs: &Tensor,
+    positions: &[[usize; 3]],
+    cache: &mut PhysicalPagedKvCache,
+) -> Vec<f32> {
+    let rope = Qwen38RopeInputs::new(positions, inputs.device(), inputs.dtype())
+        .with_decode_step(cache, std::iter::once(attention))
+        .unwrap();
+    let mut prepared = cache
+        .prepare_append(cache.context_len(), positions.len())
+        .unwrap();
+    let output = attention
+        .forward_physical(inputs, &rope, cache, &mut prepared, 0)
+        .unwrap();
+    cache.commit_prepared(prepared).unwrap();
+    host_values(&output).unwrap()
+}
+
+fn attention_inputs(
+    tokens: usize,
+    hidden: usize,
+    seed: f32,
+    device: &Device,
+    dtype: DType,
+) -> Tensor {
+    Tensor::from_vec(
+        noise(tokens * hidden, 1000 + seed as u64, 1.0),
+        (1, tokens, hidden),
+        &Device::Cpu,
+    )
+    .unwrap()
+    .to_dtype(dtype)
+    .unwrap()
+    .to_device(device)
+    .unwrap()
+}
+
+/// Prefill (the chain) then decode at long, text and image positions: the
+/// fused q/k (eager on the CPU arena, which declines the fused K/V write)
+/// and the fused gate track today's chain at the 27B attention geometry,
+/// scalar and batched.
+#[test]
+fn fused_attention_tracks_the_chain_at_qwen38_geometry() {
+    let _guard = counters_lock();
+    let (hidden, dtype) = (64, DType::F16);
+    let legacy = attention_block(hidden, &Device::Cpu, dtype);
+    let mut fused = attention_block(hidden, &Device::Cpu, dtype);
+    fused.resolve_fused_attention(&Qwen38CudaSwitches::default(), &Device::Cpu, dtype, true);
+    for path in fused.fast_paths() {
+        assert_eq!(*path, Qwen38FastPath::Fused);
+    }
+    let prompt: Vec<[usize; 3]> = (0..3).map(|p| [199_990 + p; 3]).collect();
+    let steps = [[199_993; 3], [199_994; 3], [7, 3, 11], [199_996; 3]];
+    let run = |attention: &Qwen38FullAttention, instance: u64| {
+        let mut cache = attention_caches(&Device::Cpu, dtype, 1, instance).remove(0);
+        let mut outputs = vec![attend(
+            attention,
+            &attention_inputs(3, hidden, 1.0, &Device::Cpu, dtype),
+            &prompt,
+            &mut cache,
+        )];
+        for (step, position) in steps.iter().enumerate() {
+            outputs.push(attend(
+                attention,
+                &attention_inputs(1, hidden, 10.0 + step as f32, &Device::Cpu, dtype),
+                &[*position],
+                &mut cache,
+            ));
+        }
+        outputs
+    };
+    let before = telemetry::snapshot();
+    let expected = run(&legacy, 501);
+    let between = telemetry::snapshot();
+    let actual = run(&fused, 502);
+    let after = telemetry::snapshot();
+    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_close(
+            &format!("attention forward {index}"),
+            actual,
+            expected,
+            0.01,
+            0.03,
+        );
+    }
+    assert_eq!(
+        between.cuda_fused_qk_norm_rope_total,
+        before.cuda_fused_qk_norm_rope_total
+    );
+    assert_eq!(
+        between.cuda_fused_attn_gate_total,
+        before.cuda_fused_attn_gate_total
+    );
+    assert_eq!(
+        after.cuda_fused_qk_norm_rope_total - between.cuda_fused_qk_norm_rope_total,
+        steps.len() as u64
+    );
+    // The CPU arena declines the fused K/V write.
+    assert_eq!(
+        after.cuda_fused_qk_norm_rope_kv_total,
+        between.cuda_fused_qk_norm_rope_kv_total
+    );
+    // The gate also serves the prefill forward.
+    assert_eq!(
+        after.cuda_fused_attn_gate_total - between.cuda_fused_attn_gate_total,
+        steps.len() as u64 + 1
+    );
+
+    // Two ragged rows through the batched decode.
+    let batch = |attention: &Qwen38FullAttention, instance: u64| {
+        let mut caches = attention_caches(&Device::Cpu, dtype, 2, instance);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            let positions: Vec<[usize; 3]> = (0..2 + row).map(|p| [p; 3]).collect();
+            attend(
+                attention,
+                &attention_inputs(2 + row, hidden, 20.0 + row as f32, &Device::Cpu, dtype),
+                &positions,
+                cache,
+            );
+        }
+        let positions = [[2, 2, 2], [3000, 3000, 3000]];
+        let starts = caches
+            .iter()
+            .map(|cache| cache.context_len())
+            .collect::<Vec<_>>();
+        let slots = caches
+            .iter()
+            .zip(&starts)
+            .map(|(cache, start)| cache.slots_for_append(*start, 1).unwrap()[0])
+            .collect::<Vec<_>>();
+        let lowered = caches[0].arena().lower_slots(&slots).unwrap();
+        let metadata = KvDecodeBatchMetadata {
+            sequences: caches
+                .iter()
+                .zip(&starts)
+                .map(|(cache, start)| cache.sequence_table(start + 1).unwrap())
+                .collect(),
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(caches[0].arena().config(), lowered.logical_slots())
+                .unwrap();
+        let refs = caches.iter().collect::<Vec<_>>();
+        let output = attention
+            .forward_physical_decode_batch(
+                &attention_inputs(2, hidden, 40.0, &Device::Cpu, dtype)
+                    .reshape((2, 1, hidden))
+                    .unwrap(),
+                &positions,
+                &refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                0,
+            )
+            .unwrap();
+        completions.drain().unwrap();
+        host_values(&output).unwrap()
+    };
+    assert_close(
+        "batched attention",
+        &batch(&fused, 503),
+        &batch(&legacy, 504),
+        0.01,
+        0.03,
+    );
+}
+
+/// The self-check at long positions sees a 0.1% frequency error, which a
+/// short position would hide; an image position needs valid sections.
+#[test]
+fn fused_qk_self_check_rejects_a_wrong_rotation() {
+    let attention = attention_block(64, &Device::Cpu, DType::F16);
+    let spec = QkNormRopeSpec {
+        num_heads: 24,
+        num_kv_heads: 4,
+        head_dim: 256,
+        rope_dim: 64,
+        eps: 1e-6,
+    };
+    let inv_freq = |scale: f32| {
+        Tensor::from_vec(
+            attention
+                .rope_inv_freqs
+                .iter()
+                .map(|f| f * scale)
+                .collect::<Vec<_>>(),
+            32,
+            &Device::Cpu,
+        )
+        .unwrap()
+    };
+    attention
+        .fused_qk_self_check(&spec, &inv_freq(1.0), &Device::Cpu, DType::F16)
+        .unwrap();
+    let error = attention
+        .fused_qk_self_check(&spec, &inv_freq(1.001), &Device::Cpu, DType::F16)
+        .unwrap_err();
+    assert!(error.to_string().contains("3000"), "{error}");
+    assert_eq!(
+        attention.mrope_position([7, 3, 11]).unwrap().height_section,
+        11
+    );
+    let mut text_only = attention_block(64, &Device::Cpu, DType::F16);
+    text_only.mrope_sections = vec![11];
+    assert!(text_only.mrope_position([7, 3, 11]).is_none());
+    assert!(text_only.mrope_position([7, 7, 7]).is_some());
+}
+
+/// Production resolution on CUDA at the 27B attention geometry turns all
+/// three paths on; on a live BF16 accelerator arena the decode tokens then
+/// take the K/V-writing launch through `write_fused_and_attend`, and every
+/// output (including later tokens attending to the fused writes) tracks
+/// today's chain.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_qk_norm_rope_kv_matches_chain_qwen38_geometry() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let _guard = counters_lock();
+    let (hidden, dtype) = (256, DType::BF16);
+    let legacy = attention_block(hidden, &device, dtype);
+    let mut fused = attention_block(hidden, &device, dtype);
+    fused.resolve_fused_attention(&Qwen38CudaSwitches::default(), &device, dtype, false);
+    for path in fused.fast_paths() {
+        assert_eq!(*path, Qwen38FastPath::Fused);
+    }
+    let run = |attention: &Qwen38FullAttention, instance: u64| {
+        let mut cache = attention_caches(&device, dtype, 1, instance).remove(0);
+        let prompt: Vec<[usize; 3]> = (0..4).map(|p| [p; 3]).collect();
+        let mut outputs = vec![attend(
+            attention,
+            &attention_inputs(4, hidden, 1.0, &device, dtype),
+            &prompt,
+            &mut cache,
+        )];
+        for step in 0..6 {
+            outputs.push(attend(
+                attention,
+                &attention_inputs(1, hidden, 10.0 + step as f32, &device, dtype),
+                &[[4 + step; 3]],
+                &mut cache,
+            ));
+        }
+        outputs
+    };
+    let expected = run(&legacy, 601);
+    let before = telemetry::snapshot();
+    let actual = run(&fused, 602);
+    let after = telemetry::snapshot();
+    assert_eq!(
+        after.cuda_fused_qk_norm_rope_kv_total - before.cuda_fused_qk_norm_rope_kv_total,
+        6
+    );
+    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_close(
+            &format!("CUDA attention forward {index}"),
+            actual,
+            expected,
+            0.01,
+            0.03,
+        );
+    }
 }

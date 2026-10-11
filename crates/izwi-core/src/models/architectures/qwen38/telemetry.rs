@@ -48,6 +48,11 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_fused_gdn_decode_attempts_total: u64,
     pub cuda_fused_gdn_decode_success_total: u64,
     pub cuda_fused_gdn_decode_fallback_total: u64,
+    pub cuda_fused_qk_norm_rope_total: u64,
+    pub cuda_fused_qk_norm_rope_kv_total: u64,
+    pub cuda_qk_rope_chain_total: u64,
+    pub cuda_fused_attn_gate_total: u64,
+    pub cuda_attn_gate_composition_total: u64,
     pub cuda_fused_rms_norm_total: u64,
     pub cuda_fused_add_rms_norm_total: u64,
     pub cuda_rms_norm_composition_total: u64,
@@ -124,6 +129,11 @@ counters!(
     CUDA_FUSED_GDN_DECODE_ATTEMPTS,
     CUDA_FUSED_GDN_DECODE_SUCCESS,
     CUDA_FUSED_GDN_DECODE_FALLBACK,
+    CUDA_FUSED_QK_NORM_ROPE,
+    CUDA_FUSED_QK_NORM_ROPE_KV,
+    CUDA_QK_ROPE_CHAIN,
+    CUDA_FUSED_ATTN_GATE,
+    CUDA_ATTN_GATE_COMPOSITION,
     CUDA_FUSED_RMS_NORM,
     CUDA_FUSED_ADD_RMS_NORM,
     CUDA_RMS_NORM_COMPOSITION,
@@ -289,6 +299,32 @@ pub(crate) fn record_cuda_rms_norm_composition() {
     CUDA_RMS_NORM_COMPOSITION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One decode token's q/k through the fused norm + RoPE kernel: `kv` when the
+/// same launch wrote its K/V into the paged cache. Production resolves it on
+/// CUDA only; the portable reference that tests resolve counts here too.
+pub(crate) fn record_fused_qk_norm_rope(kv: bool) {
+    if kv {
+        CUDA_FUSED_QK_NORM_ROPE_KV.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FUSED_QK_NORM_ROPE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA decode token's q/k through the norm, plan and rotary chain.
+pub(crate) fn record_cuda_qk_rope_chain() {
+    CUDA_QK_ROPE_CHAIN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One attention output gated by the fused kernel (any device, see above).
+pub(crate) fn record_fused_attn_gate() {
+    CUDA_FUSED_ATTN_GATE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One CUDA attention output gated by the sigmoid and multiply composition.
+pub(crate) fn record_cuda_attn_gate_composition() {
+    CUDA_ATTN_GATE_COMPOSITION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// A fused fast path disagreed with its composition at load and stayed off.
 pub(crate) fn record_fast_path_self_check_failure() {
     FAST_PATH_SELF_CHECK_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -431,6 +467,11 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_fused_gdn_decode_attempts_total: load!(CUDA_FUSED_GDN_DECODE_ATTEMPTS),
         cuda_fused_gdn_decode_success_total: load!(CUDA_FUSED_GDN_DECODE_SUCCESS),
         cuda_fused_gdn_decode_fallback_total: load!(CUDA_FUSED_GDN_DECODE_FALLBACK),
+        cuda_fused_qk_norm_rope_total: load!(CUDA_FUSED_QK_NORM_ROPE),
+        cuda_fused_qk_norm_rope_kv_total: load!(CUDA_FUSED_QK_NORM_ROPE_KV),
+        cuda_qk_rope_chain_total: load!(CUDA_QK_ROPE_CHAIN),
+        cuda_fused_attn_gate_total: load!(CUDA_FUSED_ATTN_GATE),
+        cuda_attn_gate_composition_total: load!(CUDA_ATTN_GATE_COMPOSITION),
         cuda_fused_rms_norm_total: load!(CUDA_FUSED_RMS_NORM),
         cuda_fused_add_rms_norm_total: load!(CUDA_FUSED_ADD_RMS_NORM),
         cuda_rms_norm_composition_total: load!(CUDA_RMS_NORM_COMPOSITION),

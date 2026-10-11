@@ -13,7 +13,8 @@ use super::native::{
 use super::text::{
     load_native_projection, load_native_zero_centered_norm, native_fp8_selected,
     native_projection_representation, norm_self_check, resolve_norm_path, Qwen38FullAttention,
-    Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38TextModel,
+    Qwen38Mlp, Qwen38Projection, Qwen38ProjectionRepresentation, Qwen38RmsNorm, Qwen38RopeInputs,
+    Qwen38TextModel,
 };
 use crate::backends::kv::KvWriteCompletionCollector;
 use crate::error::{Error, Result};
@@ -457,6 +458,8 @@ impl Qwen38MtpHead {
         }
         self.attention.set_fused_norms(fused);
         self.fused_norm_path = path;
+        self.attention
+            .resolve_fused_attention(switches, &self.device, dtype, allow_cpu);
     }
 
     /// Resolve against the portable CPU references (tests only).
@@ -467,8 +470,12 @@ impl Qwen38MtpHead {
 
     /// Fast-path resolutions for the admin diagnostics.
     pub(crate) fn fast_path_diagnostics(&self) -> serde_json::Value {
+        let [qk_rope, kv_write, attn_gate] = self.attention.fast_paths();
         serde_json::json!({
             "rms_norm": summarize([&self.fused_norm_path]),
+            "qk_rope": summarize([qk_rope]),
+            "kv_write": summarize([kv_write]),
+            "attn_gate": summarize([attn_gate]),
         })
     }
 
@@ -507,21 +514,14 @@ impl Qwen38MtpHead {
         let predecessor = self.pre_fc_norm_hidden.forward(&pairs.hidden_states)?;
         let fused = Tensor::cat(&[&embedding, &predecessor], 2)?;
         let hidden_states = self.fc.forward(&fused)?;
-        let mrope_plan = self.attention.prepare_mrope_plan(
-            &pairs.position_ids,
-            &self.device,
-            hidden_states.dtype(),
-        )?;
+        let rope = Qwen38RopeInputs::new(&pairs.position_ids, &self.device, hidden_states.dtype())
+            .with_decode_step(cache, std::iter::once(&self.attention))?;
         let mut prepared = cache.prepare_append(cache.context_len(), token_count)?;
         let result = (|| -> Result<Tensor> {
             let normalized = self.input_layernorm.forward(&hidden_states)?;
-            let attended = self.attention.forward_physical(
-                &normalized,
-                &mrope_plan,
-                cache,
-                &mut prepared,
-                0,
-            )?;
+            let attended =
+                self.attention
+                    .forward_physical(&normalized, &rope, cache, &mut prepared, 0)?;
             let (residual, normalized) = self
                 .post_attention_layernorm
                 .add_forward(&hidden_states, &attended)?;
@@ -1315,8 +1315,13 @@ pub(crate) mod tests {
             "legacy"
         );
         fused.enable_fast_paths_for_tests();
-        let summary = &fused.fast_path_diagnostics()["rms_norm"];
-        assert_eq!(summary["backend"], "fused", "{summary}");
+        let diagnostics = fused.fast_path_diagnostics();
+        for name in ["rms_norm", "qk_rope", "kv_write", "attn_gate"] {
+            assert_eq!(
+                diagnostics[name]["backend"], "fused",
+                "{name}: {diagnostics}"
+            );
+        }
 
         let values = |seed: f32, rows: usize| {
             Tensor::from_vec(

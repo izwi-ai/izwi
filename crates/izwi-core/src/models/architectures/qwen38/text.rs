@@ -12,17 +12,18 @@ use std::sync::Arc;
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
 use super::fast_path::{
-    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_GDN_ENV,
-    FUSED_NORM_ENV,
+    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath,
+    FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
 };
 use super::telemetry::{
-    record_cuda_attention_dtype_casts, record_cuda_head_expansion_materialization,
-    record_cuda_kernel, record_cuda_projection, record_cuda_rms_norm_composition, record_cuda_rope,
-    record_cuda_state_initial_allocation, record_fused_rms_norm, CudaKernelPath,
-    CudaProjectionPath,
+    record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition,
+    record_cuda_head_expansion_materialization, record_cuda_kernel, record_cuda_projection,
+    record_cuda_qk_rope_chain, record_cuda_rms_norm_composition, record_cuda_rope,
+    record_cuda_state_initial_allocation, record_fused_attn_gate, record_fused_qk_norm_rope,
+    record_fused_rms_norm, CudaKernelPath, CudaProjectionPath,
 };
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -32,8 +33,10 @@ use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::gate;
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::norm;
+use crate::kernels::cuda::rope::{self, MropePosition, QkNormRopeSpec};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
@@ -800,6 +803,17 @@ pub(super) struct Qwen38FullAttention {
     mrope_sections: Vec<usize>,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
+    /// Fused q/k norm + partial M-RoPE for a decode token, with its F32
+    /// inverse frequencies on the device. Resolved at load.
+    fused_qk: Option<(QkNormRopeSpec, Tensor)>,
+    fused_qk_path: Qwen38FastPath,
+    /// The fused q/k launch also writes the rotated key and the value into
+    /// the paged cache (`write_fused_and_attend`).
+    fused_kv_write: bool,
+    fused_kv_write_path: Qwen38FastPath,
+    /// The gated attention output in one launch.
+    fused_gate: bool,
+    fused_gate_path: Qwen38FastPath,
 }
 
 /// Forward-scoped rotary tensors shared by every Qwen3.8 full-attention layer.
@@ -813,6 +827,71 @@ pub(super) struct Qwen38MropePlan {
     sin: Option<Tensor>,
     sequence_len: usize,
     rope_dim: usize,
+}
+
+/// Forward-scoped rotary inputs shared by every full-attention layer: the
+/// token positions; the cos/sin plan, built on first use by a layer that runs
+/// the composition (the fused kernel takes the positions as scalars); and,
+/// for a text decode token whose layers write K/V from the fused kernel, the
+/// device step `[0, position, flat slot]` (U32) that kernel reads.
+pub(super) struct Qwen38RopeInputs<'a> {
+    positions: &'a [[usize; 3]],
+    device: Device,
+    dtype: DType,
+    plan: std::cell::OnceCell<Qwen38MropePlan>,
+    step: Option<Tensor>,
+}
+
+impl<'a> Qwen38RopeInputs<'a> {
+    pub(super) fn new(positions: &'a [[usize; 3]], device: &Device, dtype: DType) -> Self {
+        Self {
+            positions,
+            device: device.clone(),
+            dtype,
+            plan: std::cell::OnceCell::new(),
+            step: None,
+        }
+    }
+
+    /// Upload the step buffer when the forward is one text token at the
+    /// cache's next slot and some layer writes K/V from the fused kernel: one
+    /// 12-byte copy per forward, shared by every such layer. The flat slot is
+    /// `page * page_tokens + offset`, the arena's own slot lowering.
+    pub(super) fn with_decode_step<'b>(
+        mut self,
+        cache: &PhysicalPagedKvCache,
+        mut layers: impl Iterator<Item = &'b Qwen38FullAttention>,
+    ) -> Result<Self> {
+        let [[temporal, height, width]] = self.positions else {
+            return Ok(self);
+        };
+        if temporal != height || temporal != width || !layers.any(|layer| layer.fused_kv_write) {
+            return Ok(self);
+        }
+        let slot = cache.slots_for_append(cache.context_len(), 1)?[0];
+        let flat = slot
+            .block
+            .index
+            .checked_mul(cache.arena().config().page_tokens)
+            .and_then(|base| base.checked_add(slot.offset));
+        if let (Some(flat), Ok(position)) = (flat, u32::try_from(*temporal)) {
+            self.step = Some(Tensor::from_vec(
+                vec![0u32, position, flat],
+                3,
+                &self.device,
+            )?);
+        }
+        Ok(self)
+    }
+
+    /// The cos/sin plan, built by the first layer that needs it.
+    fn plan(&self, attention: &Qwen38FullAttention) -> Result<&Qwen38MropePlan> {
+        if let Some(plan) = self.plan.get() {
+            return Ok(plan);
+        }
+        let plan = attention.prepare_mrope_plan(self.positions, &self.device, self.dtype)?;
+        Ok(self.plan.get_or_init(|| plan))
+    }
 }
 
 struct Qwen38LinearAttention {
@@ -1350,9 +1429,9 @@ impl Qwen38TextModel {
             first_full.head_dim,
         )?;
         let start_pos = cache.context_len();
+        let rope = Qwen38RopeInputs::new(position_ids, input.device(), input.dtype())
+            .with_decode_step(cache, self.full_attention_layers())?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
-        let mrope_plan =
-            first_full.prepare_mrope_plan(position_ids, input.device(), input.dtype())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.ensure_state_initialized(layer_state, &self.device)?;
         }
@@ -1364,7 +1443,7 @@ impl Qwen38TextModel {
             hidden = layer.forward_physical(
                 hidden,
                 layer_state,
-                &mrope_plan,
+                &rope,
                 cache,
                 &mut prepared,
                 &mut physical_layer,
@@ -1438,8 +1517,13 @@ impl Qwen38TextModel {
         self.resolve_fused_norms(switches, allow_cpu);
         let dtype = self.activation_dtype();
         for layer in &mut self.layers {
-            if let Qwen38Mixer::Linear(linear) = &mut layer.mixer {
-                linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu);
+            match &mut layer.mixer {
+                Qwen38Mixer::Linear(linear) => {
+                    linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu)
+                }
+                Qwen38Mixer::Full(attention) => {
+                    attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu)
+                }
             }
         }
     }
@@ -1459,6 +1543,16 @@ impl Qwen38TextModel {
                 Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
                 Qwen38Mixer::Full(_) => None,
             })),
+            "qk_rope": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[0])),
+            "kv_write": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[1])),
+            "attn_gate": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[2])),
+        })
+    }
+
+    fn full_attention_layers(&self) -> impl Iterator<Item = &Qwen38FullAttention> {
+        self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen38Mixer::Full(attention) => Some(attention),
+            Qwen38Mixer::Linear(_) => None,
         })
     }
 
@@ -1639,7 +1733,7 @@ impl Qwen38Layer {
         &self,
         hidden: Qwen38Hidden,
         state: &mut Qwen38LayerRuntimeState,
-        mrope_plan: &Qwen38MropePlan,
+        rope: &Qwen38RopeInputs<'_>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
@@ -1655,13 +1749,8 @@ impl Qwen38Layer {
                 }
             }
             Qwen38Mixer::Full(mixer) => {
-                let output = mixer.forward_physical(
-                    &normalized,
-                    mrope_plan,
-                    cache,
-                    prepared,
-                    *physical_layer,
-                )?;
+                let output =
+                    mixer.forward_physical(&normalized, rope, cache, prepared, *physical_layer)?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("Qwen3.8 physical layer ordinal overflow".into())
                 })?;
@@ -1941,22 +2030,303 @@ impl Qwen38FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
+            fused_qk: None,
+            fused_qk_path: Qwen38FastPath::default(),
+            fused_kv_write: false,
+            fused_kv_write_path: Qwen38FastPath::default(),
+            fused_gate: false,
+            fused_gate_path: Qwen38FastPath::default(),
         })
+    }
+
+    /// Resolve the fused attention paths at load, each after a self-check on
+    /// this layer's own head-norm gains and rotary configuration:
+    /// - q/k norm + partial M-RoPE (`kernels/cuda/rope.rs`), against the
+    ///   norm + plan + rotary chain at short, long and image positions;
+    /// - the K/V write from that launch, into a scratch paged cache (it also
+    ///   needs, per request, K/V stored in the activation dtype);
+    /// - the attention gate (`kernels/cuda/gate.rs`), against the composition.
+    pub(super) fn resolve_fused_attention(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+        allow_cpu: bool,
+    ) {
+        self.fused_qk = None;
+        self.fused_qk_path = if let Some(path) =
+            decode_gate(FUSED_QK_ROPE_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !self.fused_qk_fits(device, dtype) {
+            Qwen38FastPath::legacy(
+                "fused q/k norm + RoPE needs SM80+, 16-bit activations, F32 head-norm gains and rotary dims",
+            )
+        } else {
+            let resolved = Tensor::from_vec(
+                self.rope_inv_freqs.clone(),
+                self.rope_inv_freqs.len(),
+                device,
+            )
+            .map_err(Error::from)
+            .and_then(|inv_freq| {
+                let spec = QkNormRopeSpec {
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                    rope_dim: self.rope_dim,
+                    eps: self.q_norm.eps as f32,
+                };
+                self.fused_qk_self_check(&spec, &inv_freq, device, dtype)?;
+                Ok((spec, inv_freq))
+            });
+            match resolved {
+                Ok(fused) => {
+                    self.fused_qk = Some(fused);
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("q/k norm + RoPE", &error),
+            }
+        };
+
+        self.fused_kv_write = false;
+        self.fused_kv_write_path =
+            if let Some(path) = decode_gate(FUSED_KV_WRITE_ENV, switches, device, allow_cpu) {
+                path
+            } else if let Some((spec, inv_freq)) = &self.fused_qk {
+                match self.fused_kv_write_self_check(spec, inv_freq, device, dtype) {
+                    Ok(()) => {
+                        self.fused_kv_write = true;
+                        Qwen38FastPath::Fused
+                    }
+                    Err(error) => Qwen38FastPath::self_check_failed("K/V write", &error),
+                }
+            } else {
+                Qwen38FastPath::legacy("the fused K/V write needs the fused q/k norm + RoPE")
+            };
+
+        self.fused_gate = false;
+        self.fused_gate_path = if let Some(path) =
+            decode_gate(FUSED_ATTN_GATE_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !matches!(dtype, DType::F16 | DType::BF16) || !gate::supported(device, dtype) {
+            Qwen38FastPath::legacy("the fused attention gate needs SM80+ and 16-bit activations")
+        } else {
+            match self.fused_gate_self_check(device, dtype) {
+                Ok(()) => {
+                    self.fused_gate = true;
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("attention gate", &error),
+            }
+        };
+    }
+
+    /// The fast-path resolutions `[q/k norm + RoPE, K/V write, gate]`.
+    pub(super) fn fast_paths(&self) -> [&Qwen38FastPath; 3] {
+        [
+            &self.fused_qk_path,
+            &self.fused_kv_write_path,
+            &self.fused_gate_path,
+        ]
+    }
+
+    fn fused_qk_fits(&self, device: &Device, dtype: DType) -> bool {
+        matches!(dtype, DType::F16 | DType::BF16)
+            && self.rope_dim > 0
+            && self.rope_inv_freqs.len() == self.rope_dim / 2
+            && rope::supported(device, dtype, self.head_dim, self.rope_dim)
+            && self.q_norm.eps == self.k_norm.eps
+            && [&self.q_norm, &self.k_norm].iter().all(|norm| {
+                norm.weight.dtype() == DType::F32 && norm.weight.dims() == [self.head_dim]
+            })
+    }
+
+    /// Random `dtype` values of `shape` on `device` for the self-checks.
+    fn self_check_tensor(
+        shape: &[usize],
+        seed: f32,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            self_check_wave(shape.iter().product(), seed, 2.0),
+            shape,
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?)
+    }
+
+    /// The fused q/k against today's chain (head norms, cos/sin plan from F32
+    /// host angles, rotary op, pass-through concat) for one token at
+    /// positions 5, 3000 and 200000, and at the image position [7, 3, 11]
+    /// when the sections allow it.
+    fn fused_qk_self_check(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        for (index, position) in [[5, 5, 5], [3000, 3000, 3000], [200_000; 3], [7, 3, 11]]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(mrope) = self.mrope_position(position) else {
+                continue;
+            };
+            let seed = 10.0 * index as f32;
+            let q_proj = Self::self_check_tensor(&[1, 1, heads, 2 * dim], seed, device, dtype)?;
+            let k_proj =
+                Self::self_check_tensor(&[1, 1, kv_heads, dim], seed + 1.0, device, dtype)?;
+            let query = self
+                .q_norm
+                .forward(&q_proj.narrow(3, 0, dim)?.contiguous()?)?;
+            let key = self.k_norm.forward(&k_proj)?;
+            let plan = self.prepare_mrope_plan(&[position], device, dtype)?;
+            let (q_ref, k_ref) = self.apply_rope_plan(&query, &key, &plan)?;
+            let (q, k) = rope::qk_norm_rope(
+                &q_proj,
+                &k_proj,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                inv_freq,
+                spec,
+                mrope,
+            )?;
+            compare_values(
+                &format!("fused q at {position:?}"),
+                &host_values(&q)?,
+                &host_values(&q_ref)?,
+                0.01,
+                0.03,
+            )?;
+            compare_values(
+                &format!("fused k at {position:?}"),
+                &host_values(&k)?,
+                &host_values(&k_ref)?,
+                0.01,
+                0.03,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The K/V-writing variant into a scratch `[2, 16, kv_heads, head_dim]`
+    /// cache at flat slot 21, position 3000: the returned queries and the
+    /// slot's key row match the eager kernel, the value row is the value, and
+    /// every other slot stays zero.
+    fn fused_kv_write_self_check(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        const PAGES: usize = 2;
+        const PAGE_TOKENS: usize = 16;
+        const SLOT: usize = 21;
+        const POSITION: usize = 3000;
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let q_proj = Self::self_check_tensor(&[1, 1, heads, 2 * dim], 1.0, device, dtype)?;
+        let k_proj = Self::self_check_tensor(&[1, 1, kv_heads, dim], 2.0, device, dtype)?;
+        let v_proj = Self::self_check_tensor(&[1, 1, kv_heads, dim], 3.0, device, dtype)?;
+        let keys = Tensor::zeros((PAGES, PAGE_TOKENS, kv_heads, dim), dtype, device)?;
+        let values = Tensor::zeros((PAGES, PAGE_TOKENS, kv_heads, dim), dtype, device)?;
+        let step = Tensor::from_vec(vec![0u32, POSITION as u32, SLOT as u32], 3, device)?;
+        let queries = rope::qk_norm_rope_kv(
+            &q_proj,
+            &k_proj,
+            &v_proj,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            &step,
+            &keys,
+            &values,
+        )?;
+        let (q_ref, k_ref) = rope::qk_norm_rope(
+            &q_proj,
+            &k_proj,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            MropePosition {
+                temporal: POSITION,
+                height: POSITION,
+                width: POSITION,
+                height_section: 0,
+                width_section: 0,
+            },
+        )?;
+        compare_values(
+            "fused K/V write queries",
+            &host_values(&queries)?,
+            &host_values(&q_ref)?,
+            0.01,
+            0.02,
+        )?;
+        let row = kv_heads * dim;
+        let (keys, values) = (host_values(&keys)?, host_values(&values)?);
+        for slot in 0..PAGES * PAGE_TOKENS {
+            let (key, value) = (&keys[slot * row..][..row], &values[slot * row..][..row]);
+            if slot == SLOT {
+                compare_values(
+                    "fused K/V write key",
+                    key,
+                    &host_values(&k_ref)?,
+                    0.02,
+                    0.02,
+                )?;
+                compare_values(
+                    "fused K/V write value",
+                    value,
+                    &host_values(&v_proj)?,
+                    0.02,
+                    0.02,
+                )?;
+            } else if key.iter().chain(value).any(|x| *x != 0.0) {
+                return Err(Error::InferenceError(format!(
+                    "fused K/V write touched slot {slot} instead of only {SLOT}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The fused gate against the composition over two rows.
+    fn fused_gate_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (heads, dim) = (self.num_heads, self.head_dim);
+        let attn = Self::self_check_tensor(&[2, 1, heads * dim], 4.0, device, dtype)?;
+        let q_proj = Self::self_check_tensor(&[2, 1, heads, 2 * dim], 5.0, device, dtype)?;
+        compare_values(
+            "fused attention gate",
+            &host_values(&gate::attn_gate(&attn, &q_proj, heads, dim)?)?,
+            &host_values(&gate::reference(&attn, &q_proj, heads, dim)?)?,
+            0.01,
+            0.02,
+        )
     }
 
     pub(super) fn forward_physical(
         &self,
         hidden_states: &Tensor,
-        mrope_plan: &Qwen38MropePlan,
+        rope: &Qwen38RopeInputs<'_>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: usize,
     ) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
-        if seq_len == 0 || seq_len != mrope_plan.sequence_len {
+        if seq_len == 0 || seq_len != rope.positions.len() {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.8 physical attention received {} tokens and a {}-token rotary plan",
-                seq_len, mrope_plan.sequence_len
+                "Qwen3.8 physical attention received {} tokens and {} rotary positions",
+                seq_len,
+                rope.positions.len()
             )));
         }
         let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
@@ -1964,12 +2334,6 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
             .reshape((1, seq_len, self.num_heads, self.head_dim * 2))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            1,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
         let key_states = qkv
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
@@ -1978,43 +2342,207 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
             .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let (query_states, key_states) =
-            self.apply_rope_plan(&query_states, &key_states, mrope_plan)?;
-        let queries = query_states
-            .reshape((seq_len, self.num_heads, self.head_dim))?
-            .contiguous()?;
-        let keys = key_states
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let values = value_states
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let storage_dtype = cache.arena().config().dtype;
-        let output_dtype = queries.dtype();
-        if queries.device().is_cuda() && storage_dtype != output_dtype {
-            // Q, K, V enter storage dtype and the attention result returns to
-            // the activation dtype.
-            record_cuda_attention_dtype_casts(4);
-        }
-        let queries = queries.to_dtype(storage_dtype)?;
-        let keys = keys.to_dtype(storage_dtype)?;
-        let values = values.to_dtype(storage_dtype)?;
-        let output = cache.write_and_attend(
-            physical_layer,
-            prepared,
-            &queries,
-            &keys,
-            &values,
-            1.0 / (self.head_dim as f32).sqrt(),
-        )?;
+        let output_dtype = q_proj.dtype();
+        let fused = match rope.positions {
+            [position] => self.fused_qk_for(&q_proj, &key_states, *position),
+            _ => None,
+        };
+        let output = if let Some((spec, inv_freq, position)) = fused {
+            self.fused_qk_attend(
+                spec,
+                inv_freq,
+                position,
+                [&q_proj, &key_states, &value_states],
+                rope.step.as_ref(),
+                cache,
+                prepared,
+                physical_layer,
+            )?
+        } else {
+            if seq_len == 1 && q_proj.device().is_cuda() {
+                record_cuda_qk_rope_chain();
+            }
+            let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+            let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+            let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+            let (query_states, key_states) =
+                self.apply_rope_plan(&query_states, &key_states, rope.plan(self)?)?;
+            let queries = query_states
+                .reshape((seq_len, self.num_heads, self.head_dim))?
+                .contiguous()?;
+            let keys = key_states
+                .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+                .contiguous()?;
+            let values = value_states
+                .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+                .contiguous()?;
+            self.write_and_attend(cache, prepared, physical_layer, &queries, &keys, &values)?
+        };
         let output =
             output
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        let output = self.gate_output(&output, &q_proj)?;
         self.o_proj.forward(&output).map_err(Error::from)
+    }
+
+    /// Cast token-major Q/K/V to the cache's storage dtype and write and
+    /// attend through the arena.
+    fn write_and_attend(
+        &self,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: usize,
+        queries: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<Tensor> {
+        let storage_dtype = cache.arena().config().dtype;
+        if queries.device().is_cuda() && storage_dtype != queries.dtype() {
+            // Q, K, V enter storage dtype and the attention result returns to
+            // the activation dtype.
+            record_cuda_attention_dtype_casts(4);
+        }
+        cache.write_and_attend(
+            physical_layer,
+            prepared,
+            &queries.to_dtype(storage_dtype)?,
+            &keys.to_dtype(storage_dtype)?,
+            &values.to_dtype(storage_dtype)?,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )
+    }
+
+    /// The fused q/k norm + RoPE for one token at `position`, when resolved
+    /// and the projections fit it.
+    fn fused_qk_for(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        position: [usize; 3],
+    ) -> Option<(&QkNormRopeSpec, &Tensor, MropePosition)> {
+        let (spec, inv_freq) = self.fused_qk.as_ref()?;
+        let fits = matches!(q_proj.dtype(), DType::F16 | DType::BF16)
+            && key_states.dtype() == q_proj.dtype();
+        if !fits {
+            return None;
+        }
+        Some((spec, inv_freq, self.mrope_position(position)?))
+    }
+
+    /// The kernel's view of one token's M-RoPE position: text positions need
+    /// no sections; an image position takes the height and width sections,
+    /// and the composition refuses it too when they are not valid.
+    fn mrope_position(&self, [temporal, height, width]: [usize; 3]) -> Option<MropePosition> {
+        let text = temporal == height && temporal == width;
+        let sections = match self.mrope_sections.as_slice() {
+            [_, height, width]
+                if self.mrope_sections.iter().sum::<usize>() == self.rope_dim / 2 =>
+            {
+                Some((*height, *width))
+            }
+            _ => None,
+        };
+        let (height_section, width_section) = if text { (0, 0) } else { sections? };
+        Some(MropePosition {
+            temporal,
+            height,
+            width,
+            height_section,
+            width_section,
+        })
+    }
+
+    /// One token through the fused q/k norm + partial M-RoPE. With the fused
+    /// K/V write resolved, a text position, a step buffer for this forward and
+    /// K/V stored in the activation dtype, the same launch writes the rotated
+    /// key and the value into the paged cache; otherwise the arena writes the
+    /// kernel's K/V. Returns the attention output `[1, heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_qk_attend(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        position: MropePosition,
+        [q_proj, key_states, value_states]: [&Tensor; 3],
+        step: Option<&Tensor>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let text = position.temporal == position.height && position.temporal == position.width;
+        if let Some(step) = step.filter(|_| {
+            self.fused_kv_write && text && cache.arena().config().dtype == q_proj.dtype()
+        }) {
+            let output = cache.write_fused_and_attend(
+                physical_layer,
+                prepared,
+                1.0 / (self.head_dim as f32).sqrt(),
+                &mut |keys, values| {
+                    let queries = rope::qk_norm_rope_kv(
+                        q_proj,
+                        key_states,
+                        value_states,
+                        &self.q_norm.weight,
+                        &self.k_norm.weight,
+                        inv_freq,
+                        spec,
+                        step,
+                        keys,
+                        values,
+                    )?;
+                    record_fused_qk_norm_rope(true);
+                    Ok(queries.reshape((1, self.num_heads, self.head_dim))?)
+                },
+            )?;
+            if let Some(output) = output {
+                return Ok(output);
+            }
+        }
+        let (queries, keys) = rope::qk_norm_rope(
+            q_proj,
+            key_states,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            position,
+        )?;
+        record_fused_qk_norm_rope(false);
+        self.write_and_attend(
+            cache,
+            prepared,
+            physical_layer,
+            &queries.reshape((1, self.num_heads, self.head_dim))?,
+            &keys.reshape((1, self.num_kv_heads, self.head_dim))?,
+            &value_states
+                .reshape((1, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+        )
+    }
+
+    /// `attn * sigmoid(gate)`, the gate being the second half of each head's
+    /// slice of `q_proj` `[.., heads, 2 * head_dim]`: one launch when fused.
+    fn gate_output(&self, output: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        if self.fused_gate
+            && output.dtype() == q_proj.dtype()
+            && matches!(output.dtype(), DType::F16 | DType::BF16)
+        {
+            record_fused_attn_gate();
+            return Ok(gate::attn_gate(
+                output,
+                q_proj,
+                self.num_heads,
+                self.head_dim,
+            )?);
+        }
+        if output.device().is_cuda() {
+            record_cuda_attn_gate_composition();
+        }
+        let gate = q_proj
+            .narrow(3, self.head_dim, self.head_dim)?
+            .reshape(output.shape())?;
+        (output * ops::sigmoid(&gate)?).map_err(Error::from)
     }
 
     pub(super) fn forward_physical_decode_batch(
@@ -2058,12 +2586,6 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
             .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
         let key_states = qkv
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
@@ -2072,27 +2594,60 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
             .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let plan = self.prepare_mrope_plan(
-                &[position_ids[row]],
-                hidden_states.device(),
-                hidden_states.dtype(),
-            )?;
-            let q_row = query_states.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope_plan(&q_row, &k_row, &plan)?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
+        let fused = position_ids
+            .iter()
+            .map(|position| self.fused_qk_for(&q_proj, &key_states, *position))
+            .collect::<Option<Vec<_>>>();
+        if let Some(rows) = fused {
+            // One launch per row with host positions; the arena writes K/V.
+            for (row, (spec, inv_freq, position)) in rows.into_iter().enumerate() {
+                let (q_row, k_row) = rope::qk_norm_rope(
+                    &q_proj.i(row)?,
+                    &key_states.i(row)?,
+                    &self.q_norm.weight,
+                    &self.k_norm.weight,
+                    inv_freq,
+                    spec,
+                    position,
+                )?;
+                record_fused_qk_norm_rope(false);
+                queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                values.push(
+                    value_states
+                        .i(row)?
+                        .reshape((self.num_kv_heads, self.head_dim))?,
+                );
+            }
+        } else {
+            if hidden_states.device().is_cuda() {
+                for _ in 0..batch_size {
+                    record_cuda_qk_rope_chain();
+                }
+            }
+            let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+            let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+            let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+            for row in 0..batch_size {
+                let plan = self.prepare_mrope_plan(
+                    &[position_ids[row]],
+                    hidden_states.device(),
+                    hidden_states.dtype(),
+                )?;
+                let q_row = query_states.i(row)?.unsqueeze(0)?;
+                let k_row = key_states.i(row)?.unsqueeze(0)?;
+                let (q_row, k_row) = self.apply_rope_plan(&q_row, &k_row, &plan)?;
+                queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                values.push(
+                    value_states
+                        .i(row)?
+                        .reshape((self.num_kv_heads, self.head_dim))?,
+                );
+            }
         }
         let query_refs = queries.iter().collect::<Vec<_>>();
         let key_refs = keys.iter().collect::<Vec<_>>();
@@ -2134,7 +2689,7 @@ impl Qwen38FullAttention {
             1,
             self.num_heads * self.head_dim,
         ))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        let output = self.gate_output(&output, &q_proj)?;
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
