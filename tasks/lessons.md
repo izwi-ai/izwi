@@ -195,3 +195,13 @@
 - A model-side engine preference is only a request. Qwen3.6 asked for 8-token decode quanta, but the scheduler grants them only before a request's soft SLA, which is about 0.7 s for normal-priority interactive and streaming chat, unless the model opts into `sustained_decode_quantum`. On the H100 the pipeline therefore ran for about 22 quanta in roughly 5,500 tokens. Before relying on a scheduler grant, trace every gate in `decode_token_quanta` with production request settings, and test the grant after the deadline has passed. Give every new fast path a diagnostics counter (here `whole_step.pipelined`), so the first deploy shows whether it actually engaged.
 - A bit-exact comparison between two runs is only an invariant if both runs execute the same op shapes. The Qwen3.6 attach test compared an attached run (prefilled from the fork) with a fresh run (prefilled in one span). The matmul row counts differed, and x86's CPU kernels rounded a few rows differently in the last ulp. aarch64 happened to agree, so the test passed locally and failed on every Linux CI run. Before asserting bit equality, make both sides take identical chunk and span boundaries, or assert a tolerance. CI runs on x86 and the dev machine on ARM, so anything that only passes on one architecture needs checking on the other.
 - CI pins `dtolnay/rust-toolchain@stable`, so new stable clippy lints (1.99's `chunks_exact_to_as_chunks`) fail the `-D warnings` gate with no repo change. Before pushing, run the hygiene clippy with the current stable (`cargo +<latest> clippy --workspace --all-targets`, `TAURI_CONFIG` as in `check-backend-truth.sh`), not only the local default toolchain.
+- Model families that were deliberately forked into their own modules stay separate unless the user
+  asks otherwise. For Qwen3.8 I recommended moving it onto the Qwen3.6 trunk to inherit the fast
+  paths; the user rejected re-coupling the families. Plan ports into each family's own trunk, and
+  reuse only the generic infrastructure under `kernels/` (kernels take geometry as parameters;
+  they are not family code). Offer convergence only as a clearly labeled alternative, never as
+  the recommendation, when a module header documents the fork as intentional.
+- Before planning or implementing on a named branch, check what it contains relative to the
+  branch the research was done on (`git rev-list --count A..B`, `git cat-file -e B:path`). The
+  Qwen3.8 plan assumed kernels that existed only on an unmerged branch; the new branch sat at
+  `main` without them until main was updated.

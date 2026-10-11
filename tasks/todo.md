@@ -1,3 +1,73 @@
+# Plan — Qwen3.8-27B-FP8 load admission failure + inference performance — 2026-10-11
+
+Branch `perf-qwen38` (base `main` @ `abf3f26f`). Evidence and per-phase detail are in
+`tasks/qwen38-performance-admission-research-2026-10-11.md`; the reports are in
+`tasks/qwen38-performance-evidence-2026-10-11/`.
+
+**Decision (user, 2026-10-11).** Qwen3.6 and Qwen3.8 stay separate. Fast paths are ported into
+`q38/`'s own trunk, which may call the generic kernels under `kernels/`. Qwen3.6 orchestration is a
+reference, not a dependency, and Qwen3.6 numerics must not change.
+
+**Root causes (confirmed in code).**
+- **Load refusal.**
+  - CUDA automatic rows = device memory ÷ 256 MiB, which is 316 retained + 316 staged on an
+    80 GB H100.
+  - The CUDA fit charges 156.9 MB/sequence of recurrent state for all of them: 99.2 GB > 85 GB.
+  - Result: "CUDA managed context cannot fit the model-authored minimum" on every CUDA GPU.
+- **Slowness.**
+  - Auto runs Q8_0, not FP8, and Q8 blocks graphs.
+  - Per token: ~2,200 eager launches and allocations, plus 3 syncs.
+  - MTP rounds add a 144 MiB state copy and host-side full-vocab verify.
+  - The bar: vLLM runs 77–79 t/s on an H100 at concurrency 1.
+
+Ops workaround until Phase 0 deploys: `IZWI_MAX_RETAINED_SEQUENCES=16`,
+`IZWI_MAX_STAGED_TRANSACTIONS=8`, `IZWI_MODAL_GPU=H100`, `IZWI_GIT_REF=<full SHA>`.
+
+Phase 0 — admission
+- [ ] 1 Automatic staged rows = physical decode width (A2).
+- [ ] 2 Automatic CUDA rows shrink to fit the model's state; CPU admission-matrix test (A1 + A6).
+- [ ] 3 Refuse an unfittable CUDA state plan before streaming weights (A3).
+- [ ] 4 Per-backend Qwen3.8 memory figures in the catalog (A5).
+
+Phase 1 — correctness and harness
+- [ ] 5 Qwen3.8 HF golden-parity fixture + generator (G0).
+- [ ] 6 M-RoPE tables from F32 angles (C1).
+- [ ] 7 Zero-centered norm gains kept in F32 (C2).
+- [ ] 8 Conv-ring dtype guard restored (C3).
+- [ ] 9 MTP replay, quantum width, projection backend and host-sync counters (T0).
+
+Phase 2 — CUDA port into q38/
+- [ ] 10 Native block-FP8 projections by default on CUDA (mv2 self-check, FP8 packing, FP8
+      admission bytes).
+- [ ] 11 FP8 LM head on CUDA.
+- [ ] 12 Fused GDN decode (`kernels/cuda/gdn.rs`, in-place `StateTable`).
+- [ ] 13 Fused add + RMSNorm.
+- [ ] 14 Fused q/k norm + RoPE + KV write; fused gated output.
+
+Phases 6/7 — Metal and CPU residency
+- [ ] 15 Metal KV writes stop synchronizing the device per write (shared).
+- [ ] 16 Raw block-FP8 residency on Metal.
+- [ ] 17 Q8_0 residency on CPU.
+
+Phase 3 — graphs
+- [ ] 18 Segment graphs for Qwen3.8 decode layers.
+- [ ] 19 Whole-step CUDA graph.
+- [ ] 20 Multi-token quanta + pipelining on the non-MTP path.
+
+Later
+- [ ] Phase 4: MTP on the graph path (k+1 state slots, graphed verify, device speculative
+      sampling, quantized draft LM head).
+- [ ] Phase 5: chunked GDN prefill, FP8 tensor-core GEMM for M>8, CUDA prefix reuse for Qwen3.8,
+      optional FP8 KV.
+- [ ] Phase 8: GGUF path via qwen35.
+- [ ] A4: lease accounting for state and snapshots.
+
+Hardware checks on the next H100 deploy (cannot run here):
+- Qwen3.8 reaches Ready with no row variables.
+- `kv_cache.models[]` shows fitted rows.
+- Fixed-prompt t/s with MTP on and off, compared with the 10–20 t/s baseline.
+- `projection_backend = native_fp8` and every fused counter engaged.
+
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
