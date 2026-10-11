@@ -159,12 +159,58 @@ projection_backend = "expanded"`) to keep the F32 expansion, and
 
 ### Qwen3.8 multi-token prediction defaults
 
-Native Qwen3.8 MTP is enabled by default with one draft token on CPU, Metal,
-and CUDA. No environment variables are required for that default. Set
-`IZWI_QWEN38_MTP=0` and restart or reload the model to disable MTP. The
+Native Qwen3.8 MTP is enabled by default with one draft token on CPU and
+Metal. On CUDA the default (`cuda.mtp = "auto"`) leaves the MTP head out
+whenever CUDA graph decode is planned (see below): until MTP verification
+also runs in CUDA graphs, one graph launch per token is expected to beat
+MTP's eager draft and verify rounds. The head still loads on CUDA when graph
+decode is not planned (`IZWI_QWEN38_CUDA_GRAPHS=legacy`,
+`IZWI_CUDA_DECODE_GRAPHS=off`, `IZWI_CUDA_FUSED_DECODE=off`, or the Q8_0
+projection fallback). Set `IZWI_QWEN38_MTP=1` (or `IZWI_CUDA_MTP=1`) to load
+the head on CUDA anyway, and `IZWI_QWEN38_MTP=0` to disable MTP everywhere;
+restart or reload the model after changing either. The runtime diagnostics
+report the decision as `optimization_evidence.mtp.decision`. This CUDA
+default awaits a fixed-prompt throughput comparison on the H100; until then,
+`IZWI_QWEN38_MTP=1` restores the previous behavior. The
 `IZWI_QWEN38_MTP_DRAFT_TOKENS` setting controls proposal depth rather than
 enablement; its default is `1`, and supported explicit values are `1` through
 `3`.
+
+### Qwen3.8 CUDA graph decode
+
+On CUDA, single-row decode without an MTP head runs through captured CUDA
+graphs when the projections are native block FP8 and the fused decode kernels
+pass their load-time checks:
+
+- The whole step (the token embedding, all 64 layers, the final norm and the
+  block-FP8 LM head) is one graph, driven by a device step buffer that holds
+  the token, position, KV slot and block table. Where it does not apply (an
+  image position, or `IZWI_QWEN38_STEP_GRAPH=legacy`), 17 graph segments run
+  with attention eager between them.
+- Each graph is warmed eagerly, with its logits checked against the standard
+  decode on a copy of the row state, then captured and verified twice against
+  an eager run before it replays. A KV arena that grows forces a recapture.
+  Any failure turns graph decode off for the process with the reason in the
+  diagnostics, and decode continues on the eager fused path.
+- A decode quantum of up to 8 tokens per engine step
+  (`IZWI_QWEN38_DECODE_QUANTUM`, 1 to 64) keeps its width past a request's soft
+  scheduling deadline while the row decodes alone. Once the whole-step graph
+  replays, the quantum queues step k+1 before it reads token k, choosing tokens
+  with the device sampler (greedy or seeded sampling with penalties). Requests
+  that ask for logprobs decode one step at a time.
+- Load admission reserves graph decode's working memory, three recurrent-state
+  slabs plus 64 MiB (about 513 MiB for the 27B checkpoint), whenever graph
+  decode is planned.
+
+`cuda_graphs` in the runtime diagnostics reports the resolution, the phase
+(`warm`, `capture`, `verify`, `replay` or `disabled`), the counters, and the
+whole-step graph and decode quantum. Switches: `IZWI_QWEN38_CUDA_GRAPHS=legacy`
+(Qwen3.8 only), `IZWI_CUDA_DECODE_GRAPHS=off` (every model family),
+`IZWI_QWEN38_STEP_GRAPH=legacy` (segments only),
+`IZWI_QWEN38_DECODE_PIPELINE=legacy` (one step at a time) and
+`IZWI_QWEN38_FUSED_AB_GEMV=legacy` (cuBLAS for the DeltaNet alpha/beta
+projection). CUDA graph decode is not CUDA-certified until the corresponding
+NVIDIA evidence is retained.
 
 ---
 

@@ -1004,7 +1004,9 @@ impl Qwen38ChatModel {
             resident_representation = projection_representation.as_str(),
             fp8_execution_mode = %residency.execution_mode(),
             mtp_enabled = mtp_policy.enabled(),
+            mtp_decision = residency.mtp_decision(),
             mtp_draft_tokens = mtp_policy.draft_tokens(),
+            cuda_graphs = %text_model.cuda_graphs_summary()["phase"],
             "Loaded native Qwen3.8 text checkpoint"
         );
         Ok(Self {
@@ -1249,6 +1251,8 @@ impl Qwen38ChatModel {
                 "adaptive_depth_bounds": [0, 3],
                 "prefix_commit": "compact_recurrence_reconstruction_without_target_weight_replay",
                 "default_enabled": DEFAULT_MTP_ENABLED,
+                "default_policy": "auto: on, except off on CUDA when graph decode is planned (IZWI_QWEN38_MTP=1 keeps it)",
+                "decision": self.text_model.residency().mtp_decision(),
                 "default_draft_tokens": DEFAULT_MTP_DRAFT_TOKENS,
                 "enabled_switch": MTP_ENABLED_ENV,
                 "depth_switch": MTP_DRAFT_TOKENS_ENV,

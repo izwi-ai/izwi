@@ -219,6 +219,8 @@ pub(crate) struct Qwen38ResidencyPolicy {
     alpha_beta_gemv: bool,
     /// CUDA: why a switch keeps graph decode off, if one does.
     graph_switch_off: Option<String>,
+    /// How the MTP head's loading was decided, for diagnostics.
+    mtp_decision: String,
     identity: Option<Identity>,
 }
 
@@ -241,6 +243,28 @@ pub(crate) fn mtp_loaded_for(backend: BackendKind, performance: &PerformanceConf
         BackendKind::Cuda => performance.cuda.enabled() && performance.cuda.mtp.enabled(),
         BackendKind::Metal | BackendKind::Cpu => performance.cuda.mtp.enabled(),
     }
+}
+
+/// Environment switches whose true value (`1`, `true`, `yes`, `on`) asks for
+/// the MTP head explicitly: the global CUDA MTP switch and the Qwen3.8 alias.
+/// `auto` or unset lets CUDA prefer graph decode.
+pub(crate) const MTP_EXPLICIT_ENVS: [&str; 3] =
+    ["IZWI_CUDA_MTP", "IZWI_PERFORMANCE_CUDA_MTP", "IZWI_QWEN38_MTP"];
+
+fn mtp_explicitly_requested() -> bool {
+    MTP_EXPLICIT_ENVS
+        .iter()
+        .any(|name| mtp_explicit_value(std::env::var(name).ok().as_deref()))
+}
+
+/// Whether a switch value asks for MTP explicitly (not `auto`, not off).
+pub(crate) fn mtp_explicit_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// The activation dtype a load on `device` materializes (the loader derives
@@ -281,7 +305,41 @@ impl Qwen38ResidencyPolicy {
         } else if backend == BackendKind::Cpu {
             policy.resolve_cpu(config);
         }
+        policy.resolve_mtp_default(mtp_explicitly_requested());
         policy
+    }
+
+    /// CUDA: with `cuda.mtp=auto`, leave the MTP head out when graph decode
+    /// would otherwise be planned (its switches on, native block-FP8
+    /// projections). Graph decode covers decode without MTP, and MTP's rounds
+    /// still run the eager sequence/verify path (about 3,000 launches per
+    /// round for about 1.7 tokens), so one graph launch per token is expected
+    /// to be faster until MTP verification runs in graphs too. An explicit
+    /// `IZWI_QWEN38_MTP=1` (or `IZWI_CUDA_MTP=1`) keeps the head. Admission
+    /// and the loader both resolve this policy, so they agree on the head.
+    fn resolve_mtp_default(&mut self, explicit: bool) {
+        if !self.mtp || self.backend != BackendKind::Cuda {
+            return;
+        }
+        if explicit {
+            self.mtp_decision =
+                "explicit: on (IZWI_QWEN38_MTP or IZWI_CUDA_MTP asked for the head)".into();
+            return;
+        }
+        if self.graph_switch_off.is_none()
+            && matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
+        {
+            self.mtp = false;
+            self.mtp_decision = "auto: off on CUDA, which prefers graph decode while MTP verification runs eagerly; set IZWI_QWEN38_MTP=1 to load the head".into();
+        } else {
+            self.mtp_decision = format!(
+                "auto: on (CUDA graph decode is not planned: {})",
+                self.graph_switch_off.clone().unwrap_or_else(|| format!(
+                    "projections are not native block FP8 ({})",
+                    self.fallback.as_deref().unwrap_or("not selected")
+                ))
+            );
+        }
     }
 
     /// CPU: Q8_0 only when some block-FP8 projection can hold Q8_0 blocks (K
@@ -450,6 +508,13 @@ impl Qwen38ResidencyPolicy {
             } else {
                 None
             },
+            mtp_decision: if mtp_loaded_for(backend, performance) {
+                "auto: on".into()
+            } else if backend == BackendKind::Cuda && !cuda.enabled() {
+                "off: cuda.mode=off".into()
+            } else {
+                "off: cuda.mtp=off".into()
+            },
             identity: None,
         }
     }
@@ -592,6 +657,11 @@ impl Qwen38ResidencyPolicy {
         self.mtp
     }
 
+    /// How the MTP head's loading was decided, for diagnostics.
+    pub(crate) fn mtp_decision(&self) -> &str {
+        &self.mtp_decision
+    }
+
     /// Whether CUDA graph decode may resolve at load (`text/decode_graph.rs`):
     /// CUDA with the master, fused-decode and decode-graph switches on,
     /// native block-FP8 projections (Candle's Q8_0 QMatMul cannot be
@@ -656,9 +726,20 @@ impl Qwen38ResidencyPolicy {
     /// device (tests of the graph-decode plan and its admission).
     #[cfg(test)]
     pub(crate) fn cuda_native_fp8_for_tests(performance: &PerformanceConfig) -> Self {
+        Self::cuda_native_fp8_with_mtp_request_for_tests(performance, false)
+    }
+
+    /// [`Self::cuda_native_fp8_for_tests`] with the MTP head explicitly
+    /// requested (`explicit_mtp`) or not, as the environment would.
+    #[cfg(test)]
+    pub(crate) fn cuda_native_fp8_with_mtp_request_for_tests(
+        performance: &PerformanceConfig,
+        explicit_mtp: bool,
+    ) -> Self {
         let mut policy = Self::base(BackendKind::Cuda, DType::BF16, performance);
         policy.plan = Qwen38ProjectionPlan::NativeFp8 { explicit: false };
         policy.fallback = None;
+        policy.resolve_mtp_default(explicit_mtp);
         policy
     }
 

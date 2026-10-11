@@ -15,7 +15,7 @@ use crate::models::architectures::qwen38::mtp::tests::{write_fp8_geometry_checkp
 use crate::models::architectures::qwen38::native::{pinned_27b_config, Qwen38NativeCheckpoint};
 use crate::models::architectures::qwen38::residency::{
     force_cpu_native_fp8_for_tests, graph_decode_reserve_bytes, graph_decode_slab_bytes,
-    GRAPH_DECODE_FIXED_BYTES, TENSOR_ISLAND_CACHE_BYTES,
+    mtp_explicit_value, GRAPH_DECODE_FIXED_BYTES, TENSOR_ISLAND_CACHE_BYTES,
 };
 use crate::performance::{OptimizationMode, PerformanceConfig};
 
@@ -300,10 +300,45 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
             policy.graph_capacity_bytes(&text, performance).unwrap(),
         )
     };
+    // `cuda.mtp=auto` (the default) leaves the MTP head out on CUDA where
+    // graph decode is planned...
     let default = PerformanceConfig::default();
-    let (reason, bytes) = refusal(&default);
-    assert!(reason.contains("MTP head is loaded"), "{reason}");
-    assert_eq!(bytes, 2 * TENSOR_ISLAND_CACHE_BYTES, "trunk and MTP region caches");
+    let auto = Qwen38ResidencyPolicy::cuda_native_fp8_for_tests(&default);
+    assert!(!auto.mtp_loaded());
+    assert!(
+        auto.mtp_decision().starts_with("auto: off"),
+        "{}",
+        auto.mtp_decision()
+    );
+    assert!(auto.graph_decode_planned(), "{}", auto.graph_decode_refusal());
+    assert_eq!(auto.graph_capacity_bytes(&text, &default).unwrap(), reserve);
+    // ...an explicit request keeps the head, and graph decode stays off...
+    let explicit =
+        Qwen38ResidencyPolicy::cuda_native_fp8_with_mtp_request_for_tests(&default, true);
+    assert!(explicit.mtp_loaded());
+    assert!(explicit.mtp_decision().starts_with("explicit: on"));
+    assert!(explicit
+        .graph_decode_refusal()
+        .contains("MTP head is loaded"));
+    assert_eq!(
+        explicit.graph_capacity_bytes(&text, &default).unwrap(),
+        2 * TENSOR_ISLAND_CACHE_BYTES,
+        "trunk and MTP region caches"
+    );
+    // ...and auto keeps it where graph decode is switched off.
+    let mut kept_performance = default.clone();
+    kept_performance.cuda.decode_graphs = OptimizationMode::Off;
+    let kept = Qwen38ResidencyPolicy::cuda_native_fp8_for_tests(&kept_performance);
+    assert!(kept.mtp_loaded());
+    assert!(
+        kept.mtp_decision().contains("cuda.decode_graphs=off"),
+        "{}",
+        kept.mtp_decision()
+    );
+    assert!(mtp_explicit_value(Some(" ON ")) && mtp_explicit_value(Some("1")));
+    for value in [Some("auto"), Some("0"), Some("off"), Some(""), None] {
+        assert!(!mtp_explicit_value(value), "{value:?}");
+    }
     let mut graphs_off = no_mtp.clone();
     graphs_off.cuda.decode_graphs = OptimizationMode::Off;
     assert_eq!(
