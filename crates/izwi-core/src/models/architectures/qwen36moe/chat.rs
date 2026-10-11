@@ -473,6 +473,13 @@ impl Qwen36MoeChatModel {
         }
     }
 
+    /// Prefill span for an isolated request: wide when the CUDA prefill
+    /// kernels that amortize over the span are active, else the engine's
+    /// threshold (0).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        self.exec.text_model.preferred_prefill_tokens()
+    }
+
     /// Whether the graph-decode quantum outlives the request's soft
     /// scheduling SLA. An interactive or streaming request passes that SLA
     /// (0.65-0.75 s at normal priority) early in almost every stream, after

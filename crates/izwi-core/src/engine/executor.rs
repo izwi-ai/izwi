@@ -3376,6 +3376,10 @@ impl ModelExecutor for NativeExecutor {
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
             profile.speculative_decode_batch = speculative_decode_batch;
+            profile.preferred_prefill_tokens = request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .map_or(0, |model| model.as_ref().preferred_prefill_tokens());
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the

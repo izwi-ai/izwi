@@ -1189,6 +1189,20 @@ impl Qwen36TextModel {
         };
     }
 
+    /// Prefill span this model prefers when a request prefills alone: the
+    /// tensor-core MoE reads each expert's weights once per call and the
+    /// chunked DeltaNet resolves 64 tokens per step, so both gain from wide
+    /// spans. 0 (the engine's threshold) when neither is active.
+    pub(crate) fn preferred_prefill_tokens(&self) -> usize {
+        if self.gdn_prefill_path == Qwen36FusedPath::Fused
+            || self.moe_prefill_path == Qwen36FusedPath::Fused
+        {
+            PREFERRED_PREFILL_TOKENS
+        } else {
+            0
+        }
+    }
+
     /// Tensor-core grouped MoE resolution, for the admin diagnostics.
     pub(crate) fn moe_prefill_summary(&self) -> serde_json::Value {
         super::fast_path::summarize([&self.moe_prefill_path])
@@ -4295,6 +4309,13 @@ pub const CHUNKED_GDN_ENV: &str = "IZWI_QWEN36_CHUNKED_GDN";
 /// Kill switch for the tensor-core grouped MoE prefill kernels.
 pub const GROUPED_MMA_ENV: &str = "IZWI_QWEN36_GROUPED_MMA";
 
+/// Prefill span preferred with the CUDA prefill kernels active. A 1,024-token
+/// forward keeps its transient activations (the MoE's F32 partials dominate,
+/// about 75 MiB) a few hundred MiB in all, well inside the headroom a loaded
+/// H100-class device keeps; each expert's weights are read once per span
+/// instead of once per 192 tokens.
+const PREFERRED_PREFILL_TOKENS: usize = 1024;
+
 /// Shortest prefill span the chunked recurrence takes; shorter spans (MTP
 /// verification, small resumes) stay on the sequential kernel, whose single
 /// launch costs less than the chunked pair there.
@@ -6013,6 +6034,8 @@ pub(crate) mod tests {
             super::Qwen36Mixer::Linear(linear) => !linear.chunked_recurrence,
             super::Qwen36Mixer::Full(_) => true,
         }));
+        // Nothing amortizes over a wide span: the engine's threshold applies.
+        assert_eq!(model.preferred_prefill_tokens(), 0);
     }
 
     #[test]

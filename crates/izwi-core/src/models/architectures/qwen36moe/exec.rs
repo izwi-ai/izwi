@@ -45,11 +45,17 @@ const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
 
 fn qwen35_prefill_chunk_size() -> usize {
+    qwen35_prefill_chunk_size_or(DEFAULT_PREFILL_CHUNK_SIZE)
+}
+
+/// The forward size a prefill span is split into: `IZWI_QWEN35_PREFILL_CHUNK_SIZE`
+/// when set, else `default` (bounded either way).
+fn qwen35_prefill_chunk_size_or(default: usize) -> usize {
     std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
+        .unwrap_or(default)
         .min(MAX_PREFILL_CHUNK_SIZE)
 }
 
@@ -1146,7 +1152,13 @@ impl Qwen36ChatExec {
         let complete = span_end == prepared.prompt_ids.len();
         let mut logits = None;
         let mut cursor = span_start;
-        let chunk_size = qwen35_prefill_chunk_size();
+        // The scheduler's span arrives whole when the model prefers wide
+        // spans; otherwise forwards stay at the portable default.
+        let chunk_size =
+            qwen35_prefill_chunk_size_or(match self.text_model.preferred_prefill_tokens() {
+                0 => DEFAULT_PREFILL_CHUNK_SIZE,
+                preferred => preferred,
+            });
         while cursor < span_end {
             let (segment_end, image_segment) = next_prefill_segment_end(
                 &prepared.prompt_ids,

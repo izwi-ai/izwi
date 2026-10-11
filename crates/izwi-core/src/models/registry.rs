@@ -3728,6 +3728,20 @@ impl NativeChatModel {
         }
     }
 
+    /// Prefill span the loaded model prefers for an isolated request (see
+    /// [`crate::engine::ExecutionProfile::preferred_prefill_tokens`]); 0 for
+    /// the engine's chunk threshold.
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        match self {
+            Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen38(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_) => 0,
+        }
+    }
+
     /// Executor scheduler profile for multi-token decode quanta:
     /// `(preferred_decode_tokens, sustained_decode_quantum,
     /// speculative_decode_batch)`. Families whose decode step always consumes
