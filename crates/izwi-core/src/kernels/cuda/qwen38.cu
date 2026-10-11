@@ -224,9 +224,14 @@ extern "C" __global__ void qwen38_gated_rms_norm_decode_bf16(
 // Qwen3.8 single-token depthwise convolution. The packed result contains the
 // activated output followed by the next three-slot history. Keeping both in one
 // allocation lets the model stage the new transactional state without stacking
-// three Candle tensors after every token.
-extern "C" __global__ void qwen38_causal_conv_decode_f32(
-    const float* __restrict__ input,
+// three Candle tensors after every token. The input is the QKV projection row in
+// its own dtype (F32, or BF16/F16 straight from the projection, saving the cast);
+// the weight, history and packed output stay F32. A 16-bit input converts
+// exactly to F32, so every entry computes the same values as the F32 entry on
+// the cast input.
+template <class T>
+__device__ void qwen38_causal_conv_decode(
+    const T* __restrict__ input,
     const float* __restrict__ weight,
     const float* __restrict__ history,
     float* __restrict__ packed_output,
@@ -242,7 +247,7 @@ extern "C" __global__ void qwen38_causal_conv_decode_f32(
     float value = history[history_base] * weight[weight_base]
                 + history[history_base + 1] * weight[weight_base + 1]
                 + history[history_base + 2] * weight[weight_base + 2]
-                + input[channel] * weight[weight_base + 3];
+                + float(input[channel]) * weight[weight_base + 3];
     packed_output[channel] = value / (1.0f + expf(-value));
     return;
   }
@@ -252,7 +257,34 @@ extern "C" __global__ void qwen38_causal_conv_decode_f32(
   const int slot = state_index - channel * 3;
   const int history_base = channel * 3;
   packed_output[conv_dim + state_index] =
-      slot < 2 ? history[history_base + slot + 1] : input[channel];
+      slot < 2 ? history[history_base + slot + 1] : float(input[channel]);
+}
+
+extern "C" __global__ void qwen38_causal_conv_decode_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ history,
+    float* __restrict__ packed_output,
+    int conv_dim) {
+  qwen38_causal_conv_decode<float>(input, weight, history, packed_output, conv_dim);
+}
+
+extern "C" __global__ void qwen38_causal_conv_decode_bf16(
+    const __nv_bfloat16* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ history,
+    float* __restrict__ packed_output,
+    int conv_dim) {
+  qwen38_causal_conv_decode<__nv_bfloat16>(input, weight, history, packed_output, conv_dim);
+}
+
+extern "C" __global__ void qwen38_causal_conv_decode_f16(
+    const __half* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ history,
+    float* __restrict__ packed_output,
+    int conv_dim) {
+  qwen38_causal_conv_decode<__half>(input, weight, history, packed_output, conv_dim);
 }
 
 // Qwen3.8 single-token Gated DeltaNet recurrence for F32 tensors.

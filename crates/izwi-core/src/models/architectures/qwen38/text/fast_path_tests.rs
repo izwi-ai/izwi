@@ -204,7 +204,10 @@ fn fused_norm_switch_forces_the_composition() {
 
 /// Every Qwen3.8 fast-path kill switch.
 #[cfg(feature = "cuda")]
-const FAST_PATH_SWITCHES: &[&str] = &[super::super::fast_path::FUSED_NORM_ENV];
+const FAST_PATH_SWITCHES: &[&str] = &[
+    super::super::fast_path::FUSED_NORM_ENV,
+    super::super::fast_path::FUSED_GDN_ENV,
+];
 
 /// Load with every `IZWI_QWEN38_FUSED_*` switch set to `legacy`: today's
 /// composition, resolved through production loading.
@@ -323,4 +326,591 @@ fn cuda_golden_trunk_with_fast_paths_tracks_the_composition_and_hf() {
             fused.position
         );
     }
+}
+
+/// A DeltaNet mixer at the fused kernel's 128-dim heads with deterministic
+/// weights: `key_heads`/`value_heads` heads over a `hidden`-wide residual,
+/// projections in `dtype`. Today's CUDA decode kernels run where they would
+/// in production (`fused_decode` on CUDA).
+fn gdn_mixer(
+    key_heads: usize,
+    value_heads: usize,
+    hidden: usize,
+    device: &Device,
+    dtype: DType,
+) -> Qwen38LinearAttention {
+    let dim = gdn::HEAD_DIM;
+    let conv_dim = (2 * key_heads + value_heads) * dim;
+    let value_width = value_heads * dim;
+    let scale = 1.0 / (hidden as f32).sqrt();
+    let dense = |out: usize, input: usize, seed: f32, scale: f32| {
+        Qwen38Projection::Dense(Linear::new(
+            Tensor::from_vec(
+                self_check_wave(out * input, seed, scale),
+                (out, input),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+            .to_device(device)
+            .unwrap(),
+            None,
+        ))
+    };
+    let f32_tensor = |values: Vec<f32>, shape: &[usize]| {
+        Tensor::from_vec(values, shape, &Device::Cpu)
+            .unwrap()
+            .to_device(device)
+            .unwrap()
+    };
+    let conv_kernel = f32_tensor(self_check_wave(conv_dim * 4, 5.0, 0.5), &[conv_dim, 4]);
+    Qwen38LinearAttention {
+        fused_decode: device.is_cuda(),
+        qkv_z_proj: Qwen38ProjectionGroup::Separate(vec![
+            dense(conv_dim, hidden, 1.0, 2.0 * scale),
+            dense(value_width, hidden, 2.0, 2.0 * scale),
+        ]),
+        alpha_beta_proj: Qwen38ProjectionGroup::Separate(vec![
+            dense(value_heads, hidden, 3.0, 2.0 * scale),
+            dense(value_heads, hidden, 4.0, 2.0 * scale),
+        ]),
+        dt_bias: f32_tensor(self_check_wave(value_heads, 6.0, 1.0), &[1, 1, value_heads]),
+        a: f32_tensor(
+            self_check_wave(value_heads, 7.0, 1.0)
+                .iter()
+                .map(|v| -v.exp())
+                .collect(),
+            &[1, 1, value_heads],
+        ),
+        conv_kernel_slices: pre_slice_conv_kernel(&conv_kernel, 4).unwrap(),
+        conv_kernel,
+        norm: Qwen38GatedRmsNorm {
+            fused_decode: device.is_cuda(),
+            weight: f32_tensor(
+                self_check_wave(dim, 8.0, 0.2)
+                    .iter()
+                    .map(|v| 1.0 + v)
+                    .collect(),
+                &[dim],
+            ),
+            eps: 1e-6,
+        },
+        out_proj: dense(
+            hidden,
+            value_width,
+            9.0,
+            (value_width as f32).sqrt().recip(),
+        ),
+        num_k_heads: key_heads,
+        num_v_heads: value_heads,
+        head_k_dim: dim,
+        head_v_dim: dim,
+        conv_dim,
+        kernel_size: 4,
+        tiled_recurrence_enabled: false,
+        tiled_recurrence_tile_size_override: None,
+        fused_gdn: None,
+        fused_gdn_path: Qwen38FastPath::default(),
+    }
+}
+
+/// `rows` decode inputs `[1, 1, hidden]` in `dtype`.
+fn gdn_inputs(rows: usize, hidden: usize, seed: f32, device: &Device, dtype: DType) -> Vec<Tensor> {
+    (0..rows)
+        .map(|row| {
+            Tensor::from_vec(
+                self_check_wave(hidden, seed + 17.0 * row as f32, 1.0),
+                (1, 1, hidden),
+                &Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+            .to_device(device)
+            .unwrap()
+        })
+        .collect()
+}
+
+/// A zero linear-layer state, as `ensure_state_initialized` builds it.
+fn initialized_state(mixer: &Qwen38LinearAttention, device: &Device) -> Qwen38LayerRuntimeState {
+    Qwen38LayerRuntimeState::Linear {
+        conv_state: Some(ConvRingState::from_slots(
+            (0..mixer.kernel_size - 1)
+                .map(|_| owned_zero_tensor(&[mixer.conv_dim, 1], DType::F32, device).unwrap())
+                .collect(),
+        )),
+        recurrent_state: Some(
+            owned_zero_tensor(
+                &[1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim],
+                DType::F32,
+                device,
+            )
+            .unwrap(),
+        ),
+    }
+}
+
+/// The logical conv history and recurrent state of a linear layer state.
+fn linear_state_values(state: &Qwen38LayerRuntimeState) -> (Vec<f32>, Vec<f32>) {
+    let Qwen38LayerRuntimeState::Linear {
+        conv_state: Some(conv),
+        recurrent_state: Some(recurrent),
+    } = state
+    else {
+        panic!("linear state is not initialized")
+    };
+    (
+        host_values(&conv.contiguous_history().unwrap()).unwrap(),
+        host_values(recurrent).unwrap(),
+    )
+}
+
+fn assert_close(label: &str, actual: &[f32], expected: &[f32], rel_l2: f64, max_frac: f32) {
+    compare_values(label, actual, expected, rel_l2, max_frac).unwrap();
+}
+
+#[test]
+fn gdn_reference_matches_q38_portable_chain_at_trunk_geometry() {
+    let mixer = gdn_mixer(16, 48, 64, &Device::Cpu, DType::F16);
+    let spec = mixer
+        .gdn_spec(&Device::Cpu)
+        .expect("trunk geometry fits the kernel");
+    assert_eq!(spec.conv_dim(), 10240);
+    assert!(spec.grouped);
+    mixer
+        .fused_gdn_self_check(&spec, &Device::Cpu, DType::F16)
+        .unwrap();
+    let mut mixer = mixer;
+    mixer.resolve_fused_gdn(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F16,
+        true,
+    );
+    assert_eq!(mixer.fused_gdn_path, Qwen38FastPath::Fused);
+    assert_eq!(mixer.fused_gdn, Some(spec));
+}
+
+#[test]
+fn tiled_order_fails_q38_contract() {
+    let mixer = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    let grouped = mixer.gdn_spec(&Device::Cpu).unwrap();
+    let tiled = GdnDecodeSpec {
+        grouped: false,
+        ..grouped
+    };
+    let error = mixer
+        .fused_gdn_self_check(&tiled, &Device::Cpu, DType::F16)
+        .unwrap_err();
+    assert!(error.to_string().contains("diverges"), "{error}");
+}
+
+#[test]
+fn swapped_alpha_beta_fails_self_check() {
+    let mixer = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    let spec = mixer.gdn_spec(&Device::Cpu).unwrap();
+    // `in_proj_a` handed over as beta and `in_proj_b` as alpha.
+    let error = mixer
+        .fused_gdn_self_check_with(&Device::Cpu, DType::F16, |row, conv, recurrent| {
+            mixer.fused_decode_row(
+                &spec,
+                &row.mixed_qkv,
+                &row.z,
+                &row.alpha,
+                &row.beta,
+                conv,
+                recurrent,
+            )
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("diverges"), "{error}");
+}
+
+#[test]
+fn conv_f16_oracle_matches_f32() {
+    let mixer = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    let c = mixer.conv_dim;
+    let x = Tensor::from_vec(self_check_wave(c, 1.0, 2.0), (1, 1, c), &Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+    let history = Tensor::from_vec(self_check_wave(3 * c, 2.0, 1.0), (c, 3), &Device::Cpu).unwrap();
+    let (out16, next16) = qwen38_conv_decode(&x, &mixer.conv_kernel, &history).unwrap();
+    let x32 = x.to_dtype(DType::F32).unwrap();
+    let (out32, next32) = qwen38_conv_decode(&x32, &mixer.conv_kernel, &history).unwrap();
+    assert_eq!(host_values(&out16).unwrap(), host_values(&out32).unwrap());
+    assert_eq!(host_values(&next16).unwrap(), host_values(&next32).unwrap());
+    assert_eq!(next16.dims(), [c, 3]);
+    // Channel-major next history, oldest first: [h1, h2, x].
+    let next = next16.to_vec2::<f32>().unwrap();
+    let old = history.to_vec2::<f32>().unwrap();
+    let x = host_values(&x32).unwrap();
+    for channel in [0, 1, c / 2, c - 1] {
+        assert_eq!(
+            next[channel],
+            [old[channel][1], old[channel][2], x[channel]]
+        );
+    }
+    // Today's portable step agrees with the oracle.
+    let mut ring = Some(ConvRingState::from_staged(history.clone()).unwrap());
+    let legacy = mixer.depthwise_conv_step(&x32, &mut ring).unwrap();
+    assert_close(
+        "conv output",
+        &host_values(&out32).unwrap(),
+        &host_values(&legacy).unwrap(),
+        1e-6,
+        1e-5,
+    );
+    assert_eq!(
+        host_values(&ring.unwrap().contiguous_history().unwrap()).unwrap(),
+        host_values(&next32).unwrap()
+    );
+}
+
+/// Prefill through the unchanged sequence path, then decode: every fused
+/// step tracks today's decode, and the fused counters move only for it.
+#[test]
+fn fused_gdn_decode_tracks_legacy_end_to_end() {
+    let _guard = counters_lock();
+    let legacy = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    let mut fused = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    fused.resolve_fused_gdn(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F16,
+        true,
+    );
+    assert!(
+        fused.fused_gdn_path.is_fused(),
+        "{:?}",
+        fused.fused_gdn_path
+    );
+    let prompt = Tensor::cat(&gdn_inputs(5, 64, 1.0, &Device::Cpu, DType::F16), 1).unwrap();
+    let steps = gdn_inputs(6, 64, 50.0, &Device::Cpu, DType::F16);
+    let run = |mixer: &Qwen38LinearAttention| {
+        let mut state = initialized_state(mixer, &Device::Cpu);
+        mixer.forward_sequence(&prompt, &mut state).unwrap();
+        let outputs = steps
+            .iter()
+            .map(|input| host_values(&mixer.forward(input, &mut state).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        (outputs, linear_state_values(&state))
+    };
+    let before = telemetry::snapshot();
+    let (expected, expected_state) = run(&legacy);
+    let between = telemetry::snapshot();
+    let (actual, actual_state) = run(&fused);
+    let after = telemetry::snapshot();
+    for (step, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_close(&format!("decode step {step}"), actual, expected, 0.01, 0.03);
+    }
+    assert_close(
+        "conv history",
+        &actual_state.0,
+        &expected_state.0,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "recurrent state",
+        &actual_state.1,
+        &expected_state.1,
+        1e-3,
+        1e-2,
+    );
+    assert_eq!(
+        between.cuda_fused_gdn_decode_attempts_total,
+        before.cuda_fused_gdn_decode_attempts_total
+    );
+    assert_eq!(
+        after.cuda_fused_gdn_decode_success_total - between.cuda_fused_gdn_decode_success_total,
+        steps.len() as u64
+    );
+    assert_eq!(
+        after.cuda_fused_gdn_decode_fallback_total,
+        between.cuda_fused_gdn_decode_fallback_total
+    );
+}
+
+/// The ragged batch takes the fused rows (two launches each) and matches
+/// each row decoded alone.
+#[test]
+fn fused_gdn_batch_matches_scalar_rows() {
+    let _guard = counters_lock();
+    let mut mixer = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    mixer.resolve_fused_gdn(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F16,
+        true,
+    );
+    assert!(mixer.fused_gdn_path.is_fused());
+    // Three rows with different histories: prompts of 1, 3 and 4 tokens.
+    let prefilled = |row: usize| {
+        let mut state = initialized_state(&mixer, &Device::Cpu);
+        let prompt = Tensor::cat(
+            &gdn_inputs(
+                1 + row + row / 2,
+                64,
+                3.0 * row as f32,
+                &Device::Cpu,
+                DType::F16,
+            ),
+            1,
+        )
+        .unwrap();
+        mixer.forward_sequence(&prompt, &mut state).unwrap();
+        state
+    };
+    let mut scalar_states = (0..3).map(prefilled).collect::<Vec<_>>();
+    let mut batch_states = (0..3).map(prefilled).collect::<Vec<_>>();
+    for step in 0..3 {
+        let inputs = gdn_inputs(3, 64, 90.0 + 7.0 * step as f32, &Device::Cpu, DType::F16);
+        let scalar = inputs
+            .iter()
+            .zip(scalar_states.iter_mut())
+            .map(|(input, state)| host_values(&mixer.forward(input, state).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        let batch_input = Tensor::cat(&inputs, 0).unwrap();
+        let mut refs = batch_states.iter_mut().collect::<Vec<_>>();
+        let batched = mixer.forward_decode_batch(&batch_input, &mut refs).unwrap();
+        for (row, scalar) in scalar.iter().enumerate() {
+            let batched = host_values(&batched.i(row).unwrap()).unwrap();
+            assert_close(
+                &format!("step {step} row {row}"),
+                &batched,
+                scalar,
+                0.01,
+                0.03,
+            );
+        }
+    }
+    for (scalar, batch) in scalar_states.iter().zip(&batch_states) {
+        let (scalar, batch) = (linear_state_values(scalar), linear_state_values(batch));
+        // The history holds the projection rows, which a 3-row F16 matmul
+        // rounds differently from a 1-row one.
+        assert_close("conv history", &batch.0, &scalar.0, 0.005, 0.01);
+        assert_close("recurrent state", &batch.1, &scalar.1, 0.01, 0.01);
+    }
+}
+
+/// MTP verification runs the unchanged sequence path; after a partial reject
+/// the recovered portable ring feeds the next fused step exactly as it feeds
+/// today's decode.
+#[test]
+fn fused_gdn_continues_after_verify_and_partial_recover() {
+    let _guard = counters_lock();
+    let legacy = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    let mut fused = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    fused.resolve_fused_gdn(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F16,
+        true,
+    );
+    assert!(fused.fused_gdn_path.is_fused());
+    let mut state = initialized_state(&fused, &Device::Cpu);
+    let prompt = Tensor::cat(&gdn_inputs(4, 64, 1.0, &Device::Cpu, DType::F16), 1).unwrap();
+    fused.forward_sequence(&prompt, &mut state).unwrap();
+    // A fused decode step leaves the contiguous kernel history.
+    fused
+        .forward(
+            &gdn_inputs(1, 64, 20.0, &Device::Cpu, DType::F16)[0],
+            &mut state,
+        )
+        .unwrap();
+    let draft = Tensor::cat(&gdn_inputs(3, 64, 30.0, &Device::Cpu, DType::F16), 1).unwrap();
+    let mut verification = None;
+    fused
+        .forward_sequence_recording(&draft, &mut state, Some(&mut verification))
+        .unwrap();
+    let recovered = verification.unwrap().recover(1).unwrap();
+    let next = &gdn_inputs(1, 64, 40.0, &Device::Cpu, DType::F16)[0];
+    let (mut fused_state, mut legacy_state) = (recovered.clone(), recovered);
+    let actual = fused.forward(next, &mut fused_state).unwrap();
+    let expected = legacy.forward(next, &mut legacy_state).unwrap();
+    assert_close(
+        "decode after recover",
+        &host_values(&actual).unwrap(),
+        &host_values(&expected).unwrap(),
+        0.01,
+        0.03,
+    );
+    let (fused_values, legacy_values) = (
+        linear_state_values(&fused_state),
+        linear_state_values(&legacy_state),
+    );
+    assert_close(
+        "conv history",
+        &fused_values.0,
+        &legacy_values.0,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "recurrent state",
+        &fused_values.1,
+        &legacy_values.1,
+        1e-4,
+        1e-3,
+    );
+}
+
+/// Staging keeps the canonical `[C, 3]` history and `[1, 48, 128, 128]`-style
+/// state; restoring either the canonical or the legacy `[3, C, 1]` form
+/// continues the fused decode bit-for-bit.
+#[test]
+fn fused_gdn_continues_bit_exact_after_stage_and_restore() {
+    let _guard = counters_lock();
+    let mut mixer = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F16);
+    mixer.resolve_fused_gdn(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        DType::F16,
+        true,
+    );
+    assert!(mixer.fused_gdn_path.is_fused());
+    let mut state = initialized_state(&mixer, &Device::Cpu);
+    for input in gdn_inputs(3, 64, 5.0, &Device::Cpu, DType::F16) {
+        mixer.forward(&input, &mut state).unwrap();
+    }
+    let Qwen38LayerRuntimeState::Linear {
+        conv_state: Some(conv),
+        recurrent_state: Some(recurrent),
+    } = &state
+    else {
+        panic!("decode initialized the state")
+    };
+    let staged = conv.staged_tensor().unwrap();
+    assert_eq!(staged.dims(), [mixer.conv_dim, 3]);
+    assert_eq!(recurrent.dims(), [1, 6, 128, 128]);
+    let legacy_form = staged.t().unwrap().unsqueeze(2).unwrap();
+    let next = &gdn_inputs(1, 64, 60.0, &Device::Cpu, DType::F16)[0];
+    let continue_from = |history: &Tensor| {
+        let mut restored = Qwen38LayerRuntimeState::Linear {
+            conv_state: Some(ConvRingState::from_staged(history.clone()).unwrap()),
+            recurrent_state: Some(recurrent.clone()),
+        };
+        let output = host_values(&mixer.forward(next, &mut restored).unwrap()).unwrap();
+        (output, linear_state_values(&restored))
+    };
+    let mut live = state.clone();
+    let expected = (
+        host_values(&mixer.forward(next, &mut live).unwrap()).unwrap(),
+        linear_state_values(&live),
+    );
+    assert_eq!(continue_from(&staged), expected);
+    assert_eq!(continue_from(&legacy_form), expected);
+}
+
+/// The CUDA conv entries for BF16/F16 projections compute exactly what the
+/// F32 entry computes on the cast input.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_conv_decode_16_bit_entries_match_f32() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let c = 10240;
+    let weight = Tensor::from_vec(self_check_wave(c * 4, 1.0, 0.5), (c, 4), &device).unwrap();
+    let history = Tensor::from_vec(self_check_wave(c * 3, 2.0, 1.0), (c, 3), &device).unwrap();
+    for dtype in [DType::BF16, DType::F16] {
+        let x = Tensor::from_vec(self_check_wave(c, 3.0, 2.0), (1, 1, c), &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let (out16, next16) =
+            crate::kernels::cuda::try_qwen38_causal_conv_decode(&x, &weight, &history)
+                .expect("16-bit conv entry");
+        let (out32, next32) = crate::kernels::cuda::try_qwen38_causal_conv_decode(
+            &x.to_dtype(DType::F32).unwrap(),
+            &weight,
+            &history,
+        )
+        .expect("F32 conv entry");
+        assert_eq!(out16.dtype(), DType::F32);
+        assert_eq!(
+            host_values(&out16).unwrap(),
+            host_values(&out32).unwrap(),
+            "{dtype:?}"
+        );
+        assert_eq!(
+            host_values(&next16).unwrap(),
+            host_values(&next32).unwrap(),
+            "{dtype:?}"
+        );
+    }
+}
+
+/// Production resolution on CUDA (no CPU allowance) at the 27B linear-layer
+/// geometry turns the fused decode on, and decode steps through it track
+/// today's specialized q38 kernels, scalar and batched.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_fused_gdn_matches_legacy_q38_kernels_48_heads() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let _guard = counters_lock();
+    let legacy = gdn_mixer(16, 48, 256, &device, DType::BF16);
+    let mut fused = gdn_mixer(16, 48, 256, &device, DType::BF16);
+    fused.resolve_fused_gdn(&Qwen38CudaSwitches::default(), &device, DType::BF16, false);
+    assert_eq!(fused.fused_gdn_path, Qwen38FastPath::Fused);
+    let steps = gdn_inputs(4, 256, 11.0, &device, DType::BF16);
+    let (mut legacy_state, mut fused_state) = (
+        initialized_state(&legacy, &device),
+        initialized_state(&fused, &device),
+    );
+    for (step, input) in steps.iter().enumerate() {
+        let expected = legacy.forward(input, &mut legacy_state).unwrap();
+        let actual = fused.forward(input, &mut fused_state).unwrap();
+        assert_close(
+            &format!("CUDA decode step {step}"),
+            &host_values(&actual).unwrap(),
+            &host_values(&expected).unwrap(),
+            0.01,
+            0.03,
+        );
+    }
+    let (fused_values, legacy_values) = (
+        linear_state_values(&fused_state),
+        linear_state_values(&legacy_state),
+    );
+    assert_close(
+        "CUDA conv history",
+        &fused_values.0,
+        &legacy_values.0,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "CUDA recurrent state",
+        &fused_values.1,
+        &legacy_values.1,
+        1e-3,
+        1e-2,
+    );
+
+    let rows = gdn_inputs(2, 256, 70.0, &device, DType::BF16);
+    let mut legacy_rows = [legacy_state.clone(), legacy_state];
+    let mut fused_rows = [fused_state.clone(), fused_state];
+    let batch_input = Tensor::cat(&rows, 0).unwrap();
+    let expected = legacy
+        .forward_decode_batch(
+            &batch_input,
+            &mut legacy_rows.iter_mut().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let actual = fused
+        .forward_decode_batch(&batch_input, &mut fused_rows.iter_mut().collect::<Vec<_>>())
+        .unwrap();
+    assert_close(
+        "CUDA batched decode",
+        &host_values(&actual).unwrap(),
+        &host_values(&expected).unwrap(),
+        0.01,
+        0.03,
+    );
 }

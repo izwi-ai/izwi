@@ -45,6 +45,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_causal_conv_decode_fallback_total: u64,
     pub cuda_rope_kernel_success_total: u64,
     pub cuda_rope_manual_fallback_total: u64,
+    pub cuda_fused_gdn_decode_attempts_total: u64,
+    pub cuda_fused_gdn_decode_success_total: u64,
+    pub cuda_fused_gdn_decode_fallback_total: u64,
     pub cuda_fused_rms_norm_total: u64,
     pub cuda_fused_add_rms_norm_total: u64,
     pub cuda_rms_norm_composition_total: u64,
@@ -118,6 +121,9 @@ counters!(
     CUDA_CAUSAL_CONV_DECODE_FALLBACK,
     CUDA_ROPE_KERNEL_SUCCESS,
     CUDA_ROPE_MANUAL_FALLBACK,
+    CUDA_FUSED_GDN_DECODE_ATTEMPTS,
+    CUDA_FUSED_GDN_DECODE_SUCCESS,
+    CUDA_FUSED_GDN_DECODE_FALLBACK,
     CUDA_FUSED_RMS_NORM,
     CUDA_FUSED_ADD_RMS_NORM,
     CUDA_RMS_NORM_COMPOSITION,
@@ -166,6 +172,9 @@ pub(crate) enum CudaKernelPath {
     DeltaNetPrefill,
     CausalConvPrefill,
     CausalConvDecode,
+    /// A row the resolved fused GDN decode took (success) or handed back to
+    /// today's decode (fallback). Production resolves it on CUDA only.
+    FusedGdnDecode,
 }
 
 pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
@@ -240,6 +249,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_CAUSAL_CONV_DECODE_ATTEMPTS,
             &CUDA_CAUSAL_CONV_DECODE_SUCCESS,
             &CUDA_CAUSAL_CONV_DECODE_FALLBACK,
+        ),
+        CudaKernelPath::FusedGdnDecode => (
+            &CUDA_FUSED_GDN_DECODE_ATTEMPTS,
+            &CUDA_FUSED_GDN_DECODE_SUCCESS,
+            &CUDA_FUSED_GDN_DECODE_FALLBACK,
         ),
     };
     attempts.fetch_add(1, Ordering::Relaxed);
@@ -414,6 +428,9 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_causal_conv_decode_fallback_total: load!(CUDA_CAUSAL_CONV_DECODE_FALLBACK),
         cuda_rope_kernel_success_total: load!(CUDA_ROPE_KERNEL_SUCCESS),
         cuda_rope_manual_fallback_total: load!(CUDA_ROPE_MANUAL_FALLBACK),
+        cuda_fused_gdn_decode_attempts_total: load!(CUDA_FUSED_GDN_DECODE_ATTEMPTS),
+        cuda_fused_gdn_decode_success_total: load!(CUDA_FUSED_GDN_DECODE_SUCCESS),
+        cuda_fused_gdn_decode_fallback_total: load!(CUDA_FUSED_GDN_DECODE_FALLBACK),
         cuda_fused_rms_norm_total: load!(CUDA_FUSED_RMS_NORM),
         cuda_fused_add_rms_norm_total: load!(CUDA_FUSED_ADD_RMS_NORM),
         cuda_rms_norm_composition_total: load!(CUDA_RMS_NORM_COMPOSITION),

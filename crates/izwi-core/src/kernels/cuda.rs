@@ -416,14 +416,20 @@ pub fn try_qwen38_causal_conv_sequence(
     try_qwen_hybrid_causal_conv_sequence(input, weight, history)
 }
 
+/// Qwen3.8 single-token causal conv. `input` is the QKV projection row in its
+/// own dtype (F32, BF16 or F16: a 16-bit row skips the F32 cast); the weight
+/// `[C, 4]` and the history `[C, 3]` are F32, and so are both outputs.
 pub fn try_qwen38_causal_conv_decode(
     input: &Tensor,
     weight: &Tensor,
     history: &Tensor,
 ) -> Option<(Tensor, Tensor)> {
-    if !cuda_tensor_pair_supported(input, weight)
-        || !cuda_tensor_pair_supported(input, history)
-        || input.dtype() != DType::F32
+    if !cuda_tensor_supported(input)
+        || !input.device().same_device(weight.device())
+        || !input.device().same_device(history.device())
+        || !matches!(input.dtype(), DType::F32 | DType::BF16 | DType::F16)
+        || weight.dtype() != DType::F32
+        || history.dtype() != DType::F32
     {
         return None;
     }
@@ -2091,27 +2097,29 @@ impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
         history_layout: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::cudarc::driver::{
+            CudaSlice, CudaView, LaunchConfig, PushKernelArg,
+        };
         use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
 
-        fn contiguous_slice<'a>(
-            storage: &'a CudaStorageSlice,
+        fn contiguous<'a, T>(
+            slice: &'a CudaSlice<T>,
             layout: &Layout,
             name: &str,
-        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
-        {
-            let CudaStorageSlice::F32(slice) = storage else {
-                candle_core::bail!("{name} must use F32 storage")
-            };
+        ) -> candle_core::Result<CudaView<'a, T>> {
             let Some((start, end)) = layout.contiguous_offsets() else {
                 candle_core::bail!("{name} must be contiguous")
             };
             Ok(slice.slice(start..end))
         }
 
-        let input_slice = contiguous_slice(&input.slice, input_layout, "input")?;
-        let weight_slice = contiguous_slice(&weight.slice, weight_layout, "weight")?;
-        let history_slice = contiguous_slice(&history.slice, history_layout, "history")?;
+        let (CudaStorageSlice::F32(weight_slice), CudaStorageSlice::F32(history_slice)) =
+            (&weight.slice, &history.slice)
+        else {
+            candle_core::bail!("Qwen3.8 decode convolution weight and history must be F32")
+        };
+        let weight_slice = contiguous(weight_slice, weight_layout, "weight")?;
+        let history_slice = contiguous(history_slice, history_layout, "history")?;
         let total_elements = self.conv_dim.checked_mul(4).ok_or_else(|| {
             candle_core::Error::Msg("Qwen3.8 CUDA decode convolution overflow".to_string())
         })?;
@@ -2121,20 +2129,31 @@ impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
         let device = input.device();
         // SAFETY: the custom kernel writes every element before the storage is observed.
         let output = unsafe { device.alloc::<f32>(total_elements)? };
-        let function = device.get_or_load_custom_func(
-            "qwen38_causal_conv_decode_f32",
-            "izwi_qwen38_causal_conv_decode",
-            cuda_ptx::QWEN38,
-        )?;
         let config = LaunchConfig::for_num_elems(total_elements as u32);
-        let mut builder = function.builder();
-        builder.arg(&input_slice);
-        builder.arg(&weight_slice);
-        builder.arg(&history_slice);
-        builder.arg(&output);
-        candle_core::builder_arg!(builder, self.conv_dim as i32);
-        // SAFETY: argument types and element bounds match the CUDA kernel signature.
-        unsafe { builder.launch(config) }.w()?;
+        macro_rules! launch {
+            ($slice:expr, $name:literal) => {{
+                let input_slice = contiguous($slice, input_layout, "input")?;
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    "izwi_qwen38_causal_conv_decode",
+                    cuda_ptx::QWEN38,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&input_slice);
+                builder.arg(&weight_slice);
+                builder.arg(&history_slice);
+                builder.arg(&output);
+                candle_core::builder_arg!(builder, self.conv_dim as i32);
+                // SAFETY: argument types and element bounds match the CUDA kernel signature.
+                unsafe { builder.launch(config) }.w()?;
+            }};
+        }
+        match &input.slice {
+            CudaStorageSlice::F32(slice) => launch!(slice, "qwen38_causal_conv_decode_f32"),
+            CudaStorageSlice::BF16(slice) => launch!(slice, "qwen38_causal_conv_decode_bf16"),
+            CudaStorageSlice::F16(slice) => launch!(slice, "qwen38_causal_conv_decode_f16"),
+            _ => candle_core::bail!("Qwen3.8 decode convolution input must be F32, BF16 or F16"),
+        }
 
         Ok((
             candle_core::CudaStorage {
@@ -3174,6 +3193,10 @@ mod tests {
     fn qwen38_cuda_source_uses_independent_decode_symbol() {
         let source = include_str!("cuda/qwen38.cu");
         assert!(source.contains("qwen38_causal_conv_decode_f32"));
+        // 16-bit projection rows enter the conv without an F32 cast.
+        assert!(source.contains("qwen38_causal_conv_decode_bf16"));
+        assert!(source.contains("qwen38_causal_conv_decode_f16"));
+        assert!(source.contains("float(input[channel]) * weight[weight_base + 3]"));
         assert!(source.contains("qwen38_deltanet_decode_f32"));
         assert!(source.contains("qwen38_silu_mul_decode_f32"));
         assert!(source.contains("qwen38_l2_norm_decode_f32"));

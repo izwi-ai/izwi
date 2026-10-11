@@ -19,6 +19,8 @@ use crate::performance::{CudaPerformanceConfig, OptimizationMode};
 
 /// Kill switch for the fused residual add + RMSNorm.
 pub(crate) const FUSED_NORM_ENV: &str = "IZWI_QWEN38_FUSED_NORM";
+/// Kill switch for the fused DeltaNet (GDN) decode.
+pub(crate) const FUSED_GDN_ENV: &str = "IZWI_QWEN38_FUSED_GDN";
 
 /// Execution path a fast path resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]
