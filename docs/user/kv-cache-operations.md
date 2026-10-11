@@ -187,6 +187,19 @@ IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1 izwi serve --backend cuda
 Boolean values are strict: `1/true/yes/on` disables Optimized, while
 `0/false/no/off` enables normal promotion. Invalid values fail startup.
 
+On Metal, KV writes, page zeroes, and page copies are queued without a host
+wait. The first wait on any of their fences, normally the decode step's batch
+seal, drains the device once for every mutation queued before it. Managed KV
+telemetry then reports about one `host_synchronizations` per decode step
+instead of one per attention-layer write. To restore one device
+synchronization per mutation for an incident or comparison run:
+
+```bash
+IZWI_KV_METAL_EAGER_FENCES=1 izwi serve --backend metal
+```
+
+It takes the same strict boolean values.
+
 ## Benchmark methodology
 
 The checked-in microbenchmark uses the public physical arena ABI and emits
@@ -229,7 +242,8 @@ Rollback is policy-only; ABI v1 and model-owned KV are not available.
 1. Disable prefix reuse with `enable_prefix_caching: false`. Restart and confirm
    health reports `prefix.mode: disabled`.
 2. On CUDA, set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`. Restart and confirm the
-   exact route selects Portable rather than Optimized.
+   exact route selects Portable rather than Optimized. On Metal, set
+   `IZWI_KV_METAL_EAGER_FENCES=1` to synchronize after every KV mutation again.
 3. If the CUDA backend itself is suspect, explicitly select CPU or Metal and
    confirm `requested_backend_available` and `selected_backend` in health.
 4. Drain or restart the process before changing page size or dtype; never mix

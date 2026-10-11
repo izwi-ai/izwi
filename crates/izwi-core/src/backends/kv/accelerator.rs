@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use candle_core::{DType, Device, DeviceLocation, Tensor};
 
@@ -168,12 +168,143 @@ fn page_needs_zero(state: &mut AcceleratorPageCleanliness) -> bool {
     }
 }
 
+/// The `IZWI_KV_METAL_EAGER_FENCES` path: complete the mutation before
+/// publishing its fence, one device-wide synchronization per mutation.
 fn completed_device_fence(device: &Device) -> Result<DeviceFence> {
-    // Candle does not expose the current Metal command buffer as a clonable
-    // completion token. Complete this mutation before publishing its fence so
-    // coordinator commit/reuse never races queued private-buffer work.
     device.synchronize()?;
     Ok(Arc::new(CompletedAcceleratorFence))
+}
+
+/// Completion epochs for the KV mutations queued on one Metal device.
+///
+/// Candle 0.11 keeps the Metal command buffer `pub(crate)`, so a mutation
+/// cannot capture a completion token for the buffer that holds its work.
+/// Instead each mutation takes the next epoch once its work is queued, and a
+/// drain completes every epoch issued before the drain read `submitted`.
+/// Every arena on a device shares one tracker (`metal_completion_tracker`),
+/// so one drain per step covers the text and MTP arenas alike.
+struct DeviceCompletionTracker {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    // Guards no data: it keeps concurrent waiters from draining twice.
+    draining: Mutex<()>,
+    drain: Box<dyn Fn() -> Result<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for DeviceCompletionTracker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCompletionTracker")
+            .field("submitted", &self.submitted.load(Ordering::Relaxed))
+            .field("completed", &self.completed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl DeviceCompletionTracker {
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    fn new(drain: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
+        Self {
+            submitted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            draining: Mutex::new(()),
+            drain: Box::new(drain),
+        }
+    }
+
+    /// The epoch for work the caller has already queued on the device.
+    fn issue(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn is_complete(&self, epoch: u64) -> bool {
+        self.completed.load(Ordering::Acquire) >= epoch
+    }
+
+    /// Drain the device unless `epoch` has already completed; `None` always
+    /// drains. Returns whether this call drained. A failed drain completes
+    /// nothing.
+    fn complete_through(&self, epoch: Option<u64>) -> Result<bool> {
+        let done = || epoch.is_some_and(|epoch| self.is_complete(epoch));
+        if done() {
+            return Ok(false);
+        }
+        let _draining = self.draining.lock().unwrap_or_else(PoisonError::into_inner);
+        if done() {
+            return Ok(false);
+        }
+        // Read the target before draining. Every epoch at or below it was
+        // issued after its work was queued, so the drain covers that work; a
+        // later epoch may belong to work queued after the drain committed.
+        let target = self.submitted.load(Ordering::Acquire);
+        (self.drain)()?;
+        self.completed.fetch_max(target, Ordering::AcqRel);
+        Ok(true)
+    }
+}
+
+/// The tracker shared by every arena on this Metal device. Keyed by Candle's
+/// per-instance device id, so a separately created `MetalDevice` (its own
+/// command queue) gets its own tracker.
+#[cfg(feature = "metal")]
+fn metal_completion_tracker(device: &Device) -> Result<Arc<DeviceCompletionTracker>> {
+    use candle_core::metal_backend::DeviceId;
+    use std::sync::{OnceLock, Weak};
+
+    type Trackers = Mutex<HashMap<DeviceId, Weak<DeviceCompletionTracker>>>;
+    static TRACKERS: OnceLock<Trackers> = OnceLock::new();
+
+    let id = device.as_metal_device()?.id();
+    let mut trackers = TRACKERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(tracker) = trackers.get(&id).and_then(Weak::upgrade) {
+        return Ok(tracker);
+    }
+    trackers.retain(|_, tracker| tracker.strong_count() > 0);
+    let queue = device.clone();
+    let tracker = Arc::new(DeviceCompletionTracker::new(move || {
+        drain_metal_queue(&queue)
+    }));
+    trackers.insert(id, Arc::downgrade(&tracker));
+    Ok(tracker)
+}
+
+/// Wait until everything queued on this Metal device so far has run.
+#[cfg(feature = "metal")]
+fn drain_metal_queue(device: &Device) -> Result<()> {
+    let metal = device.as_metal_device()?;
+    // `flush_and_wait_current` commits a fresh command buffer and waits on that
+    // exact buffer; the queue completes buffers in commit order, so all earlier
+    // work is done when it returns. `wait_until_completed` alone can return
+    // before that work ran, because a concurrent waiter may already have taken
+    // Candle's in-flight list. It still runs afterwards, because only it
+    // reports errors that earlier command buffers recorded.
+    let current = metal.flush_and_wait_current();
+    let earlier = metal.wait_until_completed();
+    Ok(current.and(earlier)?)
+}
+
+/// A Metal KV mutation fence: complete once a drain that read the tracker
+/// after the mutation was queued has finished.
+struct MetalEpochFence {
+    epoch: u64,
+    tracker: Arc<DeviceCompletionTracker>,
+    host_synchronizations: Arc<AtomicU64>,
+}
+
+impl KvDeviceFence for MetalEpochFence {
+    fn is_complete(&self) -> bool {
+        self.tracker.is_complete(self.epoch)
+    }
+
+    fn wait(&self) -> Result<()> {
+        if self.tracker.complete_through(Some(self.epoch))? {
+            self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 const ACCELERATOR_WORKSPACE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -229,6 +360,11 @@ struct AcceleratorWorkspacePool {
     high_water_bytes: usize,
     allocations: u64,
     retired: Vec<RetiredAcceleratorWorkspace>,
+    // Metal epoch fences complete only when someone waits on them, so an
+    // unwaited retirement would hold the budget until the next drain. When
+    // set, a request that does not fit waits on the retirements instead of
+    // failing.
+    wait_on_retirements: bool,
 }
 
 impl std::fmt::Debug for AcceleratorWorkspacePool {
@@ -240,6 +376,7 @@ impl std::fmt::Debug for AcceleratorWorkspacePool {
             .field("high_water_bytes", &self.high_water_bytes)
             .field("allocations", &self.allocations)
             .field("retired_entries", &self.retired.len())
+            .field("wait_on_retirements", &self.wait_on_retirements)
             .finish()
     }
 }
@@ -252,7 +389,13 @@ impl AcceleratorWorkspacePool {
             high_water_bytes: 0,
             allocations: 0,
             retired: Vec::new(),
+            wait_on_retirements: false,
         }
+    }
+
+    fn waiting_on_retirements(mut self, enabled: bool) -> Self {
+        self.wait_on_retirements = enabled;
+        self
     }
 
     fn acquire(
@@ -265,12 +408,8 @@ impl AcceleratorWorkspacePool {
             shape: shape.to_vec(),
             dtype,
         };
-        if let Some(index) = self
-            .retired
-            .iter()
-            .position(|entry| entry.lease.key == key && entry.retirement.is_complete())
-        {
-            return Ok(self.retired.swap_remove(index).lease);
+        if let Some(lease) = self.take_completed(&key) {
+            return Ok(lease);
         }
 
         let elements = shape.iter().try_fold(1usize, |total, dimension| {
@@ -281,20 +420,15 @@ impl AcceleratorWorkspacePool {
         let bytes = elements
             .checked_mul(dtype.size_in_bytes())
             .ok_or_else(|| Error::Overloaded("accelerator workspace byte count overflow".into()))?;
-        while self
-            .reserved_bytes
-            .checked_add(bytes)
-            .is_some_and(|total| total > self.budget_bytes)
-        {
-            let Some(index) = self
-                .retired
-                .iter()
-                .position(|entry| entry.retirement.is_complete())
-            else {
-                break;
-            };
-            let retired = self.retired.swap_remove(index);
-            self.reserved_bytes = self.reserved_bytes.saturating_sub(retired.lease.bytes);
+        self.evict_completed_until_fits(bytes);
+        if self.wait_on_retirements && self.exceeds_budget(bytes) && !self.retired.is_empty() {
+            for entry in &self.retired {
+                entry.retirement.wait()?;
+            }
+            if let Some(lease) = self.take_completed(&key) {
+                return Ok(lease);
+            }
+            self.evict_completed_until_fits(bytes);
         }
         let requested_total = self.reserved_bytes.checked_add(bytes).ok_or_else(|| {
             Error::Overloaded("accelerator workspace reservation overflow".into())
@@ -310,6 +444,37 @@ impl AcceleratorWorkspacePool {
         self.high_water_bytes = self.high_water_bytes.max(requested_total);
         self.allocations = self.allocations.saturating_add(1);
         Ok(AcceleratorWorkspaceLease { key, tensor, bytes })
+    }
+
+    fn take_completed(
+        &mut self,
+        key: &AcceleratorWorkspaceKey,
+    ) -> Option<AcceleratorWorkspaceLease> {
+        let index = self
+            .retired
+            .iter()
+            .position(|entry| entry.lease.key == *key && entry.retirement.is_complete())?;
+        Some(self.retired.swap_remove(index).lease)
+    }
+
+    fn exceeds_budget(&self, bytes: usize) -> bool {
+        self.reserved_bytes
+            .checked_add(bytes)
+            .is_some_and(|total| total > self.budget_bytes)
+    }
+
+    fn evict_completed_until_fits(&mut self, bytes: usize) {
+        while self.exceeds_budget(bytes) {
+            let Some(index) = self
+                .retired
+                .iter()
+                .position(|entry| entry.retirement.is_complete())
+            else {
+                break;
+            };
+            let retired = self.retired.swap_remove(index);
+            self.reserved_bytes = self.reserved_bytes.saturating_sub(retired.lease.bytes);
+        }
     }
 
     fn retire(&mut self, lease: AcceleratorWorkspaceLease, retirement: DeviceFence) {
@@ -619,13 +784,16 @@ pub struct CandleAcceleratorKvArena {
     cuda_graph_backoff_hits: AtomicU64,
     cuda_graph_evictions: AtomicU64,
     host_synchronizations: Arc<AtomicU64>,
+    /// Metal epoch fences; `None` off Metal and under
+    /// `IZWI_KV_METAL_EAGER_FENCES`, where each mutation synchronizes.
+    metal_completion: Option<Arc<DeviceCompletionTracker>>,
 }
 
 impl CandleAcceleratorKvArena {
     pub fn new_mutation_only(config: KvArenaConfig, device: Device) -> Result<Self> {
         let backend = backend_for_device(&device)?;
-        let optimized_provider_enabled =
-            KvProviderRollout::from_process_env()?.optimized_provider_enabled();
+        let rollout = KvProviderRollout::from_process_env()?;
+        let optimized_provider_enabled = rollout.optimized_provider_enabled();
         let cuda_identity = if backend == BackendKind::Cuda {
             observe_cuda_identity(&device)
         } else {
@@ -648,6 +816,12 @@ impl CandleAcceleratorKvArena {
                 "managed KV mutation support is not compiled for {backend:?}"
             )));
         }
+        #[cfg(feature = "metal")]
+        let metal_completion = (backend == BackendKind::Metal && !rollout.metal_eager_fences())
+            .then(|| metal_completion_tracker(&device))
+            .transpose()?;
+        #[cfg(not(feature = "metal"))]
+        let metal_completion = None;
 
         let resident_capacity_pages = config
             .growth
@@ -701,9 +875,10 @@ impl CandleAcceleratorKvArena {
             mutation_lock: Mutex::new(()),
             prefill_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
             decode_metadata_cache: Mutex::new(ResidentAttentionPlanCache::default()),
-            workspace_pool: Mutex::new(AcceleratorWorkspacePool::new(
-                ACCELERATOR_WORKSPACE_BUDGET_BYTES,
-            )),
+            workspace_pool: Mutex::new(
+                AcceleratorWorkspacePool::new(ACCELERATOR_WORKSPACE_BUDGET_BYTES)
+                    .waiting_on_retirements(metal_completion.is_some()),
+            ),
             attention_plan_cache_hits: AtomicU64::new(0),
             attention_plan_cache_misses: AtomicU64::new(0),
             attention_plan_cache_evictions: AtomicU64::new(0),
@@ -733,6 +908,7 @@ impl CandleAcceleratorKvArena {
             cuda_graph_backoff_hits: AtomicU64::new(0),
             cuda_graph_evictions: AtomicU64::new(0),
             host_synchronizations,
+            metal_completion,
         })
     }
 
@@ -842,8 +1018,21 @@ impl CandleAcceleratorKvArena {
         Ok(page)
     }
 
+    /// The fence for the mutation the caller has just queued. Call it only
+    /// after that work is queued: on Metal the epoch covers exactly the work
+    /// queued before it was issued.
     fn mutation_fence(&self) -> Result<DeviceFence> {
         if self.backend == BackendKind::Metal {
+            if let Some(tracker) = &self.metal_completion {
+                // Later device work, including the next KV read, is ordered
+                // behind this write by Candle's tracked bindings and encoder
+                // fences, so nothing waits here; the first `wait` drains once.
+                return Ok(Arc::new(MetalEpochFence {
+                    epoch: tracker.issue(),
+                    tracker: tracker.clone(),
+                    host_synchronizations: self.host_synchronizations.clone(),
+                }));
+            }
             let fence = completed_device_fence(&self.device)?;
             self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
             Ok(fence)
@@ -2396,7 +2585,14 @@ impl KvArena for CandleAcceleratorKvArena {
 
     fn drain(&self) -> Result<()> {
         if self.backend == BackendKind::Metal {
-            self.device.synchronize()?;
+            match &self.metal_completion {
+                // Drains even when every epoch is complete: paged attention
+                // reads also use the storage, and they issue no epochs.
+                Some(tracker) => {
+                    tracker.complete_through(None)?;
+                }
+                None => self.device.synchronize()?,
+            }
             self.host_synchronizations.fetch_add(1, Ordering::Relaxed);
             Ok(())
         } else {
@@ -2901,6 +3097,172 @@ mod tests {
         assert!(matches!(zero_pending, AcceleratorPageCleanliness::Clean));
     }
 
+    fn counting_tracker() -> (Arc<DeviceCompletionTracker>, Arc<AtomicU64>) {
+        let drains = Arc::new(AtomicU64::new(0));
+        let counter = drains.clone();
+        let tracker = Arc::new(DeviceCompletionTracker::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        (tracker, drains)
+    }
+
+    fn epoch_fence(
+        tracker: &Arc<DeviceCompletionTracker>,
+        host_synchronizations: &Arc<AtomicU64>,
+    ) -> MetalEpochFence {
+        MetalEpochFence {
+            epoch: tracker.issue(),
+            tracker: tracker.clone(),
+            host_synchronizations: host_synchronizations.clone(),
+        }
+    }
+
+    #[test]
+    fn epoch_fence_completes_only_after_a_drain() -> Result<()> {
+        let (tracker, drains) = counting_tracker();
+        let syncs = Arc::new(AtomicU64::new(0));
+        let fence = epoch_fence(&tracker, &syncs);
+        assert!(!fence.is_complete());
+        assert!(!fence.is_complete(), "is_complete is a pure check");
+        assert_eq!(drains.load(Ordering::SeqCst), 0);
+
+        fence.wait()?;
+        assert!(fence.is_complete());
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        fence.wait()?;
+        assert_eq!(
+            drains.load(Ordering::SeqCst),
+            1,
+            "a complete fence waits for nothing"
+        );
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn one_drain_completes_every_earlier_epoch() -> Result<()> {
+        let (tracker, drains) = counting_tracker();
+        let syncs = Arc::new(AtomicU64::new(0));
+        let fences = (0..16)
+            .map(|_| epoch_fence(&tracker, &syncs))
+            .collect::<Vec<_>>();
+        fences[7].wait()?;
+        assert!(fences.iter().all(MetalEpochFence::is_complete));
+        for fence in &fences {
+            fence.wait()?;
+        }
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_epoch_issued_during_a_drain_stays_incomplete() -> Result<()> {
+        // The drain issues an epoch of its own, standing in for a mutation
+        // queued after the drain read its target: that drain cannot cover it.
+        let this = Arc::new(std::sync::OnceLock::<
+            std::sync::Weak<DeviceCompletionTracker>,
+        >::new());
+        let late = Arc::new(Mutex::new(None::<u64>));
+        let tracker = Arc::new(DeviceCompletionTracker::new({
+            let this = this.clone();
+            let late = late.clone();
+            move || {
+                let tracker = this.get().and_then(std::sync::Weak::upgrade);
+                if let Some(tracker) = tracker {
+                    late.lock().unwrap().get_or_insert_with(|| tracker.issue());
+                }
+                Ok(())
+            }
+        }));
+        this.set(Arc::downgrade(&tracker)).unwrap();
+        let syncs = Arc::new(AtomicU64::new(0));
+
+        let early = epoch_fence(&tracker, &syncs);
+        early.wait()?;
+        assert!(early.is_complete());
+        let late = MetalEpochFence {
+            epoch: late.lock().unwrap().expect("the drain issued an epoch"),
+            tracker: tracker.clone(),
+            host_synchronizations: syncs.clone(),
+        };
+        assert!(!late.is_complete());
+        late.wait()?;
+        assert!(late.is_complete());
+        assert_eq!(syncs.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_drain_completes_nothing() -> Result<()> {
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tracker = Arc::new(DeviceCompletionTracker::new({
+            let failing = failing.clone();
+            move || {
+                if failing.load(Ordering::SeqCst) {
+                    Err(Error::InferenceError("command buffer failed".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }));
+        let syncs = Arc::new(AtomicU64::new(0));
+        let fences = (0..3)
+            .map(|_| epoch_fence(&tracker, &syncs))
+            .collect::<Vec<_>>();
+
+        let error = fences[2].wait().unwrap_err();
+        assert!(error.to_string().contains("command buffer failed"));
+        assert!(fences.iter().all(|fence| !fence.is_complete()));
+        assert_eq!(syncs.load(Ordering::SeqCst), 0);
+
+        failing.store(false, Ordering::SeqCst);
+        fences[0].wait()?;
+        assert!(fences.iter().all(MetalEpochFence::is_complete));
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_waiters_drain_once() -> Result<()> {
+        let drains = Arc::new(AtomicU64::new(0));
+        let tracker = Arc::new(DeviceCompletionTracker::new({
+            let drains = drains.clone();
+            move || {
+                drains.fetch_add(1, Ordering::SeqCst);
+                // Hold the drain open so the other waiters arrive during it.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            }
+        }));
+        let syncs = Arc::new(AtomicU64::new(0));
+        let fences = (0..8)
+            .map(|_| epoch_fence(&tracker, &syncs))
+            .collect::<Vec<_>>();
+        let start = std::sync::Barrier::new(fences.len());
+        let start = &start;
+        std::thread::scope(|scope| {
+            let waiters = fences
+                .iter()
+                .map(|fence| {
+                    scope.spawn(move || {
+                        start.wait();
+                        fence.wait()
+                    })
+                })
+                .collect::<Vec<_>>();
+            waiters
+                .into_iter()
+                .try_for_each(|waiter| waiter.join().expect("waiter panicked"))
+        })?;
+        assert!(fences.iter().all(MetalEpochFence::is_complete));
+        assert_eq!(drains.load(Ordering::SeqCst), 1);
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[test]
     fn accelerator_workspace_pool_reuses_one_allocation_for_one_hundred_operations() -> Result<()> {
         let mut pool = AcceleratorWorkspacePool::new(64);
@@ -2988,6 +3350,27 @@ mod tests {
         assert!(message.contains("requested_bytes=64"));
         assert!(message.contains("reserved_bytes=64"));
         assert!(message.contains("budget_bytes=64"));
+        Ok(())
+    }
+
+    #[test]
+    fn metal_workspace_pool_waits_on_an_unwaited_retirement_instead_of_failing() -> Result<()> {
+        let mut pool = AcceleratorWorkspacePool::new(64).waiting_on_retirements(true);
+        let (pending, waited) = test_completion(false);
+        let first = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        let first_id = first.tensor.id();
+        pool.retire(first, pending);
+
+        let reused = pool.acquire(&[16], DType::F32, &Device::Cpu)?;
+        assert!(waited.load(Ordering::Acquire), "the retirement was waited");
+        assert_eq!(reused.tensor.id(), first_id);
+        assert_eq!(pool.allocations, 1);
+
+        // A checked-out workspace has nothing to wait on: the budget error stays.
+        let error = pool
+            .acquire(&[16], DType::F32, &Device::Cpu)
+            .expect_err("a checked-out workspace still consumes the budget");
+        assert!(error.to_string().contains("budget_bytes=64"));
         Ok(())
     }
 
@@ -3426,14 +3809,66 @@ mod tests {
         Ok(())
     }
 
+    /// Holds the env lock with `IZWI_KV_METAL_EAGER_FENCES` set to `value`
+    /// (unset for `None`), restoring the previous value on drop.
+    #[cfg(feature = "metal")]
+    struct EagerFenceEnv {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "metal")]
+    impl EagerFenceEnv {
+        fn set(value: Option<&str>) -> Self {
+            use crate::runtime::rollout::METAL_EAGER_KV_FENCES_ENV;
+
+            let lock = crate::env_test_lock()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let previous = std::env::var_os(METAL_EAGER_KV_FENCES_ENV);
+            match value {
+                Some(value) => std::env::set_var(METAL_EAGER_KV_FENCES_ENV, value),
+                None => std::env::remove_var(METAL_EAGER_KV_FENCES_ENV),
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    impl Drop for EagerFenceEnv {
+        fn drop(&mut self) {
+            use crate::runtime::rollout::METAL_EAGER_KV_FENCES_ENV;
+
+            match self.previous.take() {
+                Some(value) => std::env::set_var(METAL_EAGER_KV_FENCES_ENV, value),
+                None => std::env::remove_var(METAL_EAGER_KV_FENCES_ENV),
+            }
+        }
+    }
+
+    /// A Metal device of the test's own. Arenas on the shared device share one
+    /// completion tracker, so another test's drain could complete this test's
+    /// epochs between two assertions.
+    #[cfg(feature = "metal")]
+    fn private_metal_device() -> Result<Option<Device>> {
+        // Feature-only CI must tolerate an unavailable or unsupported Metal
+        // runtime without entering Candle's device constructor.
+        if crate::backends::metal_device_if_available(0).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Device::new_metal(0)?))
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn metal_paged_decode_and_prefill_match_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {
-        // Feature-only CI must tolerate an unavailable or unsupported Metal
-        // runtime without entering Candle's device constructor.
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some(device) = private_metal_device()? else {
             return Ok(());
         };
+        let _env = EagerFenceEnv::set(None);
         for dtype in [DType::F32, DType::F16] {
             for (num_kv_heads, num_query_heads) in [(1_usize, 2_usize), (2, 2), (2, 4)] {
                 let binding = KvLayerBinding {
@@ -3527,7 +3962,9 @@ mod tests {
                         slots: metal_slots.as_ref(),
                     },
                 )?;
-                assert!(fence.is_complete());
+                // Queued, not synchronized: the decode below reads the write
+                // through device ordering alone.
+                assert!(!fence.is_complete());
                 cpu_arena.write_slots(
                     binding,
                     KvWriteArgs {
@@ -3609,6 +4046,11 @@ mod tests {
                         "{dtype:?} {num_query_heads}Q/{num_kv_heads}KV: {actual} != {expected}"
                     );
                 }
+                // The readback above waited on its own command buffer, which
+                // does not advance the tracker; only a drain completes it.
+                assert!(!fence.is_complete());
+                fence.wait()?;
+                assert!(fence.is_complete());
 
                 let metal_rows = vec![
                     PagedKvPrefillRow {
@@ -3727,6 +4169,221 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// One decode step of KV traffic: sixteen layer writes, each followed by
+    /// a paged decode that reads the new token, then one seal. Returns the
+    /// arena's host synchronizations for the step after checking every decode
+    /// output and the stored K/V against the CPU arena.
+    #[cfg(feature = "metal")]
+    fn metal_decode_step_host_synchronizations(
+        device: &Device,
+        eager: Option<&str>,
+    ) -> Result<u64> {
+        use super::super::{submit_ordered_after_write, KvWriteCompletionCollector};
+
+        const LAYERS: u32 = 16;
+        const PRIOR_TOKENS: usize = 5;
+        let _env = EagerFenceEnv::set(eager);
+        let bindings = (0..LAYERS)
+            .map(|layer| KvLayerBinding {
+                model_layer: layer * 4 + 3,
+                physical_layer: layer,
+            })
+            .collect::<Vec<_>>();
+        let metal_id = KvArenaId {
+            model_instance: ModelInstanceId::new(93),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let cpu_id = KvArenaId {
+            backend: BackendKind::Cpu,
+            device_ordinal: None,
+            ..metal_id
+        };
+        let group = KvGroupId::new(0);
+        let config = |id| KvArenaConfig {
+            id,
+            group,
+            page_tokens: 4,
+            capacity_pages: 4,
+            growth: None,
+            dtype: DType::F32,
+            layers: bindings
+                .iter()
+                .map(|binding| super::super::KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: 2,
+                    key_head_dim: 4,
+                    value_head_dim: 4,
+                })
+                .collect(),
+        };
+        let metal = CandleAcceleratorKvArena::new_mutation_only(config(metal_id), device.clone())?;
+        let cpu = super::super::CpuKvArena::new(config(cpu_id))?;
+        assert_eq!(metal.metal_completion.is_none(), eager.is_some());
+
+        // One sequence on pages [1, 3]: five prior tokens, then the step's
+        // token at page 3, offset 1.
+        let slots = |arena| {
+            [(1, 0), (1, 1), (1, 2), (1, 3), (3, 0), (3, 1)].map(|(index, offset)| KvSlotRef {
+                block: CacheBlockRef {
+                    arena,
+                    group,
+                    index,
+                    slot_generation: 1,
+                },
+                offset,
+            })
+        };
+        let batch = |arena| {
+            let [first, .., last] = slots(arena);
+            KvDecodeBatchMetadata {
+                sequences: vec![crate::kv::KvSequenceBlockTable {
+                    blocks: vec![first.block, last.block],
+                    first_page_offset: 0,
+                    context_len: PRIOR_TOKENS as u32 + 1,
+                }],
+            }
+        };
+        let rows = |layer: usize, tokens: usize, seed: f32, device: &Device| {
+            let data = (0..tokens * 2 * 4)
+                .map(|index| ((index + layer * 7) as f32 * seed).sin())
+                .collect::<Vec<_>>();
+            Tensor::from_vec(data, (tokens, 2, 4), device)
+        };
+        let (metal_slots, cpu_slots) = (slots(metal_id), slots(cpu_id));
+        let metal_prior = metal.lower_slots(&metal_slots[..PRIOR_TOKENS])?;
+        let cpu_prior = cpu.lower_slots(&cpu_slots[..PRIOR_TOKENS])?;
+        let metal_step = metal.lower_slots(&metal_slots[PRIOR_TOKENS..])?;
+        let cpu_step = cpu.lower_slots(&cpu_slots[PRIOR_TOKENS..])?;
+        for (layer, binding) in bindings.iter().enumerate() {
+            let (keys, values) = (
+                rows(layer, PRIOR_TOKENS, 0.37, device)?,
+                rows(layer, PRIOR_TOKENS, 0.53, device)?,
+            );
+            metal
+                .write_slots(
+                    *binding,
+                    KvWriteArgs {
+                        keys: &keys,
+                        values: &values,
+                        slots: metal_prior.as_ref(),
+                    },
+                )?
+                .wait()?;
+            let (keys, values) = (
+                rows(layer, PRIOR_TOKENS, 0.37, &Device::Cpu)?,
+                rows(layer, PRIOR_TOKENS, 0.53, &Device::Cpu)?,
+            );
+            cpu.write_slots(
+                *binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: cpu_prior.as_ref(),
+                },
+            )?;
+        }
+
+        let before = metal.operation_stats().host_synchronizations;
+        let mut collector =
+            KvWriteCompletionCollector::new(metal.config(), metal_step.logical_slots())?;
+        let mut metal_outputs = Vec::with_capacity(bindings.len());
+        for (layer, binding) in bindings.iter().enumerate() {
+            let (keys, values) = (rows(layer, 1, 0.71, device)?, rows(layer, 1, 0.29, device)?);
+            let completion = metal.write_slots(
+                *binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: metal_step.as_ref(),
+                },
+            )?;
+            assert_eq!(completion.is_complete(), eager.is_some(), "layer {layer}");
+            let queries = rows(layer, 1, 0.11, device)?;
+            let (output, completion) = submit_ordered_after_write(completion, || {
+                metal.paged_decode(
+                    *binding,
+                    PagedKvDecodeArgs {
+                        queries: &queries,
+                        batch: &batch(metal_id),
+                        softmax_scale: 0.5,
+                        softcap: None,
+                    },
+                )
+            })?;
+            collector.collect(completion)?;
+            metal_outputs.push(output);
+        }
+        let sealed = collector.seal()?;
+        let host_synchronizations = metal.operation_stats().host_synchronizations - before;
+        assert_eq!(sealed.layers().len(), bindings.len());
+
+        for (layer, (binding, metal_output)) in bindings.iter().zip(&metal_outputs).enumerate() {
+            let (keys, values) = (
+                rows(layer, 1, 0.71, &Device::Cpu)?,
+                rows(layer, 1, 0.29, &Device::Cpu)?,
+            );
+            cpu.write_slots(
+                *binding,
+                KvWriteArgs {
+                    keys: &keys,
+                    values: &values,
+                    slots: cpu_step.as_ref(),
+                },
+            )?;
+            let cpu_output = cpu.paged_decode(
+                *binding,
+                PagedKvDecodeArgs {
+                    queries: &rows(layer, 1, 0.11, &Device::Cpu)?,
+                    batch: &batch(cpu_id),
+                    softmax_scale: 0.5,
+                    softcap: None,
+                },
+            )?;
+            let actual = metal_output
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = cpu_output.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "layer {layer} decode: {actual} != {expected}"
+                );
+            }
+            let (metal_keys, metal_values) = metal.layer_tensors(*binding)?;
+            let (cpu_keys, cpu_values) = cpu.layer_tensors(*binding)?;
+            for (metal_tensor, cpu_tensor) in [(metal_keys, cpu_keys), (metal_values, cpu_values)] {
+                assert_eq!(
+                    metal_tensor
+                        .to_device(&Device::Cpu)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    cpu_tensor.flatten_all()?.to_vec1::<f32>()?,
+                    "layer {layer} stored K/V"
+                );
+            }
+        }
+        Ok(host_synchronizations)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_decode_step_synchronizes_once_for_sixteen_layer_writes() -> Result<()> {
+        let Some(device) = private_metal_device()? else {
+            return Ok(());
+        };
+        assert_eq!(metal_decode_step_host_synchronizations(&device, None)?, 1);
+        // The kill switch restores one synchronization per layer write.
+        assert_eq!(
+            metal_decode_step_host_synchronizations(&device, Some("1"))?,
+            16
+        );
         Ok(())
     }
 
