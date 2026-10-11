@@ -225,6 +225,17 @@ pub trait KvSlotMap: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// The paged caches a captured decode graph writes itself
+/// ([`KvArena::with_graph_writes`]).
+pub struct GraphKvLayers {
+    /// Backing allocation generation. Growth swaps the tensors, so a graph
+    /// captured against another generation must not replay.
+    pub generation: u64,
+    /// `(keys, values)` per requested binding, `[pages, page_tokens,
+    /// kv_heads, head_dim]`, sharing the arena's storage.
+    pub layers: Vec<(Tensor, Tensor)>,
+}
+
 pub struct KvWriteArgs<'a> {
     pub keys: &'a Tensor,
     pub values: &'a Tensor,
@@ -730,6 +741,26 @@ pub trait KvArena: Send + Sync {
         layer: KvLayerBinding,
         args: KvWriteArgs<'_>,
     ) -> Result<KvWriteCompletion>;
+    /// Run `enqueue`, which writes `slots` into every layer of `bindings` on
+    /// the device without `write_slots` (as a captured decode graph does), then
+    /// account for those writes exactly as `write_slots` would: the pages turn
+    /// dirty, the dispatches are counted, and each binding gets a completion
+    /// fenced after the enqueued work. `decodes` paged decode dispatches the
+    /// same work performed are counted too. Mutations stay serialized for the
+    /// whole call, so the caches cannot grow or be swapped between `enqueue`
+    /// and the bookkeeping.
+    fn with_graph_writes(
+        &self,
+        _bindings: &[KvLayerBinding],
+        _slots: &dyn KvSlotMap,
+        _decodes: u64,
+        _enqueue: &mut dyn FnMut(&GraphKvLayers) -> Result<()>,
+    ) -> Result<Vec<KvWriteCompletion>> {
+        Err(Error::InferenceError(format!(
+            "{:?} KV arenas do not take graph writes",
+            self.backend_kind()
+        )))
+    }
     /// Direct paged prefill/extend. Backends may fuse this operation; the
     /// portable default remains page-native by issuing the already-attested
     /// direct decode operation for each causal query position.

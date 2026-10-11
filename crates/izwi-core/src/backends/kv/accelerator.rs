@@ -17,9 +17,10 @@ use super::cuda_tuning::{
 #[cfg(feature = "cuda")]
 use super::KvBackendRuntime;
 use super::{
-    arena_page_bytes, page_transfer, DeviceFence, KvArena, KvArenaConfig, KvArenaGrowthPlan,
-    KvArenaOperationStats, KvAttentionProvider, KvDeviceFence, KvPageCopy, KvSlotMap, KvWriteArgs,
-    KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs, PagedKvPrefillRow,
+    arena_page_bytes, page_transfer, DeviceFence, GraphKvLayers, KvArena, KvArenaConfig,
+    KvArenaGrowthPlan, KvArenaOperationStats, KvAttentionProvider, KvDeviceFence, KvPageCopy,
+    KvSlotMap, KvWriteArgs, KvWriteCompletion, PagedKvDecodeArgs, PagedKvPrefillArgs,
+    PagedKvPrefillRow,
 };
 
 /// Operations Candle 0.11 can execute without moving KV data through host memory.
@@ -2127,6 +2128,72 @@ impl KvArena for CandleAcceleratorKvArena {
         ))
     }
 
+    fn with_graph_writes(
+        &self,
+        bindings: &[KvLayerBinding],
+        slots: &dyn KvSlotMap,
+        decodes: u64,
+        enqueue: &mut dyn FnMut(&GraphKvLayers) -> Result<()>,
+    ) -> Result<Vec<KvWriteCompletion>> {
+        let lowered = self.accelerator_slots(slots)?;
+        if self.storage_dtype != self.config.dtype {
+            return Err(Error::InferenceError(
+                "graph writes need KV stored in the activation dtype".into(),
+            ));
+        }
+        let _guard = self.mutation_lock.lock().map_err(|_| {
+            Error::InferenceError("accelerator KV mutation lock was poisoned".into())
+        })?;
+        let caches = {
+            let layers = self.layers.read().map_err(|_| {
+                Error::InferenceError("accelerator KV layer map was poisoned".into())
+            })?;
+            bindings
+                .iter()
+                .map(|binding| {
+                    let layer = self.layer_from(&layers, *binding)?;
+                    Ok((layer.keys.clone(), layer.values.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        enqueue(&GraphKvLayers {
+            generation: self.backing_generation.load(Ordering::Acquire),
+            layers: caches,
+        })?;
+        {
+            let mut clean = self.clean_pages.lock().map_err(|_| {
+                Error::InferenceError("accelerator KV cleanliness was poisoned".into())
+            })?;
+            for slot in &lowered.flat_slots {
+                clean[*slot / self.config.page_tokens as usize] = AcceleratorPageCleanliness::Dirty;
+            }
+        }
+        self.slot_write_dispatches
+            .fetch_add(bindings.len() as u64, Ordering::Relaxed);
+        if decodes > 0 {
+            self.paged_decode_dispatches
+                .fetch_add(decodes, Ordering::Relaxed);
+            self.cuda_split_decode_dispatches
+                .fetch_add(decodes, Ordering::Relaxed);
+            self.last_attention_provider.store(
+                KvAttentionProvider::CudaSplitDecode.code(),
+                Ordering::Relaxed,
+            );
+        }
+        let fence = self.mutation_fence()?;
+        Ok(bindings
+            .iter()
+            .map(|binding| {
+                KvWriteCompletion::new(
+                    self.config.id,
+                    *binding,
+                    slots.logical_slots(),
+                    fence.clone(),
+                )
+            })
+            .collect())
+    }
+
     fn paged_prefill(
         &self,
         binding: KvLayerBinding,
@@ -3270,6 +3337,92 @@ mod tests {
 
         assert!(arena.zero_pages(&[block])?.is_complete());
         assert_eq!(arena.operation_stats().page_zero_dispatches, 1);
+        Ok(())
+    }
+
+    /// Writes made through `with_graph_writes` count as real writes: the page
+    /// turns dirty (so the next zeroing runs), the dispatch counters move, and
+    /// every binding gets a completion for the exact slots.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn graph_writes_keep_the_write_bookkeeping() -> Result<()> {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return Ok(());
+        };
+        let bindings = [0u32, 1].map(|layer| KvLayerBinding {
+            model_layer: layer * 2 + 1,
+            physical_layer: layer,
+        });
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(92),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let group = KvGroupId::new(0);
+        let arena = CandleAcceleratorKvArena::new_mutation_only(
+            KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 2,
+                capacity_pages: 2,
+                growth: None,
+                dtype: DType::F32,
+                layers: bindings
+                    .iter()
+                    .map(|binding| super::super::KvLayerConfig {
+                        binding: *binding,
+                        num_kv_heads: 1,
+                        key_head_dim: 1,
+                        value_head_dim: 1,
+                    })
+                    .collect(),
+            },
+            device.clone(),
+        )?;
+        let block = CacheBlockRef {
+            arena: arena_id,
+            group,
+            index: 1,
+            slot_generation: 1,
+        };
+        let slot = KvSlotRef { block, offset: 1 };
+        let slots = arena.lower_slots(&[slot])?;
+        let mut generation = None;
+        let completions = arena.with_graph_writes(&bindings, slots.as_ref(), 2, &mut |caches| {
+            generation = Some(caches.generation);
+            assert_eq!(caches.layers.len(), 2);
+            let ones = Tensor::ones((1, 1, 1), DType::F32, &device)?;
+            for (keys, values) in &caches.layers {
+                // Flat slot 3: page 1, offset 1.
+                keys.reshape((4, 1, 1))?.slice_set(&ones, 0, 3)?;
+                values.reshape((4, 1, 1))?.slice_set(&ones, 0, 3)?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(generation, Some(1));
+        assert_eq!(completions.len(), 2);
+        for (completion, binding) in completions.iter().zip(&bindings) {
+            assert_eq!(completion.arena(), arena_id);
+            assert_eq!(completion.layer(), *binding);
+            assert_eq!(completion.slot_refs(), &[slot][..]);
+            completion.wait()?;
+        }
+        let stats = arena.operation_stats();
+        assert_eq!(stats.slot_write_dispatches, 2);
+        assert_eq!(stats.paged_decode_dispatches, 2);
+        assert_eq!(stats.cuda_split_decode_dispatches, 2);
+        let (keys, _) = arena.layer_tensors(bindings[1])?;
+        assert_eq!(
+            keys.flatten_all()?.to_vec1::<f32>()?,
+            vec![0.0, 0.0, 0.0, 1.0]
+        );
+        // Dirty, so zeroing runs and clears the graph's write.
+        arena.zero_pages(&[block])?.wait()?;
+        assert_eq!(arena.operation_stats().page_zero_dispatches, 1);
+        let (keys, values) = arena.layer_tensors(bindings[0])?;
+        assert_eq!(keys.flatten_all()?.to_vec1::<f32>()?, vec![0.0; 4]);
+        assert_eq!(values.flatten_all()?.to_vec1::<f32>()?, vec![0.0; 4]);
         Ok(())
     }
 
