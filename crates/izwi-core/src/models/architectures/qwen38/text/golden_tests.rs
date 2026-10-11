@@ -398,6 +398,115 @@ fn native_trunk_matches_the_hf_reference_logits() {
     );
 }
 
+/// Effective-gain contract for HF `Qwen3_5RMSNorm`, which applies
+/// `x̂ · (1 + w)` in fp32. Whatever the plan materializes (BF16 CUDA, F16
+/// Metal, F32 CPU), every zero-centered norm of the loaded trunk must keep an
+/// F32 gain of exactly `1 + w`, and normalize a half-precision activation in
+/// F32 before casting back. The fixture's gains are random BF16 values: 73% of
+/// their `1 + w` round in BF16 (by up to 0.38%) and 16% in F16.
+#[test]
+fn zero_centered_norm_gains_stay_f32_under_every_plan() {
+    let checkpoint = Qwen38NativeCheckpoint::open_synthetic(&fixture_dir()).unwrap();
+    let device = Device::Cpu;
+    for target in [
+        ProjectionMaterialization::BF16,
+        ProjectionMaterialization::F16,
+        ProjectionMaterialization::F32,
+    ] {
+        let model = load_golden_model(&checkpoint, &device, target);
+        let mut norms = vec![(
+            "model.language_model.norm.weight".to_string(),
+            &model.output_norm,
+        )];
+        for (index, layer) in model.layers.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{index}");
+            norms.push((format!("{prefix}.input_layernorm.weight"), &layer.attn_norm));
+            norms.push((
+                format!("{prefix}.post_attention_layernorm.weight"),
+                &layer.post_attention_norm,
+            ));
+            if let Qwen38Mixer::Full(attention) = &layer.mixer {
+                norms.push((
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    &attention.q_norm,
+                ));
+                norms.push((
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    &attention.k_norm,
+                ));
+            }
+        }
+        assert_eq!(norms.len(), 1 + 2 * 8 + 2 * 2);
+
+        for (name, norm) in norms {
+            let width = checkpoint.tensors.tensor_info(&name).unwrap().shape[0];
+            let stored = checkpoint
+                .tensors
+                .materialize_dense_tensor(&name, &[width], ProjectionMaterialization::F32, &device)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(norm.weight.dtype(), DType::F32, "{target:?} {name}");
+            let gain = norm.weight.to_vec1::<f32>().unwrap();
+            assert_eq!(
+                gain.iter().map(|g| g.to_bits()).collect::<Vec<_>>(),
+                stored
+                    .iter()
+                    .map(|w| (1.0 + w).to_bits())
+                    .collect::<Vec<_>>(),
+                "{target:?} {name}: the gain must be exactly 1 + w in F32"
+            );
+
+            for (activation, tolerance) in [
+                (DType::F32, 1e-5f64),
+                // Output rounding: 2^-11 relative for F16, 2^-8 for BF16.
+                (DType::F16, 2e-3),
+                (DType::BF16, 8e-3),
+            ] {
+                let input = Tensor::from_vec(
+                    (0..2 * width)
+                        .map(|i| ((i * 7 % 11) as f32 - 5.0) / 3.0)
+                        .collect(),
+                    (2, width),
+                    &device,
+                )
+                .unwrap()
+                .to_dtype(activation)
+                .unwrap();
+                let output = norm.forward(&input).unwrap();
+                assert_eq!(output.dtype(), activation, "{name}: activation dtype");
+                // A captured graph region must retain the F32 temporaries.
+                let (_, intermediates) = norm.forward_retaining(&input).unwrap();
+                let expected_intermediates = if activation == DType::F32 { 0 } else { 2 };
+                assert_eq!(intermediates.len(), expected_intermediates, "{name}");
+                assert!(intermediates.iter().all(|t| t.dtype() == DType::F32));
+                let output = output
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                let input = input
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap();
+                for (row, values) in input.iter().zip(&output) {
+                    let mean_square =
+                        row.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / width as f64;
+                    let scale = 1.0 / (mean_square + 1e-6).sqrt();
+                    for ((x, y), g) in row.iter().zip(values).zip(&gain) {
+                        let expected = f64::from(*x) * scale * f64::from(*g);
+                        assert!(
+                            (f64::from(*y) - expected).abs() <= tolerance * expected.abs().max(1.0),
+                            "{activation:?} {name}: {y} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The production Metal plan (F16 materialization, expanded F16 projections,
 /// F16 KV, F32 DeltaNet state) on the GPU. Half precision is the error floor:
 /// HF itself run in F16 deviates from its F32 logits by up to 2.6% relative L2

@@ -374,7 +374,6 @@ impl Qwen38MtpHead {
                 "mtp.pre_fc_norm_embedding.weight",
                 hidden,
                 eps,
-                target,
                 device,
             )?,
             pre_fc_norm_hidden: load_native_zero_centered_norm(
@@ -382,7 +381,6 @@ impl Qwen38MtpHead {
                 "mtp.pre_fc_norm_hidden.weight",
                 hidden,
                 eps,
-                target,
                 device,
             )?,
             fc: load_native_projection(
@@ -399,7 +397,6 @@ impl Qwen38MtpHead {
                 &format!("{prefix}.input_layernorm.weight"),
                 hidden,
                 eps,
-                target,
                 device,
             )?,
             attention: Qwen38FullAttention::load_native(
@@ -416,18 +413,10 @@ impl Qwen38MtpHead {
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 hidden,
                 eps,
-                target,
                 device,
             )?,
             mlp: Qwen38Mlp::load_native(tensors, device, prefix, cfg, block, target, performance)?,
-            norm: load_native_zero_centered_norm(
-                tensors,
-                "mtp.norm.weight",
-                hidden,
-                eps,
-                target,
-                device,
-            )?,
+            norm: load_native_zero_centered_norm(tensors, "mtp.norm.weight", hidden, eps, device)?,
         })
     }
 

@@ -606,14 +606,32 @@ enum Qwen38ProjectionGroup {
     },
 }
 
+/// Zero-centered RMSNorm (HF `Qwen3_5RMSNorm`): the checkpoint stores `w` and
+/// the model applies `x̂ · (1 + w)`. The loader keeps the shifted gain F32
+/// under every plan, so a half-precision activation is normalized in F32 and
+/// cast back, which is HF's `(norm(x.float()) * (1 + w.float())).type_as(x)`.
 pub(super) struct Qwen38RmsNorm {
     weight: Tensor,
     eps: f64,
 }
 
+impl Qwen38RmsNorm {
+    /// Normalize `input`, also returning the F32 temporaries a half-precision
+    /// input needs, which a captured graph region must retain.
+    fn forward_retaining(&self, input: &Tensor) -> candle_core::Result<(Tensor, Vec<Tensor>)> {
+        if input.dtype() == self.weight.dtype() {
+            let output = candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)?;
+            return Ok((output, Vec::new()));
+        }
+        let wide = input.to_dtype(self.weight.dtype())?;
+        let normalized = candle_nn::ops::rms_norm(&wide, &self.weight, self.eps as f32)?;
+        Ok((normalized.to_dtype(input.dtype())?, vec![wide, normalized]))
+    }
+}
+
 impl Module for Qwen38RmsNorm {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
-        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)
+        self.forward_retaining(input).map(|(output, _)| output)
     }
 }
 
@@ -752,7 +770,6 @@ impl Qwen38TextModel {
             "model.language_model.norm.weight",
             cfg.embedding_length,
             cfg.attention_layer_norm_rms_epsilon,
-            target,
             device,
         )?;
         let output = load_native_projection(
@@ -774,7 +791,6 @@ impl Qwen38TextModel {
                 &format!("{prefix}.input_layernorm.weight"),
                 cfg.embedding_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?;
             let post_attention_norm = load_native_zero_centered_norm(
@@ -782,7 +798,6 @@ impl Qwen38TextModel {
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 cfg.embedding_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?;
             let mut mlp =
@@ -1349,11 +1364,15 @@ impl Qwen38Layer {
         {
             // Both outputs escape: the residual is needed after the FFN. The
             // RMS custom op has no growable external workspace; its only
-            // allocations are its output and the explicitly retained sum.
+            // allocations are its output, the explicitly retained sum and,
+            // under a half-precision plan, the F32 input and output of the
+            // F32-gain norm, retained as intermediates.
             let bound = residual
-                .elem_count()
-                .checked_mul(residual.dtype().size_in_bytes())
-                .and_then(|bytes| bytes.checked_mul(2));
+                .dtype()
+                .size_in_bytes()
+                .checked_add(DType::F32.size_in_bytes())
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_mul(residual.elem_count()));
             if let Some(bound) = bound {
                 if let Some(outputs) = self.graphs.run_multi(
                     &[residual, mixed],
@@ -1364,10 +1383,11 @@ impl Qwen38Layer {
                     bound,
                     |inputs| {
                         let sum = (&inputs[0] + &inputs[1])?;
-                        let normalized = self.post_attention_norm.forward(&sum)?;
+                        let (normalized, intermediates) =
+                            self.post_attention_norm.forward_retaining(&sum)?;
                         Ok(IslandOutput {
                             outputs: vec![sum, normalized],
-                            intermediates: vec![],
+                            intermediates,
                         })
                     },
                 )? {
@@ -1665,7 +1685,6 @@ impl Qwen38FullAttention {
                 &format!("{prefix}.self_attn.q_norm.weight"),
                 cfg.attention_key_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?,
             k_norm: load_native_zero_centered_norm(
@@ -1673,7 +1692,6 @@ impl Qwen38FullAttention {
                 &format!("{prefix}.self_attn.k_norm.weight"),
                 cfg.attention_key_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?,
             num_heads: cfg.attention_head_count,
@@ -2855,10 +2873,17 @@ pub(super) fn load_native_zero_centered_norm(
     name: &str,
     length: usize,
     eps: f64,
-    target: ProjectionMaterialization,
     device: &Device,
 ) -> Result<Qwen38RmsNorm> {
-    let weight = tensors.materialize_dense_tensor(name, &[length], target, device)?;
+    // The shifted gain stays F32 whatever the plan's activation dtype: `1 + w`
+    // rounded to BF16 loses up to ~0.4% per channel. `Qwen38RmsNorm` runs the
+    // norm in the gain's dtype, as HF does.
+    let weight = tensors.materialize_dense_tensor(
+        name,
+        &[length],
+        ProjectionMaterialization::F32,
+        device,
+    )?;
     let weight = (weight + 1.0)?;
     Ok(Qwen38RmsNorm { weight, eps })
 }
