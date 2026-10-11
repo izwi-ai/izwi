@@ -28,7 +28,9 @@ use std::sync::Mutex;
 use candle_core::{DType, Device, Tensor};
 use safetensors::Dtype as SafeDType;
 
-use super::fast_path::{compare_values, legacy_requested, summarize, Qwen38FastPath};
+use super::fast_path::{
+    compare_values, legacy_requested, summarize, Qwen38FastPath, FUSED_AB_GEMV_ENV,
+};
 use super::native::{
     resident_tensor_specs, IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType,
     Qwen38NativeConfig,
@@ -209,6 +211,10 @@ pub(crate) struct Qwen38ResidencyPolicy {
     /// CPU: the LM head requantized to Q8_0 with the Q8_0 projections.
     q8_lm_head: bool,
     mtp: bool,
+    /// CUDA: the DeltaNet alpha/beta projection may also keep its weights as
+    /// F32 rows for the router GEMV (`text.rs::resolve_alpha_beta_gemv`), so
+    /// admission charges those rows beside the dense weights.
+    alpha_beta_gemv: bool,
     identity: Option<Identity>,
 }
 
@@ -424,6 +430,11 @@ impl Qwen38ResidencyPolicy {
                 "native block FP8 not selected"
             }),
             mtp: mtp_loaded_for(backend, performance),
+            alpha_beta_gemv: backend == BackendKind::Cuda
+                && cuda.enabled()
+                && cuda.fused_decode.enabled()
+                && matches!(activation, DType::F16 | DType::BF16)
+                && !legacy_requested(FUSED_AB_GEMV_ENV),
             identity: None,
         }
     }
@@ -816,7 +827,15 @@ impl Qwen38ResidencyPolicy {
                 "Unsupported Qwen3.8 dtype {dtype:?} for `{name}`"
             )));
         }
-        form_bytes(form, shape, count)
+        let bytes = form_bytes(form, shape, count)?;
+        if self.alpha_beta_gemv && dtype != SafeDType::F8_E4M3 && is_alpha_beta_projection(name) {
+            // The router GEMV's F32 copy of the rows, beside the dense weights.
+            return count
+                .checked_mul(4)
+                .and_then(|rows| rows.checked_add(bytes))
+                .ok_or_else(overflow);
+        }
+        Ok(bytes)
     }
 }
 
@@ -830,6 +849,14 @@ fn keeps_f32(name: &str) -> bool {
             && [".dt_bias", ".A_log", ".conv1d.weight"]
                 .iter()
                 .any(|suffix| name.ends_with(suffix)))
+}
+
+/// A trunk DeltaNet `in_proj_a`/`in_proj_b` weight: the dense pair the router
+/// GEMV also keeps as F32 rows.
+fn is_alpha_beta_projection(name: &str) -> bool {
+    name.starts_with("model.language_model.layers.")
+        && (name.ends_with(".linear_attn.in_proj_a.weight")
+            || name.ends_with(".linear_attn.in_proj_b.weight"))
 }
 
 fn overflow() -> Error {

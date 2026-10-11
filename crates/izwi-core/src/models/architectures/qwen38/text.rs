@@ -12,7 +12,8 @@ use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
 use super::fast_path::{
     compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath,
-    FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
+    FUSED_AB_GEMV_ENV, FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV,
+    FUSED_QK_ROPE_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
@@ -1005,6 +1006,13 @@ struct Qwen38LinearAttention {
     /// `kernels/cuda/gdn.rs` recurrence. Resolved at load.
     fused_gdn: Option<GdnDecodeSpec>,
     fused_gdn_path: Qwen38FastPath,
+    /// The dense `in_proj_a`/`in_proj_b` weights as F32 rows `[2 * value
+    /// heads, hidden]` (alpha rows, then beta rows) for the router GEMV
+    /// (`moe::router_logits`): one izwi launch per decode token instead of a
+    /// tiny cuBLAS GEMM, which also keeps cuBLAS out of captured decode
+    /// graphs. Resolved at load.
+    alpha_beta_rows: Option<Tensor>,
+    alpha_beta_gemv_path: Qwen38FastPath,
 }
 
 /// One synthetic row of DeltaNet decode projections for the fused self-check.
@@ -1612,7 +1620,8 @@ impl Qwen38TextModel {
         for layer in &mut self.layers {
             match &mut layer.mixer {
                 Qwen38Mixer::Linear(linear) => {
-                    linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu)
+                    linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu);
+                    linear.resolve_alpha_beta_gemv(switches, &self.device, dtype, allow_cpu);
                 }
                 Qwen38Mixer::Full(attention) => {
                     attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu)
@@ -1634,6 +1643,10 @@ impl Qwen38TextModel {
             "rms_norm": summarize([&self.fused_norm_path]),
             "gdn_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
                 Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "gdn_alpha_beta_gemv": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.alpha_beta_gemv_path),
                 Qwen38Mixer::Full(_) => None,
             })),
             "qk_rope": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[0])),
@@ -2996,6 +3009,8 @@ impl Qwen38LinearAttention {
             tiled_recurrence_tile_size_override: qwen38_tiled_recurrence_tile_size_override(),
             fused_gdn: None,
             fused_gdn_path: Qwen38FastPath::default(),
+            alpha_beta_rows: None,
+            alpha_beta_gemv_path: Qwen38FastPath::default(),
         })
     }
 
@@ -3219,7 +3234,9 @@ impl Qwen38LinearAttention {
     }
 
     /// The decode projections in their own dtype: `(mixed_qkv, z, alpha,
-    /// beta)`, the last two pre-activation.
+    /// beta)`, the last two pre-activation. With the alpha/beta GEMV resolved,
+    /// a 16-bit row takes alpha and beta from one router-GEMV launch, rounded
+    /// through the activation dtype as the dense projection's output is.
     fn decode_projections(
         &self,
         hidden_states: &Tensor,
@@ -3227,10 +3244,119 @@ impl Qwen38LinearAttention {
         let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
         let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?;
         let z = required_group_output(&mut qkv_z, "DeltaNet Z")?;
+        if let Some(rows) = self
+            .alpha_beta_rows
+            .as_ref()
+            .filter(|_| matches!(hidden_states.dtype(), DType::F16 | DType::BF16))
+        {
+            let (alpha, beta) = self.alpha_beta_gemv(hidden_states, rows)?;
+            return Ok((mixed_qkv, z, alpha, beta));
+        }
         let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
         let alpha = required_group_output(&mut alpha_beta, "DeltaNet alpha")?;
         let beta = required_group_output(&mut alpha_beta, "DeltaNet beta")?;
         Ok((mixed_qkv, z, alpha, beta))
+    }
+
+    /// `(alpha, beta)` `[batch, rows, value_heads]` in the input's dtype from
+    /// the F32 `rows` through the router GEMV.
+    fn alpha_beta_gemv(&self, hidden_states: &Tensor, rows: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (batch, sequence, hidden) = hidden_states.dims3()?;
+        let heads = self.num_v_heads;
+        let packed = crate::kernels::cuda::moe::router_logits(
+            &hidden_states.reshape((batch * sequence, hidden))?,
+            rows,
+        )?
+        .to_dtype(hidden_states.dtype())?
+        .reshape((batch, sequence, 2 * heads))?;
+        Ok((packed.narrow(2, 0, heads)?, packed.narrow(2, heads, heads)?))
+    }
+
+    /// Resolve the alpha/beta GEMV at load: the dense `in_proj_a`/`in_proj_b`
+    /// weights become F32 rows, kept only when a two-row probe through the
+    /// router GEMV matches the dense projection on this device. The rows cost
+    /// an F32 copy of the two small matrices (about 94 MB over 48 layers of
+    /// the 27B checkpoint). `IZWI_QWEN38_FUSED_AB_GEMV=legacy` keeps the dense
+    /// projection.
+    fn resolve_alpha_beta_gemv(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+        allow_cpu: bool,
+    ) {
+        self.alpha_beta_rows = None;
+        self.alpha_beta_gemv_path = if let Some(path) =
+            decode_gate(FUSED_AB_GEMV_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !matches!(dtype, DType::F16 | DType::BF16) {
+            Qwen38FastPath::legacy("the alpha/beta GEMV needs 16-bit activations")
+        } else if let Some(rows) = self.alpha_beta_dense_rows() {
+            match self.alpha_beta_gemv_self_check(&rows, device, dtype) {
+                Ok(()) => {
+                    self.alpha_beta_rows = Some(rows);
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("alpha/beta GEMV", &error),
+            }
+        } else {
+            Qwen38FastPath::legacy(
+                "the alpha/beta GEMV needs dense in_proj_a/in_proj_b weights and a hidden width divisible by 4",
+            )
+        };
+    }
+
+    /// The dense alpha/beta weights as contiguous F32 rows `[2 * value_heads,
+    /// hidden]`, alpha first, when both projections are dense.
+    fn alpha_beta_dense_rows(&self) -> Option<Tensor> {
+        let dense = |projection: &Qwen38Projection| match projection {
+            Qwen38Projection::Dense(linear) => Some(linear.weight().clone()),
+            _ => None,
+        };
+        let weights = match &self.alpha_beta_proj {
+            Qwen38ProjectionGroup::Packed { projection, .. } => vec![dense(projection)?],
+            Qwen38ProjectionGroup::Separate(parts) => {
+                parts.iter().map(dense).collect::<Option<Vec<_>>>()?
+            }
+        };
+        let rows = Tensor::cat(&weights, 0)
+            .and_then(|rows| rows.to_dtype(DType::F32))
+            .and_then(|rows| rows.contiguous())
+            .ok()?;
+        let (count, hidden) = rows.dims2().ok()?;
+        (count == 2 * self.num_v_heads && hidden > 0 && hidden.is_multiple_of(4)).then_some(rows)
+    }
+
+    /// The router GEMV over `rows` against the dense alpha/beta projection
+    /// for two `dtype` rows on `device`.
+    fn alpha_beta_gemv_self_check(&self, rows: &Tensor, device: &Device, dtype: DType) -> Result<()> {
+        let hidden = rows.dim(1)?;
+        let probe = Tensor::from_vec(
+            self_check_wave(2 * hidden, 13.0, 1.5),
+            (2, 1, hidden),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?;
+        let mut expected = self.alpha_beta_proj.forward(&probe)?.into_iter();
+        let expected_alpha = required_group_output(&mut expected, "DeltaNet alpha")?;
+        let expected_beta = required_group_output(&mut expected, "DeltaNet beta")?;
+        let (alpha, beta) = self.alpha_beta_gemv(&probe, rows)?;
+        compare_values(
+            "DeltaNet alpha GEMV",
+            &host_values(&alpha)?,
+            &host_values(&expected_alpha)?,
+            0.01,
+            0.02,
+        )?;
+        compare_values(
+            "DeltaNet beta GEMV",
+            &host_values(&beta)?,
+            &host_values(&expected_beta)?,
+            0.01,
+            0.02,
+        )
     }
 
     /// Today's single-token decode from one row of projection outputs: F32
@@ -5282,6 +5408,8 @@ mod tests {
             tiled_recurrence_tile_size_override: None,
             fused_gdn: None,
             fused_gdn_path: Default::default(),
+            alpha_beta_rows: None,
+            alpha_beta_gemv_path: Default::default(),
         };
         let input = Tensor::from_vec(
             vec![0.2f32, -0.1, 0.3, 0.4, -0.3, 0.5, 0.1, 0.2],

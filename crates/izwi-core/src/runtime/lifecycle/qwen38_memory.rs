@@ -394,14 +394,43 @@ mod tests {
         ] {
             assert_eq!(bytes(&q8, name, SafeDType::BF16, &[5120]), 20480, "{name}");
         }
+        // CUDA keeps the dense alpha/beta pair and, for the router GEMV, an
+        // F32 copy of its rows; with the fused decode kernels off it keeps
+        // only the dense pair.
+        for name in ["in_proj_a", "in_proj_b"] {
+            assert_eq!(
+                bytes(
+                    &q8,
+                    &format!("model.language_model.layers.0.linear_attn.{name}.weight"),
+                    SafeDType::BF16,
+                    &[48, 5120]
+                ),
+                48 * 5120 * (2 + 4),
+                "{name}"
+            );
+        }
+        let mut fused_off = PerformanceConfig::default();
+        fused_off.cuda.fused_decode = crate::performance::OptimizationMode::Off;
+        let dense_only = Qwen38ResidencyPolicy::resolve_static(BackendKind::Cuda, &fused_off);
         assert_eq!(
             bytes(
-                &q8,
+                &dense_only,
                 "model.language_model.layers.0.linear_attn.in_proj_a.weight",
                 SafeDType::BF16,
                 &[48, 5120]
             ),
             48 * 5120 * 2
+        );
+        // The CPU never resolves the GEMV in production.
+        let cpu = Qwen38ResidencyPolicy::resolve_static(BackendKind::Cpu, &PerformanceConfig::default());
+        assert_eq!(
+            bytes(
+                &cpu,
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                SafeDType::BF16,
+                &[48, 5120]
+            ),
+            48 * 5120 * 4
         );
     }
 

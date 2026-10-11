@@ -3538,9 +3538,14 @@ mod tests {
             assert_eq!(metal.resident_bytes, metal_expanded);
         }
         assert_eq!(metal_expanded, 54_646_738_944);
-        // CUDA's static arm prices Q8_0 (34 bytes per 32 elements).
-        assert_eq!(cuda.resident_bytes, fp8 / 32 * 34 + dense * 2 + f32_bytes);
-        assert_eq!(cuda.resident_bytes, 31_491_231_744);
+        // CUDA's static arm prices Q8_0 (34 bytes per 32 elements), plus the
+        // F32 rows the DeltaNet alpha/beta router GEMV keeps beside the
+        // dense pair.
+        assert_eq!(
+            cuda.resident_bytes,
+            fp8 / 32 * 34 + dense * 2 + f32_bytes + TRUNK_DENSE * 4
+        );
+        assert_eq!(cuda.resident_bytes, 31_585_603_584);
         assert_eq!(
             cuda.load_peak_bytes,
             cuda.resident_bytes + QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES
@@ -3594,9 +3599,14 @@ mod tests {
             qwen38_representation_memory_estimate(BackendKind::Metal, &cuda_off),
             metal
         );
+        // The master switch also turns the alpha/beta GEMV (and its rows) off.
         assert_eq!(
             qwen38_representation_memory_estimate(BackendKind::Cuda, &cuda_off).resident_bytes,
-            cuda.resident_bytes - MTP_FP8 / 32 * 34 - MTP_DENSE * 2 - MTP_F32 * 4
+            cuda.resident_bytes
+                - MTP_FP8 / 32 * 34
+                - MTP_DENSE * 2
+                - MTP_F32 * 4
+                - TRUNK_DENSE * 4
         );
     }
 
@@ -3769,7 +3779,7 @@ mod tests {
             plan.load_authorization.host_bytes,
             ResourceAmount::Known(8_589_934_592)
         );
-        assert_eq!(device_load_peak_bytes, 31_759_667_200);
+        assert_eq!(device_load_peak_bytes, 31_854_039_040);
         assert_eq!(old_expanded_load_peak_bytes, 56_636_597_728);
         assert!(device_load_peak_bytes < REPORTED_L40S_AVAILABLE_BYTES);
         assert!(old_expanded_load_peak_bytes > REPORTED_L40S_AVAILABLE_BYTES);

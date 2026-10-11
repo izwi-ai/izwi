@@ -84,9 +84,15 @@ fn production_resolution_keeps_every_fast_path_legacy_off_cuda() {
 fn fused_fast_paths_track_the_composition_end_to_end() {
     let _guard = counters_lock();
     let (_, legacy) = golden_f16(false);
-    let (_, fused) = golden_f16(true);
+    let (_, mut fused) = golden_f16(true);
     let diagnostics = fused.fast_path_diagnostics();
-    for name in ["rms_norm", "qk_rope", "kv_write", "attn_gate"] {
+    for name in [
+        "rms_norm",
+        "qk_rope",
+        "kv_write",
+        "attn_gate",
+        "gdn_alpha_beta_gemv",
+    ] {
         assert_eq!(
             diagnostics[name]["backend"], "fused",
             "{name}: {diagnostics}"
@@ -94,6 +100,15 @@ fn fused_fast_paths_track_the_composition_end_to_end() {
     }
     // The fixture's 32-wide DeltaNet heads do not fit the 128-wide kernel.
     assert_eq!(diagnostics["gdn_decode"]["backend"], "legacy");
+    // The CPU's dense F16 matmul accumulates in F16, so the router GEMV (F32
+    // accumulation, one rounding) cannot track it to the composition's F16
+    // tolerance over a chaotic decode; its own test checks it against an F32
+    // reference. Compare the other fast paths here.
+    for layer in &mut fused.layers {
+        if let Qwen38Mixer::Linear(linear) = &mut layer.mixer {
+            assert!(linear.alpha_beta_rows.take().is_some());
+        }
+    }
     assert!(fused.output_norm.fused);
     assert!(fused.layers.iter().all(|layer| {
         layer.attn_norm.fused
@@ -227,6 +242,7 @@ const FAST_PATH_SWITCHES: &[&str] = &[
     super::super::fast_path::FUSED_QK_ROPE_ENV,
     super::super::fast_path::FUSED_KV_WRITE_ENV,
     super::super::fast_path::FUSED_ATTN_GATE_ENV,
+    super::super::fast_path::FUSED_AB_GEMV_ENV,
 ];
 
 /// Load with every `IZWI_QWEN38_FUSED_*` switch set to `legacy`: today's
@@ -320,7 +336,13 @@ fn cuda_golden_trunk_with_fast_paths_tracks_the_composition_and_hf() {
     let legacy = load_with_fast_paths_legacy(load);
     let fused = load();
     let diagnostics = fused.fast_path_diagnostics();
-    for name in ["rms_norm", "qk_rope", "kv_write", "attn_gate"] {
+    for name in [
+        "rms_norm",
+        "qk_rope",
+        "kv_write",
+        "attn_gate",
+        "gdn_alpha_beta_gemv",
+    ] {
         assert_eq!(
             diagnostics[name]["backend"], "fused",
             "{name}: {diagnostics}"
@@ -437,6 +459,8 @@ fn gdn_mixer(
         tiled_recurrence_tile_size_override: None,
         fused_gdn: None,
         fused_gdn_path: Qwen38FastPath::default(),
+        alpha_beta_rows: None,
+        alpha_beta_gemv_path: Qwen38FastPath::default(),
     }
 }
 
@@ -591,6 +615,89 @@ fn conv_f16_oracle_matches_f32() {
     assert_eq!(
         host_values(&ring.unwrap().contiguous_history().unwrap()).unwrap(),
         host_values(&next32).unwrap()
+    );
+}
+
+/// The DeltaNet alpha/beta projection through the router GEMV: the F32 rows
+/// pass their probe, decode takes them, and alpha and beta match the dense
+/// pair to 16-bit rounding. Rows in the wrong order fail the probe (RED), and
+/// F32 activations keep the dense projection.
+#[test]
+fn alpha_beta_gemv_tracks_the_dense_projection() {
+    // The CPU has no BF16 matmul for the dense reference; CUDA covers BF16.
+    let dtype = DType::F16;
+    let dense = gdn_mixer(2, 6, 64, &Device::Cpu, dtype);
+    let mut gemv = gdn_mixer(2, 6, 64, &Device::Cpu, dtype);
+    gemv.resolve_alpha_beta_gemv(&Qwen38CudaSwitches::default(), &Device::Cpu, dtype, true);
+    assert!(
+        gemv.alpha_beta_gemv_path.is_fused(),
+        "{dtype:?}: {:?}",
+        gemv.alpha_beta_gemv_path
+    );
+    let rows = gemv.alpha_beta_rows.clone().expect("GEMV rows");
+    assert_eq!(rows.dims(), [12, 64]);
+    assert_eq!(rows.dtype(), DType::F32);
+    for input in gdn_inputs(3, 64, 7.0, &Device::Cpu, dtype) {
+        let (_, _, alpha, beta) = gemv.decode_projections(&input).unwrap();
+        let (_, _, dense_alpha, dense_beta) = dense.decode_projections(&input).unwrap();
+        assert_eq!(alpha.dims(), dense_alpha.dims());
+        assert_eq!((alpha.dtype(), beta.dtype()), (dtype, dtype));
+        let concat = |a: &Tensor, b: &Tensor| {
+            let mut values = host_values(a).unwrap();
+            values.extend(host_values(b).unwrap());
+            values
+        };
+        let (actual, dense) = (concat(&alpha, &beta), concat(&dense_alpha, &dense_beta));
+        assert_close("alpha and beta", &actual, &dense, 0.01, 0.02);
+        // Against the exact F32 product, the GEMV is one rounding of the
+        // activation dtype away (half an ulp), and never further than
+        // the dense projection.
+        let exact = host_values(
+            &input
+                .to_dtype(DType::F32)
+                .unwrap()
+                .reshape((1, 64))
+                .unwrap()
+                .matmul(&rows.t().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        // A non-finite difference saturates instead of reading as zero.
+        let worst = |values: &[f32]| {
+            values
+                .iter()
+                .zip(&exact)
+                .map(|(value, exact)| {
+                    let error = (value - exact).abs() / exact.abs().max(1.0);
+                    if error.is_finite() {
+                        error
+                    } else {
+                        f32::INFINITY
+                    }
+                })
+                .fold(0f32, f32::max)
+        };
+        // Half an F16 ulp, relative.
+        let half_ulp = 2f32.powi(-11);
+        assert!(worst(&actual) <= half_ulp, "{}", worst(&actual));
+        assert!(worst(&actual) <= worst(&dense));
+    }
+    let swapped = Tensor::cat(
+        &[rows.narrow(0, 6, 6).unwrap(), rows.narrow(0, 0, 6).unwrap()],
+        0,
+    )
+    .unwrap();
+    assert!(
+        gemv.alpha_beta_gemv_self_check(&swapped, &Device::Cpu, dtype)
+            .is_err(),
+        "{dtype:?}: alpha and beta rows swapped must fail the probe"
+    );
+    let mut wide = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F32);
+    wide.resolve_alpha_beta_gemv(&Qwen38CudaSwitches::default(), &Device::Cpu, DType::F32, true);
+    assert!(wide.alpha_beta_rows.is_none());
+    assert_eq!(
+        wide.alpha_beta_gemv_path,
+        Qwen38FastPath::legacy("the alpha/beta GEMV needs 16-bit activations")
     );
 }
 
@@ -1367,3 +1474,4 @@ fn cuda_qk_norm_rope_kv_matches_chain_qwen38_geometry() {
         );
     }
 }
+

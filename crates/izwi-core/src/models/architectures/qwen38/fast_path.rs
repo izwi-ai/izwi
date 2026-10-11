@@ -27,6 +27,9 @@ pub(crate) const FUSED_QK_ROPE_ENV: &str = "IZWI_QWEN38_FUSED_QK_ROPE";
 pub(crate) const FUSED_KV_WRITE_ENV: &str = "IZWI_QWEN38_FUSED_KV_WRITE";
 /// Kill switch for the one-launch attention output gate.
 pub(crate) const FUSED_ATTN_GATE_ENV: &str = "IZWI_QWEN38_FUSED_ATTN_GATE";
+/// Kill switch for the DeltaNet alpha/beta projection through the router GEMV
+/// (the dense `in_proj_a`/`in_proj_b` matrices then go through cuBLAS).
+pub(crate) const FUSED_AB_GEMV_ENV: &str = "IZWI_QWEN38_FUSED_AB_GEMV";
 
 /// Execution path a fast path resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]

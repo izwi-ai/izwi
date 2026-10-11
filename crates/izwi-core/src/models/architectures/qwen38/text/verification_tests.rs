@@ -75,6 +75,8 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         tiled_recurrence_tile_size_override: None,
         fused_gdn: None,
         fused_gdn_path: Default::default(),
+        alpha_beta_rows: None,
+        alpha_beta_gemv_path: Default::default(),
     };
     let full = Qwen38FullAttention {
         qkv_proj: Qwen38ProjectionGroup::Separate(vec![
