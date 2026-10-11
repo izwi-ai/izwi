@@ -215,6 +215,26 @@ pub(super) fn resource_plan(
         .load_peak_bytes
         .checked_add(graphs)
         .ok_or_else(overflow)?;
+    if crate::models::architectures::qwen36moe::lm_head::fp8_lm_head_requested(
+        backend,
+        &performance.cuda,
+    ) {
+        // The head quantizes on the host, so the device never holds both
+        // copies: residency and peak both drop by the same bytes.
+        let saving = crate::models::architectures::qwen36moe::lm_head::fp8_lm_head_saving_bytes(
+            pinned_representation_inventory()
+                .trunk_bucket()
+                .lm_head_elements,
+        );
+        estimate.resident_bytes = estimate
+            .resident_bytes
+            .checked_sub(saving)
+            .ok_or_else(overflow)?;
+        estimate.load_peak_bytes = estimate
+            .load_peak_bytes
+            .checked_sub(saving)
+            .ok_or_else(overflow)?;
+    }
     let mut plan = super::model_resource_plan(backend, estimate);
     if backend == BackendKind::Cuda {
         // Host memory only holds the shard/staging window; the raw block-FP8
@@ -428,6 +448,25 @@ mod tests {
             disabled.deferred_resident_authorization.device_bytes,
             ResourceAmount::Known(CUDA_GRAPH_DECODE_BYTES)
         );
+        // The block-FP8 LM head is charged at 1 byte per element plus block
+        // scales; its kill switch restores the BF16 charge.
+        let saving = crate::models::architectures::qwen36moe::lm_head::fp8_lm_head_saving_bytes(
+            pinned_representation_inventory()
+                .trunk_bucket()
+                .lm_head_elements,
+        );
+        assert_eq!(saving, 248_320 * 2_048 - 1_940 * 16 * 4);
+        std::env::set_var(
+            crate::models::architectures::qwen36moe::lm_head::FP8_LM_HEAD_ENV,
+            "0",
+        );
+        let bf16_head = resource_plan(BackendKind::Cuda, &PerformanceConfig::default()).unwrap();
+        std::env::remove_var(crate::models::architectures::qwen36moe::lm_head::FP8_LM_HEAD_ENV);
+        let device = |plan: &ModelResourcePlan| match plan.load_authorization.device_bytes {
+            ResourceAmount::Known(bytes) => bytes,
+            ResourceAmount::Unknown => panic!("unknown device authorization"),
+        };
+        assert_eq!(device(&bf16_head) - device(&disabled), saving);
         let mut no_graphs = PerformanceConfig::default();
         no_graphs.cuda.decode_graphs = crate::performance::OptimizationMode::Off;
         let no_graphs = resource_plan(BackendKind::Cuda, &no_graphs).unwrap();

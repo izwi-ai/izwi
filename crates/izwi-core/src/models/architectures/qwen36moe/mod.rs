@@ -20,6 +20,7 @@ pub mod exec;
 pub(crate) mod fast_path;
 pub(crate) mod fused_moe;
 pub(crate) mod gguf;
+pub mod lm_head;
 pub(crate) mod mtp;
 pub mod native;
 pub(crate) mod native_model;

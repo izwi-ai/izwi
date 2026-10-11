@@ -14,7 +14,7 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::backends::{BackendKind, DeviceProfile};
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen36moe::fast_path::Qwen36CudaSwitches;
+use crate::models::architectures::qwen36moe::fast_path::{Qwen36CudaSwitches, Qwen36FusedPath};
 use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
 use crate::models::architectures::qwen36moe::mtp::Qwen36MtpHead;
 use crate::models::architectures::qwen36moe::text::{
@@ -119,6 +119,10 @@ pub(crate) struct Qwen36MoeNativeSource<'a> {
     expert_residency: Qwen36MoeProjectionResidency,
     dense_target: ProjectionMaterialization,
     cuda_switches: Qwen36CudaSwitches,
+    /// Quantize the BF16 LM head to block FP8 (`lm_head::fp8_lm_head_requested`).
+    fp8_lm_head: bool,
+    /// What the LM head became, once loaded.
+    lm_head_path: std::sync::Mutex<Option<Qwen36FusedPath>>,
 }
 
 impl<'a> Qwen36MoeNativeSource<'a> {
@@ -139,6 +143,8 @@ impl<'a> Qwen36MoeNativeSource<'a> {
             expert_residency: residency,
             dense_target,
             cuda_switches: Qwen36CudaSwitches::default(),
+            fp8_lm_head: false,
+            lm_head_path: std::sync::Mutex::new(None),
         }
     }
 
@@ -182,7 +188,44 @@ impl<'a> Qwen36MoeNativeSource<'a> {
                 BackendKind::from(device_profile.kind),
                 performance,
             ),
+            fp8_lm_head: super::lm_head::fp8_lm_head_requested(
+                BackendKind::from(device_profile.kind),
+                performance,
+            ),
+            lm_head_path: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The block-FP8 LM head, or `Ok(None)` (recorded with its reason) when it
+    /// stays BF16.
+    fn fp8_lm_head(
+        &self,
+        canonical: &str,
+        shape: &[usize],
+        device: &Device,
+    ) -> Result<Option<Qwen36Projection>> {
+        let host = self.checkpoint.materialize_dense(
+            canonical,
+            shape,
+            &Device::Cpu,
+            ProjectionMaterialization::BF16,
+        )?;
+        let (path, projection) = match super::lm_head::quantize_lm_head(&host, device)? {
+            Ok(projection) => (Qwen36FusedPath::Fused, Some(projection)),
+            Err(reason) => {
+                tracing::warn!(%reason, "Qwen3.6 FP8 LM head refused; keeping BF16");
+                (Qwen36FusedPath::legacy(reason), None)
+            }
+        };
+        self.record_lm_head(path);
+        Ok(projection)
+    }
+
+    fn record_lm_head(&self, path: Qwen36FusedPath) {
+        *self
+            .lm_head_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
     }
 
     fn resolve(&self, logical: &str) -> Result<(String, Vec<usize>, ExpectedTensorKind)> {
@@ -281,6 +324,18 @@ impl Qwen36WeightSource for Qwen36MoeNativeSource<'_> {
         // published contract) ride the dense materialization path; only
         // F8_E4M3 storage goes through the block-FP8 decode/requant.
         if kind != ExpectedTensorKind::BlockFp8 {
+            let lm_head =
+                canonical == crate::models::architectures::qwen36moe::native::LM_HEAD_TENSOR;
+            if lm_head && self.fp8_lm_head {
+                if let Some(projection) = self.fp8_lm_head(&canonical, &shape, device)? {
+                    return Ok(projection);
+                }
+            } else if lm_head {
+                self.record_lm_head(Qwen36FusedPath::legacy(format!(
+                    "the FP8 LM head runs on CUDA with block-FP8 residency ({}=0 turns it off)",
+                    super::lm_head::FP8_LM_HEAD_ENV
+                )));
+            }
             let tensor = self.checkpoint.materialize_dense(
                 &canonical,
                 &shape,
@@ -463,6 +518,13 @@ impl Qwen36WeightSource for Qwen36MoeNativeSource<'_> {
 
     fn cuda_switches(&self) -> Qwen36CudaSwitches {
         self.cuda_switches
+    }
+
+    fn lm_head_path(&self) -> Option<Qwen36FusedPath> {
+        self.lm_head_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn token_embeddings(&self, device: &Device) -> Result<Tensor> {

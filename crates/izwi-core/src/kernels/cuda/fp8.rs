@@ -192,6 +192,89 @@ pub(crate) fn decode_e4m3fn(b: u8) -> f32 {
         v
     }
 }
+
+/// Largest finite E4M3FN magnitude.
+pub(crate) const E4M3FN_MAX: f32 = 448.0;
+
+/// The nearest E4M3FN byte to `value`, ties to even, saturating at ±448; NaN
+/// maps to the NaN byte. Inverse of [`decode_e4m3fn`] on every finite byte.
+pub(crate) fn encode_e4m3fn(value: f32) -> u8 {
+    if value.is_nan() {
+        return 0x7f;
+    }
+    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
+    let magnitude = value.abs();
+    if magnitude >= E4M3FN_MAX {
+        return sign | 0x7e;
+    }
+    if magnitude < 2f32.powi(-6) {
+        // Subnormals are multiples of 2^-9; rounding up to 8 of them yields
+        // the smallest normal, 0x08, which is the same bit pattern.
+        return sign | (magnitude * 512.0).round_ties_even() as u8;
+    }
+    // A normal f32 here; scaling by a power of two is exact.
+    let exponent = ((magnitude.to_bits() >> 23) & 0xff) as i32 - 127;
+    let mut steps = (magnitude * 2f32.powi(3 - exponent)).round_ties_even() as u32;
+    let mut biased = exponent + 7;
+    if steps == 16 {
+        steps = 8;
+        biased += 1;
+    }
+    // `magnitude < 448` keeps the result at or below 0x7e.
+    sign | ((biased as u8) << 3) | (steps - 8) as u8
+}
+
+/// Block-FP8 quantization in the checkpoints' own layout: row-major `[n, k]`
+/// E4M3FN bytes and one F32 scale per 128×128 block, `[ceil(n/128),
+/// ceil(k/128)]`, so `value ≈ decode(byte) * scale`. Each scale is
+/// `amax / 448`, mapping the block's largest magnitude to ±448; an all-zero
+/// block gets scale 1. Row blocks quantize in parallel.
+pub(crate) fn quantize_block_fp8<T: Copy + Sync>(
+    values: &[T],
+    n: usize,
+    k: usize,
+    to_f32: impl Fn(T) -> f32 + Sync,
+) -> Result<(Vec<u8>, Vec<f32>)> {
+    use rayon::prelude::*;
+
+    if n == 0 || k == 0 || n.checked_mul(k) != Some(values.len()) {
+        candle_core::bail!(
+            "block-FP8 quantization of {} values as [{n}, {k}]",
+            values.len()
+        )
+    }
+    let column_blocks = k.div_ceil(128);
+    let mut bytes = vec![0u8; n * k];
+    let mut scales = vec![0f32; n.div_ceil(128) * column_blocks];
+    bytes
+        .par_chunks_mut(128 * k)
+        .zip(scales.par_chunks_mut(column_blocks))
+        .enumerate()
+        .for_each(|(row_block, (bytes, scales))| {
+            let rows = bytes.len() / k;
+            let source = &values[row_block * 128 * k..][..rows * k];
+            for (column_block, scale) in scales.iter_mut().enumerate() {
+                let columns = column_block * 128..((column_block + 1) * 128).min(k);
+                let amax = (0..rows)
+                    .flat_map(|row| source[row * k..][columns.clone()].iter())
+                    .map(|&value| to_f32(value).abs())
+                    .fold(0f32, f32::max);
+                *scale = if amax > 0.0 && amax.is_finite() {
+                    amax / E4M3FN_MAX
+                } else {
+                    1.0
+                };
+                for row in 0..rows {
+                    for column in columns.clone() {
+                        bytes[row * k + column] =
+                            encode_e4m3fn(to_f32(source[row * k + column]) / *scale);
+                    }
+                }
+            }
+        });
+    Ok((bytes, scales))
+}
+
 struct Projection {
     n: usize,
     k: usize,
@@ -401,6 +484,113 @@ impl CustomOp3 for Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finite_bytes() -> impl Iterator<Item = u8> {
+        (0u16..256).map(|b| b as u8).filter(|b| b & 127 != 127)
+    }
+
+    #[test]
+    fn encoding_inverts_every_finite_byte() {
+        for byte in finite_bytes() {
+            assert_eq!(encode_e4m3fn(decode_e4m3fn(byte)), byte, "{byte:#04x}");
+        }
+        assert!(decode_e4m3fn(encode_e4m3fn(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn encoding_rounds_to_the_nearest_byte_with_ties_to_even_and_saturates() {
+        let mut probes = vec![
+            0.0,
+            1e-9,
+            2f32.powi(-10),
+            3.0 * 2f32.powi(-10),
+            0.0146,
+            1.0625,
+            1.1875,
+            447.9,
+            448.0,
+            464.0,
+            1e9,
+            f32::INFINITY,
+        ];
+        // Every midpoint between neighbouring codes, and points just around it.
+        let mut grid: Vec<f32> = finite_bytes()
+            .filter(|b| b & 128 == 0)
+            .map(decode_e4m3fn)
+            .collect();
+        grid.sort_by(f32::total_cmp);
+        for pair in grid.windows(2) {
+            let mid = (pair[0] + pair[1]) / 2.0;
+            probes.extend([
+                mid,
+                f32::from_bits(mid.to_bits() - 1),
+                f32::from_bits(mid.to_bits() + 1),
+            ]);
+        }
+        probes.extend((0..4096).map(|i| ((i as f32) * 0.618_034).fract() * 500.0));
+        for value in probes.iter().flat_map(|&v| [v, -v]) {
+            let byte = encode_e4m3fn(value);
+            let decoded = decode_e4m3fn(byte);
+            if value.abs() >= E4M3FN_MAX {
+                assert_eq!(decoded, E4M3FN_MAX.copysign(value), "{value} saturates");
+                continue;
+            }
+            let distance = (decoded - value).abs();
+            let best = finite_bytes()
+                .map(|b| (decode_e4m3fn(b) - value).abs())
+                .fold(f32::INFINITY, f32::min);
+            assert_eq!(distance, best, "{value} encoded to {decoded}");
+            let tied = finite_bytes()
+                .filter(|&b| (decode_e4m3fn(b) - value).abs() == best)
+                .map(decode_e4m3fn)
+                .filter(|v| *v != decoded && !(*v == 0.0 && decoded == 0.0))
+                .count()
+                > 0;
+            if tied {
+                assert_eq!(byte & 1, 0, "{value} tie must round to an even mantissa");
+            }
+        }
+    }
+
+    #[test]
+    fn block_quantization_maps_each_block_maximum_to_448_and_bounds_the_error() {
+        let (n, k) = (130usize, 200usize);
+        let values: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.754_877_7).sin() * (1.0 + (i / k) as f32 * 0.05))
+            .collect();
+        let (bytes, scales) = quantize_block_fp8(&values, n, k, |v| v).unwrap();
+        assert_eq!(bytes.len(), n * k);
+        assert_eq!(scales.len(), 2 * 2);
+        for row_block in 0..2 {
+            for column_block in 0..2 {
+                let scale = scales[row_block * 2 + column_block];
+                let rows = row_block * 128..((row_block + 1) * 128).min(n);
+                let columns = column_block * 128..((column_block + 1) * 128).min(k);
+                let mut amax = 0f32;
+                let mut largest = 0f32;
+                for row in rows.clone() {
+                    for column in columns.clone() {
+                        let value = values[row * k + column];
+                        let restored = decode_e4m3fn(bytes[row * k + column]) * scale;
+                        amax = amax.max(value.abs());
+                        largest = largest.max(decode_e4m3fn(bytes[row * k + column]).abs());
+                        // Three mantissa bits: half a step is at most 1/16 of
+                        // the value, and subnormals are within half of 2^-9 * scale.
+                        assert!(
+                            (restored - value).abs()
+                                <= value.abs() / 16.0 + scale * 2f32.powi(-10) + 1e-7,
+                            "[{row}, {column}]: {value} -> {restored}"
+                        );
+                    }
+                }
+                assert_eq!(scale, amax / E4M3FN_MAX);
+                assert_eq!(largest, E4M3FN_MAX);
+            }
+        }
+        let (_, zero_scales) = quantize_block_fp8(&[0f32; 4 * 4], 4, 4, |v| v).unwrap();
+        assert_eq!(zero_scales, vec![1.0]);
+        assert!(quantize_block_fp8(&values, n, k + 1, |v| v).is_err());
+    }
     #[test]
     fn all_e4m3fn_encodings_preserve_finite_range_subnormals_and_sign() {
         for b in 0u16..256 {

@@ -56,6 +56,8 @@ pub struct Qwen36TextModel {
     /// Piecewise CUDA graph decode for single-row steps, when resolved.
     decode_graphs: Option<decode_graph::Qwen36DecodeGraphs>,
     decode_graphs_path: Qwen36FusedPath,
+    /// Whether the LM head is block FP8 (`lm_head`), and why not.
+    lm_head_path: Qwen36FusedPath,
 }
 
 /// One replay-prefill span's outputs: every row's pre-norm hidden (the MTP
@@ -854,6 +856,12 @@ pub(crate) trait Qwen36WeightSource {
     /// Token embedding matrix `[vocab, hidden]`.
     fn token_embeddings(&self, device: &Device) -> Result<Tensor>;
 
+    /// What the LM head became, when the source decides it (the native
+    /// checkpoint's block-FP8 head on CUDA).
+    fn lm_head_path(&self) -> Option<Qwen36FusedPath> {
+        None
+    }
+
     /// Global CUDA switches that keep fast paths off for this load.
     fn cuda_switches(&self) -> Qwen36CudaSwitches {
         Qwen36CudaSwitches::default()
@@ -970,6 +978,9 @@ impl Qwen36TextModel {
         } else {
             source.projection("token_embd.weight", device)?
         };
+        let lm_head_path = source.lm_head_path().unwrap_or_else(|| {
+            Qwen36FusedPath::legacy("this weight source keeps the LM head as loaded")
+        });
         let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
 
         let mut layers = Vec::with_capacity(cfg.block_count);
@@ -1015,6 +1026,7 @@ impl Qwen36TextModel {
             fp8_gemv_path: Qwen36FusedPath::legacy("unresolved"),
             decode_graphs: None,
             decode_graphs_path: Qwen36FusedPath::legacy("unresolved"),
+            lm_head_path,
         };
         match source.cuda_switches().fused_decode_off {
             Some(reason) => {
@@ -1053,6 +1065,11 @@ impl Qwen36TextModel {
                 }
             }
         };
+    }
+
+    /// Block-FP8 LM head resolution, for the admin diagnostics.
+    pub(crate) fn lm_head_summary(&self) -> serde_json::Value {
+        super::fast_path::summarize([&self.lm_head_path])
     }
 
     /// Vectorized FP8 decode GEMV resolution, for the admin diagnostics.
