@@ -84,6 +84,65 @@ pub fn paged_decode(
     softcap: Option<f32>,
     partitions: usize,
 ) -> Result<Tensor> {
+    paged_decode_with(
+        queries,
+        keys,
+        values,
+        metadata,
+        [batch, query_heads, kv_heads, page_tokens, max_blocks],
+        softmax_scale,
+        softcap,
+        partitions,
+        0,
+    )
+}
+
+/// [`paged_decode`] with one launch geometry for every context length: each
+/// row reads its length from `metadata` on the device and uses one partition
+/// per 128 tokens, up to `max_partitions`. Nothing depends on host-side
+/// lengths, so the launch can be captured in a CUDA graph and replayed as the
+/// context grows. Size `max_partitions` with [`partitions`] at the longest
+/// context the graph serves.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_adaptive(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    page_tokens: usize,
+    max_blocks: usize,
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    max_partitions: usize,
+) -> Result<Tensor> {
+    paged_decode_with(
+        queries,
+        keys,
+        values,
+        metadata,
+        [batch, query_heads, kv_heads, page_tokens, max_blocks],
+        softmax_scale,
+        softcap,
+        max_partitions,
+        MIN_PARTITION_TOKENS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paged_decode_with(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    metadata: &Tensor,
+    [batch, query_heads, kv_heads, page_tokens, max_blocks]: [usize; 5],
+    softmax_scale: f32,
+    softcap: Option<f32>,
+    partitions: usize,
+    min_partition_tokens: usize,
+) -> Result<Tensor> {
     let head_dim = queries.dim(candle_core::D::Minus1)?;
     let dtype = queries.dtype();
     let location = queries.device().location();
@@ -138,11 +197,13 @@ pub fn paged_decode(
                 max_blocks,
                 head_dim,
                 partitions,
+                min_partition_tokens,
             ],
             softmax_scale,
             softcap.unwrap_or(0.0),
         );
     }
+    let _ = min_partition_tokens;
     candle_core::bail!("split decode attention runs on CUDA only")
 }
 
@@ -200,22 +261,46 @@ pub fn self_check(
         )
     }
     let probe = Probe::new(device, dtype, query_heads, kv_heads, head_dim)?;
-    let actual = paged_decode(
-        &probe.queries,
-        &probe.keys,
-        &probe.values,
-        &probe.metadata,
-        Probe::CONTEXTS.len(),
-        query_heads,
-        kv_heads,
-        Probe::PAGE_TOKENS,
-        probe.max_blocks,
-        probe.softmax_scale,
-        None,
-        4,
-    )?;
-    compare(&actual, &probe.reference()?)
+    let reference = probe.reference()?;
+    // Four fixed partitions, then the adaptive geometry with room for eight:
+    // the rows use four and two of them.
+    for (launch, partitions) in [
+        (paged_decode as Launch, 4),
+        (paged_decode_adaptive as Launch, 8),
+    ] {
+        let actual = launch(
+            &probe.queries,
+            &probe.keys,
+            &probe.values,
+            &probe.metadata,
+            Probe::CONTEXTS.len(),
+            query_heads,
+            kv_heads,
+            Probe::PAGE_TOKENS,
+            probe.max_blocks,
+            probe.softmax_scale,
+            None,
+            partitions,
+        )?;
+        compare(&actual, &reference)?;
+    }
+    Ok(())
 }
+
+type Launch = fn(
+    &Tensor,
+    &Tensor,
+    &Tensor,
+    &Tensor,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    f32,
+    Option<f32>,
+    usize,
+) -> Result<Tensor>;
 
 struct Probe {
     queries: Tensor,
@@ -345,11 +430,11 @@ mod cuda_impl {
         keys: &Tensor,
         values: &Tensor,
         metadata: &Tensor,
-        geometry: [usize; 7],
+        geometry: [usize; 8],
         softmax_scale: f32,
         softcap: f32,
     ) -> Result<Tensor> {
-        let [batch, query_heads, kv_heads, page_tokens, max_blocks, head_dim, partitions] =
+        let [batch, query_heads, kv_heads, page_tokens, max_blocks, head_dim, partitions, min_partition_tokens] =
             geometry;
         let device = queries.device().as_cuda_device()?;
         let capacity_pages = keys.dims()[0];
@@ -412,6 +497,7 @@ mod cuda_impl {
                     int(max_blocks)?,
                     int(capacity_pages)?,
                     int(partitions)?,
+                    int(min_partition_tokens)?,
                     softmax_scale,
                     softcap
                 );
@@ -428,12 +514,15 @@ mod cuda_impl {
                 )?;
                 let mut builder = function.builder();
                 builder.arg(&partials);
+                builder.arg(&meta);
                 builder.arg(&out);
                 candle_core::builder_arg!(
                     builder,
-                    int(row_heads)?,
+                    int(batch)?,
+                    int(query_heads)?,
                     int(head_dim)?,
-                    int(partitions)?
+                    int(partitions)?,
+                    int(min_partition_tokens)?
                 );
                 // SAFETY: the partition launch on the same stream initializes
                 // every partial.

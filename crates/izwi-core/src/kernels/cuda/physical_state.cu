@@ -685,10 +685,25 @@ IZWI_DEFINE_PAGED_DECODE_PARTITION_FP8(bf16, __nv_bfloat16)
 // head dimension. Partitions write the [max, sum, unnormalized output]
 // partials of the partitioned kernel; izwi_paged_decode_split_reduce merges
 // them. Token ranges derive from the device context length, so the host only
-// chooses the partition count.
+// chooses the partition count. With a positive min_partition_tokens each row
+// also caps its partition count from its own context length, so one launch
+// geometry (and one captured graph) serves every length.
 #define IZWI_SPLIT_DECODE_WARPS 4
 #define IZWI_SPLIT_DECODE_MAX_GROUP 8
 #define IZWI_SPLIT_DECODE_MAX_PARTITIONS 1024
+
+// Partitions a row uses: all of them, or one per min_partition_tokens context
+// tokens (at least one) when that is positive.
+__device__ __forceinline__ int izwi_split_decode_partitions(
+    unsigned int context_len, int num_partitions, int min_partition_tokens) {
+  if (min_partition_tokens <= 0) {
+    return num_partitions;
+  }
+  const unsigned int wanted =
+      (context_len + static_cast<unsigned int>(min_partition_tokens) - 1) /
+      static_cast<unsigned int>(min_partition_tokens);
+  return max(1, static_cast<int>(min(wanted, static_cast<unsigned int>(num_partitions))));
+}
 
 // Loads N contiguous elements as floats. The host requires base pointers
 // aligned to 16 bytes, and callers index in multiples of N.
@@ -731,6 +746,7 @@ __device__ void izwi_paged_decode_gqa_partition(
     int max_blocks,
     int capacity_pages,
     int num_partitions,
+    int min_partition_tokens,
     float softmax_scale,
     float softcap) {
   constexpr int MAX_GROUP = IZWI_SPLIT_DECODE_MAX_GROUP;
@@ -758,6 +774,13 @@ __device__ void izwi_paged_decode_gqa_partition(
   const unsigned int first_page_offset = metadata[batch + row];
   const unsigned int* block_table = metadata + batch * 2 + row * max_blocks;
   const unsigned long long partial_stride = HEAD_DIM + 2;
+  // Partitions past the row's own count stay idle; the reduction never reads
+  // their partials. The exit is uniform across the block.
+  const int partitions = izwi_split_decode_partitions(
+      context_len, num_partitions, min_partition_tokens);
+  if (partition >= partitions) {
+    return;
+  }
 
   // Every condition is uniform across the block. An invalid row writes empty
   // partials, which the reduction turns into a zero output.
@@ -775,8 +798,7 @@ __device__ void izwi_paged_decode_gqa_partition(
   unsigned int token_start = 0;
   unsigned int token_end = 0;
   if (valid) {
-    const unsigned int span =
-        (context_len + num_partitions - 1) / num_partitions;
+    const unsigned int span = (context_len + partitions - 1) / partitions;
     token_start = min(context_len, partition * span);
     token_end = min(context_len, token_start + span);
   }
@@ -981,20 +1003,28 @@ __device__ void izwi_paged_decode_gqa_partition(
 
 // Merges split-decode partials: one block per (row, query head). Unlike the
 // serial partition reduction above, the partition weights are computed in one
-// parallel pass, so each output dimension is an independent weighted sum.
+// parallel pass, so each output dimension is an independent weighted sum. It
+// reads the partitions the row used (izwi_split_decode_partitions), laid out
+// num_partitions apart.
 template <typename T>
 __device__ void izwi_paged_decode_split_reduce(
     const float* __restrict__ partials,
+    const unsigned int* __restrict__ metadata,
     T* __restrict__ output,
-    int row_heads,
+    int batch,
+    int query_heads,
     int value_dim,
-    int num_partitions) {
+    int num_partitions,
+    int min_partition_tokens) {
   __shared__ float weights[IZWI_SPLIT_DECODE_MAX_PARTITIONS];
   __shared__ float scratch[32];
   const int row_head = blockIdx.x;
-  if (row_head >= row_heads || num_partitions > IZWI_SPLIT_DECODE_MAX_PARTITIONS) {
+  if (query_heads <= 0 || row_head >= batch * query_heads ||
+      num_partitions > IZWI_SPLIT_DECODE_MAX_PARTITIONS) {
     return;
   }
+  const int used = izwi_split_decode_partitions(
+      metadata[row_head / query_heads], num_partitions, min_partition_tokens);
   const unsigned long long stride = static_cast<unsigned long long>(value_dim) + 2;
   const float* row = partials + static_cast<unsigned long long>(row_head) * num_partitions * stride;
   const int lane = threadIdx.x & 31;
@@ -1002,7 +1032,7 @@ __device__ void izwi_paged_decode_split_reduce(
   const int warps = (blockDim.x + 31) >> 5;
 
   float local_max = -INFINITY;
-  for (int p = threadIdx.x; p < num_partitions; p += blockDim.x) {
+  for (int p = threadIdx.x; p < used; p += blockDim.x) {
     if (row[p * stride + 1] > 0.0f) {
       local_max = fmaxf(local_max, row[p * stride]);
     }
@@ -1022,7 +1052,7 @@ __device__ void izwi_paged_decode_split_reduce(
   __syncthreads();
 
   float local_sum = 0.0f;
-  for (int p = threadIdx.x; p < num_partitions; p += blockDim.x) {
+  for (int p = threadIdx.x; p < used; p += blockDim.x) {
     const float sum = row[p * stride + 1];
     const float weight = sum > 0.0f ? expf(row[p * stride] - global_max) : 0.0f;
     weights[p] = weight;
@@ -1043,7 +1073,7 @@ __device__ void izwi_paged_decode_split_reduce(
 
   for (int d = threadIdx.x; d < value_dim; d += blockDim.x) {
     float value = 0.0f;
-    for (int p = 0; p < num_partitions; ++p) {
+    for (int p = 0; p < used; ++p) {
       value += weights[p] * row[p * stride + 2 + d];
     }
     output[static_cast<unsigned long long>(row_head) * value_dim + d] =
@@ -1057,12 +1087,12 @@ __device__ void izwi_paged_decode_split_reduce(
           const TYPE* queries, const TYPE* keys, const TYPE* values,           \
           const unsigned int* metadata, float* partials, int batch,            \
           int query_heads, int kv_heads, int page_tokens, int max_blocks,      \
-          int capacity_pages, int num_partitions, float softmax_scale,         \
-          float softcap) {                                                     \
+          int capacity_pages, int num_partitions, int min_partition_tokens,    \
+          float softmax_scale, float softcap) {                                \
     izwi_paged_decode_gqa_partition<TYPE, DIM>(                                \
         queries, keys, values, metadata, partials, batch, query_heads,         \
         kv_heads, page_tokens, max_blocks, capacity_pages, num_partitions,     \
-        softmax_scale, softcap);                                               \
+        min_partition_tokens, softmax_scale, softcap);                         \
   }
 
 IZWI_DEFINE_PAGED_DECODE_SPLIT(f16, __half, 128)
@@ -1072,10 +1102,12 @@ IZWI_DEFINE_PAGED_DECODE_SPLIT(bf16, __nv_bfloat16, 256)
 
 #define IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(SUFFIX, TYPE)                    \
   extern "C" __global__ void physical_paged_decode_split_reduce_##SUFFIX(     \
-      const float* partials, TYPE* output, int row_heads, int value_dim,       \
-      int num_partitions) {                                                    \
-    izwi_paged_decode_split_reduce<TYPE>(partials, output, row_heads,          \
-                                         value_dim, num_partitions);           \
+      const float* partials, const unsigned int* metadata, TYPE* output,       \
+      int batch, int query_heads, int value_dim, int num_partitions,           \
+      int min_partition_tokens) {                                              \
+    izwi_paged_decode_split_reduce<TYPE>(partials, metadata, output, batch,    \
+                                         query_heads, value_dim,               \
+                                         num_partitions, min_partition_tokens);\
   }
 
 IZWI_DEFINE_PAGED_DECODE_SPLIT_REDUCE(f16, __half)
