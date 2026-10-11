@@ -1,11 +1,11 @@
-//! Qwen3.5-MoE chat model loader and text generation.
+//! Qwen3.6-MoE chat model loader and text generation.
 //!
 //! The wrapper is deliberately thin: it owns family-specific loading (the
 //! native block-FP8 bundle, or the synthetic GGUF fixture for CI) and
 //! text-only prompt preparation, while prompt rendering, the hybrid decode
-//! state machinery, and sampling come from the shared
-//! [`Qwen35ChatExec`](crate::models::architectures::qwen35::chat::Qwen35ChatExec)
-//! core the dense `Qwen35ChatModel` drives.
+//! state machinery, and sampling come from this family's
+//! [`Qwen36ChatExec`](crate::models::architectures::qwen36moe::exec::Qwen36ChatExec)
+//! core.
 
 use std::path::Path;
 
@@ -16,11 +16,11 @@ use crate::error::{Error, Result};
 use crate::kv::v2::InferenceStateContract;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen35::chat::{
-    ChatDecodeState, ChatDecodeStep, Qwen35ChatExec, Qwen35PreparedPrompt, Qwen35TextConfig,
-    Qwen35Tokenizer,
+use crate::models::architectures::qwen36moe::exec::{
+    ChatDecodeState, ChatDecodeStep, Qwen36ChatExec, Qwen36PreparedPrompt, Qwen36TextConfig,
+    Qwen36Tokenizer,
 };
-use crate::models::architectures::qwen35::text::{GgufSource, Qwen35TextModel};
+use crate::models::architectures::qwen36moe::text::{GgufSource, Qwen36TextModel};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
@@ -113,7 +113,7 @@ pub struct Qwen36MoeChatModel {
     device_kind: BackendKind,
     kv_storage_provider: Qwen36MoeKvStorageProvider,
     performance: crate::performance::CudaPerformanceConfig,
-    exec: Qwen35ChatExec,
+    exec: Qwen36ChatExec,
 }
 
 impl InferenceStateContractProvider for Qwen36MoeChatModel {
@@ -123,6 +123,22 @@ impl InferenceStateContractProvider for Qwen36MoeChatModel {
             self.managed_composite_cache_contract(dtype, default_kv_page_size())?,
         ))
     }
+}
+
+/// Decode tokens per engine step for a stream decoding alone on graph
+/// decode (`IZWI_QWEN36_DECODE_QUANTUM`, 1-64; 1 is one token per step).
+pub const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN36_DECODE_QUANTUM";
+const DEFAULT_DECODE_QUANTUM: usize = 8;
+
+fn decode_quantum_tokens() -> usize {
+    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+}
+
+fn decode_quantum_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| (1..=64).contains(tokens))
+        .unwrap_or(DEFAULT_DECODE_QUANTUM)
 }
 
 impl Qwen36MoeChatModel {
@@ -144,7 +160,7 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: DeviceProfile,
         performance: &crate::performance::PerformanceConfig,
-        _prefix_reuse: bool,
+        prefix_reuse: bool,
     ) -> Result<Self> {
         performance.validate()?;
         if variant != ModelVariant::Qwen36Moe35BA3BFp8 {
@@ -178,7 +194,7 @@ impl Qwen36MoeChatModel {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         tracing::info!(mtp_enabled, "Qwen3.6-MoE MTP policy");
         let fixture_path = model_dir.join(QWEN36_MOE_FIXTURE_GGUF_FILENAME);
-        let exec = if fixture_path.exists() {
+        let mut exec = if fixture_path.exists() {
             Self::load_fixture_gguf(
                 model_dir,
                 &fixture_path,
@@ -196,6 +212,31 @@ impl Qwen36MoeChatModel {
                 kv_storage_provider,
             )?
         };
+        // Phase 5a: the registry resolved cross-request prefix reuse for this
+        // family and backend; the contract shares only when no MTP head loaded.
+        exec.prefix_caching = prefix_reuse;
+        tracing::info!(
+            prefix_reuse,
+            shares_prefixes = prefix_reuse && exec.mtp_head.is_none(),
+            "Qwen3.6-MoE prefix reuse"
+        );
+        let moe = exec.text_model.moe_backend_summary();
+        let gdn_decode = exec.text_model.gdn_decode_summary();
+        let rms_norm = exec.text_model.rms_norm_summary();
+        let qk_rope = exec.text_model.qk_rope_summary();
+        let attn_gate = exec.text_model.attn_gate_summary();
+        let fp8_gemv = exec.text_model.fp8_gemv_summary();
+        let cuda_graphs = exec.text_model.cuda_graphs_summary();
+        tracing::info!(
+            %moe,
+            %gdn_decode,
+            %rms_norm,
+            %qk_rope,
+            %attn_gate,
+            %fp8_gemv,
+            %cuda_graphs,
+            "Qwen3.6-MoE fused kernel paths"
+        );
         Ok(Self {
             device_kind,
             kv_storage_provider,
@@ -210,17 +251,17 @@ impl Qwen36MoeChatModel {
         variant: ModelVariant,
         device: &DeviceProfile,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let loader =
             GgufLoader::from_path_with_backend(fixture_path, BackendKind::from(device.kind))?;
         let text_config = parse_fixture_gguf_config(&loader)?;
-        let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &loader)?;
-        let text_model = Qwen35TextModel::load_with_source(
+        let tokenizer = Qwen36Tokenizer::load(model_dir, variant, &loader)?;
+        let text_model = Qwen36TextModel::load_with_source(
             &GgufSource::new(&loader),
             &text_config,
             &device.device,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -230,6 +271,7 @@ impl Qwen36MoeChatModel {
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_adaptive: false,
             kv_storage_dtype: kv_storage_provider.dtype(),
+            prefix_caching: false,
         })
     }
 
@@ -240,14 +282,14 @@ impl Qwen36MoeChatModel {
         performance: &crate::performance::CudaPerformanceConfig,
         mtp_policy: Qwen36MoeMtpLoadPolicy,
         kv_storage_provider: Qwen36MoeKvStorageProvider,
-    ) -> Result<Qwen35ChatExec> {
+    ) -> Result<Qwen36ChatExec> {
         let mtp_enabled = mtp_policy == Qwen36MoeMtpLoadPolicy::Enabled;
         let checkpoint = Qwen36MoeNativeCheckpoint::open_with_policies(
             model_dir,
             super::native::Qwen36MoeGeometryPolicy::from_env(),
             mtp_policy,
         )?;
-        let tokenizer = Qwen35Tokenizer::load_hf(model_dir, variant)?;
+        let tokenizer = Qwen36Tokenizer::load_hf(model_dir, variant)?;
         let (text_config, text_model, mtp_head) = load_text_model_native(
             &checkpoint,
             device,
@@ -255,7 +297,7 @@ impl Qwen36MoeChatModel {
             performance,
             mtp_enabled,
         )?;
-        Ok(Qwen35ChatExec {
+        Ok(Qwen36ChatExec {
             variant,
             tokenizer,
             text_config,
@@ -265,6 +307,7 @@ impl Qwen36MoeChatModel {
             mtp_envelope_rounds: std::sync::atomic::AtomicU64::new(0),
             mtp_adaptive: performance.enabled() && performance.mtp_adaptive,
             kv_storage_dtype: kv_storage_provider.dtype(),
+            prefix_caching: false,
         })
     }
 
@@ -272,7 +315,7 @@ impl Qwen36MoeChatModel {
         self.exec.variant()
     }
 
-    pub fn text_config(&self) -> &Qwen35TextConfig {
+    pub fn text_config(&self) -> &Qwen36TextConfig {
         self.exec.text_config()
     }
 
@@ -315,7 +358,7 @@ impl Qwen36MoeChatModel {
         &self,
         messages: &[ChatMessage],
         config: &ChatGenerationConfig,
-    ) -> Result<Qwen35PreparedPrompt> {
+    ) -> Result<Qwen36PreparedPrompt> {
         if !config.request.media_inputs.is_empty() {
             return Err(Error::InvalidInput(
                 "Qwen3.5/3.6-MoE serving is text-only and does not accept media inputs".to_string(),
@@ -352,7 +395,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
         self.start_decode_state_physical_with_mtp(messages, max_new_tokens, config, prepared, cache, None)
@@ -363,7 +406,7 @@ impl Qwen36MoeChatModel {
         messages: &[ChatMessage],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
-        prepared: Option<&Qwen35PreparedPrompt>,
+        prepared: Option<&Qwen36PreparedPrompt>,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
@@ -389,7 +432,7 @@ impl Qwen36MoeChatModel {
 
     pub(crate) fn begin_resumable_prefill_state_physical(
         &self,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
@@ -403,7 +446,7 @@ impl Qwen36MoeChatModel {
     pub(crate) fn continue_resumable_prefill_physical(
         &self,
         state: &mut ChatDecodeState,
-        prepared: &Qwen35PreparedPrompt,
+        prepared: &Qwen36PreparedPrompt,
         span_start: usize,
         span_end: usize,
     ) -> Result<bool> {
@@ -417,13 +460,34 @@ impl Qwen36MoeChatModel {
 
     /// Tokens per decode quantum the scheduler should grant: one more than
     /// the configured MTP draft depth when the draft head is loaded, so a
-    /// speculative round fits the grant; scalar (1) without MTP.
+    /// speculative round fits the grant. Without MTP, graph decode takes
+    /// [`decode_quantum_tokens`] per engine step, so the step's scheduling,
+    /// admission, commit and streaming are paid once per quantum instead of
+    /// once per token (the scheduler only grants it to a stream decoding
+    /// alone); other devices stay scalar (1).
     pub fn preferred_decode_tokens(&self) -> usize {
-        self.exec
-            .mtp_head
-            .as_ref()
-            .map(|head| head.draft_depth() + 1)
-            .unwrap_or(1)
+        match &self.exec.mtp_head {
+            Some(head) => head.draft_depth() + 1,
+            None if self.exec.text_model.graph_decode() => decode_quantum_tokens(),
+            None => 1,
+        }
+    }
+
+    /// Prefill span for an isolated request: wide when the CUDA prefill
+    /// kernels that amortize over the span are active, else the engine's
+    /// threshold (0).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        self.exec.text_model.preferred_prefill_tokens()
+    }
+
+    /// Whether the graph-decode quantum outlives the request's soft
+    /// scheduling SLA. An interactive or streaming request passes that SLA
+    /// (0.65-0.75 s at normal priority) early in almost every stream, after
+    /// which the scheduler would grant one token per step for the rest of
+    /// it. The quantum still yields to waiting or co-batched work and to hard
+    /// deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.exec.mtp_head.is_none() && self.preferred_decode_tokens() > 1
     }
 
     /// Serving diagnostics for the admin model API: KV storage, performance
@@ -440,6 +504,16 @@ impl Qwen36MoeChatModel {
                 "projection_backend": format!("{:?}", self.performance.projection_backend),
                 "mtp_enabled": self.performance.mtp.enabled(),
             },
+            "moe": self.exec.text_model.moe_backend_summary(),
+            "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "gdn_prefill": self.exec.text_model.gdn_prefill_summary(),
+            "moe_prefill": self.exec.text_model.moe_prefill_summary(),
+            "rms_norm": self.exec.text_model.rms_norm_summary(),
+            "qk_rope": self.exec.text_model.qk_rope_summary(),
+            "attn_gate": self.exec.text_model.attn_gate_summary(),
+            "fp8_gemv": self.exec.text_model.fp8_gemv_summary(),
+            "lm_head": self.exec.text_model.lm_head_summary(),
+            "cuda_graphs": self.exec.text_model.cuda_graphs_summary(),
             "mtp": {
                 "head_loaded": self.exec.mtp_head.is_some(),
                 "draft_depth": self.exec.mtp_head.as_ref().map(|head| head.draft_depth()),
@@ -521,7 +595,7 @@ impl Qwen36MoeChatModel {
     /// spans before decode resumes.
     pub(crate) fn begin_replay_state_physical(
         &self,
-        saved: &crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint,
+        saved: &crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint,
         cache: PhysicalPagedKvCache,
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<ChatDecodeState> {
@@ -847,20 +921,409 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Phase 5a: a session attaching a published prefix (shared pages below
+    /// the fork cursor plus the publisher's forked DeltaNet snapshot) must
+    /// generate exactly what a fresh run of the same prompt generates, and
+    /// decoding must never mutate the published snapshot. The attach uses the
+    /// manager's real primitives (see qwen38's attach tests).
+    #[test]
+    fn attached_prefill_matches_the_fresh_run_and_keeps_the_snapshot_intact() {
+        assert_attach_matches_fresh(DeviceProfile::cpu(), 8, true);
+    }
+
+    /// The same attach on Metal, through the accelerator KV arena and device
+    /// state tensors. Device matmuls may round differently for the attached
+    /// run's shorter prefill, so state is compared within tolerance; the
+    /// tokens must still match.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_attached_prefill_matches_the_fresh_run() {
+        if crate::backends::metal_device_if_available(0).is_none() {
+            eprintln!("metal device unavailable; attach leg not run");
+            return;
+        }
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Metal,
+        )
+        .expect("metal profile");
+        assert_attach_matches_fresh(profile, 8, false);
+    }
+
+    /// The CUDA lane's prefix-reuse evidence: production BF16 KV in 16-token
+    /// pages (the smallest the CUDA paged kernels take).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_attached_prefill_matches_the_fresh_run() {
+        if crate::kernels::cuda::cuda_test_device().is_none() {
+            return;
+        }
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Cuda,
+        )
+        .expect("cuda profile");
+        assert_attach_matches_fresh(profile, 16, false);
+    }
+
+    /// Prefills the fixture prompt fresh, and again attached at a page-aligned
+    /// fork of a published prefix, on `device` with `page`-token KV pages.
+    /// The attached session must start from the published snapshot bit for
+    /// bit on every device. `exact` also demands a bit-identical final state
+    /// (the CPU lane); on devices, matmuls over the attached run's shorter
+    /// prefill may round differently, so the final state only has to land
+    /// within a gross-error bound and decode the same tokens.
+    fn assert_attach_matches_fresh(device: DeviceProfile, page: usize, exact: bool) {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::{CpuKvArena, KvArena};
+        use crate::backends::state::{
+            negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
+            StateBackendPlanRequest, StateComponentValue, TensorStateArena, TensorStateCapacity,
+        };
+        use crate::models::architectures::qwen36moe::cache::{
+            CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
+        };
+
+        // Another test sets the prefill chunk size; hold it fixed so both
+        // prefills chunk alike.
+        let _env = crate::env_test_lock().lock().expect("env lock");
+        let backend = BackendKind::from(device.kind);
+        let (mut model, dir) =
+            load_fixture_on(&format!("prefix-attach-{backend:?}"), device.clone());
+        model.exec.prefix_caching = true;
+        let exec = &model.exec;
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            seed: 7,
+            ..Default::default()
+        };
+        let prepared = exec
+            .prepare_text_prompt(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: "a shared conversation history, then a new question".into(),
+                }],
+                &config,
+            )
+            .unwrap();
+        let total = prepared.prompt_ids().len();
+        let fork = (total / 2) - (total / 2) % page;
+        assert!(
+            fork >= page && fork < total,
+            "prompt {total} tokens, fork {fork}"
+        );
+
+        // One paged arena with addressable blocks: the publisher's pages below
+        // the fork are shared; every session keeps private pages above it.
+        let kv_heads = model.text_config().attention_head_count_kv as u32;
+        let head_dim = model.text_config().attention_key_length as u32;
+        let device_ordinal = arena_device_ordinal(&device);
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(5151),
+            backend,
+            device_ordinal,
+            generation: 1,
+        };
+        let group = KvGroupId::new(1);
+        let bindings = [(1u32, 0u32), (3, 1)].map(|(model_layer, physical_layer)| KvLayerBinding {
+            model_layer,
+            physical_layer,
+        });
+        let arena_config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: page as u32,
+            capacity_pages: 64,
+            growth: None,
+            dtype: exec.kv_storage_dtype,
+            layers: bindings
+                .iter()
+                .map(|binding| KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: kv_heads,
+                    key_head_dim: head_dim,
+                    value_head_dim: head_dim,
+                })
+                .collect(),
+        };
+        let arena: Arc<dyn KvArena> = if backend == BackendKind::Cpu {
+            Arc::new(CpuKvArena::new(arena_config).unwrap())
+        } else {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            {
+                Arc::new(
+                    CandleAcceleratorKvArena::new_mutation_only(
+                        arena_config,
+                        device.device.clone(),
+                    )
+                    .unwrap(),
+                )
+            }
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            panic!("accelerator KV arenas require the cuda or metal feature")
+        };
+        let view = |blocks: std::ops::Range<u32>, context_len: usize| {
+            PhysicalPagedKvCache::new(
+                arena.clone(),
+                bindings.to_vec(),
+                blocks
+                    .map(|index| CacheBlockRef {
+                        arena: id,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    })
+                    .collect(),
+                context_len,
+            )
+            .unwrap()
+        };
+        let pages = |tokens: usize| tokens.div_ceil(page) as u32 + 2;
+
+        let contract = exec
+            .managed_composite_cache_contract(exec.kv_storage_dtype, page)
+            .unwrap();
+        let plan = negotiate_state_plan(
+            &contract,
+            &StateBackendPlanRequest {
+                backend,
+                device_ordinal,
+                page_tokens_hint: None,
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let capacity = TensorStateCapacity::for_plan(&plan, 8, 8).unwrap();
+        let tensors =
+            TensorStateArena::new(Arc::new(plan), capacity, device.device.clone()).unwrap();
+
+        let decode = |state: &mut ChatDecodeState| {
+            let mut text = String::new();
+            for _ in 0..8 {
+                let step = exec.decode_quantum(state, 1).unwrap();
+                text.push_str(&step.delta);
+                if step.finished {
+                    break;
+                }
+            }
+            text
+        };
+
+        // Publisher: prefill [0, fork) and commit the hybrid state there.
+        let mut publisher = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(0..pages(total), 0),
+                None,
+            )
+            .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut publisher, &prepared, 0, fork)
+            .unwrap());
+        assert_eq!(publisher.physical_context_len(), fork);
+        let published_state = publisher.linear_state_values();
+        let published = PhysicalStateSequenceId::new(1).unwrap();
+        tensors.register(published).unwrap();
+        let transaction = PhysicalStateTransactionId::new(1).unwrap();
+        tensors.begin(transaction, published).unwrap();
+        publisher
+            .stage_tensor_state(&tensors, transaction.get())
+            .unwrap();
+        tensors.commit(transaction, fork as u64).unwrap();
+        let snapshot_values = |sequence| {
+            [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN]
+                .iter()
+                .flat_map(|domain| {
+                    tensors
+                        .read(sequence, *domain)
+                        .unwrap()
+                        .unwrap()
+                        .components
+                        .iter()
+                        .flat_map(|component| {
+                            component
+                                .tensor
+                                .as_ref()
+                                .unwrap()
+                                .to_dtype(DType::F32)
+                                .unwrap()
+                                .flatten_all()
+                                .unwrap()
+                                .to_vec1::<f32>()
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let snapshot_before = snapshot_values(published);
+
+        // Fresh reference over private pages. It prefills across the same
+        // span boundary as the publisher and the attached session, so every
+        // forward has the same shape on both sides: CPU matmuls may round a
+        // row differently with the row count (x86 does, aarch64 happens not
+        // to), which would turn the exact check into a check of the BLAS.
+        let fresh_base = pages(total);
+        let mut reference = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(fresh_base..fresh_base + pages(total), 0),
+                None,
+            )
+            .unwrap();
+        assert!(!exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, 0, fork)
+            .unwrap());
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut reference, &prepared, fork, total)
+            .unwrap());
+        let reference_state = reference.linear_state_values();
+        assert!(!reference_state.is_empty());
+        let expected = decode(&mut reference);
+        assert!(!expected.is_empty());
+
+        // Attached session: the publisher's pages below the fork, private pages
+        // above, and the forked snapshot. Only [fork, total) is prefilled.
+        let fork_pages = (fork / page) as u32;
+        let private_base = 2 * fresh_base;
+        let blocks = (0..fork_pages).chain(private_base..private_base + pages(total));
+        let mut attached = exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                PhysicalPagedKvCache::new(
+                    arena.clone(),
+                    bindings.to_vec(),
+                    blocks
+                        .map(|index| CacheBlockRef {
+                            arena: id,
+                            group,
+                            index,
+                            slot_generation: 1,
+                        })
+                        .collect(),
+                    fork,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let forked = PhysicalStateSequenceId::new(2).unwrap();
+        tensors.register(forked).unwrap();
+        let fork_transaction = PhysicalStateTransactionId::new(2).unwrap();
+        tensors.begin(fork_transaction, forked).unwrap();
+        for domain in [RECURRENT_STATE_DOMAIN, CONVOLUTION_STATE_DOMAIN] {
+            let snapshot = tensors.read(published, domain).unwrap().unwrap();
+            let components = snapshot
+                .components
+                .iter()
+                .map(|component| StateComponentValue {
+                    component: component.component,
+                    tensor: component.tensor.clone(),
+                })
+                .collect();
+            tensors
+                .stage_replace(fork_transaction, domain, 0, fork as u64, components)
+                .unwrap();
+        }
+        tensors.commit(fork_transaction, fork as u64).unwrap();
+        attached.bind_tensor_sequence(forked.get()).unwrap();
+        attached.restore_tensor_state(&tensors).unwrap();
+        assert_eq!(
+            attached.linear_state_values(),
+            published_state,
+            "the attached session must start from the published snapshot, bit for bit"
+        );
+        assert!(exec
+            .continue_resumable_prefill_physical(&mut attached, &prepared, fork, total)
+            .unwrap());
+        assert_eq!(attached.physical_context_len(), total);
+        let attached_state = attached.linear_state_values();
+        if exact {
+            assert_eq!(
+                attached_state, reference_state,
+                "the attached DeltaNet state must equal the fresh run's, bit for bit"
+            );
+        } else {
+            let scale = reference_state.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let error = attached_state
+                .iter()
+                .zip(&reference_state)
+                .map(|(a, r)| (a - r).abs())
+                .fold(0f32, |m, d| {
+                    if d.is_finite() {
+                        m.max(d)
+                    } else {
+                        f32::INFINITY
+                    }
+                });
+            assert_eq!(attached_state.len(), reference_state.len());
+            assert!(
+                error <= 5e-2 * scale.max(1e-3),
+                "{backend:?}: attached DeltaNet state differs from the fresh run by {error} (max |ref| {scale})"
+            );
+        }
+        assert_eq!(
+            decode(&mut attached),
+            expected,
+            "the attached session must generate the fresh run's tokens"
+        );
+        assert_eq!(
+            snapshot_values(published),
+            snapshot_before,
+            "decoding an attached session must not mutate the published snapshot"
+        );
+
+        // A cursor at or past the prompt end has no private token to compute.
+        assert!(exec
+            .begin_resumable_prefill_state_physical(
+                &prepared,
+                6,
+                &config,
+                view(0..pages(total), total),
+                None
+            )
+            .is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn load_fixture(tag: &str) -> (Qwen36MoeChatModel, PathBuf) {
+        load_fixture_on(tag, DeviceProfile::cpu())
+    }
+
+    fn load_fixture_on(tag: &str, device: DeviceProfile) -> (Qwen36MoeChatModel, PathBuf) {
         let dir = fixture_dir(tag);
         write_fixture(&dir);
-        let model =
-            Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, DeviceProfile::cpu())
-                .expect("load qwen36moe fixture");
+        let model = Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, device)
+            .expect("load qwen36moe fixture");
         (model, dir)
+    }
+
+    /// The runtime's device tag for an arena: Metal arenas require the exact
+    /// device identity (Candle reports the registry id, not the ordinal).
+    fn arena_device_ordinal(device: &DeviceProfile) -> Option<u32> {
+        match device.device.location() {
+            candle_core::DeviceLocation::Cpu => None,
+            candle_core::DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+            candle_core::DeviceLocation::Metal { gpu_id } => {
+                let id = gpu_id as u64;
+                Some((id ^ (id >> 32)) as u32)
+            }
+        }
     }
 
     pub(crate) fn physical_cache(model: &Qwen36MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};
-        use candle_core::DeviceLocation;
         let contract = match model.inference_state_contract().expect("contract") {
             InferenceStateCapability::Managed(contract) => contract,
             other => panic!("expected managed contract, got {other:?}"),
@@ -869,16 +1332,7 @@ pub(crate) mod tests {
         // domain: full-attention model layers 1 and 3 → physical 0 and 1.
         let kv_heads = model.text_config().attention_head_count_kv;
         let head_dim = model.text_config().attention_key_length;
-        // Mirror the runtime's device tag: Metal arenas require the exact
-        // device identity (Candle reports the registry id, not the ordinal).
-        let device_ordinal = match device.device.location() {
-            DeviceLocation::Cpu => None,
-            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
-            DeviceLocation::Metal { gpu_id } => {
-                let id = gpu_id as u64;
-                Some((id ^ (id >> 32)) as u32)
-            }
-        };
+        let device_ordinal = arena_device_ordinal(device);
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(4242),
             backend: BackendKind::from(device.kind),
@@ -965,6 +1419,144 @@ pub(crate) mod tests {
         ChatGenerationConfig::default()
     }
 
+    #[test]
+    fn decode_quantum_switch_defaults_to_eight_and_bounds_its_value() {
+        assert_eq!(decode_quantum_from(None), 8);
+        assert_eq!(decode_quantum_from(Some(" 1 ")), 1);
+        assert_eq!(decode_quantum_from(Some("16")), 16);
+        assert_eq!(decode_quantum_from(Some("0")), 8);
+        assert_eq!(decode_quantum_from(Some("65")), 8);
+        assert_eq!(decode_quantum_from(Some("many")), 8);
+        // No graph decode on the CPU fixture: one token per engine step.
+        let (model, dir) = load_fixture("quantum");
+        assert_eq!(model.preferred_decode_tokens(), 1);
+        assert!(!model.sustained_decode_quantum());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A multi-token quantum reports a logprob for every token it emits, not
+    /// only the last step's.
+    #[test]
+    fn a_decode_quantum_keeps_every_steps_logprobs() {
+        let (model, dir) = load_fixture("quantum-logprobs");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let config = ChatGenerationConfig {
+            logprobs: true,
+            top_logprobs: 2,
+            ..generation_config()
+        };
+        let cache = physical_cache(&model, &DeviceProfile::cpu());
+        let mut state = model
+            .start_decode_state_physical(&messages, 8, &config, None, cache)
+            .expect("decode state");
+        let step = model.exec.decode_quantum(&mut state, 4).expect("quantum");
+        let emitted = step.tokens_generated;
+        assert!(emitted > 1, "the fixture must emit several tokens");
+        assert_eq!(
+            state.pending_logprobs.len(),
+            emitted,
+            "one logprob per emitted token"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A decode quantum on the whole-step graph pipelines its steps: device
+    /// token selection, with step k+1 queued before token k is read back.
+    /// It must emit what step-by-step decode does and stop where it does,
+    /// discarding the step queued past the end. (The fixture's own trunk is
+    /// too small for the fused paths; its tokenizer drives the synthetic
+    /// block-FP8 trunk instead.)
+    #[test]
+    fn a_pipelined_quantum_matches_step_by_step_decode() {
+        use crate::models::architectures::qwen36moe::text::tests::{
+            e2e_cache, synthetic_fused_model,
+        };
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "ab".to_string(),
+        }];
+        let decode = |tag: &str, config: &ChatGenerationConfig, quantum: Option<usize>| {
+            let (mut model, dir) = load_fixture(tag);
+            let (text_model, text_config) = synthetic_fused_model(384, quantum.is_some());
+            assert_eq!(text_model.graph_step_ready(), quantum.is_some());
+            model.exec.text_model = text_model;
+            model.exec.text_config = text_config;
+            // Graph decode asks for its quantum past the soft SLA.
+            assert_eq!(model.sustained_decode_quantum(), quantum.is_some());
+            let cache = e2e_cache(&Device::Cpu);
+            let mut state = model
+                .start_decode_state_physical(&messages, 9, config, None, cache)
+                .expect("decode state");
+            let (mut text, mut calls) = (String::new(), 0usize);
+            while !state.is_finished() {
+                let step = match quantum {
+                    Some(budget) => model.exec.decode_quantum(&mut state, budget),
+                    None => model.exec.decode_step(&mut state),
+                }
+                .expect("decode");
+                text.push_str(&step.delta);
+                calls += 1;
+            }
+            let pipelined = model.exec.text_model.cuda_graphs_summary()["whole_step"]["pipelined"]
+                .as_u64()
+                .unwrap_or(0);
+            std::fs::remove_dir_all(dir).ok();
+            ((state.generated_ids().to_vec(), text), calls, pipelined)
+        };
+        let greedy = generation_config();
+        let (expected, steps, _) = decode("pipelined-reference", &greedy, None);
+        assert!(
+            expected.0.len() > 4,
+            "the fixture must emit several tokens: {expected:?}"
+        );
+        let (actual, quanta, pipelined) = decode("pipelined", &greedy, Some(4));
+        assert_eq!(actual, expected);
+        assert!(quanta < steps, "{quanta} quanta for {steps} steps");
+        // The first token comes from the prefill; each quantum after it
+        // forwards its first token from the host and the rest from the device.
+        assert!(pipelined > 0, "no step took a device-selected token");
+
+        // A stop token mid-quantum finishes the stream with the next step
+        // already queued: that step is discarded and nothing more is emitted.
+        let (ids, _) = &expected;
+        let stop = ids
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(index, token)| !ids[..*index].contains(token))
+            .map(|(_, &token)| token)
+            .expect("a token first emitted mid-stream");
+        let stopping = ChatGenerationConfig {
+            stop_token_ids: vec![stop],
+            ..generation_config()
+        };
+        let (expected, _, _) = decode("pipelined-stop-reference", &stopping, None);
+        let (actual, _, pipelined) = decode("pipelined-stop", &stopping, Some(8));
+        assert!(
+            expected.0.len() < ids.len(),
+            "the stop token ends the stream early"
+        );
+        assert_eq!(actual, expected);
+        assert!(pipelined > 0);
+
+        // Sampled decode draws on the device sampler; it must run to the cap.
+        let sampled = ChatGenerationConfig {
+            temperature: 0.7,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: 7,
+            ..generation_config()
+        };
+        let ((tokens, _), _, pipelined) = decode("pipelined-sampled", &sampled, Some(4));
+        assert!(
+            !tokens.is_empty() && pipelined > 0,
+            "{tokens:?} tokens, {pipelined} pipelined"
+        );
+    }
+
     /// Per-row cache windows over ONE shared arena: the continuous decode
     /// batch requires every row to reference the same arena instance.
     fn shared_physical_caches(
@@ -975,21 +1567,13 @@ pub(crate) mod tests {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};
-        use candle_core::DeviceLocation;
         let contract = match model.inference_state_contract().expect("contract") {
             InferenceStateCapability::Managed(contract) => contract,
             other => panic!("expected managed contract, got {other:?}"),
         };
         let kv_heads = model.text_config().attention_head_count_kv;
         let head_dim = model.text_config().attention_key_length;
-        let device_ordinal = match device.device.location() {
-            DeviceLocation::Cpu => None,
-            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
-            DeviceLocation::Metal { gpu_id } => {
-                let id = gpu_id as u64;
-                Some((id ^ (id >> 32)) as u32)
-            }
-        };
+        let device_ordinal = arena_device_ordinal(device);
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(4244),
             backend: BackendKind::from(device.kind),
@@ -1281,6 +1865,43 @@ pub(crate) mod tests {
         let counters = model.expert_activation_counters();
         assert_eq!(counters.len(), 4);
         assert!(counters.iter().all(|c| c.total_selections() > 0));
+        // The GGUF fixture's quantized experts cannot take the fused block-FP8
+        // path; diagnostics must say so per layer, with the reason.
+        let moe = &model.runtime_diagnostics()["moe"];
+        assert_eq!(moe["backend"], "legacy");
+        assert_eq!(moe["legacy_layers"], 4);
+        assert_eq!(moe["fused_layers"], 0);
+        assert!(moe["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("block-FP8")));
+        // The fixture's linear-attention layers stay on the Candle chain: the
+        // fused DeltaNet decode is CUDA-only.
+        let gdn = &model.runtime_diagnostics()["gdn_decode"];
+        assert_eq!(gdn["backend"], "legacy");
+        assert_eq!(gdn["fused_layers"], 0);
+        assert_eq!(
+            model.runtime_diagnostics()["rms_norm"]["legacy_reasons"][0],
+            "fused RMSNorm runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["qk_rope"]["legacy_reasons"][0],
+            "fused q/k norm + RoPE runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["attn_gate"]["legacy_reasons"][0],
+            "fused attention output gate runs on CUDA and Metal only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["fp8_gemv"]["legacy_reasons"][0],
+            "vectorized FP8 decode GEMV runs on CUDA only"
+        );
+        assert_eq!(
+            model.runtime_diagnostics()["cuda_graphs"]["legacy_reasons"][0],
+            "CUDA graph decode runs on CUDA only"
+        );
+        assert!(gdn["legacy_reasons"][0]
+            .as_str()
+            .is_some_and(|reason| reason.contains("CUDA and Metal only")));
 
         // Re-run and require identical output (seeded rng, greedy decode).
         let first: Vec<String> = steps.iter().map(|step| step.delta.clone()).collect();

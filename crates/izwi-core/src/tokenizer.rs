@@ -112,6 +112,24 @@ impl Tokenizer {
         )))
     }
 
+    /// Like [`Self::from_path`], but a present `tokenizer.json` that fails to
+    /// parse is an error instead of a fallback. The vocab.json + merges.txt
+    /// fallback uses the GPT-2 ByteLevel split and no normalizer, so for a
+    /// checkpoint whose `tokenizer.json` carries its own pre-tokenizer regex
+    /// and NFC normalizer (Qwen) a silent fallback changes tokenization.
+    pub fn from_path_requiring_tokenizer_json(model_dir: &Path) -> Result<Self> {
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if tokenizer_path.exists() {
+            return Self::from_tokenizer_json(&tokenizer_path).map_err(|err| {
+                Error::TokenizationError(format!(
+                    "Failed to parse tokenizer.json at {}: {err}",
+                    tokenizer_path.display()
+                ))
+            });
+        }
+        Self::from_path(model_dir)
+    }
+
     fn from_tokenizer_json(path: &Path) -> Result<Self> {
         let inner =
             HfTokenizer::from_file(path).map_err(|e| Error::TokenizationError(e.to_string()))?;
@@ -552,6 +570,26 @@ mod tests {
             .iter()
             .map(|byte| byte_level_char(*byte))
             .collect()
+    }
+
+    #[test]
+    fn requiring_tokenizer_json_rejects_a_corrupt_file_instead_of_falling_back() {
+        let dir = std::env::temp_dir().join(format!("izwi-tokenizer-strict-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{ not json").unwrap();
+        fs::write(dir.join("vocab.json"), br#"{"a": 0, "b": 1}"#).unwrap();
+        fs::write(dir.join("merges.txt"), b"#version: 0.2\n").unwrap();
+
+        let err = match Tokenizer::from_path_requiring_tokenizer_json(&dir) {
+            Ok(_) => panic!("a corrupt tokenizer.json must not fall back"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("tokenizer.json"), "{err}");
+        assert!(
+            Tokenizer::from_path(&dir).is_ok(),
+            "the lenient loader keeps its vocab+merges fallback"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

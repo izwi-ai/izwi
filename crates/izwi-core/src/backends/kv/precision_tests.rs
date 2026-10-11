@@ -184,6 +184,7 @@ fn cuda_flash_paged_bf16_preserves_finite_kv_range() -> Result<()> {
             causal_overflow_config(BackendKind::Cuda, dtype, 256),
             device.clone(),
         )?;
+        arena.disable_cuda_split_decode();
         let (keys, values) = arena.layer_tensors(arena.config().layers[0].binding)?;
         assert_eq!(keys.dtype(), dtype, "test requires dense KV storage");
         assert_eq!(values.dtype(), dtype, "test requires dense KV storage");

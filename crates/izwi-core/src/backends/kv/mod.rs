@@ -154,6 +154,8 @@ pub struct KvArenaOperationStats {
     pub portable_attention_dispatches: u64,
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
+    /// Opt-in grouped-query split decode (`IZWI_CUDA_SPLIT_DECODE=1`).
+    pub cuda_split_decode_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
     pub cuda_graph_warmups: u64,
     pub cuda_graph_captures: u64,
@@ -174,6 +176,7 @@ pub enum KvAttentionProvider {
     CudaNative,
     CudaFlashAttention,
     MetalNative,
+    CudaSplitDecode,
 }
 
 impl KvAttentionProvider {
@@ -184,6 +187,7 @@ impl KvAttentionProvider {
             Self::CudaNative => "cuda_native",
             Self::CudaFlashAttention => "cuda_flash_attention",
             Self::MetalNative => "metal_native",
+            Self::CudaSplitDecode => "cuda_split_decode",
         }
     }
 
@@ -198,6 +202,7 @@ impl KvAttentionProvider {
             3 => Some(Self::CudaNative),
             4 => Some(Self::CudaFlashAttention),
             5 => Some(Self::MetalNative),
+            6 => Some(Self::CudaSplitDecode),
             _ => None,
         }
     }
@@ -218,6 +223,17 @@ pub trait KvSlotMap: Any + Send + Sync {
         self.len() == 0
     }
     fn as_any(&self) -> &dyn Any;
+}
+
+/// The paged caches a captured decode graph writes itself
+/// ([`KvArena::with_graph_writes`]).
+pub struct GraphKvLayers {
+    /// Backing allocation generation. Growth swaps the tensors, so a graph
+    /// captured against another generation must not replay.
+    pub generation: u64,
+    /// `(keys, values)` per requested binding, `[pages, page_tokens,
+    /// kv_heads, head_dim]`, sharing the arena's storage.
+    pub layers: Vec<(Tensor, Tensor)>,
 }
 
 pub struct KvWriteArgs<'a> {
@@ -725,6 +741,26 @@ pub trait KvArena: Send + Sync {
         layer: KvLayerBinding,
         args: KvWriteArgs<'_>,
     ) -> Result<KvWriteCompletion>;
+    /// Run `enqueue`, which writes `slots` into every layer of `bindings` on
+    /// the device without `write_slots` (as a captured decode graph does), then
+    /// account for those writes exactly as `write_slots` would: the pages turn
+    /// dirty, the dispatches are counted, and each binding gets a completion
+    /// fenced after the enqueued work. `decodes` paged decode dispatches the
+    /// same work performed are counted too. Mutations stay serialized for the
+    /// whole call, so the caches cannot grow or be swapped between `enqueue`
+    /// and the bookkeeping.
+    fn with_graph_writes(
+        &self,
+        _bindings: &[KvLayerBinding],
+        _slots: &dyn KvSlotMap,
+        _decodes: u64,
+        _enqueue: &mut dyn FnMut(&GraphKvLayers) -> Result<()>,
+    ) -> Result<Vec<KvWriteCompletion>> {
+        Err(Error::InferenceError(format!(
+            "{:?} KV arenas do not take graph writes",
+            self.backend_kind()
+        )))
+    }
     /// Direct paged prefill/extend. Backends may fuse this operation; the
     /// portable default remains page-native by issuing the already-attested
     /// direct decode operation for each causal query position.

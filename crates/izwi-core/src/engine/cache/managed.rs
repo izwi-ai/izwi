@@ -79,6 +79,7 @@ pub struct ManagedKvOperationSnapshot {
     pub portable_attention_dispatches: u64,
     pub cuda_native_attention_dispatches: u64,
     pub cuda_flash_attention_dispatches: u64,
+    pub cuda_split_decode_dispatches: u64,
     pub metal_native_attention_dispatches: u64,
     pub cuda_graph_warmups: u64,
     pub cuda_graph_captures: u64,
@@ -148,6 +149,9 @@ impl ManagedKvOperationSnapshot {
         self.cuda_flash_attention_dispatches = self
             .cuda_flash_attention_dispatches
             .saturating_add(other.cuda_flash_attention_dispatches);
+        self.cuda_split_decode_dispatches = self
+            .cuda_split_decode_dispatches
+            .saturating_add(other.cuda_split_decode_dispatches);
         self.metal_native_attention_dispatches = self
             .metal_native_attention_dispatches
             .saturating_add(other.metal_native_attention_dispatches);
@@ -387,6 +391,10 @@ struct PendingPrefixCommit {
     arena: KvArenaId,
     page_tokens: u32,
     publications: Vec<KvPrefixPublication>,
+    /// Whether this span may publish the committed tensor snapshot at its
+    /// commit cursor (DS1.2b). A request declaring a snapshot boundary
+    /// (Phase 5a) snapshots only at that boundary.
+    snapshot: bool,
 }
 
 /// DS4.3: host-resident pages a prepare restored into its transaction's fresh
@@ -862,6 +870,8 @@ impl ManagedKvCacheManager {
                                 .cuda_native_attention_dispatches,
                             cuda_flash_attention_dispatches: operation_stats
                                 .cuda_flash_attention_dispatches,
+                            cuda_split_decode_dispatches: operation_stats
+                                .cuda_split_decode_dispatches,
                             metal_native_attention_dispatches: operation_stats
                                 .metal_native_attention_dispatches,
                             cuda_graph_warmups: operation_stats.cuda_graph_warmups,
@@ -2332,7 +2342,20 @@ impl ManagedKvCacheManager {
                 provisional_groups: prepared.provisional_groups,
                 writable_blocks: prepared.writable_blocks,
             });
-            if prefix_eligible || expected_attach_cursor.is_some() {
+            // Phase 5a: a request declaring its stable-history boundary also
+            // publishes the pages of every later prefill span inside its
+            // prompt, so a conversation's chain keeps growing turn by turn
+            // instead of stopping at the first chunk.
+            let declared_boundary = request.and_then(|request| request.managed_snapshot_boundary());
+            let boundary_publication = declared_boundary.is_some()
+                && session_generation == ManagedSessionGeneration::INITIAL
+                && target_committed_tokens > 1
+                && request.is_some_and(|request| {
+                    domain_sequence_input
+                        .is_some_and(|input| input.end <= request.prompt_tokens.len())
+                })
+                && prefix_enabled_for_domain(&state.contract, group.domain);
+            if prefix_eligible || expected_attach_cursor.is_some() || boundary_publication {
                 let Some(namespace) = namespace.as_ref() else {
                     continue;
                 };
@@ -2350,10 +2373,22 @@ impl ManagedKvCacheManager {
                     group.id,
                 )?;
                 if !publications.is_empty() {
+                    // Without a declared boundary keep the DS1.2b rule (any
+                    // aligned commit of an eligible span). With one, only
+                    // the span ending on the boundary's interval floor
+                    // snapshots: each snapshot is the full hybrid state.
+                    let snapshot = match (declared_boundary, &snapshot_sharing) {
+                        (None, _) => true,
+                        (Some(boundary), Some((_, _, interval))) if *interval > 0 => {
+                            target_committed_tokens == boundary - boundary % *interval
+                        }
+                        (Some(_), _) => false,
+                    };
                     pending_prefixes.push(PendingPrefixCommit {
                         arena: group.arena,
                         page_tokens: group.page_tokens,
                         publications,
+                        snapshot,
                     });
                 }
             }
@@ -2743,7 +2778,7 @@ impl ManagedKvCacheManager {
                     // end equals the committed cursor; capture it for the
                     // tensor publication after the state commits.
                     if let Some(sharing) = state.tensor_snapshots.as_ref() {
-                        if sharing.paged_arena == domain.arena {
+                        if sharing.paged_arena == domain.arena && publication.snapshot {
                             let last = publication.publications.last().expect("non-empty");
                             if let Some(end) = last
                                 .key
@@ -7950,6 +7985,200 @@ mod tests {
             .coordinators
             .values()
             .for_each(|coordinator| coordinator.check_invariants().unwrap());
+    }
+
+    /// Phase 5a: a request declaring its stable-history boundary publishes
+    /// pages from every prefill span and a tensor snapshot only on the
+    /// boundary's interval floor, so each conversation turn attaches at the
+    /// previous turn's boundary and the chain keeps growing.
+    #[test]
+    fn declared_history_boundary_advances_the_hybrid_chain_across_turns() {
+        let model = ModelInstanceId::new(611);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([31; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let arena = runtime.tensor_state().unwrap().clone();
+        let request = |tokens: Vec<u32>, boundary: u32| {
+            let mut request = prefix_request(model, tokens);
+            request.set_managed_snapshot_boundary_for_test(Some(boundary));
+            request
+        };
+        let mut txn = 700_u64;
+        let mut commit = |manager: &mut ManagedKvCacheManager,
+                          session: &SessionKey,
+                          request: &EngineCoreRequest,
+                          start: usize,
+                          end: usize,
+                          value: f32|
+         -> u32 {
+            txn += 1;
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn,
+                    session,
+                    &sequence_work(start, end),
+                    Some(request),
+                )
+                .unwrap()
+                .unwrap();
+            let execution_start = reservation.domains[0].execution_start_tokens;
+            let target = reservation.domains[0].target_committed_tokens;
+            arena
+                .stage_replace(
+                    PhysicalStateTransactionId::new(txn).unwrap(),
+                    StateDomainId::new(2),
+                    u64::from(execution_start),
+                    u64::from(target),
+                    hybrid_tensor_values(&[value; 4]),
+                )
+                .unwrap();
+            let receipt = if execution_start == start as u32 {
+                reservation.completed_write_receipt_for_test()
+            } else {
+                reservation
+                    .completed_write_receipt_for_prefix_for_test(target, 32)
+                    .unwrap()
+            };
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .unwrap();
+            execution_start
+        };
+
+        // Turn 1: 100 prompt tokens, stable history 70 (interval floor 64).
+        // The scheduler ends the first span on the floor.
+        let turn1 = (0..100_u32).collect::<Vec<_>>();
+        let request1 = request(turn1.clone(), 70);
+        let session1 = SessionKey::new("turn-1".into(), 1);
+        assert_eq!(commit(&mut manager, &session1, &request1, 0, 64, 1.0), 0);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+        // The later span publishes its pages but no snapshot.
+        assert_eq!(commit(&mut manager, &session1, &request1, 64, 100, 2.0), 64);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+        // The turn finishes; its published pages and snapshot stay shared.
+        manager.release_session(&session1).unwrap();
+
+        // Turn 2 shares only turn 1's first 70 tokens (the reasoning of an
+        // answer is not re-rendered); its own history ends at 110 (floor 96).
+        let mut turn2 = turn1[..70].to_vec();
+        turn2.extend(500..560_u32);
+        let request2 = request(turn2.clone(), 110);
+        let session2 = SessionKey::new("turn-2".into(), 1);
+        assert_eq!(
+            commit(&mut manager, &session2, &request2, 0, 96, 3.0),
+            64,
+            "turn 2 attaches at turn 1's boundary"
+        );
+        let sequence2 = manager.telemetry_snapshot().tensor_snapshot_attaches;
+        assert_eq!(sequence2, 1);
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 2);
+        // An aligned later span (96..128) is not its boundary: no snapshot.
+        assert_eq!(commit(&mut manager, &session2, &request2, 96, 128, 4.0), 96);
+        assert_eq!(
+            commit(&mut manager, &session2, &request2, 128, 130, 5.0),
+            128
+        );
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 2);
+        manager.release_session(&session2).unwrap();
+
+        // Turn 3 attaches at turn 2's boundary: pages 0-1 from turn 1, page
+        // 2 from turn 2, and the snapshot at 96.
+        let mut turn3 = turn2[..110].to_vec();
+        turn3.extend(900..940_u32);
+        let request3 = request(turn3, 140);
+        let session3 = SessionKey::new("turn-3".into(), 1);
+        assert_eq!(
+            commit(&mut manager, &session3, &request3, 0, 128, 6.0),
+            96,
+            "turn 3 attaches at turn 2's boundary"
+        );
+        let telemetry = manager.telemetry_snapshot();
+        assert_eq!(telemetry.tensor_snapshot_attaches, 2);
+        assert_eq!(telemetry.reused_tokens, 64 + 96);
+        assert_eq!(
+            telemetry.tensor_snapshot_publishes, 3,
+            "turn 3 snapshots at 128"
+        );
+        manager.models[&model]
+            .coordinators
+            .values()
+            .for_each(|coordinator| coordinator.check_invariants().unwrap());
+    }
+
+    /// Without a declared boundary nothing changes: later spans publish no
+    /// pages, so a second request cannot attach past the first chunk.
+    #[test]
+    fn undeclared_requests_keep_first_span_only_publication() {
+        let model = ModelInstanceId::new(612);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([32; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(hybrid_snapshot_contract()),
+            )
+            .unwrap()
+            .unwrap();
+        let tokens = (0..128_u32).collect::<Vec<_>>();
+        let first = prefix_request(model, tokens.clone());
+        let session = SessionKey::new("undeclared".into(), 1);
+        let arena = runtime.tensor_state().unwrap().clone();
+        for (txn, (start, end)) in [(801_u64, (0, 64)), (802, (64, 128))] {
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn,
+                    &session,
+                    &sequence_work(start, end),
+                    Some(&first),
+                )
+                .unwrap()
+                .unwrap();
+            arena
+                .stage_replace(
+                    PhysicalStateTransactionId::new(txn).unwrap(),
+                    StateDomainId::new(2),
+                    start as u64,
+                    end as u64,
+                    hybrid_tensor_values(&[1.0; 4]),
+                )
+                .unwrap();
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .unwrap();
+        }
+        let mut longer = tokens;
+        longer.extend([1, 2, 3]);
+        let second = prefix_request(model, longer);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                803,
+                &SessionKey::new("undeclared-2".into(), 1),
+                &sequence_work(0, 131),
+                Some(&second),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation.domains[0].execution_start_tokens, 64,
+            "only the first span's pages and snapshot are shared"
+        );
     }
 
     #[test]

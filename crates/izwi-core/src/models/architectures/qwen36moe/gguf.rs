@@ -5,21 +5,21 @@
 //! only as the tiny synthetic fixture path that lets CI exercise the hybrid
 //! trunk + sparse-expert mechanics without the 35B download (the DS10
 //! fixture pattern). Fixture checkpoints declare the same geometry keys as
-//! the dense `qwen35` arch, renamed to `qwen36moe`, plus the qwen3-MoE-style
+//! the dense Qwen3.5 GGUF arch, renamed to `qwen36moe`, plus the qwen3-MoE-style
 //! expert keys.
 
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen35::chat::{
-    required_f64, required_usize, required_usize_array, Qwen35TextConfig,
+use crate::models::architectures::qwen36moe::exec::{
+    required_f64, required_usize, required_usize_array, Qwen36TextConfig,
 };
-use crate::models::architectures::qwen35::text::Qwen35MoeFfnGeometry;
+use crate::models::architectures::qwen36moe::text::Qwen36MoeFfnGeometry;
 use crate::models::shared::weights::gguf::GgufLoader;
 
 /// Filename the qwen36moe loader treats as the synthetic-fixture checkpoint.
 /// The published variant never ships as GGUF, so this name is unambiguous.
 pub const QWEN36_MOE_FIXTURE_GGUF_FILENAME: &str = "qwen36moe-fixture.gguf";
 
-pub(crate) fn parse_fixture_gguf_config(loader: &GgufLoader) -> Result<Qwen35TextConfig> {
+pub(crate) fn parse_fixture_gguf_config(loader: &GgufLoader) -> Result<Qwen36TextConfig> {
     let architecture = loader
         .get_metadata_string("general.architecture")
         .unwrap_or_else(|| "qwen36moe".to_string());
@@ -41,7 +41,7 @@ pub(crate) fn parse_fixture_gguf_config(loader: &GgufLoader) -> Result<Qwen35Tex
         )));
     }
 
-    Ok(Qwen35TextConfig {
+    Ok(Qwen36TextConfig {
         architecture,
         block_count: required_usize(loader, "qwen36moe.block_count")?,
         context_length: required_usize(loader, "qwen36moe.context_length")?,
@@ -69,7 +69,7 @@ pub(crate) fn parse_fixture_gguf_config(loader: &GgufLoader) -> Result<Qwen35Tex
         ssm_time_step_rank: required_usize(loader, "qwen36moe.ssm.time_step_rank")?,
         ssm_inner_size: required_usize(loader, "qwen36moe.ssm.inner_size")?,
         full_attention_interval: required_usize(loader, "qwen36moe.full_attention_interval")?,
-        moe_ffn: Some(Qwen35MoeFfnGeometry {
+        moe_ffn: Some(Qwen36MoeFfnGeometry {
             num_experts: expert_count,
             num_experts_per_tok: expert_used_count,
             expert_intermediate_size: expert_feed_forward_length,

@@ -1127,29 +1127,23 @@ fn benchmark_operation(
             "{operation} completed without advancing its arena dispatch counter"
         ));
     }
+    let provider = after
+        .last_attention_provider
+        .map(|provider| provider.name());
     if options.provider == "portable"
-        && matches!(
-            after
-                .last_attention_provider
-                .map(|provider| provider.name()),
-            Some("cuda_flash_attention")
-        )
+        && matches!(provider, Some("cuda_flash_attention" | "cuda_split_decode"))
     {
-        return Err("portable provider request executed the optimized CUDA provider".into());
+        return Err("portable provider request executed an optimized CUDA provider".into());
     }
+    // Split decode is the default optimized CUDA decode provider; prefill
+    // stays on FlashAttention.
+    let optimized = provider == Some("cuda_flash_attention")
+        || (operation == "paged_decode" && provider == Some("cuda_split_decode"));
     if options.provider == "optimized"
         && matches!(operation, "paged_prefill" | "paged_decode")
-        && after
-            .last_attention_provider
-            .map(|provider| provider.name())
-            != Some("cuda_flash_attention")
+        && !optimized
     {
-        return Err(format!(
-            "optimized provider request executed {:?}",
-            after
-                .last_attention_provider
-                .map(|provider| provider.name())
-        ));
+        return Err(format!("optimized provider request executed {provider:?}"));
     }
     emit_measurement(
         options,

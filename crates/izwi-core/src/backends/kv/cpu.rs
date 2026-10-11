@@ -703,6 +703,7 @@ impl KvArena for CpuKvArena {
             portable_attention_dispatches: 0,
             cuda_native_attention_dispatches: 0,
             cuda_flash_attention_dispatches: 0,
+            cuda_split_decode_dispatches: 0,
             metal_native_attention_dispatches: 0,
             cuda_graph_warmups: 0,
             cuda_graph_captures: 0,
@@ -1335,6 +1336,24 @@ mod tests {
             }
         }
         output
+    }
+
+    #[test]
+    fn graph_writes_are_refused_without_running_the_work() -> Result<()> {
+        let arena = CpuKvArena::new(config(DType::F32))?;
+        let slots = arena.lower_slots(&[KvSlotRef {
+            block: block(0),
+            offset: 0,
+        }])?;
+        let mut ran = false;
+        let refused = arena.with_graph_writes(&[LAYER], slots.as_ref(), 1, &mut |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(refused.is_err());
+        assert!(!ran);
+        assert_eq!(arena.operation_stats().slot_write_dispatches, 0);
+        Ok(())
     }
 
     #[test]

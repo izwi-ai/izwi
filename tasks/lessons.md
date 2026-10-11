@@ -107,3 +107,91 @@
   registry — a peer's row can be staler than a third party's view, so it cannot
   gate the race. Diagnose these by running the lane under realistic CPU load
   (the repo's CI runners are 2 vCPU): an idle machine hid a 1-in-6 flake.
+- A loader that materializes a tensor correctly can still be wrong about its VALUE
+  CONVENTION, and no shape/dtype/finiteness check will ever see it. Qwen3.5/3.6-MoE
+  stores RMSNorm gains zero-centered (HF applies `1.0 + weight` at runtime); the
+  qwen36moe native loader used them raw, attenuating 100 per-layer gains ~10-25x, so
+  the residual stream degenerated to the untouched embedding and the model emitted the
+  unconditional unigram prior as multilingual salad — a symptom that reads exactly like
+  a broken CUDA kernel. Two sessions of kernel/layout/routing audits cleared every
+  prime suspect while the bug sat one `+ 1.0` away in a loader. Rules that follow:
+  (1) when a native safetensors loader and its sibling disagree on a *value transform*
+  (`qwen38/text.rs::load_native_zero_centered_norm` vs `qwen36moe/native_model.rs::rms_norm`),
+  that disagreement is a defect until proven otherwise — diff the transforms, not just
+  the paths; (2) "the trunk works in production" is worthless as coverage when the
+  production path is a different FORMAT (llama.cpp bakes the `+1` in at GGUF
+  conversion, so the GGUF fixture cannot detect its absence); (3) a fixture generated
+  from the plan, or asserting only FINITENESS, cannot catch a gain error — assert
+  effective gain == 1 + w; (4) census the PUBLISHED VALUES, which is cheap: safetensors
+  headers are readable over HTTP Range, so a 37 GB checkpoint's value census costs a
+  few hundred KB. Validate the decoder against 2-3 known-plausible tensors (A_log,
+  dt_bias, conv1d) before believing any reading, and use a sibling checkpoint whose
+  loader is known-good as the control. Two decoder traps: BF16 is the HIGH half of F32
+  (low-half reconstruction yields all-denormal zeros), and `data_offsets` are relative
+  to `8 + header_length`, not byte 0.
+- When a shared trunk was written for GGUF and a NATIVE loader feeds it, enumerate EVERY
+  value transform the llama.cpp converter applies for that arch (`conversion/<family>.py`
+  `modify_tensors` + any mixin bases) and check that the native loader mirrors each one.
+  Qwen3.5/3.6 has four transforms: A_log→-exp, norm +1, conv squeeze, and the V-head grouped→tiled
+  reorder. Two of them were missed. "The GGUF path works on this trunk" proves the
+  convention of the CONVERTED file, never the published one. That fallacy hid the norm
+  bug and then "refuted" the V-head bug. Also: a norm's convention comes from its module
+  CLASS in the reference implementation, not from a magnitude census of its stored values
+  (a trained zero-centered gain can drift to 1.6). And "no weight permutation can
+  reconcile layouts X and Y" claims need a written proof; permuting the other side
+  usually works.
+- When a checkpoint convention disagrees with a shared trunk's assumption, first ask whether the
+  TRUNK can honor the checkpoint's convention cheaply before rewriting weights at load. The
+  Qwen3.6 value-head order fix was ~30 lines as a source-declared expansion order
+  (`linear_v_head_order`) versus byte-level permutation across five residency forms (packed Q8,
+  tiled Q8, expanded, raw FP8, streaming loads). Weight surgery is right only when every
+  consumer (kernels included) hard-codes the convention. Then gate the kernels that do (the
+  compact Metal DeltaNet kernel hard-codes tiled pairing on un-expanded heads).
+- Prove a value-parity fixture is RED before trusting it green: revert each fix in turn and
+  confirm the golden test fails by a margin far above its tolerance (here 2-3 logits vs 2e-3),
+  and validate the reference itself (HF cached decode == full forward) before using it.
+- Do not run rustfmt over whole files to "keep them clean" unless HEAD is verifiably clean
+  in-repo (`git show HEAD:f | rustfmt --check` via stdin can report clean while the in-repo
+  run reformats ~150 lines); unrelated reformat churn buries a fix. Only the files listed in
+  `scripts/ci/check-backend-truth.sh` are format-gated.
+- Splitting a dirty tree into logical commits: stage exact content with
+  `git hash-object -w` + `git update-index --cacheinfo`, test the index state under
+  `git stash push --keep-index`, then restore with `git checkout stash@{0} -- <files>` and
+  drop the stash — `git stash pop` conflicts once the staged hunks are committed.
+- Do not make a plan's first phase depend on measurement access the user may not have
+  (profilers, benchmark lanes, side-by-side runs of other engines on the production GPU).
+  Before gating work on "measure first", confirm what hardware and tooling the user can reach.
+  When the answer is "none beyond the deployed app", verify progress with what exists: the app's
+  own throughput readout on a fixed prompt, CPU-testable structural invariants (count
+  device-to-host readbacks through one helper), path counters in diagnostics, and load-time
+  self-checks that compare each new GPU fast path to the legacy path and disable it on
+  mismatch. Start with the phase whose targets are COUNTED in code (for example, 80 syncs per
+  token), not estimated, so it is safe without a profile. Restate any earlier promotion rule
+  that assumed hardware evidence instead of silently ignoring it.
+- Never gate a commit on `cargo test ... | grep ... | head && git commit`: a pipeline's exit
+  status is the LAST command's (`head` exits 0 even when the build failed and grep matched
+  nothing), so a non-compiling tree got committed. Capture output to a file, keep each
+  command's `$?`, and commit only inside `if [ $T -eq 0 ] && [ $C -eq 0 ]; then ... fi`. A
+  silent/empty test summary is a failure, not a pass.
+- When applying rustfmt only to "my" hunks of a file with pre-existing format drift, rustfmt's
+  import re-sorting splits one logical move into a removal hunk and an insertion hunk at
+  different lines; applying only the hunk that overlaps my edits silently DELETES imports.
+  Re-compile after any partial-format pass, and prefer hand-formatting the few new hunks.
+- Without nvcc/GPU locally (macOS), CUDA work is still verifiable before deploy: Apple clang
+  parses CUDA device code with `-x cuda --cuda-device-only -fsyntax-only -nocudainc` plus a small
+  stub header (validate the stubs by checking the repo's existing .cu files first); a
+  std::thread-per-CUDA-thread emulator (block barriers + warp-shuffle exchange) runs the real
+  kernel source against a float64 reference; and `cargo check/clippy --features cuda` works with
+  a fake `nvcc` that prints a 5-line `--version` (cudarc reads line 4) and touches the PTX/object
+  outputs the build scripts expect.
+- When porting fast paths to a new device, test each path's load-time resolution on that device through production loading, not only its kernels and a test hook. The Metal kernels passed their GPU tests, but `resolve_fused_qk` probed support with a hard-coded BF16 that the F16-only Metal kernel rejects, so the path silently stayed legacy. A device leg asserting every diagnostics summary is `fused` caught it at once.
+- A load-time self-check that compares a fused path with a "reference" built from the same transformed weights (stacked views, packs) cannot see a bad transform. Check the transform against the original tensors before dropping them.
+- On failure paths around a native resource (stream capture, graph teardown), read the wrapper library's source for hidden pre-checks before relying on its cleanup call. cudarc's `end_capture` first runs `bind_to_thread` → `check_err`, which returns a stale error saved by an unrelated `Drop` without ever ending the capture, leaving the stream stuck in capture mode. Use the raw driver call inside a drop guard for cleanup that must always run.
+- On tiny random fixtures, greedy text can be insensitive to the state under test: a prefix-attach test passed with the snapshot restore removed, because the fixture decoded the same tokens either way. Compare the restored state (or logits) exactly against the fresh run, and RED-check the test by deleting the behaviour before trusting it.
+- Floating-point tolerance helpers must not fold with `f32::max`: it returns the non-NaN operand, so a NaN output reads as zero error and passes. Saturate non-finite differences to infinity, and test the helper with a NaN input.
+- A tolerance-based device test can hide the bug it targets: on the qwen36moe fixture, attaching without restoring the snapshot changed the final state by only 0.3%, inside a 1% device tolerance. Check the mechanism exactly where it is exact on every device (the state right after restore equals the snapshot), keep the tolerance only for gross end-to-end errors, and RED-check each device leg. Tests that read env-driven behaviour (prefill chunk size) must hold `crate::env_test_lock()`, or a parallel test can change it between the runs being compared.
+- Before switching off a library's "redundant" safety mechanism, read every code path that depends on it, not only the one it is named for, and test it on the real threading model. cudarc's event tracking looked redundant for "one stream", but Candle runs on the per-thread default stream (a different stream per thread) and izwi drops tensors on whatever tokio thread finishes with them; cudarc's `CudaSlice::drop` also binds the CUDA context only through those event waits. Turning it off made cross-thread frees fail with `CUDA_ERROR_INVALID_CONTEXT`, leak, and latch errors that broke serving. A cross-thread drop test on the GPU would have caught it.
+- Probes and health checks must not call APIs that consume shared error state. cudarc's `bind_to_thread` returns and clears whatever a `Drop` latched on the context, so a capacity probe using `CudaContext::mem_get_info` failed on another component's error and reported it as missing memory. Observers should query the driver directly and log their own failures.
+- A model-side engine preference is only a request. Qwen3.6 asked for 8-token decode quanta, but the scheduler grants them only before a request's soft SLA, which is about 0.7 s for normal-priority interactive and streaming chat, unless the model opts into `sustained_decode_quantum`. On the H100 the pipeline therefore ran for about 22 quanta in roughly 5,500 tokens. Before relying on a scheduler grant, trace every gate in `decode_token_quanta` with production request settings, and test the grant after the deadline has passed. Give every new fast path a diagnostics counter (here `whole_step.pipelined`), so the first deploy shows whether it actually engaged.
+- A bit-exact comparison between two runs is only an invariant if both runs execute the same op shapes. The Qwen3.6 attach test compared an attached run (prefilled from the fork) with a fresh run (prefilled in one span). The matmul row counts differed, and x86's CPU kernels rounded a few rows differently in the last ulp. aarch64 happened to agree, so the test passed locally and failed on every Linux CI run. Before asserting bit equality, make both sides take identical chunk and span boundaries, or assert a tolerance. CI runs on x86 and the dev machine on ARM, so anything that only passes on one architecture needs checking on the other.
+- CI pins `dtolnay/rust-toolchain@stable`, so new stable clippy lints (1.99's `chunks_exact_to_as_chunks`) fail the `-D warnings` gate with no repo change. Before pushing, run the hygiene clippy with the current stable (`cargo +<latest> clippy --workspace --all-targets`, `TAURI_CONFIG` as in `check-backend-truth.sh`), not only the local default toolchain.

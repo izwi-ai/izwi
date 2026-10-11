@@ -1,0 +1,252 @@
+//! Shared bookkeeping for Qwen3.6 fused fast paths (MoE experts, DeltaNet
+//! decode, ...).
+//!
+//! Each block resolves at load to [`Qwen36FusedPath::Fused`] or to
+//! [`Qwen36FusedPath::Legacy`] with a reason. A block only takes the fused path
+//! after a self-check on its own device passes, and an environment switch can
+//! force the legacy Candle chain without a code change. Diagnostics aggregate
+//! the per-layer outcomes with [`summarize`].
+
+use crate::backends::BackendKind;
+use crate::error::{Error, Result};
+use crate::performance::{CudaPerformanceConfig, OptimizationMode};
+
+/// Execution path a block resolved to at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Qwen36FusedPath {
+    Fused,
+    Legacy { reason: String },
+}
+
+impl Qwen36FusedPath {
+    pub(crate) fn legacy(reason: impl Into<String>) -> Self {
+        Self::Legacy {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn is_fused(&self) -> bool {
+        matches!(self, Self::Fused)
+    }
+}
+
+/// The global CUDA performance switches as they apply to the Qwen3.6 fast
+/// paths: `cuda.mode=off` turns all of them off, `cuda.fused_decode` the
+/// fused decode kernels (DeltaNet, norms, q/k RoPE, vectorized GEMV) and
+/// `cuda.packed_projections` the packed projections, `cuda.decode_graphs` the
+/// piecewise CUDA graph decode. Like qwen38's, they bind
+/// on CUDA only; the `IZWI_QWEN36_*` switches bind on every device. Each field
+/// is the reason its path is off, if it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Qwen36CudaSwitches {
+    pub(crate) moe_off: Option<&'static str>,
+    pub(crate) fused_decode_off: Option<&'static str>,
+    pub(crate) packed_off: Option<&'static str>,
+    pub(crate) graphs_off: Option<&'static str>,
+}
+
+impl Qwen36CudaSwitches {
+    pub(crate) fn from_performance(
+        backend: BackendKind,
+        performance: &CudaPerformanceConfig,
+    ) -> Self {
+        if backend != BackendKind::Cuda {
+            return Self::default();
+        }
+        let off = |mode: OptimizationMode, reason: &'static str| {
+            if !performance.enabled() {
+                Some("cuda.mode=off")
+            } else {
+                (!mode.enabled()).then_some(reason)
+            }
+        };
+        Self {
+            moe_off: (!performance.enabled()).then_some("cuda.mode=off"),
+            fused_decode_off: off(performance.fused_decode, "cuda.fused_decode=off"),
+            packed_off: off(
+                performance.packed_projections,
+                "cuda.packed_projections=off",
+            ),
+            graphs_off: off(performance.decode_graphs, "cuda.decode_graphs=off"),
+        }
+    }
+}
+
+/// Whether the environment switch `var` asks for the legacy path
+/// (`legacy`, `off`, `0` or `false`, case-insensitive).
+pub(crate) fn legacy_requested(var: &str) -> bool {
+    legacy_value(std::env::var(var).ok().as_deref())
+}
+
+pub(crate) fn legacy_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "legacy" | "off" | "0" | "false"
+        )
+    })
+}
+
+/// Diagnostics summary over per-layer paths: overall backend
+/// (`fused`/`legacy`/`mixed`/`none`), layer counts, and distinct reasons.
+pub(crate) fn summarize<'a>(
+    paths: impl IntoIterator<Item = &'a Qwen36FusedPath>,
+) -> serde_json::Value {
+    let mut fused = 0usize;
+    let mut legacy = 0usize;
+    let mut reasons: Vec<&str> = Vec::new();
+    for path in paths {
+        match path {
+            Qwen36FusedPath::Fused => fused += 1,
+            Qwen36FusedPath::Legacy { reason } => {
+                legacy += 1;
+                if !reasons.contains(&reason.as_str()) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    }
+    let backend = match (fused, legacy) {
+        (0, 0) => "none",
+        (_, 0) => "fused",
+        (0, _) => "legacy",
+        _ => "mixed",
+    };
+    serde_json::json!({
+        "backend": backend,
+        "fused_layers": fused,
+        "legacy_layers": legacy,
+        "legacy_reasons": reasons,
+    })
+}
+
+/// Self-check comparison of a fused output against its reference: relative L2
+/// error at most `rel_l2`, every element within `max_frac` of the largest
+/// reference magnitude, and no non-finite values.
+pub(crate) fn compare_values(
+    label: &str,
+    actual: &[f32],
+    expected: &[f32],
+    rel_l2: f64,
+    max_frac: f32,
+) -> Result<()> {
+    if actual.len() != expected.len() {
+        return Err(Error::InferenceError(format!(
+            "{label}: {} values vs {} in the reference",
+            actual.len(),
+            expected.len()
+        )));
+    }
+    let mut err = 0f64;
+    let mut norm = 0f64;
+    let mut max_ref = 0f32;
+    let mut max_err = 0f32;
+    for (a, b) in actual.iter().zip(expected) {
+        if !a.is_finite() {
+            return Err(Error::InferenceError(format!(
+                "{label}: fused path produced a non-finite value"
+            )));
+        }
+        err += f64::from(a - b).powi(2);
+        norm += f64::from(*b).powi(2);
+        max_ref = max_ref.max(b.abs());
+        max_err = max_err.max((a - b).abs());
+    }
+    let observed = (err / norm.max(f64::MIN_POSITIVE)).sqrt();
+    if observed > rel_l2 || max_err > max_frac * max_ref.max(f32::MIN_POSITIVE) {
+        return Err(Error::InferenceError(format!(
+            "{label}: fused output diverges from the reference: relative L2 {observed:.4}, max error {max_err} vs max |ref| {max_ref}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_switches_bind_on_cuda_only() {
+        let mut performance = CudaPerformanceConfig::default();
+        for backend in [BackendKind::Cuda, BackendKind::Metal, BackendKind::Cpu] {
+            assert_eq!(
+                Qwen36CudaSwitches::from_performance(backend, &performance),
+                Qwen36CudaSwitches::default()
+            );
+        }
+        performance.fused_decode = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.fused_decode_off, Some("cuda.fused_decode=off"));
+        assert_eq!((switches.moe_off, switches.packed_off), (None, None));
+        assert_eq!(switches.graphs_off, None);
+        assert_eq!(
+            Qwen36CudaSwitches::from_performance(BackendKind::Metal, &performance),
+            Qwen36CudaSwitches::default()
+        );
+
+        performance.fused_decode = OptimizationMode::Auto;
+        performance.decode_graphs = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.graphs_off, Some("cuda.decode_graphs=off"));
+        assert_eq!(switches.fused_decode_off, None);
+        performance.decode_graphs = OptimizationMode::Auto;
+
+        performance.fused_decode = OptimizationMode::Auto;
+        performance.packed_projections = OptimizationMode::Off;
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.packed_off, Some("cuda.packed_projections=off"));
+        assert_eq!((switches.moe_off, switches.fused_decode_off), (None, None));
+
+        // `cuda.mode=off` turns everything off, normalized or not.
+        let performance = CudaPerformanceConfig {
+            mode: OptimizationMode::Off,
+            ..CudaPerformanceConfig::default()
+        };
+        let switches = Qwen36CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(
+            switches,
+            Qwen36CudaSwitches {
+                moe_off: Some("cuda.mode=off"),
+                fused_decode_off: Some("cuda.mode=off"),
+                packed_off: Some("cuda.mode=off"),
+                graphs_off: Some("cuda.mode=off"),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_switch_values() {
+        for value in ["legacy", " OFF ", "0", "False"] {
+            assert!(legacy_value(Some(value)), "{value}");
+        }
+        for value in ["auto", "1", "fused", ""] {
+            assert!(!legacy_value(Some(value)), "{value}");
+        }
+        assert!(!legacy_value(None));
+    }
+
+    #[test]
+    fn summary_reports_mixed_paths_with_distinct_reasons() {
+        let paths = [
+            Qwen36FusedPath::Fused,
+            Qwen36FusedPath::legacy("a"),
+            Qwen36FusedPath::legacy("a"),
+            Qwen36FusedPath::legacy("b"),
+        ];
+        let summary = summarize(&paths);
+        assert_eq!(summary["backend"], "mixed");
+        assert_eq!(summary["fused_layers"], 1);
+        assert_eq!(summary["legacy_layers"], 3);
+        assert_eq!(summary["legacy_reasons"], serde_json::json!(["a", "b"]));
+        assert_eq!(summarize(&[])["backend"], "none");
+    }
+
+    #[test]
+    fn compare_rejects_wrong_outputs_and_accepts_rounding_noise() {
+        let reference = [1.0f32, -2.0, 0.5, 4.0];
+        assert!(compare_values("t", &[1.004, -2.01, 0.498, 4.02], &reference, 0.03, 0.08).is_ok());
+        assert!(compare_values("t", &[-1.0, 2.0, 0.5, 4.0], &reference, 0.03, 0.08).is_err());
+        assert!(compare_values("t", &[f32::NAN, -2.0, 0.5, 4.0], &reference, 0.03, 0.08).is_err());
+        assert!(compare_values("t", &[1.0], &reference, 0.03, 0.08).is_err());
+    }
+}

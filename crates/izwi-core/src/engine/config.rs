@@ -510,7 +510,19 @@ impl EngineCoreConfig {
         self.max_seq_len = CUDA_MAX_NATIVE_CONTEXT_TOKENS;
         let page_tokens = self.block_size.max(1);
         let required_pages = self.max_seq_len.div_ceil(page_tokens);
-        self.max_blocks = self.max_blocks.max(required_pages);
+        // The prefix-cache budget must fit beside one maximum-length request
+        // (the policy resolver reserves that request's pages). Without the
+        // headroom, prefix reuse resolves to a zero budget on CUDA, and
+        // explicit enablement fails startup. The arena grows on demand, so
+        // this raises the logical cap only.
+        let prefix_pages = if self.enable_prefix_caching {
+            self.max_prefix_cache_pages
+        } else {
+            0
+        };
+        self.max_blocks = self
+            .max_blocks
+            .max(required_pages.saturating_add(prefix_pages));
     }
 
     pub fn resolved_kv_cache_policy(&self) -> Result<ResolvedKvCachePolicy> {
@@ -701,6 +713,30 @@ mod managed_kv_default_tests {
 
         assert_eq!(config.max_seq_len, CUDA_MAX_NATIVE_CONTEXT_TOKENS);
         assert_eq!(config.max_blocks, 4096);
+    }
+
+    #[test]
+    fn cuda_context_capacity_leaves_room_for_the_prefix_cache() {
+        let mut config = EngineCoreConfig {
+            backend: BackendKind::Cuda,
+            block_size: 64,
+            max_blocks: 1024,
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            max_prefix_cache_pages: 256,
+            ..EngineCoreConfig::default()
+        };
+
+        config.apply_backend_context_capacity(4096);
+
+        assert_eq!(config.max_blocks, 4096 + 256);
+        let policy = config
+            .resolved_kv_cache_policy()
+            .expect("explicit prefix caching fits beside a max-length request");
+        assert!(matches!(
+            policy.effective.prefix,
+            crate::config::PrefixCachePolicy::Namespaced { max_pages: 256, .. }
+        ));
     }
 
     #[test]

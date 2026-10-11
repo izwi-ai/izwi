@@ -543,6 +543,11 @@ struct RequestMetadata {
     /// The first prefill chunk is aligned to this boundary so the committed
     /// tensor state can publish a snapshot for cross-request fork.
     managed_snapshot_prefill_interval: Option<u32>,
+    /// Phase 5a: the prompt's stable-history boundary declared by the
+    /// prepared prompt. A prefill span crossing its interval-aligned floor
+    /// is clipped to end there, so the manager can publish the committed
+    /// tensor snapshot that the conversation's next turn attaches to.
+    managed_snapshot_boundary: Option<u32>,
     /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
     /// are already resident (shared pages plus a forked tensor snapshot), so
     /// the first prefill span starts here instead of zero. `None` means a
@@ -570,6 +575,8 @@ struct RequestCachePolicy {
     /// multi-token quanta are granted inside continuous batches (not only
     /// solo) subject to the fairness gates.
     speculative_decode_batch: bool,
+    /// Model-preferred prefill span for an isolated request (0: none).
+    preferred_prefill_tokens: usize,
 }
 
 impl Default for RequestCachePolicy {
@@ -585,6 +592,7 @@ impl Default for RequestCachePolicy {
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
+            preferred_prefill_tokens: 0,
         }
     }
 }
@@ -738,6 +746,7 @@ impl Scheduler {
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
+            managed_snapshot_boundary: request.managed_snapshot_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
         };
 
@@ -803,6 +812,7 @@ impl Scheduler {
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
+                managed_snapshot_boundary: request.managed_snapshot_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
             },
         );
@@ -959,6 +969,7 @@ impl Scheduler {
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
             speculative_decode_batch: profile.speculative_decode_batch,
+            preferred_prefill_tokens: profile.preferred_prefill_tokens,
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -988,6 +999,33 @@ impl Scheduler {
             boundary
         } else {
             target_tokens
+        }
+    }
+
+    /// Phase 5a: clip an incremental prefill span `[start, start + tokens)`
+    /// that crosses the declared history boundary, floored to the snapshot
+    /// interval, so it ends exactly on it. Spans that end at or before it, or
+    /// start at or past it, keep their exact length.
+    fn clip_prefill_to_snapshot_boundary(
+        metadata: &RequestMetadata,
+        start: usize,
+        tokens: usize,
+    ) -> usize {
+        let (Some(interval), Some(boundary)) = (
+            metadata.managed_snapshot_prefill_interval,
+            metadata.managed_snapshot_boundary,
+        ) else {
+            return tokens;
+        };
+        if metadata.cache_policy.prefill != PrefillMode::Incremental || interval < 2 {
+            return tokens;
+        }
+        let (interval, boundary) = (interval as usize, boundary as usize);
+        let aligned = boundary - boundary % interval;
+        if aligned > start && aligned < start.saturating_add(tokens) {
+            aligned - start
+        } else {
+            tokens
         }
     }
 
@@ -1565,11 +1603,17 @@ impl Scheduler {
                 continue;
             }
             let mut target_tokens = remaining_prompt;
+            let (chunk_threshold, prefill_budget) = self.prefill_chunk_for(
+                &metadata,
+                effective_prefill_chunk_threshold,
+                has_decode_demand,
+                remaining_prefill_budget,
+            );
             if !full_prefill
                 && self.config.enable_chunked_prefill
-                && target_tokens > effective_prefill_chunk_threshold
+                && target_tokens > chunk_threshold
             {
-                target_tokens = effective_prefill_chunk_threshold;
+                target_tokens = chunk_threshold;
             }
             if full_prefill {
                 if !result.decode_requests.is_empty()
@@ -1580,7 +1624,7 @@ impl Scheduler {
                 scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens
-                    .min(remaining_prefill_budget)
+                    .min(prefill_budget)
                     .min(metadata.workspace_prefill_token_cap.unwrap_or(usize::MAX));
             }
             if target_tokens == 0 {
@@ -1589,6 +1633,8 @@ impl Scheduler {
 
             let target_tokens =
                 Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
+            let target_tokens =
+                Self::clip_prefill_to_snapshot_boundary(&metadata, num_computed, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             self.record_prefill_backoff(original_target_tokens, num_tokens);
@@ -1675,13 +1721,19 @@ impl Scheduler {
                 .unwrap_or(0)
                 .min(metadata.prefill_tokens().saturating_sub(1));
             let mut target_tokens = metadata.prefill_tokens().saturating_sub(prefix_start);
+            let (chunk_threshold, prefill_budget) = self.prefill_chunk_for(
+                &metadata,
+                effective_prefill_chunk_threshold,
+                has_decode_demand,
+                remaining_prefill_budget,
+            );
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
                 && self.config.enable_chunked_prefill
-                && target_tokens > effective_prefill_chunk_threshold
+                && target_tokens > chunk_threshold
             {
-                target_tokens = effective_prefill_chunk_threshold;
+                target_tokens = chunk_threshold;
             }
 
             // Full-prefill executors cannot honor a scheduler chunk. Permit one
@@ -1696,7 +1748,7 @@ impl Scheduler {
                 scheduling_full_prefill_batch = true;
             } else {
                 target_tokens = target_tokens
-                    .min(remaining_prefill_budget)
+                    .min(prefill_budget)
                     .min(metadata.workspace_prefill_token_cap.unwrap_or(usize::MAX));
             }
             if target_tokens == 0 {
@@ -1705,6 +1757,8 @@ impl Scheduler {
 
             let target_tokens =
                 Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
+            let target_tokens =
+                Self::clip_prefill_to_snapshot_boundary(&metadata, prefix_start, target_tokens);
             let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             let span_end = prefix_start.saturating_add(num_tokens);
@@ -3373,6 +3427,27 @@ impl Scheduler {
         }
     }
 
+    /// The chunk threshold and token budget for one request's prefill span
+    /// this step. A request prefilling alone (nothing decoding, nothing else
+    /// running or waiting) gets its loaded model's preferred span when that
+    /// is wider, and the step budget stretches to it; otherwise the engine's
+    /// threshold and remaining budget apply unchanged.
+    fn prefill_chunk_for(
+        &self,
+        metadata: &RequestMetadata,
+        threshold: usize,
+        has_decode_demand: bool,
+        remaining_budget: usize,
+    ) -> (usize, usize) {
+        let preferred = metadata.cache_policy.preferred_prefill_tokens;
+        let isolated = !has_decode_demand && self.running.len() <= 1 && self.waiting_count() <= 1;
+        if isolated && preferred > threshold {
+            (preferred, remaining_budget.max(preferred))
+        } else {
+            (threshold, remaining_budget)
+        }
+    }
+
     fn effective_prefill_chunk_threshold(&self, has_decode_demand: bool) -> usize {
         let base = if self.config.enable_adaptive_batching {
             self.telemetry.dynamic_prefill_chunk_threshold.max(32)
@@ -3512,14 +3587,72 @@ mod tests {
                 preferred_decode_tokens: 1,
                 sustained_decode_quantum: false,
                 speculative_decode_batch: false,
+                preferred_prefill_tokens: 0,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
+            managed_snapshot_boundary: None,
             managed_prefix_cursor: None,
         }
+    }
+
+    #[test]
+    fn prefill_spans_clip_to_the_declared_history_boundary() {
+        let mut metadata = snapshot_metadata(Some(64), PrefillMode::Incremental);
+        metadata.managed_snapshot_boundary = Some(200);
+        // Aligned boundary 192: a span crossing it ends there.
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 256),
+            192
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 128, 256),
+            64
+        );
+        // Spans ending at or before it, or starting at or past it, keep their length.
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 192),
+            192
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 100),
+            100
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 192, 64),
+            64
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 256, 64),
+            64
+        );
+        // A boundary below one interval floors to zero: nothing to clip.
+        metadata.managed_snapshot_boundary = Some(40);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 256),
+            256
+        );
+        // Without an interval, a boundary, or incremental prefill: unchanged.
+        let mut unshared = snapshot_metadata(None, PrefillMode::Incremental);
+        unshared.managed_snapshot_boundary = Some(200);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&unshared, 0, 256),
+            256
+        );
+        let mut full = snapshot_metadata(Some(64), PrefillMode::Full);
+        full.managed_snapshot_boundary = Some(200);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&full, 0, 256),
+            256
+        );
+        let undeclared = snapshot_metadata(Some(64), PrefillMode::Incremental);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&undeclared, 0, 256),
+            256
+        );
     }
 
     #[test]
@@ -4688,6 +4821,73 @@ mod tests {
             scheduled.prefill_requests[0].num_tokens, 8,
             "scheduler should use its configured token chunk without fake KV pressure"
         );
+    }
+
+    /// A loaded model's preferred prefill span replaces the engine threshold,
+    /// and stretches the step budget, only while its request prefills alone.
+    /// With a peer decoding, a newcomer gets the threshold so the peer's
+    /// tokens are not held behind a wide prefill.
+    #[test]
+    fn preferred_prefill_span_applies_only_to_an_isolated_prefill() {
+        // The engine floors its threshold at 32.
+        let config = || SchedulerConfig {
+            max_batch_size: 2,
+            max_tokens_per_step: 48,
+            min_tokens_per_step: 1,
+            policy: SchedulingPolicy::FCFS,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 32,
+            enable_preemption: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        };
+        let admit = |scheduler: &mut Scheduler, id: &str, prompt: usize, preferred: usize| {
+            let mut request = EngineCoreRequest::tts("prompt");
+            request.id = id.to_string();
+            request.prompt_tokens = vec![7; prompt];
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler.get_sequence_id(&id.to_string()).unwrap();
+            let mut profile =
+                ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+            profile.prefill = PrefillMode::Incremental;
+            profile.preferred_prefill_tokens = preferred;
+            assert!(scheduler
+                .update_execution_profile(&SessionKey::new(id.to_string(), epoch), &profile));
+        };
+
+        // Alone: 80-token spans, past both the threshold (32) and the step
+        // budget (48), for the first span and the ones after it.
+        let mut scheduler = Scheduler::new(config());
+        admit(&mut scheduler, "alone", 200, 80);
+        for (cursor, span) in [(0, 80), (80, 80), (160, 40)] {
+            let row = scheduler.schedule().prefill_requests.remove(0);
+            assert_eq!((row.num_computed_tokens, row.num_tokens), (cursor, span));
+            scheduler.update_after_step(&"alone".to_string(), span, 0, 1.0);
+        }
+
+        // A model without a preference keeps the threshold.
+        let mut scheduler = Scheduler::new(config());
+        admit(&mut scheduler, "plain", 200, 0);
+        assert_eq!(scheduler.schedule().prefill_requests[0].num_tokens, 32);
+
+        // With a peer decoding, the newcomer's span is the threshold.
+        let mut scheduler = Scheduler::new(config());
+        admit(&mut scheduler, "peer", 4, 0);
+        assert_eq!(scheduler.schedule().prefill_requests[0].num_tokens, 4);
+        scheduler.update_after_step(&"peer".to_string(), 4, 1, 1.0);
+        admit(&mut scheduler, "newcomer", 200, 80);
+        let scheduled = scheduler.schedule();
+        assert_eq!(
+            scheduled.decode_requests.len(),
+            1,
+            "the peer keeps decoding"
+        );
+        let newcomer = scheduled
+            .prefill_requests
+            .iter()
+            .find(|row| row.request_id == "newcomer")
+            .expect("the newcomer prefills beside the decode");
+        assert_eq!(newcomer.num_tokens, 32);
     }
 
     #[test]

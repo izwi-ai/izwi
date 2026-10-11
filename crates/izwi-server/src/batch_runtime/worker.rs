@@ -29,6 +29,20 @@ use std::{
 use tokio::{sync::Notify, task::JoinHandle};
 use tracing::{debug, error, info};
 
+/// Every idle slot polls every `poll_interval`, and they all report the same
+/// worker row. An unchanged heartbeat is re-sent at most this often; any
+/// change (status, current stage, leases, slots, errors) is written at once.
+/// Readiness treats a heartbeat as stale after 5 s by default
+/// (`IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS`), so liveness stays fresh while
+/// the shared database no longer takes a commit per slot per poll.
+const HEARTBEAT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The last heartbeat this runner committed and when.
+struct WrittenHeartbeat {
+    update: RegisteredWorkerHeartbeatUpdate,
+    written_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchWorkerConfig {
     pub worker_id: String,
@@ -518,7 +532,7 @@ pub struct BatchWorkerRunner {
     last_maintenance_at: Arc<RwLock<Option<Instant>>>,
     active_executions: Arc<RwLock<HashMap<String, ActiveExecution>>>,
     claim_lock: Arc<tokio::sync::Mutex<()>>,
-    heartbeat_lock: Arc<tokio::sync::Mutex<()>>,
+    last_heartbeat: Arc<tokio::sync::Mutex<Option<WrittenHeartbeat>>>,
     artifact_store: Option<Arc<ArtifactStore>>,
 }
 
@@ -564,7 +578,7 @@ impl BatchWorkerRunner {
             last_maintenance_at: Arc::new(RwLock::new(None)),
             active_executions: Arc::new(RwLock::new(HashMap::new())),
             claim_lock: Arc::new(tokio::sync::Mutex::new(())),
-            heartbeat_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_heartbeat: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -1140,7 +1154,7 @@ impl BatchWorkerRunner {
         status: &str,
         current: Option<(String, String)>,
     ) -> anyhow::Result<()> {
-        let _heartbeat_lock = self.heartbeat_lock.lock().await;
+        let mut last_heartbeat = self.last_heartbeat.lock().await;
         let (current_job_id, current_stage_id) = current
             .map_or((None, None), |(job_id, stage_id)| {
                 (Some(job_id), Some(stage_id))
@@ -1209,22 +1223,32 @@ impl BatchWorkerRunner {
                 "last_claimed_stage_id": health.last_claimed_stage_id,
             }),
         };
+        let update = RegisteredWorkerHeartbeatUpdate {
+            registration,
+            status: status.to_string(),
+            current_job_id,
+            current_stage_id,
+            details,
+            diagnostic_json: serde_json::json!({
+                "capabilities": self.config.capabilities,
+                "model_ids": self.config.model_ids,
+                "stage_kinds": self.config.stage_kinds,
+                "instance_id": self.config.instance_id,
+                "resources": self.config.resources,
+            }),
+        };
+        if last_heartbeat.as_ref().is_some_and(|last| {
+            last.update == update && last.written_at.elapsed() < HEARTBEAT_REFRESH_INTERVAL
+        }) {
+            return Ok(());
+        }
         self.store
-            .upsert_registered_worker_heartbeat(RegisteredWorkerHeartbeatUpdate {
-                registration,
-                status: status.to_string(),
-                current_job_id,
-                current_stage_id,
-                details,
-                diagnostic_json: serde_json::json!({
-                    "capabilities": self.config.capabilities,
-                    "model_ids": self.config.model_ids,
-                    "stage_kinds": self.config.stage_kinds,
-                    "instance_id": self.config.instance_id,
-                    "resources": self.config.resources,
-                }),
-            })
+            .upsert_registered_worker_heartbeat(update.clone())
             .await?;
+        *last_heartbeat = Some(WrittenHeartbeat {
+            update,
+            written_at: Instant::now(),
+        });
         Ok(())
     }
 
@@ -2185,6 +2209,62 @@ mod tests {
             .expect("heartbeat")
             .expect("heartbeat exists");
         assert_eq!(heartbeat.status, "draining");
+    }
+
+    #[tokio::test]
+    async fn idle_polls_refresh_an_unchanged_heartbeat_at_most_once_per_interval() {
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("runtime.sqlite"),
+        ));
+        store.set_test_clock(clock.clone());
+        let store = Arc::new(store);
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            BatchWorkerConfig::local("worker-test"),
+            BatchWorkerHealth::new("worker-test"),
+        );
+        let heartbeat = || async {
+            store
+                .get_worker_heartbeat("worker-test")
+                .await
+                .expect("heartbeat")
+                .expect("heartbeat exists")
+        };
+
+        assert!(!runner.run_once().await.expect("first poll"));
+        assert_eq!(heartbeat().await.last_heartbeat_at, 1_000);
+
+        // Unchanged idle polls inside the refresh interval do not commit.
+        clock.store(2_000, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert!(!runner.run_once().await.expect("idle poll"));
+        }
+        assert_eq!(heartbeat().await.last_heartbeat_at, 1_000);
+
+        // A changed heartbeat is written immediately.
+        runner.drain.begin();
+        assert!(!runner.run_once().await.expect("draining poll"));
+        let draining = heartbeat().await;
+        assert_eq!(draining.status, "draining");
+        assert_eq!(draining.last_heartbeat_at, 2_000);
+
+        // An unchanged heartbeat is refreshed once the interval has elapsed.
+        clock.store(3_000, Ordering::SeqCst);
+        runner
+            .last_heartbeat
+            .lock()
+            .await
+            .as_mut()
+            .expect("written heartbeat")
+            .written_at -= HEARTBEAT_REFRESH_INTERVAL;
+        assert!(!runner.run_once().await.expect("refresh poll"));
+        assert_eq!(heartbeat().await.last_heartbeat_at, 3_000);
     }
 
     #[tokio::test]

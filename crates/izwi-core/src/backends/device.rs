@@ -974,6 +974,39 @@ fn detect_cuda_capabilities(_ordinal: usize) -> CudaProbe {
 mod tests {
     use super::*;
 
+    /// Tensors outlive the thread that made them: results and session state
+    /// cross tokio threads that may never have bound the CUDA context. Candle
+    /// runs on the per-thread default stream, and cudarc's `CudaSlice` drop
+    /// binds the context only through its event waits. With event tracking
+    /// off it frees on the dropping thread's default stream with no current
+    /// context, which fails with `CUDA_ERROR_INVALID_CONTEXT`, leaks the
+    /// allocation and latches the error on the context for the next caller.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_tensors_drop_cleanly_on_threads_without_the_context() {
+        let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+            return;
+        };
+        let context = device
+            .as_cuda_device()
+            .unwrap()
+            .cuda_stream()
+            .context()
+            .clone();
+        assert!(
+            context.is_event_tracking(),
+            "the selected CUDA device must keep cudarc's event tracking"
+        );
+        context
+            .check_err()
+            .expect("no error latched before the drop");
+        let tensor = candle_core::Tensor::zeros(1024, candle_core::DType::F32, &device).unwrap();
+        std::thread::spawn(move || drop(tensor)).join().unwrap();
+        context
+            .check_err()
+            .expect("dropping a tensor on a fresh thread must not latch a CUDA error");
+    }
+
     #[test]
     fn assigned_cpu_selects_cpu_without_accelerator_discovery() {
         let profile =

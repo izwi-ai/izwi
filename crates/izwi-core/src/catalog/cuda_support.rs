@@ -533,7 +533,7 @@ impl ModelVariant {
         if self.is_qwen35_moe_fp8() {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
-                "Qwen3.5/3.6 MoE stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv at load and expands projections to resident BF16, not native FP8 execution",
+                "Qwen3.5/3.6 MoE stores 128x128 block-scaled FP8 Safetensors weights; with CUDA performance optimizations on (the default) projections stay resident as raw block FP8 and the fp8 projection kernel applies weight_scale_inv per GEMM (per-tensor Q8_0 fallback for kernel-incompatible geometry); projection_backend = \"q8\" or disabled optimizations expand them to resident BF16 at load",
             );
         }
 

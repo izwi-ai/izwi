@@ -17,8 +17,15 @@ use crate::kernels::FusedSiluMulResult;
 #[cfg(feature = "cuda")]
 mod epilogues;
 pub mod fp8;
+pub mod gate;
+pub mod gdn;
 pub mod graphs;
+pub mod moe;
+pub mod norm;
+pub mod rope;
 pub mod sampling;
+pub mod segment_graph;
+pub mod split_decode;
 pub mod timing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +543,7 @@ pub fn try_fused_gated_delta_recurrent(
     let gates = g.unsqueeze(1).ok()?;
     let betas = beta.unsqueeze(1).ok()?;
     let (outputs, next_state) =
-        cuda_gated_delta_sequence(&queries, &keys, &values, &gates, &betas, state)?;
+        cuda_gated_delta_sequence(&queries, &keys, &values, &gates, &betas, state, false)?;
     Some((outputs.squeeze(1).ok()?, next_state))
 }
 
@@ -631,13 +638,188 @@ pub fn try_tiled_deltanet_recurrence(
     initial_state: &Tensor,
     tile_size: usize,
 ) -> Option<(Tensor, Tensor)> {
+    if tile_size == 0 {
+        return None;
+    }
+    let seq_len = deltanet_recurrence_sequence(queries, keys, values, g, beta, initial_state)?;
+    let tile_size = tile_size.min(seq_len.max(1));
+    if tile_size >= seq_len {
+        return cuda_gated_delta_sequence(queries, keys, values, g, beta, initial_state, false);
+    }
+
+    let mut outputs = Vec::with_capacity(seq_len.div_ceil(tile_size));
+    let mut state = initial_state.clone();
+    for token_start in (0..seq_len).step_by(tile_size) {
+        let token_count = tile_size.min(seq_len - token_start);
+        let query_tile = queries.narrow(1, token_start, token_count).ok()?;
+        let key_tile = keys.narrow(1, token_start, token_count).ok()?;
+        let value_tile = values.narrow(1, token_start, token_count).ok()?;
+        let g_tile = g.narrow(1, token_start, token_count).ok()?;
+        let beta_tile = beta.narrow(1, token_start, token_count).ok()?;
+        let (output, next_state) = cuda_gated_delta_sequence(
+            &query_tile,
+            &key_tile,
+            &value_tile,
+            &g_tile,
+            &beta_tile,
+            &state,
+            false,
+        )?;
+        outputs.push(output);
+        state = next_state;
+    }
+    let output_refs = outputs.iter().collect::<Vec<_>>();
+    Some((Tensor::cat(&output_refs, 1).ok()?, state))
+}
+
+/// Chunked Gated DeltaNet prefill (FLA's `chunk_gated_delta_rule`, chunk
+/// 64): the same inputs and result as [`try_tiled_deltanet_recurrence`], but
+/// the tokens of a chunk are resolved together (a 64-row forward substitution
+/// and small matmuls) instead of one after another, and each head's state is
+/// split across value-column blocks. `None` when the inputs or the geometry
+/// (key dim a multiple of 32 up to 256, value dim a multiple of 16) do not
+/// fit; the caller keeps the sequential kernel.
+pub fn try_chunked_deltanet_recurrence(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+) -> Option<(Tensor, Tensor)> {
+    deltanet_recurrence_sequence(queries, keys, values, g, beta, initial_state)?;
+    let (_, _, _, key_dim) = queries.dims4().ok()?;
+    let (_, _, _, value_dim) = values.dims4().ok()?;
+    if !chunked_deltanet_supported(key_dim, value_dim) {
+        return None;
+    }
+    cuda_gated_delta_sequence(queries, keys, values, g, beta, initial_state, true)
+}
+
+/// Head geometry the chunked DeltaNet kernels cover.
+pub fn chunked_deltanet_supported(key_dim: usize, value_dim: usize) -> bool {
+    key_dim > 0
+        && key_dim.is_multiple_of(32)
+        && key_dim <= 256
+        && value_dim > 0
+        && value_dim.is_multiple_of(16)
+}
+
+/// Run the chunked DeltaNet kernels on `device` against the sequential kernel
+/// over three chunks (the last partial) at the given head geometry: outputs
+/// and the final state must agree to float rounding.
+pub fn verify_chunked_deltanet(
+    device: &candle_core::Device,
+    heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> std::result::Result<(), String> {
+    const SEQUENCE: usize = 150;
+    let fail = |error: candle_core::Error| error.to_string();
+    let wave = |n: usize, seed: f32, scale: f32| {
+        (0..n)
+            .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+            .collect::<Vec<_>>()
+    };
+    let unit = |seed: f32| -> std::result::Result<Tensor, String> {
+        let raw = Tensor::from_vec(
+            wave(SEQUENCE * heads * key_dim, seed, 1.0),
+            (1, SEQUENCE, heads, key_dim),
+            device,
+        )
+        .map_err(fail)?;
+        let norm = raw
+            .sqr()
+            .and_then(|x| x.sum_keepdim(3))
+            .and_then(|x| x.sqrt())
+            .map_err(fail)?;
+        raw.broadcast_div(&norm).map_err(fail)
+    };
+    let queries = unit(0.0)?;
+    let keys = unit(7.0)?;
+    let values = Tensor::from_vec(
+        wave(SEQUENCE * heads * value_dim, 3.0, 0.5),
+        (1, SEQUENCE, heads, value_dim),
+        device,
+    )
+    .map_err(fail)?;
+    let g = Tensor::from_vec(
+        wave(SEQUENCE * heads, 11.0, 0.25)
+            .into_iter()
+            .map(|x| -x.abs() - 0.01)
+            .collect(),
+        (1, SEQUENCE, heads),
+        device,
+    )
+    .map_err(fail)?;
+    let beta = Tensor::from_vec(
+        wave(SEQUENCE * heads, 5.0, 0.45)
+            .into_iter()
+            .map(|x| 0.5 + x)
+            .collect(),
+        (1, SEQUENCE, heads),
+        device,
+    )
+    .map_err(fail)?;
+    let initial = Tensor::from_vec(
+        wave(heads * key_dim * value_dim, 13.0, 0.1),
+        (1, heads, key_dim, value_dim),
+        device,
+    )
+    .map_err(fail)?;
+    let chunked = try_chunked_deltanet_recurrence(&queries, &keys, &values, &g, &beta, &initial)
+        .ok_or("the chunked DeltaNet kernels refused the probe")?;
+    let sequential =
+        cuda_gated_delta_sequence(&queries, &keys, &values, &g, &beta, &initial, false)
+            .ok_or("the sequential DeltaNet kernel refused the probe")?;
+    let host = |tensor: &Tensor| -> std::result::Result<Vec<f32>, String> {
+        tensor
+            .flatten_all()
+            .and_then(|x| x.to_vec1::<f32>())
+            .map_err(fail)
+    };
+    for (name, actual, expected) in [
+        ("output", &chunked.0, &sequential.0),
+        ("state", &chunked.1, &sequential.1),
+    ] {
+        let (actual, expected) = (host(actual)?, host(expected)?);
+        let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let error = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, e)| {
+                if (a - e).is_finite() {
+                    (a - e).abs()
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0f32, f32::max);
+        if !error.is_finite() || error > 1e-4 * scale {
+            return Err(format!(
+                "chunked DeltaNet {name} differs from the sequential kernel by {error} (max |ref| {scale})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The sequence length of a DeltaNet recurrence the CUDA sequence kernels
+/// accept: F32 CUDA tensors, batch 1, matching shapes.
+fn deltanet_recurrence_sequence(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+) -> Option<usize> {
     if !cuda_tensor_pair_supported(queries, keys)
         || !cuda_tensor_pair_supported(queries, values)
         || !cuda_tensor_pair_supported(queries, g)
         || !cuda_tensor_pair_supported(queries, beta)
         || !cuda_tensor_pair_supported(queries, initial_state)
         || queries.dtype() != DType::F32
-        || tile_size == 0
     {
         return None;
     }
@@ -671,34 +853,7 @@ pub fn try_tiled_deltanet_recurrence(
     if s_head_k_dim != head_k_dim || s_head_v_dim != v_head_dim {
         return None;
     }
-
-    let tile_size = tile_size.min(seq_len.max(1));
-    if tile_size >= seq_len {
-        return cuda_gated_delta_sequence(queries, keys, values, g, beta, initial_state);
-    }
-
-    let mut outputs = Vec::with_capacity(seq_len.div_ceil(tile_size));
-    let mut state = initial_state.clone();
-    for token_start in (0..seq_len).step_by(tile_size) {
-        let token_count = tile_size.min(seq_len - token_start);
-        let query_tile = queries.narrow(1, token_start, token_count).ok()?;
-        let key_tile = keys.narrow(1, token_start, token_count).ok()?;
-        let value_tile = values.narrow(1, token_start, token_count).ok()?;
-        let g_tile = g.narrow(1, token_start, token_count).ok()?;
-        let beta_tile = beta.narrow(1, token_start, token_count).ok()?;
-        let (output, next_state) = cuda_gated_delta_sequence(
-            &query_tile,
-            &key_tile,
-            &value_tile,
-            &g_tile,
-            &beta_tile,
-            &state,
-        )?;
-        outputs.push(output);
-        state = next_state;
-    }
-    let output_refs = outputs.iter().collect::<Vec<_>>();
-    Some((Tensor::cat(&output_refs, 1).ok()?, state))
+    Some(seq_len)
 }
 
 fn validate_cuda_paged_decode_metadata(
@@ -1724,6 +1879,7 @@ fn cuda_gated_delta_sequence(
     g: &Tensor,
     beta: &Tensor,
     initial_state: &Tensor,
+    chunked: bool,
 ) -> Option<(Tensor, Tensor)> {
     let (batch, sequence, heads, key_dim) = queries.dims4().ok()?;
     let (key_batch, key_sequence, key_heads, key_width) = keys.dims4().ok()?;
@@ -1769,6 +1925,7 @@ fn cuda_gated_delta_sequence(
                 heads,
                 key_dim,
                 value_dim,
+                chunked,
             },
         )
         .ok()?;
@@ -2093,6 +2250,8 @@ struct CudaGatedDeltaSequenceOp {
     heads: usize,
     key_dim: usize,
     value_dim: usize,
+    /// The chunked kernels (batch 1) rather than the sequential one.
+    chunked: bool,
 }
 
 struct CudaQwen38DeltaNetDecodeOp {
@@ -2192,6 +2351,85 @@ impl CustomOp3 for CudaQwen38DeltaNetDecodeOp {
     }
 }
 
+impl CudaGatedDeltaSequenceOp {
+    /// The chunked pair: per-chunk gamma, A and P for every chunk at once,
+    /// then the in-order scan over chunks (see `qwen35.cu`).
+    #[cfg(feature = "cuda")]
+    fn launch_chunked(
+        &self,
+        device: &candle_core::CudaDevice,
+        qkv: &candle_core::cuda_backend::cudarc::driver::CudaView<'_, f32>,
+        gates: &candle_core::cuda_backend::cudarc::driver::CudaView<'_, f32>,
+        state: &candle_core::cuda_backend::cudarc::driver::CudaView<'_, f32>,
+        output: &candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>,
+    ) -> candle_core::Result<()> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+        const CHUNK: usize = 64;
+        const COLUMNS: usize = 16;
+        if self.batch != 1 || !chunked_deltanet_supported(self.key_dim, self.value_dim) {
+            candle_core::bail!("the chunked DeltaNet kernels take batch 1 and a supported geometry")
+        }
+        let chunks = self.sequence.div_ceil(CHUNK);
+        let chunk_heads = chunks * self.heads;
+        // SAFETY: the prepare kernel writes every element of all three
+        // buffers before the scan kernel reads them.
+        let gamma = unsafe { device.alloc::<f32>(chunk_heads * CHUNK)? };
+        let a = unsafe { device.alloc::<f32>(chunk_heads * CHUNK * CHUNK)? };
+        let p = unsafe { device.alloc::<f32>(chunk_heads * CHUNK * CHUNK)? };
+        let (sequence, heads, key_dim, value_dim) = (
+            self.sequence as i32,
+            self.heads as i32,
+            self.key_dim as i32,
+            self.value_dim as i32,
+        );
+
+        let prepare = device.get_or_load_custom_func(
+            "qwen35_gated_delta_chunk_prepare_f32",
+            "izwi_qwen35_gated_delta_sequence",
+            cuda_ptx::QWEN35,
+        )?;
+        let mut builder = prepare.builder();
+        builder.arg(qkv);
+        builder.arg(gates);
+        builder.arg(&gamma);
+        builder.arg(&a);
+        builder.arg(&p);
+        candle_core::builder_arg!(builder, sequence, heads, key_dim, value_dim);
+        let config = LaunchConfig {
+            grid_dim: (chunks as u32, self.heads as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: argument types and launch dimensions match the kernel.
+        unsafe { builder.launch(config) }.w()?;
+
+        let scan = device.get_or_load_custom_func(
+            "qwen35_gated_delta_chunk_scan_f32",
+            "izwi_qwen35_gated_delta_sequence",
+            cuda_ptx::QWEN35,
+        )?;
+        let mut builder = scan.builder();
+        builder.arg(qkv);
+        builder.arg(gates);
+        builder.arg(state);
+        builder.arg(&gamma);
+        builder.arg(&a);
+        builder.arg(&p);
+        builder.arg(output);
+        candle_core::builder_arg!(builder, sequence, heads, key_dim, value_dim);
+        let config = LaunchConfig {
+            grid_dim: (self.heads as u32, (self.value_dim / COLUMNS) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: argument types and launch dimensions match the kernel; the
+        // scan is queued after the prepare kernel on the same stream.
+        unsafe { builder.launch(config) }.w()?;
+        Ok(())
+    }
+}
+
 impl CustomOp3 for CudaGatedDeltaSequenceOp {
     fn name(&self) -> &'static str {
         "qwen35-gated-delta-sequence"
@@ -2246,6 +2484,16 @@ impl CustomOp3 for CudaGatedDeltaSequenceOp {
         let state_elements = self.batch * self.heads * self.key_dim * self.value_dim;
         // SAFETY: the custom kernel writes every element before the storage is observed.
         let output = unsafe { device.alloc::<f32>(output_elements + state_elements)? };
+        if self.chunked {
+            self.launch_chunked(device, &qkv_slice, &gates_slice, &state_slice, &output)?;
+            return Ok((
+                candle_core::CudaStorage {
+                    slice: CudaStorageSlice::F32(output),
+                    device: device.clone(),
+                },
+                Shape::from_dims(&[output_elements + state_elements]),
+            ));
+        }
         let function = device.get_or_load_custom_func(
             "qwen35_gated_delta_sequence_f32",
             "izwi_qwen35_gated_delta_sequence",
@@ -2851,6 +3099,19 @@ mod cuda_ptx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_deltanet_geometry_covers_the_trunk_heads_and_rejects_the_rest() {
+        assert!(chunked_deltanet_supported(128, 128));
+        assert!(chunked_deltanet_supported(64, 16));
+        assert!(chunked_deltanet_supported(256, 32));
+        for (key_dim, value_dim) in [(0, 128), (96 + 1, 128), (288, 128), (128, 8), (128, 0)] {
+            assert!(
+                !chunked_deltanet_supported(key_dim, value_dim),
+                "{key_dim}x{value_dim}"
+            );
+        }
+    }
 
     #[test]
     fn cuda_kernel_status_is_explicit() {
@@ -3733,11 +3994,20 @@ mod qwen35_tiled_recurrence_device_tests {
         let initial = Tensor::from_vec(initial, (1, HEADS, KEY_DIM, VALUE_DIM), &device).unwrap();
         let initial_before = initial.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
 
-        for tile_size in [SEQ, 17] {
-            let (output, next_state) = try_tiled_deltanet_recurrence(
-                &queries, &keys, &values, &gates, &betas, &initial, tile_size,
-            )
-            .unwrap_or_else(|| panic!("tiled recurrence must engage on CUDA (tile {tile_size})"));
+        // Tile sizes, then 0 for the chunked kernels (two chunks at SEQ = 96,
+        // the second partial).
+        for tile_size in [SEQ, 17, 0] {
+            let (output, next_state) = if tile_size == 0 {
+                try_chunked_deltanet_recurrence(&queries, &keys, &values, &gates, &betas, &initial)
+                    .expect("chunked recurrence must engage on CUDA")
+            } else {
+                try_tiled_deltanet_recurrence(
+                    &queries, &keys, &values, &gates, &betas, &initial, tile_size,
+                )
+                .unwrap_or_else(|| {
+                    panic!("tiled recurrence must engage on CUDA (tile {tile_size})")
+                })
+            };
             assert_eq!(output.dims(), [1, SEQ, HEADS, VALUE_DIM]);
             assert_eq!(next_state.dims(), [1, HEADS, KEY_DIM, VALUE_DIM]);
             let actual_output = output

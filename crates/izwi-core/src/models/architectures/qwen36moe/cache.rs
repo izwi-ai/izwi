@@ -1,0 +1,424 @@
+//! Semantic cache domains for Qwen3.6-MoE's hybrid decoder.
+//!
+//! Full-attention pages, recurrent state, and convolution history advance in
+//! one consistency group and are committed by the managed runtime transaction.
+
+use candle_core::DType;
+
+use crate::error::{Error, Result};
+use crate::kv::v2::{
+    AttentionMask, AttentionPattern, BoundedShape, CheckpointPolicy, InferenceStateContract,
+    KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec, PagedAttentionLayerSpec,
+    PlacementPolicy, PositionSemantics, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent,
+    StateClock,
+    StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
+    StateGroupSpec, StateScope, TensorComponentSpec, TensorRole, TensorStateDomainSpec,
+    CURRENT_INFERENCE_STATE_ABI,
+};
+
+use super::exec::Qwen36TextConfig;
+
+pub(crate) const FULL_ATTENTION_DOMAIN: StateDomainId = StateDomainId::new(1);
+pub(crate) const RECURRENT_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
+pub(crate) const CONVOLUTION_STATE_DOMAIN: StateDomainId = StateDomainId::new(3);
+/// MTP draft attention: one paged layer at model_layer = block_count, part
+/// of the same consistency group. Present only when the draft head loads.
+pub(crate) const MTP_ATTENTION_DOMAIN: StateDomainId = StateDomainId::new(4);
+
+pub(crate) fn qwen35_composite_cache_contract(
+    config: &Qwen36TextConfig,
+    attention_dtype: DType,
+    preferred_page_tokens: usize,
+) -> Result<InferenceStateContract> {
+    qwen35_composite_cache_contract_with_mtp(
+        config,
+        attention_dtype,
+        preferred_page_tokens,
+        false,
+        false,
+    )
+}
+
+/// `mtp` appends the draft layer's paged domain (model_layer = block_count)
+/// to the consistency group. MTP state never shares prefixes.
+///
+/// `prefix_caching` (Phase 5a) shares committed prefixes across requests as
+/// Qwen3.8 does (DS1.2b): the attention domain publishes committed pages and
+/// the recurrent/convolution domains publish transactional snapshots at page
+/// boundaries. A loaded MTP head keeps every domain private.
+pub(crate) fn qwen35_composite_cache_contract_with_mtp(
+    config: &Qwen36TextConfig,
+    attention_dtype: DType,
+    preferred_page_tokens: usize,
+    mtp: bool,
+    prefix_caching: bool,
+) -> Result<InferenceStateContract> {
+    if config.full_attention_interval == 0 {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 composite cache requires a non-zero full-attention interval".into(),
+        ));
+    }
+    if config.ssm_time_step_rank == 0
+        || !config
+            .ssm_inner_size
+            .is_multiple_of(config.ssm_time_step_rank)
+    {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 composite cache has invalid recurrent head geometry".into(),
+        ));
+    }
+
+    let dtype = storage_dtype(attention_dtype)?;
+    let query_heads = as_u32(config.attention_head_count, "query head count")?;
+    let kv_heads = as_u32(config.attention_head_count_kv, "KV head count")?;
+    let key_head_dim = as_u32(config.attention_key_length, "key head dimension")?;
+    let value_head_dim = as_u32(config.attention_value_length, "value head dimension")?;
+    let rotary_dim = as_u32(config.rope_dimension_count, "rotary dimension")?;
+    let preferred = as_u32(preferred_page_tokens.max(1), "page size")?;
+
+    let mut attention_layers = Vec::new();
+    let mut recurrent_layers = Vec::new();
+    let mut convolution_layers = Vec::new();
+    let recurrent_elements = checked_product(&[
+        config.ssm_time_step_rank,
+        config.ssm_state_size,
+        config.ssm_inner_size / config.ssm_time_step_rank,
+    ])?;
+    let convolution_width = config
+        .ssm_state_size
+        .checked_mul(config.ssm_group_count)
+        .and_then(|keys| keys.checked_mul(2))
+        .and_then(|keys| keys.checked_add(config.ssm_inner_size))
+        .ok_or_else(|| Error::InvalidInput("Qwen3.5 convolution width overflow".into()))?;
+    let convolution_elements = convolution_width
+        .checked_mul(config.ssm_conv_kernel.saturating_sub(1))
+        .ok_or_else(|| Error::InvalidInput("Qwen3.5 convolution state overflow".into()))?;
+
+    for layer in 0..config.block_count {
+        let model_layer = as_u32(layer, "model layer")?;
+        if (layer + 1).is_multiple_of(config.full_attention_interval) {
+            attention_layers.push(PagedAttentionLayerSpec {
+                model_layer,
+                query_heads,
+                kv_heads,
+                key_head_dim,
+                value_head_dim,
+                pattern: AttentionPattern::Full,
+                mask: AttentionMask::Causal,
+                key_encoding: KeyEncoding::Rotary { rotary_dim },
+                attention_logit_softcap: None,
+            });
+        } else {
+            recurrent_layers.push((model_layer, recurrent_elements));
+            convolution_layers.push((
+                model_layer,
+                u64::try_from(convolution_elements).map_err(|_| {
+                    Error::InvalidInput("Qwen3.5 convolution state exceeds u64".into())
+                })?,
+            ));
+        }
+    }
+    if attention_layers.is_empty() || recurrent_layers.is_empty() {
+        return Err(Error::InvalidInput(
+            "Qwen3.5 composite cache requires both full-attention and linear layers".into(),
+        ));
+    }
+
+    let share_prefixes = prefix_caching && !mtp;
+    let attention_prefix = if share_prefixes {
+        PrefixPolicy::CommittedPages {
+            positions: PositionSemantics::Absolute,
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let tensor_prefix = if share_prefixes {
+        PrefixPolicy::CommittedSnapshots {
+            interval_steps: u64::from(preferred),
+        }
+    } else {
+        PrefixPolicy::Disabled
+    };
+    let retained_header = |id, prefix: PrefixPolicy| StateDomainHeader {
+        id,
+        scope: StateScope::Retained,
+        clock: StateClock::DecoderTokens,
+        placement: PlacementPolicy::BackendLocalWithHostOffload,
+        prefix,
+        checkpoint: CheckpointPolicy::Transactional,
+    };
+    let tensor_components = |layers: &[(u32, u64)], role: TensorRole| {
+        layers
+            .iter()
+            .enumerate()
+            .map(|(index, (_, elements))| {
+                Ok(TensorComponentSpec {
+                    id: StateComponentId::new(u32::try_from(index + 1).map_err(|_| {
+                        Error::InvalidInput("Qwen3.5 state component count exceeds u32".into())
+                    })?),
+                    role: role.clone(),
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: *elements },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let paged_page_size = PageSizeConstraint {
+        min_tokens: 1,
+        preferred_tokens: preferred,
+        max_tokens: preferred.max(256),
+        multiple_of: 1,
+    };
+    let mut domain_specs = vec![StateDomainSpec::PagedAttention(
+        PagedAttentionDomainSpec {
+            header: retained_header(FULL_ATTENTION_DOMAIN, attention_prefix),
+            layers: attention_layers.clone(),
+            page_size: paged_page_size,
+            accepted_dtypes: vec![dtype],
+        },
+    )];
+    domain_specs.push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+        header: retained_header(RECURRENT_STATE_DOMAIN, tensor_prefix.clone()),
+        components: tensor_components(&recurrent_layers, TensorRole::RecurrentHidden)?,
+    }));
+    domain_specs.push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+        header: retained_header(CONVOLUTION_STATE_DOMAIN, tensor_prefix),
+        components: tensor_components(&convolution_layers, TensorRole::ConvolutionState)?,
+    }));
+    if mtp {
+        domain_specs.push(StateDomainSpec::PagedAttention(PagedAttentionDomainSpec {
+            header: StateDomainHeader {
+                id: MTP_ATTENTION_DOMAIN,
+                scope: StateScope::Retained,
+                clock: StateClock::DecoderTokens,
+                placement: PlacementPolicy::BackendLocalWithHostOffload,
+                prefix: PrefixPolicy::Disabled,
+                checkpoint: CheckpointPolicy::Transactional,
+            },
+            layers: vec![PagedAttentionLayerSpec {
+                model_layer: as_u32(config.block_count, "model layer")?,
+                query_heads,
+                kv_heads,
+                key_head_dim,
+                value_head_dim,
+                pattern: AttentionPattern::Full,
+                mask: AttentionMask::Causal,
+                key_encoding: KeyEncoding::Rotary { rotary_dim },
+                attention_logit_softcap: None,
+            }],
+            page_size: paged_page_size,
+            accepted_dtypes: vec![dtype],
+        }));
+    }
+    let mut group_domains = vec![
+        FULL_ATTENTION_DOMAIN,
+        RECURRENT_STATE_DOMAIN,
+        CONVOLUTION_STATE_DOMAIN,
+    ];
+    if mtp {
+        group_domains.push(MTP_ATTENTION_DOMAIN);
+    }
+    let contract = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains: domain_specs,
+        groups: vec![StateGroupSpec {
+            id: StateGroupId::new(1),
+            domains: group_domains,
+            prefix_shareable: false,
+        }],
+    };
+    contract.validate()?;
+    Ok(contract)
+}
+
+fn storage_dtype(dtype: DType) -> Result<StateDType> {
+    match dtype {
+        DType::F32 => Ok(StateDType::F32),
+        DType::F16 => Ok(StateDType::F16),
+        DType::BF16 => Ok(StateDType::Bf16),
+        dtype => Err(Error::InvalidInput(format!(
+            "Qwen3.5 managed attention does not support {dtype:?} storage"
+        ))),
+    }
+}
+
+fn as_u32(value: usize, label: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::InvalidInput(format!("Qwen3.5 {label} exceeds u32")))
+}
+
+fn checked_product(values: &[usize]) -> Result<u64> {
+    let product = values.iter().try_fold(1usize, |product, value| {
+        product.checked_mul(*value).ok_or(())
+    });
+    u64::try_from(
+        product.map_err(|_| Error::InvalidInput("Qwen3.5 recurrent state size overflow".into()))?,
+    )
+    .map_err(|_| Error::InvalidInput("Qwen3.5 recurrent state exceeds u64".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Qwen36TextConfig {
+        Qwen36TextConfig {
+            architecture: "qwen35".into(),
+            block_count: 8,
+            context_length: 4_096,
+            embedding_length: 1_024,
+            feed_forward_length: 3_072,
+            attention_head_count: 16,
+            attention_head_count_kv: 4,
+            attention_key_length: 64,
+            attention_value_length: 64,
+            rope_dimension_sections: vec![8, 12, 12],
+            rope_dimension_count: 64,
+            rope_freq_base: 10_000.0,
+            attention_layer_norm_rms_epsilon: 1e-6,
+            ssm_conv_kernel: 4,
+            ssm_state_size: 64,
+            ssm_group_count: 4,
+            ssm_time_step_rank: 8,
+            ssm_inner_size: 1_024,
+            full_attention_interval: 4,
+            moe_ffn: None,
+        }
+    }
+
+    #[test]
+    fn mtp_flag_appends_the_draft_layer_domain_to_the_consistency_group() {
+        let contract =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true, false)
+                .unwrap();
+        assert_eq!(contract.domains.len(), 4);
+
+        let StateDomainSpec::PagedAttention(mtp) = &contract.domains[3] else {
+            panic!("expected the MTP draft domain");
+        };
+        assert_eq!(mtp.header.id, MTP_ATTENTION_DOMAIN);
+        assert_eq!(
+            mtp.layers
+                .iter()
+                .map(|layer| layer.model_layer)
+                .collect::<Vec<_>>(),
+            vec![config().block_count as u32],
+        );
+        assert_eq!(mtp.header.prefix, PrefixPolicy::Disabled);
+        assert_eq!(mtp.header.checkpoint, CheckpointPolicy::Transactional);
+        // The draft layer joins the same consistency group.
+        let group = &contract.groups[0];
+        assert!(group.domains.contains(&MTP_ATTENTION_DOMAIN));
+        assert!(!group.prefix_shareable);
+    }
+
+    #[test]
+    fn prefix_caching_declares_shareable_policies_and_mtp_stays_private() {
+        let shared =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, false, true)
+                .unwrap();
+        let StateDomainSpec::PagedAttention(attention) = &shared.domains[0] else {
+            panic!("expected paged-attention domain");
+        };
+        assert_eq!(
+            attention.header.prefix,
+            PrefixPolicy::CommittedPages {
+                positions: PositionSemantics::Absolute,
+            }
+        );
+        for tensor in &shared.domains[1..] {
+            assert_eq!(
+                tensor.header().prefix,
+                PrefixPolicy::CommittedSnapshots { interval_steps: 32 }
+            );
+        }
+
+        // A loaded MTP head keeps every domain private.
+        let with_mtp =
+            qwen35_composite_cache_contract_with_mtp(&config(), DType::F16, 32, true, true)
+                .unwrap();
+        assert!(with_mtp
+            .domains
+            .iter()
+            .all(|domain| domain.header().prefix == PrefixPolicy::Disabled));
+    }
+
+    #[test]
+    fn composite_contract_covers_every_hybrid_layer_without_prefix_claims() {
+        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        assert_eq!(contract.domains.len(), 3);
+
+        let StateDomainSpec::PagedAttention(attention) = &contract.domains[0] else {
+            panic!("expected attention domain");
+        };
+        assert_eq!(attention.header.id, FULL_ATTENTION_DOMAIN);
+        assert_eq!(
+            attention
+                .layers
+                .iter()
+                .map(|layer| layer.model_layer)
+                .collect::<Vec<_>>(),
+            vec![3, 7]
+        );
+        assert_eq!(attention.header.prefix, PrefixPolicy::Disabled);
+
+        let StateDomainSpec::Tensor(recurrent) = &contract.domains[1] else {
+            panic!("expected recurrent domain");
+        };
+        let StateDomainSpec::Tensor(convolution) = &contract.domains[2] else {
+            panic!("expected convolution domain");
+        };
+        assert_eq!(recurrent.components.len(), 6);
+        assert_eq!(convolution.components.len(), 6);
+        assert!(recurrent.components.iter().all(|component| component
+            .shape
+            .maximum_elements()
+            .unwrap()
+            == 65_536));
+        assert!(convolution.components.iter().all(|component| component
+            .shape
+            .maximum_elements()
+            .unwrap()
+            == 4_608));
+        assert_eq!(recurrent.header.prefix, PrefixPolicy::Disabled);
+        assert_eq!(convolution.header.prefix, PrefixPolicy::Disabled);
+    }
+
+    #[test]
+    fn composite_contract_allocates_paged_and_transactional_tensor_arenas() {
+        use crate::backends::BackendKind;
+        use crate::engine::{ManagedKvCacheManager, ModelInstanceId};
+        use crate::kv::InferenceStateCapability;
+
+        let contract = qwen35_composite_cache_contract(&config(), DType::F16, 32).unwrap();
+        assert_eq!(contract.groups.len(), 1);
+        assert_eq!(
+            contract.groups[0].domains,
+            vec![
+                crate::kv::v2::StateDomainId::new(1),
+                crate::kv::v2::StateDomainId::new(2),
+                crate::kv::v2::StateDomainId::new(3),
+            ]
+        );
+        assert!(!contract.groups[0].prefix_shareable);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                ModelInstanceId::new(71),
+                BackendKind::Cpu,
+                2,
+                32,
+                &InferenceStateCapability::Managed(contract),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(runtime.state_plan_v2().paged_attention.len(), 1);
+        assert_eq!(runtime.state_plan_v2().non_paged.len(), 2);
+        assert!(runtime.tensor_state().is_some());
+    }
+}

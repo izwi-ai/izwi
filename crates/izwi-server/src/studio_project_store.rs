@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    db::{raw, StoreDatabase},
+    db::{raw, write_transaction_options, StoreDatabase},
     ids::new_uuid,
     storage_layout::{self},
 };
@@ -372,7 +372,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<StudioProjectRecord> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project create transaction")?;
         let now = now_unix_millis_i64();
@@ -460,7 +460,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project update transaction")?;
 
@@ -549,7 +549,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment text transaction")?;
         let now = now_unix_millis_i64();
@@ -597,7 +597,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment settings transaction")?;
         let now = now_unix_millis_i64();
@@ -651,7 +651,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment text/settings transaction")?;
         let now = now_unix_millis_i64();
@@ -704,7 +704,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment insert transaction")?;
         let now = now_unix_millis_i64();
@@ -912,7 +912,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment split transaction")?;
         let now = now_unix_millis_i64();
@@ -1029,7 +1029,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment delete transaction")?;
         let now = now_unix_millis_i64();
@@ -1094,7 +1094,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment merge transaction")?;
         let now = now_unix_millis_i64();
@@ -1206,7 +1206,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment reorder transaction")?;
 
@@ -1275,7 +1275,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment batch delete transaction")?;
         let rows = query_all(
@@ -1374,7 +1374,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio segment attach transaction")?;
         let now = now_unix_millis_i64();
@@ -1412,7 +1412,7 @@ impl StudioProjectStore {
     pub async fn delete_project(&self, project_id: String) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project delete transaction")?;
         execute(
@@ -1500,7 +1500,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectMetaRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project metadata transaction")?;
         let exists = project_exists(&tx, &project_id).await?;
@@ -1717,7 +1717,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectSnapshotRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project snapshot transaction")?;
         let Some(project) = fetch_project(&tx, &project_id).await? else {
@@ -1757,7 +1757,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project snapshot restore transaction")?;
         let snapshot_json = query_one(
@@ -1881,7 +1881,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRenderJobRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project render job transaction")?;
         let exists = project_exists(&tx, &project_id).await?;
@@ -1931,7 +1931,7 @@ impl StudioProjectStore {
     ) -> anyhow::Result<Option<StudioProjectRenderJobRecord>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start Studio project render job update transaction")?;
         let current = query_one(

@@ -221,8 +221,8 @@ impl NativeExecutor {
             NativeChatDecodeState::Qwen38(model_state) => {
                 super::state::SuspendedReplayCheckpoint::Qwen38(model_state.replay_checkpoint()?)
             }
-            NativeChatDecodeState::Qwen35(model_state) => {
-                super::state::SuspendedReplayCheckpoint::Qwen35Moe(model_state.replay_checkpoint()?)
+            NativeChatDecodeState::Qwen36Moe(model_state) => {
+                super::state::SuspendedReplayCheckpoint::Qwen36Moe(model_state.replay_checkpoint()?)
             }
             _ => return Ok(None),
         };
@@ -475,9 +475,9 @@ impl NativeExecutor {
                         )?)
                     }
                     (
-                        NativeChatModel::Qwen35Moe(moe),
-                        super::state::SuspendedReplayCheckpoint::Qwen35Moe(checkpoint),
-                    ) => NativeChatDecodeState::Qwen35(moe.begin_replay_state_physical(
+                        NativeChatModel::Qwen36Moe(moe),
+                        super::state::SuspendedReplayCheckpoint::Qwen36Moe(checkpoint),
+                    ) => NativeChatDecodeState::Qwen36Moe(moe.begin_replay_state_physical(
                         checkpoint,
                         cache,
                         mtp_cache.take(),
@@ -581,13 +581,13 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35Moe(_)) => {
+                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen36Moe(_)) => {
                     Self::run_blocking(|| {
-                        model.start_qwen35_moe_decode_state_managed(
+                        model.start_qwen36_moe_decode_state_managed(
                             messages,
                             max_new_tokens,
                             &generation_config,
-                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35_moe()),
+                            prepared_chat_prompt.and_then(|prepared| prepared.as_qwen36_moe()),
                             cache,
                         )
                     })?
@@ -677,7 +677,7 @@ impl NativeExecutor {
         let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
         let replay_tokens = state_lease.state().and_then(|active| match &active.state {
             NativeChatDecodeState::Qwen38(state) => state.replay_tokens(),
-            NativeChatDecodeState::Qwen35(state) => state.replay_tokens(),
+            NativeChatDecodeState::Qwen36Moe(state) => state.replay_tokens(),
             _ => None,
         });
         let resumable_span = resumable_prefill_quantum
@@ -704,8 +704,8 @@ impl NativeExecutor {
                         Self::run_blocking(|| qwen.continue_replay_physical(state, start, end))?;
                     }
                     (
-                        NativeChatModel::Qwen35Moe(moe),
-                        NativeChatDecodeState::Qwen35(state),
+                        NativeChatModel::Qwen36Moe(moe),
+                        NativeChatDecodeState::Qwen36Moe(state),
                     ) => {
                         Self::run_blocking(|| moe.continue_replay_physical(state, start, end))?;
                     }
@@ -990,19 +990,33 @@ impl NativeExecutor {
             match managed_cache {
                 Some(mut views) => {
                     let tensor_reservation = views.tensor_state.clone();
-                    let (cache, mtp_cache) = if request.model_variant.is_some_and(|variant| {
-                        variant.family() == crate::catalog::ModelFamily::Qwen38Chat
-                            || variant.family() == crate::catalog::ModelFamily::Qwen35MoeChat
-                    }) {
+                    let family = request.model_variant.map(|variant| variant.family());
+                    let (cache, mtp_cache) = if family
+                        == Some(crate::catalog::ModelFamily::Qwen38Chat)
+                    {
                         let target =
-                            views.take_paged_domain(super::QWEN35_MOE_TARGET_ATTENTION_DOMAIN, true)?;
-                        let mtp = views
-                            .take_paged_domain(super::QWEN35_MOE_MTP_ATTENTION_DOMAIN, false)?;
+                            views.take_paged_domain(super::QWEN38_TARGET_ATTENTION_DOMAIN, true)?;
+                        let mtp =
+                            views.take_paged_domain(super::QWEN38_MTP_ATTENTION_DOMAIN, false)?;
                         views.ensure_all_paged_consumed()?;
                         (
                             target.ok_or_else(|| {
                                 Error::InferenceError(
-                                    "continuous hybrid row lost its target cache".into(),
+                                    "continuous Qwen3.8 row lost its target cache".into(),
+                                )
+                            })?,
+                            mtp,
+                        )
+                    } else if family == Some(crate::catalog::ModelFamily::Qwen35MoeChat) {
+                        let target = views
+                            .take_paged_domain(super::QWEN36_MOE_TARGET_ATTENTION_DOMAIN, true)?;
+                        let mtp = views
+                            .take_paged_domain(super::QWEN36_MOE_MTP_ATTENTION_DOMAIN, false)?;
+                        views.ensure_all_paged_consumed()?;
+                        (
+                            target.ok_or_else(|| {
+                                Error::InferenceError(
+                                    "continuous Qwen3.6-MoE row lost its target cache".into(),
                                 )
                             })?,
                             mtp,
@@ -1066,7 +1080,7 @@ impl NativeExecutor {
             Some(budget) => {
                 if !matches!(
                     model.as_ref(),
-                    NativeChatModel::Qwen38(_) | NativeChatModel::Qwen35Moe(_)
+                    NativeChatModel::Qwen38(_) | NativeChatModel::Qwen36Moe(_)
                 ) {
                     return Err(Error::InvalidInput(
                         "speculative envelopes require an MTP speculative model".to_string(),

@@ -88,10 +88,10 @@ use state::{
 
 const QWEN38_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
 const QWEN38_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
-// The qwen3.5/3.6-MoE contract reuses the same domain numbering: full
-// attention at 1, the optional MTP draft layer at 4.
-const QWEN35_MOE_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
-const QWEN35_MOE_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
+// The Qwen3.6-MoE contract uses the same domain numbering: full attention
+// at 1, the optional MTP draft layer at 4.
+const QWEN36_MOE_TARGET_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(1);
+const QWEN36_MOE_MTP_ATTENTION_DOMAIN: CacheDomainId = CacheDomainId::new(4);
 // Cancellation signals are AtomicBools without a notification edge. Polling
 // at 40 Hz bounds cancelled FIFO residency without turning admission into a
 // hot loop.
@@ -3376,6 +3376,10 @@ impl ModelExecutor for NativeExecutor {
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;
             profile.speculative_decode_batch = speculative_decode_batch;
+            profile.preferred_prefill_tokens = request
+                .prepared_chat_model_for_executor()
+                .ok()
+                .map_or(0, |model| model.as_ref().preferred_prefill_tokens());
         }
         // DS1.2b: hybrid contracts that declare committed-snapshot sharing get
         // their first prefill chunk aligned to the declared interval by the

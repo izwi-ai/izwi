@@ -400,6 +400,7 @@ async fn create_streaming_thread_message(
     let thread_id_for_task = thread_id.clone();
     let model_id_for_task = model_id.clone();
     let user_message_for_start = user_message.clone();
+    let correlation_id = execution_request.correlation_id.clone();
     let (mut event_rx, stream_completion) =
         spawn_chat_stream_with_keepalive(state, execution_request, turn_guard);
 
@@ -458,9 +459,17 @@ async fn create_streaming_thread_message(
                                 },
                             })
                             .unwrap_or_default(),
-                            Err(err) => thread_stream_error_payload(format!(
-                                "Failed to persist assistant message: {err}"
-                            )),
+                            Err(err) => {
+                                tracing::error!(
+                                    thread_id = %thread_id_for_task,
+                                    correlation_id = correlation_id.as_deref().unwrap_or(""),
+                                    error = %format!("{err:#}"),
+                                    "failed to persist streamed chat turn"
+                                );
+                                thread_stream_error_payload(format!(
+                                    "Failed to persist assistant message: {err:#}"
+                                ))
+                            }
                         }
                     };
                     (payload, true)
@@ -572,7 +581,8 @@ async fn get_thread_or_not_found(
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Chat storage error: {err}"))
+    tracing::error!(error = %format!("{err:#}"), "chat storage error");
+    ApiError::internal(format!("Chat storage error: {err:#}"))
 }
 
 fn map_store_or_not_found(err: anyhow::Error) -> ApiError {
@@ -742,5 +752,21 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(media_inputs.len(), 2);
+    }
+
+    #[test]
+    fn storage_errors_keep_the_underlying_database_cause() {
+        let err = anyhow::anyhow!("(code: 517) database is locked")
+            .context("Failed to append chat turn message");
+        let api_error = map_store_or_not_found(err);
+        assert_eq!(api_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            api_error.message,
+            "Chat storage error: Failed to append chat turn message: \
+             (code: 517) database is locked"
+        );
+
+        let missing = map_store_or_not_found(anyhow::anyhow!("Thread not found"));
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
     }
 }

@@ -5,7 +5,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 
-use crate::db::{raw, StoreDatabase};
+use crate::db::{raw, write_transaction_options, StoreDatabase};
 use crate::entity::voice_observations;
 use crate::ids::new_uuid;
 
@@ -76,7 +76,7 @@ impl VoiceObservationStore {
     ) -> anyhow::Result<Vec<VoiceObservation>> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start voice observation transaction")?;
         let mut persisted = Vec::new();

@@ -1243,6 +1243,13 @@ pub struct ExecutionProfile {
     /// multi-token quanta inside continuous batches (not just solo rows).
     #[serde(default)]
     pub speculative_decode_batch: bool,
+    /// Model-preferred prefill span for an isolated request (nothing else
+    /// decoding or waiting); 0 keeps the engine's chunk threshold. Kernels
+    /// whose per-call cost amortizes over the span (expert weights read once
+    /// per call, a chunked recurrence) prefer wider spans than the threshold
+    /// that keeps co-scheduled decode responsive.
+    #[serde(default)]
+    pub preferred_prefill_tokens: usize,
     pub resolved_from_loaded_model: bool,
     pub compute_dtype: String,
     pub kv_dtype: String,
@@ -1287,6 +1294,7 @@ impl ExecutionProfile {
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
+            preferred_prefill_tokens: 0,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
             kv_dtype: "none".to_string(),

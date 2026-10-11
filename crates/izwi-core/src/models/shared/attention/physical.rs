@@ -419,6 +419,28 @@ impl PhysicalPagedKvCache {
                 self.context_len
             )));
         }
+        self.slots_from(start_pos, token_count)
+    }
+
+    /// Slots for an append at `start_pos`, which may lie past appends written
+    /// but not yet committed: pipelined decode queues step k+1 before it
+    /// commits step k. Commits stay in order (see
+    /// [`Self::commit_shared_completion`]).
+    pub(crate) fn slots_for_queued_append(
+        &self,
+        start_pos: usize,
+        token_count: usize,
+    ) -> Result<Vec<KvSlotRef>> {
+        if start_pos < self.context_len {
+            return Err(Error::InvalidInput(format!(
+                "physical paged append at {start_pos} precedes the committed context {}",
+                self.context_len
+            )));
+        }
+        self.slots_from(start_pos, token_count)
+    }
+
+    fn slots_from(&self, start_pos: usize, token_count: usize) -> Result<Vec<KvSlotRef>> {
         let end = start_pos
             .checked_add(token_count)
             .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;

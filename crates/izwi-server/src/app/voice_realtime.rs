@@ -2762,7 +2762,7 @@ async fn ensure_agent_session(
         .chat_store
         .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
         .await
-        .map_err(|err| format!("Chat storage error: {err}"))?;
+        .map_err(|err| format!("Chat storage error: {err:#}"))?;
 
     let now = now_unix_millis();
     let session_id = new_uuid();

@@ -13,7 +13,7 @@ use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::db::{raw, StoreDatabase};
+use crate::db::{raw, write_transaction_options, StoreDatabase};
 use crate::entity::{chat_messages, chat_threads};
 use crate::ids::new_uuid;
 
@@ -251,7 +251,7 @@ impl ChatStore {
     ) -> anyhow::Result<ChatThreadMessage> {
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start chat message transaction")?;
 
@@ -345,7 +345,7 @@ impl ChatStore {
 
         let db = self.db.connection().await?;
         let tx = db
-            .begin()
+            .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start chat turn transaction")?;
 
@@ -1010,6 +1010,82 @@ mod tests {
                 .expect("thread lookup")
                 .expect("thread exists");
             assert_eq!(summary.system_prompt.as_deref(), Some("original prompt"));
+            clear_env();
+        })
+        .await;
+    }
+
+    /// Background workers (batch heartbeats, maintenance) commit to the same
+    /// SQLite file continuously. A turn transaction that reads before it
+    /// writes must not lose its write upgrade to those commits
+    /// (SQLITE_BUSY_SNAPSHOT), which the busy timeout cannot retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turns_persist_while_another_connection_commits_continuously() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        with_env_lock(async {
+            let (_temp, store) = setup_store();
+            let thread = store
+                .create_thread_with_system_prompt(None, None, None)
+                .await
+                .expect("thread should create");
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer_store = store.clone();
+            let writer_stop = stop.clone();
+            let writer = tokio::spawn(async move {
+                let db = writer_store
+                    .db
+                    .connection()
+                    .await
+                    .expect("writer connection");
+                let mut commits = 0usize;
+                while !writer_stop.load(Ordering::Relaxed) {
+                    db.execute_unprepared(
+                        "INSERT INTO runtime_admission_locks (id, lock_value) \
+                         VALUES ('chat-store-test-writer', 1) \
+                         ON CONFLICT(id) DO UPDATE SET lock_value = lock_value + 1",
+                    )
+                    .await
+                    .expect("background commit");
+                    commits += 1;
+                }
+                commits
+            });
+
+            const TURNS: usize = 100;
+            for turn in 0..TURNS {
+                let pending = store
+                    .prepare_user_message(thread.id.clone(), format!("question {turn}"), None)
+                    .await
+                    .expect("pending user");
+                store
+                    .append_turn_with_system_prompt(
+                        pending,
+                        format!("answer {turn}"),
+                        "Qwen3.6-35B-A3B-FP8".to_string(),
+                        8,
+                        1.0,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("turn {turn} should persist: {err:#}"));
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            let commits = writer.await.expect("writer task");
+            assert!(
+                commits > 0,
+                "background writer must have overlapped the turns"
+            );
+            assert_eq!(
+                store
+                    .list_messages(thread.id)
+                    .await
+                    .expect("messages")
+                    .len(),
+                TURNS * 2
+            );
             clear_env();
         })
         .await;
