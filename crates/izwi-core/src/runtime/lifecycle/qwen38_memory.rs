@@ -138,10 +138,22 @@ pub(super) fn resource_plan(
         // weights.
         let prefill_scratch = policy.prefill_scratch_bytes();
         let resident_bytes = weights.checked_add(prefill_scratch).ok_or_else(overflow)?;
+        // The CPU's Q8_0 conversion streams through the tiled converter:
+        // its staging, two mapped shards and the worker stacks join the peak.
+        let staging = if backend == BackendKind::Cpu
+            && policy.plan()
+                == crate::models::architectures::qwen38::residency::Qwen38ProjectionPlan::Q8
+            && performance.loading.enabled()
+        {
+            host_conversion_scratch(performance, &source_shards)?
+        } else {
+            0
+        };
         let estimate = ModelMemoryEstimate {
             resident_bytes,
             load_peak_bytes: resident_bytes
                 .checked_add(super::QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
+                .and_then(|n| n.checked_add(staging))
                 .ok_or_else(overflow)?,
         };
         tracing::info!(
@@ -177,34 +189,7 @@ pub(super) fn resource_plan(
     };
     let mut plan = super::model_resource_plan(BackendKind::Cuda, estimate);
     let scratch = if performance.loading.enabled() {
-        let mut mapped_sizes = source_shards
-            .iter()
-            .map(|path| std::fs::metadata(path).map(|metadata| metadata.len()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        mapped_sizes.sort_unstable_by(|a, b| b.cmp(a));
-        // File-backed pages are reclaimable, but reserve the complete two-map
-        // window conservatively rather than confusing a staging cap with RSS.
-        let mapped = mapped_sizes
-            .into_iter()
-            .take(2)
-            .try_fold(0u64, |sum, n| sum.checked_add(n).ok_or_else(overflow))?;
-        let available = std::thread::available_parallelism().map_or(1, usize::from);
-        let requested = if performance.loading.workers == 0 {
-            available
-        } else {
-            performance.loading.workers
-        };
-        let workers = if performance.loading.parallel_conversion.enabled() {
-            requested.min(available).clamp(1, 64)
-        } else {
-            1
-        };
-        let stacks = (workers as u64 + 1) * 256 * 1024;
-        u64::try_from(performance.loading.max_staging_bytes)
-            .map_err(|_| overflow())?
-            .checked_add(mapped)
-            .and_then(|n| n.checked_add(stacks))
-            .ok_or_else(overflow)?
+        host_conversion_scratch(performance, &source_shards)?
     } else {
         super::QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES
     };
@@ -242,6 +227,42 @@ pub(super) fn resource_plan(
         "Selected Qwen3.8 CUDA weight inventory"
     );
     Ok(plan)
+}
+
+/// Host memory of the bounded conversion pipeline: the staging budget, the
+/// two retained shard mappings and the conversion workers' stacks.
+fn host_conversion_scratch(
+    performance: &PerformanceConfig,
+    source_shards: &BTreeSet<std::path::PathBuf>,
+) -> Result<u64> {
+    let mut mapped_sizes = source_shards
+        .iter()
+        .map(|path| std::fs::metadata(path).map(|metadata| metadata.len()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    mapped_sizes.sort_unstable_by(|a, b| b.cmp(a));
+    // File-backed pages are reclaimable, but reserve the complete two-map
+    // window conservatively rather than confusing a staging cap with RSS.
+    let mapped = mapped_sizes
+        .into_iter()
+        .take(2)
+        .try_fold(0u64, |sum, n| sum.checked_add(n).ok_or_else(overflow))?;
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let requested = if performance.loading.workers == 0 {
+        available
+    } else {
+        performance.loading.workers
+    };
+    let workers = if performance.loading.parallel_conversion.enabled() {
+        requested.min(available).clamp(1, 64)
+    } else {
+        1
+    };
+    let stacks = (workers as u64 + 1) * 256 * 1024;
+    u64::try_from(performance.loading.max_staging_bytes)
+        .map_err(|_| overflow())?
+        .checked_add(mapped)
+        .and_then(|n| n.checked_add(stacks))
+        .ok_or_else(overflow)
 }
 
 /// A raw block-FP8 projection keeps its F32 scale grid resident beside it:
@@ -435,7 +456,11 @@ mod tests {
             ResourceAmount::Known(bytes) => bytes,
             ResourceAmount::Unknown => panic!("CPU residency must be known"),
         };
-        let expanded = resident(&resource_plan(dir.path(), &device, &performance).unwrap());
+        let mut expanded_config = PerformanceConfig::default();
+        expanded_config.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+        let expanded = resident(&resource_plan(dir.path(), &device, &expanded_config).unwrap());
+        // The CPU default: Q8_0 projections and head (34 bytes per 32).
+        let cpu_q8 = resident(&resource_plan(dir.path(), &device, &performance).unwrap());
         let _forced = force_cpu_native_fp8_for_tests();
         let native = resident(&resource_plan(dir.path(), &device, &performance).unwrap());
 
@@ -458,6 +483,10 @@ mod tests {
             expanded - native,
             fp8 * 3 - scale_grid * 4 + head * 4 - head_fp8
         );
+        assert_eq!(
+            expanded - cpu_q8,
+            fp8 * 4 - fp8 / 32 * 34 + head * 4 - head / 32 * 34
+        );
 
         let policy =
             crate::models::architectures::qwen38::residency::Qwen38ResidencyPolicy::resolve(
@@ -474,10 +503,11 @@ mod tests {
         );
         policy.poison_projections("forced load-time mismatch");
         let q8 = resident(&resource_plan(dir.path(), &device, &performance).unwrap());
-        // Q8_0 projections keep the head dense (F32 on the CPU).
+        // Q8_0 projections on the CPU take the CPU's Q8_0 head.
+        assert_eq!(q8, cpu_q8);
         assert_eq!(
             q8 - native,
-            fp8 / 32 * 34 - fp8 - scale_grid * 4 + head * 4 - head_fp8
+            fp8 / 32 * 34 - fp8 - scale_grid * 4 + head / 32 * 34 - head_fp8
         );
         let loader_policy =
             crate::models::architectures::qwen38::residency::Qwen38ResidencyPolicy::resolve(

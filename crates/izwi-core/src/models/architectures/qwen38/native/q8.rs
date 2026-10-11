@@ -337,6 +337,85 @@ impl IndexedSafetensors {
     }
 }
 
+impl IndexedSafetensors {
+    /// A dense BF16/F16/F32 `[n, k]` tensor (the LM head) as Q8_0, converted
+    /// from the mapping in row tiles in parallel: each 32-element block is
+    /// quantized exactly as Candle's `BlockQ8_0::from_float`, and blocks never
+    /// cross a row, so the bytes equal whole-tensor `QTensor::quantize`.
+    pub fn materialize_dense_as_q8(
+        &self,
+        name: &str,
+        shape: [usize; 2],
+        device: &Device,
+    ) -> Result<QMatMul> {
+        let [rows, cols] = shape;
+        if rows == 0 || !cols.is_multiple_of(32) || cols == 0 {
+            return Err(Error::ModelLoadError(format!(
+                "Q8_0 needs K divisible by 32: `{name}` is {shape:?}"
+            )));
+        }
+        let words_per_row = cols / 32 * 17;
+        let words = self.with_tensor_view(name, None, Some(&shape[..]), |view| {
+            let (width, decode): (usize, fn(&[u8]) -> f32) = match view.dtype() {
+                SafeDType::BF16 => (2, |b| {
+                    bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
+                }),
+                SafeDType::F16 => (2, |b| {
+                    f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32()
+                }),
+                SafeDType::F32 => (4, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                dtype => {
+                    return Err(Error::ModelLoadError(format!(
+                        "Dense Q8_0 source `{name}` has unsupported dtype {dtype:?}"
+                    )))
+                }
+            };
+            let data = view.data();
+            let mut words = vec![0u16; rows * words_per_row];
+            words
+                .par_chunks_mut(words_per_row * 64)
+                .enumerate()
+                .try_for_each(|(tile, out)| -> Result<()> {
+                    for (index, block) in out.chunks_exact_mut(17).enumerate() {
+                        let first = (tile * 64 * words_per_row / 17 + index) * 32;
+                        let mut values = [0f32; 32];
+                        let mut amax = 0f32;
+                        for (j, value) in values.iter_mut().enumerate() {
+                            let at = (first + j) * width;
+                            *value = decode(&data[at..at + width]);
+                            if !value.is_finite() {
+                                return Err(Error::ModelLoadError(format!(
+                                    "Dense Q8_0 source `{name}` has a non-finite value at {}",
+                                    first + j
+                                )));
+                            }
+                            amax = amax.max(value.abs());
+                        }
+                        // Exactly Candle BlockQ8_0::from_float.
+                        let d = amax / 127.;
+                        let inv = if d != 0. { 1. / d } else { 0. };
+                        block[0] = f16::from_f32(d).to_bits();
+                        for j in 0..16 {
+                            block[j + 1] = u16::from_le_bytes([
+                                (values[j * 2] * inv).round() as i8 as u8,
+                                (values[j * 2 + 1] * inv).round() as i8 as u8,
+                            ]);
+                        }
+                    }
+                    Ok(())
+                })?;
+            Ok(words)
+        })?;
+        validate_q8(&words)?;
+        let storage = QStorage::from_data(
+            std::borrow::Cow::Borrowed(words_bytes(&words)),
+            device,
+            GgmlDType::Q8_0,
+        )?;
+        Ok(QMatMul::QTensor(Arc::new(QTensor::new(storage, &shape)?)))
+    }
+}
+
 fn convert_tile(
     raw: &[u8],
     offset: usize,
@@ -617,6 +696,106 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn dense_as_q8_is_byte_equal_to_whole_tensor_quantization() {
+        let d = TestDir::new("dense-as-q8");
+        // 130 rows: two 64-row tiles and a partial one.
+        let (rows, cols) = (130usize, 96usize);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.754_877_7).sin() * (1.0 + (i / cols) as f32 * 0.01))
+            .collect();
+        let bytes = bf16_bytes(&values);
+        write_safetensors(
+            &d.path().join("a.safetensors"),
+            &[("head.weight", SafeDType::BF16, vec![rows, cols], &bytes)],
+        );
+        write_index(
+            d.path(),
+            serde_json::json!({"head.weight": "a.safetensors"}),
+        );
+        let source = IndexedSafetensors::open(d.path()).unwrap();
+        let QMatMul::QTensor(actual) = source
+            .materialize_dense_as_q8("head.weight", [rows, cols], &Device::Cpu)
+            .unwrap()
+        else {
+            panic!("expected Q8_0 storage")
+        };
+        let rounded: Vec<f32> = values.iter().map(|v| bf16::from_f32(*v).to_f32()).collect();
+        let reference = QTensor::quantize(
+            &Tensor::from_vec(rounded, (rows, cols), &Device::Cpu).unwrap(),
+            GgmlDType::Q8_0,
+        )
+        .unwrap();
+        assert_eq!(actual.data().unwrap(), reference.data().unwrap());
+        assert!(source
+            .materialize_dense_as_q8("head.weight", [rows, cols + 1], &Device::Cpu)
+            .is_err());
+    }
+
+    #[test]
+    fn parallel_q8_group_on_the_cpu_matches_the_sequential_path() {
+        let d = TestDir::new("parallel-q8-group");
+        let mut tensors = Vec::new();
+        let mut owned = Vec::new();
+        for (index, rows) in [(0u8, 128usize), (1, 64)] {
+            let raw: Vec<u8> = (0..rows * 256)
+                .map(|i| match ((i * 37 + index as usize * 11) % 256) as u8 {
+                    b if b & 0x7f == 0x7f => 0x30,
+                    b => b,
+                })
+                .collect();
+            let scales = bf16_bytes(&vec![0.01 * (1.0 + index as f32); rows.div_ceil(128) * 2]);
+            owned.push((format!("p{index}.weight"), rows, raw, scales));
+        }
+        for (name, rows, raw, scales) in &owned {
+            tensors.push((
+                name.clone(),
+                SafeDType::F8_E4M3,
+                vec![*rows, 256],
+                raw.clone(),
+            ));
+            tensors.push((
+                name.replace(".weight", ".weight_scale_inv"),
+                SafeDType::BF16,
+                vec![rows.div_ceil(128), 2],
+                scales.clone(),
+            ));
+        }
+        let views: Vec<(&str, SafeDType, Vec<usize>, &[u8])> = tensors
+            .iter()
+            .map(|(n, t, s, b)| (n.as_str(), *t, s.clone(), b.as_slice()))
+            .collect();
+        write_safetensors(&d.path().join("a.safetensors"), &views);
+        let map: serde_json::Map<_, _> = tensors
+            .iter()
+            .map(|(n, ..)| (n.clone(), serde_json::json!("a.safetensors")))
+            .collect();
+        write_index(d.path(), serde_json::Value::Object(map));
+        let parts = [("p0.weight", [128, 256]), ("p1.weight", [64, 256])];
+        let optimized = LoadingPerformanceConfig {
+            derived_weight_cache: crate::performance::OptimizationMode::Off,
+            workers: 3,
+            ..Default::default()
+        };
+        let parallel = IndexedSafetensors::open_with_options(d.path(), &optimized)
+            .unwrap()
+            .materialize_q8_projection_parallel(&parts, [128, 128], &Device::Cpu)
+            .unwrap();
+        let compat = LoadingPerformanceConfig {
+            mode: crate::performance::OptimizationMode::Off,
+            ..Default::default()
+        };
+        let sequential = IndexedSafetensors::open_with_options(d.path(), &compat)
+            .unwrap()
+            .materialize_q8_projection_parallel(&parts, [128, 128], &Device::Cpu)
+            .unwrap();
+        let (QMatMul::QTensor(a), QMatMul::QTensor(b)) = (parallel, sequential) else {
+            panic!("expected Q8_0 storage")
+        };
+        assert_eq!(a.shape().dims(), [192, 256]);
+        assert_eq!(a.data().unwrap(), b.data().unwrap());
+    }
+
     #[test]
     fn staging_budget_bounds_tiles_and_rejects_too_small() {
         let o = LoadingPerformanceConfig {

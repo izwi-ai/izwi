@@ -83,6 +83,7 @@ pub use config::{
 pub use error::{Error, Result};
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use performance::{
+    CpuPerformanceConfig, CpuPerformanceConfigOverrides, CpuProjectionBackend,
     CudaPerformanceConfig, CudaPerformanceConfigOverrides, CudaProjectionBackend,
     LoadingIoStrategy, LoadingPerformanceConfig, LoadingPerformanceConfigOverrides,
     MetalPerformanceConfig, MetalPerformanceConfigOverrides, MetalProjectionBackend,

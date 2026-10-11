@@ -21,6 +21,8 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_bf16_lm_head_calls_total: u64,
     pub metal_fp8_gemv_calls_total: u64,
     pub metal_fp8_dequant_matmul_calls_total: u64,
+    pub cpu_q8_matmul_calls_total: u64,
+    pub cpu_q8_tiled_prefill_calls_total: u64,
     pub cuda_attention_dtype_casts_total: u64,
     pub cuda_bf16_kv_provider_selected_total: u64,
     pub cuda_f16_kv_fallback_selected_total: u64,
@@ -109,6 +111,8 @@ counters!(
     CUDA_BF16_LM_HEAD_CALLS,
     METAL_FP8_GEMV_CALLS,
     METAL_FP8_DEQUANT_MATMUL_CALLS,
+    CPU_Q8_MATMUL_CALLS,
+    CPU_Q8_TILED_PREFILL_CALLS,
     CUDA_ATTENTION_DTYPE_CASTS,
     CUDA_BF16_KV_PROVIDER_SELECTED,
     CUDA_F16_KV_FALLBACK_SELECTED,
@@ -239,6 +243,16 @@ pub(crate) fn record_metal_fp8_projection(gemv: bool) {
         METAL_FP8_GEMV_CALLS.fetch_add(1, Ordering::Relaxed);
     } else {
         METAL_FP8_DEQUANT_MATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CPU Q8_0 projection call: Candle's Q8_0 matmul (decode rows), or the
+/// tiled F32 expansion + matmul (prefill spans).
+pub(crate) fn record_cpu_q8_projection(tiled: bool) {
+    if tiled {
+        CPU_Q8_TILED_PREFILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CPU_Q8_MATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -483,6 +497,8 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_bf16_lm_head_calls_total: load!(CUDA_BF16_LM_HEAD_CALLS),
         metal_fp8_gemv_calls_total: load!(METAL_FP8_GEMV_CALLS),
         metal_fp8_dequant_matmul_calls_total: load!(METAL_FP8_DEQUANT_MATMUL_CALLS),
+        cpu_q8_matmul_calls_total: load!(CPU_Q8_MATMUL_CALLS),
+        cpu_q8_tiled_prefill_calls_total: load!(CPU_Q8_TILED_PREFILL_CALLS),
         cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
         cuda_bf16_kv_provider_selected_total: load!(CUDA_BF16_KV_PROVIDER_SELECTED),
         cuda_f16_kv_fallback_selected_total: load!(CUDA_F16_KV_FALLBACK_SELECTED),

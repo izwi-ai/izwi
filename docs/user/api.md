@@ -900,7 +900,8 @@ per-path outcomes appear under `fast_paths.fp8_projections`, `fast_paths.fp8_gem
 deliberate precision reduction, with its observed gate error). On Metal the
 representation is `native_block_fp8_with_dense_f16` (or `expanded_f16` with
 `IZWI_METAL_PROJECTION_BACKEND=expanded`), with the per-kind GEMV checks under
-`fast_paths.metal_fp8_gemv`; the CPU continues to report `expanded_f32`.
+`fast_paths.metal_fp8_gemv`; the CPU reports `q8_0_projections_with_dense_f32`
+(or `expanded_f32` with `IZWI_CPU_PROJECTION_BACKEND=expanded`).
 
 | Method | Path | Notes |
 |--------|------|-------|

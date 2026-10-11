@@ -69,17 +69,39 @@ pub(super) fn golden_reference() -> (Vec<u32>, usize, Vec<Vec<f32>>) {
     )
 }
 
+/// The production load for `device`, with the CPU pinned to its F32
+/// expansion (`cpu.projection_backend = "expanded"`): HF parity at F32
+/// tolerance needs the exact projections. The Q8_0 default has its own leg.
 pub(super) fn load_golden_model(
     checkpoint: &Qwen38NativeCheckpoint,
     device: &Device,
     target: ProjectionMaterialization,
 ) -> Qwen38TextModel {
-    Qwen38TextModel::load_native_with_performance(
+    let mut performance = crate::performance::PerformanceConfig::default();
+    performance.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+    load_golden_model_with(checkpoint, device, target, &performance)
+}
+
+pub(super) fn load_golden_model_with(
+    checkpoint: &Qwen38NativeCheckpoint,
+    device: &Device,
+    target: ProjectionMaterialization,
+    performance: &crate::performance::PerformanceConfig,
+) -> Qwen38TextModel {
+    let policy = Qwen38ResidencyPolicy::resolve(
+        device,
+        target,
+        performance,
+        &checkpoint.tensors,
+        &checkpoint.config,
+    );
+    Qwen38TextModel::load_native_with_policy(
         &checkpoint.tensors,
         &checkpoint.config,
         device,
         target,
-        &crate::performance::PerformanceConfig::default().cuda,
+        &performance.cuda,
+        &policy,
     )
     .unwrap()
 }
@@ -396,6 +418,61 @@ fn native_trunk_matches_the_hf_reference_logits() {
     }
     eprintln!(
         "qwen38 golden CPU: {} rows, worst max |diff| {worst:e}",
+        rows.len()
+    );
+}
+
+/// The CPU's default Q8_0 residency on the golden sequence: block-FP8
+/// projections and the LM head requantized to Q8_0 (activations quantized to
+/// Q8_0 where Candle's QMatMul runs). A deliberate CPU trade of logit error
+/// for about 3.4x less memory and traffic; the bounds only catch gross
+/// errors (a convention error is 50-100%).
+#[test]
+fn native_trunk_tracks_the_hf_reference_logits_with_cpu_q8_0() {
+    let checkpoint = Qwen38NativeCheckpoint::open_synthetic(&fixture_dir()).unwrap();
+    let (token_ids, prompt, reference) = golden_reference();
+    let device = Device::Cpu;
+    let model = load_golden_model_with(
+        &checkpoint,
+        &device,
+        ProjectionMaterialization::F32,
+        &crate::performance::PerformanceConfig::default(),
+    );
+    assert_eq!(
+        model.projection_representation(),
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseF32
+    );
+    let arena = GoldenArena::new(&checkpoint.config, &device, DType::F32);
+    let rows = golden_trunk_rows(&model, &arena, &token_ids, prompt);
+    let mut agree = 0usize;
+    let mut worst = 0.0f32;
+    let mut total = 0.0f32;
+    for row in &rows {
+        let relative = relative_l2(&row.logits, &reference[row.position]);
+        assert!(
+            relative < 0.5,
+            "CPU Q8_0 {} logits at position {} diverge from HF by {relative} (relative L2)",
+            row.path,
+            row.position
+        );
+        worst = worst.max(relative);
+        total += relative;
+        agree += usize::from(argmax(&row.logits) == argmax(&reference[row.position]));
+    }
+    // This random-init fixture amplifies perturbations through its eight
+    // layers (its CPU F16 plan already sits a few percent from HF), so the
+    // 0.55% Q8_0 weight error lands near 12% on average; a convention error
+    // is 50-100% on every row.
+    let mean = total / rows.len() as f32;
+    assert!(mean < 0.2, "CPU Q8_0 mean relative L2 {mean}");
+    assert!(
+        agree * 5 >= rows.len() * 4,
+        "CPU Q8_0 greedy tokens agree with HF on only {agree}/{} rows",
+        rows.len()
+    );
+    eprintln!(
+        "qwen38 golden CPU Q8_0: {} rows, worst relative L2 {worst:e}, mean {mean:e}, argmax agreement {agree}/{}",
+        rows.len(),
         rows.len()
     );
 }

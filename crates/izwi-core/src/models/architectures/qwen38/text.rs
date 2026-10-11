@@ -19,12 +19,13 @@ use super::native::{
 };
 use super::residency::{fp8_row_dot, probe_activations, Qwen38ResidencyPolicy, Qwen38WeightForm};
 use super::telemetry::{
-    record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition, record_cuda_fp8_gemv,
-    record_cuda_fp8_packed_projection, record_cuda_head_expansion_materialization,
-    record_cuda_kernel, record_cuda_lm_head, record_cuda_projection, record_cuda_qk_rope_chain,
-    record_cuda_rms_norm_composition, record_cuda_rope, record_cuda_state_initial_allocation,
-    record_fast_path_self_check_failure, record_fused_attn_gate, record_fused_qk_norm_rope,
-    record_fused_rms_norm, record_metal_fp8_projection, CudaKernelPath, CudaProjectionPath,
+    record_cpu_q8_projection, record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition,
+    record_cuda_fp8_gemv, record_cuda_fp8_packed_projection,
+    record_cuda_head_expansion_materialization, record_cuda_kernel, record_cuda_lm_head,
+    record_cuda_projection, record_cuda_qk_rope_chain, record_cuda_rms_norm_composition,
+    record_cuda_rope, record_cuda_state_initial_allocation, record_fast_path_self_check_failure,
+    record_fused_attn_gate, record_fused_qk_norm_rope, record_fused_rms_norm,
+    record_metal_fp8_projection, CudaKernelPath, CudaProjectionPath,
 };
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -211,6 +212,7 @@ pub enum Qwen38ProjectionRepresentation {
     NativeFp8WithQ8FallbackF16,
     NativeFp8WithQ8FallbackBf16,
     NativeFp8WithDenseF16,
+    PackedQ8WithDenseF32,
 }
 
 impl Qwen38ProjectionRepresentation {
@@ -219,6 +221,7 @@ impl Qwen38ProjectionRepresentation {
             Self::NativeFp8WithQ8FallbackF16 => "native_block_fp8_with_q8_fallback_dense_f16",
             Self::NativeFp8WithQ8FallbackBf16 => "native_block_fp8_with_q8_fallback_dense_bf16",
             Self::NativeFp8WithDenseF16 => "native_block_fp8_with_dense_f16",
+            Self::PackedQ8WithDenseF32 => "q8_0_projections_with_dense_f32",
             Self::ExpandedF32 => "expanded_f32",
             Self::ExpandedF16 => "expanded_f16",
             Self::ExpandedBf16 => "expanded_bf16",
@@ -229,7 +232,7 @@ impl Qwen38ProjectionRepresentation {
 
     pub const fn compute_dtype(self) -> &'static str {
         match self {
-            Self::ExpandedF32 => "f32",
+            Self::ExpandedF32 | Self::PackedQ8WithDenseF32 => "f32",
             Self::ExpandedF16
             | Self::PackedQ8WithDenseF16
             | Self::NativeFp8WithQ8FallbackF16
@@ -663,6 +666,11 @@ pub(super) enum Qwen38Fp8Kernel {
 /// Metal runs the FP8 GEMV up to this many activation rows; a longer span
 /// expands the weights to a transient F16 matrix for one matrix multiply.
 const METAL_FP8_GEMV_MAX_ROWS: usize = 8;
+/// The CPU runs Candle's Q8_0 matmul up to this many activation rows; a
+/// longer span expands weight row tiles to F32 for one F32 matmul per tile.
+const CPU_Q8_MATMUL_MAX_ROWS: usize = 8;
+/// Weight rows the CPU Q8_0 prefill expands at a time (42 MB at K = 5120).
+const CPU_Q8_PREFILL_TILE_ROWS: usize = 2048;
 
 enum Qwen38ProjectionGroup {
     Separate(Vec<Qwen38Projection>),
@@ -826,7 +834,26 @@ impl Module for Qwen38Projection {
                     vectorized,
                 )
             }
-            Self::Quantized(projection) => projection.forward(input),
+            Self::Quantized(projection) => {
+                if let (true, QMatMul::QTensor(weights)) = (input.device().is_cpu(), projection) {
+                    let k = weights.shape().dims2()?.1;
+                    let rows = input.elem_count() / k.max(1);
+                    if input.dtype() == DType::F32
+                        && weights.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                    {
+                        let tiled = rows > CPU_Q8_MATMUL_MAX_ROWS;
+                        record_cpu_q8_projection(tiled);
+                        if tiled {
+                            return crate::kernels::cpu_q8::dequant_tile_matmul(
+                                input,
+                                weights,
+                                CPU_Q8_PREFILL_TILE_ROWS,
+                            );
+                        }
+                    }
+                }
+                projection.forward(input)
+            }
             Self::Dense(projection) => projection.forward(input),
         }
     }
@@ -1630,10 +1657,10 @@ impl Qwen38TextModel {
         let (path, gate_error) = &self.fp8_lm_head;
         let mut summary = summarize([path]);
         summary["gate_relative_l2"] = serde_json::json!(gate_error);
-        summary["precision"] = serde_json::json!(if path.is_fused() {
-            "deliberately reduced: the BF16 head is quantized to block FP8 (E4M3, F32 scale per 128x128 block); logits stay in the activation dtype"
-        } else {
-            "checkpoint BF16 head in the activation dtype"
+        summary["precision"] = serde_json::json!(match &self.output {
+            Qwen38Projection::NativeFp8 { .. } => "deliberately reduced: the BF16 head is quantized to block FP8 (E4M3, F32 scale per 128x128 block); logits stay in the activation dtype",
+            Qwen38Projection::Quantized(_) => "reduced: the BF16 head is requantized to Q8_0 (F16 scale per 32 elements); logits stay F32",
+            Qwen38Projection::Dense(_) => "checkpoint BF16 head in the activation dtype",
         });
         summary
     }
@@ -4231,7 +4258,7 @@ pub(super) fn load_native_projection(
                 })
         }
         Qwen38WeightForm::Q8_0 => tensors
-            .materialize_q8_projection(name, shape, loader.block, loader.device)
+            .materialize_q8_projection_parallel(&[(name, shape)], loader.block, loader.device)
             .map(Qwen38Projection::Quantized),
         Qwen38WeightForm::Dense(_) => tensors
             .materialize_projection(name, shape, loader.block, loader.target, loader.device)
@@ -4247,6 +4274,19 @@ fn load_lm_head(
     shape: [usize; 2],
 ) -> Result<(Qwen38Projection, (Qwen38FastPath, Option<f64>))> {
     let name = "lm_head.weight";
+    if loader.policy.lm_head_form(shape) == Qwen38WeightForm::Q8_0 {
+        // The CPU's Q8_0 head, requantized from the BF16 mapping in row tiles.
+        return Ok((
+            loader
+                .tensors
+                .materialize_dense_as_q8(name, shape, loader.device)
+                .map(Qwen38Projection::Quantized)?,
+            (
+                Qwen38FastPath::legacy("the CPU LM head is Q8_0, not block FP8"),
+                None,
+            ),
+        ));
+    }
     if loader.policy.lm_head_form(shape) != Qwen38WeightForm::RawFp8 {
         let reason = match loader.policy.fp8_lm_head() {
             Qwen38FastPath::Legacy { reason } => reason.clone(),
@@ -4360,7 +4400,7 @@ fn load_native_projection_group(
             }
         }
         Qwen38WeightForm::Q8_0 => tensors
-            .materialize_q8_projection_group(projections, loader.block, loader.device)
+            .materialize_q8_projection_parallel(projections, loader.block, loader.device)
             .map(Qwen38Projection::Quantized)?,
         Qwen38WeightForm::Dense(_) => tensors
             .materialize_projection_group(projections, loader.block, loader.target, loader.device)

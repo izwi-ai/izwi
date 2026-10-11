@@ -1222,6 +1222,26 @@ impl IndexedSafetensors {
         Ok(QMatMul::QTensor(Arc::new(quantized)))
     }
 
+    /// Q8_0 projections (one, or several packed in order) through the bounded
+    /// parallel tiled converter on the CPU and CUDA when loading
+    /// optimizations are on, the sequential path otherwise. Both produce
+    /// Candle's exact Q8_0 bytes. Qwen3.8's residency path; the existing
+    /// single and group methods keep their routing.
+    pub fn materialize_q8_projection_parallel(
+        &self,
+        projections: &[(&str, [usize; 2])],
+        block_shape: [usize; 2],
+        device: &Device,
+    ) -> Result<QMatMul> {
+        if self.options.enabled() && (device.is_cpu() || device.is_cuda()) {
+            return self.materialize_q8_tiled(projections, block_shape, device);
+        }
+        match projections {
+            [(name, shape)] => self.materialize_q8_projection(name, *shape, block_shape, device),
+            _ => self.materialize_q8_projection_group(projections, block_shape, device),
+        }
+    }
+
     /// Materialize several FP8 projections as one persistent Q8_0 matrix.
     pub fn materialize_q8_projection_group(
         &self,
@@ -1446,9 +1466,14 @@ impl Qwen38NativeCheckpoint {
     /// on [`ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY`].
     #[cfg(test)]
     pub(crate) fn open_synthetic(model_dir: &Path) -> Result<Self> {
+        // Fixtures never write the derived Q8_0 cache into the user's cache
+        // directory.
         Self::open_with_policy(
             model_dir,
-            &LoadingPerformanceConfig::default(),
+            &LoadingPerformanceConfig {
+                derived_weight_cache: crate::performance::OptimizationMode::Off,
+                ..LoadingPerformanceConfig::default()
+            },
             Qwen38GeometryPolicy::Synthetic,
         )
     }

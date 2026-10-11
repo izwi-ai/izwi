@@ -3500,9 +3500,20 @@ mod tests {
             "census accounts for every BF16 checkpoint element"
         );
 
-        // CPU expands everything to F32 (F32 gains and math).
-        assert_eq!(cpu.resident_bytes, (fp8 + dense) * 4 + f32_bytes);
-        assert_eq!(cpu.resident_bytes, 109_282_791_424);
+        // The CPU keeps projections and the LM head as Q8_0 (34 bytes per 32
+        // elements) and the rest F32; `expanded` expands everything to F32.
+        assert_eq!(
+            cpu.resident_bytes,
+            (fp8 + LM_HEAD) / 32 * 34 + (dense - LM_HEAD) * 4 + f32_bytes
+        );
+        assert_eq!(cpu.resident_bytes, 32_994_136_064);
+        let mut cpu_expanded = crate::performance::PerformanceConfig::default();
+        cpu_expanded.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Cpu, &cpu_expanded).resident_bytes,
+            109_282_791_424
+        );
+        assert_eq!((fp8 + dense) * 4 + f32_bytes, 109_282_791_424);
         // Metal keeps raw block FP8 (bytes + F32 block scales) with F16 dense
         // tensors and the 1 GiB F16 prefill scratch; a build without the
         // Metal kernels expands to F16.

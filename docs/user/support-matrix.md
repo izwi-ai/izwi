@@ -140,8 +140,22 @@ load; a projection whose matrix-vector kernel disagrees runs the expansion inste
 and a check that still fails fails that load, after which the next load expands to
 F16. Diagnostics report `resident_representation: native_block_fp8_with_dense_f16`.
 Set `IZWI_METAL_PROJECTION_BACKEND=expanded` (or `[runtime.performance.metal]
-projection_backend = "expanded"`) to expand to F16 at load. The CPU continues to
-use its expanded F32 representation.
+projection_backend = "expanded"`) to expand to F16 at load.
+
+### Qwen3.8 CPU weight residency
+
+On the CPU, `Qwen3.8-27B-FP8` keeps its block-FP8 projections and its LM head as
+Q8_0 (the block scales applied, then requantized to 8-bit blocks of 32 values),
+about 30.7 GiB resident instead of about 102 GiB for the F32 expansion; the
+embedding and other dense tensors stay F32. Decode runs Candle's Q8_0 matrix
+multiplication, which also quantizes activations to 8 bits; prompt spans longer
+than 8 tokens expand row tiles of the weights to F32 for one F32 matrix
+multiplication. This changes CPU numerics: on the test fixtures, logits sit 2-4%
+(relative L2) from the F32 expansion, and greedy tokens can flip at near-ties.
+Diagnostics report `resident_representation: q8_0_projections_with_dense_f32`. Set
+`IZWI_CPU_PROJECTION_BACKEND=expanded` (or `[runtime.performance.cpu]
+projection_backend = "expanded"`) to keep the F32 expansion, and
+`IZWI_QWEN38_CPU_LM_HEAD=dense` to keep only the head in F32.
 
 ### Qwen3.8 multi-token prediction defaults
 

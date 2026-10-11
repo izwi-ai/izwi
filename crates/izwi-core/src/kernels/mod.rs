@@ -9,6 +9,7 @@
 //! - Fallback to Candle operations for unsupported backends and kernels
 
 pub mod buffer_pool;
+pub mod cpu_q8;
 pub mod cuda;
 pub mod metal;
 #[cfg(feature = "metal")]

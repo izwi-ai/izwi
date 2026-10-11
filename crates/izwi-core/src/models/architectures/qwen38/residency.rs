@@ -37,7 +37,9 @@ use super::text::Qwen38ProjectionRepresentation;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::kernels::cuda::fp8;
-use crate::performance::{CudaProjectionBackend, MetalProjectionBackend, PerformanceConfig};
+use crate::performance::{
+    CpuProjectionBackend, CudaProjectionBackend, MetalProjectionBackend, PerformanceConfig,
+};
 
 /// Kill switch for native block-FP8 projections (`legacy`/`off`/`0`/`false`):
 /// Qwen3.8 keeps Q8_0 on CUDA. Qwen3.6 is unaffected.
@@ -45,6 +47,15 @@ pub(crate) const FP8_PROJECTIONS_ENV: &str = "IZWI_QWEN38_FP8_PROJECTIONS";
 /// Kill switch for the vectorized FP8 decode GEMV: the reference GEMV runs.
 pub(crate) const FP8_GEMV_ENV: &str = "IZWI_QWEN38_FP8_GEMV";
 pub(crate) use super::lm_head::FP8_LM_HEAD_ENV;
+/// Keeps the CPU LM head in F32 (`dense`, `legacy`, `off`, `0`, `false`)
+/// while the CPU projections are Q8_0.
+pub(crate) const CPU_LM_HEAD_ENV: &str = "IZWI_QWEN38_CPU_LM_HEAD";
+
+fn cpu_dense_head_requested() -> bool {
+    std::env::var(CPU_LM_HEAD_ENV).is_ok_and(|value| {
+        value.trim().eq_ignore_ascii_case("dense") || legacy_requested(CPU_LM_HEAD_ENV)
+    })
+}
 
 /// The checkpoint's block-scale geometry the FP8 kernels index.
 pub(crate) const FP8_BLOCK: [usize; 2] = [128, 128];
@@ -195,6 +206,8 @@ pub(crate) struct Qwen38ResidencyPolicy {
     packing: bool,
     /// The LM head quantized to block FP8 (with native FP8 projections).
     fp8_lm_head: Qwen38FastPath,
+    /// CPU: the LM head requantized to Q8_0 with the Q8_0 projections.
+    q8_lm_head: bool,
     mtp: bool,
     identity: Option<Identity>,
 }
@@ -255,8 +268,28 @@ impl Qwen38ResidencyPolicy {
             policy.resolve_native(device, performance, tensors, config);
         } else if backend == BackendKind::Metal {
             policy.resolve_metal(device, config);
+        } else if backend == BackendKind::Cpu {
+            policy.resolve_cpu(config);
         }
         policy
+    }
+
+    /// CPU: Q8_0 only when some block-FP8 projection can hold Q8_0 blocks (K
+    /// divisible by 32); a checkpoint with none keeps the F32 expansion and
+    /// reports it.
+    fn resolve_cpu(&mut self, config: &Qwen38NativeConfig) {
+        if self.plan != Qwen38ProjectionPlan::Q8 {
+            return;
+        }
+        let eligible = fp8_geometries(config, self.mtp, false)
+            .map(|shapes| shapes.iter().any(|[_, k]| k.is_multiple_of(32)))
+            .unwrap_or(false);
+        if !eligible {
+            self.plan = Qwen38ProjectionPlan::Expanded;
+            self.fallback = Some("no block-FP8 projection has K divisible by 32 for Q8_0".into());
+            self.packing = false;
+            self.q8_lm_head = false;
+        }
     }
 
     /// Metal: raw block FP8 unless `metal.projection_backend = "expanded"`,
@@ -324,7 +357,17 @@ impl Qwen38ResidencyPolicy {
             "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path";
         let (plan, fallback) = match backend {
             BackendKind::Cuda => (Qwen38ProjectionPlan::Q8, None),
-            BackendKind::Cpu => (Qwen38ProjectionPlan::Expanded, Some(expanded_reason.into())),
+            BackendKind::Cpu => match performance.cpu.projection_backend {
+                CpuProjectionBackend::Expanded => (
+                    Qwen38ProjectionPlan::Expanded,
+                    Some(format!(
+                        "cpu.projection_backend=expanded: {expanded_reason}"
+                    )),
+                ),
+                CpuProjectionBackend::Auto | CpuProjectionBackend::Q8 => {
+                    (Qwen38ProjectionPlan::Q8, None)
+                }
+            },
             BackendKind::Metal => match performance.metal.projection_backend {
                 MetalProjectionBackend::Expanded => (
                     Qwen38ProjectionPlan::Expanded,
@@ -368,9 +411,13 @@ impl Qwen38ResidencyPolicy {
                 Qwen38FastPath::Fused
             },
             packing: metal_native
+                || (backend == BackendKind::Cpu && plan == Qwen38ProjectionPlan::Q8)
                 || backend == BackendKind::Cuda
                     && cuda.enabled()
                     && cuda.packed_projections.enabled(),
+            q8_lm_head: backend == BackendKind::Cpu
+                && plan == Qwen38ProjectionPlan::Q8
+                && !cpu_dense_head_requested(),
             fp8_lm_head: Qwen38FastPath::legacy(if metal_native {
                 "the Metal LM head stays F16"
             } else {
@@ -587,6 +634,12 @@ impl Qwen38ResidencyPolicy {
                 Qwen38WeightForm::Q8_0
             }
             Qwen38ProjectionPlan::NativeFp8 { .. } => Qwen38WeightForm::Dense(self.activation),
+            // Q8_0 blocks hold 32 elements of one row.
+            Qwen38ProjectionPlan::Q8
+                if self.backend == BackendKind::Cpu && !shape[1].is_multiple_of(32) =>
+            {
+                Qwen38WeightForm::Dense(self.activation)
+            }
             Qwen38ProjectionPlan::Q8 => Qwen38WeightForm::Q8_0,
             Qwen38ProjectionPlan::Expanded => Qwen38WeightForm::Dense(self.activation),
         }
@@ -603,6 +656,7 @@ impl Qwen38ResidencyPolicy {
         self.packing
             && forms.iter().all(|form| form == first)
             && (self.backend != BackendKind::Metal || *first == Qwen38WeightForm::RawFp8)
+            && (self.backend != BackendKind::Cpu || !matches!(first, Qwen38WeightForm::Dense(_)))
     }
 
     /// The resident form of the `[vocab, hidden]` LM head (BF16 in the
@@ -614,6 +668,11 @@ impl Qwen38ResidencyPolicy {
             && self.fp8_fits(shape, FP8_BLOCK)
         {
             Qwen38WeightForm::RawFp8
+        } else if self.q8_lm_head
+            && self.plan == Qwen38ProjectionPlan::Q8
+            && shape[1].is_multiple_of(32)
+        {
+            Qwen38WeightForm::Q8_0
         } else {
             Qwen38WeightForm::Dense(self.activation)
         }
@@ -636,7 +695,7 @@ impl Qwen38ResidencyPolicy {
             (Qwen38ProjectionPlan::NativeFp8 { .. }, DType::F32) => R::ExpandedF32,
             (Qwen38ProjectionPlan::NativeFp8 { .. }, _) => R::NativeFp8WithQ8FallbackBf16,
             (Qwen38ProjectionPlan::Q8, DType::F16) => R::PackedQ8WithDenseF16,
-            (Qwen38ProjectionPlan::Q8, DType::F32) => R::ExpandedF32,
+            (Qwen38ProjectionPlan::Q8, DType::F32) => R::PackedQ8WithDenseF32,
             (Qwen38ProjectionPlan::Q8, _) => R::PackedQ8WithDenseBf16,
             (Qwen38ProjectionPlan::Expanded, DType::F32) => R::ExpandedF32,
             (Qwen38ProjectionPlan::Expanded, DType::F16) => R::ExpandedF16,
@@ -653,6 +712,9 @@ impl Qwen38ResidencyPolicy {
             (Qwen38ProjectionPlan::NativeFp8 { explicit: true }, _) => {
                 "native_block_fp8_explicit_self_checked".into()
             }
+            (Qwen38ProjectionPlan::Q8, BackendKind::Cpu) if self.fallback.is_none() => {
+                "q8_0_cpu_requantized".into()
+            }
             (Qwen38ProjectionPlan::Q8, _) => format!(
                 "q8_0_fallback:{}",
                 self.fallback.as_deref().unwrap_or("unspecified")
@@ -666,6 +728,7 @@ impl Qwen38ResidencyPolicy {
         match self.plan {
             Qwen38ProjectionPlan::NativeFp8 { .. } if self.backend == BackendKind::Metal => "block-FP8 projections stay resident on Metal as the checkpoint's E4M3 bytes; up to 8 rows run the FP8 GEMV and longer spans expand to a transient F16 matrix for one matrix multiplication, after a load-time check of every projection kind against the original checkpoint bytes; the LM head and dense tensors stay F16".into(),
             Qwen38ProjectionPlan::NativeFp8 { .. } => "block-FP8 projections stay resident as the checkpoint's E4M3 bytes and run on the compact FP8 kernels (16-bit activations, software FP8 decode) after device gates and a load-time check against the original checkpoint bytes; not runtime-certified on CUDA hardware".into(),
+            Qwen38ProjectionPlan::Q8 if self.backend == BackendKind::Cpu && self.fallback.is_none() => "the CPU keeps block-FP8 projections (K divisible by 32) and the LM head as Q8_0: weight_scale_inv applied, then requantized (activations are quantized to Q8_0 in decode); decode rows run Candle's Q8_0 matmul and longer spans expand row tiles to F32 for one F32 matmul; the embedding and other dense tensors stay F32; IZWI_CPU_PROJECTION_BACKEND=expanded keeps the F32 expansion".into(),
             Qwen38ProjectionPlan::Q8 => format!(
                 "CUDA applies weight_scale_inv and requantizes projections to Q8_0: {}",
                 self.fallback.as_deref().unwrap_or("unspecified")

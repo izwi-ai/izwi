@@ -86,6 +86,14 @@ pub(super) fn fixture_rows(
     (rows, decoded)
 }
 
+/// The CPU's F32 expansion (`cpu.projection_backend = "expanded"`): the
+/// exact reference the other plans are compared with.
+pub(super) fn expanded_cpu() -> PerformanceConfig {
+    let mut performance = PerformanceConfig::default();
+    performance.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+    performance
+}
+
 fn fixture() -> (TestDir, Qwen38NativeCheckpoint) {
     let dir = TestDir::new("fp8-geometry");
     write_fp8_geometry_checkpoint(dir.path());
@@ -181,11 +189,10 @@ fn forced_native_fp8_trunk_tracks_the_expanded_f32_load() {
     let _restore = Restore;
     let (_dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::F32;
-    let performance = PerformanceConfig::default();
     let expanded = load(
         &checkpoint,
         target,
-        &resolve(&checkpoint, target, &performance),
+        &resolve(&checkpoint, target, &expanded_cpu()),
     )
     .unwrap();
     assert_eq!(
@@ -268,7 +275,7 @@ fn forced_fp8_lm_head_quantizes_checks_and_tracks_the_dense_head() {
     let expanded = load(
         &checkpoint,
         target,
-        &resolve(&checkpoint, target, &performance),
+        &resolve(&checkpoint, target, &expanded_cpu()),
     )
     .unwrap();
     assert_eq!(expanded.fp8_lm_head_diagnostics()["backend"], "legacy");
@@ -503,9 +510,13 @@ fn projection_plan_policy_matrix() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::F32;
-    // Without the CPU stand-in, the CPU keeps its expanded plan.
+    // Without the CPU stand-in, the CPU keeps Q8_0 (or the F32 expansion).
     assert_eq!(
         resolve(&checkpoint, target, &PerformanceConfig::default()).plan(),
+        Qwen38ProjectionPlan::Q8
+    );
+    assert_eq!(
+        resolve(&checkpoint, target, &expanded_cpu()).plan(),
         Qwen38ProjectionPlan::Expanded
     );
     let _forced = force_cpu_native_fp8_for_tests();
@@ -537,9 +548,10 @@ fn projection_plan_policy_matrix() {
     let mut q8 = PerformanceConfig::default();
     q8.cuda.projection_backend = CudaProjectionBackend::Q8;
     assert_eq!(q8_reason(&q8), "q8_0_fallback:cuda.projection_backend=q8");
+    // Q8_0 projections on the CPU take the CPU's Q8_0 head.
     assert_eq!(
         resolve(&checkpoint, target, &q8).lm_head_form([512, 256]),
-        Qwen38WeightForm::Dense(DType::F32)
+        Qwen38WeightForm::Q8_0
     );
     std::env::set_var(FP8_PROJECTIONS_ENV, "legacy");
     let killed = q8_reason(&PerformanceConfig::default());
@@ -686,7 +698,12 @@ fn cuda_resolve_picks_native_fp8_on_auto_and_packed_groups_match_original_parts(
     .unwrap();
     assert_eq!(summarize(native.fp8_packing())["fused_layers"], 8);
     let cpu = ProjectionMaterialization::F32;
-    let expanded = load(&checkpoint, cpu, &resolve(&checkpoint, cpu, &performance)).unwrap();
+    let expanded = load(
+        &checkpoint,
+        cpu,
+        &resolve(&checkpoint, cpu, &expanded_cpu()),
+    )
+    .unwrap();
     let cpu_arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
     let (reference, tokens) = fixture_rows(&expanded, &cpu_arena, 0, None);
     let arena = GoldenArena::new(&checkpoint.config, &device, DType::BF16);
@@ -824,7 +841,12 @@ fn metal_native_fp8_tracks_cpu_f32_and_metal_expanded_loads() {
         Qwen38ProjectionRepresentation::ExpandedF16
     );
     let cpu = ProjectionMaterialization::F32;
-    let cpu_expanded = load(&checkpoint, cpu, &resolve(&checkpoint, cpu, &performance)).unwrap();
+    let cpu_expanded = load(
+        &checkpoint,
+        cpu,
+        &resolve(&checkpoint, cpu, &expanded_cpu()),
+    )
+    .unwrap();
 
     let cpu_arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
     let (reference, tokens) = fixture_rows(&cpu_expanded, &cpu_arena, 0, None);
@@ -1023,4 +1045,174 @@ fn metal_fp8_kernels_match_the_host_reference_at_qwen38_shapes() {
         run(shape, &[1, 2, 3, 4]);
     }
     run([1024, 5120], &[9, 64, 256]);
+}
+
+/// The CPU's default residency: block-FP8 projections and the LM head as
+/// Q8_0 (packed groups through the tiled converter), F32 elsewhere. Decode
+/// rows run Candle's Q8_0 matmul (which also quantizes the activations) and
+/// longer spans the tiled F32 path; logits stay within 6% of the F32
+/// expansion with the same greedy tokens on at least 90% of rows.
+#[test]
+fn cpu_q8_residency_tracks_the_expanded_f32_load() {
+    let _guard = super::super::fast_path::counters_lock();
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::F32;
+    let expanded = load(
+        &checkpoint,
+        target,
+        &resolve(&checkpoint, target, &expanded_cpu()),
+    )
+    .unwrap();
+    let policy = resolve(&checkpoint, target, &PerformanceConfig::default());
+    assert_eq!(policy.plan(), Qwen38ProjectionPlan::Q8);
+    assert_eq!(policy.execution_mode(), "q8_0_cpu_requantized");
+    let before = crate::models::architectures::qwen38::telemetry::snapshot();
+    let q8 = load(&checkpoint, target, &policy).unwrap();
+    assert_eq!(
+        q8.projection_representation(),
+        Qwen38ProjectionRepresentation::PackedQ8WithDenseF32
+    );
+    assert_eq!(
+        q8.projection_representation().as_str(),
+        "q8_0_projections_with_dense_f32"
+    );
+    assert!(matches!(q8.output, Qwen38Projection::Quantized(_)));
+    let packed = q8
+        .layers
+        .iter()
+        .filter(|layer| {
+            matches!(
+                layer.mlp.gate_up,
+                Qwen38ProjectionGroup::Packed {
+                    projection: Qwen38Projection::Quantized(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(packed, 4);
+    assert!(q8
+        .layers
+        .iter()
+        .all(|layer| matches!(layer.mlp.down, Qwen38Projection::Quantized(_))));
+
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
+    let (reference, tokens) = fixture_rows(&expanded, &arena, 0, None);
+    let (rows, _) = fixture_rows(&q8, &arena, 1, Some(&tokens));
+    let mut worst = 0f32;
+    let mut agree = 0usize;
+    for (index, (row, reference)) in rows.iter().zip(&reference).enumerate() {
+        let error = relative_l2(row, reference);
+        // Weights requantized to Q8_0 everywhere, plus Candle's Q8_0
+        // activations on rows that take QMatMul (the 8-row prompt and every
+        // decode step): measured 4.4% worst here (2.4% with F32 activations).
+        assert!(error <= 6e-2, "row {index}: relative L2 {error}");
+        worst = worst.max(error);
+        agree += usize::from(argmax(row) == argmax(reference));
+    }
+    eprintln!(
+        "qwen38 CPU Q8_0 vs expanded F32: worst relative L2 {worst:e}, greedy agreement {agree}/{}",
+        rows.len()
+    );
+    assert!(
+        agree * 10 >= rows.len() * 9,
+        "greedy agreement {agree}/{}",
+        rows.len()
+    );
+    let decode = crate::models::architectures::qwen38::telemetry::snapshot();
+    assert!(decode.cpu_q8_matmul_calls_total > before.cpu_q8_matmul_calls_total);
+
+    // A 16-row span takes the tiled F32 path (F32 activations): only the
+    // weights' Q8_0 error remains (measured 2.4% worst here).
+    let sequence: Vec<u32> = PROMPT
+        .iter()
+        .copied()
+        .chain(tokens.iter().copied())
+        .collect();
+    let positions: Vec<[usize; 3]> = (0..sequence.len()).map(|p| [p, p, p]).collect();
+    let span = |model: &Qwen38TextModel, session| {
+        let mut state = model.new_state();
+        let mut cache = arena.session(session);
+        let output = model
+            .prefill_token_ids_with_hidden_physical(
+                &sequence, &positions, &mut state, &mut cache, false,
+            )
+            .unwrap()
+            .expect("prefill output");
+        model
+            .project_target_hidden_span(&output.hidden_states)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let (q8_span, expanded_span) = (span(&q8, 2), span(&expanded, 3));
+    let vocab = checkpoint.config.vocab_size;
+    for (index, (row, reference)) in q8_span
+        .chunks(vocab)
+        .zip(expanded_span.chunks(vocab))
+        .enumerate()
+    {
+        let error = relative_l2(row, reference);
+        assert!(
+            error <= 3e-2,
+            "16-row span row {index}: relative L2 {error}"
+        );
+    }
+    let after = crate::models::architectures::qwen38::telemetry::snapshot();
+    assert!(after.cpu_q8_tiled_prefill_calls_total > decode.cpu_q8_tiled_prefill_calls_total);
+}
+
+/// The CPU policy table: Q8_0 needs K divisible by 32 (otherwise F32), the
+/// head follows unless `IZWI_QWEN38_CPU_LM_HEAD=dense`, packing covers Q8_0
+/// groups only, and `expanded` keeps today's F32 path.
+#[test]
+fn cpu_policy_table() {
+    use crate::models::architectures::qwen38::residency::CPU_LM_HEAD_ENV;
+    use safetensors::Dtype as SafeDType;
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let performance = PerformanceConfig::default();
+    let q8 = Qwen38ResidencyPolicy::resolve_static(crate::backends::BackendKind::Cpu, &performance);
+    let block = [128, 128];
+    assert_eq!(
+        q8.projection_form(SafeDType::F8_E4M3, [256, 256], block),
+        Qwen38WeightForm::Q8_0
+    );
+    assert_eq!(
+        q8.projection_form(SafeDType::F8_E4M3, [256, 48], [2, 2]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert_eq!(
+        q8.projection_form(SafeDType::BF16, [256, 256], block),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert_eq!(q8.lm_head_form([512, 256]), Qwen38WeightForm::Q8_0);
+    assert_eq!(
+        q8.lm_head_form([512, 4]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert!(q8.packing_allowed(&[Qwen38WeightForm::Q8_0; 2]));
+    assert!(!q8.packing_allowed(&[Qwen38WeightForm::Dense(DType::F32); 2]));
+    std::env::set_var(CPU_LM_HEAD_ENV, "dense");
+    let dense_head =
+        Qwen38ResidencyPolicy::resolve_static(crate::backends::BackendKind::Cpu, &performance);
+    std::env::remove_var(CPU_LM_HEAD_ENV);
+    assert_eq!(
+        dense_head.lm_head_form([512, 256]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    let expanded =
+        Qwen38ResidencyPolicy::resolve_static(crate::backends::BackendKind::Cpu, &expanded_cpu());
+    assert_eq!(expanded.plan(), Qwen38ProjectionPlan::Expanded);
+    assert_eq!(
+        expanded.projection_form(SafeDType::F8_E4M3, [256, 256], block),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
+    assert_eq!(
+        expanded.lm_head_form([512, 256]),
+        Qwen38WeightForm::Dense(DType::F32)
+    );
 }

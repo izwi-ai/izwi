@@ -28,6 +28,7 @@ selector!(OptimizationMode { Off => "off" });
 selector!(CudaProjectionBackend { Q8 => "q8", NativeFp8 => "native_fp8" });
 selector!(LoadingIoStrategy { Mmap => "mmap", Sequential => "sequential" });
 selector!(MetalProjectionBackend { Expanded => "expanded", NativeFp8 => "native_fp8" });
+selector!(CpuProjectionBackend { Expanded => "expanded", Q8 => "q8" });
 impl OptimizationMode {
     pub const fn enabled(self) -> bool {
         matches!(self, Self::Auto)
@@ -40,6 +41,7 @@ pub struct PerformanceConfig {
     pub cuda: CudaPerformanceConfig,
     pub loading: LoadingPerformanceConfig,
     pub metal: MetalPerformanceConfig,
+    pub cpu: CpuPerformanceConfig,
     // A clone carries the same snapshot. Serialization intentionally starts a
     // new configuration lifetime and excludes process-local resolution state.
     #[serde(skip)]
@@ -52,7 +54,10 @@ pub struct PerformanceConfig {
 // already captured its environment. Round trips preserve the public contract.
 impl PartialEq for PerformanceConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.cuda == other.cuda && self.loading == other.loading && self.metal == other.metal
+        self.cuda == other.cuda
+            && self.loading == other.loading
+            && self.metal == other.metal
+            && self.cpu == other.cpu
     }
 }
 impl Eq for PerformanceConfig {}
@@ -144,6 +149,16 @@ pub struct MetalPerformanceConfig {
     pub projection_backend: MetalProjectionBackend,
 }
 
+/// CPU policy. Only model families with a CPU-specific residency read it
+/// (today Qwen3.8).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CpuPerformanceConfig {
+    /// Block-FP8 projection residency on the CPU: `auto` and `q8` requantize
+    /// them (and the LM head) to Q8_0, `expanded` expands them to F32.
+    pub projection_backend: CpuProjectionBackend,
+}
+
 /// A partial layer: omitted siblings never reset earlier sources.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -154,6 +169,8 @@ pub struct PerformanceConfigOverrides {
     pub loading: LoadingPerformanceConfigOverrides,
     #[serde(skip_serializing_if = "MetalPerformanceConfigOverrides::is_empty")]
     pub metal: MetalPerformanceConfigOverrides,
+    #[serde(skip_serializing_if = "CpuPerformanceConfigOverrides::is_empty")]
+    pub cpu: CpuPerformanceConfigOverrides,
     #[serde(skip)]
     environment_error: Option<String>,
 }
@@ -165,6 +182,18 @@ pub struct MetalPerformanceConfigOverrides {
     pub projection_backend: Option<MetalProjectionBackend>,
 }
 impl MetalPerformanceConfigOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.projection_backend.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CpuPerformanceConfigOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection_backend: Option<CpuProjectionBackend>,
+}
+impl CpuPerformanceConfigOverrides {
     pub fn is_empty(&self) -> bool {
         self.projection_backend.is_none()
     }
@@ -363,6 +392,9 @@ impl PerformanceConfig {
         if let Some(value) = overrides.metal.projection_backend {
             self.metal.projection_backend = value;
         }
+        if let Some(value) = overrides.cpu.projection_backend {
+            self.cpu.projection_backend = value;
+        }
         if let Some(error) = &overrides.environment_error {
             self.environment_error = Some(error.clone());
         }
@@ -399,6 +431,9 @@ impl From<&PerformanceConfig> for PerformanceConfigOverrides {
             metal: MetalPerformanceConfigOverrides {
                 projection_backend: Some(config.metal.projection_backend),
             },
+            cpu: CpuPerformanceConfigOverrides {
+                projection_backend: Some(config.cpu.projection_backend),
+            },
             environment_error: None,
         }
     }
@@ -409,6 +444,7 @@ impl PerformanceConfigOverrides {
         self.cuda.is_empty()
             && self.loading.is_empty()
             && self.metal.is_empty()
+            && self.cpu.is_empty()
             && self.environment_error.is_none()
     }
 
@@ -640,6 +676,13 @@ impl PerformanceConfigOverrides {
                 self.metal.projection_backend = Some(
                     value
                         .parse::<MetalProjectionBackend>()
+                        .map_err(|error| Error::ConfigError(format!("{key}: {error}")))?,
+                )
+            }
+            "cpu.projection_backend" => {
+                self.cpu.projection_backend = Some(
+                    value
+                        .parse::<CpuProjectionBackend>()
                         .map_err(|error| Error::ConfigError(format!("{key}: {error}")))?,
                 )
             }
@@ -913,6 +956,15 @@ pub const ENVIRONMENT_BINDINGS: &[PerformanceEnvironmentBinding] = &[
         ],
         mode: false,
     },
+    PerformanceEnvironmentBinding {
+        key: "cpu.projection_backend",
+        canonical: "IZWI_CPU_PROJECTION_BACKEND",
+        aliases: &[
+            "IZWI_PERFORMANCE_CPU_PROJECTION_BACKEND",
+            "IZWI_QWEN38_CPU_PROJECTION_BACKEND",
+        ],
+        mode: false,
+    },
 ];
 
 /// User configuration path shared by CLI and standalone server startup.
@@ -1133,6 +1185,43 @@ mod tests {
     }
 
     #[test]
+    fn cpu_projection_backend_binds_from_env_toml_and_set_value() {
+        assert_eq!(
+            PerformanceConfig::default().cpu.projection_backend,
+            CpuProjectionBackend::Auto
+        );
+        let env = layer(&[("IZWI_CPU_PROJECTION_BACKEND", "expanded")]);
+        assert_eq!(
+            env.cpu.projection_backend,
+            Some(CpuProjectionBackend::Expanded)
+        );
+        let alias = layer(&[("IZWI_QWEN38_CPU_PROJECTION_BACKEND", "q8")]);
+        assert_eq!(alias.cpu.projection_backend, Some(CpuProjectionBackend::Q8));
+        let mut config = PerformanceConfig::default();
+        config.apply_overrides(&env);
+        assert_eq!(
+            config.cpu.projection_backend,
+            CpuProjectionBackend::Expanded
+        );
+        config.cuda.mode = OptimizationMode::Off;
+        assert_eq!(
+            config.normalized().cpu.projection_backend,
+            CpuProjectionBackend::Expanded
+        );
+        let parsed: PerformanceConfig =
+            toml::from_str("[cpu]\nprojection_backend = \"q8\"").unwrap();
+        assert_eq!(parsed.cpu.projection_backend, CpuProjectionBackend::Q8);
+        let mut overrides = PerformanceConfigOverrides::default();
+        overrides
+            .set_value("cpu.projection_backend", "expanded")
+            .unwrap();
+        assert!(!overrides.is_empty());
+        assert!(overrides
+            .set_value("cpu.projection_backend", "fp8")
+            .is_err());
+    }
+
+    #[test]
     fn each_environment_key_is_read_at_most_once() {
         let mut reads = std::collections::HashSet::new();
         PerformanceConfigOverrides::from_lookup(|key| {
@@ -1170,6 +1259,7 @@ mod tests {
             ("IZWI_LOADING_IO_STRATEGY", "random"),
             ("IZWI_CUDA_PROJECTION_BACKEND", "bf16"),
             ("IZWI_METAL_PROJECTION_BACKEND", "q8"),
+            ("IZWI_CPU_PROJECTION_BACKEND", "native_fp8"),
         ] {
             assert!(
                 PerformanceConfigOverrides::from_lookup(

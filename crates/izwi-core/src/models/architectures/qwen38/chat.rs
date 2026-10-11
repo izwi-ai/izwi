@@ -4184,17 +4184,31 @@ mod tests {
         );
         assert!(native.fallback_reason.contains("not runtime-certified"));
 
-        // The CPU keeps its expanded plan.
+        // The CPU keeps Q8_0 projections, or its F32 expansion when told to.
         let cpu = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
             BackendKind::Cpu,
             &performance,
         ));
-        assert_eq!(cpu.resident_representation, "expanded_f32");
+        assert_eq!(
+            cpu.resident_representation,
+            "q8_0_projections_with_dense_f32"
+        );
         assert_eq!(cpu.runtime_compute_dtype, "f32");
+        assert_eq!(cpu.fp8_execution_mode, "q8_0_cpu_requantized");
+        assert!(cpu
+            .fallback_reason
+            .contains("IZWI_CPU_PROJECTION_BACKEND=expanded"));
+        let mut cpu_expanded = crate::performance::PerformanceConfig::default();
+        cpu_expanded.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+        let cpu = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cpu,
+            &cpu_expanded,
+        ));
+        assert_eq!(cpu.resident_representation, "expanded_f32");
         assert_eq!(cpu.fp8_execution_mode, "expanded_fallback");
         assert_eq!(
             cpu.fallback_reason,
-            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
+            "cpu.projection_backend=expanded: native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
         );
         // Metal keeps raw block FP8 in a Metal build, and expands to F16
         // when told to (or without the Metal kernels).
