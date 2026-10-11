@@ -2883,13 +2883,29 @@ fn combine_metal_memory_snapshot(
 
 #[cfg(feature = "cuda")]
 fn cuda_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    use candle_core::cuda_backend::cudarc::driver::result;
+
     let stream = device.device.as_cuda_device().ok()?.cuda_stream();
-    let (available, total) = stream.context().mem_get_info().ok()?;
-    Some((
-        u64::try_from(total).ok()?,
-        u64::try_from(available).ok()?,
-        CapacitySource::CudaDriver,
-    ))
+    let context = stream.context();
+    // Query the driver directly. cudarc's `CudaContext::mem_get_info` binds
+    // through `bind_to_thread`, which first returns (and clears) any error a
+    // `Drop` elsewhere latched on the context: the sample failed, admission
+    // saw Unknown capacity, and the work that caused the error never saw it.
+    // SAFETY: `context` keeps the CUDA context alive across both calls, and
+    // making it current only changes this sampler thread's binding.
+    let sample =
+        unsafe { result::ctx::set_current(context.cu_ctx()) }.and_then(|()| result::mem_get_info());
+    match sample {
+        Ok((available, total)) => Some((
+            u64::try_from(total).ok()?,
+            u64::try_from(available).ok()?,
+            CapacitySource::CudaDriver,
+        )),
+        Err(error) => {
+            tracing::warn!(%error, "CUDA physical-capacity probe failed");
+            None
+        }
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -2903,6 +2919,40 @@ mod tests {
     use crate::engine::ResourceVector;
     use crate::model::ModelVariant;
     use crate::runtime::adapters::{CapabilityKind, LoadedModelBundle, RuntimeAdapterRegistry};
+
+    /// A `Drop` elsewhere (a cross-thread free, a wait on a destroyed graph's
+    /// event) can latch an error on the shared CUDA context. The capacity
+    /// probe must still sample, and leave the error for the work that owns
+    /// it, instead of failing admission with Unknown capacity.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_capacity_probe_ignores_errors_latched_by_other_work() {
+        use candle_core::cuda_backend::cudarc::driver::{sys, DriverError};
+
+        if crate::kernels::cuda::cuda_test_device().is_none() {
+            return;
+        }
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Cuda,
+        )
+        .expect("cuda profile");
+        let context = profile
+            .device
+            .as_cuda_device()
+            .unwrap()
+            .cuda_stream()
+            .context()
+            .clone();
+        context.record_err::<()>(Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE)));
+        let (total, available, source) =
+            cuda_memory_snapshot(&profile).expect("a latched error must not fail the probe");
+        assert!(total > 0 && available <= total, "{available} of {total}");
+        assert_eq!(source, CapacitySource::CudaDriver);
+        assert!(
+            context.check_err().is_err(),
+            "the probe must leave the latched error for the work that owns it"
+        );
+    }
 
     #[derive(Debug)]
     struct MutableCapacityProvider {
