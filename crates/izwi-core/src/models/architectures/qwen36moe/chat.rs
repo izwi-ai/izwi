@@ -888,7 +888,53 @@ pub(crate) mod tests {
     /// manager's real primitives (see qwen38's attach tests).
     #[test]
     fn attached_prefill_matches_the_fresh_run_and_keeps_the_snapshot_intact() {
-        use crate::backends::kv::CpuKvArena;
+        assert_attach_matches_fresh(DeviceProfile::cpu(), 8, true);
+    }
+
+    /// The same attach on Metal, through the accelerator KV arena and device
+    /// state tensors. Device matmuls may round differently for the attached
+    /// run's shorter prefill, so state is compared within tolerance; the
+    /// tokens must still match.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_attached_prefill_matches_the_fresh_run() {
+        if crate::backends::metal_device_if_available(0).is_none() {
+            eprintln!("metal device unavailable; attach leg not run");
+            return;
+        }
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Metal,
+        )
+        .expect("metal profile");
+        assert_attach_matches_fresh(profile, 8, false);
+    }
+
+    /// The CUDA lane's prefix-reuse evidence: production BF16 KV in 16-token
+    /// pages (the smallest the CUDA paged kernels take).
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_attached_prefill_matches_the_fresh_run() {
+        if crate::kernels::cuda::cuda_test_device().is_none() {
+            return;
+        }
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Cuda,
+        )
+        .expect("cuda profile");
+        assert_attach_matches_fresh(profile, 16, false);
+    }
+
+    /// Prefills the fixture prompt fresh, and again attached at a page-aligned
+    /// fork of a published prefix, on `device` with `page`-token KV pages.
+    /// The attached session must start from the published snapshot bit for
+    /// bit on every device. `exact` also demands a bit-identical final state
+    /// (the CPU lane); on devices, matmuls over the attached run's shorter
+    /// prefill may round differently, so the final state only has to land
+    /// within a gross-error bound and decode the same tokens.
+    fn assert_attach_matches_fresh(device: DeviceProfile, page: usize, exact: bool) {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        use crate::backends::kv::CandleAcceleratorKvArena;
+        use crate::backends::kv::{CpuKvArena, KvArena};
         use crate::backends::state::{
             negotiate_state_plan, PhysicalStateSequenceId, PhysicalStateTransactionId,
             StateBackendPlanRequest, StateComponentValue, TensorStateArena, TensorStateCapacity,
@@ -897,7 +943,12 @@ pub(crate) mod tests {
             CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
         };
 
-        let (mut model, _dir) = load_fixture("prefix-attach");
+        // Another test sets the prefill chunk size; hold it fixed so both
+        // prefills chunk alike.
+        let _env = crate::env_test_lock().lock().expect("env lock");
+        let backend = BackendKind::from(device.kind);
+        let (mut model, dir) =
+            load_fixture_on(&format!("prefix-attach-{backend:?}"), device.clone());
         model.exec.prefix_caching = true;
         let exec = &model.exec;
         let config = ChatGenerationConfig {
@@ -919,7 +970,6 @@ pub(crate) mod tests {
             )
             .unwrap();
         let total = prepared.prompt_ids().len();
-        let page = 8usize;
         let fork = (total / 2) - (total / 2) % page;
         assert!(
             fork >= page && fork < total,
@@ -930,10 +980,11 @@ pub(crate) mod tests {
         // the fork are shared; every session keeps private pages above it.
         let kv_heads = model.text_config().attention_head_count_kv as u32;
         let head_dim = model.text_config().attention_key_length as u32;
+        let device_ordinal = arena_device_ordinal(&device);
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(5151),
-            backend: BackendKind::Cpu,
-            device_ordinal: None,
+            backend,
+            device_ordinal,
             generation: 1,
         };
         let group = KvGroupId::new(1);
@@ -941,26 +992,39 @@ pub(crate) mod tests {
             model_layer,
             physical_layer,
         });
-        let arena = Arc::new(
-            CpuKvArena::new(KvArenaConfig {
-                id,
-                group,
-                page_tokens: page as u32,
-                capacity_pages: 64,
-                growth: None,
-                dtype: DType::F32,
-                layers: bindings
-                    .iter()
-                    .map(|binding| KvLayerConfig {
-                        binding: *binding,
-                        num_kv_heads: kv_heads,
-                        key_head_dim: head_dim,
-                        value_head_dim: head_dim,
-                    })
-                    .collect(),
-            })
-            .unwrap(),
-        );
+        let arena_config = KvArenaConfig {
+            id,
+            group,
+            page_tokens: page as u32,
+            capacity_pages: 64,
+            growth: None,
+            dtype: exec.kv_storage_dtype,
+            layers: bindings
+                .iter()
+                .map(|binding| KvLayerConfig {
+                    binding: *binding,
+                    num_kv_heads: kv_heads,
+                    key_head_dim: head_dim,
+                    value_head_dim: head_dim,
+                })
+                .collect(),
+        };
+        let arena: Arc<dyn KvArena> = if backend == BackendKind::Cpu {
+            Arc::new(CpuKvArena::new(arena_config).unwrap())
+        } else {
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            {
+                Arc::new(
+                    CandleAcceleratorKvArena::new_mutation_only(
+                        arena_config,
+                        device.device.clone(),
+                    )
+                    .unwrap(),
+                )
+            }
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            panic!("accelerator KV arenas require the cuda or metal feature")
+        };
         let view = |blocks: std::ops::Range<u32>, context_len: usize| {
             PhysicalPagedKvCache::new(
                 arena.clone(),
@@ -980,20 +1044,21 @@ pub(crate) mod tests {
         let pages = |tokens: usize| tokens.div_ceil(page) as u32 + 2;
 
         let contract = exec
-            .managed_composite_cache_contract(DType::F32, page)
+            .managed_composite_cache_contract(exec.kv_storage_dtype, page)
             .unwrap();
         let plan = negotiate_state_plan(
             &contract,
             &StateBackendPlanRequest {
-                backend: BackendKind::Cpu,
-                device_ordinal: None,
+                backend,
+                device_ordinal,
                 page_tokens_hint: None,
                 storage_dtype_hint: None,
             },
         )
         .unwrap();
         let capacity = TensorStateCapacity::for_plan(&plan, 8, 8).unwrap();
-        let tensors = TensorStateArena::new(Arc::new(plan), capacity, Device::Cpu).unwrap();
+        let tensors =
+            TensorStateArena::new(Arc::new(plan), capacity, device.device.clone()).unwrap();
 
         let decode = |state: &mut ChatDecodeState| {
             let mut text = String::new();
@@ -1021,6 +1086,7 @@ pub(crate) mod tests {
             .continue_resumable_prefill_physical(&mut publisher, &prepared, 0, fork)
             .unwrap());
         assert_eq!(publisher.physical_context_len(), fork);
+        let published_state = publisher.linear_state_values();
         let published = PhysicalStateSequenceId::new(1).unwrap();
         tensors.register(published).unwrap();
         let transaction = PhysicalStateTransactionId::new(1).unwrap();
@@ -1043,6 +1109,8 @@ pub(crate) mod tests {
                             component
                                 .tensor
                                 .as_ref()
+                                .unwrap()
+                                .to_dtype(DType::F32)
                                 .unwrap()
                                 .flatten_all()
                                 .unwrap()
@@ -1122,15 +1190,40 @@ pub(crate) mod tests {
         tensors.commit(fork_transaction, fork as u64).unwrap();
         attached.bind_tensor_sequence(forked.get()).unwrap();
         attached.restore_tensor_state(&tensors).unwrap();
+        assert_eq!(
+            attached.linear_state_values(),
+            published_state,
+            "the attached session must start from the published snapshot, bit for bit"
+        );
         assert!(exec
             .continue_resumable_prefill_physical(&mut attached, &prepared, fork, total)
             .unwrap());
         assert_eq!(attached.physical_context_len(), total);
-        assert_eq!(
-            attached.linear_state_values(),
-            reference_state,
-            "the attached DeltaNet state must equal the fresh run's, bit for bit"
-        );
+        let attached_state = attached.linear_state_values();
+        if exact {
+            assert_eq!(
+                attached_state, reference_state,
+                "the attached DeltaNet state must equal the fresh run's, bit for bit"
+            );
+        } else {
+            let scale = reference_state.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let error = attached_state
+                .iter()
+                .zip(&reference_state)
+                .map(|(a, r)| (a - r).abs())
+                .fold(0f32, |m, d| {
+                    if d.is_finite() {
+                        m.max(d)
+                    } else {
+                        f32::INFINITY
+                    }
+                });
+            assert_eq!(attached_state.len(), reference_state.len());
+            assert!(
+                error <= 5e-2 * scale.max(1e-3),
+                "{backend:?}: attached DeltaNet state differs from the fresh run by {error} (max |ref| {scale})"
+            );
+        }
         assert_eq!(
             decode(&mut attached),
             expected,
@@ -1152,22 +1245,38 @@ pub(crate) mod tests {
                 None
             )
             .is_err());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn load_fixture(tag: &str) -> (Qwen36MoeChatModel, PathBuf) {
+        load_fixture_on(tag, DeviceProfile::cpu())
+    }
+
+    fn load_fixture_on(tag: &str, device: DeviceProfile) -> (Qwen36MoeChatModel, PathBuf) {
         let dir = fixture_dir(tag);
         write_fixture(&dir);
-        let model =
-            Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, DeviceProfile::cpu())
-                .expect("load qwen36moe fixture");
+        let model = Qwen36MoeChatModel::load(&dir, ModelVariant::Qwen36Moe35BA3BFp8, device)
+            .expect("load qwen36moe fixture");
         (model, dir)
+    }
+
+    /// The runtime's device tag for an arena: Metal arenas require the exact
+    /// device identity (Candle reports the registry id, not the ordinal).
+    fn arena_device_ordinal(device: &DeviceProfile) -> Option<u32> {
+        match device.device.location() {
+            candle_core::DeviceLocation::Cpu => None,
+            candle_core::DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
+            candle_core::DeviceLocation::Metal { gpu_id } => {
+                let id = gpu_id as u64;
+                Some((id ^ (id >> 32)) as u32)
+            }
+        }
     }
 
     pub(crate) fn physical_cache(model: &Qwen36MoeChatModel, device: &DeviceProfile) -> PhysicalPagedKvCache {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};
-        use candle_core::DeviceLocation;
         let contract = match model.inference_state_contract().expect("contract") {
             InferenceStateCapability::Managed(contract) => contract,
             other => panic!("expected managed contract, got {other:?}"),
@@ -1176,16 +1285,7 @@ pub(crate) mod tests {
         // domain: full-attention model layers 1 and 3 → physical 0 and 1.
         let kv_heads = model.text_config().attention_head_count_kv;
         let head_dim = model.text_config().attention_key_length;
-        // Mirror the runtime's device tag: Metal arenas require the exact
-        // device identity (Candle reports the registry id, not the ordinal).
-        let device_ordinal = match device.device.location() {
-            DeviceLocation::Cpu => None,
-            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
-            DeviceLocation::Metal { gpu_id } => {
-                let id = gpu_id as u64;
-                Some((id ^ (id >> 32)) as u32)
-            }
-        };
+        let device_ordinal = arena_device_ordinal(device);
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(4242),
             backend: BackendKind::from(device.kind),
@@ -1282,21 +1382,13 @@ pub(crate) mod tests {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         use crate::backends::kv::CandleAcceleratorKvArena;
         use crate::backends::kv::{CpuKvArena, KvArena};
-        use candle_core::DeviceLocation;
         let contract = match model.inference_state_contract().expect("contract") {
             InferenceStateCapability::Managed(contract) => contract,
             other => panic!("expected managed contract, got {other:?}"),
         };
         let kv_heads = model.text_config().attention_head_count_kv;
         let head_dim = model.text_config().attention_key_length;
-        let device_ordinal = match device.device.location() {
-            DeviceLocation::Cpu => None,
-            DeviceLocation::Cuda { gpu_id } => u32::try_from(gpu_id).ok(),
-            DeviceLocation::Metal { gpu_id } => {
-                let id = gpu_id as u64;
-                Some((id ^ (id >> 32)) as u32)
-            }
-        };
+        let device_ordinal = arena_device_ordinal(device);
         let id = KvArenaId {
             model_instance: ModelInstanceId::new(4244),
             backend: BackendKind::from(device.kind),
