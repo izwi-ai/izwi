@@ -46,6 +46,10 @@
 //! with explicit state tensors. Tests use that to check the segmentation
 //! against the standard decode path bit for bit.
 //!
+//! When it applies, the whole-step graph (`step_graph.rs`) is tried first: the
+//! entire step, attention and the LM head included, as one captured graph.
+//! The segments take any step it does not.
+//!
 //! Qwen3.8 owns this module. Qwen3.6 keeps its own decode graphs; the two
 //! families share only the generic pieces under `kernels/`.
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -68,6 +72,9 @@ use crate::models::architectures::qwen38::fast_path::{
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
+#[path = "step_graph.rs"]
+mod step_graph;
+
 /// Logit agreement the warm step demands of the segmented decode against the
 /// standard decode. Both run the same kernels except the table-addressed conv
 /// (the same arithmetic), so this catches addressing and composition errors,
@@ -75,10 +82,12 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 const WARM_CHECK_REL_L2: f64 = 0.02;
 const WARM_CHECK_MAX_FRACTION: f32 = 0.05;
 
-/// What a graph-decoded step returns: the pre-norm hidden `[1, 1, hidden]`
-/// for the caller's final norm and LM head.
+/// What a graph-decoded step returns: logits `[1, 1, vocab]` when the LM
+/// head ran inside the whole-step graph, otherwise the pre-norm hidden
+/// `[1, 1, hidden]` for the caller's final norm and LM head.
 pub(super) enum GraphDecodeOutput {
     Hidden(Tensor),
+    Logits(Tensor),
 }
 
 /// Where one DeltaNet layer reads its state and writes the next one.
@@ -252,14 +261,20 @@ struct Runtime {
     phase: Phase,
     graphs: Vec<SegmentGraph>,
     table: Option<DeviceTable>,
+    /// The whole-step graph, tried before the segments when planned.
+    whole: step_graph::WholeStepRuntime,
     fence: StepFence,
 }
 
 impl Runtime {
+    /// Turn graph decode off: the segments, and the whole-step graph too.
     fn disable(&mut self, reason: String) {
         tracing::warn!(%reason, "Qwen3.8 CUDA graph decode disabled; decoding eagerly");
         for graph in self.graphs.iter_mut() {
             graph.reset();
+        }
+        if !matches!(self.whole.phase, Phase::Disabled(_)) {
+            self.whole.disable(reason.clone());
         }
         self.phase = Phase::Disabled(reason);
     }
@@ -280,6 +295,7 @@ impl Drop for Runtime {
                 std::mem::forget(graph);
             }
             std::mem::forget(self.table.take());
+            self.whole.leak();
         }
     }
 }
@@ -293,6 +309,8 @@ pub(super) struct Qwen38DecodeGraphs {
     attention_count: usize,
     /// Capture graphs (CUDA). Otherwise every step runs the segments eagerly.
     capture: bool,
+    /// The whole-step graph, or why it does not apply.
+    whole: std::result::Result<step_graph::WholeStepPlan, String>,
     runtime: Mutex<Runtime>,
     warmups: AtomicU64,
     warm_checks: AtomicU64,
@@ -311,6 +329,7 @@ impl Qwen38DecodeGraphs {
         model: &Qwen38TextModel,
         switches: &Qwen38CudaSwitches,
         allow_eager: bool,
+        whole_step: bool,
     ) -> (Option<Self>, Qwen38FastPath) {
         let device = &model.device;
         let refuse = |reason: String| (None, Qwen38FastPath::legacy(reason));
@@ -366,6 +385,11 @@ impl Qwen38DecodeGraphs {
         }
         let segments = plan_segments(&attention);
         let graphs = segments.iter().map(|_| SegmentGraph::default()).collect();
+        let whole = if whole_step {
+            step_graph::WholeStepPlan::resolve(model, device.is_cuda())
+        } else {
+            Err("not requested".into())
+        };
         (
             Some(Self {
                 segments,
@@ -373,10 +397,12 @@ impl Qwen38DecodeGraphs {
                 linear_count,
                 attention_count,
                 capture: device.is_cuda(),
+                whole,
                 runtime: Mutex::new(Runtime {
                     phase: Phase::Warm,
                     graphs,
                     table: None,
+                    whole: step_graph::WholeStepRuntime::new(),
                     fence: StepFence::default(),
                 }),
                 warmups: AtomicU64::new(0),
@@ -393,12 +419,17 @@ impl Qwen38DecodeGraphs {
     /// Diagnostics: phase, counters and the reason graph decode was turned
     /// off at runtime, if it was.
     pub(super) fn summary(&self) -> serde_json::Value {
-        let phase = self
-            .runtime
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .phase
-            .clone();
+        let (phase, whole_phase) = {
+            let runtime = self
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (runtime.phase.clone(), runtime.whole.phase.clone())
+        };
+        let whole_step = match &self.whole {
+            Ok(plan) => plan.summary(&whole_phase),
+            Err(reason) => serde_json::json!({ "phase": "off", "disabled_reason": reason }),
+        };
         let disabled = match &phase {
             Phase::Disabled(reason) => Some(reason.clone()),
             _ => None,
@@ -415,15 +446,17 @@ impl Qwen38DecodeGraphs {
             "replays": self.replays.load(Relaxed),
             "verified_segments": self.verified_segments.load(Relaxed),
             "eager_steps": self.eager_steps.load(Relaxed),
+            "whole_step": whole_step,
         })
     }
 
-    /// Run one decode row through the segments (`embedded` `[1, 1, hidden]`
-    /// is `token`'s embedding). `None` hands the step to the standard decode:
-    /// graph decode is off or busy, the row's state is not in the fused
-    /// form, or the step failed (which turns graph decode off). Nothing is
-    /// published then. `reference` computes the standard decode's logits on a
-    /// copy of the row state for the warm check.
+    /// Run one decode row through the whole-step graph when it applies, else
+    /// through the segments (`embedded` `[1, 1, hidden]` is `token`'s
+    /// embedding). `None` hands the step to the standard decode: graph decode
+    /// is off or busy, the row's state is not in the fused form, or the step
+    /// failed (which turns graph decode off). Nothing is published then.
+    /// `reference` computes the standard decode's logits on a copy of the row
+    /// state for the warm checks.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward(
         &self,
@@ -439,20 +472,32 @@ impl Qwen38DecodeGraphs {
         completions: &mut KvWriteCompletionCollector,
         reference: &mut dyn FnMut() -> Result<Tensor>,
     ) -> Option<GraphDecodeOutput> {
-        let _ = (token, slot);
         let Ok(mut runtime) = self.runtime.try_lock() else {
             self.eager_steps.fetch_add(1, Relaxed);
             return None;
         };
-        if matches!(runtime.phase, Phase::Disabled(_)) {
+        let whole = match &self.whole {
+            Ok(plan)
+                if !matches!(runtime.whole.phase, Phase::Disabled(_))
+                    && position[0] == position[1]
+                    && position[0] == position[2] =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        };
+        if whole.is_none() && matches!(runtime.phase, Phase::Disabled(_)) {
             self.eager_steps.fetch_add(1, Relaxed);
             return None;
         }
         let step = self.step(
             &mut runtime,
+            whole,
             model,
+            token,
             embedded,
             position,
+            slot,
             state,
             cache,
             slots,
@@ -478,9 +523,12 @@ impl Qwen38DecodeGraphs {
     fn step(
         &self,
         runtime: &mut Runtime,
+        whole: Option<&step_graph::WholeStepPlan>,
         model: &Qwen38TextModel,
+        token: u32,
         embedded: &Tensor,
         position: [usize; 3],
+        slot: KvSlotRef,
         state: &mut Qwen38TextRuntimeState,
         cache: &PhysicalPagedKvCache,
         slots: &dyn KvSlotMap,
@@ -496,6 +544,43 @@ impl Qwen38DecodeGraphs {
             return Ok(None);
         };
         runtime.fence.order_after_previous(&device)?;
+        if let Some(plan) = whole {
+            let request = step_graph::StepRequest {
+                token: Some(token),
+                position: position[0],
+                slot,
+                cache,
+                slots,
+                metadata,
+            };
+            let done = step_graph::run(
+                plan,
+                &mut runtime.whole,
+                self,
+                model,
+                &request,
+                &inputs,
+                completions,
+                reference,
+            );
+            // Whatever the outcome, the step may have queued work.
+            let marked = runtime.fence.mark_step_end(&device);
+            if let Some(done) = done? {
+                marked?;
+                done.published.publish(model, state)?;
+                return Ok(Some(if plan.head_in_graph() {
+                    GraphDecodeOutput::Logits(done.output)
+                } else {
+                    GraphDecodeOutput::Hidden(done.output)
+                }));
+            }
+            // The whole-step graph turned itself off: the segments take the
+            // step.
+            marked?;
+            if matches!(runtime.phase, Phase::Disabled(_)) {
+                return Ok(None);
+            }
+        }
         // The warm check's standard decode runs first: it writes the step's
         // KV slot, which the segments then rewrite with the same values.
         let expected = if self.capture && runtime.phase == Phase::Warm {
@@ -1142,6 +1227,35 @@ impl StateOutputs {
                 storage: ConvHistoryStorage::Contiguous(out.history),
             });
             *recurrent_state = Some(out.state);
+        }
+        Ok(())
+    }
+}
+
+impl StateOutputs {
+    /// Compare this (graph-written) state with `eager`'s, layer by layer:
+    /// the conv history exactly (to 1e-6), the recurrent state to rounding.
+    /// Layers either side lacks are skipped.
+    fn compare_with(&self, eager: &StateOutputs, label: &str) -> Result<()> {
+        for (layer, (graph_state, eager_state)) in self.layers.iter().zip(&eager.layers).enumerate()
+        {
+            let (Some(graph_state), Some(eager_state)) = (graph_state, eager_state) else {
+                continue;
+            };
+            compare_values(
+                &format!("{label} layer {layer} conv history"),
+                &host(&graph_state.history)?,
+                &host(&eager_state.history)?,
+                1e-6,
+                1e-6,
+            )?;
+            compare_values(
+                &format!("{label} layer {layer} recurrent state"),
+                &host(&graph_state.state)?,
+                &host(&eager_state.state)?,
+                0.01,
+                0.02,
+            )?;
         }
         Ok(())
     }

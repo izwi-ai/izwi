@@ -35,6 +35,9 @@ pub(crate) const FUSED_AB_GEMV_ENV: &str = "IZWI_QWEN38_FUSED_AB_GEMV";
 /// `cuda.decode_graphs=off` (`IZWI_CUDA_DECODE_GRAPHS=off`, alias
 /// `IZWI_QWEN38_DECODE_GRAPHS=off`) turns graph decode off for every family.
 pub(crate) const DECODE_GRAPHS_ENV: &str = "IZWI_QWEN38_CUDA_GRAPHS";
+/// Kill switch for the whole-step CUDA graph (`legacy`, `off`, `0`, `false`):
+/// graph decode keeps its piecewise segments.
+pub(crate) const STEP_GRAPH_ENV: &str = "IZWI_QWEN38_STEP_GRAPH";
 
 /// Execution path a fast path resolved to at load.
 #[derive(Debug, Clone, PartialEq, Eq)]

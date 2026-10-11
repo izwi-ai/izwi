@@ -1880,12 +1880,14 @@ impl Qwen38ChatModel {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let hidden = head.forward_steps_batch(
-                &embeddings,
-                &target.hidden_states,
-                &positions,
-                &mut mtp_caches,
-            )?;
+            let target_hidden = target.hidden_states.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.8 MTP rows need the target hidden states, which graph decode omits"
+                        .into(),
+                )
+            })?;
+            let hidden =
+                head.forward_steps_batch(&embeddings, target_hidden, &positions, &mut mtp_caches)?;
             Some(hidden)
         } else {
             None

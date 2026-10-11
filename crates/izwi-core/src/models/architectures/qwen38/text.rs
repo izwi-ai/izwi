@@ -82,6 +82,9 @@ pub struct Qwen38TextModel {
     /// it resolved at load, and why not otherwise.
     decode_graphs: Option<decode_graph::Qwen38DecodeGraphs>,
     decode_graphs_path: Qwen38FastPath,
+    /// The checkpoint's context length: the longest block table the
+    /// whole-step graph's step buffer must hold.
+    max_context_tokens: usize,
 }
 
 /// One target-model prefill pass retained for MTP prompt alignment.
@@ -95,7 +98,10 @@ pub(super) struct Qwen38TextPrefillOutput {
 }
 
 pub(super) struct Qwen38TextDecodeBatchOutput {
-    pub hidden_states: Tensor,
+    /// The pre-norm hidden rows, or `None` when the whole-step CUDA graph
+    /// ran the LM head inside the graph (only single rows without an MTP
+    /// head take that path).
+    pub hidden_states: Option<Tensor>,
     pub logits: Tensor,
 }
 
@@ -1157,10 +1163,11 @@ impl Qwen38TextModel {
             fused_norm_path: Qwen38FastPath::default(),
             decode_graphs: None,
             decode_graphs_path: Qwen38FastPath::default(),
+            max_context_tokens: cfg.context_length,
         };
         let switches = Qwen38CudaSwitches::for_device(device, performance);
         model.resolve_fast_paths(&switches, false);
-        model.resolve_decode_graphs(&switches, false);
+        model.resolve_decode_graphs(&switches, false, true);
         Ok(model)
     }
 
@@ -1333,7 +1340,7 @@ impl Qwen38TextModel {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
         Ok(Qwen38TextDecodeBatchOutput {
-            hidden_states: hidden,
+            hidden_states: Some(hidden),
             logits,
         })
     }
@@ -1442,9 +1449,10 @@ impl Qwen38TextModel {
             &mut reference,
         );
         let (hidden_states, logits) = match output {
+            Some(decode_graph::GraphDecodeOutput::Logits(logits)) => (None, logits),
             Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
                 match self.project_target_hidden_span(&hidden) {
-                    Ok(logits) => (hidden, logits),
+                    Ok(logits) => (Some(hidden), logits),
                     Err(error) => {
                         return match completions.drain() {
                             Ok(()) => Err(error),
@@ -1790,11 +1798,18 @@ impl Qwen38TextModel {
         })
     }
 
-    /// Resolve graph decode after the fast paths it needs. When it resolves,
-    /// the `TensorIsland` regions retire: a capture cannot nest inside
-    /// another.
-    fn resolve_decode_graphs(&mut self, switches: &Qwen38CudaSwitches, allow_eager: bool) {
-        let (graphs, path) = decode_graph::Qwen38DecodeGraphs::resolve(self, switches, allow_eager);
+    /// Resolve graph decode after the fast paths it needs, with the
+    /// whole-step graph when `whole_step` asks for it. When graph decode
+    /// resolves, the `TensorIsland` regions retire: a capture cannot nest
+    /// inside another.
+    fn resolve_decode_graphs(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        allow_eager: bool,
+        whole_step: bool,
+    ) {
+        let (graphs, path) =
+            decode_graph::Qwen38DecodeGraphs::resolve(self, switches, allow_eager, whole_step);
         if graphs.is_some() {
             for layer in &mut self.layers {
                 layer.graphs_enabled = false;
@@ -1810,7 +1825,15 @@ impl Qwen38TextModel {
     /// the fast paths resolve.
     #[cfg(test)]
     pub(super) fn enable_segmented_decode_for_tests(&mut self) {
-        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true);
+        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true, false);
+    }
+
+    /// Run single-row decode through the whole-step body eagerly off CUDA
+    /// (tests of the step body; CUDA resolves this at load). Call after the
+    /// fast paths resolve.
+    #[cfg(test)]
+    pub(super) fn enable_step_graph_for_tests(&mut self) {
+        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true, true);
     }
 
     /// Whether single-row decode runs through the decode graphs. Such steps

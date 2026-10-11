@@ -147,6 +147,7 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         fused_norm_path: Default::default(),
         decode_graphs: None,
         decode_graphs_path: Default::default(),
+        max_context_tokens: 64,
     }
 }
 fn cache() -> PhysicalPagedKvCache {

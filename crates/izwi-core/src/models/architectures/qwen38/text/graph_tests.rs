@@ -112,7 +112,9 @@ fn decode_rows(
                 &mut [&mut cache],
             )
             .unwrap();
-        assert!(output.hidden_states.dims3().is_ok());
+        if let Some(hidden) = &output.hidden_states {
+            assert!(hidden.dims3().is_ok());
+        }
         rows.push(host_values(&output.logits).unwrap());
     }
     assert_eq!(cache.context_len(), PROMPT.len() + tokens.len());
@@ -189,6 +191,7 @@ fn graph_decode_resolution_reports_why_it_stays_off() {
             decode_graphs_off: Some("cuda.decode_graphs=off"),
             ..Qwen38CudaSwitches::default()
         },
+        true,
         true,
     );
     assert_eq!(reason(&model), "cuda.decode_graphs=off");
@@ -327,6 +330,67 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
     }
 }
 
+/// The whole-step body off CUDA, run eagerly with the arena's attention: the
+/// token read from the step buffer, every layer through one body, the final
+/// norm and the block-FP8 LM head, and the state publication must reproduce
+/// the standard batched decode exactly, step after step. (On CUDA the same
+/// body runs with the fused RoPE/KV-write and split-decode kernels and is
+/// captured.)
+#[test]
+fn whole_step_decode_matches_the_standard_batched_path() {
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let standard = fused_model(&checkpoint);
+    let mut whole = fused_model(&checkpoint);
+    whole.enable_step_graph_for_tests();
+    let graphs = whole.cuda_graphs_summary();
+    assert_eq!(graphs["whole_step"]["phase"], "warm", "{graphs}");
+    assert_eq!(graphs["whole_step"]["head_in_graph"], true, "{graphs}");
+
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F16);
+    let (expected, expected_state) = decode_rows(&standard, &arena, 0, &DECODE);
+    let (actual, actual_state) = decode_rows(&whole, &arena, 1, &DECODE);
+    assert_eq!(actual, expected, "whole-step decode must be bit-identical");
+    assert_eq!(actual_state, expected_state, "published state");
+    let graphs = whole.cuda_graphs_summary();
+    assert_eq!(graphs["whole_step"]["phase"], "warm", "no capture off CUDA");
+    assert_eq!(graphs["whole_step"]["warmups"].as_u64(), Some(8), "{graphs}");
+    assert_eq!(graphs["warmups"], 0, "the segments never ran: {graphs}");
+    assert_eq!(graphs["eager_steps"], 0);
+
+    let mut wrong = DECODE;
+    wrong[5] ^= 1;
+    let (diverged, _) = decode_rows(&whole, &arena, 2, &wrong);
+    assert_eq!(diverged[..6], expected[..6]);
+    assert_ne!(diverged[6], expected[6]);
+}
+
+/// The whole-step graph's own prerequisites: without them the segments
+/// still resolve and take every step.
+#[test]
+fn whole_step_plan_reports_why_it_stays_off() {
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let mut model = fused_model(&checkpoint);
+    model.enable_segmented_decode_for_tests();
+    let graphs = model.cuda_graphs_summary();
+    assert_eq!(graphs["backend"], "fused", "{graphs}");
+    assert_eq!(graphs["whole_step"]["phase"], "off");
+    assert_eq!(graphs["whole_step"]["disabled_reason"], "not requested");
+    for layer in &mut model.layers {
+        if let Qwen38Mixer::Full(attention) = &mut layer.mixer {
+            attention.fused_kv_write = false;
+        }
+    }
+    model.enable_step_graph_for_tests();
+    let reason = model.cuda_graphs_summary()["whole_step"]["disabled_reason"].clone();
+    assert!(reason.as_str().unwrap().contains("K/V write"), "{reason}");
+    // The segments decode in its place.
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F16);
+    decode_rows(&model, &arena, 0, &DECODE[..2]);
+    assert_eq!(model.cuda_graphs_summary()["warmups"].as_u64(), Some(2 * 2));
+}
+
 /// Production resolution on the GPU: graph decode resolves (no MTP head),
 /// passes its warm check against the standard decode, captures and verifies
 /// every segment twice, then replays, and tracks the eager decode.
@@ -360,10 +424,18 @@ fn cuda_graph_decode_reaches_replay_and_tracks_the_eager_decode() {
     };
     let mut performance = PerformanceConfig::default();
     performance.cuda.mtp = OptimizationMode::Off;
-    let graphs = load(&performance);
+    // The segments: production resolution again without the whole-step
+    // graph, which would take every step.
+    let mut graphs = load(&performance);
+    graphs.resolve_decode_graphs(
+        &Qwen38CudaSwitches::for_device(&device, &performance.cuda),
+        false,
+        false,
+    );
     let summary = graphs.cuda_graphs_summary();
     assert_eq!(summary["backend"], "fused", "{summary}");
     assert_eq!(summary["capture"], true);
+    assert_eq!(summary["whole_step"]["phase"], "off");
     let segments = summary["segments"].as_u64().unwrap();
     performance.cuda.decode_graphs = OptimizationMode::Off;
     let eager = load(&performance);
@@ -390,4 +462,204 @@ fn cuda_graph_decode_reaches_replay_and_tracks_the_eager_decode() {
     );
     assert_eq!(summary["replays"].as_u64(), Some(5 * segments), "{summary}");
     assert_eq!(summary["eager_steps"], 0);
+}
+
+/// The whole-step graph on the GPU through production resolution: warm (its
+/// logits checked against the standard decode), capture + verify, verify,
+/// then replays, the LM head inside the graph; the segments never run.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_whole_step_graph_reaches_replay_and_tracks_the_eager_decode() {
+    use super::golden_tests::{argmax, relative_l2};
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::BF16;
+    let load = |performance: &PerformanceConfig| {
+        let policy = Qwen38ResidencyPolicy::resolve(
+            &device,
+            target,
+            performance,
+            &checkpoint.tensors,
+            &checkpoint.config,
+        );
+        Qwen38TextModel::load_native_with_policy(
+            &checkpoint.tensors,
+            &checkpoint.config,
+            &device,
+            target,
+            &performance.cuda,
+            &policy,
+        )
+        .unwrap()
+    };
+    let mut performance = PerformanceConfig::default();
+    performance.cuda.mtp = OptimizationMode::Off;
+    let graphs = load(&performance);
+    let summary = graphs.cuda_graphs_summary();
+    assert_eq!(summary["whole_step"]["phase"], "warm", "{summary}");
+    assert_eq!(summary["whole_step"]["head_in_graph"], true, "{summary}");
+    performance.cuda.decode_graphs = OptimizationMode::Off;
+    let eager = load(&performance);
+
+    let arena = GoldenArena::new(&checkpoint.config, &device, DType::BF16);
+    let (expected, _) = decode_rows(&eager, &arena, 0, &DECODE);
+    let (actual, _) = decode_rows(&graphs, &arena, 1, &DECODE);
+    let mut agree = 0usize;
+    for (index, (row, expected)) in actual.iter().zip(&expected).enumerate() {
+        let error = relative_l2(row, expected);
+        assert!(error < 5e-2, "row {index}: relative L2 {error}");
+        agree += usize::from(argmax(row) == argmax(expected));
+    }
+    assert!(agree + 1 >= actual.len(), "greedy agreement {agree}/{}", actual.len());
+    let summary = graphs.cuda_graphs_summary();
+    let whole = &summary["whole_step"];
+    assert_eq!(whole["phase"], "replay", "{summary}");
+    assert_eq!(whole["warm_checks"].as_u64(), Some(1), "{summary}");
+    assert_eq!(whole["captures"].as_u64(), Some(1), "{summary}");
+    assert_eq!(whole["verified"].as_u64(), Some(2), "{summary}");
+    assert_eq!(whole["replays"].as_u64(), Some(5), "{summary}");
+    assert_eq!(summary["warmups"], 0, "the segments never ran: {summary}");
+    assert_eq!(summary["eager_steps"], 0);
+}
+
+/// A KV arena that grows swaps its backing tensors: the whole-step graph,
+/// captured against the old ones, must recapture (and verify again) before
+/// it replays, and keep decoding what the eager path decodes.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_whole_step_graph_recaptures_after_kv_growth() {
+    use super::golden_tests::relative_l2;
+    use crate::backends::kv::{
+        CandleAcceleratorKvArena, KvArena, KvArenaConfig, KvArenaGrowthConfig, KvLayerConfig,
+    };
+    use crate::backends::BackendKind;
+    use crate::engine::ModelInstanceId;
+    use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let _env = env_lock();
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::BF16;
+    let mut performance = PerformanceConfig::default();
+    performance.cuda.mtp = OptimizationMode::Off;
+    let load = |performance: &PerformanceConfig| {
+        let policy = Qwen38ResidencyPolicy::resolve(
+            &device,
+            target,
+            performance,
+            &checkpoint.tensors,
+            &checkpoint.config,
+        );
+        Qwen38TextModel::load_native_with_policy(
+            &checkpoint.tensors,
+            &checkpoint.config,
+            &device,
+            target,
+            &performance.cuda,
+            &policy,
+        )
+        .unwrap()
+    };
+    let graphs = load(&performance);
+    performance.cuda.decode_graphs = OptimizationMode::Off;
+    let eager = load(&performance);
+    let text = &checkpoint.config.text;
+    let binding = KvLayerBinding {
+        model_layer: 3,
+        physical_layer: 0,
+    };
+    let arena_for = |generation: u32| {
+        let id = KvArenaId {
+            model_instance: ModelInstanceId::new(3812),
+            backend: BackendKind::Cuda,
+            device_ordinal: Some(0),
+            generation,
+        };
+        let group = KvGroupId::new(1);
+        let arena: Arc<dyn KvArena> = Arc::new(
+            CandleAcceleratorKvArena::new_mutation_only(
+                KvArenaConfig {
+                    id,
+                    group,
+                    page_tokens: 8,
+                    capacity_pages: 8,
+                    growth: Some(KvArenaGrowthConfig {
+                        initial_pages: 4,
+                        growth_quantum_pages: 4,
+                    }),
+                    dtype: DType::BF16,
+                    layers: vec![KvLayerConfig {
+                        binding,
+                        num_kv_heads: text.attention_head_count_kv as u32,
+                        key_head_dim: text.attention_key_length as u32,
+                        value_head_dim: text.attention_value_length as u32,
+                    }],
+                },
+                device.clone(),
+            )
+            .unwrap(),
+        );
+        let blocks = (0..4)
+            .map(|index| CacheBlockRef {
+                arena: id,
+                group,
+                index,
+                slot_generation: 1,
+            })
+            .collect();
+        let cache = PhysicalPagedKvCache::new(arena.clone(), vec![binding], blocks, 0).unwrap();
+        (arena, cache)
+    };
+    let decode = |model: &Qwen38TextModel, generation: u32, grow_after: Option<usize>| {
+        let (arena, mut cache) = arena_for(generation);
+        let mut state = model.new_state();
+        let positions = (0..PROMPT.len() + DECODE.len())
+            .map(|position| [position; 3])
+            .collect::<Vec<_>>();
+        model
+            .prefill_token_ids_physical(
+                &PROMPT,
+                &positions[..PROMPT.len()],
+                &mut state,
+                &mut cache,
+                false,
+            )
+            .unwrap();
+        let mut rows = Vec::new();
+        for (step, &token) in DECODE.iter().enumerate() {
+            if grow_after == Some(step) {
+                let plan = arena.plan_resident_growth(8).unwrap().expect("growth");
+                arena.grow_resident_pages(plan).unwrap();
+            }
+            let output = model
+                .forward_token_ids_batch_at_physical(
+                    &[token],
+                    &[positions[PROMPT.len() + step]],
+                    &mut [&mut state],
+                    &mut [&mut cache],
+                )
+                .unwrap();
+            rows.push(host_values(&output.logits).unwrap());
+        }
+        rows
+    };
+    let expected = decode(&eager, 1, None);
+    // Warm, capture, verify, replay, replay; growth; recapture (with its
+    // verification), verify, replay.
+    let actual = decode(&graphs, 2, Some(5));
+    for (index, (row, expected)) in actual.iter().zip(&expected).enumerate() {
+        let error = relative_l2(row, expected);
+        assert!(error < 5e-2, "row {index}: relative L2 {error}");
+    }
+    let summary = graphs.cuda_graphs_summary();
+    let whole = &summary["whole_step"];
+    assert_eq!(whole["phase"], "replay", "{summary}");
+    assert_eq!(whole["recaptures"].as_u64(), Some(1), "{summary}");
+    assert_eq!(whole["captures"].as_u64(), Some(2), "{summary}");
+    assert_eq!(whole["verified"].as_u64(), Some(4), "{summary}");
+    assert_eq!(whole["replays"].as_u64(), Some(3), "{summary}");
 }
