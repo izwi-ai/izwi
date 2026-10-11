@@ -553,6 +553,17 @@ impl ConvRingState {
                 *next_idx
             )));
         }
+        // The ring holds the conv state arena's F32 dtype for the whole
+        // session; an incoming projection in another dtype would poison the
+        // ring with mixed-dtype slots that later `cat`/multiply fail on.
+        let slot_dtype = slots[*next_idx].dtype();
+        if current.dtype() != slot_dtype {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 convolution ring dtype drift: ring {:?}, incoming {:?}",
+                slot_dtype,
+                current.dtype()
+            )));
+        }
         slots[*next_idx] = current.clone();
         *next_idx = (*next_idx + 1) % slots.len();
         Ok(())
@@ -3760,6 +3771,38 @@ mod tests {
             }],
         };
         assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
+    }
+
+    /// A projection in a foreign dtype must fail at the ring, leaving it
+    /// untouched, instead of poisoning it with a mixed-dtype slot that a later
+    /// `cat` or multiply fails on, whichever storage form the ring is in.
+    #[test]
+    fn conv_ring_decode_push_rejects_dtype_drift() {
+        let slots = (0..3)
+            .map(|_| Tensor::zeros((4, 1), DType::F32, &Device::Cpu).unwrap())
+            .collect();
+        let staged = Tensor::zeros((4, 3), DType::F32, &Device::Cpu).unwrap();
+        for mut ring in [
+            ConvRingState::from_slots(slots),
+            ConvRingState::from_staged(staged).unwrap(),
+        ] {
+            for dtype in [DType::BF16, DType::F16] {
+                let current = Tensor::ones((4, 1), dtype, &Device::Cpu).unwrap();
+                let error = ring.push_decode(&current).unwrap_err().to_string();
+                assert!(error.contains("dtype drift"), "{error}");
+            }
+            let history = ring.contiguous_history().unwrap();
+            assert_eq!(history.dtype(), DType::F32);
+            assert_eq!(history.to_vec2::<f32>().unwrap(), vec![vec![0.0; 3]; 4]);
+
+            let current = Tensor::ones((4, 1), DType::F32, &Device::Cpu).unwrap();
+            ring.push_decode(&current)
+                .expect("a matching projection is accepted");
+            assert_eq!(
+                ring.contiguous_history().unwrap().to_vec2::<f32>().unwrap(),
+                vec![vec![0.0, 0.0, 1.0]; 4]
+            );
+        }
     }
 
     #[test]
