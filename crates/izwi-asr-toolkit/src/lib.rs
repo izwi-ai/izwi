@@ -239,6 +239,27 @@ pub fn plan_audio_chunks(
         }
 
         let mut next_start = split.saturating_sub(overlap_samples);
+        // Open the next chunk at a quiet point near the nominal overlap start,
+        // so it rarely begins on a word fragment that defeats boundary dedup.
+        // Searching half the overlap either side keeps at least half of it.
+        let snap_samples = overlap_samples / 2;
+        if snap_samples > frame_samples {
+            let snap_low = next_start.saturating_sub(snap_samples).max(start + 1);
+            let snap_high = (next_start + snap_samples).min(split.saturating_sub(frame_samples));
+            if snap_high > snap_low + frame_samples {
+                if let Some(found) = choose_split_point(
+                    samples,
+                    snap_low,
+                    snap_high,
+                    next_start,
+                    frame_samples,
+                    config.silence_energy_quantile,
+                    config.silence_energy_scale,
+                ) {
+                    next_start = found;
+                }
+            }
+        }
         if next_start <= start {
             next_start = split;
         }
@@ -428,11 +449,57 @@ fn union_sample_len(ranges: &[(usize, usize)]) -> usize {
     total.saturating_add(current.1.saturating_sub(current.0))
 }
 
+/// Leading tokens of a chunk that boundary dedup may drop as fragments of a
+/// word cut by the chunk start, ahead of the words it matches.
+const MAX_FRAGMENT_TOKENS: usize = 2;
+/// Upper bound on words spoken per second of overlapping audio.
+const MAX_OVERLAP_WORDS_PER_SEC: f32 = 4.0;
+/// Characters in an average word and the space after it.
+const CHARS_PER_WORD: usize = 6;
+/// Character-level dedup bounds, for scripts written without spaces.
+const MIN_CHAR_OVERLAP: usize = 14;
+const MAX_CHAR_OVERLAP: usize = 120;
+
 /// Transcript assembler that merges chunk outputs and removes boundary duplicates.
 #[derive(Debug, Clone)]
 pub struct TranscriptAssembler {
     config: AsrLongFormConfig,
     merged: String,
+}
+
+/// Overlap decision for a chunk whose text is still arriving, settled once the
+/// text covers every word the overlap can hold. The commit reuses it, so text
+/// streamed from the unfinished chunk is never contradicted by the merge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettledChunkOverlap {
+    overlap_secs: f32,
+    /// Leading cleaned chunk text that duplicates the transcript tail.
+    duplicate_prefix: String,
+}
+
+/// Bounds for matching a chunk start against the transcript tail.
+#[derive(Debug, Clone, Copy)]
+struct OverlapBounds {
+    min_words: usize,
+    max_words: usize,
+    max_chars: usize,
+}
+
+impl OverlapBounds {
+    /// A short overlap holds only a word or two, so the match bounds follow the
+    /// overlap: at least one word per second of it (up to the configured
+    /// minimum) and at most the words fast speech fits in it plus the word cut
+    /// at its start. Skipped fragments count toward the maximum.
+    fn new(config: &AsrLongFormConfig, overlap_secs: f32) -> Self {
+        let min_words = (overlap_secs.round() as usize).clamp(1, config.min_word_overlap.max(1));
+        let max_words = ((overlap_secs * MAX_OVERLAP_WORDS_PER_SEC).ceil() as usize + 1)
+            .min(config.max_word_overlap.max(1));
+        Self {
+            min_words,
+            max_words,
+            max_chars: (max_words * CHARS_PER_WORD).min(MAX_CHAR_OVERLAP),
+        }
+    }
 }
 
 impl TranscriptAssembler {
@@ -444,69 +511,146 @@ impl TranscriptAssembler {
     }
 
     /// Push chunk text and get the incremental delta added to the merged output.
+    /// Chunks are taken to overlap by the configured `overlap_secs`.
     pub fn push_chunk_text(&mut self, chunk_text: &str) -> String {
+        self.push_chunk_text_with_overlap(chunk_text, self.config.overlap_secs)
+    }
+
+    /// Push the text of a chunk whose audio overlaps the previous chunk by
+    /// `overlap_secs` and get the delta added to the merged output. Chunks
+    /// that do not overlap are appended without dedup, so a phrase genuinely
+    /// repeated across a pause survives.
+    pub fn push_chunk_text_with_overlap(&mut self, chunk_text: &str, overlap_secs: f32) -> String {
         let cleaned = clean_chunk_text(chunk_text, self.config.max_repeated_chars);
-        if cleaned.is_empty() {
+        let delta_start = self.duplicate_prefix_len(&cleaned, overlap_secs);
+        self.append_from(&cleaned, delta_start)
+    }
+
+    /// Settle the overlap for a chunk whose text so far is `partial_text`, or
+    /// `None` while that text is too short to show which of its words repeat
+    /// the transcript tail.
+    pub fn settle_chunk_overlap(
+        &self,
+        partial_text: &str,
+        overlap_secs: f32,
+    ) -> Option<SettledChunkOverlap> {
+        let cleaned = clean_chunk_text(partial_text, self.config.max_repeated_chars);
+        if self.dedups(overlap_secs) {
+            // Every word window the boundary search tries lies within the
+            // first `max` tokens, so once a later token exists they are final.
+            let bounds = OverlapBounds::new(&self.config, overlap_secs);
+            if token_views(&cleaned).len() <= bounds.max_words {
+                return None;
+            }
+        }
+        let duplicate_len = self.duplicate_prefix_len(&cleaned, overlap_secs);
+        Some(SettledChunkOverlap {
+            overlap_secs,
+            duplicate_prefix: cleaned[..duplicate_len].to_string(),
+        })
+    }
+
+    /// Text the chunk adds to the transcript so far, spacing included. It only
+    /// grows as `partial_text` grows, and the commit appends a continuation.
+    pub fn provisional_chunk_text(
+        &self,
+        partial_text: &str,
+        settled: &SettledChunkOverlap,
+    ) -> String {
+        let cleaned = clean_chunk_text(partial_text, self.config.max_repeated_chars);
+        let Some(rest) = cleaned.strip_prefix(settled.duplicate_prefix.as_str()) else {
+            return String::new();
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
             return String::new();
         }
+        format!("{}{rest}", spacing_between(&self.merged, rest))
+    }
 
-        if self.merged.is_empty() {
-            self.merged = cleaned.clone();
-            return cleaned;
+    /// Commit a chunk whose overlap was settled while it streamed. A final
+    /// text that contradicts the settled prefix is merged from scratch.
+    pub fn push_settled_chunk_text(
+        &mut self,
+        chunk_text: &str,
+        settled: &SettledChunkOverlap,
+    ) -> String {
+        let cleaned = clean_chunk_text(chunk_text, self.config.max_repeated_chars);
+        if !cleaned.starts_with(settled.duplicate_prefix.as_str()) {
+            let delta_start = self.duplicate_prefix_len(&cleaned, settled.overlap_secs);
+            return self.append_from(&cleaned, delta_start);
         }
-
-        let mut delta_start = dedupe_overlap_word_boundary(
-            &self.merged,
-            &cleaned,
-            self.config.min_word_overlap,
-            self.config.max_word_overlap,
-        )
-        .unwrap_or(0);
-
-        if delta_start == 0 {
-            delta_start =
-                dedupe_overlap_char_boundary(&self.merged, &cleaned, 14, 120).unwrap_or(0);
-        }
-
-        if delta_start == 0 {
-            delta_start = dedupe_overlap_word_boundary(
-                &self.merged,
-                &cleaned,
-                self.config.min_context_replay_words,
-                self.config.max_context_replay_words,
-            )
-            .unwrap_or(0);
-        }
-
-        if delta_start >= cleaned.len() {
-            return String::new();
-        }
-
-        let delta_raw = cleaned[delta_start..].trim_start();
-        if delta_raw.is_empty() {
-            return String::new();
-        }
-
-        let before_len = self.merged.len();
-        append_with_spacing(&mut self.merged, delta_raw);
-        self.merged[before_len..].to_string()
+        self.append_from(&cleaned, settled.duplicate_prefix.len())
     }
 
     pub fn text(&self) -> &str {
         &self.merged
     }
 
-    /// Merged text as it would stand after pushing `chunk_text`, without
-    /// mutating this assembler. Used to stream provisional intra-chunk deltas
-    /// through the same boundary-dedup rules that commit-time merging applies.
-    pub fn preview_merged_text(&self, chunk_text: &str) -> String {
-        let mut preview = self.clone();
-        preview.push_chunk_text(chunk_text);
-        preview.merged
-    }
-
     pub fn finish(self) -> String {
         self.merged
+    }
+
+    fn dedups(&self, overlap_secs: f32) -> bool {
+        !self.merged.is_empty() && overlap_secs > 0.0
+    }
+
+    /// Byte length of the leading part of `next` (cleaned chunk text) that
+    /// repeats the end of the merged transcript. Only a bounded tail of the
+    /// transcript is examined, so the cost does not grow with its length.
+    fn duplicate_prefix_len(&self, next: &str, overlap_secs: f32) -> usize {
+        if next.is_empty() || !self.dedups(overlap_secs) {
+            return 0;
+        }
+        let bounds = OverlapBounds::new(&self.config, overlap_secs);
+        let tail = tail_words(
+            &self.merged,
+            bounds.max_words.max(self.config.max_context_replay_words),
+        );
+        let prev = token_views(tail);
+        let next_tokens = token_views(next);
+        dedupe_overlap_word_boundary(
+            &prev,
+            &next_tokens,
+            next.len(),
+            bounds.min_words,
+            bounds.max_words,
+            MAX_FRAGMENT_TOKENS,
+        )
+        .or_else(|| {
+            dedupe_overlap_char_boundary(
+                tail_chars(&self.merged, bounds.max_chars),
+                next,
+                MIN_CHAR_OVERLAP,
+                bounds.max_chars,
+            )
+        })
+        .or_else(|| {
+            // A decoder prompted with earlier text can replay a long stretch
+            // of it at the chunk start; trim that as well.
+            dedupe_overlap_word_boundary(
+                &prev,
+                &next_tokens,
+                next.len(),
+                self.config.min_context_replay_words,
+                self.config.max_context_replay_words,
+                0,
+            )
+        })
+        .unwrap_or(0)
+    }
+
+    fn append_from(&mut self, cleaned: &str, delta_start: usize) -> String {
+        if delta_start >= cleaned.len() {
+            return String::new();
+        }
+        let delta_raw = cleaned[delta_start..].trim_start();
+        if delta_raw.is_empty() {
+            return String::new();
+        }
+        let before_len = self.merged.len();
+        append_with_spacing(&mut self.merged, delta_raw);
+        self.merged[before_len..].to_string()
     }
 }
 
@@ -641,15 +785,13 @@ fn remove_repeated_chars(text: &str, max_run: usize) -> String {
 }
 
 fn append_with_spacing(dst: &mut String, delta: &str) {
-    if dst.is_empty() {
-        dst.push_str(delta);
-        return;
-    }
+    dst.push_str(spacing_between(dst, delta));
+    dst.push_str(delta);
+}
 
-    let prev_last = dst.chars().next_back();
-    let next_first = delta.chars().next();
-
-    let needs_space = match (prev_last, next_first) {
+/// Separator to insert between merged text `prev` and an appended `delta`.
+fn spacing_between(prev: &str, delta: &str) -> &'static str {
+    let needs_space = match (prev.chars().next_back(), delta.chars().next()) {
         (Some(a), Some(b)) => {
             !a.is_whitespace()
                 && !b.is_whitespace()
@@ -658,11 +800,11 @@ fn append_with_spacing(dst: &mut String, delta: &str) {
         }
         _ => false,
     };
-
     if needs_space {
-        dst.push(' ');
+        " "
+    } else {
+        ""
     }
-    dst.push_str(delta);
 }
 
 fn is_opening_punctuation(ch: char) -> bool {
@@ -682,42 +824,86 @@ struct TokenView {
     start: usize,
 }
 
+/// Find where `next` stops repeating the end of `prev`: the last `k` tokens of
+/// `prev` (`min_overlap..=max_overlap`, longest first) must match `k` tokens of
+/// `next` after at most `max_skip` leading tokens that are a fragment of the
+/// word the chunk start cut. Skipped and matched tokens together stay within
+/// `max_overlap`. Returns the byte offset in `next` (of length `next_len`)
+/// where new text starts.
 fn dedupe_overlap_word_boundary(
-    prev: &str,
-    next: &str,
+    prev: &[TokenView],
+    next: &[TokenView],
+    next_len: usize,
     min_overlap: usize,
     max_overlap: usize,
+    max_skip: usize,
 ) -> Option<usize> {
-    let a = token_views(prev);
-    let b = token_views(next);
-    if a.is_empty() || b.is_empty() {
+    if prev.is_empty() || next.is_empty() {
         return None;
     }
 
-    let upper = cmp::min(max_overlap.max(1), cmp::min(a.len(), b.len()));
+    let upper = cmp::min(max_overlap.max(1), cmp::min(prev.len(), next.len()));
     let lower = min_overlap.max(1);
     if upper < lower {
         return None;
     }
 
     for k in (lower..=upper).rev() {
-        let a_slice = &a[a.len() - k..];
-        let b_slice = &b[..k];
-
-        if a_slice
-            .iter()
-            .zip(b_slice.iter())
-            .all(|(left, right)| !left.norm.is_empty() && left.norm == right.norm)
-        {
-            return if k == b.len() {
-                Some(next.len())
+        let tail = &prev[prev.len() - k..];
+        let skip_limit = max_skip
+            .min(next.len() - k)
+            .min(max_overlap.saturating_sub(k));
+        for skip in 0..=skip_limit {
+            if skip > 0 && !is_cut_word_fragment(&prev[..prev.len() - k], &next[..skip]) {
+                continue;
+            }
+            if !token_windows_match(tail, &next[skip..skip + k]) {
+                continue;
+            }
+            let end = skip + k;
+            return Some(if end == next.len() {
+                next_len
             } else {
-                Some(b[k].start)
-            };
+                next[end].start
+            });
         }
     }
 
     None
+}
+
+/// A chunk that opens mid-word renders the cut word as a fragment of it, so the
+/// skipped tokens must spell the end of the transcript words they overlap.
+fn is_cut_word_fragment(prev_before_window: &[TokenView], skipped: &[TokenView]) -> bool {
+    if prev_before_window.len() < skipped.len() {
+        return false;
+    }
+    let counterpart = prev_before_window[prev_before_window.len() - skipped.len()..]
+        .iter()
+        .map(|token| token.norm.as_str())
+        .collect::<String>();
+    let fragment = skipped
+        .iter()
+        .map(|token| token.norm.as_str())
+        .collect::<String>();
+    counterpart.ends_with(&fragment)
+}
+
+/// Both ends must agree, which anchors the boundary; inside, 80% of the
+/// tokens must agree, which tolerates one misheard word in five.
+fn token_windows_match(left: &[TokenView], right: &[TokenView]) -> bool {
+    let (Some(first), Some(last)) = (left.first(), left.last()) else {
+        return false;
+    };
+    if first.norm != right[0].norm || last.norm != right[right.len() - 1].norm {
+        return false;
+    }
+    let matched = left
+        .iter()
+        .zip(right)
+        .filter(|(left, right)| left.norm == right.norm)
+        .count();
+    matched * 5 >= left.len() * 4
 }
 
 fn dedupe_overlap_char_boundary(
@@ -727,7 +913,7 @@ fn dedupe_overlap_char_boundary(
     max_chars: usize,
 ) -> Option<usize> {
     let prev_chars: Vec<char> = prev.chars().collect();
-    let next_chars: Vec<char> = next.chars().collect();
+    let next_chars: Vec<char> = next.chars().take(max_chars.max(1)).collect();
     if prev_chars.is_empty() || next_chars.is_empty() {
         return None;
     }
@@ -756,6 +942,40 @@ fn dedupe_overlap_char_boundary(
     }
 
     None
+}
+
+/// The suffix of `text` holding its last `words` whitespace-separated words.
+fn tail_words(text: &str, words: usize) -> &str {
+    if words == 0 {
+        return "";
+    }
+    let mut seen = 0usize;
+    let mut in_word = false;
+    for (idx, ch) in text.char_indices().rev() {
+        if !ch.is_whitespace() {
+            in_word = true;
+            continue;
+        }
+        if in_word {
+            seen += 1;
+            if seen == words {
+                return &text[idx + ch.len_utf8()..];
+            }
+            in_word = false;
+        }
+    }
+    text
+}
+
+/// The suffix of `text` holding its last `chars` characters.
+fn tail_chars(text: &str, chars: usize) -> &str {
+    if chars == 0 {
+        return "";
+    }
+    text.char_indices()
+        .rev()
+        .nth(chars - 1)
+        .map_or(text, |(idx, _)| &text[idx..])
 }
 
 fn char_count_to_byte_index(text: &str, char_count: usize) -> usize {
@@ -950,29 +1170,161 @@ mod tests {
     }
 
     #[test]
-    fn assembler_preview_merged_text_dedups_overlap_without_mutating() {
+    fn next_chunk_starts_at_a_quiet_point_near_the_nominal_overlap() {
+        let cfg = AsrLongFormConfig {
+            target_chunk_secs: 10.0,
+            hard_max_chunk_secs: 12.0,
+            min_chunk_secs: 2.0,
+            overlap_secs: 2.0,
+            silence_search_secs: 1.0,
+            ..AsrLongFormConfig::default()
+        };
+        let sr = 1_000u32;
+        // Uniform energy splits the first chunk at its 10 s target, so the
+        // nominal overlap start is 8 s. The only pause near it is 7.0-7.6 s.
+        let mut samples = vec![0.5f32; 30_000];
+        samples[7_000..7_600].fill(0.0);
+
+        let chunks = plan_audio_chunks(&samples, sr, &cfg, None);
+
+        assert_eq!(chunks[0].end_sample, 10_000);
+        assert!(
+            (7_000..7_600).contains(&chunks[1].start_sample),
+            "next chunk should open in the pause, got {}",
+            chunks[1].start_sample
+        );
+    }
+
+    fn merged(chunks: &[(&str, f32)]) -> String {
         let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
-        assembler.push_chunk_text("hello world this is a test");
+        for (text, overlap_secs) in chunks {
+            assembler.push_chunk_text_with_overlap(text, *overlap_secs);
+        }
+        assembler.finish()
+    }
 
-        let preview = assembler.preview_merged_text("is a test of chunk stitching");
-
-        assert_eq!(preview, "hello world this is a test of chunk stitching");
+    #[test]
+    fn short_overlaps_dedupe_one_and_two_word_boundary_repeats() {
+        // Qwen3-ASR stream=true on a 116 s file, 1 s streaming overlaps.
         assert_eq!(
-            assembler.text(),
-            "hello world this is a test",
-            "preview must not advance the assembler"
+            merged(&[
+                ("and the treatment is very expensive.", 0.0),
+                ("Expensive, and there's no cure.", 1.0),
+            ]),
+            "and the treatment is very expensive. and there's no cure."
+        );
+        assert_eq!(
+            merged(&[
+                ("whether you live in the U.S. or not.", 0.0),
+                ("Or not the reckoned cost is high.", 1.0),
+            ]),
+            "whether you live in the U.S. or not. the reckoned cost is high."
+        );
+        for overlap_secs in [0.45, 1.0] {
+            assert_eq!(
+                merged(&[
+                    ("the quick brown fox", 0.0),
+                    ("brown fox jumps", overlap_secs)
+                ]),
+                "the quick brown fox jumps",
+                "overlap {overlap_secs}s"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_opening_on_a_word_fragment_still_dedupes() {
+        assert_eq!(
+            merged(&[("the quick brown fox", 0.0), ("rown fox jumps", 1.0)]),
+            "the quick brown fox jumps"
         );
     }
 
     #[test]
-    fn assembler_preview_matches_later_commit() {
+    fn boundary_match_tolerates_one_misheard_word_in_five() {
+        assert_eq!(
+            merged(&[
+                ("count with me one two three four five", 0.0),
+                ("one two tree four five six seven", 2.0),
+            ]),
+            "count with me one two three four five six seven"
+        );
+    }
+
+    #[test]
+    fn chunks_that_do_not_overlap_keep_a_genuine_repeat() {
+        assert_eq!(
+            merged(&[("I don't know.", 0.0), ("I don't know why.", 0.0)]),
+            "I don't know. I don't know why."
+        );
+    }
+
+    #[test]
+    fn dedup_window_stays_within_the_words_an_overlap_can_hold() {
+        // Half a second of overlap cannot repeat seven words, and "it was" is
+        // not a fragment of the words before "over", so a chunk that opens
+        // with a phrase the speaker said before keeps it.
+        assert_eq!(
+            merged(&[
+                ("we said it was over and over and over", 0.0),
+                ("it was over and over and over again", 0.45),
+            ]),
+            "we said it was over and over and over it was over and over and over again"
+        );
+    }
+
+    #[test]
+    fn settled_overlap_waits_for_the_partial_to_cover_the_overlap() {
         let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
-        assembler.push_chunk_text("the quick brown fox");
-        let preview = assembler.preview_merged_text("brown fox jumps over");
+        assembler.push_chunk_text("the quick brown fox jumps over");
 
-        assembler.push_chunk_text("brown fox jumps over");
+        // One second of overlap can repeat up to five words.
+        assert!(assembler
+            .settle_chunk_overlap("fox jumps over the", 1.0)
+            .is_none());
+        let settled = assembler
+            .settle_chunk_overlap("fox jumps over the lazy d", 1.0)
+            .expect("six tokens cover the overlap");
+        assert_eq!(
+            assembler.provisional_chunk_text("fox jumps over the lazy d", &settled),
+            " the lazy d"
+        );
+        assert_eq!(
+            assembler.text(),
+            "the quick brown fox jumps over",
+            "settling must not advance the assembler"
+        );
 
-        assert_eq!(preview, assembler.text());
+        let delta = assembler.push_settled_chunk_text("fox jumps over the lazy dog", &settled);
+
+        assert_eq!(delta, " the lazy dog");
+        assert_eq!(
+            assembler.text(),
+            "the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn settled_overlap_is_recomputed_when_the_commit_contradicts_it() {
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        assembler.push_chunk_text("alpha beta gamma");
+        let settled = assembler
+            .settle_chunk_overlap("gamma delta epsilon zeta eta theta", 1.0)
+            .expect("settled");
+
+        let delta = assembler.push_settled_chunk_text("beta gamma delta", &settled);
+
+        assert_eq!(delta, " delta");
+        assert_eq!(assembler.text(), "alpha beta gamma delta");
+    }
+
+    #[test]
+    fn transcript_tails_are_bounded_by_words_and_chars() {
+        assert_eq!(tail_words("one two  three four", 2), "three four");
+        assert_eq!(tail_words("one two", 5), "one two");
+        assert_eq!(tail_words("one two", 0), "");
+        assert_eq!(tail_chars("héllo 世界", 4), "o 世界");
+        assert_eq!(tail_chars("ab", 5), "ab");
     }
 
     #[test]

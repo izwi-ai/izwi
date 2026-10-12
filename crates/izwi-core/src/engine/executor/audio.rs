@@ -1,6 +1,6 @@
 use izwi_asr_toolkit::{
     plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
-    AudioChunk, SpeechChunkPlan, TranscriptAssembler,
+    AudioChunk, SettledChunkOverlap, SpeechChunkPlan, TranscriptAssembler,
 };
 use serde_json::json;
 use std::time::Instant;
@@ -643,11 +643,10 @@ impl NativeExecutor {
         }
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
-        let mut deferred_boundary_delta = String::new();
-        let mut emitted_stream_chars = 0usize;
-        let stable_text_streaming =
-            stream_tx.is_some() && stream_options.stable_text_holdback_chars > 0;
-        let mut partial_streamed_any = false;
+        let mut cursor = TranscriptStreamCursor::default();
+        let holdback_chars = stream_options.stable_text_holdback_chars;
+        let stable_text_streaming = stream_tx.is_some() && holdback_chars > 0;
+        let mut previous_chunk_end: Option<usize> = None;
         let mut chunk_diagnostics = Vec::new();
         for (idx, chunk) in chunk_plan.iter().enumerate() {
             if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
@@ -666,6 +665,12 @@ impl NativeExecutor {
                 continue;
             }
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
+            // Audio this chunk shares with the previous one. Chunks that do not
+            // overlap (speech-island plans) are merged without boundary dedup.
+            let overlap_secs = previous_chunk_end.map_or(0.0, |end| {
+                samples_to_seconds(end.saturating_sub(chunk.start_sample), sample_rate)
+            });
+            previous_chunk_end = Some(chunk.end_sample);
             let prefix_text = assembler.text().to_string();
             if let Some(tx) = stream_tx {
                 Self::stream_asr_progress_with_policy(
@@ -683,7 +688,8 @@ impl NativeExecutor {
                 )?;
             }
             let chunk_started = Instant::now();
-            let mut partial_pending = String::new();
+            let mut partial_text = String::new();
+            let mut settled: Option<SettledChunkOverlap> = None;
             let mut partial_error: Option<Error> = None;
             let mut partial_streamed = false;
             let chunk_result = {
@@ -692,14 +698,19 @@ impl NativeExecutor {
                     if partial_error.is_some() || delta.is_empty() {
                         return;
                     }
-                    partial_pending.push_str(delta);
-                    let visible = assembler.preview_merged_text(&partial_pending);
-                    let stable_delta = Self::next_text_delta_stable(
-                        &visible,
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        false,
-                    );
+                    partial_text.push_str(delta);
+                    // Stream nothing from this chunk until its text covers the
+                    // overlap with the previous chunk; after that its deltas
+                    // only append, and the commit reuses the same decision.
+                    if settled.is_none() {
+                        settled = assembler.settle_chunk_overlap(&partial_text, overlap_secs);
+                    }
+                    let Some(overlap) = settled.as_ref() else {
+                        return;
+                    };
+                    let provisional = assembler.provisional_chunk_text(&partial_text, overlap);
+                    let stable_delta =
+                        cursor.advance(assembler.text(), &provisional, holdback_chars, false);
                     if stable_delta.is_empty() {
                         return;
                     }
@@ -751,103 +762,57 @@ impl NativeExecutor {
                     ),
                 )?;
             }
-            let mut delta = assembler.push_chunk_text(&chunk_text);
+            match settled.as_ref() {
+                Some(overlap) => {
+                    let provisional = assembler.provisional_chunk_text(&partial_text, overlap);
+                    let committed_len = assembler.text().len();
+                    assembler.push_settled_chunk_text(&chunk_text, overlap);
+                    if !assembler.text()[committed_len..].starts_with(&provisional) {
+                        debug!(
+                            "ASR chunk {idx} of request {request_id} committed text that differs from its streamed partials"
+                        );
+                    }
+                }
+                None => {
+                    assembler.push_chunk_text_with_overlap(&chunk_text, overlap_secs);
+                }
+            }
+            cursor.align(assembler.text(), "");
+
+            let Some(tx) = stream_tx else {
+                continue;
+            };
             let is_last_chunk = idx + 1 == chunk_plan.len();
-
-            if partial_streamed {
-                partial_streamed_any = true;
-                if let Some(tx) = stream_tx {
-                    let stable_delta = Self::next_text_delta_stable(
-                        assembler.text(),
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        is_last_chunk,
-                    );
-                    if !stable_delta.is_empty() {
-                        Self::stream_text_with_policy(
-                            tx,
-                            stream_policy,
-                            request_id,
-                            sequence,
-                            stable_delta,
-                        )?;
-                    }
-                }
+            // Without partials or a holdback, a delta that is only boundary
+            // punctuation waits to be streamed with the next chunk's text.
+            if !partial_streamed
+                && !stable_text_streaming
+                && !is_last_chunk
+                && is_boundary_noise_delta(cursor.pending(assembler.text()))
+            {
                 continue;
             }
-
-            if stable_text_streaming {
-                if let Some(tx) = stream_tx {
-                    let stable_delta = Self::next_text_delta_stable(
-                        assembler.text(),
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        is_last_chunk,
-                    );
-                    if !stable_delta.is_empty() {
-                        Self::stream_text_with_policy(
-                            tx,
-                            stream_policy,
-                            request_id,
-                            sequence,
-                            stable_delta,
-                        )?;
-                    }
-                }
-                continue;
-            }
-
-            if !deferred_boundary_delta.is_empty() {
-                deferred_boundary_delta.push_str(&delta);
-                delta = std::mem::take(&mut deferred_boundary_delta);
-            }
-
-            if !is_last_chunk && is_boundary_noise_delta(&delta) {
-                deferred_boundary_delta.push_str(&delta);
-                continue;
-            }
-
-            if !delta.is_empty() {
-                if let Some(tx) = stream_tx {
-                    let streamed_chars = delta.chars().count();
-                    Self::stream_text_with_policy(tx, stream_policy, request_id, sequence, delta)?;
-                    // Keep the partial-emitter accounting coherent: any
-                    // committed text streamed outside next_text_delta_stable
-                    // still counts as visible, or a later partial-emitting
-                    // chunk would re-stream it.
-                    emitted_stream_chars = emitted_stream_chars.saturating_add(streamed_chars);
-                }
-            }
-        }
-
-        if stable_text_streaming || partial_streamed_any {
-            if let Some(tx) = stream_tx {
-                let final_delta = Self::next_text_delta_stable(
-                    assembler.text(),
-                    &mut emitted_stream_chars,
-                    0,
-                    true,
-                );
-                if !final_delta.is_empty() {
-                    Self::stream_text_with_policy(
-                        tx,
-                        stream_policy,
-                        request_id,
-                        sequence,
-                        final_delta,
-                    )?;
-                }
-            }
-        }
-
-        if !deferred_boundary_delta.is_empty() {
-            if let Some(tx) = stream_tx {
+            let stable_delta = cursor.advance(assembler.text(), "", holdback_chars, is_last_chunk);
+            if !stable_delta.is_empty() {
                 Self::stream_text_with_policy(
                     tx,
                     stream_policy,
                     request_id,
                     sequence,
-                    deferred_boundary_delta,
+                    stable_delta,
+                )?;
+            }
+        }
+
+        if let Some(tx) = stream_tx {
+            let final_delta = cursor.advance(assembler.text(), "", 0, true);
+            if !final_delta.is_empty() {
+                Self::stream_text_with_policy(
+                    tx,
+                    stream_policy,
+                    request_id,
+                    sequence,
+                    final_delta,
                 )?;
             }
         }
@@ -987,39 +952,92 @@ impl NativeExecutor {
         *emitted_samples = stable_end;
         delta
     }
+}
 
-    pub(super) fn next_text_delta_stable(
-        all_text: &str,
-        emitted_chars: &mut usize,
+/// Append-only cursor over streamed transcript text: the committed transcript
+/// followed by the current chunk's provisional text. `emitted` is a byte
+/// offset into that text. Committed text extends the provisional text it
+/// replaces, so the offset stays valid across commits.
+#[derive(Debug, Default)]
+struct TranscriptStreamCursor {
+    emitted: usize,
+}
+
+impl TranscriptStreamCursor {
+    /// Text past the cursor, minus a tail of `holdback_chars` characters until
+    /// `is_final`. Work is bounded by the delta and the holdback, not by the
+    /// transcript length.
+    fn advance(
+        &mut self,
+        committed: &str,
+        provisional: &str,
         holdback_chars: usize,
         is_final: bool,
     ) -> String {
-        let total_chars = all_text.chars().count();
-        let stable_end = if is_final {
-            total_chars
+        self.align(committed, provisional);
+        let end = if is_final {
+            committed.len() + provisional.len()
         } else {
-            total_chars.saturating_sub(holdback_chars)
+            holdback_start(committed, provisional, holdback_chars)
         };
-        let start = (*emitted_chars).min(stable_end);
-        if start >= stable_end {
+        if end <= self.emitted {
             return String::new();
         }
+        let split = committed.len();
+        let mut delta = String::with_capacity(end - self.emitted);
+        if self.emitted < split {
+            delta.push_str(&committed[self.emitted..end.min(split)]);
+        }
+        if end > split {
+            delta.push_str(&provisional[self.emitted.max(split) - split..end - split]);
+        }
+        self.emitted = end;
+        delta
+    }
 
-        let start_byte = char_to_byte_index(all_text, start);
-        let end_byte = char_to_byte_index(all_text, stable_end);
-        *emitted_chars = stable_end;
-        all_text[start_byte..end_byte].to_string()
+    /// Committed text not yet streamed.
+    fn pending<'a>(&self, committed: &'a str) -> &'a str {
+        committed.get(self.emitted..).unwrap_or("")
+    }
+
+    /// Keep the cursor within `committed` followed by `provisional` and on a
+    /// character boundary. It only moves when model text contradicted text
+    /// that was already streamed.
+    fn align(&mut self, committed: &str, provisional: &str) {
+        let split = committed.len();
+        let mut emitted = self.emitted.min(split + provisional.len());
+        while !(if emitted <= split {
+            committed.is_char_boundary(emitted)
+        } else {
+            provisional.is_char_boundary(emitted - split)
+        }) {
+            emitted += 1;
+        }
+        self.emitted = emitted;
     }
 }
 
-fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
-    if char_idx == 0 {
-        return 0;
+/// Byte offset, in `committed` followed by `provisional`, where the last
+/// `holdback_chars` characters begin.
+fn holdback_start(committed: &str, provisional: &str, holdback_chars: usize) -> usize {
+    let total = committed.len() + provisional.len();
+    if holdback_chars == 0 {
+        return total;
     }
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len())
+    let mut remaining = holdback_chars;
+    for (idx, _) in provisional.char_indices().rev() {
+        remaining -= 1;
+        if remaining == 0 {
+            return committed.len() + idx;
+        }
+    }
+    for (idx, _) in committed.char_indices().rev() {
+        remaining -= 1;
+        if remaining == 0 {
+            return idx;
+        }
+    }
+    0
 }
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
@@ -1059,6 +1077,7 @@ mod tests {
 
     use super::{
         AsrChunkPlannerKind, AsrChunkStreamOptions, AsrChunkTranscription, NativeExecutor,
+        TranscriptStreamCursor,
     };
 
     #[test]
@@ -1107,35 +1126,40 @@ mod tests {
     }
 
     #[test]
-    fn next_text_delta_stable_holds_back_unstable_tail() {
-        let mut emitted = 0usize;
+    fn stream_cursor_holds_back_unstable_tail() {
+        let mut cursor = TranscriptStreamCursor::default();
 
-        let first = NativeExecutor::next_text_delta_stable("hello world", &mut emitted, 5, false);
-        assert_eq!(first, "hello ");
-        assert_eq!(emitted, 6);
-
-        let second =
-            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, false);
-        assert_eq!(second, "world ");
-        assert_eq!(emitted, 12);
-
-        let final_delta =
-            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, true);
-        assert_eq!(final_delta, "again");
-        assert_eq!(emitted, 17);
+        assert_eq!(cursor.advance("hello world", "", 5, false), "hello ");
+        assert_eq!(cursor.advance("hello world again", "", 5, false), "world ");
+        assert_eq!(cursor.advance("hello world again", "", 5, true), "again");
+        assert_eq!(cursor.advance("hello world again", "", 5, true), "");
     }
 
     #[test]
-    fn next_text_delta_stable_respects_utf8_boundaries() {
-        let mut emitted = 0usize;
-        let first = NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, false);
-        assert_eq!(first, "héllo ");
-        assert_eq!(emitted, 6);
+    fn stream_cursor_respects_utf8_boundaries() {
+        let mut cursor = TranscriptStreamCursor::default();
 
-        let final_delta =
-            NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, true);
-        assert_eq!(final_delta, "世界");
-        assert_eq!(emitted, 8);
+        assert_eq!(cursor.advance("héllo 世界", "", 2, false), "héllo ");
+        assert_eq!(cursor.advance("héllo 世界", "", 2, true), "世界");
+    }
+
+    #[test]
+    fn stream_cursor_spans_committed_and_provisional_text() {
+        let mut cursor = TranscriptStreamCursor::default();
+
+        assert_eq!(
+            cursor.advance("alpha", " beta gam", 3, false),
+            "alpha beta "
+        );
+        assert_eq!(
+            cursor.advance("alpha", " beta gamma delta", 3, false),
+            "gamma de"
+        );
+        // The commit extends the provisional text, so the cursor carries over.
+        assert_eq!(
+            cursor.advance("alpha beta gamma delta epsilon", "", 0, true),
+            "lta epsilon"
+        );
     }
 
     #[test]
@@ -1557,13 +1581,14 @@ mod tests {
     fn chunk_plan_streaming_partial_deltas_dedup_overlap_words() {
         let sr = 10u32;
         let samples = vec![0.0f32; sr as usize * 2];
+        // The chunks share one second of audio.
         let chunk_plan = vec![
             AudioChunk {
                 start_sample: 0,
-                end_sample: sr as usize,
+                end_sample: sr as usize * 3 / 2,
             },
             AudioChunk {
-                start_sample: sr as usize,
+                start_sample: sr as usize / 2,
                 end_sample: sr as usize * 2,
             },
         ];
@@ -1690,6 +1715,135 @@ mod tests {
         );
         let streamed: String = text_deltas.concat();
         assert_eq!(streamed, "one two three four five six seven eight");
+    }
+
+    /// Stream `chunk_texts` through the chunk executor (as word partials when
+    /// `emit_partials`) and return the final transcript and the concatenated
+    /// stream deltas.
+    fn stream_chunks(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunk_texts: &[&str],
+        holdback_chars: usize,
+        emit_partials: bool,
+    ) -> (String, String) {
+        let samples = vec![0.0f32; chunk_plan.last().expect("chunks").end_sample];
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let mut chunk_idx = 0usize;
+        let chunked =
+            NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                "req-stream",
+                Some(&tx),
+                EngineStreamPolicy::FailOnFull,
+                &mut sequence,
+                &samples,
+                sr,
+                chunk_plan,
+                &NativeExecutor::asr_long_form_config(),
+                AsrChunkStreamOptions {
+                    stable_text_holdback_chars: holdback_chars,
+                },
+                |_chunk_audio, _sr, _prefix, partial| {
+                    let text = chunk_texts[chunk_idx];
+                    chunk_idx += 1;
+                    if let (true, Some(emit)) = (emit_partials, partial) {
+                        for word in text.split_inclusive(' ') {
+                            emit(word);
+                        }
+                    }
+                    Ok(AsrChunkTranscription {
+                        text: text.to_string(),
+                        diagnostics: None,
+                    })
+                },
+            )
+            .expect("streaming chunk plan should complete");
+        let streamed = tx
+            .take()
+            .expect("staged events")
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect::<String>();
+        (chunked.text, streamed)
+    }
+
+    fn assert_stream_matches_final(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunk_texts: &[&str],
+        expected: &str,
+    ) {
+        for holdback_chars in [0, 20] {
+            for emit_partials in [true, false] {
+                let (text, streamed) =
+                    stream_chunks(chunk_plan, sr, chunk_texts, holdback_chars, emit_partials);
+                assert_eq!(
+                    text, expected,
+                    "holdback {holdback_chars}, partials {emit_partials}"
+                );
+                assert_eq!(
+                    streamed, text,
+                    "holdback {holdback_chars}, partials {emit_partials}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_stream_matches_the_final_transcript_with_one_second_overlaps() {
+        // Six-second chunks at 10 Hz sharing one second of audio each.
+        let chunk_plan = [(0, 60), (50, 110), (100, 160)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &[
+                "one two three four five six seven",
+                "seven eight nine ten eleven twelve thirteen",
+                "thirteen fourteen fifteen sixteen seventeen",
+            ],
+            "one two three four five six seven eight nine ten eleven twelve thirteen \
+             fourteen fifteen sixteen seventeen",
+        );
+    }
+
+    #[test]
+    fn chunk_stream_matches_the_final_transcript_with_three_second_overlaps() {
+        // The partials of each later chunk start inside a three-second overlap
+        // and never stream duplicated words that the commit then drops.
+        let chunk_plan = [(0, 240), (210, 480), (450, 600)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &[
+                "we walked along the river past the old mill",
+                "past the old mill and on toward the harbor where boats",
+                "harbor where boats rocked gently in the evening light",
+            ],
+            "we walked along the river past the old mill and on toward the harbor where \
+             boats rocked gently in the evening light",
+        );
+    }
+
+    #[test]
+    fn chunk_stream_keeps_genuine_repeats_across_chunks_that_do_not_overlap() {
+        // Speech-island plans leave a gap between chunks.
+        let chunk_plan = [(0, 20), (30, 50)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &["I don't know.", "I don't know why."],
+            "I don't know. I don't know why.",
+        );
     }
 
     #[test]
