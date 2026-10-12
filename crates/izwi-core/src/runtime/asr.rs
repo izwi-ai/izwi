@@ -351,6 +351,20 @@ fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
         .unwrap_or(output.audio.duration_secs)
 }
 
+/// Transcript language: the caller's hint when given, otherwise the language
+/// the model detected and reported as `language` in its ASR diagnostics.
+fn asr_response_language(
+    requested: Option<&str>,
+    diagnostics: Option<&serde_json::Value>,
+) -> Option<String> {
+    requested.map(str::to_string).or_else(|| {
+        diagnostics
+            .and_then(|diagnostics| diagnostics.get("language"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
 /// Install the caller's ASR decode budget. An omitted budget is marked
 /// automatic so duration-aware families (Granite, LFM2.5 Audio long-form) may
 /// derive it per chunk, and Parakeet preparation may size it from the encoder
@@ -2462,7 +2476,7 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -2574,7 +2588,7 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -2683,7 +2697,7 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -2871,7 +2885,7 @@ impl RuntimeService {
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
@@ -5495,6 +5509,22 @@ mod tests {
             granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn asr_response_language_prefers_the_hint_then_the_detected_language() {
+        let detected = serde_json::json!({ "language": "de" });
+        assert_eq!(
+            asr_response_language(Some("en"), Some(&detected)).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            asr_response_language(None, Some(&detected)).as_deref(),
+            Some("de")
+        );
+        assert_eq!(asr_response_language(None, None), None);
+        let undetected = serde_json::json!({ "language": null });
+        assert_eq!(asr_response_language(None, Some(&undetected)), None);
     }
 
     #[test]

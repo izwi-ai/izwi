@@ -273,6 +273,12 @@ pub(crate) struct WhisperDecodeState {
     max_steps: usize,
     finished: bool,
     rng: StdRng,
+    /// Language resolved once before the prompt was built.
+    language: WhisperLanguageResolution,
+    /// Every finished temperature attempt, kept across fallback restarts.
+    attempts: Vec<WhisperAttemptRecord>,
+    /// The attempt the terminal policy accepted or skipped, with its temperature.
+    published_attempt: Option<(WhisperDecodeAttempt, f32)>,
 }
 
 /// Owns a registered retained cross-attention sequence until construction of
@@ -374,6 +380,8 @@ struct WhisperDecodeCheckpointPayload {
     max_steps: usize,
     finished: bool,
     rng: StdRng,
+    attempts: Vec<WhisperAttemptRecord>,
+    published_attempt: Option<(WhisperDecodeAttempt, f32)>,
     managed_completions_drained: bool,
     current_managed_generation: u64,
 }
@@ -560,6 +568,8 @@ impl WhisperDecodeState {
         self.max_steps = payload.max_steps;
         self.finished = payload.finished;
         self.rng = payload.rng;
+        self.attempts = payload.attempts;
+        self.published_attempt = payload.published_attempt;
         self.managed_completions_drained = payload.managed_completions_drained;
         self.current_managed_generation = payload.current_managed_generation;
         self.active_quantum = None;
@@ -610,6 +620,8 @@ impl WhisperDecodeState {
                 max_steps: self.max_steps,
                 finished: self.finished,
                 rng: self.rng.clone(),
+                attempts: self.attempts.clone(),
+                published_attempt: self.published_attempt.clone(),
                 managed_completions_drained: self.managed_completions_drained,
                 current_managed_generation: self.current_managed_generation,
             }),
@@ -734,6 +746,25 @@ struct WhisperDecodeAttempt {
     sampled_token_count: usize,
     decode_steps: usize,
     profile: WhisperDecodeProfile,
+}
+
+/// One finished retained attempt and the policy verdict on it.
+#[derive(Debug, Clone)]
+struct WhisperAttemptRecord {
+    temperature: f32,
+    attempt: WhisperDecodeAttempt,
+    retry_reasons: Vec<&'static str>,
+    no_speech_skip: bool,
+}
+
+/// Terminal-policy inputs, resolved from the model's generation config.
+#[derive(Debug, Clone, Copy)]
+struct WhisperTerminalPolicy<'a> {
+    temperatures: &'a [f32],
+    logprob_threshold: f32,
+    no_speech_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+    vocab_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1533,8 +1564,8 @@ impl WhisperTurboAsrModel {
             prepared.layers.clone(),
         )?;
 
-        let initialized: Result<(Vec<u32>, usize)> = (|| {
-            let resolved_language = self.resolve_request_language_retained(
+        let initialized: Result<(Vec<u32>, usize, WhisperLanguageResolution)> = (|| {
+            let language = self.resolve_request_language_retained(
                 language,
                 &mut self_kv,
                 cross_owner.runtime.as_ref(),
@@ -1549,7 +1580,7 @@ impl WhisperTurboAsrModel {
             let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
             let prompt = build_whisper_prompt_prefix(
                 &self.special,
-                resolved_language.as_ref().map(|(token, _)| *token),
+                language.resolved.as_ref().map(|(token, _)| *token),
                 &initial_prompt_tokens,
                 self.config.max_target_positions,
                 self.runtime_tuning.initial_prompt_max_tokens,
@@ -1563,9 +1594,9 @@ impl WhisperTurboAsrModel {
                 self.config.max_target_positions,
                 configured_steps,
             )?;
-            Ok((prompt, max_steps))
+            Ok((prompt, max_steps, language))
         })();
-        let (prompt, max_steps) = initialized?;
+        let (prompt, max_steps, language) = initialized?;
         let (cross_runtime, cross_sequence) = cross_owner.into_decode_state_parts();
 
         Ok(WhisperDecodeState {
@@ -1595,6 +1626,9 @@ impl WhisperTurboAsrModel {
             max_steps,
             finished: false,
             rng: StdRng::from_entropy(),
+            language,
+            attempts: Vec::new(),
+            published_attempt: None,
         })
     }
 
@@ -1681,86 +1715,60 @@ impl WhisperTurboAsrModel {
         &self,
         state: &mut WhisperDecodeState,
     ) -> Result<WhisperTerminalTransition> {
-        if !state.finished {
-            return Err(Error::InvalidInput(
-                "Whisper terminal policy requires a finished decode attempt".into(),
-            ));
-        }
-        let avg_logprob = if state.sampled_token_count > 0 {
-            (state.sum_logprobs / state.sampled_token_count as f64) as f32
-        } else {
-            f32::NEG_INFINITY
-        };
-        let attempt = WhisperDecodeAttempt {
-            text: state.assembled.trim().to_string(),
-            avg_logprob,
-            no_speech_prob: state.no_speech_prob,
-            ended_with_eot: state.ended_with_eot,
-            repetition_loop: state.repetition_loop,
-            compression_ratio: token_compression_ratio(
-                &state.generated_tokens,
-                self.config.vocab_size,
-            ),
-            generated_token_count: state.generated_tokens.len(),
-            sampled_token_count: state.sampled_token_count,
-            decode_steps: state.decode_steps,
-            profile: WhisperDecodeProfile::new(false),
-        };
-        let logprob_threshold = self
-            .generation
-            .logprob_threshold
-            .unwrap_or(DEFAULT_LOGPROB_THRESHOLD);
-        let no_speech_threshold = self
-            .generation
-            .no_speech_threshold
-            .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD);
         let temperatures = self.decode_temperatures();
-        let next_temperature = usize::try_from(state.attempt_generation)
-            .ok()
-            .and_then(|index| temperatures.get(index))
-            .copied();
-        let expected_generation = state.current_managed_generation;
-        let new_generation = if next_temperature.is_some() {
-            expected_generation.checked_add(1).ok_or_else(|| {
-                Error::InferenceError("Whisper managed KV generation overflow".into())
-            })?
-        } else {
-            expected_generation
-        };
-        let (transition, best_attempt) = whisper_terminal_policy_transition(
-            attempt,
-            state.temperature,
-            state.best_attempt.take(),
-            next_temperature,
-            logprob_threshold,
-            no_speech_threshold,
-            self.generation.compression_ratio_threshold,
-            expected_generation,
-            new_generation,
-        );
-        state.best_attempt = best_attempt;
-        state.pending_retry = match &transition {
-            WhisperTerminalTransition::RetryRequired {
-                next_temperature,
-                expected_generation,
-                new_generation,
-                ..
-            } => Some(WhisperPendingRetry {
-                next_temperature: *next_temperature,
-                expected_generation: *expected_generation,
-                new_generation: *new_generation,
-                next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(
-                    || Error::InferenceError("Whisper retry attempt generation overflow".into()),
-                )?,
-            }),
-            _ => None,
-        };
-        match &transition {
-            WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
-            WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
-            WhisperTerminalTransition::RetryRequired { .. } => {}
+        resolve_whisper_terminal_transition(
+            state,
+            WhisperTerminalPolicy {
+                temperatures: &temperatures,
+                logprob_threshold: self
+                    .generation
+                    .logprob_threshold
+                    .unwrap_or(DEFAULT_LOGPROB_THRESHOLD),
+                no_speech_threshold: self
+                    .generation
+                    .no_speech_threshold
+                    .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD),
+                compression_ratio_threshold: self.generation.compression_ratio_threshold,
+                vocab_size: self.config.vocab_size,
+            },
+        )
+    }
+
+    /// Diagnostics for a retained sequence whose terminal policy accepted or
+    /// skipped an attempt, with the keys the atomic path reports. `None`
+    /// until the terminal policy publishes.
+    pub(crate) fn retained_terminal_diagnostics(
+        &self,
+        state: &WhisperDecodeState,
+    ) -> Option<serde_json::Value> {
+        let mut diagnostics = whisper_retained_terminal_diagnostics(state)?;
+        if let Some(root) = diagnostics.as_object_mut() {
+            root.insert(
+                "device".into(),
+                whisper_device_diagnostics(
+                    self.device.kind,
+                    self.model_dtype,
+                    self.cuda_dtype_shim,
+                ),
+            );
+            root.insert(
+                "fallback_policy".into(),
+                json!({
+                    "no_fallback": self.runtime_tuning.no_fallback,
+                    "max_fallback_retries": self.runtime_tuning.max_fallback_retries,
+                    "max_attempts": self.runtime_tuning.max_fallback_retries.saturating_add(1),
+                }),
+            );
+            root.insert(
+                "language_resolution".into(),
+                json!({
+                    "strategy": state.language.strategy,
+                    "default_language": self.runtime_tuning.default_language,
+                    "detect_ms": state.language.detect_ms,
+                }),
+            );
         }
-        Ok(transition)
+        Some(diagnostics)
     }
 
     pub(crate) fn decode_step_retained(
@@ -1903,16 +1911,32 @@ impl WhisperTurboAsrModel {
         self_kv: &mut PhysicalPagedKvCache,
         cross_runtime: &RetainedStaticAttentionRuntimeV2,
         cross_sequence: RetainedStaticAttentionSequenceId,
-    ) -> Result<Option<(u32, String)>> {
+    ) -> Result<WhisperLanguageResolution> {
         if let Some(language) = language {
-            return self.resolve_language_token(language);
+            return Ok(WhisperLanguageResolution {
+                resolved: self.resolve_language_token(language)?,
+                hint_used: true,
+                detect_ms: 0.0,
+                strategy: "hint",
+            });
         }
         if let Some(default) = self.runtime_tuning.default_language.as_deref() {
-            return self.resolve_language_token(default);
+            return Ok(WhisperLanguageResolution {
+                resolved: self.resolve_language_token(default)?,
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "default",
+            });
         }
         if self.language_token_ids.is_empty() {
-            return Ok(None);
+            return Ok(WhisperLanguageResolution {
+                resolved: None,
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "detected",
+            });
         }
+        let detect_started = Instant::now();
         self_kv.reset_invocation()?;
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
         let output = self.whisper.decoder_forward_retained_at(
@@ -1942,7 +1966,12 @@ impl WhisperTurboAsrModel {
                         .map(|code| (token, code))
                 })
         };
-        Ok(resolved)
+        Ok(WhisperLanguageResolution {
+            resolved,
+            hint_used: false,
+            detect_ms: elapsed_ms(detect_started),
+            strategy: "detected",
+        })
     }
 
     pub(crate) fn physical_state_spec(
@@ -2182,9 +2211,11 @@ impl WhisperTurboAsrModel {
                 "effective_samples": trimmed_audio.len(),
                 "trimmed_samples": audio.len().saturating_sub(trimmed_audio.len()),
             },
+            "language": language,
             "language_resolution": {
                 "strategy": language_resolution.strategy,
                 "default_language": self.runtime_tuning.default_language,
+                "detect_ms": language_detect_ms,
             },
             "prompt": {
                 "initial_prompt_requested": prompt_diagnostics.initial_prompt_requested,
@@ -2211,6 +2242,7 @@ impl WhisperTurboAsrModel {
             "decode": {
                 "ended_with_eot": final_attempt.ended_with_eot,
                 "repetition_loop": final_attempt.repetition_loop,
+                "stop_reason": whisper_stop_reason(&final_attempt),
                 "avg_logprob": final_attempt.avg_logprob,
                 "no_speech_prob": final_attempt.no_speech_prob,
                 "compression_ratio": final_attempt.compression_ratio,
@@ -3788,6 +3820,9 @@ fn decode_retry_reasons(
     reasons
 }
 
+/// Terminal policy for one finished attempt. Returns the transition, the best
+/// attempt to keep for a pending retry, and the attempt a terminal transition
+/// publishes (accepted or skipped), each with its temperature.
 fn whisper_terminal_policy_transition(
     attempt: WhisperDecodeAttempt,
     temperature: f32,
@@ -3801,6 +3836,7 @@ fn whisper_terminal_policy_transition(
 ) -> (
     WhisperTerminalTransition,
     Option<(WhisperDecodeAttempt, f32)>,
+    Option<(WhisperDecodeAttempt, f32)>,
 ) {
     if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
         return (
@@ -3808,6 +3844,7 @@ fn whisper_terminal_policy_transition(
                 no_speech_probability: attempt.no_speech_prob,
             },
             None,
+            Some((attempt, temperature)),
         );
     }
     let retry_reasons =
@@ -3829,6 +3866,7 @@ fn whisper_terminal_policy_transition(
                     new_generation,
                 },
                 best,
+                None,
             );
         }
     }
@@ -3839,7 +3877,175 @@ fn whisper_terminal_policy_transition(
             selected_temperature,
         },
         None,
+        Some((selected, selected_temperature)),
     )
+}
+
+/// Apply the terminal policy to a finished retained attempt. Every attempt is
+/// recorded across temperature restarts, and the accepted or skipped attempt
+/// is kept so the published output can carry its diagnostics.
+fn resolve_whisper_terminal_transition(
+    state: &mut WhisperDecodeState,
+    policy: WhisperTerminalPolicy<'_>,
+) -> Result<WhisperTerminalTransition> {
+    if !state.finished {
+        return Err(Error::InvalidInput(
+            "Whisper terminal policy requires a finished decode attempt".into(),
+        ));
+    }
+    let avg_logprob = if state.sampled_token_count > 0 {
+        (state.sum_logprobs / state.sampled_token_count as f64) as f32
+    } else {
+        f32::NEG_INFINITY
+    };
+    let attempt = WhisperDecodeAttempt {
+        text: state.assembled.trim().to_string(),
+        avg_logprob,
+        no_speech_prob: state.no_speech_prob,
+        ended_with_eot: state.ended_with_eot,
+        repetition_loop: state.repetition_loop,
+        compression_ratio: token_compression_ratio(&state.generated_tokens, policy.vocab_size),
+        generated_token_count: state.generated_tokens.len(),
+        sampled_token_count: state.sampled_token_count,
+        decode_steps: state.decode_steps,
+        profile: WhisperDecodeProfile::new(false),
+    };
+    let next_temperature = usize::try_from(state.attempt_generation)
+        .ok()
+        .and_then(|index| policy.temperatures.get(index))
+        .copied();
+    let expected_generation = state.current_managed_generation;
+    let new_generation = if next_temperature.is_some() {
+        expected_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InferenceError("Whisper managed KV generation overflow".into()))?
+    } else {
+        expected_generation
+    };
+    state.attempts.push(WhisperAttemptRecord {
+        temperature: state.temperature,
+        retry_reasons: decode_retry_reasons(
+            &attempt,
+            policy.logprob_threshold,
+            policy.compression_ratio_threshold,
+        ),
+        no_speech_skip: should_skip_as_no_speech(
+            &attempt,
+            policy.logprob_threshold,
+            policy.no_speech_threshold,
+        ),
+        attempt: attempt.clone(),
+    });
+    let (transition, best_attempt, published_attempt) = whisper_terminal_policy_transition(
+        attempt,
+        state.temperature,
+        state.best_attempt.take(),
+        next_temperature,
+        policy.logprob_threshold,
+        policy.no_speech_threshold,
+        policy.compression_ratio_threshold,
+        expected_generation,
+        new_generation,
+    );
+    state.best_attempt = best_attempt;
+    state.published_attempt = published_attempt;
+    state.pending_retry = match &transition {
+        WhisperTerminalTransition::RetryRequired {
+            next_temperature,
+            expected_generation,
+            new_generation,
+            ..
+        } => Some(WhisperPendingRetry {
+            next_temperature: *next_temperature,
+            expected_generation: *expected_generation,
+            new_generation: *new_generation,
+            next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Whisper retry attempt generation overflow".into())
+            })?,
+        }),
+        _ => None,
+    };
+    match &transition {
+        WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
+        WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
+        WhisperTerminalTransition::RetryRequired { .. } => {}
+    }
+    Ok(transition)
+}
+
+/// Why a decode attempt stopped, as the atomic and retained paths report it.
+fn whisper_stop_reason(attempt: &WhisperDecodeAttempt) -> &'static str {
+    if attempt.ended_with_eot {
+        "eot"
+    } else if attempt.repetition_loop {
+        "repetition_loop"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// Model-independent retained diagnostics: the attempt ladder, the published
+/// attempt's decode metrics and the resolved language. `None` until the
+/// terminal policy accepts or skips an attempt.
+fn whisper_retained_terminal_diagnostics(state: &WhisperDecodeState) -> Option<serde_json::Value> {
+    let (published, selected_temperature) = state.published_attempt.as_ref()?;
+    let no_speech_skip = state
+        .attempts
+        .last()
+        .is_some_and(|record| record.no_speech_skip);
+    // Attempts before the last one each triggered a temperature retry.
+    let retried = state.attempts.len().saturating_sub(1);
+    let mut fallback_reasons = Vec::<&'static str>::new();
+    for record in &state.attempts[..retried] {
+        record_unique_reasons(&mut fallback_reasons, &record.retry_reasons);
+    }
+    if no_speech_skip {
+        record_unique_reason(&mut fallback_reasons, "no_speech");
+    }
+    let language = state
+        .language
+        .resolved
+        .as_ref()
+        .map(|(_token, code)| code.as_str());
+    Some(json!({
+        "model_family": "whisper_asr",
+        "execution": "retained_sequence",
+        "fallback_attempts": state.attempts.len(),
+        "attempted_temperatures": state
+            .attempts
+            .iter()
+            .map(|record| record.temperature)
+            .collect::<Vec<_>>(),
+        "selected_temperature": selected_temperature,
+        "language": language,
+        "language_hint_used": state.language.hint_used,
+        "no_speech_skip": no_speech_skip,
+        "fallback_reasons": fallback_reasons,
+        "decode_attempts": state
+            .attempts
+            .iter()
+            .map(|record| {
+                whisper_attempt_diagnostics(
+                    record.temperature,
+                    &record.attempt,
+                    &record.retry_reasons,
+                    record.no_speech_skip,
+                )
+            })
+            .collect::<Vec<_>>(),
+        "decode": {
+            "ended_with_eot": published.ended_with_eot,
+            "repetition_loop": published.repetition_loop,
+            "stop_reason": whisper_stop_reason(published),
+            "avg_logprob": published.avg_logprob,
+            "no_speech_prob": published.no_speech_prob,
+            "compression_ratio": published.compression_ratio,
+            "decode_steps": published.decode_steps,
+            "generated_tokens": published.generated_token_count,
+            "generated_token_count": published.generated_token_count,
+            "sampled_token_count": published.sampled_token_count,
+        },
+    }))
 }
 
 fn should_retry_decode(
@@ -4382,7 +4588,7 @@ mod tests {
         let attempt = terminal_attempt("you", logprob, no_speech, true);
 
         assert!(should_skip_as_no_speech(&attempt, -1.0, 0.6));
-        let (transition, _) = whisper_terminal_policy_transition(
+        let (transition, _, _) = whisper_terminal_policy_transition(
             attempt,
             0.0,
             None,
@@ -4707,7 +4913,7 @@ mod tests {
 
     #[test]
     fn terminal_policy_no_speech_precedes_temperature_retry() {
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             terminal_attempt("hallucination", -2.0, Some(0.9), false),
             0.0,
             None,
@@ -4725,12 +4931,14 @@ mod tests {
             }
         );
         assert!(best.is_none());
+        let (skipped, temperature) = published.expect("skipped attempt is published");
+        assert_eq!((skipped.no_speech_prob, temperature), (Some(0.9), 0.0));
     }
 
     #[test]
     fn terminal_policy_requests_configured_retry_and_retains_best_attempt() {
         let attempt = terminal_attempt("first", -2.0, Some(0.1), false);
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             attempt.clone(),
             0.0,
             None,
@@ -4755,13 +4963,14 @@ mod tests {
         assert!(reasons.contains(&"missing_eot"));
         assert!(reasons.contains(&"low_logprob"));
         assert_eq!(best.expect("retained best").0.text, attempt.text);
+        assert!(published.is_none(), "a pending retry publishes nothing");
     }
 
     #[test]
     fn terminal_policy_final_attempt_selects_better_prior_attempt() {
         let prior = terminal_attempt("better transcript", -0.2, Some(0.1), true);
         let final_attempt = terminal_attempt("worse", -2.0, Some(0.1), false);
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             final_attempt,
             0.2,
             Some((prior, 0.0)),
@@ -4780,6 +4989,8 @@ mod tests {
             }
         );
         assert!(best.is_none());
+        let (selected, temperature) = published.expect("accepted attempt is published");
+        assert_eq!((selected.text.as_str(), temperature), ("better transcript", 0.0));
     }
 
     fn early_failure_cross_runtime(
@@ -5122,7 +5333,171 @@ mod tests {
             max_steps: 3,
             finished: false,
             rng: rand::rngs::StdRng::seed_from_u64(7),
+            language: super::WhisperLanguageResolution {
+                resolved: Some((20, "en".into())),
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "detected",
+            },
+            attempts: Vec::new(),
+            published_attempt: None,
         }
+    }
+
+    const TEST_TERMINAL_TEMPERATURES: [f32; 2] = [0.0, 0.2];
+
+    fn test_terminal_policy() -> super::WhisperTerminalPolicy<'static> {
+        super::WhisperTerminalPolicy {
+            temperatures: &TEST_TERMINAL_TEMPERATURES,
+            logprob_threshold: -1.0,
+            no_speech_threshold: 0.6,
+            compression_ratio_threshold: None,
+            vocab_size: 51_866,
+        }
+    }
+
+    /// Mark the state's current attempt finished with the given decode metrics.
+    fn finish_test_attempt(
+        state: &mut WhisperDecodeState,
+        text: &str,
+        avg_logprob: f64,
+        no_speech_prob: Option<f32>,
+        ended_with_eot: bool,
+    ) {
+        state.generated_tokens = vec![5, 6];
+        state.assembled = text.into();
+        state.sampled_token_count = 2;
+        state.sum_logprobs = avg_logprob * 2.0;
+        state.no_speech_prob = no_speech_prob;
+        state.ended_with_eot = ended_with_eot;
+        state.decode_steps = 2;
+        state.finished = true;
+    }
+
+    fn diagnostic_f64(diagnostics: &serde_json::Value, pointer: &str) -> f64 {
+        diagnostics
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("diagnostics lack numeric {pointer}: {diagnostics}"))
+    }
+
+    #[test]
+    fn retained_terminal_accept_and_skip_publish_decode_diagnostics() {
+        let mut accepted = transactional_test_state();
+        accepted.temperature = 0.0;
+        finish_test_attempt(&mut accepted, "hello there", -0.25, Some(0.125), true);
+        assert!(super::whisper_retained_terminal_diagnostics(&accepted).is_none());
+        let replacement = replacement_test_cache(&accepted, 0);
+        let mut quantum = accepted
+            .begin_managed_quantum(replacement)
+            .expect("terminal quantum");
+
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut accepted, test_terminal_policy())
+                .expect("accept");
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::Accept {
+                text: "hello there".into(),
+                selected_temperature: 0.0,
+            }
+        );
+        // A rolled-back terminal quantum must not leave a published attempt behind.
+        accepted
+            .rollback_managed_quantum(&mut quantum)
+            .expect("rollback terminal quantum");
+        assert!(accepted.attempts.is_empty());
+        assert!(super::whisper_retained_terminal_diagnostics(&accepted).is_none());
+        super::resolve_whisper_terminal_transition(&mut accepted, test_terminal_policy())
+            .expect("accept after rollback");
+
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&accepted).expect("accept diagnostics");
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/avg_logprob"), -0.25);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.125);
+        assert_eq!(diagnostics["decode"]["stop_reason"], "eot");
+        assert_eq!(diagnostics["no_speech_skip"], false);
+        assert_eq!(diagnostics["fallback_attempts"], 1);
+        assert_eq!(diagnostics["selected_temperature"], 0.0);
+        assert_eq!(diagnostics["language"], "en");
+        assert_eq!(diagnostics["execution"], "retained_sequence");
+
+        let mut skipped = transactional_test_state();
+        skipped.temperature = 0.0;
+        finish_test_attempt(&mut skipped, "you", -1.5, Some(0.875), true);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut skipped, test_terminal_policy())
+                .expect("skip");
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: Some(0.875)
+            }
+        );
+        assert!(skipped.assembled.is_empty());
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&skipped).expect("skip diagnostics");
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/avg_logprob"), -1.5);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.875);
+        assert_eq!(diagnostics["no_speech_skip"], true);
+        assert_eq!(diagnostics["fallback_reasons"], serde_json::json!(["no_speech"]));
+        assert_eq!(diagnostics["decode_attempts"][0]["no_speech"], true);
+    }
+
+    #[test]
+    fn retained_terminal_diagnostics_keep_attempts_across_fallback_restart() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        state.temperature = 0.0;
+        finish_test_attempt(&mut state, "garbled", -4.0, Some(0.25), false);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut state, test_terminal_policy())
+                .expect("retry");
+        assert!(matches!(
+            transition,
+            WhisperTerminalTransition::RetryRequired { .. }
+        ));
+        assert!(
+            super::whisper_retained_terminal_diagnostics(&state).is_none(),
+            "a retry publishes no diagnostics"
+        );
+
+        let replacement = generation_test_cache(&state, 2, 0);
+        let mut generation = state
+            .begin_managed_generation(replacement, 1, 2)
+            .expect("begin retry generation");
+        state
+            .commit_managed_quantum(&mut generation)
+            .expect("commit retry generation");
+        assert_eq!(state.temperature, 0.2);
+        finish_test_attempt(&mut state, "you", -1.5, Some(0.875), true);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut state, test_terminal_policy())
+                .expect("skip on the last temperature");
+        assert!(matches!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech { .. }
+        ));
+
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&state).expect("terminal diagnostics");
+        assert_eq!(diagnostics["fallback_attempts"], 2);
+        let temperatures = diagnostics["attempted_temperatures"]
+            .as_array()
+            .expect("temperatures")
+            .iter()
+            .map(|value| value.as_f64().expect("temperature") as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(temperatures, TEST_TERMINAL_TEMPERATURES);
+        let reasons = diagnostics["fallback_reasons"]
+            .as_array()
+            .expect("fallback reasons");
+        assert!(reasons.contains(&serde_json::json!("low_logprob")));
+        assert!(reasons.contains(&serde_json::json!("no_speech")));
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.875);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode_attempts/0/avg_logprob"), -4.0);
+        assert_eq!(diagnostics["decode_attempts"][0]["no_speech"], false);
+        assert_eq!(diagnostic_f64(&diagnostics, "/selected_temperature") as f32, 0.2);
     }
 
     fn append_test_decode_token(state: &mut WhisperDecodeState, token: u32) -> Result<()> {

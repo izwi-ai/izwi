@@ -3446,6 +3446,7 @@ impl NativeExecutor {
             let mut finished = false;
             let mut cancelled = false;
             let mut restart = false;
+            let mut diagnostics = None;
             let mut events = Vec::new();
             for _ in 0..iterations {
                 if request.is_cancelled() {
@@ -3498,6 +3499,9 @@ impl NativeExecutor {
                         break;
                     };
                     restart = matches!(action, WhisperTerminalAction::Restart);
+                    if !restart {
+                        diagnostics = active.model.whisper_terminal_diagnostics(&active.state)?;
+                    }
                 } else {
                     // Whisper fallback policy can reject an entire temperature attempt at
                     // EOS. Do not publish provisional text before the policy accepts it.
@@ -3577,25 +3581,35 @@ impl NativeExecutor {
                 active.input_sample_count,
                 completions,
                 restart,
+                diagnostics,
             ))
         })();
-        let (generated, text, finished, cancelled, sample_rate, sample_count, completions, restart) =
-            match execution {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = request.take_staged_stream_outputs()?;
-                    if let Some(checkpoint) = checkpoint.take() {
-                        state_lease
-                            .require_state_mut()?
-                            .state
-                            .rollback_managed_quantum(checkpoint)?;
-                        state_lease.mark_clean();
-                    } else if fresh {
-                        state_lease.discard_state();
-                    }
-                    return Err(error);
+        let (
+            generated,
+            text,
+            finished,
+            cancelled,
+            sample_rate,
+            sample_count,
+            completions,
+            restart,
+            diagnostics,
+        ) = match execution {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs()?;
+                if let Some(checkpoint) = checkpoint.take() {
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .rollback_managed_quantum(checkpoint)?;
+                    state_lease.mark_clean();
+                } else if fresh {
+                    state_lease.discard_state();
                 }
-            };
+                return Err(error);
+            }
+        };
         if cancelled {
             if let Some(checkpoint) = checkpoint.take() {
                 state_lease
@@ -3668,7 +3682,7 @@ impl NativeExecutor {
             tokens_generated: generated,
             finished,
             phase_timing_override: None,
-            asr_diagnostics: None,
+            asr_diagnostics: diagnostics,
             error: None,
             logprobs: Vec::new(),
         })

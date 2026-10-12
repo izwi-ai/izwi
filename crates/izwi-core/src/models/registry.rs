@@ -1266,6 +1266,22 @@ impl NativeAsrModel {
         }
     }
 
+    /// Diagnostics of a retained Whisper sequence once its terminal policy
+    /// has accepted or skipped an attempt.
+    pub(crate) fn whisper_terminal_diagnostics(
+        &self,
+        state: &NativeAsrDecodeState,
+    ) -> Result<Option<serde_json::Value>> {
+        match (self, state) {
+            (Self::WhisperTurbo(model), NativeAsrDecodeState::Whisper(state)) => {
+                Ok(model.retained_terminal_diagnostics(state))
+            }
+            _ => Err(Error::InvalidInput(
+                "Whisper terminal state was routed to another ASR model".into(),
+            )),
+        }
+    }
+
     /// Execute an atomic ASR operation through its complete lifecycle-owned
     /// invocation workspace. This is the model-adapter boundary used by direct
     /// runtime pipelines; callers never select or omit physical domains.
