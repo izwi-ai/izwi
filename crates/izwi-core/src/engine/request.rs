@@ -2837,6 +2837,15 @@ impl EngineCoreRequest {
         Ok(Some((prepared.samples.clone(), prepared.sample_rate)))
     }
 
+    /// Duration of the canonical input audio decoded at preparation. ASR
+    /// executors report generated audio, which is empty for transcription, so
+    /// this is the request's record of how much audio it transcribes.
+    pub(crate) fn prepared_asr_input_duration_secs(&self) -> Option<f32> {
+        self.prepared_asr_audio
+            .as_ref()
+            .map(|prepared| (prepared.samples.len() as f64 / prepared.sample_rate as f64) as f32)
+    }
+
     pub(crate) fn prepared_asr_audio_retained_bytes(&self) -> Result<usize> {
         self.prepared_asr_audio.as_ref().map_or(Ok(0), |prepared| {
             prepared
@@ -5877,6 +5886,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("changed after decoded-audio preparation"));
+    }
+
+    #[test]
+    fn prepared_asr_input_duration_is_sample_count_over_rate() {
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        assert_eq!(request.prepared_asr_input_duration_secs(), None);
+
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 36_000], 24_000)
+            .unwrap();
+        assert_eq!(request.prepared_asr_input_duration_secs(), Some(1.5));
     }
 
     #[test]

@@ -4887,6 +4887,12 @@ impl EngineCore {
                 .get(&request_id)
                 .map(|request| request.num_prompt_tokens())
                 .unwrap_or(engine_output.token_stats.prompt_tokens);
+            // ASR executors report generated audio, which is empty for
+            // transcription; the prepared request records the input duration.
+            engine_output.input_audio_duration_secs = self
+                .requests
+                .get(&request_id)
+                .and_then(|request| request.prepared_asr_input_duration_secs());
             // DS9.1: the managed prefix depth this request actually ran with.
             // The scheduler's cursor copy is authoritative — it is cleared
             // when the probed prefix is lost and the row replans from zero.
@@ -10106,6 +10112,31 @@ mod tests {
                 .get_status(&"decode-isolation-blocked".to_string()),
             Some(RequestStatus::Waiting)
         );
+    }
+
+    #[tokio::test]
+    async fn asr_output_carries_prepared_input_duration_when_executor_audio_is_empty() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request.id = "asr-input-duration".to_string();
+        core.add_request(request).unwrap();
+        // Admission of prepared audio requires the loaded model lease that
+        // runtime preparation installs alongside it. Install the decoded audio
+        // after admission to model a prepared row whose executor reports none.
+        Arc::get_mut(core.requests.get_mut("asr-input-duration").unwrap())
+            .expect("the core owns the admitted request")
+            .install_prepared_asr_audio(variant, vec![0.0; 36_000], 24_000)
+            .unwrap();
+
+        let outputs = core.step().await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].error.is_none(), "{:?}", outputs[0].error);
+        assert_eq!(outputs[0].audio.duration_secs, 0.0);
+        assert_eq!(outputs[0].input_audio_duration_secs, Some(1.5));
     }
 
     #[test]

@@ -10,8 +10,9 @@ use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::{
-    AsrProgress, AsrProgressPhase, EngineCoreRequest, RealtimeAsrSessionHandle, ResourceAmount,
-    ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType, WorkCost, WorkUnit,
+    AsrProgress, AsrProgressPhase, EngineCoreRequest, EngineOutput, RealtimeAsrSessionHandle,
+    ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType,
+    WorkCost, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
@@ -308,6 +309,14 @@ fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     // avoids decoding compressed public input synchronously on a Tokio worker
     // merely to construct the engine request.
     (variant.family() == ModelFamily::GraniteSpeechAsr).then_some(GRANITE_ASR_AUTO_MAX_TOKENS)
+}
+
+/// Transcribed audio duration. Preparation records it for every family that
+/// decodes before admission; otherwise only the executor's report is known.
+fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
+    output
+        .input_audio_duration_secs
+        .unwrap_or(output.audio.duration_secs)
 }
 
 /// Install the caller's ASR decode budget. An omitted budget is marked
@@ -2415,12 +2424,13 @@ impl RuntimeService {
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
+        let duration_secs = asr_transcription_duration_secs(&output);
         let text = output.text.unwrap_or_default();
 
         Ok(AsrTranscription {
             text,
             language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2526,12 +2536,13 @@ impl RuntimeService {
                 std::future::ready(Ok(()))
             })
             .await?;
+        let duration_secs = asr_transcription_duration_secs(&output);
         let text = output.text.unwrap_or(streamed_text);
 
         Ok(AsrTranscription {
             text,
             language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2634,12 +2645,13 @@ impl RuntimeService {
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
+        let duration_secs = asr_transcription_duration_secs(&output);
         let text = output.text.unwrap_or_default();
 
         Ok(AsrTranscription {
             text,
             language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2821,12 +2833,13 @@ impl RuntimeService {
             self.run_admitted_transport_streaming_request(admitted, handle_chunk)
                 .await?
         };
+        let duration_secs = asr_transcription_duration_secs(&output);
         let text = output.text.unwrap_or(streamed_text);
 
         Ok(AsrTranscription {
             text,
             language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -5408,6 +5421,26 @@ mod tests {
             granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn asr_transcription_duration_prefers_prepared_input_over_executor_audio() {
+        let mut output = crate::engine::OutputProcessor::new(16_000).process(
+            crate::engine::ExecutorOutput {
+                audio: Some(crate::engine::AudioOutput::new(Vec::new(), 16_000)),
+                ..crate::engine::ExecutorOutput::terminal("asr-duration".to_string())
+            },
+            1,
+            Duration::from_millis(300),
+        );
+        assert_eq!(output.audio.duration_secs, 0.0);
+        output.input_audio_duration_secs = Some(1.5);
+        assert_eq!(asr_transcription_duration_secs(&output), 1.5);
+
+        // Families without preparation report the decoded input themselves.
+        output.input_audio_duration_secs = None;
+        output.audio.duration_secs = 2.0;
+        assert_eq!(asr_transcription_duration_secs(&output), 2.0);
     }
 
     #[test]

@@ -276,6 +276,8 @@ impl OutputProcessor {
             token_stats,
             latency_breakdown: None,
             asr_diagnostics: executor_output.asr_diagnostics,
+            // Stamped by the engine core from the request's prepared audio.
+            input_audio_duration_secs: None,
             logprobs: executor_output.logprobs,
             error: executor_output.error,
             provenance: super::OutcomeProvenance::produced_output(),
