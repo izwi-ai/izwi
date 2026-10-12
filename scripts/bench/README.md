@@ -421,3 +421,32 @@ pressure certification. Forced replay boundaries, loss/duplication of streamed
 output, long-prompt fairness, slow clients, and resource-exhaustion recovery still
 require the engine tests and targeted CUDA stress runs in the implementation plan.
 No production inference is run by the deterministic Python fixture tests.
+
+## Live ASR matrix
+
+`run-asr-matrix.sh` transcribes a fixed fixture set with every listed ASR model
+through the OpenAI `/v1/audio/transcriptions` route. Each model gets its own
+`izwi-server` with an isolated database, media and spool directory, so a failed
+or memory-heavy model cannot contaminate the next. A footprint guard samples the
+server once a second and kills it above `--guard-mb` (macOS `footprint`, which
+includes unified GPU memory; resident set size elsewhere).
+
+```bash
+cargo build --release -p izwi-server --features izwi-server/metal
+scripts/bench/run-asr-matrix.sh --backend metal \
+    --models Parakeet-TDT-0.6B-v3,Whisper-Large-v3-Turbo \
+    --fixtures fox,test,diar116,long600,silence,noise
+```
+
+Fixtures are `fox` and `test` (scored against `data/fox.md` and
+`data/test.md`), `diar116` and `diar60` (two-speaker MP3 at 44.1 kHz), `long600`
+(the first 10 minutes of `data/ceo.mp3`), and generated `silence` and `noise`,
+which must come back empty. Derived fixtures need `ffmpeg` or `sox`. Use
+`--form stream=true` to score streamed responses; the scorer then also checks
+that the concatenated deltas equal the final transcript.
+
+`score-asr-matrix.py` writes `summary.json` beside `results.jsonl` with WER,
+word counts, returned duration and rtf, segment counts, the number of long-form
+chunks that stopped on their token budget, and the peak footprint per model.
+Run it with the same matrix before and after a change and compare the summaries;
+the deterministic scorer checks live in `test-score-asr-matrix.py`.

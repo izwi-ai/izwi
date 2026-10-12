@@ -493,6 +493,7 @@ run_hygiene() {
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-streaming-benchmark.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-long-form-qualification.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-fish-serving-capacity.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-asr-matrix.py
 }
 
 run_cargo_cuda_compile() {
