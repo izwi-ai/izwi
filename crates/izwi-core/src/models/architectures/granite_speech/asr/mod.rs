@@ -37,10 +37,10 @@ mod runtime;
 mod transcript;
 
 pub use config::{
-    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig,
-    GraniteSpeechEncoderConfig, GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig,
-    GraniteSpeechProcessorConfig, GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig,
-    GraniteTextConfig,
+    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig,
+    GraniteSpeechCheckpointKind, GraniteSpeechConfig, GraniteSpeechEncoderConfig,
+    GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig, GraniteSpeechProcessorConfig,
+    GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig, GraniteTextConfig,
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
@@ -59,16 +59,19 @@ pub use transcript::{
     GraniteSpeechTimestampWord,
 };
 
+/// Files both published checkpoints ship. Plus also ships
+/// `generation_config.json` and nests its audio settings in
+/// `processor_config.json`; base ships `preprocessor_config.json` instead.
 const REQUIRED_ARTIFACTS: &[&str] = &[
     "chat_template.jinja",
     "config.json",
-    "generation_config.json",
     "model.safetensors.index.json",
     "processor_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
 ];
 
+const UNTIED_LM_HEAD_TENSOR: &str = "language_model.lm_head.weight";
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
 const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 5.0 * 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -103,6 +106,7 @@ pub struct GraniteSpeechAsrModel {
     device: DeviceProfile,
     dtype: DType,
     config: GraniteSpeechConfig,
+    checkpoint_kind: GraniteSpeechCheckpointKind,
     processor: GraniteSpeechProcessorConfig,
     generation: GraniteSpeechGenerationConfig,
     tokenizer_config: GraniteSpeechTokenizerConfig,
@@ -497,11 +501,25 @@ impl GraniteSpeechAsrModel {
             )));
         }
 
-        let shards = ensure_granite_speech_artifacts(model_dir)?;
+        let artifacts = granite_speech_artifacts(model_dir)?;
         let config = GraniteSpeechConfig::load(model_dir)?;
-        config.validate_plus()?;
+        let checkpoint_kind = config.validate()?;
+        let expected_kind = GraniteSpeechCheckpointKind::Plus;
+        if checkpoint_kind != expected_kind {
+            return Err(Error::ModelLoadError(format!(
+                "{variant} expects a {} checkpoint, but {} declares {}",
+                expected_kind.model_type(),
+                model_dir.display(),
+                checkpoint_kind.model_type()
+            )));
+        }
+        validate_granite_lm_head_layout(
+            config.tie_word_embeddings(),
+            artifacts.has_untied_lm_head,
+        )?;
+        let shards = artifacts.shard_paths;
         let processor = GraniteSpeechProcessorConfig::load(model_dir)?;
-        let generation = GraniteSpeechGenerationConfig::load(model_dir)?;
+        let generation = GraniteSpeechGenerationConfig::load(model_dir, &config)?;
         let tokenizer_config = GraniteSpeechTokenizerConfig::load(model_dir)?;
         let chat_template = load_granite_speech_chat_template(model_dir)?;
         let prompt_tokenizer =
@@ -524,6 +542,7 @@ impl GraniteSpeechAsrModel {
             device,
             dtype,
             config,
+            checkpoint_kind,
             processor,
             generation,
             tokenizer_config,
@@ -536,6 +555,10 @@ impl GraniteSpeechAsrModel {
 
     pub fn config(&self) -> &GraniteSpeechConfig {
         &self.config
+    }
+
+    pub fn checkpoint_kind(&self) -> GraniteSpeechCheckpointKind {
+        self.checkpoint_kind
     }
 
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
@@ -2277,6 +2300,30 @@ fn granite_token_debug_enabled() -> bool {
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    granite_speech_artifacts(model_dir).map(|artifacts| artifacts.shard_paths)
+}
+
+struct GraniteSpeechArtifacts {
+    shard_paths: Vec<PathBuf>,
+    has_untied_lm_head: bool,
+}
+
+/// The output head the config resolves must be the one the checkpoint ships:
+/// an untied head needs its own tensor, and a tied config must not silently
+/// discard a trained one.
+fn validate_granite_lm_head_layout(tied: bool, has_untied_lm_head: bool) -> Result<()> {
+    match (tied, has_untied_lm_head) {
+        (false, false) => Err(Error::ModelLoadError(format!(
+            "Granite Speech config unties the output head but the checkpoint index has no {UNTIED_LM_HEAD_TENSOR}"
+        ))),
+        (true, true) => Err(Error::ModelLoadError(format!(
+            "Granite Speech config ties the output head to the embedding but the checkpoint ships {UNTIED_LM_HEAD_TENSOR}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn granite_speech_artifacts(model_dir: &Path) -> Result<GraniteSpeechArtifacts> {
     for file in REQUIRED_ARTIFACTS {
         let path = model_dir.join(file);
         if !path.exists() {
@@ -2339,7 +2386,10 @@ pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>>
         shard_paths.push(path);
     }
 
-    Ok(shard_paths)
+    Ok(GraniteSpeechArtifacts {
+        shard_paths,
+        has_untied_lm_head: weight_map.contains_key(UNTIED_LM_HEAD_TENSOR),
+    })
 }
 
 fn validate_shard_filename(file: &str) -> Result<()> {
@@ -2591,7 +2641,6 @@ mod tests {
     fn write_required_non_weight_files(model_dir: &Path) {
         std::fs::write(model_dir.join("chat_template.jinja"), "{{ prompt }}").unwrap();
         std::fs::write(model_dir.join("config.json"), "{}").unwrap();
-        std::fs::write(model_dir.join("generation_config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("processor_config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
@@ -2857,6 +2906,36 @@ mod tests {
             .to_string()
             .contains("Invalid Granite Speech safetensors shard path"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn artifact_validation_reports_untied_head_and_needs_no_generation_config() {
+        let dir = temp_model_dir();
+        write_required_non_weight_files(&dir);
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"language_model.lm_head.weight":"model-00002-of-00003.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("model-00002-of-00003.safetensors"), []).unwrap();
+        let artifacts = granite_speech_artifacts(&dir).unwrap();
+        assert!(artifacts.has_untied_lm_head);
+        assert!(!dir.join("generation_config.json").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn lm_head_layout_must_match_the_resolved_tie() {
+        validate_granite_lm_head_layout(true, false).unwrap();
+        validate_granite_lm_head_layout(false, true).unwrap();
+        assert!(validate_granite_lm_head_layout(false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("has no language_model.lm_head.weight"));
+        assert!(validate_granite_lm_head_layout(true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("ships language_model.lm_head.weight"));
     }
 
     #[test]

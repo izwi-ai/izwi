@@ -649,7 +649,11 @@ impl GraniteSpeechRuntime {
         let projector_elapsed = projector_started.elapsed();
 
         let language_model_started = Instant::now();
-        let text_model = GraniteLanguageModel::load(&config.text_config, vb.pp("language_model"))?;
+        let text_model = GraniteLanguageModel::load(
+            &config.text_config,
+            config.tie_word_embeddings(),
+            vb.pp("language_model"),
+        )?;
         let language_model_elapsed = language_model_started.elapsed();
 
         // Model construction has consumed the VarBuilder, so release the source
@@ -2271,13 +2275,14 @@ struct GraniteLanguageModel {
 }
 
 impl GraniteLanguageModel {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &GraniteTextConfig, tie_word_embeddings: bool, vb: VarBuilder) -> Result<Self> {
         let execution_plan = GraniteTextExecutionPlan::for_device(vb.device(), vb.dtype());
-        Self::load_with_execution_plan(config, vb, execution_plan)
+        Self::load_with_execution_plan(config, tie_word_embeddings, vb, execution_plan)
     }
 
     fn load_with_execution_plan(
         config: &GraniteTextConfig,
+        tie_word_embeddings: bool,
         vb: VarBuilder,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
@@ -2298,7 +2303,7 @@ impl GraniteLanguageModel {
         }
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = if config.tie_word_embeddings {
+        let lm_head = if tie_word_embeddings {
             let weight = if execution_plan.selective_f16_lm_head {
                 embed_tokens.embeddings().to_dtype(DType::F16)?
             } else {
@@ -3934,7 +3939,7 @@ mod tests {
             residual_multiplier: 0.22,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
-            tie_word_embeddings: true,
+            tie_word_embeddings: Some(true),
             use_cache: true,
             vocab_size: 16,
         }
@@ -4062,6 +4067,7 @@ mod tests {
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         GraniteLanguageModel::load_with_execution_plan(
             &tiny_granite_text_config(),
+            true,
             vb,
             GraniteTextExecutionPlan {
                 selective_f16_lm_head: false,
@@ -4115,6 +4121,7 @@ mod tests {
                 chunk_size_feed_forward: 0,
             },
             text_config: tiny_granite_text_config(),
+            tie_word_embeddings: None,
             window_size: 2,
             model_type: None,
         }
@@ -4412,6 +4419,54 @@ mod tests {
         assert!(cache_b.take_completed_writes().is_empty());
     }
 
+    /// Base ships `language_model.lm_head.weight`; an untied load must
+    /// project with that tensor, not the token embedding.
+    #[test]
+    fn untied_language_model_projects_with_its_own_head() {
+        let device = Device::Cpu;
+        let mut tensors = tiny_granite_text_tensors(&device);
+        let head = Tensor::from_vec(
+            (0..64).map(|index| index as f32 / 64.0).collect::<Vec<_>>(),
+            (16, 4),
+            &device,
+        )
+        .unwrap();
+        tensors.insert("lm_head.weight".to_string(), head.clone());
+        let plan = GraniteTextExecutionPlan {
+            selective_f16_lm_head: false,
+            selective_f16_qkv: false,
+            f16_attention_core: false,
+            selective_f16_mlp: false,
+            selective_f16_attention_output: false,
+        };
+
+        let untied = GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            false,
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+            plan,
+        )
+        .unwrap();
+        let diff = (untied.lm_head.weight() - &head)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(diff, 0.0);
+
+        tensors.remove("lm_head.weight");
+        assert!(GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            false,
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+            plan,
+        )
+        .is_err());
+    }
+
     #[test]
     fn selective_f16_plan_retains_one_decoder_execution_representation() {
         let device = Device::Cpu;
@@ -4424,9 +4479,13 @@ mod tests {
             selective_f16_attention_output: true,
         };
 
-        let model =
-            GraniteLanguageModel::load_with_execution_plan(&tiny_granite_text_config(), vb, plan)
-                .unwrap();
+        let model = GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            true,
+            vb,
+            plan,
+        )
+        .unwrap();
         let layer = &model.layers[0];
 
         assert_eq!(model.embed_tokens.embeddings().dtype(), DType::F32);

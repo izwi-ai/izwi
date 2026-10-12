@@ -1,0 +1,43 @@
+{
+  "source": "HF safetensors index + HTTP-range shard headers (generated 2026-10-12)",
+  "repo_id": "ibm-granite/granite-speech-4.1-2b",
+  "revision": "de575db64086f84fdc79da4932d1076e965bc546",
+  "index_total_size": 4626414392,
+  "tensor_count": 954,
+  "has_lm_head": true,
+  "shards": [
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors"
+  ],
+  "tensors": {
+    "language_model.lm_head.weight": {
+      "dtype": "BF16",
+      "shape": [
+        100353,
+        2048
+      ]
+    },
+    "language_model.model.embed_tokens.weight": {
+      "dtype": "BF16",
+      "shape": [
+        100353,
+        2048
+      ]
+    },
+    "projector.linear.weight": {
+      "dtype": "BF16",
+      "shape": [
+        2048,
+        1024
+      ]
+    },
+    "projector.qformer.encoder.layer.0.crossattention.attention.key.weight": {
+      "dtype": "BF16",
+      "shape": [
+        1024,
+        1024
+      ]
+    }
+  }
+}

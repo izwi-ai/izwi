@@ -1,4 +1,6 @@
-//! Hugging Face config parsing for Granite Speech 4.1 Plus.
+//! Hugging Face config parsing for the Granite Speech 4.1 checkpoints: the
+//! punctuating base model (`granite_speech`) and the rich-transcription plus
+//! model (`granite_speech_plus`).
 
 use std::fs;
 use std::path::Path;
@@ -6,6 +8,45 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+
+const BASE_MODEL_TYPE: &str = "granite_speech";
+const PLUS_MODEL_TYPE: &str = "granite_speech_plus";
+const BASE_ARCHITECTURE: &str = "GraniteSpeechForConditionalGeneration";
+const PLUS_ARCHITECTURE: &str = "GraniteSpeechPlusForConditionalGeneration";
+
+/// Which published Granite Speech checkpoint a config describes. The two share
+/// one architecture; plus concatenates intermediate encoder layers into the
+/// projector input and is trained for speaker turns and word timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraniteSpeechCheckpointKind {
+    Base,
+    Plus,
+}
+
+impl GraniteSpeechCheckpointKind {
+    fn from_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            BASE_MODEL_TYPE => Some(Self::Base),
+            PLUS_MODEL_TYPE => Some(Self::Plus),
+            _ => None,
+        }
+    }
+
+    fn from_architecture(architecture: &str) -> Option<Self> {
+        match architecture {
+            BASE_ARCHITECTURE => Some(Self::Base),
+            PLUS_ARCHITECTURE => Some(Self::Plus),
+            _ => None,
+        }
+    }
+
+    pub const fn model_type(self) -> &'static str {
+        match self {
+            Self::Base => BASE_MODEL_TYPE,
+            Self::Plus => PLUS_MODEL_TYPE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GraniteSpeechConfig {
@@ -17,10 +58,16 @@ pub struct GraniteSpeechConfig {
     #[serde(default)]
     pub dtype: Option<String>,
     pub encoder_config: GraniteSpeechEncoderConfig,
-    #[serde(default)]
+    /// transformers' `GraniteSpeechConfig` defaults this to true, so an
+    /// absent field means an adapter is expected.
+    #[serde(default = "default_has_lora_adapter")]
     pub has_lora_adapter: bool,
     pub projector_config: GraniteSpeechProjectorConfig,
     pub text_config: GraniteTextConfig,
+    /// Composite-config tie flag. Base publishes `false` here and an untied
+    /// `language_model.lm_head.weight`; plus sets it on `text_config` instead.
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     #[serde(default = "default_window_size")]
     pub window_size: usize,
     #[serde(default)]
@@ -98,20 +145,34 @@ pub struct GraniteTextConfig {
     pub rms_norm_eps: f64,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    /// Language-model tie flag; resolve through
+    /// [`GraniteSpeechConfig::tie_word_embeddings`], which also consults the
+    /// composite config.
     #[serde(default)]
-    pub tie_word_embeddings: bool,
+    pub tie_word_embeddings: Option<bool>,
     #[serde(default)]
     pub use_cache: bool,
     pub vocab_size: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// Processor settings with the audio front end resolved. Plus nests the
+/// feature extractor under `processor_config.json:audio_processor`; base
+/// ships it as a separate `preprocessor_config.json`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GraniteSpeechProcessorConfig {
     pub audio_processor: GraniteSpeechAudioProcessorConfig,
-    #[serde(default = "default_audio_token")]
     pub audio_token: String,
-    #[serde(default)]
     pub processor_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct GraniteSpeechProcessorConfigFile {
+    #[serde(default)]
+    audio_processor: Option<GraniteSpeechAudioProcessorConfig>,
+    #[serde(default = "default_audio_token")]
+    audio_token: String,
+    #[serde(default)]
+    processor_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -173,18 +234,55 @@ impl GraniteSpeechConfig {
         load_json_file(&model_dir.join("config.json"), "Granite Speech config")
     }
 
-    pub fn validate_plus(&self) -> Result<()> {
-        let model_type_ok = self
-            .model_type
-            .as_deref()
-            .is_some_and(|model_type| model_type == "granite_speech_plus");
-        let architecture_ok = self
-            .architectures
-            .iter()
-            .any(|architecture| architecture == "GraniteSpeechPlusForConditionalGeneration");
-        if !model_type_ok && !architecture_ok {
+    /// The checkpoint this config describes. `model_type` and the declared
+    /// architecture must agree when both name a Granite Speech checkpoint.
+    pub fn checkpoint_kind(&self) -> Result<GraniteSpeechCheckpointKind> {
+        let from_model_type = match self.model_type.as_deref() {
+            Some(model_type) => Some(
+                GraniteSpeechCheckpointKind::from_model_type(model_type).ok_or_else(|| {
+                    Error::ModelLoadError(format!(
+                        "Granite Speech loader expected model_type {BASE_MODEL_TYPE} or {PLUS_MODEL_TYPE}, got {model_type}"
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        let mut from_architectures = self.architectures.iter().filter_map(|architecture| {
+            GraniteSpeechCheckpointKind::from_architecture(architecture)
+        });
+        let from_architecture = from_architectures.next();
+        if from_architectures.any(|other| Some(other) != from_architecture) {
             return Err(Error::ModelLoadError(
-                "Granite Speech loader expected a granite_speech_plus config".to_string(),
+                "Granite Speech config declares both the base and the plus architecture"
+                    .to_string(),
+            ));
+        }
+        match (from_model_type, from_architecture) {
+            (Some(model_type), Some(architecture)) if model_type != architecture => {
+                Err(Error::ModelLoadError(format!(
+                    "Granite Speech model_type {} disagrees with architecture {:?}",
+                    model_type.model_type(),
+                    self.architectures
+                )))
+            }
+            (Some(kind), _) | (None, Some(kind)) => Ok(kind),
+            (None, None) => Err(Error::ModelLoadError(format!(
+                "Granite Speech loader expected a {BASE_MODEL_TYPE} or {PLUS_MODEL_TYPE} config"
+            ))),
+        }
+    }
+
+    /// Check the config against what the native runtime implements and
+    /// return the checkpoint kind it describes.
+    pub fn validate(&self) -> Result<GraniteSpeechCheckpointKind> {
+        let kind = self.checkpoint_kind()?;
+
+        // The runtime has no LoRA path; IBM's 4.1 checkpoints ship merged
+        // weights and declare `has_lora_adapter: false`.
+        if self.has_lora_adapter {
+            return Err(Error::ModelLoadError(
+                "Granite Speech checkpoints with a LoRA adapter are not supported (has_lora_adapter must be false)"
+                    .to_string(),
             ));
         }
 
@@ -195,8 +293,36 @@ impl GraniteSpeechConfig {
             )));
         }
 
-        let projected_encoder_width =
-            self.encoder_config.hidden_dim * (self.encoder_config.cat_hidden_layers.len() + 1);
+        let encoder = &self.encoder_config;
+        // transformers' base encoder has no concatenation; only plus exports
+        // intermediate layers into the projector input.
+        if kind == GraniteSpeechCheckpointKind::Base && !encoder.cat_hidden_layers.is_empty() {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech base config must not set encoder cat_hidden_layers, got {:?}",
+                encoder.cat_hidden_layers
+            )));
+        }
+        for (position, &layer) in encoder.cat_hidden_layers.iter().enumerate() {
+            if layer >= encoder.num_layers {
+                return Err(Error::ModelLoadError(format!(
+                    "Granite Speech cat_hidden_layers index {layer} is out of range [0, {})",
+                    encoder.num_layers
+                )));
+            }
+            if encoder.cat_hidden_layers[..position].contains(&layer) {
+                return Err(Error::ModelLoadError(format!(
+                    "Granite Speech cat_hidden_layers repeats layer {layer}"
+                )));
+            }
+        }
+        if encoder.context_size == 0 || encoder.context_size > encoder.max_pos_emb {
+            return Err(Error::ModelLoadError(format!(
+                "Granite Speech encoder context_size {} must be in [1, max_pos_emb {}]",
+                encoder.context_size, encoder.max_pos_emb
+            )));
+        }
+
+        let projected_encoder_width = encoder.hidden_dim * (encoder.cat_hidden_layers.len() + 1);
         if projected_encoder_width != self.projector_config.encoder_hidden_size {
             return Err(Error::ModelLoadError(format!(
                 "Granite Speech concatenated encoder width {} does not match projector encoder_hidden_size {}",
@@ -204,7 +330,17 @@ impl GraniteSpeechConfig {
             )));
         }
 
-        Ok(())
+        Ok(kind)
+    }
+
+    /// Whether the output head shares the token embedding: the language
+    /// model's own flag first, then the composite config's, then
+    /// transformers' `GraniteSpeechConfig` default (tied).
+    pub fn tie_word_embeddings(&self) -> bool {
+        self.text_config
+            .tie_word_embeddings
+            .or(self.tie_word_embeddings)
+            .unwrap_or(true)
     }
 
     pub fn target_dtype_hint(&self) -> Option<&str> {
@@ -226,10 +362,28 @@ impl GraniteSpeechConfig {
 
 impl GraniteSpeechProcessorConfig {
     pub fn load(model_dir: &Path) -> Result<Self> {
-        load_json_file(
+        let file: GraniteSpeechProcessorConfigFile = load_json_file(
             &model_dir.join("processor_config.json"),
             "Granite Speech processor config",
-        )
+        )?;
+        let audio_processor = match file.audio_processor {
+            Some(audio_processor) => audio_processor,
+            None => {
+                let path = model_dir.join("preprocessor_config.json");
+                if !path.exists() {
+                    return Err(Error::ModelNotFound(format!(
+                        "Granite Speech processor_config.json has no audio_processor and {} is missing",
+                        path.display()
+                    )));
+                }
+                load_json_file(&path, "Granite Speech preprocessor config")?
+            }
+        };
+        Ok(Self {
+            audio_processor,
+            audio_token: file.audio_token,
+            processor_class: file.processor_class,
+        })
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -242,11 +396,23 @@ impl GraniteSpeechProcessorConfig {
 }
 
 impl GraniteSpeechGenerationConfig {
-    pub fn load(model_dir: &Path) -> Result<Self> {
-        load_json_file(
-            &model_dir.join("generation_config.json"),
-            "Granite Speech generation config",
-        )
+    /// `generation_config.json` when the checkpoint ships one (plus), else
+    /// the language model's own special tokens (base ships none).
+    pub fn load(model_dir: &Path, config: &GraniteSpeechConfig) -> Result<Self> {
+        let path = model_dir.join("generation_config.json");
+        if path.exists() {
+            return load_json_file(&path, "Granite Speech generation config");
+        }
+        Ok(Self::from_text_config(&config.text_config))
+    }
+
+    pub fn from_text_config(text: &GraniteTextConfig) -> Self {
+        Self {
+            bos_token_id: text.bos_token_id,
+            eos_token_id: text.eos_token_id,
+            pad_token_id: text.pad_token_id,
+            use_cache: text.use_cache,
+        }
     }
 }
 
@@ -283,6 +449,10 @@ where
 
 fn default_audio_token() -> String {
     "<|audio|>".to_string()
+}
+
+fn default_has_lora_adapter() -> bool {
+    true
 }
 
 fn default_sampling_rate() -> u32 {
@@ -399,27 +569,230 @@ mod tests {
                 residual_multiplier: 0.22,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10_000.0,
-                tie_word_embeddings: true,
+                tie_word_embeddings: Some(true),
                 use_cache: true,
                 vocab_size: 100_353,
             },
+            tie_word_embeddings: None,
             window_size: 15,
             model_type: Some("granite_speech_plus".to_string()),
         }
     }
 
+    fn fixture_dir(kind: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/granite_speech")
+            .join(kind)
+    }
+
+    fn census(kind: &str) -> serde_json::Value {
+        let raw = fs::read_to_string(fixture_dir(kind).join("tensor_census.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn census_shape(census: &serde_json::Value, tensor: &str) -> Vec<u64> {
+        census["tensors"][tensor]["shape"]
+            .as_array()
+            .unwrap_or_else(|| panic!("census is missing {tensor}"))
+            .iter()
+            .map(|dim| dim.as_u64().unwrap())
+            .collect()
+    }
+
+    const PROJECTOR_KEY: &str =
+        "projector.qformer.encoder.layer.0.crossattention.attention.key.weight";
+
     #[test]
-    fn validate_plus_accepts_concatenated_encoder_width() {
+    fn validate_accepts_concatenated_plus_encoder_width() {
         let cfg = plus_config();
-        cfg.validate_plus().unwrap();
+        assert_eq!(cfg.validate().unwrap(), GraniteSpeechCheckpointKind::Plus);
     }
 
     #[test]
-    fn validate_plus_rejects_projector_width_mismatch() {
+    fn validate_rejects_projector_width_mismatch() {
         let mut cfg = plus_config();
         cfg.projector_config.encoder_hidden_size = 1024;
-        let err = cfg.validate_plus().unwrap_err();
+        let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("concatenated encoder width 2048"));
+    }
+
+    /// The published configs are the contract: each must validate as its own
+    /// checkpoint kind and agree with the tensors the checkpoint ships.
+    #[test]
+    fn published_plus_config_validates_against_its_tensor_census() {
+        let cfg = GraniteSpeechConfig::load(&fixture_dir("plus")).unwrap();
+        let census = census("plus");
+        assert_eq!(cfg.validate().unwrap(), GraniteSpeechCheckpointKind::Plus);
+        assert_eq!(cfg.encoder_config.cat_hidden_layers, vec![3]);
+        assert_eq!(cfg.projector_config.encoder_hidden_size, 2048);
+        assert_eq!(
+            census_shape(&census, PROJECTOR_KEY),
+            vec![1024, cfg.projector_config.encoder_hidden_size as u64]
+        );
+        assert!(cfg.tie_word_embeddings());
+        assert_eq!(census["has_lm_head"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn published_base_config_validates_against_its_tensor_census() {
+        let cfg = GraniteSpeechConfig::load(&fixture_dir("base")).unwrap();
+        let census = census("base");
+        assert_eq!(cfg.validate().unwrap(), GraniteSpeechCheckpointKind::Base);
+        assert!(cfg.encoder_config.cat_hidden_layers.is_empty());
+        assert_eq!(cfg.projector_config.encoder_hidden_size, 1024);
+        assert_eq!(
+            census_shape(&census, PROJECTOR_KEY),
+            vec![1024, cfg.projector_config.encoder_hidden_size as u64]
+        );
+        // Base publishes `tie_word_embeddings: false` only on the composite
+        // config, and ships the untied head the runtime must then load.
+        assert_eq!(cfg.text_config.tie_word_embeddings, None);
+        assert!(!cfg.tie_word_embeddings());
+        assert_eq!(census["has_lm_head"], serde_json::json!(true));
+        assert_eq!(
+            census_shape(&census, "language_model.lm_head.weight"),
+            vec![
+                cfg.text_config.vocab_size as u64,
+                cfg.text_config.hidden_size as u64
+            ]
+        );
+    }
+
+    #[test]
+    fn tie_resolution_prefers_text_config_then_composite_then_tied() {
+        let mut cfg = plus_config();
+        cfg.text_config.tie_word_embeddings = Some(false);
+        cfg.tie_word_embeddings = Some(true);
+        assert!(!cfg.tie_word_embeddings());
+        cfg.text_config.tie_word_embeddings = None;
+        assert!(cfg.tie_word_embeddings());
+        cfg.tie_word_embeddings = Some(false);
+        assert!(!cfg.tie_word_embeddings());
+        cfg.tie_word_embeddings = None;
+        assert!(cfg.tie_word_embeddings());
+    }
+
+    #[test]
+    fn checkpoint_kind_requires_agreeing_model_type_and_architecture() {
+        let mut cfg = plus_config();
+        cfg.model_type = None;
+        assert_eq!(
+            cfg.checkpoint_kind().unwrap(),
+            GraniteSpeechCheckpointKind::Plus
+        );
+        cfg.model_type = Some("granite_speech".to_string());
+        assert!(cfg
+            .checkpoint_kind()
+            .unwrap_err()
+            .to_string()
+            .contains("disagrees"));
+        cfg.model_type = Some("granite".to_string());
+        assert!(cfg
+            .checkpoint_kind()
+            .unwrap_err()
+            .to_string()
+            .contains("expected model_type"));
+        cfg.model_type = None;
+        cfg.architectures.clear();
+        assert!(cfg.checkpoint_kind().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_lora_adapters_and_defaults_absent_flag_like_transformers() {
+        let mut cfg = plus_config();
+        cfg.has_lora_adapter = true;
+        assert!(cfg.validate().unwrap_err().to_string().contains("LoRA"));
+
+        let mut raw: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(fixture_dir("plus").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        raw.as_object_mut().unwrap().remove("has_lora_adapter");
+        let cfg: GraniteSpeechConfig = serde_json::from_value(raw).unwrap();
+        assert!(cfg.has_lora_adapter);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_encoder_concatenation_and_context() {
+        let mut base = plus_config();
+        base.model_type = Some("granite_speech".to_string());
+        base.architectures = vec!["GraniteSpeechForConditionalGeneration".to_string()];
+        assert!(base
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must not set encoder cat_hidden_layers"));
+
+        let mut out_of_range = plus_config();
+        out_of_range.encoder_config.cat_hidden_layers = vec![16];
+        assert!(out_of_range
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("out of range [0, 16)"));
+
+        let mut repeated = plus_config();
+        repeated.encoder_config.cat_hidden_layers = vec![3, 3];
+        repeated.projector_config.encoder_hidden_size = 3072;
+        assert!(repeated
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("repeats"));
+
+        let mut context = plus_config();
+        context.encoder_config.context_size = 513;
+        assert!(context
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("context_size 513"));
+    }
+
+    #[test]
+    fn processor_config_reads_nested_plus_and_separate_base_audio_settings() {
+        for kind in ["plus", "base"] {
+            let processor = GraniteSpeechProcessorConfig::load(&fixture_dir(kind)).unwrap();
+            assert_eq!(processor.audio_token, "<|audio|>");
+            assert_eq!(processor.audio_processor.melspec_kwargs.n_mels, 80);
+            assert_eq!(processor.audio_processor.melspec_kwargs.hop_length, 160);
+            assert_eq!(processor.audio_processor.projector_window_size, 15);
+            assert_eq!(processor.audio_processor.projector_downsample_rate, 5);
+            assert_eq!(processor.sample_rate(), 16_000);
+        }
+    }
+
+    #[test]
+    fn processor_config_without_audio_settings_names_the_missing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("granite-speech-processor-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("processor_config.json"),
+            r#"{"audio_token":"<|audio|>"}"#,
+        )
+        .unwrap();
+        let err = GraniteSpeechProcessorConfig::load(&dir).unwrap_err();
+        assert!(err.to_string().contains("preprocessor_config.json"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn generation_config_is_optional_and_falls_back_to_text_tokens() {
+        let base = GraniteSpeechConfig::load(&fixture_dir("base")).unwrap();
+        assert!(!fixture_dir("base").join("generation_config.json").exists());
+        let generation = GraniteSpeechGenerationConfig::load(&fixture_dir("base"), &base).unwrap();
+        assert_eq!(generation.bos_token_id, 100_257);
+        assert_eq!(generation.eos_token_id, 100_257);
+        assert_eq!(generation.pad_token_id, 100_256);
+
+        let plus = GraniteSpeechConfig::load(&fixture_dir("plus")).unwrap();
+        let generation = GraniteSpeechGenerationConfig::load(&fixture_dir("plus"), &plus).unwrap();
+        assert_eq!(
+            generation,
+            GraniteSpeechGenerationConfig::from_text_config(&plus.text_config)
+        );
     }
 
     #[test]
