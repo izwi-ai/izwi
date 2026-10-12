@@ -37,6 +37,22 @@ const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+/// Prefill span requested from the scheduler when a request prefills alone
+/// on an accelerator. Each engine step adds fixed host work (state staging,
+/// KV commit, scheduling), and with chunked prefill on (the CUDA default)
+/// the engine's threshold cuts prompts into 192-token steps. The model still
+/// runs the span in `IZWI_QWEN35_PREFILL_CHUNK_SIZE` forward chunks.
+const ACCELERATOR_PREFERRED_PREFILL_TOKENS: usize = 1024;
+
+/// Preferred isolated prefill span for a backend; 0 keeps the engine's
+/// threshold. CPU prefill is compute-bound per token, so a wider step only
+/// delays cancellation and new arrivals.
+fn preferred_prefill_tokens_for(backend: BackendKind) -> usize {
+    match backend {
+        BackendKind::Cuda | BackendKind::Metal => ACCELERATOR_PREFERRED_PREFILL_TOKENS,
+        BackendKind::Cpu => 0,
+    }
+}
 
 fn qwen35_prefill_chunk_size() -> usize {
     std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
@@ -1155,6 +1171,12 @@ impl Qwen35ChatModel {
 
     pub fn max_context_tokens(&self) -> Result<usize> {
         self.exec.max_context_tokens()
+    }
+
+    /// Prefill span for an isolated request (see
+    /// [`crate::engine::ExecutionProfile::preferred_prefill_tokens`]).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        preferred_prefill_tokens_for(self.device_kind)
     }
 
     /// Hybrid retained-state contract shared by loading, scheduling, and the
@@ -2408,6 +2430,17 @@ mod tests {
             1,
             "a penalized token 0 falls below token 1"
         );
+    }
+
+    #[test]
+    fn accelerators_prefer_wide_isolated_prefill_spans() {
+        for backend in [BackendKind::Cuda, BackendKind::Metal] {
+            let span = preferred_prefill_tokens_for(backend);
+            assert_eq!(span, ACCELERATOR_PREFERRED_PREFILL_TOKENS, "{backend:?}");
+            assert_eq!(span % DEFAULT_PREFILL_CHUNK_SIZE, 0, "{backend:?}");
+            assert!(span <= MAX_PREFILL_CHUNK_SIZE, "{backend:?}");
+        }
+        assert_eq!(preferred_prefill_tokens_for(BackendKind::Cpu), 0);
     }
 
     #[test]
