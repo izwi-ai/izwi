@@ -498,16 +498,15 @@ pub(crate) struct GraniteSpeechPhysicalStateSpec {
 
 impl GraniteSpeechAsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        if variant != ModelVariant::GraniteSpeech412BPlus {
-            return Err(Error::InvalidInput(format!(
+        let expected_kind = GraniteSpeechCheckpointKind::for_variant(variant).ok_or_else(|| {
+            Error::InvalidInput(format!(
                 "GraniteSpeechAsrModel cannot load non-Granite variant {variant}"
-            )));
-        }
+            ))
+        })?;
 
         let artifacts = granite_speech_artifacts(model_dir)?;
         let config = GraniteSpeechConfig::load(model_dir)?;
         let checkpoint_kind = config.validate()?;
-        let expected_kind = GraniteSpeechCheckpointKind::Plus;
         if checkpoint_kind != expected_kind {
             return Err(Error::ModelLoadError(format!(
                 "{variant} expects a {} checkpoint, but {} declares {}",
@@ -2928,6 +2927,63 @@ mod tests {
         assert!(artifacts.has_untied_lm_head);
         assert!(!dir.join("generation_config.json").exists());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A catalog variant must load the checkpoint it names: the base variant
+    /// on a plus directory (or the reverse) would serve the wrong prompts
+    /// and capabilities.
+    #[test]
+    fn load_rejects_the_other_checkpoint_kind_before_mapping_weights() {
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/granite_speech");
+        for (fixture, wrong_variant, expected, found) in [
+            (
+                "base",
+                ModelVariant::GraniteSpeech412BPlus,
+                "granite_speech_plus",
+                "granite_speech",
+            ),
+            (
+                "plus",
+                ModelVariant::GraniteSpeech412B,
+                "granite_speech",
+                "granite_speech_plus",
+            ),
+        ] {
+            let dir = temp_model_dir();
+            write_required_non_weight_files(&dir);
+            std::fs::copy(
+                fixtures.join(fixture).join("config.json"),
+                dir.join("config.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                r#"{"weight_map":{"a":"model-00001-of-00003.safetensors"}}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("model-00001-of-00003.safetensors"), []).unwrap();
+            let err = GraniteSpeechAsrModel::load(
+                &dir,
+                wrong_variant,
+                test_profile(DeviceKind::Cpu, false),
+            )
+            .err()
+            .expect("mismatched checkpoint must not load")
+            .to_string();
+            assert!(
+                err.contains(&format!("expects a {expected} checkpoint"))
+                    && err.ends_with(&format!("declares {found}")),
+                "{err}"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+        assert!(GraniteSpeechAsrModel::load(
+            &fixtures.join("base"),
+            ModelVariant::WhisperLargeV3Turbo,
+            test_profile(DeviceKind::Cpu, false),
+        )
+        .is_err());
     }
 
     #[test]

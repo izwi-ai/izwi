@@ -399,11 +399,25 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     ],
     size: "2.37 GB",
   },
-  "Granite-Speech-4.1-2B-Plus": {
+  "Granite-Speech-4.1-2B": {
     shortName: "Granite Speech 4.1",
+    fullName: "IBM Granite Speech 4.1 2B",
+    description:
+      "IBM Granite Speech ASR with punctuated, capitalized transcripts in English, French, German, Spanish, Portuguese, and Japanese, plus keyword biasing",
+    category: "asr",
+    capabilities: [
+      "Transcription",
+      "Punctuation",
+      "Keyword biasing",
+      "16 kHz",
+    ],
+    size: "4.63 GB",
+  },
+  "Granite-Speech-4.1-2B-Plus": {
+    shortName: "Granite Speech 4.1 Plus",
     fullName: "IBM Granite Speech 4.1 2B Plus",
     description:
-      "IBM Granite Speech rich transcription model with multilingual ASR, speaker-attributed transcripts, word timestamps, prefix prompting, and keyword biasing",
+      "IBM Granite Speech rich transcription model with speaker-attributed transcripts, word timestamps, prefix prompting, and keyword biasing; transcripts are unpunctuated by design",
     category: "asr",
     capabilities: [
       "Transcription",

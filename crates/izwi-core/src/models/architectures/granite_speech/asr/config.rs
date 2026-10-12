@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
 
 const BASE_MODEL_TYPE: &str = "granite_speech";
 const PLUS_MODEL_TYPE: &str = "granite_speech_plus";
@@ -36,6 +37,15 @@ impl GraniteSpeechCheckpointKind {
         match architecture {
             BASE_ARCHITECTURE => Some(Self::Base),
             PLUS_ARCHITECTURE => Some(Self::Plus),
+            _ => None,
+        }
+    }
+
+    /// The checkpoint a catalog variant must load.
+    pub const fn for_variant(variant: ModelVariant) -> Option<Self> {
+        match variant {
+            ModelVariant::GraniteSpeech412B => Some(Self::Base),
+            ModelVariant::GraniteSpeech412BPlus => Some(Self::Plus),
             _ => None,
         }
     }

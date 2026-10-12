@@ -7702,11 +7702,16 @@ mod tests {
 
     #[test]
     fn resolves_granite_speech_asr_loader_registration() {
-        let registration = resolve_asr_loader_registration(ModelVariant::GraniteSpeech412BPlus)
-            .expect("Granite Speech ASR loader should be registered");
+        for variant in [
+            ModelVariant::GraniteSpeech412B,
+            ModelVariant::GraniteSpeech412BPlus,
+        ] {
+            let registration = resolve_asr_loader_registration(variant)
+                .expect("Granite Speech ASR loader should be registered");
 
-        assert_eq!(registration.name, "granite_speech_asr");
-        assert_eq!(registration.family, ModelFamily::GraniteSpeechAsr);
+            assert_eq!(registration.name, "granite_speech_asr");
+            assert_eq!(registration.family, ModelFamily::GraniteSpeechAsr);
+        }
     }
 
     #[test]

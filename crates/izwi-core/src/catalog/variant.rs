@@ -151,7 +151,7 @@ impl ModelVariant {
             Qwen3Asr06BGguf | Qwen3Asr17BGguf => ModelFamily::Qwen3Asr,
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
-            GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
+            GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -281,8 +281,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 VoxtralMini4BRealtime2602
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
-            } else if resolve_granite_speech_variant(&normalized).is_some() {
-                GraniteSpeech412BPlus
+            } else if let Some(granite_speech) = resolve_granite_speech_variant(&normalized) {
+                granite_speech
             } else if normalized.contains("vibevoice") && normalized.contains("asr") {
                 VibeVoiceAsr
             } else if normalized.contains("whisper")
@@ -571,15 +571,14 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
-    if normalized.contains("41") || normalized.contains("4dot1") || normalized.contains("2b") {
-        return Some(GraniteSpeech412BPlus);
-    }
-
+    // IBM's library resolves local checkpoints the same way: "plus" names the
+    // rich-transcription model, anything else the punctuating base model,
+    // which is IBM's default.
     if normalized.contains("plus") {
         return Some(GraniteSpeech412BPlus);
     }
 
-    Some(GraniteSpeech412BPlus)
+    Some(GraniteSpeech412B)
 }
 
 fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
@@ -815,6 +814,41 @@ mod tests {
     fn resolve_asr_accepts_granite_speech_family_alias() {
         let resolved = resolve_asr_model_variant(Some("granite speech plus"));
         assert_eq!(resolved, ModelVariant::GraniteSpeech412BPlus);
+    }
+
+    #[test]
+    fn granite_speech_names_resolve_to_base_unless_they_say_plus() {
+        for (input, expected) in [
+            (
+                "ibm-granite/granite-speech-4.1-2b",
+                ModelVariant::GraniteSpeech412B,
+            ),
+            ("granite-speech-4.1-2b", ModelVariant::GraniteSpeech412B),
+            ("Granite-Speech-4.1-2B", ModelVariant::GraniteSpeech412B),
+            ("Granite Speech 4.1 2B", ModelVariant::GraniteSpeech412B),
+            (
+                "ibm-granite/granite-speech-4.1-2b-plus",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+            (
+                "Granite-Speech-4.1-2B-Plus",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+        ] {
+            assert_eq!(parse_model_variant(input).unwrap(), expected, "{input}");
+        }
+        for (input, expected) in [
+            ("granite speech", ModelVariant::GraniteSpeech412B),
+            ("granite-speech-4.1", ModelVariant::GraniteSpeech412B),
+            ("granite_speech_2b", ModelVariant::GraniteSpeech412B),
+            ("granite speech plus", ModelVariant::GraniteSpeech412BPlus),
+            (
+                "granite-speech-4.1-2b-plus-local",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+        ] {
+            assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
+        }
     }
 
     #[test]
