@@ -56,22 +56,19 @@ impl ChatExecutionRequest {
 
     fn resolved_generation_params(&self) -> GenerationParams {
         let max_new_tokens = self.resolved_max_new_tokens();
-        // Qwen's published sampling profile for its thinking chat models
-        // (the Qwen3.6-35B-A3B-FP8 `generation_config.json` is exactly the
-        // thinking branch). The engine-wide default (T 0.7, top_p 0.9, no
-        // top-k, repetition penalty 1.1 over prompt + output) penalizes
-        // `<|im_end|>`, newlines, and `</think>` on these models.
-        let mut params = if matches!(
-            self.variant,
-            ModelVariant::Qwen3827BFp8 | ModelVariant::Qwen36Moe35BA3BFp8
-        ) {
-            let thinking = self.chat_config.enable_thinking.unwrap_or(true);
+        // Qwen chat models get Qwen's published sampling profile. The
+        // engine-wide default (T 0.7, top_p 0.9, no top-k, repetition penalty
+        // 1.1 over prompt + output) penalizes `<|im_end|>`, newlines, and
+        // `</think>` on these models.
+        let mut params = if let Some(profile) =
+            qwen_sampling_profile(self.variant, self.chat_config.enable_thinking)
+        {
             GenerationParams {
-                temperature: if thinking { 1.0 } else { 0.7 },
-                top_p: if thinking { 0.95 } else { 0.80 },
+                temperature: profile.temperature,
+                top_p: profile.top_p,
                 top_k: 20,
                 repetition_penalty: 1.0,
-                presence_penalty: if thinking { 0.0 } else { 1.5 },
+                presence_penalty: profile.presence_penalty,
                 max_tokens: max_new_tokens,
                 ..Default::default()
             }
@@ -111,6 +108,60 @@ impl ChatExecutionRequest {
 
     fn resolved_chat_config(&self) -> ChatRequestConfig {
         self.chat_config.clone()
+    }
+}
+
+/// Sampling values that differ between Qwen's published per-mode profiles.
+/// Every profile also uses top-k 20 and repetition penalty 1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QwenSamplingProfile {
+    temperature: f32,
+    top_p: f32,
+    presence_penalty: f32,
+}
+
+/// Qwen's published sampling profile for a chat model, or `None` for models
+/// that use the engine default. The values come from each model's card or
+/// `generation_config.json`; `enable_thinking` falls back to the model's own
+/// default mode exactly as its prompt renderer does.
+fn qwen_sampling_profile(
+    variant: ModelVariant,
+    enable_thinking: Option<bool>,
+) -> Option<QwenSamplingProfile> {
+    let profile = |temperature, top_p, presence_penalty| QwenSamplingProfile {
+        temperature,
+        top_p,
+        presence_penalty,
+    };
+    match variant {
+        // The Qwen3.6-35B-A3B-FP8 `generation_config.json` is exactly the
+        // thinking branch.
+        ModelVariant::Qwen3827BFp8 | ModelVariant::Qwen36Moe35BA3BFp8 => {
+            Some(if enable_thinking.unwrap_or(true) {
+                profile(1.0, 0.95, 0.0)
+            } else {
+                profile(0.7, 0.80, 1.5)
+            })
+        }
+        // Qwen3.5-4B and -9B think by default. Their cards give the general
+        // thinking and instruct profiles below.
+        ModelVariant::Qwen354BGguf | ModelVariant::Qwen359BGguf => {
+            Some(if enable_thinking.unwrap_or(true) {
+                profile(1.0, 0.95, 1.5)
+            } else {
+                profile(0.7, 0.80, 1.5)
+            })
+        }
+        // Qwen3.5-0.8B and -2B answer without thinking by default. Their
+        // cards give these text profiles for each mode.
+        ModelVariant::Qwen3508BGguf | ModelVariant::Qwen352BGguf => {
+            Some(if enable_thinking.unwrap_or(false) {
+                profile(1.0, 0.95, 1.5)
+            } else {
+                profile(1.0, 1.0, 2.0)
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1405,7 +1456,7 @@ mod tests {
     #[test]
     fn explicit_overrides_win_over_default_generation_params() {
         let request = ChatExecutionRequest {
-            variant: ModelVariant::Qwen354BGguf,
+            variant: ModelVariant::Gemma34BIt,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "hello".to_string(),
@@ -1501,6 +1552,73 @@ mod tests {
             assert_eq!(params.repetition_penalty, 1.2, "{variant:?}");
             assert_eq!(params.presence_penalty, -0.4, "{variant:?}");
         }
+    }
+
+    /// Expected `(temperature, top_p, presence_penalty)` for each Qwen3.5
+    /// variant and thinking request, from the Qwen3.5 model cards.
+    const QWEN35_PROFILES: [(ModelVariant, Option<bool>, (f32, f32, f32)); 12] = [
+        (ModelVariant::Qwen354BGguf, None, (1.0, 0.95, 1.5)),
+        (ModelVariant::Qwen354BGguf, Some(true), (1.0, 0.95, 1.5)),
+        (ModelVariant::Qwen354BGguf, Some(false), (0.7, 0.80, 1.5)),
+        (ModelVariant::Qwen359BGguf, None, (1.0, 0.95, 1.5)),
+        (ModelVariant::Qwen359BGguf, Some(true), (1.0, 0.95, 1.5)),
+        (ModelVariant::Qwen359BGguf, Some(false), (0.7, 0.80, 1.5)),
+        (ModelVariant::Qwen3508BGguf, None, (1.0, 1.0, 2.0)),
+        (ModelVariant::Qwen3508BGguf, Some(false), (1.0, 1.0, 2.0)),
+        (ModelVariant::Qwen3508BGguf, Some(true), (1.0, 0.95, 1.5)),
+        (ModelVariant::Qwen352BGguf, None, (1.0, 1.0, 2.0)),
+        (ModelVariant::Qwen352BGguf, Some(false), (1.0, 1.0, 2.0)),
+        (ModelVariant::Qwen352BGguf, Some(true), (1.0, 0.95, 1.5)),
+    ];
+
+    #[test]
+    fn qwen35_models_use_their_published_sampling_profile_per_mode() {
+        for (variant, enable_thinking, (temperature, top_p, presence)) in QWEN35_PROFILES {
+            let params = qwen_request(variant, enable_thinking).resolved_generation_params();
+            let case = format!("{variant:?} enable_thinking={enable_thinking:?}");
+            assert_eq!(params.temperature, temperature, "{case}");
+            assert_eq!(params.top_p, top_p, "{case}");
+            assert_eq!(params.top_k, 20, "{case}");
+            assert_eq!(params.repetition_penalty, 1.0, "{case}");
+            assert_eq!(params.presence_penalty, presence, "{case}");
+        }
+    }
+
+    #[test]
+    fn qwen35_models_let_explicit_sampling_values_win_over_profile() {
+        for variant in [
+            ModelVariant::Qwen3508BGguf,
+            ModelVariant::Qwen352BGguf,
+            ModelVariant::Qwen354BGguf,
+            ModelVariant::Qwen359BGguf,
+        ] {
+            let mut request = qwen_request(variant, None);
+            request.temperature = Some(0.2);
+            request.top_p = Some(0.3);
+            request.top_k = Some(7);
+            request.repetition_penalty = Some(1.2);
+            request.presence_penalty = Some(0.0);
+
+            let params = request.resolved_generation_params();
+            assert_eq!(params.temperature, 0.2, "{variant:?}");
+            assert_eq!(params.top_p, 0.3, "{variant:?}");
+            assert_eq!(params.top_k, 7, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.2, "{variant:?}");
+            assert_eq!(params.presence_penalty, 0.0, "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn chat_models_without_a_qwen_profile_keep_the_engine_default() {
+        let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
+        request.max_tokens = Some(32);
+        let params = request.resolved_generation_params();
+        let defaults = GenerationParams::default();
+        assert_eq!(params.temperature, defaults.temperature);
+        assert_eq!(params.top_p, defaults.top_p);
+        assert_eq!(params.top_k, defaults.top_k);
+        assert_eq!(params.repetition_penalty, defaults.repetition_penalty);
+        assert_eq!(params.presence_penalty, defaults.presence_penalty);
     }
 
     #[test]

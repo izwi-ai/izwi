@@ -23,7 +23,8 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates_with_history, device_candidates_cover_top_p,
+    sample_device_candidates, PenaltyHistory,
 };
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -97,18 +98,41 @@ where
     }
 }
 
+/// Initial token history for the sampling penalties. The prompt is kept
+/// only when the repetition penalty reads it, because the presence penalty
+/// reads generated tokens alone (vLLM semantics, which Qwen's published
+/// sampling profiles assume).
 fn initial_penalty_history(
     prompt_ids: &[u32],
     max_new_tokens: usize,
     track_history: bool,
+    include_prompt: bool,
 ) -> Vec<u32> {
     if !track_history {
         return Vec::new();
     }
 
-    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(max_new_tokens.max(1)));
-    history.extend_from_slice(prompt_ids);
+    let prompt = if include_prompt { prompt_ids } else { &[] };
+    let mut history = Vec::with_capacity(prompt.len().saturating_add(max_new_tokens.max(1)));
+    history.extend_from_slice(prompt);
     history
+}
+
+/// Penalty histories for the next sample. `history_ids` starts with
+/// `prompt_len` prompt tokens (zero when the prompt is not tracked) and
+/// continues with the generated tokens.
+fn penalty_history(
+    track_history: bool,
+    history_ids: &[u32],
+    prompt_len: usize,
+) -> PenaltyHistory<'_> {
+    if !track_history {
+        return PenaltyHistory::uniform(&[]);
+    }
+    PenaltyHistory {
+        repetition: history_ids,
+        presence: &history_ids[prompt_len.min(history_ids.len())..],
+    }
 }
 
 fn expected_physical_decode_cursor(prefill_progress: usize, tokens_generated: usize) -> usize {
@@ -124,6 +148,8 @@ pub struct ChatDecodeState {
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
     history_ids: Vec<u32>,
+    /// Number of prompt tokens at the start of `history_ids`.
+    penalty_prompt_len: usize,
     decoder: IncrementalDecoder,
     tokens_generated: usize,
     track_history: bool,
@@ -648,6 +674,7 @@ impl Qwen35ChatExec {
         }
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let include_prompt = track_history && config.repetition_penalty > 1.0;
         Ok(ChatDecodeState {
             text_state: self.text_model.new_state(),
             physical_kv: cache,
@@ -658,7 +685,13 @@ impl Qwen35ChatExec {
                 &prepared.prompt_ids,
                 max_new_tokens,
                 track_history,
+                include_prompt,
             ),
+            penalty_prompt_len: if include_prompt {
+                prepared.prompt_ids.len()
+            } else {
+                0
+            },
             decoder: IncrementalDecoder::new(true),
             tokens_generated: 0,
             track_history,
@@ -816,11 +849,11 @@ impl Qwen35ChatExec {
             input_tokens_committed = 1;
         }
 
-        let history: &[u32] = if state.track_history {
-            &state.history_ids
-        } else {
-            &[]
-        };
+        let history = penalty_history(
+            state.track_history,
+            &state.history_ids,
+            state.penalty_prompt_len,
+        );
         state.pending_logprobs.clear();
         let next = {
             let output = state.unconsumed_output.take().ok_or_else(|| {
@@ -829,7 +862,7 @@ impl Qwen35ChatExec {
                 )
             })?;
             let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token(
+                grammar.sample_token_with_history(
                     &output,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -941,15 +974,15 @@ impl Qwen35ChatExec {
 
         let mut sampled = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let history = if state.track_history {
-                state.history_ids.as_slice()
-            } else {
-                &[]
-            };
+            let history = penalty_history(
+                state.track_history,
+                &state.history_ids,
+                state.penalty_prompt_len,
+            );
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
             let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token(
+                grammar.sample_token_with_history(
                     &row_logits,
                     self.tokenizer.vocab_size,
                     &state.config,
@@ -1789,7 +1822,7 @@ fn take_quantum_sample(
     output: &mut Option<Tensor>,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
     let output = output.take().ok_or_else(|| {
@@ -1804,7 +1837,7 @@ fn sample_next_token_with_logprobs(
     logits: &Tensor,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<(
     u32,
@@ -1848,7 +1881,7 @@ fn sample_next_token(
     logits: &Tensor,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
     if vocab_size == 0 {
@@ -1868,7 +1901,7 @@ fn sample_next_token(
         return argmax_clamped(logits, vocab_size);
     }
 
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates_with_history(
         logits,
         vocab_size,
         config.top_k,
@@ -1890,9 +1923,9 @@ fn sample_next_token(
     let mut values = logits_to_vec(logits)?;
     truncate_logits_to_vocab(&mut values, vocab_size);
 
-    if config.repetition_penalty > 1.0 && !history.is_empty() {
+    if config.repetition_penalty > 1.0 && !history.repetition.is_empty() {
         let mut seen = vec![false; values.len()];
-        for &token in history {
+        for &token in history.repetition {
             let idx = token as usize;
             if idx < seen.len() {
                 seen[idx] = true;
@@ -1915,9 +1948,9 @@ fn sample_next_token(
         }
     }
 
-    if config.presence_penalty.abs() > f32::EPSILON && !history.is_empty() {
+    if config.presence_penalty.abs() > f32::EPSILON && !history.presence.is_empty() {
         let mut seen = vec![false; values.len()];
-        for &token in history {
+        for &token in history.presence {
             let idx = token as usize;
             if idx < seen.len() {
                 seen[idx] = true;
@@ -2311,11 +2344,70 @@ mod tests {
     #[test]
     fn penalty_history_starts_with_exact_prompt_ids() {
         let prompt_ids = vec![248_000, 17, 23, 248_001];
-        let mut history = initial_penalty_history(&prompt_ids, 8, true);
+        let mut history = initial_penalty_history(&prompt_ids, 8, true, true);
         assert_eq!(history, prompt_ids);
         history.push(99);
         assert_eq!(&history[..prompt_ids.len()], prompt_ids.as_slice());
-        assert!(initial_penalty_history(&prompt_ids, 8, false).is_empty());
+        assert!(initial_penalty_history(&prompt_ids, 8, false, true).is_empty());
+        assert!(initial_penalty_history(&prompt_ids, 8, true, false).is_empty());
+    }
+
+    #[test]
+    fn presence_penalty_reads_generated_tokens_while_repetition_reads_the_prompt() {
+        let prompt_ids = [248_046u32, 13, 7];
+        let mut history = initial_penalty_history(&prompt_ids, 8, true, true);
+        history.extend([5, 13]);
+        let split = penalty_history(true, &history, prompt_ids.len());
+        assert_eq!(split.repetition, &[248_046, 13, 7, 5, 13]);
+        assert_eq!(split.presence, &[5, 13]);
+
+        let generated_only = vec![5u32, 13];
+        let presence_only = penalty_history(true, &generated_only, 0);
+        assert_eq!(presence_only.repetition, &[5, 13]);
+        assert_eq!(presence_only.presence, &[5, 13]);
+
+        let untracked = penalty_history(false, &history, prompt_ids.len());
+        assert!(untracked.repetition.is_empty() && untracked.presence.is_empty());
+    }
+
+    #[test]
+    fn presence_penalty_spares_tokens_that_only_appear_in_the_prompt() {
+        // Token 0 stands for `<|im_end|>`: it ends every prompt turn but has
+        // not been generated. A presence penalty must not push it below
+        // token 1, which appears nowhere. Token 2 was generated.
+        let logits = Tensor::from_vec(vec![10.0f32, 9.0, -50.0], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 1e-3,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 2.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
+        };
+        let history = [0u32, 2];
+        let mut rng = SimpleRng::new(7);
+        let split = PenaltyHistory {
+            repetition: &history,
+            presence: &history[1..],
+        };
+        assert_eq!(
+            sample_next_token(&logits, 3, &config, split, &mut rng).unwrap(),
+            0,
+            "prompt-only token keeps its logit"
+        );
+        let mut rng = SimpleRng::new(7);
+        let legacy = PenaltyHistory::uniform(&history);
+        assert_eq!(
+            sample_next_token(&logits, 3, &config, legacy, &mut rng).unwrap(),
+            1,
+            "a penalized token 0 falls below token 1"
+        );
     }
 
     #[test]
@@ -2607,7 +2699,8 @@ mod tests {
             constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
-        let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
+        let token = sample_next_token(&logits, 3, &config, PenaltyHistory::uniform(&[]), &mut rng)
+            .expect("sample token");
         assert_eq!(token, 2);
     }
 
@@ -2632,19 +2725,19 @@ mod tests {
             top_logprobs: 0,
             constrain_json_object: false,
         };
-        let history = [1u32];
+        let history = PenaltyHistory::uniform(&[1u32]);
         let mut direct_rng = SimpleRng::new(17);
-        let expected = sample_next_token(&output, 4, &config, &history, &mut direct_rng).unwrap();
+        let expected = sample_next_token(&output, 4, &config, history, &mut direct_rng).unwrap();
         let mut quantum_rng = SimpleRng::new(17);
         let mut unconsumed = Some(output);
 
         assert_eq!(
-            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).unwrap(),
+            take_quantum_sample(&mut unconsumed, 4, &config, history, &mut quantum_rng).unwrap(),
             expected
         );
         assert!(unconsumed.is_none());
         assert!(
-            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).is_err()
+            take_quantum_sample(&mut unconsumed, 4, &config, history, &mut quantum_rng).is_err()
         );
     }
 
@@ -2666,7 +2759,7 @@ mod tests {
             constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
-        let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
+        let result = sample_next_token(&logits, 0, &config, PenaltyHistory::uniform(&[]), &mut rng);
         assert!(result.is_err());
     }
 
@@ -2694,8 +2787,9 @@ mod tests {
                 constrain_json_object: false,
             };
             let mut rng = SimpleRng::new(7);
-            let error = sample_next_token(&logits, 3, &config, &[], &mut rng)
-                .expect_err("all in-vocabulary logits are non-finite");
+            let error =
+                sample_next_token(&logits, 3, &config, PenaltyHistory::uniform(&[]), &mut rng)
+                    .expect_err("all in-vocabulary logits are non-finite");
             let message = error.to_string();
             assert!(message.contains("0 finite"));
             assert!(message.contains("1 NaN"));

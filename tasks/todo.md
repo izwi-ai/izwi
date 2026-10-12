@@ -1,3 +1,52 @@
+# Plan — Qwen3.5 dense (0.8B / 2B / 4B / 9B GGUF) inference performance — 2026-10-12
+
+Branch `perf-qwen35` (worktree `.claude/worktrees/perf-qwen35`, base `main` @ `abf3f26f`).
+Research and per-phase detail are in `tasks/qwen35-performance-research-2026-10-11.md`; the
+reports are in `tasks/qwen35-performance-evidence-2026-10-11/` (A–F). Both are local, untracked
+files (`/tasks/*` is ignored).
+
+**Family rule (user decision).** Fast paths are ported into `q35/`'s own trunk, which may call the
+generic kernels under `kernels/`. Qwen3.6 is a reference, not a dependency.
+
+**Decisions.** The recommended options are used until the user says otherwise:
+- D1: F32 kernel variants, not a BF16 trunk.
+- D2: copy the fast-path bookkeeping into qwen35.
+- D3: x86-64-v3 CPU build with a baseline fallback.
+- D4: Qwen's per-size sampling profile.
+
+**Overlap with `perf-qwen38`** (36 commits, unmerged). Admission and automatic-rows work (part of
+S5) lives there. Leave it to that branch and rebase after it merges.
+
+Phase 0 — serving defaults, telemetry, memory
+- [x] 1 S1: per-size Qwen3.5 sampling profile from the model cards. Qwen3.5's presence penalty
+      now counts generated tokens only (vLLM semantics); repetition still counts prompt + output.
+      Without that change, the profile's 1.5–2.0 presence penalty would hit `<|im_end|>` from
+      the prompt.
+- [ ] 2 S2: decode-only t/s + TTFT in the UI; qwen35 `runtime_diagnostics`; sync, launch, sampler,
+      prefill-span, quantum and prefix counters.
+- [ ] 3 S3: revisit. Leaving omitted `max_tokens` uncapped at the API layer was a deliberate
+      decision, matching vLLM and pinned by a server test. Fix the arena claim instead
+      (incremental claims, T3).
+- [ ] 4 S4: wider qwen35 prefill spans.
+- [ ] 5 S5: quantized embedding gather; lazy/F16 vision tower. Admission goes to `perf-qwen38`.
+- [ ] 6 S6: load warmup; one-pass special-token matcher.
+
+Phase 1 — host work per token
+- [ ] 7 H1: one sync per token (seal after the LM head, packed greedy readback).
+- [ ] 8 H2: RoPE tables built on the host once and uploaded (lesson: Metal's cos/sin is inexact),
+      indexed on device.
+- [ ] 9 H3: packed conv history staged by handle; no per-token checkpoint clones.
+- [ ] 10 H4: sampler cleanup; mine the `cuda-qwen35` branch.
+- [ ] 11 H5: multi-token decode quanta with `sustained_decode_quantum`.
+
+Phase 2 — fused decode in q35/
+- [ ] 12 P1: fused DeltaNet decode via `kernels/cuda/gdn.rs` (`grouped: false`), CUDA + Metal.
+- [ ] 13 P2: F32 norm/RoPE/gate kernel variants and their fused wiring.
+- [ ] 14 P3/K1: izwi-owned K-quant MMVQ with model-owned scratch.
+- [ ] 15 G0: parity harness (eager trunk as the oracle, tiny random GGUF, RED-checked).
+
+Phase 3 and later: as in the research doc (graphs, prefix reuse, batching, Metal, CPU, other GPUs).
+
 # Plan — Qwen3.8-27B-FP8 load admission failure + inference performance — 2026-10-11
 
 Branch `perf-qwen38` (base `main` @ `abf3f26f`). Evidence and per-phase detail are in
