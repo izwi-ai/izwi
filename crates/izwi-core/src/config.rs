@@ -724,8 +724,11 @@ pub struct EngineConfig {
 
     /// Hard upper bound for committed prefix pages. This is additionally
     /// clamped to preserve capacity for at least one maximum-length request.
-    #[serde(default = "default_max_prefix_cache_pages")]
-    pub max_prefix_cache_pages: usize,
+    /// `None` (the default) is automatic: [`DEFAULT_MAX_PREFIX_CACHE_PAGES`],
+    /// raised per model to a quarter of a CUDA KV arena that is fully
+    /// allocated at load.
+    #[serde(default)]
+    pub max_prefix_cache_pages: Option<usize>,
 
     /// Catalog-gated prefix-reuse default (DS1.6). When `enable_prefix_caching`
     /// is false and this is true, the serving layer engages committed prefix
@@ -793,7 +796,7 @@ impl Default for EngineConfig {
             num_threads: default_num_threads(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
-            max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            max_prefix_cache_pages: None,
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
@@ -814,9 +817,9 @@ fn default_managed_prefix_cache_salt() -> Option<String> {
     None
 }
 
-fn default_max_prefix_cache_pages() -> usize {
-    128
-}
+/// Prefix page budget when none is configured: 128 pages of 64 tokens
+/// (8,192 tokens). CUDA arenas fully allocated at load raise it per model.
+pub const DEFAULT_MAX_PREFIX_CACHE_PAGES: usize = 128;
 
 fn default_enable_chunked_prefill() -> bool {
     false
@@ -906,6 +909,13 @@ impl EngineConfig {
         self.max_sequence_length.explicit_tokens().unwrap_or(4096)
     }
 
+    /// The configured prefix page budget, or the default when it is
+    /// automatic (the floor each model's automatic budget starts from).
+    pub(crate) fn prefix_cache_pages_or_default(&self) -> usize {
+        self.max_prefix_cache_pages
+            .unwrap_or(DEFAULT_MAX_PREFIX_CACHE_PAGES)
+    }
+
     /// Validate cache settings and report requested versus effective policy.
     pub fn resolved_kv_cache_policy(
         &self,
@@ -916,7 +926,7 @@ impl EngineConfig {
             &self.kv_cache_dtype,
             self.enable_prefix_caching,
             self.managed_prefix_cache_salt.as_deref(),
-            self.max_prefix_cache_pages,
+            self.prefix_cache_pages_or_default(),
             total_capacity_pages,
             // Portable automatic context is resolved during model loading. Keep
             // the historical reserve until that effective value is available.
@@ -1269,7 +1279,7 @@ mod managed_kv_default_tests {
             max_sequence_length: ContextLengthPreference::explicit(512).unwrap(),
             enable_prefix_caching: true,
             managed_prefix_cache_salt: Some("tenant-a".to_string()),
-            max_prefix_cache_pages: 100,
+            max_prefix_cache_pages: Some(100),
             ..EngineConfig::default()
         };
         let policy = config.resolved_kv_cache_policy(64).unwrap();

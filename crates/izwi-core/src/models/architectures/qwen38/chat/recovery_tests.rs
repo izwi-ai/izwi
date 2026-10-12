@@ -155,6 +155,7 @@ pub(crate) fn model_fixture(hybrid: bool) -> Qwen38ChatModel {
             inner,
             vocab_size: 8,
             specials: SpecialTokenIds {
+                im_start: u32::MAX,
                 im_end: 100,
                 eos: 101,
                 eos_alt: None,
@@ -168,6 +169,9 @@ pub(crate) fn model_fixture(hybrid: bool) -> Qwen38ChatModel {
         mtp_policy: Qwen38MtpPolicy::Enabled { draft_tokens: 2 },
         mtp_head: Some(mtp_head),
         prefix_caching: false,
+        prefix_reuse: Qwen38PrefixReuse::default(),
+        graph_quantum: GraphQuantumCounters::default(),
+        kernel_timings: serde_json::Value::Null,
     }
 }
 
@@ -234,6 +238,7 @@ fn start_with_caches(
         prompt_ids: vec![1, 2],
         prompt_positions: vec![[0; 3], [1; 3]],
         next_text_position: 2,
+        history_boundary: None,
     };
     model
         .start_decode_state_physical(&[], 12, &config, Some(&prepared), text, mtp)
@@ -482,6 +487,7 @@ fn cpu_replay_preserves_published_boundary_and_sampling_with_and_without_mtp() {
                 prompt_ids: vec![1, 2],
                 prompt_positions: vec![[0; 3], [1; 3]],
                 next_text_position: 2,
+                history_boundary: None,
             };
             let mut uninterrupted = model
                 .start_decode_state_physical(
@@ -571,6 +577,7 @@ fn replay_of_partial_prefill_preserves_known_mtp_successor() {
             prompt_ids: vec![1, 2, 3, 4],
             prompt_positions: (0..4).map(|position| [position; 3]).collect(),
             next_text_position: 4,
+            history_boundary: None,
         };
         let mut original = model
             .begin_chunked_prefill_state_physical(
@@ -626,5 +633,6 @@ pub(crate) fn prepared_prompt() -> Qwen38PreparedPrompt {
         prompt_ids: vec![1, 2],
         prompt_positions: vec![[0; 3], [1; 3]],
         next_text_position: 2,
+        history_boundary: None,
     }
 }

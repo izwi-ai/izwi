@@ -107,7 +107,7 @@ async fn attach_after_publish_completes_without_error() {
         num_threads: 1,
         enable_prefix_caching: true,
         managed_prefix_cache_salt: Some("repro-salt".into()),
-        max_prefix_cache_pages: 64,
+        max_prefix_cache_pages: Some(64),
         enable_chunked_prefill: true,
         chunked_prefill_threshold: 8,
         max_sequence_length: izwi_core::config::ContextLengthPreference::explicit(4096).unwrap(),

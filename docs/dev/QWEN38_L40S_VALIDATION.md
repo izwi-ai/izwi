@@ -22,16 +22,25 @@ runtime policy lives under `[runtime.performance.cuda]` and
 subordinate switches. Restart the server or reload the model after changing
 policy; retain requested/resolved diagnostics and the reason for fallbacks.
 
-Auto projection selection retains compact Q8 pending real-device crossover
-evidence. Explicit `projection_backend = "native_fp8"` selects the implemented
-software-decode FP8-weight/16-bit-activation (W8A16) provider on eligible paths.
-It does not implement true FP8-activation Tensor Core W8A8. The provider name
-alone must not be reported as proof of native FP8 arithmetic or a speedup.
+Auto projection selection resolves native block FP8, the software-decode
+FP8-weight/16-bit-activation (W8A16) provider, once the device gates pass: every
+projection shape inside the kernel contract, `fp8::verify_decode_kernels_at` at the
+checkpoint's real K (5120, 6144, 17408), and a real-weight probe on the first rows
+of two layer-0 projections. The load then checks each projection kind against the
+original checkpoint bytes; a failure fails the load and the next load admits Q8_0.
+Explicit `projection_backend = "native_fp8"` keeps native FP8 where the kernel
+contract allows it. It does not implement true FP8-activation Tensor Core W8A8.
+The provider name alone must not be reported as proof of native FP8 arithmetic or
+a speedup: A/B it against `IZWI_CUDA_PROJECTION_BACKEND=q8` (decode bandwidth and
+TTFT at about 1.2k prompt tokens).
 
 | Subsystem | Automatic policy | Explicit opt-out |
 |---|---|---|
 | CUDA optimizations | `mode = "auto"` | `IZWI_CUDA_MODE=off` |
 | Projection provider | `projection_backend = "auto"` | `IZWI_CUDA_PROJECTION_BACKEND=q8` |
+| Qwen3.8 native FP8 projections | gated auto | `IZWI_QWEN38_FP8_PROJECTIONS=legacy` |
+| Qwen3.8 vectorized FP8 GEMV | gated auto | `IZWI_QWEN38_FP8_GEMV=legacy` |
+| Qwen3.8 block-FP8 LM head | with native FP8 | `IZWI_QWEN38_FP8_LM_HEAD=legacy` |
 | Packed projections | `packed_projections = "auto"` | `IZWI_CUDA_PACKED_PROJECTIONS=off` |
 | Fused decode | `fused_decode = "auto"` | `IZWI_CUDA_FUSED_DECODE=off` |
 | KV precision | BF16 on observed CUDA capability 8.0+ | `IZWI_QWEN38_CUDA_BF16_KV=0` |

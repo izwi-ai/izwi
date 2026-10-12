@@ -177,7 +177,7 @@ impl RetainedTensorStateRuntimeV2 {
         transaction: PhysicalStateTransactionId,
         expected_cursor: u64,
     ) -> Result<()> {
-        self.arena.commit(transaction, expected_cursor)
+        self.arena.commit(transaction, expected_cursor).map(drop)
     }
 
     pub(crate) fn abort_transaction(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
@@ -185,7 +185,7 @@ impl RetainedTensorStateRuntimeV2 {
     }
 
     pub(crate) fn release_sequence(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
-        self.arena.release(sequence)
+        self.arena.release(sequence).map(drop)
     }
 
     fn close_and_validate_drained(&self) -> Result<()> {

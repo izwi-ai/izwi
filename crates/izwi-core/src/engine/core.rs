@@ -46,6 +46,7 @@ use super::executor::{
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
     record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
+    record_engine_workspace_wait, EngineWorkspaceWaitOutcome,
 };
 use super::output::OutputProcessor;
 use super::request::{
@@ -369,24 +370,51 @@ impl PhysicalBatchAssembly {
         Some(workspace)
     }
 
+    fn matches_shape(
+        &self,
+        lane: &BatchLaneKey,
+        mode: NativeBatchMode,
+        budget: &BatchBudget,
+        output_visibility: super::OutputVisibility,
+        shape_policy: StageShapePolicy,
+        launch_policy: PhysicalLaunchPolicy,
+    ) -> bool {
+        self.physical_batch.lane == *lane
+            && self.physical_batch.mode == mode
+            && self.physical_batch.budget == *budget
+            && self.output_visibility == output_visibility
+            && self.shape_policy == shape_policy
+            && self.launch_policy == launch_policy
+    }
+
+    /// Structural precondition of `try_push` for a row of this cost. Element
+    /// and workspace budgets need the prepared row; `try_push` checks them.
+    fn may_accept(&self, cost: &WorkCost) -> bool {
+        self.physical_batch.rows.len() < self.physical_batch.budget.max_rows
+            && !self.isolates_multi_token_quanta(cost)
+    }
+
+    fn isolates_multi_token_quanta(&self, cost: &WorkCost) -> bool {
+        // Shared continuous envelopes are N rows by exactly one token.
+        // Model-authored multi-token quanta are isolated so membership can
+        // change only after their bounded transaction commits.
+        self.physical_batch.mode == NativeBatchMode::Continuous
+            && !self.physical_batch.rows.is_empty()
+            && (cost.logical_units > 1
+                || self
+                    .physical_batch
+                    .rows
+                    .iter()
+                    .any(|existing| existing.cost.logical_units > 1))
+    }
+
     fn try_push(
         &mut self,
         request: Arc<EngineCoreRequest>,
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
     ) -> bool {
-        if self.physical_batch.mode == NativeBatchMode::Continuous
-            && !self.physical_batch.rows.is_empty()
-            && (row.cost.logical_units > 1
-                || self
-                    .physical_batch
-                    .rows
-                    .iter()
-                    .any(|existing| existing.cost.logical_units > 1))
-        {
-            // Shared continuous envelopes are N rows by exactly one token.
-            // Model-authored multi-token quanta are isolated so membership can
-            // change only after their bounded transaction commits.
+        if self.isolates_multi_token_quanta(&row.cost) {
             return false;
         }
         let mut candidate = self.physical_batch.clone();
@@ -416,11 +444,32 @@ impl PhysicalBatchAssembly {
     }
 }
 
+/// One session's run of refused batch workspaces.
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceWait {
+    started: Instant,
+    /// Attempts since the last shape reduction; drives the backoff.
+    attempts: u32,
+}
+
+impl WorkspaceWait {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            attempts: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LifecycleRetryPolicy {
     max_execution_retries: u32,
     execution_backoff_base: Duration,
     execution_backoff_max: Duration,
+    /// How long a session may keep retrying a refused batch workspace while
+    /// no other session makes progress. A refusal happens before device
+    /// entry, so retrying is exact; this replaces the attempt budget.
+    workspace_wait_budget: Duration,
     cleanup_backoff_base: Duration,
     cleanup_backoff_max: Duration,
     cleanup_budget_per_step: usize,
@@ -432,6 +481,9 @@ impl Default for LifecycleRetryPolicy {
             max_execution_retries: 3,
             execution_backoff_base: Duration::from_millis(5),
             execution_backoff_max: Duration::from_millis(200),
+            // Several CUDA capacity samples (fresh for 250 ms, stale for at
+            // most 1 s): three attempts 35 ms apart all read the same sample.
+            workspace_wait_budget: Duration::from_secs(5),
             cleanup_backoff_base: Duration::from_millis(25),
             cleanup_backoff_max: Duration::from_secs(1),
             cleanup_budget_per_step: 16,
@@ -516,6 +568,8 @@ pub struct EngineCore {
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
+    /// Each session's current run of refused batch workspaces.
+    workspace_waits: HashMap<super::SessionKey, WorkspaceWait>,
     workspace_row_limits: HashMap<super::SessionKey, usize>,
     workspace_pressure: HashMap<super::SessionKey, super::scheduler::ScheduledRequest>,
     retry_policy: LifecycleRetryPolicy,
@@ -1198,6 +1252,7 @@ impl EngineCore {
             // Other work can release live workspace/request reservations. A
             // progressing owner must not exhaust a waiting stream's budget.
             self.execution_retry_attempts.remove(session);
+            self.workspace_waits.remove(session);
         }
     }
 
@@ -1226,6 +1281,10 @@ impl EngineCore {
             // A smaller physical shape is a new attempt at fitting; only
             // unchanged failures consume the bounded no-progress retry budget.
             self.execution_retry_attempts.remove(&session);
+            if let Some(wait) = self.workspace_waits.get_mut(&session) {
+                // Retry the smaller shape promptly; the wait keeps its clock.
+                wait.attempts = 0;
+            }
         } else {
             self.workspace_pressure.insert(session, scheduled.clone());
         }
@@ -1637,10 +1696,42 @@ impl EngineCore {
             }
         };
 
-        if Self::is_workspace_backpressure(&result) {
+        let workspace_backpressure = Self::is_workspace_backpressure(&result);
+        if workspace_backpressure {
             self.observe_workspace_retry(&plan.session);
         }
         let retry_attempt = match &mut result.disposition {
+            ExecutionDisposition::Failed(failure)
+                if workspace_backpressure && failure.retry != RetryDisposition::Never =>
+            {
+                // The refusal came before device entry, so the step is retried
+                // exactly. It waits for capacity on a wall-clock budget: a few
+                // attempts milliseconds apart would all read one cached
+                // capacity sample, and fail a running stream for nothing.
+                let wait = self
+                    .workspace_waits
+                    .entry(plan.session.clone())
+                    .or_insert_with(WorkspaceWait::start);
+                wait.attempts = wait.attempts.saturating_add(1);
+                let (attempts, waited) = (wait.attempts, wait.started.elapsed());
+                if waited < self.retry_policy.workspace_wait_budget {
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Retried);
+                    Some(attempts)
+                } else {
+                    self.workspace_waits.remove(&plan.session);
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Exhausted);
+                    let message = format!(
+                        "executor retry budget exhausted after {attempts} attempts over {:.1}s of workspace backpressure: {}",
+                        waited.as_secs_f64(),
+                        failure.message
+                    );
+                    failure.retry = RetryDisposition::Never;
+                    failure.message = message.clone();
+                    result.output.finished = true;
+                    result.output.error = Some(message);
+                    None
+                }
+            }
             ExecutionDisposition::Failed(failure) if failure.retry != RetryDisposition::Never => {
                 let attempts = self
                     .execution_retry_attempts
@@ -1663,6 +1754,11 @@ impl EngineCore {
             }
             _ => {
                 self.execution_retry_attempts.remove(&plan.session);
+                if self.workspace_waits.remove(&plan.session).is_some()
+                    && result.provenance.dispatch_state != DispatchState::NotStarted
+                {
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Recovered);
+                }
                 None
             }
         };
@@ -2670,6 +2766,19 @@ impl EngineCore {
             .map(|request| request.id.clone())
             .collect::<HashSet<_>>();
         let mut assemblies: Vec<PhysicalBatchAssembly> = Vec::new();
+        // Preparing a row begins its managed-state transaction, but only the
+        // first `available_candidates` assemblies launch this step. A row that
+        // could only open a later assembly is deferred before preparation, so
+        // formation never stages more transactions than one step launches
+        // (candidate limit x batch width), the bound automatic staged rows use.
+        let candidate_limit = self
+            .config
+            .resolved_physical_execution_capacity()
+            .candidate_dispatch_limit
+            .get();
+        let available_candidates = candidate_limit
+            .saturating_sub(self.in_flight_dispatches.len())
+            .min(max_candidates);
 
         for scheduled in scheduled {
             if !available.contains(&scheduled.request_id) {
@@ -2735,6 +2844,24 @@ impl EngineCore {
                     // entry and are governed by their independent rollout.
                     budget.max_rows = 1;
                 }
+            }
+            let joins_launchable_assembly = budget.max_rows > 1
+                && assemblies
+                    .iter()
+                    .take(available_candidates)
+                    .any(|assembly| {
+                        assembly.matches_shape(
+                            &lane,
+                            plan.batch_mode,
+                            &budget,
+                            output_visibility,
+                            shape_policy,
+                            launch_policy,
+                        ) && assembly.may_accept(&cost)
+                    });
+            if assemblies.len() >= available_candidates && !joins_launchable_assembly {
+                transaction_deferred.push(scheduled.clone());
+                continue;
             }
             let planned_work = plan.work.clone();
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
@@ -2817,13 +2944,14 @@ impl EngineCore {
             let mut pending = Some((request, executable, row));
             if budget.max_rows > 1 {
                 for assembly in &mut assemblies {
-                    if assembly.physical_batch.lane != lane
-                        || assembly.physical_batch.mode != plan.batch_mode
-                        || assembly.physical_batch.budget != budget
-                        || assembly.output_visibility != output_visibility
-                        || assembly.shape_policy != shape_policy
-                        || assembly.launch_policy != launch_policy
-                    {
+                    if !assembly.matches_shape(
+                        &lane,
+                        plan.batch_mode,
+                        &budget,
+                        output_visibility,
+                        shape_policy,
+                        launch_policy,
+                    ) {
                         continue;
                     }
                     let Some((request, scheduled, row)) = pending.take() else {
@@ -2874,14 +3002,6 @@ impl EngineCore {
             }
         }
 
-        let candidate_limit = self
-            .config
-            .resolved_physical_execution_capacity()
-            .candidate_dispatch_limit
-            .get();
-        let available_candidates = candidate_limit
-            .saturating_sub(self.in_flight_dispatches.len())
-            .min(max_candidates);
         let mut prepared = Vec::with_capacity(assemblies.len().min(available_candidates));
         for (index, assembly) in assemblies.into_iter().enumerate() {
             if index >= available_candidates {
@@ -3095,6 +3215,8 @@ impl EngineCore {
         managed_kv_cache.set_host_offload_policy(
             crate::engine::cache::offload::HostOffloadPolicy::resolve(&config)?,
         );
+        managed_kv_cache.set_prefix_snapshot_rows(config.max_prefix_snapshots);
+        managed_kv_cache.set_automatic_prefix_cache_pages(config.max_prefix_cache_pages.is_none());
 
         Ok(Self {
             config,
@@ -3121,6 +3243,7 @@ impl EngineCore {
             execution_retry_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
+            workspace_waits: HashMap::new(),
             workspace_row_limits: HashMap::new(),
             workspace_pressure: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
@@ -3524,6 +3647,7 @@ impl EngineCore {
         self.active_stream_batches
             .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.workspace_waits.remove(session);
     }
 
     fn request_managed_session_release(&mut self, session: &super::SessionKey) -> bool {
@@ -4243,6 +4367,7 @@ impl EngineCore {
             // the original streams and let the protected survivor try again.
             for row in &blocked {
                 self.execution_retry_attempts.remove(&row.session_key());
+                self.workspace_waits.remove(&row.session_key());
             }
         }
 
@@ -5217,26 +5342,27 @@ impl EngineCore {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
             })?,
         );
-        let logical_token_reach = if fit_cuda_resident_context {
-            let maximum_tokens = logical_context_tokens.ok_or_else(|| {
-                Error::ModelLoadError(
-                    "CUDA managed state requires a positive loaded-model context limit".into(),
-                )
-            })?;
-            Some(
-                self.managed_kv_cache
+        let (logical_token_reach, retained_sequence_rows, staged_transaction_rows) =
+            if fit_cuda_resident_context {
+                let context = logical_context_tokens.ok_or_else(|| {
+                    Error::ModelLoadError(
+                        "CUDA managed state requires a positive loaded-model context limit".into(),
+                    )
+                })?;
+                let context = u64::try_from(context)
+                    .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
+                let incremental = self.config.cuda_incremental_chat_enabled();
+                let automatic_rows = self.config.automatic_row_limits.retained_sequences;
+                let context_reserve_bytes = self
+                    .config
+                    .cuda_context_reserve_bytes(self.managed_kv_cache.device_capacity());
+                let fit = self
+                    .managed_kv_cache
                     .fit_cuda_resident_logical_token_reach(
                         model_instance,
                         contract,
-                        Self::cuda_pool_upper_bound(
-                            u64::try_from(maximum_tokens).map_err(|_| {
-                                Error::ModelLoadError("model context exceeds u64".into())
-                            })?,
-                            retained_sequence_rows,
-                            self.config.cuda_incremental_chat_enabled(),
-                        )?,
-                        self.config
-                            .portable_context_reserve_bytes
+                        |rows| Self::cuda_pool_upper_bound(context, rows, incremental),
+                        context_reserve_bytes
                             .checked_add(decode_workspace_reserve_bytes)
                             .ok_or_else(|| {
                                 Error::ModelLoadError(
@@ -5244,19 +5370,44 @@ impl EngineCore {
                                 )
                             })?,
                         self.config.block_size,
-                        retained_sequence_rows,
-                        staged_transaction_rows,
+                        crate::engine::cache::managed::CudaResidentRowRequest {
+                            retained_sequence_rows,
+                            staged_transaction_rows,
+                            automatic_state_budget_fraction: automatic_rows
+                                .then_some(self.config.cuda_state_budget_fraction),
+                        },
+                    )?;
+                info!(
+                    ?model_instance,
+                    automatic_rows,
+                    retained_sequence_rows = fit.retained_sequence_rows,
+                    staged_transaction_rows = fit.staged_transaction_rows,
+                    prefix_snapshot_rows = fit.prefix_snapshot_rows,
+                    per_sequence_state_bytes = fit.per_sequence_state_bytes,
+                    resident_state_bytes = fit.resident_state_bytes,
+                    logical_token_reach = fit.logical_token_reach,
+                    context_reserve_bytes,
+                    decode_workspace_reserve_bytes,
+                    "Fitted CUDA resident state rows and context"
+                );
+                (
+                    Some(fit.logical_token_reach),
+                    fit.retained_sequence_rows,
+                    fit.staged_transaction_rows,
+                )
+            } else {
+                (
+                    self.resolve_managed_token_reach_for_contract(
+                        backend,
+                        model_instance,
+                        contract,
+                        logical_context_tokens,
+                        1,
                     )?,
-            )
-        } else {
-            self.resolve_managed_token_reach_for_contract(
-                backend,
-                model_instance,
-                contract,
-                logical_context_tokens,
-                1,
-            )?
-        };
+                    retained_sequence_rows,
+                    staged_transaction_rows,
+                )
+            };
         let runtime = self
             .managed_kv_cache
             .bind_request_with_capacity_policy(
@@ -5349,10 +5500,18 @@ impl EngineCore {
         retained_rows: usize,
         staged_rows: usize,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        // An automatic staged limit is sized for tensor-width launches, not an
+        // operator ceiling; a model that fits its own launch width (Fish) is
+        // bounded by its retained rows instead.
+        let staged_ceiling = if self.config.automatic_row_limits.staged_transactions {
+            self.config.max_retained_sequences
+        } else {
+            self.config.max_staged_transactions
+        };
         if retained_rows == 0
             || staged_rows == 0
             || retained_rows > self.config.max_retained_sequences
-            || staged_rows > self.config.max_staged_transactions
+            || staged_rows > staged_ceiling
         {
             return Err(Error::ModelLoadError(
                 "model row limits exceed configured capacity".into(),
@@ -5684,6 +5843,7 @@ impl EngineCore {
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
         self.workspace_retry_progress.clear();
+        self.workspace_waits.clear();
         self.workspace_row_limits.clear();
         self.workspace_pressure.clear();
         self.initialized = false;
@@ -8479,8 +8639,17 @@ mod tests {
         core.execution_retry_attempts.insert(session.clone(), 1);
         core.observe_workspace_retry(&session);
         assert_eq!(core.execution_retry_attempts[&session], 1);
+        // Peer progress restarts the wall-clock wait too.
+        core.workspace_waits
+            .insert(session.clone(), WorkspaceWait::start());
+        core.workspace_progress_epoch += 1;
+        core.observe_workspace_retry(&session);
+        assert!(!core.workspace_waits.contains_key(&session));
+        core.workspace_waits
+            .insert(session.clone(), WorkspaceWait::start());
         core.clear_exact_execution_state(&session);
         assert!(!core.workspace_retry_progress.contains_key(&session));
+        assert!(!core.workspace_waits.contains_key(&session));
     }
 
     #[test]
@@ -8703,69 +8872,157 @@ mod tests {
         }
     }
 
+    async fn retry_budget_test_core() -> (EngineCore, ScheduledRequest) {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        core.retry_policy.max_execution_retries = 2;
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let mut request = EngineCoreRequest::tts("retry budget");
+        request.id = "retry-budget".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+        (core, scheduled)
+    }
+
+    fn assert_retry_budget_terminal(committed: Option<CommittedExecutorOutput>, expected: &str) {
+        let committed = committed.expect("retry budget must terminalize");
+        assert!(
+            committed
+                .output
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains(expected)),
+            "{:?}",
+            committed.output.error
+        );
+        assert!(matches!(
+            committed.disposition,
+            ExecutionDisposition::Failed(ExecutionFailure {
+                retry: RetryDisposition::Never,
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn retry_budget_exhaustion_terminalizes_the_exact_session() {
-        for workspace in [false, true] {
-            let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
-                Mutex::new(Vec::new()),
-            ))));
-            let mut core = EngineCore::new_with_unified_executor(
-                EngineCoreConfig {
-                    max_batch_size: 1,
-                    max_tokens_per_step: 8,
-                    ..Default::default()
-                },
-                executor,
-            )
-            .unwrap();
-            core.retry_policy.max_execution_retries = 2;
-            core.retry_policy.execution_backoff_base = Duration::ZERO;
-            core.retry_policy.execution_backoff_max = Duration::ZERO;
-            let mut request = EngineCoreRequest::tts("retry budget");
-            request.id = "retry-budget".to_string();
-            request.prompt_tokens = vec![1];
-            core.add_request(request).unwrap();
-            core.refresh_scheduler_execution_profiles().await;
-
-            let mut scheduled = core.scheduler.schedule().prefill_requests.remove(0);
-            let session = scheduled.session_key();
-            if workspace {
-                core.incremental_stream_sessions.insert(session.clone());
-            }
-            for attempt in 1..=3 {
-                core.begin_execution_plan(&scheduled).await.unwrap();
-                let committed = core
-                    .commit_executor_result(
-                        if workspace {
-                            workspace_rejection(&scheduled, 1)
-                        } else {
-                            retryable_step_result(&scheduled, RetryDisposition::RetrySameSession)
-                        },
-                        1.0,
-                    )
-                    .await;
-                if attempt <= 2 {
-                    assert!(committed.is_none());
-                    scheduled = core.scheduler.schedule().prefill_requests.remove(0);
-                    assert_eq!(scheduled.session_key(), session);
-                } else {
-                    let committed = committed.expect("retry budget must terminalize");
-                    assert_eq!(committed.session, session);
-                    assert!(committed
-                        .output
-                        .error
-                        .as_deref()
-                        .is_some_and(|message| message.contains("retry budget exhausted")));
-                    assert!(matches!(
-                        committed.disposition,
-                        ExecutionDisposition::Failed(ExecutionFailure {
-                            retry: RetryDisposition::Never,
-                            ..
-                        })
-                    ));
-                }
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        for attempt in 1..=3 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            let committed = core
+                .commit_executor_result(
+                    retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                    1.0,
+                )
+                .await;
+            if attempt <= 2 {
+                assert!(committed.is_none());
+                scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+                assert_eq!(scheduled.session_key(), session);
+            } else {
+                assert_eq!(committed.as_ref().map(|c| &c.session), Some(&session));
+                assert_retry_budget_terminal(committed, "retry budget exhausted after 2 attempts");
             }
         }
+    }
+
+    /// The H100 field failure (b1d51b89): a running stream's decode workspace
+    /// was refused 25 MB short, retried 5, 10 and 20 ms later against the same
+    /// cached capacity sample, and failed after three attempts in ~35 ms. A
+    /// refused workspace now waits on a wall-clock budget instead.
+    #[tokio::test]
+    async fn refused_workspace_waits_on_a_wall_clock_budget_not_the_attempt_budget() {
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        core.incremental_stream_sessions.insert(session.clone());
+        let before = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        // Well past max_execution_retries (2): every refusal defers.
+        for attempt in 1..=6 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            let committed = core
+                .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+                .await;
+            assert!(
+                committed.is_none(),
+                "refusal {attempt} failed the stream: {:?}",
+                committed.map(|c| c.output.error)
+            );
+            assert_eq!(core.workspace_waits[&session].attempts, attempt);
+            assert!(!core.execution_retry_attempts.contains_key(&session));
+            scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+            assert_eq!(scheduled.session_key(), session);
+        }
+        // Once the wait has lasted its budget, the next refusal fails it.
+        core.workspace_waits.get_mut(&session).unwrap().started =
+            Instant::now() - core.retry_policy.workspace_wait_budget;
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let committed = core
+            .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+            .await;
+        assert_retry_budget_terminal(
+            committed,
+            "retry budget exhausted after 7 attempts over 5.0s of workspace backpressure",
+        );
+        assert!(!core.workspace_waits.contains_key(&session));
+        let after = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        assert!(after.retried >= before.retried + 6);
+        assert!(after.exhausted > before.exhausted);
+    }
+
+    #[tokio::test]
+    async fn admitted_workspace_ends_the_wait_and_keeps_the_attempt_budget() {
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        let before = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        for _ in 0..4 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            assert!(core
+                .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+                .await
+                .is_none());
+            scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+        }
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let mut output = workspace_rejection(&scheduled, 1).output;
+        output.error = None;
+        output.tokens_processed = 1;
+        let committed = core
+            .commit_executor_result(ExecutorStepResult::new(&scheduled, output), 1.0)
+            .await;
+        assert!(committed.is_none_or(|c| c.output.error.is_none()));
+        assert!(!core.workspace_waits.contains_key(&session));
+        let after = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        assert!(after.recovered > before.recovered);
+        // The refusals did not spend the attempt budget of other failures.
+        scheduled = core
+            .scheduler
+            .schedule()
+            .prefill_requests
+            .pop()
+            .or_else(|| core.scheduler.schedule().decode_requests.pop())
+            .expect("the session continues");
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        assert!(core
+            .commit_executor_result(
+                retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                1.0,
+            )
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -10195,6 +10452,78 @@ mod tests {
         assert!(core.active_managed_cache.is_empty());
         assert!(core.active_stream_batches.is_empty());
         drop(decode);
+    }
+
+    #[tokio::test]
+    async fn formation_stages_transactions_only_for_rows_the_step_launches() {
+        let model_instance = ModelInstanceId::new(993);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 4,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                block_size: 16,
+                max_blocks: 8,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        let ids = ["launch-a", "launch-b", "launch-c", "launch-d"];
+        for (id, token) in ids.into_iter().zip(11..) {
+            let request = managed_test_request(&mut core, model_instance, id, vec![token]);
+            core.add_request(request).expect("add managed request");
+        }
+
+        // Four scalar rows are scheduled, and a serial step launches one.
+        let prepared = core
+            .prepare_step()
+            .await
+            .expect("prepare")
+            .expect("one launch");
+        assert_eq!(prepared.recovery().batch_ids().len(), 1);
+        assert_eq!(core.active_managed_cache.len(), 1);
+        let snapshot = core.managed_kv_cache.runtime_snapshot();
+        assert_eq!(snapshot.totals.coordinator.active_transactions, 1);
+        assert_eq!(
+            snapshot.counters.transaction_aborts, 0,
+            "rows the step cannot launch must not stage a managed transaction"
+        );
+        drop(prepared);
+    }
+
+    #[test]
+    fn automatic_staged_rows_do_not_cap_a_model_fitted_staging_width() {
+        let contract = crate::kv::test_contract();
+        let core_with = |automatic| {
+            let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+            let mut config = EngineCoreConfig {
+                max_retained_sequences: 8,
+                max_staged_transactions: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            };
+            config.automatic_row_limits.staged_transactions = automatic;
+            EngineCore::new_with_unified_executor(config, executor).unwrap()
+        };
+
+        let load = |core: &mut EngineCore, model, retained, staged| {
+            core.load_managed_model_state_with_row_limits(
+                ModelInstanceId::new(model),
+                &contract,
+                None,
+                retained,
+                staged,
+            )
+        };
+
+        assert!(load(&mut core_with(false), 46, 8, 6).is_err());
+        let mut automatic = core_with(true);
+        load(&mut automatic, 47, 8, 6)
+            .expect("an automatic staged limit must not cap a model-fitted width");
+        assert!(load(&mut automatic, 48, 9, 6).is_err());
     }
 
     #[tokio::test]

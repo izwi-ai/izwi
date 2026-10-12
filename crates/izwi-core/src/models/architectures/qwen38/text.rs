@@ -6,18 +6,27 @@ const GRAPH_LAYER_LIMIT: usize = 8;
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_nn::{ops, rotary_emb, Embedding, Linear};
-use safetensors::Dtype as SafeDType;
 use std::sync::Arc;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen38TextConfig;
+use super::fast_path::{
+    compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_AB_GEMV_ENV,
+    FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
+    GDN_PREFILL_ENV,
+};
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
 };
+use super::residency::{fp8_row_dot, probe_activations, Qwen38ResidencyPolicy, Qwen38WeightForm};
 use super::telemetry::{
-    record_cuda_attention_dtype_casts, record_cuda_head_expansion_materialization,
-    record_cuda_kernel, record_cuda_projection, record_cuda_rope,
-    record_cuda_state_initial_allocation, CudaKernelPath, CudaProjectionPath,
+    record_cpu_q8_projection, record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition,
+    record_cuda_fp8_gemv, record_cuda_fp8_packed_projection, record_cuda_fp8_prefill_gemm,
+    record_cuda_head_expansion_materialization, record_cuda_kernel, record_cuda_lm_head,
+    record_cuda_projection, record_cuda_qk_rope_chain, record_cuda_rms_norm_composition,
+    record_cuda_rope, record_cuda_state_initial_allocation, record_fast_path_self_check_failure,
+    record_fused_attn_gate, record_fused_qk_norm_rope, record_fused_rms_norm,
+    record_metal_fp8_projection, CudaKernelPath, CudaProjectionPath,
 };
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
@@ -27,6 +36,11 @@ use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
 use crate::error::{Error, Result};
+use crate::kernels::cuda::gate;
+use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
+use crate::kernels::cuda::norm;
+use crate::kernels::cuda::rope::{self, MropePosition, QkNormRopeSpec};
+use crate::kernels::cuda::{qwen38_deltanet_sequence, qwen38_deltanet_sequence_supported};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
@@ -34,7 +48,7 @@ use crate::kernels::{
     try_qwen38_silu_mul_decode, try_tiled_deltanet_recurrence,
 };
 use crate::kv::v2::{StateComponentId, StateDomainId};
-use crate::kv::KvDecodeBatchMetadata;
+use crate::kv::{KvDecodeBatchMetadata, KvSlotRef};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
@@ -43,14 +57,39 @@ use crate::models::shared::telemetry::{
     record_prefill_sequence_span, record_rope_kernel, record_rope_manual,
 };
 
+#[path = "decode_graph.rs"]
+mod decode_graph;
+mod kernel_timings;
+
 pub struct Qwen38TextModel {
     device: Device,
     projection_representation: Qwen38ProjectionRepresentation,
+    /// The residency policy the trunk was loaded under.
+    residency: Qwen38ResidencyPolicy,
+    /// One entry per block-FP8 projection group: packed, or why not.
+    fp8_packing: Vec<Qwen38FastPath>,
+    /// Metal: one entry per checked FP8 projection kind (GEMV or rerouted).
+    fp8_gemv_checks: Vec<Qwen38FastPath>,
+    /// CUDA: one entry per checked FP8 projection kind (prefill GEMM or why
+    /// the kind keeps the compact kernel).
+    fp8_prefill_gemm_checks: Vec<Qwen38FastPath>,
+    /// The LM head as block FP8 (or why not), with the host gate's
+    /// relative L2 error against the BF16 head.
+    fp8_lm_head: (Qwen38FastPath, Option<f64>),
     token_embeddings: Embedding,
     layers: Vec<Qwen38Layer>,
     output_norm: Qwen38RmsNorm,
     output: Qwen38Projection,
     finite_diagnostics_enabled: bool,
+    /// Fused residual add + RMSNorm over every trunk norm.
+    fused_norm_path: Qwen38FastPath,
+    /// Piecewise CUDA graph decode of single rows (`decode_graph.rs`), when
+    /// it resolved at load, and why not otherwise.
+    decode_graphs: Option<decode_graph::Qwen38DecodeGraphs>,
+    decode_graphs_path: Qwen38FastPath,
+    /// The checkpoint's context length: the longest block table the
+    /// whole-step graph's step buffer must hold.
+    max_context_tokens: usize,
 }
 
 /// One target-model prefill pass retained for MTP prompt alignment.
@@ -63,8 +102,34 @@ pub(super) struct Qwen38TextPrefillOutput {
     pub logits: Option<Tensor>,
 }
 
+/// One decode step queued through the replaying whole-step graph: its logits
+/// are on the device and its KV write is not committed yet
+/// ([`Qwen38TextModel::commit_enqueued_step`]).
+pub(super) struct EnqueuedGraphStep {
+    /// `[1, 1, vocab]` on the device (the step's own copy).
+    pub(super) logits: Tensor,
+    position: usize,
+    /// Taken by the commit. A step dropped uncommitted (a discarded
+    /// pipelined step, an error) waits for its KV writes, so their pages
+    /// cannot be reused under them.
+    completions: Option<KvWriteCompletionCollector>,
+}
+
+impl Drop for EnqueuedGraphStep {
+    fn drop(&mut self) {
+        if let Some(completions) = self.completions.take() {
+            if let Err(error) = completions.drain() {
+                tracing::warn!(%error, "draining an uncommitted Qwen3.8 graph step failed");
+            }
+        }
+    }
+}
+
 pub(super) struct Qwen38TextDecodeBatchOutput {
-    pub hidden_states: Tensor,
+    /// The pre-norm hidden rows, or `None` when the whole-step CUDA graph
+    /// ran the LM head inside the graph (only single rows without an MTP
+    /// head take that path).
+    pub hidden_states: Option<Tensor>,
     pub logits: Tensor,
 }
 
@@ -188,6 +253,8 @@ pub enum Qwen38ProjectionRepresentation {
     PackedQ8WithDenseBf16,
     NativeFp8WithQ8FallbackF16,
     NativeFp8WithQ8FallbackBf16,
+    NativeFp8WithDenseF16,
+    PackedQ8WithDenseF32,
 }
 
 impl Qwen38ProjectionRepresentation {
@@ -195,6 +262,8 @@ impl Qwen38ProjectionRepresentation {
         match self {
             Self::NativeFp8WithQ8FallbackF16 => "native_block_fp8_with_q8_fallback_dense_f16",
             Self::NativeFp8WithQ8FallbackBf16 => "native_block_fp8_with_q8_fallback_dense_bf16",
+            Self::NativeFp8WithDenseF16 => "native_block_fp8_with_dense_f16",
+            Self::PackedQ8WithDenseF32 => "q8_0_projections_with_dense_f32",
             Self::ExpandedF32 => "expanded_f32",
             Self::ExpandedF16 => "expanded_f16",
             Self::ExpandedBf16 => "expanded_bf16",
@@ -205,10 +274,11 @@ impl Qwen38ProjectionRepresentation {
 
     pub const fn compute_dtype(self) -> &'static str {
         match self {
-            Self::ExpandedF32 => "f32",
-            Self::ExpandedF16 | Self::PackedQ8WithDenseF16 | Self::NativeFp8WithQ8FallbackF16 => {
-                "f16"
-            }
+            Self::ExpandedF32 | Self::PackedQ8WithDenseF32 => "f32",
+            Self::ExpandedF16
+            | Self::PackedQ8WithDenseF16
+            | Self::NativeFp8WithQ8FallbackF16
+            | Self::NativeFp8WithDenseF16 => "f16",
             Self::ExpandedBf16
             | Self::PackedQ8WithDenseBf16
             | Self::NativeFp8WithQ8FallbackBf16 => "bf16",
@@ -251,6 +321,46 @@ impl Qwen38TextRuntimeState {
             }
         }
         Some(())
+    }
+
+    /// Whether every DeltaNet layer holds its recurrent state. A fresh state
+    /// holds none until its first prefill zero-initializes it; a span that
+    /// resumes above token zero must find the state its earlier spans (or an
+    /// attached snapshot) left.
+    pub(crate) fn linear_state_initialized(&self) -> bool {
+        self.layers.iter().all(|layer| match layer {
+            Qwen38LayerRuntimeState::Linear {
+                recurrent_state, ..
+            } => recurrent_state.is_some(),
+            Qwen38LayerRuntimeState::Full => true,
+        })
+    }
+
+    /// Host copy of the hybrid state in the order the tensor domains commit
+    /// it: every DeltaNet layer's recurrent state, then every layer's
+    /// convolution history.
+    #[cfg(test)]
+    pub(crate) fn linear_state_values(&self) -> Result<Vec<f32>> {
+        let mut recurrent = Vec::new();
+        let mut convolution = Vec::new();
+        for layer in &self.layers {
+            if let Qwen38LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            {
+                let state = recurrent_state.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 recurrent state was not initialized".into())
+                })?;
+                let ring = conv_state.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 convolution state was not initialized".into())
+                })?;
+                recurrent.extend(host_values(state)?);
+                convolution.extend(host_values(&ring.staged_tensor()?)?);
+            }
+        }
+        recurrent.extend(convolution);
+        Ok(recurrent)
     }
 
     pub(crate) fn restore_tensor_domains(
@@ -516,6 +626,15 @@ impl ConvRingState {
         self.contiguous_history()
     }
 
+    fn is_f32(&self) -> bool {
+        match &self.storage {
+            ConvHistoryStorage::Ring { slots, .. } => {
+                slots.iter().all(|slot| slot.dtype() == DType::F32)
+            }
+            ConvHistoryStorage::Contiguous(history) => history.dtype() == DType::F32,
+        }
+    }
+
     /// Move every logical history slot into independent fixed-history storage.
     ///
     /// Sequence-prefill slots are views into the entire projected token span.
@@ -551,6 +670,17 @@ impl ConvRingState {
                 "Invalid Qwen3.8 convolution ring: slots={}, next_idx={}",
                 slots.len(),
                 *next_idx
+            )));
+        }
+        // The ring holds the conv state arena's F32 dtype for the whole
+        // session; an incoming projection in another dtype would poison the
+        // ring with mixed-dtype slots that later `cat`/multiply fail on.
+        let slot_dtype = slots[*next_idx].dtype();
+        if current.dtype() != slot_dtype {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 convolution ring dtype drift: ring {:?}, incoming {:?}",
+                slot_dtype,
+                current.dtype()
             )));
         }
         slots[*next_idx] = current.clone();
@@ -593,10 +723,51 @@ pub(super) struct Qwen38Mlp {
 }
 
 pub(super) enum Qwen38Projection {
-    NativeFp8(super::native::RawBlockFp8Projection),
+    /// The checkpoint's block-FP8 bytes and F32 block scales, executed by the
+    /// compact FP8 kernels with the decode kernel chosen at load. With
+    /// `prefill_gemm`, spans of [`FP8_PREFILL_GEMM_MIN_ROWS`] rows or more
+    /// expand bounded weight tiles to the activation dtype for a dense GEMM
+    /// (`fp8::block_fp8_projection_dequant_gemm`) instead; it is set only
+    /// after the projection kind passed its load-time check.
+    NativeFp8 {
+        raw: super::native::RawBlockFp8Projection,
+        kernel: Qwen38Fp8Kernel,
+        prefill_gemm: bool,
+    },
     Quantized(QMatMul),
     Dense(Linear),
 }
+
+/// Decode kernel of a native block-FP8 projection, fixed at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Qwen38Fp8Kernel {
+    /// The reference GEMV (and the prefill GEMM above four rows).
+    Reference,
+    /// The vectorized GEMV on eligible decode calls (CUDA, verified at load).
+    Vectorized,
+    /// Metal: always expand to F16 and multiply (the GEMV failed its check
+    /// for this projection kind, or `IZWI_QWEN38_FP8_GEMV=legacy`).
+    DequantOnly,
+}
+
+/// Metal runs the FP8 GEMV up to this many activation rows; a longer span
+/// expands the weights to a transient F16 matrix for one matrix multiply.
+const METAL_FP8_GEMV_MAX_ROWS: usize = 8;
+/// The CPU runs Candle's Q8_0 matmul up to this many activation rows; a
+/// longer span expands weight row tiles to F32 for one F32 matmul per tile.
+const CPU_Q8_MATMUL_MAX_ROWS: usize = 8;
+/// Weight rows the CPU Q8_0 prefill expands at a time (42 MB at K = 5120).
+const CPU_Q8_PREFILL_TILE_ROWS: usize = 2048;
+/// Activation rows from which a CUDA block-FP8 projection with the prefill
+/// GEMM resolved runs it instead of the compact `mm` kernel. `mm` computes
+/// 16-row output tiles and decodes every weight byte in software once per
+/// tile, so at 16 rows and up its cost grows with the span while the
+/// dequantized path's weight traffic (1 byte read, 2 written and read again
+/// per weight, all tiles) stays fixed and cuBLAS runs at tensor-core rate.
+/// Below one `mm` tile, `mm` reads each weight byte once and keeps the
+/// smaller traffic. The load-time timings report both paths at 16 rows so the
+/// crossover can be checked on the device.
+pub(super) const FP8_PREFILL_GEMM_MIN_ROWS: usize = 16;
 
 enum Qwen38ProjectionGroup {
     Separate(Vec<Qwen38Projection>),
@@ -606,14 +777,121 @@ enum Qwen38ProjectionGroup {
     },
 }
 
+/// Zero-centered RMSNorm (HF `Qwen3_5RMSNorm`): the checkpoint stores `w` and
+/// the model applies `x̂ · (1 + w)`. The loader keeps the shifted gain F32
+/// under every plan, so a half-precision activation is normalized in F32 and
+/// cast back, which is HF's `(norm(x.float()) * (1 + w.float())).type_as(x)`.
 pub(super) struct Qwen38RmsNorm {
     weight: Tensor,
     eps: f64,
+    /// One-launch kernel (`kernels/cuda/norm.rs`) for 16-bit activations with
+    /// this F32 gain, enabled by [`Qwen38TextModel::resolve_fast_paths`].
+    fused: bool,
+}
+
+impl Qwen38RmsNorm {
+    fn new(weight: Tensor, eps: f64) -> Self {
+        Self {
+            weight,
+            eps,
+            fused: false,
+        }
+    }
+
+    pub(super) fn set_fused(&mut self, fused: bool) {
+        self.fused = fused;
+    }
+
+    fn fused_applies(&self, input: &Tensor) -> bool {
+        self.fused
+            && self.weight.dtype() == DType::F32
+            && matches!(input.dtype(), DType::F16 | DType::BF16)
+    }
+
+    /// Normalize `input`, also returning the F32 temporaries a half-precision
+    /// input needs, which a captured graph region must retain.
+    fn forward_retaining(&self, input: &Tensor) -> candle_core::Result<(Tensor, Vec<Tensor>)> {
+        if input.dtype() == self.weight.dtype() {
+            let output = candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)?;
+            return Ok((output, Vec::new()));
+        }
+        let wide = input.to_dtype(self.weight.dtype())?;
+        let normalized = candle_nn::ops::rms_norm(&wide, &self.weight, self.eps as f32)?;
+        Ok((normalized.to_dtype(input.dtype())?, vec![wide, normalized]))
+    }
+
+    /// `(residual + delta, norm(residual + delta))`: one launch when fused,
+    /// otherwise the add and the composition. The sum is rounded to the
+    /// activation dtype before the norm either way.
+    pub(super) fn add_forward(
+        &self,
+        residual: &Tensor,
+        delta: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        if self.fused_applies(residual)
+            && delta.dtype() == residual.dtype()
+            && delta.dims() == residual.dims()
+        {
+            record_fused_rms_norm(true);
+            return Ok(norm::add_rms_norm(
+                residual,
+                delta,
+                &self.weight,
+                self.eps as f32,
+            )?);
+        }
+        let sum = (residual + delta)?;
+        let normalized = self.forward(&sum)?;
+        Ok((sum, normalized))
+    }
 }
 
 impl Module for Qwen38RmsNorm {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
-        candle_nn::ops::rms_norm(input, &self.weight, self.eps as f32)
+        if self.fused_applies(input) {
+            record_fused_rms_norm(false);
+            return norm::rms_norm(input, &self.weight, self.eps as f32);
+        }
+        if input.device().is_cuda() {
+            record_cuda_rms_norm_composition();
+        }
+        self.forward_retaining(input).map(|(output, _)| output)
+    }
+}
+
+/// The residual stream at a layer boundary, with the previous layer's MLP
+/// output optionally not yet added: the next norm folds that add into its
+/// launch ([`Qwen38RmsNorm::add_forward`]).
+struct Qwen38Hidden {
+    residual: Tensor,
+    pending: Option<Tensor>,
+}
+
+impl Qwen38Hidden {
+    fn new(residual: Tensor) -> Self {
+        Self {
+            residual,
+            pending: None,
+        }
+    }
+
+    /// The pre-norm hidden state with any pending add applied.
+    fn materialize(self) -> Result<Tensor> {
+        match self.pending {
+            Some(delta) => (&self.residual + &delta).map_err(Error::from),
+            None => Ok(self.residual),
+        }
+    }
+
+    /// `(residual stream, norm(residual stream))` for the next layer.
+    fn normalized(self, norm: &Qwen38RmsNorm) -> Result<(Tensor, Tensor)> {
+        match self.pending {
+            Some(delta) => norm.add_forward(&self.residual, &delta),
+            None => {
+                let normalized = norm.forward(&self.residual)?;
+                Ok((self.residual, normalized))
+            }
+        }
     }
 }
 
@@ -621,17 +899,126 @@ impl Module for Qwen38Projection {
     fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
         if input.device().is_cuda() {
             record_cuda_projection(match self {
-                Self::NativeFp8(_) => CudaProjectionPath::NativeFp8,
+                Self::NativeFp8 { .. } => CudaProjectionPath::NativeFp8,
                 Self::Quantized(_) => CudaProjectionPath::Q8,
                 Self::Dense(_) => CudaProjectionPath::Dense,
             });
         }
         match self {
-            Self::NativeFp8(raw) => {
-                crate::kernels::cuda::fp8::block_fp8_projection(input, &raw.weights, &raw.scales)
+            Self::NativeFp8 {
+                raw,
+                kernel,
+                prefill_gemm,
+            } => {
+                let vectorized = *kernel == Qwen38Fp8Kernel::Vectorized;
+                if *prefill_gemm
+                    && input.elem_count() / raw.shape[1].max(1) >= FP8_PREFILL_GEMM_MIN_ROWS
+                {
+                    if input.device().is_cuda() {
+                        record_cuda_fp8_prefill_gemm();
+                    }
+                    let output = crate::kernels::cuda::fp8::block_fp8_projection_dequant_gemm(
+                        input,
+                        &raw.weights,
+                        &raw.scales,
+                    )?;
+                    #[cfg(test)]
+                    let output = prefill_gemm_fault::apply(output)?;
+                    return Ok(output);
+                }
+                if input.device().is_metal() {
+                    let rows = input.elem_count() / raw.shape[1].max(1);
+                    if *kernel == Qwen38Fp8Kernel::DequantOnly || rows > METAL_FP8_GEMV_MAX_ROWS {
+                        record_metal_fp8_projection(false);
+                        let dense =
+                            crate::kernels::metal_fp8::dequantize_f16(&raw.weights, &raw.scales)?
+                                .to_dtype(input.dtype())?;
+                        return Linear::new(dense, None).forward(input);
+                    }
+                    record_metal_fp8_projection(true);
+                }
+                if input.device().is_cuda() {
+                    let rows = input.elem_count() / raw.shape[1].max(1);
+                    if rows <= 4 {
+                        record_cuda_fp8_gemv(vectorized);
+                    }
+                }
+                crate::kernels::cuda::fp8::block_fp8_projection_selecting(
+                    input,
+                    &raw.weights,
+                    &raw.scales,
+                    vectorized,
+                )
             }
-            Self::Quantized(projection) => projection.forward(input),
+            Self::Quantized(projection) => {
+                if let (true, QMatMul::QTensor(weights)) = (input.device().is_cpu(), projection) {
+                    let k = weights.shape().dims2()?.1;
+                    let rows = input.elem_count() / k.max(1);
+                    if input.dtype() == DType::F32
+                        && weights.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                    {
+                        let tiled = rows > CPU_Q8_MATMUL_MAX_ROWS;
+                        record_cpu_q8_projection(tiled);
+                        if tiled {
+                            return crate::kernels::cpu_q8::dequant_tile_matmul(
+                                input,
+                                weights,
+                                CPU_Q8_PREFILL_TILE_ROWS,
+                            );
+                        }
+                    }
+                }
+                projection.forward(input)
+            }
             Self::Dense(projection) => projection.forward(input),
+        }
+    }
+}
+
+impl Qwen38Projection {
+    /// A native block-FP8 projection with the prefill GEMM switched to
+    /// `enabled` (same resident tensors); `None` for other forms.
+    pub(super) fn with_prefill_gemm(&self, enabled: bool) -> Option<Self> {
+        match self {
+            Self::NativeFp8 { raw, kernel, .. } => Some(Self::NativeFp8 {
+                raw: raw.clone(),
+                kernel: *kernel,
+                prefill_gemm: enabled,
+            }),
+            Self::Quantized(_) | Self::Dense(_) => None,
+        }
+    }
+}
+
+/// Tests: a fault injected into the dequantized prefill GEMM's output only
+/// (x1.5), so the load-time check and its fallback can be RED-checked.
+#[cfg(test)]
+pub(super) mod prefill_gemm_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(in crate::models::architectures::qwen38) struct Injected;
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            FAULT.with(|fault| fault.set(false));
+        }
+    }
+
+    /// Corrupt every prefill GEMM on this thread until the guard drops.
+    pub(in crate::models::architectures::qwen38) fn inject() -> Injected {
+        FAULT.with(|fault| fault.set(true));
+        Injected
+    }
+
+    pub(super) fn apply(output: candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+        if FAULT.with(Cell::get) {
+            output * 1.5
+        } else {
+            Ok(output)
         }
     }
 }
@@ -644,6 +1031,11 @@ impl Qwen38ProjectionGroup {
                 .map(|projection| projection.forward(input).map_err(Error::from))
                 .collect(),
             Self::Packed { projection, widths } => {
+                if input.device().is_cuda()
+                    && matches!(projection, Qwen38Projection::NativeFp8 { .. })
+                {
+                    record_cuda_fp8_packed_projection();
+                }
                 let output = projection.forward(input)?;
                 split_projection_output(&output, widths)
             }
@@ -664,6 +1056,17 @@ pub(super) struct Qwen38FullAttention {
     mrope_sections: Vec<usize>,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
+    /// Fused q/k norm + partial M-RoPE for a decode token, with its F32
+    /// inverse frequencies on the device. Resolved at load.
+    fused_qk: Option<(QkNormRopeSpec, Tensor)>,
+    fused_qk_path: Qwen38FastPath,
+    /// The fused q/k launch also writes the rotated key and the value into
+    /// the paged cache (`write_fused_and_attend`).
+    fused_kv_write: bool,
+    fused_kv_write_path: Qwen38FastPath,
+    /// The gated attention output in one launch.
+    fused_gate: bool,
+    fused_gate_path: Qwen38FastPath,
 }
 
 /// Forward-scoped rotary tensors shared by every Qwen3.8 full-attention layer.
@@ -677,6 +1080,71 @@ pub(super) struct Qwen38MropePlan {
     sin: Option<Tensor>,
     sequence_len: usize,
     rope_dim: usize,
+}
+
+/// Forward-scoped rotary inputs shared by every full-attention layer: the
+/// token positions; the cos/sin plan, built on first use by a layer that runs
+/// the composition (the fused kernel takes the positions as scalars); and,
+/// for a text decode token whose layers write K/V from the fused kernel, the
+/// device step `[0, position, flat slot]` (U32) that kernel reads.
+pub(super) struct Qwen38RopeInputs<'a> {
+    positions: &'a [[usize; 3]],
+    device: Device,
+    dtype: DType,
+    plan: std::cell::OnceCell<Qwen38MropePlan>,
+    step: Option<Tensor>,
+}
+
+impl<'a> Qwen38RopeInputs<'a> {
+    pub(super) fn new(positions: &'a [[usize; 3]], device: &Device, dtype: DType) -> Self {
+        Self {
+            positions,
+            device: device.clone(),
+            dtype,
+            plan: std::cell::OnceCell::new(),
+            step: None,
+        }
+    }
+
+    /// Upload the step buffer when the forward is one text token at the
+    /// cache's next slot and some layer writes K/V from the fused kernel: one
+    /// 12-byte copy per forward, shared by every such layer. The flat slot is
+    /// `page * page_tokens + offset`, the arena's own slot lowering.
+    pub(super) fn with_decode_step<'b>(
+        mut self,
+        cache: &PhysicalPagedKvCache,
+        mut layers: impl Iterator<Item = &'b Qwen38FullAttention>,
+    ) -> Result<Self> {
+        let [[temporal, height, width]] = self.positions else {
+            return Ok(self);
+        };
+        if temporal != height || temporal != width || !layers.any(|layer| layer.fused_kv_write) {
+            return Ok(self);
+        }
+        let slot = cache.slots_for_append(cache.context_len(), 1)?[0];
+        let flat = slot
+            .block
+            .index
+            .checked_mul(cache.arena().config().page_tokens)
+            .and_then(|base| base.checked_add(slot.offset));
+        if let (Some(flat), Ok(position)) = (flat, u32::try_from(*temporal)) {
+            self.step = Some(Tensor::from_vec(
+                vec![0u32, position, flat],
+                3,
+                &self.device,
+            )?);
+        }
+        Ok(self)
+    }
+
+    /// The cos/sin plan, built by the first layer that needs it.
+    fn plan(&self, attention: &Qwen38FullAttention) -> Result<&Qwen38MropePlan> {
+        if let Some(plan) = self.plan.get() {
+            return Ok(plan);
+        }
+        let plan = attention.prepare_mrope_plan(self.positions, &self.device, self.dtype)?;
+        Ok(self.plan.get_or_init(|| plan))
+    }
 }
 
 struct Qwen38LinearAttention {
@@ -697,6 +1165,30 @@ struct Qwen38LinearAttention {
     kernel_size: usize,
     tiled_recurrence_enabled: bool,
     tiled_recurrence_tile_size_override: Option<usize>,
+    /// Fused single-token decode: q38's own conv kernel, then the generic
+    /// `kernels/cuda/gdn.rs` recurrence. Resolved at load.
+    fused_gdn: Option<GdnDecodeSpec>,
+    fused_gdn_path: Qwen38FastPath,
+    /// The dense `in_proj_a`/`in_proj_b` weights as F32 rows `[2 * value
+    /// heads, hidden]` (alpha rows, then beta rows) for the router GEMV
+    /// (`moe::router_logits`): one izwi launch per decode token instead of a
+    /// tiny cuBLAS GEMM, which also keeps cuBLAS out of captured decode
+    /// graphs. Resolved at load.
+    alpha_beta_rows: Option<Tensor>,
+    alpha_beta_gemv_path: Qwen38FastPath,
+    /// Grouped prefill (`kernels::cuda::qwen38_deltanet_sequence`): one
+    /// launch per chunk straight from the conv output, no expanded q/k.
+    /// Resolved at load; verification spans keep today's path.
+    gdn_prefill: bool,
+    gdn_prefill_path: Qwen38FastPath,
+}
+
+/// One synthetic row of DeltaNet decode projections for the fused self-check.
+struct GdnSelfCheckRow {
+    mixed_qkv: Tensor,
+    z: Tensor,
+    beta: Tensor,
+    alpha: Tensor,
 }
 
 struct Qwen38GatedRmsNorm {
@@ -716,6 +1208,8 @@ impl Qwen38TextModel {
         Self::load_native_with_performance(tensors, native, device, target, &performance.cuda)
     }
 
+    /// Load under the residency policy `performance` resolves for `device`
+    /// (the CUDA performance section; the other sections at their defaults).
     pub fn load_native_with_performance(
         tensors: &IndexedSafetensors,
         native: &Qwen38NativeConfig,
@@ -723,23 +1217,31 @@ impl Qwen38TextModel {
         target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let mut config = crate::performance::PerformanceConfig::default();
+        config.cuda = performance.clone();
+        let policy = Qwen38ResidencyPolicy::resolve(device, target, &config, tensors, native);
+        Self::load_native_with_policy(tensors, native, device, target, performance, &policy)
+    }
+
+    /// Load under an already resolved residency `policy`: the one load
+    /// admission priced.
+    pub(crate) fn load_native_with_policy(
+        tensors: &IndexedSafetensors,
+        native: &Qwen38NativeConfig,
+        device: &Device,
+        target: ProjectionMaterialization,
+        performance: &CudaPerformanceConfig,
+        policy: &Qwen38ResidencyPolicy,
+    ) -> Result<Self> {
         let cfg = &native.text;
-        let projection_representation = if native_fp8_selected(
+        let loader = Qwen38WeightLoader::new(
+            tensors,
+            policy,
             device,
+            native.block_fp8.block_shape,
             target,
-            [cfg.embedding_length, cfg.feed_forward_length],
-            performance,
-        ) {
-            match target {
-                ProjectionMaterialization::F16 => {
-                    Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
-                }
-                _ => Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16,
-            }
-        } else {
-            native_projection_representation(device, target)
-        };
-        let block = native.block_fp8.block_shape;
+        );
+        let projection_representation = policy.representation();
         let embedding_weights = tensors.materialize_dense_tensor(
             "model.language_model.embed_tokens.weight",
             &[native.vocab_size, cfg.embedding_length],
@@ -752,18 +1254,10 @@ impl Qwen38TextModel {
             "model.language_model.norm.weight",
             cfg.embedding_length,
             cfg.attention_layer_norm_rms_epsilon,
-            target,
             device,
         )?;
-        let output = load_native_projection(
-            tensors,
-            "lm_head.weight",
-            [native.vocab_size, cfg.embedding_length],
-            block,
-            target,
-            device,
-            performance,
-        )?;
+        let (output, fp8_lm_head) =
+            load_lm_head(&loader, [native.vocab_size, cfg.embedding_length])?;
 
         let graphs = Arc::new(TensorIsland::default());
         let mut layers = Vec::with_capacity(cfg.block_count);
@@ -774,7 +1268,6 @@ impl Qwen38TextModel {
                 &format!("{prefix}.input_layernorm.weight"),
                 cfg.embedding_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?;
             let post_attention_norm = load_native_zero_centered_norm(
@@ -782,34 +1275,16 @@ impl Qwen38TextModel {
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 cfg.embedding_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?;
-            let mut mlp =
-                Qwen38Mlp::load_native(tensors, device, &prefix, cfg, block, target, performance)?;
+            let mut mlp = Qwen38Mlp::load_native(&loader, &prefix, cfg, performance)?;
             let mixer = match layer_type {
                 Qwen38LayerType::FullAttention => {
-                    Qwen38Mixer::Full(Qwen38FullAttention::load_native(
-                        tensors,
-                        device,
-                        &prefix,
-                        cfg,
-                        block,
-                        target,
-                        performance,
-                    )?)
+                    Qwen38Mixer::Full(Qwen38FullAttention::load_native(&loader, &prefix, cfg)?)
                 }
-                Qwen38LayerType::LinearAttention => {
-                    Qwen38Mixer::Linear(Qwen38LinearAttention::load_native(
-                        tensors,
-                        device,
-                        &prefix,
-                        cfg,
-                        block,
-                        target,
-                        performance,
-                    )?)
-                }
+                Qwen38LayerType::LinearAttention => Qwen38Mixer::Linear(
+                    Qwen38LinearAttention::load_native(&loader, &prefix, cfg, performance)?,
+                ),
             };
             mlp.graphs = graphs.clone();
             mlp.graph_generation = layer_idx as u64;
@@ -827,15 +1302,34 @@ impl Qwen38TextModel {
                 mlp,
             });
         }
-        Ok(Self {
+        let outcomes = loader.into_outcomes();
+        let mut model = Self {
             device: device.clone(),
             projection_representation,
+            residency: policy.clone(),
+            fp8_packing: outcomes.packing,
+            fp8_gemv_checks: outcomes.gemv,
+            fp8_prefill_gemm_checks: outcomes.prefill_gemm,
+            fp8_lm_head,
             token_embeddings,
             layers,
             output_norm,
             output,
             finite_diagnostics_enabled: qwen38_env_bool("IZWI_QWEN38_FINITE_DIAGNOSTICS", false),
-        })
+            fused_norm_path: Qwen38FastPath::default(),
+            decode_graphs: None,
+            decode_graphs_path: Qwen38FastPath::default(),
+            max_context_tokens: cfg.context_length,
+        };
+        let switches = Qwen38CudaSwitches::for_device(device, performance);
+        model.resolve_fast_paths(&switches, false);
+        model.resolve_decode_graphs(&switches, false, true);
+        Ok(model)
+    }
+
+    /// The residency policy this trunk was loaded under.
+    pub(crate) fn residency(&self) -> &Qwen38ResidencyPolicy {
+        &self.residency
     }
 
     pub(super) fn graph_diagnostics(&self) -> serde_json::Value {
@@ -949,46 +1443,40 @@ impl Qwen38TextModel {
                 .map(|(row, cache)| cache.sequence_table(start_positions[row] + 1))
                 .collect::<Result<Vec<_>>>()?,
         };
+        if let (1, Some(graphs)) = (batch_size, &self.decode_graphs) {
+            if let Some(output) = self.graph_decode_row(
+                graphs,
+                token_ids[0],
+                position_ids[0],
+                combined_slots[0],
+                states[0],
+                caches[0],
+                lowered.as_ref(),
+                &metadata,
+                sparse_layers.len(),
+            )? {
+                return Ok(output);
+            }
+        }
+        let first = &*caches[0];
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<(Tensor, Tensor)> {
-            let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = self.token_embeddings.forward(&input)?;
-            let mut physical_layer = 0usize;
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                let mut layer_states = states
-                    .iter_mut()
-                    .map(|state| &mut state.layers[layer_index])
-                    .collect::<Vec<_>>();
-                for layer_state in layer_states.iter_mut() {
-                    layer.ensure_state_initialized(layer_state, &self.device)?;
-                }
-                let cache_refs = caches
-                    .iter()
-                    .map(|cache| &**cache)
-                    .collect::<Vec<&PhysicalPagedKvCache>>();
-                hidden = layer.forward_physical_decode_batch(
-                    &hidden,
-                    &mut layer_states,
-                    position_ids,
-                    &cache_refs,
-                    lowered.as_ref(),
-                    &metadata,
-                    &mut completions,
-                    &mut physical_layer,
-                )?;
-                validate_qwen38_finite_tensor(
-                    &hidden,
-                    layer_index,
-                    layer.decode_diagnostic_path(),
-                    self.finite_diagnostics_enabled,
-                )?;
-            }
-            if physical_layer != sparse_layers.len() {
-                return Err(Error::InferenceError(
-                    "Qwen3.8 batched attention did not cover every sparse layer".into(),
-                ));
-            }
+            let embedded = self.embed_decode_token_ids(token_ids)?;
+            let cache_refs = caches
+                .iter()
+                .map(|cache| &**cache)
+                .collect::<Vec<&PhysicalPagedKvCache>>();
+            let hidden = self.standard_decode_hidden(
+                embedded,
+                position_ids,
+                states,
+                &cache_refs,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                sparse_layers.len(),
+            )?;
             let logits = self.project_target_hidden_span(&hidden)?;
             Ok((hidden, logits))
         })();
@@ -1008,9 +1496,140 @@ impl Qwen38TextModel {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
         Ok(Qwen38TextDecodeBatchOutput {
-            hidden_states: hidden,
+            hidden_states: Some(hidden),
             logits,
         })
+    }
+
+    /// The standard (uncaptured) decode of a batch of rows: every layer in
+    /// turn, attention through the arena. Returns the pre-norm hidden.
+    #[allow(clippy::too_many_arguments)]
+    fn standard_decode_hidden(
+        &self,
+        embedded: Tensor,
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen38TextRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        attention_layers: usize,
+    ) -> Result<Tensor> {
+        let mut hidden = Qwen38Hidden::new(embedded);
+        let mut physical_layer = 0usize;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let mut layer_states = states
+                .iter_mut()
+                .map(|state| &mut state.layers[layer_index])
+                .collect::<Vec<_>>();
+            for layer_state in layer_states.iter_mut() {
+                layer.ensure_state_initialized(layer_state, &self.device)?;
+            }
+            hidden = layer.forward_physical_decode_batch(
+                hidden,
+                &mut layer_states,
+                position_ids,
+                caches,
+                slots,
+                metadata,
+                completions,
+                &mut physical_layer,
+            )?;
+            hidden =
+                self.validate_layer_output(hidden, layer_index, layer.decode_diagnostic_path())?;
+        }
+        if physical_layer != attention_layers {
+            return Err(Error::InferenceError(
+                "Qwen3.8 batched attention did not cover every sparse layer".into(),
+            ));
+        }
+        hidden.materialize()
+    }
+
+    /// One row through graph decode, its KV writes collected apart and
+    /// committed only when the graphs took the step. `Ok(None)`: the graphs
+    /// did not take it (nothing was published, and any KV write they queued
+    /// was waited for), so the caller runs the standard decode, which
+    /// rewrites the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn graph_decode_row(
+        &self,
+        graphs: &decode_graph::Qwen38DecodeGraphs,
+        token: u32,
+        position: [usize; 3],
+        slot: KvSlotRef,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        attention_layers: usize,
+    ) -> Result<Option<Qwen38TextDecodeBatchOutput>> {
+        let start = cache.context_len();
+        let embedded = self.embed_decode_token_ids(&[token])?;
+        let view: &PhysicalPagedKvCache = cache;
+        let mut completions =
+            KvWriteCompletionCollector::new(view.arena().config(), slots.logical_slots())?;
+        // The warm check: the standard decode on a copy of the row state, its
+        // writes collected and sealed apart.
+        let reference_state = state.clone();
+        let mut reference = || -> Result<Tensor> {
+            let mut reference_state = reference_state.clone();
+            let mut collector =
+                KvWriteCompletionCollector::new(view.arena().config(), slots.logical_slots())?;
+            let hidden = self.standard_decode_hidden(
+                embedded.clone(),
+                &[position],
+                &mut [&mut reference_state],
+                &[view],
+                slots,
+                metadata,
+                &mut collector,
+                attention_layers,
+            );
+            let sealed = collector.seal();
+            let logits = self.project_target_hidden_span(&hidden?)?;
+            sealed?;
+            Ok(logits)
+        };
+        let output = graphs.forward(
+            self,
+            token,
+            &embedded,
+            position,
+            slot,
+            state,
+            view,
+            slots,
+            metadata,
+            &mut completions,
+            &mut reference,
+        );
+        let (hidden_states, logits) = match output {
+            Some(decode_graph::GraphDecodeOutput::Logits(logits)) => (None, logits),
+            Some(decode_graph::GraphDecodeOutput::Hidden(hidden)) => {
+                match self.project_target_hidden_span(&hidden) {
+                    Ok(logits) => (Some(hidden), logits),
+                    Err(error) => {
+                        return match completions.drain() {
+                            Ok(()) => Err(error),
+                            Err(drain) => Err(Error::InferenceError(format!(
+                                "Qwen3.8 graph decode head failed: {error}; write-fence drain also failed: {drain}"
+                            ))),
+                        }
+                    }
+                }
+            }
+            None => {
+                completions.drain()?;
+                return Ok(None);
+            }
+        };
+        let completion = Arc::new(completions.seal()?);
+        cache.commit_shared_completion(start, 1, completion)?;
+        Ok(Some(Qwen38TextDecodeBatchOutput {
+            hidden_states,
+            logits,
+        }))
     }
 
     pub(super) fn forward_token_id_hidden_at_physical(
@@ -1099,6 +1718,14 @@ impl Qwen38TextModel {
     /// Project an already normalized MTP hidden span through the target LM
     /// head without applying the target model's output norm.
     pub(super) fn project_with_shared_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head_forward(hidden)
+    }
+
+    /// The LM head, shared by the target logits and every MTP draft.
+    fn lm_head_forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        if hidden.device().is_cuda() {
+            record_cuda_lm_head(matches!(self.output, Qwen38Projection::NativeFp8 { .. }));
+        }
         self.output.forward(hidden).map_err(Error::from)
     }
 
@@ -1202,35 +1829,34 @@ impl Qwen38TextModel {
             first_full.head_dim,
         )?;
         let start_pos = cache.context_len();
+        let rope = Qwen38RopeInputs::new(position_ids, input.device(), input.dtype())
+            .with_decode_step(cache, self.full_attention_layers())?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
-        let mrope_plan =
-            first_full.prepare_mrope_plan(position_ids, input.device(), input.dtype())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             layer.ensure_state_initialized(layer_state, &self.device)?;
         }
-        let mut hidden = input.clone();
+        let mut hidden = Qwen38Hidden::new(input.clone());
         let mut physical_layer = 0usize;
         for (layer_index, (layer, layer_state)) in
             self.layers.iter().zip(state.layers.iter_mut()).enumerate()
         {
             hidden = layer.forward_physical(
-                &hidden,
+                hidden,
                 layer_state,
-                &mrope_plan,
+                &rope,
                 cache,
                 &mut prepared,
                 &mut physical_layer,
                 verification.as_mut().map(|layers| &mut layers[layer_index]),
             )?;
-            validate_qwen38_finite_tensor(
-                &hidden,
+            hidden = self.validate_layer_output(
+                hidden,
                 layer_index,
                 if sequence_len == 1 {
                     layer.decode_diagnostic_path()
                 } else {
                     layer.prefill_diagnostic_path()
                 },
-                self.finite_diagnostics_enabled,
             )?;
         }
         if physical_layer != sparse_layers.len() {
@@ -1238,8 +1864,26 @@ impl Qwen38TextModel {
                 "Qwen3.8 physical attention did not cover every sparse layer".into(),
             ));
         }
+        let hidden = hidden.materialize()?;
         cache.commit_prepared(prepared)?;
         Ok(hidden)
+    }
+
+    /// Finite-value diagnostics over a layer's output. Only when they are
+    /// enabled does the pending residual add materialize here instead of in
+    /// the next norm.
+    fn validate_layer_output(
+        &self,
+        hidden: Qwen38Hidden,
+        layer_index: usize,
+        path: &'static str,
+    ) -> Result<Qwen38Hidden> {
+        if !self.finite_diagnostics_enabled {
+            return Ok(hidden);
+        }
+        let hidden = hidden.materialize()?;
+        validate_qwen38_finite_tensor(&hidden, layer_index, path, true)?;
+        Ok(Qwen38Hidden::new(hidden))
     }
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
@@ -1256,7 +1900,7 @@ impl Qwen38TextModel {
             "output.norm",
             self.finite_diagnostics_enabled,
         )?;
-        let logits = self.output.forward(&hidden)?;
+        let logits = self.lm_head_forward(&hidden)?;
         validate_qwen38_finite_tensor(
             &logits,
             self.layers.len(),
@@ -1264,6 +1908,286 @@ impl Qwen38TextModel {
             self.finite_diagnostics_enabled,
         )?;
         Ok(logits)
+    }
+
+    /// Resolve the fused fast paths at load: CUDA in production, while
+    /// `allow_cpu` resolves them against the portable CPU references in tests.
+    /// Each path turns on only after its self-check on this device passes.
+    pub(super) fn resolve_fast_paths(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
+        self.resolve_fused_norms(switches, allow_cpu);
+        let dtype = self.activation_dtype();
+        let mut gdn_prefill = None;
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                Qwen38Mixer::Linear(linear) => {
+                    linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu);
+                    linear.resolve_alpha_beta_gemv(switches, &self.device, dtype, allow_cpu);
+                    linear.resolve_gdn_prefill(switches, &self.device, allow_cpu, &mut gdn_prefill);
+                }
+                Qwen38Mixer::Full(attention) => {
+                    attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu)
+                }
+            }
+        }
+    }
+
+    /// Resolve every fast path against the portable CPU references (tests
+    /// only): production resolution enables them on CUDA alone.
+    #[cfg(test)]
+    pub(super) fn enable_fast_paths_for_tests(&mut self) {
+        self.resolve_fast_paths(&Qwen38CudaSwitches::default(), true);
+    }
+
+    /// Fast-path resolutions for the admin diagnostics.
+    pub(super) fn fast_path_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rms_norm": summarize([&self.fused_norm_path]),
+            "gdn_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "gdn_prefill": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.gdn_prefill_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "gdn_alpha_beta_gemv": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.alpha_beta_gemv_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "qk_rope": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[0])),
+            "kv_write": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[1])),
+            "attn_gate": summarize(self.full_attention_layers().map(|layer| layer.fast_paths()[2])),
+        })
+    }
+
+    /// Resolve graph decode after the fast paths it needs, with the
+    /// whole-step graph when `whole_step` asks for it. When graph decode
+    /// resolves, the `TensorIsland` regions retire: a capture cannot nest
+    /// inside another.
+    fn resolve_decode_graphs(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        allow_eager: bool,
+        whole_step: bool,
+    ) {
+        let (graphs, path) =
+            decode_graph::Qwen38DecodeGraphs::resolve(self, switches, allow_eager, whole_step);
+        if graphs.is_some() {
+            for layer in &mut self.layers {
+                layer.graphs_enabled = false;
+                layer.mlp.graphs_enabled = false;
+            }
+        }
+        self.decode_graphs = graphs;
+        self.decode_graphs_path = path;
+    }
+
+    /// Run single-row decode through the graph segments eagerly off CUDA
+    /// (tests of the segmentation; CUDA resolves this at load). Call after
+    /// the fast paths resolve.
+    #[cfg(test)]
+    pub(super) fn enable_segmented_decode_for_tests(&mut self) {
+        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true, false);
+    }
+
+    /// Run single-row decode through the whole-step body eagerly off CUDA
+    /// (tests of the step body; CUDA resolves this at load). Call after the
+    /// fast paths resolve.
+    #[cfg(test)]
+    pub(super) fn enable_step_graph_for_tests(&mut self) {
+        self.resolve_decode_graphs(&Qwen38CudaSwitches::default(), true, true);
+    }
+
+    /// Whether single-row decode runs through the decode graphs. Such steps
+    /// go through [`Self::forward_token_ids_batch_at_physical`], where the
+    /// graphs live.
+    pub(super) fn graph_decode(&self) -> bool {
+        self.decode_graphs.is_some()
+    }
+
+    /// Whether a single-row step can be queued with a device-resident input
+    /// token ([`Self::enqueue_graph_step`]): the whole-step graph is
+    /// replaying.
+    pub(super) fn graph_step_ready(&self) -> bool {
+        self.decode_graphs
+            .as_ref()
+            .is_some_and(|graphs| graphs.whole_step_replaying())
+    }
+
+    /// The whole-step graph's token slot on the device (U32 `[1]`), where
+    /// token selection writes the next step's input token.
+    pub(super) fn graph_step_token(&self) -> Option<Result<Tensor>> {
+        self.decode_graphs
+            .as_ref()
+            .and_then(|graphs| graphs.whole_step_token_slot())
+    }
+
+    /// Queue one single-row decode step at `position` through the replaying
+    /// whole-step graph without waiting for it. `token` `None` takes the token
+    /// the previous step's selection wrote into the step buffer. The step's
+    /// DeltaNet state is published into `state`; its KV write is committed
+    /// later, in order, by [`Self::commit_enqueued_step`]. `Ok(None)`: the
+    /// graph did not take the step, and nothing was published.
+    pub(super) fn enqueue_graph_step(
+        &self,
+        token: Option<u32>,
+        position: usize,
+        state: &mut Qwen38TextRuntimeState,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<Option<EnqueuedGraphStep>> {
+        let Some(graphs) = &self.decode_graphs else {
+            return Ok(None);
+        };
+        self.validate_runtime_state(state)?;
+        let slot = cache.slots_for_queued_append(position, 1)?[0];
+        let lowered = cache.arena().lower_slots(&[slot])?;
+        let metadata = KvDecodeBatchMetadata {
+            sequences: vec![cache.sequence_table(position + 1)?],
+        };
+        let mut completions =
+            KvWriteCompletionCollector::new(cache.arena().config(), lowered.logical_slots())?;
+        let output = graphs.forward_whole(
+            self,
+            token,
+            position,
+            slot,
+            state,
+            cache,
+            lowered.as_ref(),
+            &metadata,
+            &mut completions,
+        );
+        let logits = match output {
+            Ok(Some(decode_graph::GraphDecodeOutput::Logits(logits))) => Ok(logits),
+            Ok(Some(decode_graph::GraphDecodeOutput::Hidden(hidden))) => {
+                self.project_target_hidden_span(&hidden)
+            }
+            Ok(None) => {
+                completions.drain()?;
+                return Ok(None);
+            }
+            Err(error) => Err(error),
+        };
+        match logits {
+            Ok(logits) => Ok(Some(EnqueuedGraphStep {
+                logits,
+                position,
+                completions: Some(completions),
+            })),
+            Err(error) => match completions.drain() {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3.8 queued graph step failed: {error}; write-fence drain also failed: {drain}"
+                ))),
+            },
+        }
+    }
+
+    /// Commit a queued step's KV write (after its token was read back, so the
+    /// write fences have passed), in order.
+    pub(super) fn commit_enqueued_step(
+        &self,
+        mut step: EnqueuedGraphStep,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let completions = step
+            .completions
+            .take()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 graph step committed twice".into()))?;
+        cache.commit_shared_completion(step.position, 1, Arc::new(completions.seal()?))
+    }
+
+    /// `cuda_graphs` in the admin diagnostics: resolution, phase and counters.
+    pub(super) fn cuda_graphs_summary(&self) -> serde_json::Value {
+        match &self.decode_graphs {
+            Some(graphs) => graphs.summary(),
+            None => {
+                let mut summary = summarize([&self.decode_graphs_path]);
+                summary["phase"] = serde_json::json!("off");
+                summary
+            }
+        }
+    }
+
+    /// Packing outcome of every block-FP8 projection group of the trunk.
+    pub(super) fn fp8_packing(&self) -> &[Qwen38FastPath] {
+        &self.fp8_packing
+    }
+
+    /// Metal: the GEMV check outcome of every FP8 projection kind.
+    pub(super) fn fp8_gemv_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_gemv_checks
+    }
+
+    /// CUDA: the dequantized prefill GEMM per checked FP8 projection kind.
+    pub(super) fn fp8_prefill_gemm_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_prefill_gemm_checks
+    }
+
+    /// Whether any trunk projection kind runs the dequantized prefill GEMM.
+    pub(super) fn prefill_gemm_active(&self) -> bool {
+        self.fp8_prefill_gemm_checks
+            .iter()
+            .any(Qwen38FastPath::is_fused)
+    }
+
+    /// `fast_paths.fp8_lm_head`: the head's form and its observed error.
+    pub(super) fn fp8_lm_head_diagnostics(&self) -> serde_json::Value {
+        let (path, gate_error) = &self.fp8_lm_head;
+        let mut summary = summarize([path]);
+        summary["gate_relative_l2"] = serde_json::json!(gate_error);
+        summary["precision"] = serde_json::json!(match &self.output {
+            Qwen38Projection::NativeFp8 { .. } => "deliberately reduced: the BF16 head is quantized to block FP8 (E4M3, F32 scale per 128x128 block); logits stay in the activation dtype",
+            Qwen38Projection::Quantized(_) => "reduced: the BF16 head is requantized to Q8_0 (F16 scale per 32 elements); logits stay F32",
+            Qwen38Projection::Dense(_) => "checkpoint BF16 head in the activation dtype",
+        });
+        summary
+    }
+
+    fn full_attention_layers(&self) -> impl Iterator<Item = &Qwen38FullAttention> {
+        self.layers.iter().filter_map(|layer| match &layer.mixer {
+            Qwen38Mixer::Full(attention) => Some(attention),
+            Qwen38Mixer::Linear(_) => None,
+        })
+    }
+
+    /// The plan's activation dtype (the embedding table's).
+    fn activation_dtype(&self) -> DType {
+        self.token_embeddings.embeddings().dtype()
+    }
+
+    /// Fused residual add + RMSNorm on every trunk norm (layer, q/k and
+    /// output norms), after a self-check of layer 0's input norm and the first
+    /// q norm against the composition. `IZWI_QWEN38_FUSED_NORM=legacy` keeps
+    /// the cast, norm, cast chain.
+    fn resolve_fused_norms(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
+        let dtype = self.activation_dtype();
+        let path = resolve_norm_path(switches, &self.device, allow_cpu, dtype, || {
+            let mut norms = Vec::with_capacity(2);
+            if let Some(layer) = self.layers.first() {
+                norms.push(&layer.attn_norm);
+            }
+            if let Some(attention) = self.layers.iter().find_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Full(attention) => Some(attention),
+                Qwen38Mixer::Linear(_) => None,
+            }) {
+                norms.push(&attention.q_norm);
+            }
+            norms
+                .into_iter()
+                .try_for_each(|norm| norm_self_check(norm, &self.device, dtype))
+        });
+        let fused = path.is_fused();
+        self.output_norm.fused = fused;
+        for layer in &mut self.layers {
+            layer.attn_norm.fused = fused;
+            layer.post_attention_norm.fused = fused;
+            if let Qwen38Mixer::Full(attention) = &mut layer.mixer {
+                attention.q_norm.fused = fused;
+                attention.k_norm.fused = fused;
+            }
+        }
+        self.fused_norm_path = path;
     }
 
     fn validate_runtime_state(&self, state: &Qwen38TextRuntimeState) -> Result<()> {
@@ -1342,6 +2266,10 @@ impl Qwen38Layer {
     }
 
     fn residual_norm(&self, residual: &Tensor, mixed: &Tensor) -> Result<(Tensor, Tensor)> {
+        if self.post_attention_norm.fused_applies(residual) {
+            // One launch already; the graph region would only wrap it.
+            return self.post_attention_norm.add_forward(residual, mixed);
+        }
         if self.graphs_enabled
             && residual
                 .dims3()
@@ -1349,11 +2277,15 @@ impl Qwen38Layer {
         {
             // Both outputs escape: the residual is needed after the FFN. The
             // RMS custom op has no growable external workspace; its only
-            // allocations are its output and the explicitly retained sum.
+            // allocations are its output, the explicitly retained sum and,
+            // under a half-precision plan, the F32 input and output of the
+            // F32-gain norm, retained as intermediates.
             let bound = residual
-                .elem_count()
-                .checked_mul(residual.dtype().size_in_bytes())
-                .and_then(|bytes| bytes.checked_mul(2));
+                .dtype()
+                .size_in_bytes()
+                .checked_add(DType::F32.size_in_bytes())
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_mul(residual.elem_count()));
             if let Some(bound) = bound {
                 if let Some(outputs) = self.graphs.run_multi(
                     &[residual, mixed],
@@ -1364,10 +2296,11 @@ impl Qwen38Layer {
                     bound,
                     |inputs| {
                         let sum = (&inputs[0] + &inputs[1])?;
-                        let normalized = self.post_attention_norm.forward(&sum)?;
+                        let (normalized, intermediates) =
+                            self.post_attention_norm.forward_retaining(&sum)?;
                         Ok(IslandOutput {
                             outputs: vec![sum, normalized],
-                            intermediates: vec![],
+                            intermediates,
                         })
                     },
                 )? {
@@ -1380,18 +2313,28 @@ impl Qwen38Layer {
         Ok((sum, normalized))
     }
 
+    /// The layer tail after its mixer: residual add + post-attention norm,
+    /// then the MLP, whose output the next norm adds.
+    fn post_mixer(&self, residual: &Tensor, mixed: &Tensor) -> Result<Qwen38Hidden> {
+        let (residual, hidden_states) = self.residual_norm(residual, mixed)?;
+        let mlp_output = self.mlp.forward(&hidden_states)?;
+        Ok(Qwen38Hidden {
+            residual,
+            pending: Some(mlp_output),
+        })
+    }
+
     fn forward_physical(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen38Hidden,
         state: &mut Qwen38LayerRuntimeState,
-        mrope_plan: &Qwen38MropePlan,
+        rope: &Qwen38RopeInputs<'_>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
         verification: Option<&mut Option<Qwen38LinearVerification>>,
-    ) -> Result<Tensor> {
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+    ) -> Result<Qwen38Hidden> {
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen38Mixer::Linear(mixer) => {
                 if normalized.dim(1)? == 1 {
@@ -1401,27 +2344,21 @@ impl Qwen38Layer {
                 }
             }
             Qwen38Mixer::Full(mixer) => {
-                let output = mixer.forward_physical(
-                    &normalized,
-                    mrope_plan,
-                    cache,
-                    prepared,
-                    *physical_layer,
-                )?;
+                let output =
+                    mixer.forward_physical(&normalized, rope, cache, prepared, *physical_layer)?;
                 *physical_layer = physical_layer.checked_add(1).ok_or_else(|| {
                     Error::InvalidInput("Qwen3.8 physical layer ordinal overflow".into())
                 })?;
                 output
             }
         };
-        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        self.post_mixer(&residual, &mixed)
     }
 
-    pub(super) fn forward_physical_decode_batch(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_physical_decode_batch(
         &self,
-        hidden_states: &Tensor,
+        hidden: Qwen38Hidden,
         states: &mut [&mut Qwen38LayerRuntimeState],
         position_ids: &[[usize; 3]],
         caches: &[&PhysicalPagedKvCache],
@@ -1429,9 +2366,9 @@ impl Qwen38Layer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         physical_layer: &mut usize,
-    ) -> Result<Tensor> {
-        let batch_size = hidden_states.dim(0)?;
-        if hidden_states.dim(1)? != 1
+    ) -> Result<Qwen38Hidden> {
+        let batch_size = hidden.residual.dim(0)?;
+        if hidden.residual.dim(1)? != 1
             || batch_size == 0
             || states.len() != batch_size
             || position_ids.len() != batch_size
@@ -1441,8 +2378,7 @@ impl Qwen38Layer {
                 "Qwen3.8 layer decode batch dimensions do not match".into(),
             ));
         }
-        let residual = hidden_states.clone();
-        let normalized = self.attn_norm.forward(hidden_states)?;
+        let (residual, normalized) = hidden.normalized(&self.attn_norm)?;
         let mixed = match &self.mixer {
             Qwen38Mixer::Linear(mixer) => mixer.forward_decode_batch(&normalized, states)?,
             Qwen38Mixer::Full(mixer) => {
@@ -1461,22 +2397,18 @@ impl Qwen38Layer {
                 output
             }
         };
-        let (residual, hidden_states) = self.residual_norm(&residual, &mixed)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        (&residual + &hidden_states).map_err(Error::from)
+        self.post_mixer(&residual, &mixed)
     }
 }
 
 impl Qwen38Mlp {
     pub(super) fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let device = loader.device;
         let gate_name = format!("{prefix}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}.mlp.up_proj.weight");
         Ok(Self {
@@ -1489,24 +2421,16 @@ impl Qwen38Mlp {
                 && performance.enabled()
                 && performance.fused_decode.enabled(),
             gate_up: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&gate_name, [cfg.feed_forward_length, cfg.embedding_length]),
                     (&up_name, [cfg.feed_forward_length, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             down: load_native_projection(
-                tensors,
+                loader,
                 &format!("{prefix}.mlp.down_proj.weight"),
                 [cfg.embedding_length, cfg.feed_forward_length],
-                block,
-                target,
-                device,
-                performance,
             )?,
         })
     }
@@ -1558,7 +2482,7 @@ impl Qwen38Mlp {
         }
         let mut owners = Vec::with_capacity(6);
         for projection in projections.iter().chain(std::iter::once(&self.down)) {
-            let Qwen38Projection::NativeFp8(raw) = projection else {
+            let Qwen38Projection::NativeFp8 { raw, .. } = projection else {
                 return None;
             };
             owners.push(raw.weights.clone());
@@ -1615,14 +2539,11 @@ impl Qwen38Mlp {
 
 impl Qwen38FullAttention {
     pub(super) fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
-        performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let (tensors, device) = (loader.tensors, loader.device);
         let q_width = cfg
             .attention_head_count
             .checked_mul(cfg.attention_key_length)
@@ -1637,35 +2558,26 @@ impl Qwen38FullAttention {
         let v_name = format!("{prefix}.self_attn.v_proj.weight");
         Ok(Self {
             qkv_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&q_name, [q_width, cfg.embedding_length]),
                     (&k_name, [kv_width, cfg.embedding_length]),
                     (&v_name, [kv_width, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             o_proj: load_native_projection(
-                tensors,
+                loader,
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 [
                     cfg.embedding_length,
                     cfg.attention_head_count * cfg.attention_value_length,
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             q_norm: load_native_zero_centered_norm(
                 tensors,
                 &format!("{prefix}.self_attn.q_norm.weight"),
                 cfg.attention_key_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?,
             k_norm: load_native_zero_centered_norm(
@@ -1673,7 +2585,6 @@ impl Qwen38FullAttention {
                 &format!("{prefix}.self_attn.k_norm.weight"),
                 cfg.attention_key_length,
                 cfg.attention_layer_norm_rms_epsilon,
-                target,
                 device,
             )?,
             num_heads: cfg.attention_head_count,
@@ -1693,22 +2604,303 @@ impl Qwen38FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
+            fused_qk: None,
+            fused_qk_path: Qwen38FastPath::default(),
+            fused_kv_write: false,
+            fused_kv_write_path: Qwen38FastPath::default(),
+            fused_gate: false,
+            fused_gate_path: Qwen38FastPath::default(),
         })
+    }
+
+    /// Resolve the fused attention paths at load, each after a self-check on
+    /// this layer's own head-norm gains and rotary configuration:
+    /// - q/k norm + partial M-RoPE (`kernels/cuda/rope.rs`), against the
+    ///   norm + plan + rotary chain at short, long and image positions;
+    /// - the K/V write from that launch, into a scratch paged cache (it also
+    ///   needs, per request, K/V stored in the activation dtype);
+    /// - the attention gate (`kernels/cuda/gate.rs`), against the composition.
+    pub(super) fn resolve_fused_attention(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+        allow_cpu: bool,
+    ) {
+        self.fused_qk = None;
+        self.fused_qk_path = if let Some(path) =
+            decode_gate(FUSED_QK_ROPE_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !self.fused_qk_fits(device, dtype) {
+            Qwen38FastPath::legacy(
+                "fused q/k norm + RoPE needs SM80+, 16-bit activations, F32 head-norm gains and rotary dims",
+            )
+        } else {
+            let resolved = Tensor::from_vec(
+                self.rope_inv_freqs.clone(),
+                self.rope_inv_freqs.len(),
+                device,
+            )
+            .map_err(Error::from)
+            .and_then(|inv_freq| {
+                let spec = QkNormRopeSpec {
+                    num_heads: self.num_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                    rope_dim: self.rope_dim,
+                    eps: self.q_norm.eps as f32,
+                };
+                self.fused_qk_self_check(&spec, &inv_freq, device, dtype)?;
+                Ok((spec, inv_freq))
+            });
+            match resolved {
+                Ok(fused) => {
+                    self.fused_qk = Some(fused);
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("q/k norm + RoPE", &error),
+            }
+        };
+
+        self.fused_kv_write = false;
+        self.fused_kv_write_path =
+            if let Some(path) = decode_gate(FUSED_KV_WRITE_ENV, switches, device, allow_cpu) {
+                path
+            } else if let Some((spec, inv_freq)) = &self.fused_qk {
+                match self.fused_kv_write_self_check(spec, inv_freq, device, dtype) {
+                    Ok(()) => {
+                        self.fused_kv_write = true;
+                        Qwen38FastPath::Fused
+                    }
+                    Err(error) => Qwen38FastPath::self_check_failed("K/V write", &error),
+                }
+            } else {
+                Qwen38FastPath::legacy("the fused K/V write needs the fused q/k norm + RoPE")
+            };
+
+        self.fused_gate = false;
+        self.fused_gate_path = if let Some(path) =
+            decode_gate(FUSED_ATTN_GATE_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !matches!(dtype, DType::F16 | DType::BF16) || !gate::supported(device, dtype) {
+            Qwen38FastPath::legacy("the fused attention gate needs SM80+ and 16-bit activations")
+        } else {
+            match self.fused_gate_self_check(device, dtype) {
+                Ok(()) => {
+                    self.fused_gate = true;
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("attention gate", &error),
+            }
+        };
+    }
+
+    /// The fast-path resolutions `[q/k norm + RoPE, K/V write, gate]`.
+    pub(super) fn fast_paths(&self) -> [&Qwen38FastPath; 3] {
+        [
+            &self.fused_qk_path,
+            &self.fused_kv_write_path,
+            &self.fused_gate_path,
+        ]
+    }
+
+    fn fused_qk_fits(&self, device: &Device, dtype: DType) -> bool {
+        matches!(dtype, DType::F16 | DType::BF16)
+            && self.rope_dim > 0
+            && self.rope_inv_freqs.len() == self.rope_dim / 2
+            && rope::supported(device, dtype, self.head_dim, self.rope_dim)
+            && self.q_norm.eps == self.k_norm.eps
+            && [&self.q_norm, &self.k_norm].iter().all(|norm| {
+                norm.weight.dtype() == DType::F32 && norm.weight.dims() == [self.head_dim]
+            })
+    }
+
+    /// Random `dtype` values of `shape` on `device` for the self-checks.
+    fn self_check_tensor(
+        shape: &[usize],
+        seed: f32,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            self_check_wave(shape.iter().product(), seed, 2.0),
+            shape,
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?)
+    }
+
+    /// The fused q/k against today's chain (head norms, cos/sin plan from F32
+    /// host angles, rotary op, pass-through concat) for one token at
+    /// positions 5, 3000 and 200000, and at the image position [7, 3, 11]
+    /// when the sections allow it.
+    fn fused_qk_self_check(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        for (index, position) in [[5, 5, 5], [3000, 3000, 3000], [200_000; 3], [7, 3, 11]]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(mrope) = self.mrope_position(position) else {
+                continue;
+            };
+            let seed = 10.0 * index as f32;
+            let q_proj = Self::self_check_tensor(&[1, 1, heads, 2 * dim], seed, device, dtype)?;
+            let k_proj =
+                Self::self_check_tensor(&[1, 1, kv_heads, dim], seed + 1.0, device, dtype)?;
+            let query = self
+                .q_norm
+                .forward(&q_proj.narrow(3, 0, dim)?.contiguous()?)?;
+            let key = self.k_norm.forward(&k_proj)?;
+            let plan = self.prepare_mrope_plan(&[position], device, dtype)?;
+            let (q_ref, k_ref) = self.apply_rope_plan(&query, &key, &plan)?;
+            let (q, k) = rope::qk_norm_rope(
+                &q_proj,
+                &k_proj,
+                &self.q_norm.weight,
+                &self.k_norm.weight,
+                inv_freq,
+                spec,
+                mrope,
+            )?;
+            compare_values(
+                &format!("fused q at {position:?}"),
+                &host_values(&q)?,
+                &host_values(&q_ref)?,
+                0.01,
+                0.03,
+            )?;
+            compare_values(
+                &format!("fused k at {position:?}"),
+                &host_values(&k)?,
+                &host_values(&k_ref)?,
+                0.01,
+                0.03,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The K/V-writing variant into a scratch `[2, 16, kv_heads, head_dim]`
+    /// cache at flat slot 21, position 3000: the returned queries and the
+    /// slot's key row match the eager kernel, the value row is the value, and
+    /// every other slot stays zero.
+    fn fused_kv_write_self_check(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        const PAGES: usize = 2;
+        const PAGE_TOKENS: usize = 16;
+        const SLOT: usize = 21;
+        const POSITION: usize = 3000;
+        let (heads, kv_heads, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
+        let q_proj = Self::self_check_tensor(&[1, 1, heads, 2 * dim], 1.0, device, dtype)?;
+        let k_proj = Self::self_check_tensor(&[1, 1, kv_heads, dim], 2.0, device, dtype)?;
+        let v_proj = Self::self_check_tensor(&[1, 1, kv_heads, dim], 3.0, device, dtype)?;
+        let keys = Tensor::zeros((PAGES, PAGE_TOKENS, kv_heads, dim), dtype, device)?;
+        let values = Tensor::zeros((PAGES, PAGE_TOKENS, kv_heads, dim), dtype, device)?;
+        let step = Tensor::from_vec(vec![0u32, POSITION as u32, SLOT as u32], 3, device)?;
+        let queries = rope::qk_norm_rope_kv(
+            &q_proj,
+            &k_proj,
+            &v_proj,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            &step,
+            &keys,
+            &values,
+        )?;
+        let (q_ref, k_ref) = rope::qk_norm_rope(
+            &q_proj,
+            &k_proj,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            MropePosition {
+                temporal: POSITION,
+                height: POSITION,
+                width: POSITION,
+                height_section: 0,
+                width_section: 0,
+            },
+        )?;
+        compare_values(
+            "fused K/V write queries",
+            &host_values(&queries)?,
+            &host_values(&q_ref)?,
+            0.01,
+            0.02,
+        )?;
+        let row = kv_heads * dim;
+        let (keys, values) = (host_values(&keys)?, host_values(&values)?);
+        for slot in 0..PAGES * PAGE_TOKENS {
+            let (key, value) = (&keys[slot * row..][..row], &values[slot * row..][..row]);
+            if slot == SLOT {
+                compare_values(
+                    "fused K/V write key",
+                    key,
+                    &host_values(&k_ref)?,
+                    0.02,
+                    0.02,
+                )?;
+                compare_values(
+                    "fused K/V write value",
+                    value,
+                    &host_values(&v_proj)?,
+                    0.02,
+                    0.02,
+                )?;
+            } else if key.iter().chain(value).any(|x| *x != 0.0) {
+                return Err(Error::InferenceError(format!(
+                    "fused K/V write touched slot {slot} instead of only {SLOT}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The fused gate against the composition over two rows.
+    fn fused_gate_self_check(&self, device: &Device, dtype: DType) -> Result<()> {
+        let (heads, dim) = (self.num_heads, self.head_dim);
+        let attn = Self::self_check_tensor(&[2, 1, heads * dim], 4.0, device, dtype)?;
+        let q_proj = Self::self_check_tensor(&[2, 1, heads, 2 * dim], 5.0, device, dtype)?;
+        compare_values(
+            "fused attention gate",
+            &host_values(&gate::attn_gate(&attn, &q_proj, heads, dim)?)?,
+            &host_values(&gate::reference(&attn, &q_proj, heads, dim)?)?,
+            0.01,
+            0.02,
+        )
     }
 
     pub(super) fn forward_physical(
         &self,
         hidden_states: &Tensor,
-        mrope_plan: &Qwen38MropePlan,
+        rope: &Qwen38RopeInputs<'_>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: usize,
     ) -> Result<Tensor> {
         let seq_len = hidden_states.dim(1)?;
-        if seq_len == 0 || seq_len != mrope_plan.sequence_len {
+        if seq_len == 0 || seq_len != rope.positions.len() {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.8 physical attention received {} tokens and a {}-token rotary plan",
-                seq_len, mrope_plan.sequence_len
+                "Qwen3.8 physical attention received {} tokens and {} rotary positions",
+                seq_len,
+                rope.positions.len()
             )));
         }
         let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
@@ -1716,12 +2908,6 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
             .reshape((1, seq_len, self.num_heads, self.head_dim * 2))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            1,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ))?;
         let key_states = qkv
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
@@ -1730,43 +2916,207 @@ impl Qwen38FullAttention {
             .next()
             .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
             .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let (query_states, key_states) =
-            self.apply_rope_plan(&query_states, &key_states, mrope_plan)?;
-        let queries = query_states
-            .reshape((seq_len, self.num_heads, self.head_dim))?
-            .contiguous()?;
-        let keys = key_states
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let values = value_states
-            .reshape((seq_len, self.num_kv_heads, self.head_dim))?
-            .contiguous()?;
-        let storage_dtype = cache.arena().config().dtype;
-        let output_dtype = queries.dtype();
-        if queries.device().is_cuda() && storage_dtype != output_dtype {
-            // Q, K, V enter storage dtype and the attention result returns to
-            // the activation dtype.
-            record_cuda_attention_dtype_casts(4);
-        }
-        let queries = queries.to_dtype(storage_dtype)?;
-        let keys = keys.to_dtype(storage_dtype)?;
-        let values = values.to_dtype(storage_dtype)?;
-        let output = cache.write_and_attend(
-            physical_layer,
-            prepared,
-            &queries,
-            &keys,
-            &values,
-            1.0 / (self.head_dim as f32).sqrt(),
-        )?;
+        let output_dtype = q_proj.dtype();
+        let fused = match rope.positions {
+            [position] => self.fused_qk_for(&q_proj, &key_states, *position),
+            _ => None,
+        };
+        let output = if let Some((spec, inv_freq, position)) = fused {
+            self.fused_qk_attend(
+                spec,
+                inv_freq,
+                position,
+                [&q_proj, &key_states, &value_states],
+                rope.step.as_ref(),
+                cache,
+                prepared,
+                physical_layer,
+            )?
+        } else {
+            if seq_len == 1 && q_proj.device().is_cuda() {
+                record_cuda_qk_rope_chain();
+            }
+            let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+            let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+            let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+            let (query_states, key_states) =
+                self.apply_rope_plan(&query_states, &key_states, rope.plan(self)?)?;
+            let queries = query_states
+                .reshape((seq_len, self.num_heads, self.head_dim))?
+                .contiguous()?;
+            let keys = key_states
+                .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+                .contiguous()?;
+            let values = value_states
+                .reshape((seq_len, self.num_kv_heads, self.head_dim))?
+                .contiguous()?;
+            self.write_and_attend(cache, prepared, physical_layer, &queries, &keys, &values)?
+        };
         let output =
             output
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        let output = self.gate_output(&output, &q_proj)?;
         self.o_proj.forward(&output).map_err(Error::from)
+    }
+
+    /// Cast token-major Q/K/V to the cache's storage dtype and write and
+    /// attend through the arena.
+    fn write_and_attend(
+        &self,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: usize,
+        queries: &Tensor,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<Tensor> {
+        let storage_dtype = cache.arena().config().dtype;
+        if queries.device().is_cuda() && storage_dtype != queries.dtype() {
+            // Q, K, V enter storage dtype and the attention result returns to
+            // the activation dtype.
+            record_cuda_attention_dtype_casts(4);
+        }
+        cache.write_and_attend(
+            physical_layer,
+            prepared,
+            &queries.to_dtype(storage_dtype)?,
+            &keys.to_dtype(storage_dtype)?,
+            &values.to_dtype(storage_dtype)?,
+            1.0 / (self.head_dim as f32).sqrt(),
+        )
+    }
+
+    /// The fused q/k norm + RoPE for one token at `position`, when resolved
+    /// and the projections fit it.
+    fn fused_qk_for(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        position: [usize; 3],
+    ) -> Option<(&QkNormRopeSpec, &Tensor, MropePosition)> {
+        let (spec, inv_freq) = self.fused_qk.as_ref()?;
+        let fits = matches!(q_proj.dtype(), DType::F16 | DType::BF16)
+            && key_states.dtype() == q_proj.dtype();
+        if !fits {
+            return None;
+        }
+        Some((spec, inv_freq, self.mrope_position(position)?))
+    }
+
+    /// The kernel's view of one token's M-RoPE position: text positions need
+    /// no sections; an image position takes the height and width sections,
+    /// and the composition refuses it too when they are not valid.
+    fn mrope_position(&self, [temporal, height, width]: [usize; 3]) -> Option<MropePosition> {
+        let text = temporal == height && temporal == width;
+        let sections = match self.mrope_sections.as_slice() {
+            [_, height, width]
+                if self.mrope_sections.iter().sum::<usize>() == self.rope_dim / 2 =>
+            {
+                Some((*height, *width))
+            }
+            _ => None,
+        };
+        let (height_section, width_section) = if text { (0, 0) } else { sections? };
+        Some(MropePosition {
+            temporal,
+            height,
+            width,
+            height_section,
+            width_section,
+        })
+    }
+
+    /// One token through the fused q/k norm + partial M-RoPE. With the fused
+    /// K/V write resolved, a text position, a step buffer for this forward and
+    /// K/V stored in the activation dtype, the same launch writes the rotated
+    /// key and the value into the paged cache; otherwise the arena writes the
+    /// kernel's K/V. Returns the attention output `[1, heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_qk_attend(
+        &self,
+        spec: &QkNormRopeSpec,
+        inv_freq: &Tensor,
+        position: MropePosition,
+        [q_proj, key_states, value_states]: [&Tensor; 3],
+        step: Option<&Tensor>,
+        cache: &PhysicalPagedKvCache,
+        prepared: &mut PreparedPhysicalPagedStep,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let text = position.temporal == position.height && position.temporal == position.width;
+        if let Some(step) = step.filter(|_| {
+            self.fused_kv_write && text && cache.arena().config().dtype == q_proj.dtype()
+        }) {
+            let output = cache.write_fused_and_attend(
+                physical_layer,
+                prepared,
+                1.0 / (self.head_dim as f32).sqrt(),
+                &mut |keys, values| {
+                    let queries = rope::qk_norm_rope_kv(
+                        q_proj,
+                        key_states,
+                        value_states,
+                        &self.q_norm.weight,
+                        &self.k_norm.weight,
+                        inv_freq,
+                        spec,
+                        step,
+                        keys,
+                        values,
+                    )?;
+                    record_fused_qk_norm_rope(true);
+                    Ok(queries.reshape((1, self.num_heads, self.head_dim))?)
+                },
+            )?;
+            if let Some(output) = output {
+                return Ok(output);
+            }
+        }
+        let (queries, keys) = rope::qk_norm_rope(
+            q_proj,
+            key_states,
+            &self.q_norm.weight,
+            &self.k_norm.weight,
+            inv_freq,
+            spec,
+            position,
+        )?;
+        record_fused_qk_norm_rope(false);
+        self.write_and_attend(
+            cache,
+            prepared,
+            physical_layer,
+            &queries.reshape((1, self.num_heads, self.head_dim))?,
+            &keys.reshape((1, self.num_kv_heads, self.head_dim))?,
+            &value_states
+                .reshape((1, self.num_kv_heads, self.head_dim))?
+                .contiguous()?,
+        )
+    }
+
+    /// `attn * sigmoid(gate)`, the gate being the second half of each head's
+    /// slice of `q_proj` `[.., heads, 2 * head_dim]`: one launch when fused.
+    fn gate_output(&self, output: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        if self.fused_gate
+            && output.dtype() == q_proj.dtype()
+            && matches!(output.dtype(), DType::F16 | DType::BF16)
+        {
+            record_fused_attn_gate();
+            return Ok(gate::attn_gate(
+                output,
+                q_proj,
+                self.num_heads,
+                self.head_dim,
+            )?);
+        }
+        if output.device().is_cuda() {
+            record_cuda_attn_gate_composition();
+        }
+        let gate = q_proj
+            .narrow(3, self.head_dim, self.head_dim)?
+            .reshape(output.shape())?;
+        (output * ops::sigmoid(&gate)?).map_err(Error::from)
     }
 
     pub(super) fn forward_physical_decode_batch(
@@ -1779,12 +3129,69 @@ impl Qwen38FullAttention {
         completions: &mut KvWriteCompletionCollector,
         physical_layer: usize,
     ) -> Result<Tensor> {
+        if hidden_states.dim(1)? != 1 {
+            return Err(Error::InvalidInput(
+                "Qwen3.8 full-attention decode batch dimensions do not match".into(),
+            ));
+        }
+        let (q_proj, key_states, value_states) = self.decode_projections(hidden_states)?;
+        let output = self.decode_attend(
+            &q_proj,
+            &key_states,
+            &value_states,
+            position_ids,
+            caches,
+            slots,
+            metadata,
+            completions,
+            physical_layer,
+        )?;
+        self.decode_output(&output, &q_proj)
+    }
+
+    /// The q/k/v projections of decode rows `[B, 1, hidden]`: `q_proj`
+    /// `[B, 1, heads, 2 * head_dim]` (query and gate halves of each head),
+    /// keys and values `[B, 1, kv_heads, head_dim]`.
+    pub(super) fn decode_projections(
+        &self,
+        hidden_states: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let batch_size = hidden_states.dim(0)?;
-        if hidden_states.dim(1)? != 1
-            || batch_size == 0
-            || position_ids.len() != batch_size
-            || caches.len() != batch_size
-        {
+        let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
+        let q_proj = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
+            .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
+        let key_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        let value_states = qkv
+            .next()
+            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
+            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        Ok((q_proj, key_states, value_states))
+    }
+
+    /// Attention for one decode token per row from its projections: q/k
+    /// norm and RoPE at each row's position, the K/V write through the arena
+    /// and the paged decode. Returns the attention output `[B, 1, heads *
+    /// head_dim]` in the activation dtype, before the output gate.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_attend(
+        &self,
+        q_proj: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        position_ids: &[[usize; 3]],
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let batch_size = q_proj.dim(0)?;
+        if batch_size == 0 || position_ids.len() != batch_size || caches.len() != batch_size {
             return Err(Error::InvalidInput(
                 "Qwen3.8 full-attention decode batch dimensions do not match".into(),
             ));
@@ -1805,46 +3212,57 @@ impl Qwen38FullAttention {
             ));
         }
 
-        let mut qkv = self.qkv_proj.forward(hidden_states)?.into_iter();
-        let q_proj = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted Q".into()))?
-            .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
-        let query_states = q_proj.narrow(3, 0, self.head_dim)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
-        let key_states = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted K".into()))?
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
-        let value_states = qkv
-            .next()
-            .ok_or_else(|| Error::InferenceError("Qwen3.8 QKV projection omitted V".into()))?
-            .reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
-        let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
-        let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let mut queries = Vec::with_capacity(batch_size);
         let mut keys = Vec::with_capacity(batch_size);
         let mut values = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let plan = self.prepare_mrope_plan(
-                &[position_ids[row]],
-                hidden_states.device(),
-                hidden_states.dtype(),
-            )?;
-            let q_row = query_states.i(row)?.unsqueeze(0)?;
-            let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope_plan(&q_row, &k_row, &plan)?;
-            queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            values.push(
-                value_states
-                    .i(row)?
-                    .reshape((self.num_kv_heads, self.head_dim))?,
-            );
+        let fused = position_ids
+            .iter()
+            .map(|position| self.fused_qk_for(q_proj, key_states, *position))
+            .collect::<Option<Vec<_>>>();
+        if let Some(rows) = fused {
+            // One launch per row with host positions; the arena writes K/V.
+            for (row, (spec, inv_freq, position)) in rows.into_iter().enumerate() {
+                let (q_row, k_row) = rope::qk_norm_rope(
+                    &q_proj.i(row)?,
+                    &key_states.i(row)?,
+                    &self.q_norm.weight,
+                    &self.k_norm.weight,
+                    inv_freq,
+                    spec,
+                    position,
+                )?;
+                record_fused_qk_norm_rope(false);
+                queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                values.push(
+                    value_states
+                        .i(row)?
+                        .reshape((self.num_kv_heads, self.head_dim))?,
+                );
+            }
+        } else {
+            if q_proj.device().is_cuda() {
+                for _ in 0..batch_size {
+                    record_cuda_qk_rope_chain();
+                }
+            }
+            let query_states = q_proj.narrow(3, 0, self.head_dim)?;
+            let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
+            let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
+            for row in 0..batch_size {
+                let plan =
+                    self.prepare_mrope_plan(&[position_ids[row]], q_proj.device(), q_proj.dtype())?;
+                let q_row = query_states.i(row)?.unsqueeze(0)?;
+                let k_row = key_states.i(row)?.unsqueeze(0)?;
+                let (q_row, k_row) = self.apply_rope_plan(&q_row, &k_row, &plan)?;
+                queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
+                keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
+                values.push(
+                    value_states
+                        .i(row)?
+                        .reshape((self.num_kv_heads, self.head_dim))?,
+                );
+            }
         }
         let query_refs = queries.iter().collect::<Vec<_>>();
         let key_refs = keys.iter().collect::<Vec<_>>();
@@ -1886,7 +3304,12 @@ impl Qwen38FullAttention {
             1,
             self.num_heads * self.head_dim,
         ))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        Ok(output)
+    }
+
+    /// The attention tail: the output gate, then `o_proj`.
+    pub(super) fn decode_output(&self, attended: &Tensor, q_proj: &Tensor) -> Result<Tensor> {
+        let output = self.gate_output(attended, q_proj)?;
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
@@ -1908,6 +3331,15 @@ impl Qwen38FullAttention {
 
     pub(super) fn cache_geometry(&self) -> (usize, usize, usize) {
         (self.num_kv_heads, self.head_dim, self.head_dim)
+    }
+
+    pub(super) fn q_norm(&self) -> &Qwen38RmsNorm {
+        &self.q_norm
+    }
+
+    pub(super) fn set_fused_norms(&mut self, fused: bool) {
+        self.q_norm.set_fused(fused);
+        self.k_norm.set_fused(fused);
     }
 
     fn apply_rope_plan(
@@ -1997,14 +3429,12 @@ impl Qwen38FullAttention {
 
 impl Qwen38LinearAttention {
     fn load_native(
-        tensors: &IndexedSafetensors,
-        device: &Device,
+        loader: &Qwen38WeightLoader<'_>,
         prefix: &str,
         cfg: &Qwen38TextConfig,
-        block: [usize; 2],
-        target: ProjectionMaterialization,
         performance: &CudaPerformanceConfig,
     ) -> Result<Self> {
+        let (tensors, device) = (loader.tensors, loader.device);
         let num_k_heads = cfg.ssm_group_count;
         let num_v_heads = cfg.ssm_time_step_rank;
         let head_k_dim = cfg.ssm_state_size;
@@ -2058,26 +3488,18 @@ impl Qwen38LinearAttention {
                 && performance.enabled()
                 && performance.fused_decode.enabled(),
             qkv_z_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&qkv_name, [conv_dim, cfg.embedding_length]),
                     (&z_name, [cfg.ssm_inner_size, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             alpha_beta_proj: load_native_projection_group(
-                tensors,
+                loader,
                 &[
                     (&alpha_name, [num_v_heads, cfg.embedding_length]),
                     (&beta_name, [num_v_heads, cfg.embedding_length]),
                 ],
-                block,
-                target,
-                device,
-                performance,
             )?,
             dt_bias,
             a,
@@ -2085,13 +3507,9 @@ impl Qwen38LinearAttention {
             conv_kernel_slices,
             norm,
             out_proj: load_native_projection(
-                tensors,
+                loader,
                 &format!("{linear}.out_proj.weight"),
                 [cfg.embedding_length, cfg.ssm_inner_size],
-                block,
-                target,
-                device,
-                performance,
             )?,
             num_k_heads,
             num_v_heads,
@@ -2101,7 +3519,191 @@ impl Qwen38LinearAttention {
             kernel_size: cfg.ssm_conv_kernel,
             tiled_recurrence_enabled: qwen38_tiled_recurrence_enabled(),
             tiled_recurrence_tile_size_override: qwen38_tiled_recurrence_tile_size_override(),
+            fused_gdn: None,
+            fused_gdn_path: Qwen38FastPath::default(),
+            alpha_beta_rows: None,
+            alpha_beta_gemv_path: Qwen38FastPath::default(),
+            gdn_prefill: false,
+            gdn_prefill_path: Qwen38FastPath::default(),
         })
+    }
+
+    /// Resolve the fused single-token decode at load. It needs 128-dim heads,
+    /// a 4-tap conv and value heads grouped over key heads (HF order), and
+    /// turns on only after a two-step self-check against today's decode on
+    /// this layer's own conv kernel, `dt_bias`, `A` and norm gain.
+    /// `IZWI_QWEN38_FUSED_GDN=legacy` keeps today's decode.
+    fn resolve_fused_gdn(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+        allow_cpu: bool,
+    ) {
+        self.fused_gdn = None;
+        self.fused_gdn_path = if let Some(path) =
+            decode_gate(FUSED_GDN_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if let Some(spec) = self.gdn_spec(device) {
+            match self.fused_gdn_self_check(&spec, device, dtype) {
+                Ok(()) => {
+                    self.fused_gdn = Some(spec);
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("DeltaNet decode", &error),
+            }
+        } else {
+            Qwen38FastPath::legacy(
+                    "fused DeltaNet decode needs SM80+, 128-dim heads, a 4-tap conv and value heads grouped over key heads",
+                )
+        };
+    }
+
+    /// The fused decode's view of this layer, when the generic kernel serves
+    /// its geometry on `device`.
+    fn gdn_spec(&self, device: &Device) -> Option<GdnDecodeSpec> {
+        let spec = GdnDecodeSpec {
+            key_heads: self.num_k_heads,
+            value_heads: self.num_v_heads,
+            grouped: true,
+            norm_eps: self.norm.eps as f32,
+        };
+        let fits = gdn::supported(device, self.head_k_dim, self.head_v_dim, self.kernel_size)
+            && self.num_k_heads > 0
+            && self.num_v_heads.is_multiple_of(self.num_k_heads)
+            && spec.conv_dim() == self.conv_dim
+            && self.conv_kernel.dims() == [self.conv_dim, gdn::CONV_TAPS]
+            && self.conv_kernel.dtype() == DType::F32
+            && self.norm.weight.dims() == [self.head_v_dim]
+            && self.norm.weight.dtype() == DType::F32;
+        fits.then_some(spec)
+    }
+
+    fn fused_gdn_self_check(
+        &self,
+        spec: &GdnDecodeSpec,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        self.fused_gdn_self_check_with(device, dtype, |row, conv_state, recurrent_state| {
+            self.fused_decode_row(
+                spec,
+                &row.mixed_qkv,
+                &row.z,
+                &row.beta,
+                &row.alpha,
+                conv_state,
+                recurrent_state,
+            )
+        })
+    }
+
+    /// Two consecutive synthetic decode steps through today's decode and
+    /// through `fused`, from identical states (a rotated portable ring and a
+    /// random F32 recurrent state): the outputs, the recurrent states and the
+    /// conv histories must agree after each step.
+    fn fused_gdn_self_check_with(
+        &self,
+        device: &Device,
+        dtype: DType,
+        fused: impl Fn(
+            &GdnSelfCheckRow,
+            &mut Option<ConvRingState>,
+            &mut Option<Tensor>,
+        ) -> Result<Tensor>,
+    ) -> Result<()> {
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let row = |len: usize, seed: f32, scale: f32| -> Result<Tensor> {
+            Ok(
+                Tensor::from_vec(self_check_wave(len, seed, scale), (1, 1, len), &Device::Cpu)?
+                    .to_dtype(dtype)?
+                    .to_device(device)?,
+            )
+        };
+        let slot = |seed: f32| -> Result<Tensor> {
+            Ok(Tensor::from_vec(
+                self_check_wave(self.conv_dim, seed, 1.0),
+                (self.conv_dim, 1),
+                &Device::Cpu,
+            )?
+            .to_device(device)?)
+        };
+        let state_len = self.num_v_heads * self.head_k_dim * self.head_v_dim;
+        let conv_state = Some(ConvRingState {
+            storage: ConvHistoryStorage::Ring {
+                slots: vec![slot(1.0)?, slot(2.0)?, slot(3.0)?],
+                next_idx: 1,
+            },
+        });
+        let recurrent_state = Some(
+            Tensor::from_vec(
+                self_check_wave(state_len, 4.0, 0.3),
+                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                &Device::Cpu,
+            )?
+            .to_device(device)?,
+        );
+        let (mut legacy_conv, mut legacy_recurrent) = (conv_state.clone(), recurrent_state.clone());
+        let (mut fused_conv, mut fused_recurrent) = (conv_state, recurrent_state);
+        for step in 0..2 {
+            let seed = 10.0 * (step as f32 + 1.0);
+            let inputs = GdnSelfCheckRow {
+                mixed_qkv: row(self.conv_dim, seed, 1.0)?,
+                z: row(value_width, seed + 1.0, 1.5)?,
+                beta: row(self.num_v_heads, seed + 2.0, 2.0)?,
+                alpha: row(self.num_v_heads, seed + 3.0, 2.0)?,
+            };
+            let expected = self.legacy_decode_row(
+                &inputs.mixed_qkv,
+                &inputs.z,
+                &inputs.alpha,
+                &inputs.beta,
+                &mut legacy_conv,
+                &mut legacy_recurrent,
+                dtype,
+            )?;
+            let actual = fused(&inputs, &mut fused_conv, &mut fused_recurrent)?;
+            compare_values(
+                &format!("DeltaNet decode output, step {step}"),
+                &host_values(&actual)?,
+                &host_values(&expected)?,
+                0.01,
+                0.03,
+            )?;
+            let state = |state: &Option<Tensor>| -> Result<Vec<f32>> {
+                host_values(state.as_ref().ok_or_else(|| {
+                    Error::InferenceError("DeltaNet self-check lost its recurrent state".into())
+                })?)
+            };
+            compare_values(
+                &format!("DeltaNet recurrent state, step {step}"),
+                &state(&fused_recurrent)?,
+                &state(&legacy_recurrent)?,
+                1e-4,
+                1e-3,
+            )?;
+            let history = |ring: &Option<ConvRingState>| -> Result<Vec<f32>> {
+                host_values(
+                    &ring
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::InferenceError(
+                                "DeltaNet self-check lost its conv history".into(),
+                            )
+                        })?
+                        .contiguous_history()?,
+                )
+            };
+            compare_values(
+                &format!("DeltaNet conv history, step {step}"),
+                &history(&fused_conv)?,
+                &history(&legacy_conv)?,
+                1e-6,
+                1e-6,
+            )?;
+        }
+        Ok(())
     }
 
     fn forward(
@@ -2109,28 +3711,192 @@ impl Qwen38LinearAttention {
         hidden_states: &Tensor,
         state: &mut Qwen38LayerRuntimeState,
     ) -> Result<Tensor> {
-        let (conv_state, recurrent_state) = match state {
-            Qwen38LayerRuntimeState::Linear {
+        let (conv_state, recurrent_state) = linear_state(state)?;
+        let residual_dtype = hidden_states.dtype();
+        let (mixed_qkv, z, alpha, beta) = self.decode_projections(hidden_states)?;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let output = match self.fused_gdn_for(
+            &mixed_qkv,
+            &z,
+            &alpha,
+            &beta,
+            [(&*conv_state, &*recurrent_state)],
+        ) {
+            Some(spec) => self
+                .fused_decode_row(
+                    spec,
+                    &mixed_qkv,
+                    &z,
+                    &beta,
+                    &alpha,
+                    conv_state,
+                    recurrent_state,
+                )?
+                .reshape((1, 1, value_width))?
+                .to_dtype(residual_dtype)?,
+            None => self.legacy_decode_row(
+                &mixed_qkv,
+                &z,
+                &alpha,
+                &beta,
                 conv_state,
                 recurrent_state,
-            } => (conv_state, recurrent_state),
-            _ => {
-                return Err(Error::InferenceError(
-                    "Qwen3.8 layer runtime state does not match linear-attention layer".to_string(),
-                ))
+                residual_dtype,
+            )?,
+        };
+        self.out_proj.forward(&output).map_err(Error::from)
+    }
+
+    /// The decode projections in their own dtype: `(mixed_qkv, z, alpha,
+    /// beta)`, the last two pre-activation. With the alpha/beta GEMV resolved,
+    /// a 16-bit row takes alpha and beta from one router-GEMV launch, rounded
+    /// through the activation dtype as the dense projection's output is.
+    fn decode_projections(
+        &self,
+        hidden_states: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
+        let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?;
+        let z = required_group_output(&mut qkv_z, "DeltaNet Z")?;
+        if let Some(rows) = self
+            .alpha_beta_rows
+            .as_ref()
+            .filter(|_| matches!(hidden_states.dtype(), DType::F16 | DType::BF16))
+        {
+            let (alpha, beta) = self.alpha_beta_gemv(hidden_states, rows)?;
+            return Ok((mixed_qkv, z, alpha, beta));
+        }
+        let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
+        let alpha = required_group_output(&mut alpha_beta, "DeltaNet alpha")?;
+        let beta = required_group_output(&mut alpha_beta, "DeltaNet beta")?;
+        Ok((mixed_qkv, z, alpha, beta))
+    }
+
+    /// `(alpha, beta)` `[batch, rows, value_heads]` in the input's dtype from
+    /// the F32 `rows` through the router GEMV.
+    fn alpha_beta_gemv(&self, hidden_states: &Tensor, rows: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (batch, sequence, hidden) = hidden_states.dims3()?;
+        let heads = self.num_v_heads;
+        let packed = crate::kernels::cuda::moe::router_logits(
+            &hidden_states.reshape((batch * sequence, hidden))?,
+            rows,
+        )?
+        .to_dtype(hidden_states.dtype())?
+        .reshape((batch, sequence, 2 * heads))?;
+        Ok((packed.narrow(2, 0, heads)?, packed.narrow(2, heads, heads)?))
+    }
+
+    /// Resolve the alpha/beta GEMV at load: the dense `in_proj_a`/`in_proj_b`
+    /// weights become F32 rows, kept only when a two-row probe through the
+    /// router GEMV matches the dense projection on this device. The rows cost
+    /// an F32 copy of the two small matrices (about 94 MB over 48 layers of
+    /// the 27B checkpoint). `IZWI_QWEN38_FUSED_AB_GEMV=legacy` keeps the dense
+    /// projection.
+    fn resolve_alpha_beta_gemv(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        dtype: DType,
+        allow_cpu: bool,
+    ) {
+        self.alpha_beta_rows = None;
+        self.alpha_beta_gemv_path = if let Some(path) =
+            decode_gate(FUSED_AB_GEMV_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !matches!(dtype, DType::F16 | DType::BF16) {
+            Qwen38FastPath::legacy("the alpha/beta GEMV needs 16-bit activations")
+        } else if let Some(rows) = self.alpha_beta_dense_rows() {
+            match self.alpha_beta_gemv_self_check(&rows, device, dtype) {
+                Ok(()) => {
+                    self.alpha_beta_rows = Some(rows);
+                    Qwen38FastPath::Fused
+                }
+                Err(error) => Qwen38FastPath::self_check_failed("alpha/beta GEMV", &error),
+            }
+        } else {
+            Qwen38FastPath::legacy(
+                "the alpha/beta GEMV needs dense in_proj_a/in_proj_b weights and a hidden width divisible by 4",
+            )
+        };
+    }
+
+    /// The dense alpha/beta weights as contiguous F32 rows `[2 * value_heads,
+    /// hidden]`, alpha first, when both projections are dense.
+    fn alpha_beta_dense_rows(&self) -> Option<Tensor> {
+        let dense = |projection: &Qwen38Projection| match projection {
+            Qwen38Projection::Dense(linear) => Some(linear.weight().clone()),
+            _ => None,
+        };
+        let weights = match &self.alpha_beta_proj {
+            Qwen38ProjectionGroup::Packed { projection, .. } => vec![dense(projection)?],
+            Qwen38ProjectionGroup::Separate(parts) => {
+                parts.iter().map(dense).collect::<Option<Vec<_>>>()?
             }
         };
+        let rows = Tensor::cat(&weights, 0)
+            .and_then(|rows| rows.to_dtype(DType::F32))
+            .and_then(|rows| rows.contiguous())
+            .ok()?;
+        let (count, hidden) = rows.dims2().ok()?;
+        (count == 2 * self.num_v_heads && hidden > 0 && hidden.is_multiple_of(4)).then_some(rows)
+    }
 
-        let residual_dtype = hidden_states.dtype();
-        let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
-        let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?.to_dtype(DType::F32)?;
-        let z = required_group_output(&mut qkv_z, "DeltaNet Z")?.to_dtype(DType::F32)?;
-        let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
-        let alpha =
-            required_group_output(&mut alpha_beta, "DeltaNet alpha")?.to_dtype(DType::F32)?;
-        let beta = ops::sigmoid(
-            &required_group_output(&mut alpha_beta, "DeltaNet beta")?.to_dtype(DType::F32)?,
+    /// The router GEMV over `rows` against the dense alpha/beta projection
+    /// for two `dtype` rows on `device`.
+    fn alpha_beta_gemv_self_check(
+        &self,
+        rows: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        let hidden = rows.dim(1)?;
+        let probe = Tensor::from_vec(
+            self_check_wave(2 * hidden, 13.0, 1.5),
+            (2, 1, hidden),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?;
+        let mut expected = self.alpha_beta_proj.forward(&probe)?.into_iter();
+        let expected_alpha = required_group_output(&mut expected, "DeltaNet alpha")?;
+        let expected_beta = required_group_output(&mut expected, "DeltaNet beta")?;
+        let (alpha, beta) = self.alpha_beta_gemv(&probe, rows)?;
+        compare_values(
+            "DeltaNet alpha GEMV",
+            &host_values(&alpha)?,
+            &host_values(&expected_alpha)?,
+            0.01,
+            0.02,
         )?;
+        compare_values(
+            "DeltaNet beta GEMV",
+            &host_values(&beta)?,
+            &host_values(&expected_beta)?,
+            0.01,
+            0.02,
+        )
+    }
+
+    /// Today's single-token decode from one row of projection outputs: F32
+    /// casts, the Candle discretization, q38's conv and recurrence kernels (or
+    /// the portable chain) and the gated norm. Returns the out-projection
+    /// input `[1, 1, value_heads * head_v_dim]` in `out_dtype`.
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_decode_row(
+        &self,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        conv_state: &mut Option<ConvRingState>,
+        recurrent_state: &mut Option<Tensor>,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
+        let mixed_qkv = mixed_qkv.to_dtype(DType::F32)?;
+        let z = z.to_dtype(DType::F32)?;
+        let alpha = alpha.to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(&beta.to_dtype(DType::F32)?)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -2212,10 +3978,104 @@ impl Qwen38LinearAttention {
         let output = output.reshape((self.num_v_heads, self.head_v_dim))?;
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z, true)?;
-        let output = output
+        output
             .reshape((1, 1, self.num_v_heads * self.head_v_dim))?
-            .to_dtype(residual_dtype)?;
-        self.out_proj.forward(&output).map_err(Error::from)
+            .to_dtype(out_dtype)
+            .map_err(Error::from)
+    }
+
+    /// The resolved fused decode, when every row's projections and state fit
+    /// it: 16-bit or F32 projections with beta and alpha in z's dtype, a 3-slot
+    /// F32 conv history and an F32 (or absent) recurrent state. A resolved path
+    /// that cannot take the rows counts a fallback per row.
+    fn fused_gdn_for<'a, 'b>(
+        &'a self,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        rows: impl IntoIterator<Item = (&'b Option<ConvRingState>, &'b Option<Tensor>)>,
+    ) -> Option<&'a GdnDecodeSpec> {
+        let spec = self.fused_gdn.as_ref()?;
+        let floating =
+            |tensor: &Tensor| matches!(tensor.dtype(), DType::F32 | DType::F16 | DType::BF16);
+        let projections = floating(mixed_qkv)
+            && floating(z)
+            && alpha.dtype() == z.dtype()
+            && beta.dtype() == z.dtype();
+        let mut count = 0usize;
+        let mut states = true;
+        for (conv_state, recurrent_state) in rows {
+            count += 1;
+            states &= conv_state.as_ref().is_some_and(|ring| {
+                ring.history_len().ok() == Some(gdn::CONV_TAPS - 1) && ring.is_f32()
+            }) && recurrent_state
+                .as_ref()
+                .is_none_or(|state| state.dtype() == DType::F32);
+        }
+        let accepted = projections && states;
+        for _ in 0..count {
+            record_cuda_kernel(CudaKernelPath::FusedGdnDecode, accepted);
+        }
+        accepted.then_some(spec)
+    }
+
+    /// One token's causal conv, recurrence and gated norm through two
+    /// launches: q38's own conv kernel (channel-major `[C, 3]` history, input
+    /// in the projection dtype) and the generic `gdn::recurrent_decode`.
+    /// `beta_raw`/`alpha` are the pre-activation `in_proj_b`/`in_proj_a`
+    /// outputs. The previous history and state are read-only and the kernels
+    /// write fresh outputs, which are published only after both succeed: a
+    /// failed step leaves the layer state untouched, and snapshots sharing
+    /// the previous tensors stay valid. Returns `[value_heads * head_v_dim]`
+    /// in z's dtype.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_decode_row(
+        &self,
+        spec: &GdnDecodeSpec,
+        mixed_qkv: &Tensor,
+        z: &Tensor,
+        beta_raw: &Tensor,
+        alpha: &Tensor,
+        conv_state: &mut Option<ConvRingState>,
+        recurrent_state: &mut Option<Tensor>,
+    ) -> Result<Tensor> {
+        let ring = conv_state.as_mut().ok_or_else(|| {
+            Error::InferenceError(
+                "Qwen3.8 fused DeltaNet decode needs an initialized convolution history".into(),
+            )
+        })?;
+        let history = ring.contiguous_history()?;
+        let (conv, next_history) = qwen38_conv_decode(mixed_qkv, &self.conv_kernel, &history)?;
+        let zeros;
+        let previous = match recurrent_state.as_ref() {
+            Some(previous) => previous,
+            None => {
+                if conv.device().is_cuda() {
+                    record_cuda_state_initial_allocation();
+                }
+                zeros = Tensor::zeros(
+                    (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                    DType::F32,
+                    conv.device(),
+                )?;
+                &zeros
+            }
+        };
+        let (y, next) = gdn::recurrent_decode(
+            &conv,
+            z,
+            beta_raw,
+            alpha,
+            &self.dt_bias,
+            &self.a,
+            &self.norm.weight,
+            previous,
+            spec,
+        )?;
+        ring.replace_contiguous(next_history, gdn::CONV_TAPS - 1)?;
+        *recurrent_state = Some(next);
+        Ok(y)
     }
 
     fn forward_decode_batch(
@@ -2230,15 +4090,45 @@ impl Qwen38LinearAttention {
             ));
         }
         let residual_dtype = hidden_states.dtype();
-        let mut qkv_z = self.qkv_z_proj.forward(hidden_states)?.into_iter();
-        let mixed_qkv = required_group_output(&mut qkv_z, "DeltaNet QKV")?.to_dtype(DType::F32)?;
-        let z = required_group_output(&mut qkv_z, "DeltaNet Z")?.to_dtype(DType::F32)?;
-        let mut alpha_beta = self.alpha_beta_proj.forward(hidden_states)?.into_iter();
-        let alpha =
-            required_group_output(&mut alpha_beta, "DeltaNet alpha")?.to_dtype(DType::F32)?;
-        let beta = ops::sigmoid(
-            &required_group_output(&mut alpha_beta, "DeltaNet beta")?.to_dtype(DType::F32)?,
-        )?;
+        let (mixed_qkv, z, alpha, beta) = self.decode_projections(hidden_states)?;
+        let value_width = self.num_v_heads * self.head_v_dim;
+        let rows = states
+            .iter()
+            .map(|state| match &**state {
+                Qwen38LayerRuntimeState::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => Ok((conv_state, recurrent_state)),
+                Qwen38LayerRuntimeState::Full => Err(Error::InferenceError(
+                    "Qwen3.8 layer runtime state does not match linear-attention layer".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(spec) = self.fused_gdn_for(&mixed_qkv, &z, &alpha, &beta, rows) {
+            // Two launches per row; the projections stay batched.
+            let mut outputs = Vec::with_capacity(batch_size);
+            for (row, state) in states.iter_mut().enumerate() {
+                let (conv_state, recurrent_state) = linear_state(state)?;
+                outputs.push(self.fused_decode_row(
+                    spec,
+                    &mixed_qkv.i(row)?,
+                    &z.i(row)?,
+                    &beta.i(row)?,
+                    &alpha.i(row)?,
+                    conv_state,
+                    recurrent_state,
+                )?);
+            }
+            let refs = outputs.iter().collect::<Vec<_>>();
+            let output = Tensor::stack(&refs, 0)?
+                .reshape((batch_size, 1, value_width))?
+                .to_dtype(residual_dtype)?;
+            return self.out_proj.forward(&output).map_err(Error::from);
+        }
+        let mixed_qkv = mixed_qkv.to_dtype(DType::F32)?;
+        let z = z.to_dtype(DType::F32)?;
+        let alpha = alpha.to_dtype(DType::F32)?;
+        let beta = ops::sigmoid(&beta.to_dtype(DType::F32)?)?;
         if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(Error::InferenceError(format!(
                 "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
@@ -2246,7 +4136,6 @@ impl Qwen38LinearAttention {
             )));
         }
         let key_width = self.num_k_heads * self.head_k_dim;
-        let value_width = self.num_v_heads * self.head_v_dim;
         let mut output_rows = Vec::with_capacity(batch_size);
         let mut gate_rows = Vec::with_capacity(batch_size);
         for row in 0..batch_size {
@@ -2389,7 +4278,94 @@ impl Qwen38LinearAttention {
 
         let convolution_input = verification.as_ref().map(|_| mixed_qkv.clone());
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
+        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+            return Err(Error::InferenceError(format!(
+                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
 
+        let current_state = if let Some(state) = recurrent_state.take() {
+            state
+        } else {
+            if mixed_qkv.device().is_cuda() {
+                record_cuda_state_initial_allocation();
+            }
+            Tensor::zeros(
+                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                DType::F32,
+                mixed_qkv.device(),
+            )?
+        };
+
+        let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
+        let g = g.reshape((1, seq_len, self.num_v_heads))?;
+        // The grouped kernel reads the conv output as is. Verification keeps
+        // today's path: it retains the normalized q/k for prefix recovery.
+        let grouped = if self.gdn_prefill && verification.is_none() {
+            let result = qwen38_deltanet_sequence(
+                &mixed_qkv,
+                &g,
+                &beta,
+                &current_state,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            );
+            if mixed_qkv.device().is_cuda() {
+                record_cuda_kernel(CudaKernelPath::DeltaNetGroupedPrefill, result.is_ok());
+            }
+            match result {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    tracing::warn!(%error, "Qwen3.8 grouped DeltaNet prefill failed; using the legacy recurrence");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (output, next_state) = match grouped {
+            Some(result) => result,
+            None => {
+                let (query, key, value) = self.normalized_qkv(&mixed_qkv, seq_len)?;
+                if let Some(retained) = verification {
+                    *retained = Some(Qwen38LinearVerification {
+                        initial: initial.expect("recording retains initial state"),
+                        convolution_input: convolution_input.expect("recording retains conv input"),
+                        query: query.clone(),
+                        key: key.clone(),
+                        value: value.clone(),
+                        g: g.clone(),
+                        beta: beta.clone(),
+                    });
+                }
+                self.legacy_sequence_recurrence(query, key, value, &g, &beta, current_state)?
+            }
+        };
+        // Sequence kernels may return the final state as a view into their
+        // packed output. Detach only this fixed-size escape value, using
+        // Candle-managed storage rather than an application private buffer.
+        *recurrent_state = Some(deep_copy_tensor_storage(&next_state)?);
+
+        let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let output = self.norm.forward(&output, &z, false)?;
+        let output = output
+            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
+        self.out_proj.forward(&output).map_err(Error::from)
+    }
+
+    /// Split a conv output `[1, seq, conv_dim]` into L2-normalized query and
+    /// key `[1, seq, key heads, key dim]` and the value `[1, seq, value
+    /// heads, value dim]`, as the legacy prefill recurrence consumes them.
+    fn normalized_qkv(
+        &self,
+        mixed_qkv: &Tensor,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let key_width = self.num_k_heads * self.head_k_dim;
         let value_width = self.num_v_heads * self.head_v_dim;
         let query = mixed_qkv.narrow(2, 0, key_width)?.reshape((
@@ -2410,114 +4386,170 @@ impl Qwen38LinearAttention {
             self.num_v_heads,
             self.head_v_dim,
         ))?;
+        Ok((
+            l2norm(&query, 1e-6, self.fused_decode)?,
+            l2norm(&key, 1e-6, self.fused_decode)?,
+            value,
+        ))
+    }
 
-        let query = l2norm(&query, 1e-6, self.fused_decode)?;
-        let key = l2norm(&key, 1e-6, self.fused_decode)?;
-        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
-            return Err(Error::InferenceError(format!(
-                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
-                self.num_v_heads, self.num_k_heads
-            )));
-        }
-
-        let current_state = if let Some(state) = recurrent_state.take() {
-            state
+    /// Today's prefill recurrence over normalized q/k: the tiled sequence
+    /// kernel when enabled, the portable recurrence otherwise. Both take one
+    /// q/k head per value head, so a grouped layout (16 key / 48 value heads)
+    /// is first expanded in Transformers' repeat-interleave order; the
+    /// kernel is never tried on the unexpanded heads it rejects.
+    fn legacy_sequence_recurrence(
+        &self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let seq_len = query.dim(1)?;
+        let (query, key) = if self.num_v_heads == self.num_k_heads {
+            (query, key)
         } else {
-            if value.device().is_cuda() {
-                record_cuda_state_initial_allocation();
+            let repeats = self.num_v_heads / self.num_k_heads;
+            if query.device().is_cuda() {
+                record_cuda_head_expansion_materialization();
+                record_cuda_head_expansion_materialization();
             }
-            Tensor::zeros(
-                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
-                value.device(),
-            )?
+            (
+                repeat_interleave_head_states_seq(&query, repeats)?,
+                repeat_interleave_head_states_seq(&key, repeats)?,
+            )
         };
-
-        let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
-        let g = g.reshape((1, seq_len, self.num_v_heads))?;
-        if let Some(retained) = verification {
-            *retained = Some(Qwen38LinearVerification {
-                initial: initial.expect("recording retains initial state"),
-                convolution_input: convolution_input.expect("recording retains conv input"),
-                query: query.clone(),
-                key: key.clone(),
-                value: value.clone(),
-                g: g.clone(),
-                beta: beta.clone(),
-            });
-        }
-        let tile_size =
-            qwen38_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let fused_sequence = if self.tiled_recurrence_enabled {
-            let fused = try_tiled_deltanet_recurrence(
-                &query,
-                &key,
-                &value,
-                &g,
-                &beta,
-                &current_state,
-                tile_size,
+        if self.tiled_recurrence_enabled {
+            let tile_size = qwen38_tiled_recurrence_tile_size(
+                seq_len,
+                self.tiled_recurrence_tile_size_override,
             );
+            let fused =
+                try_tiled_deltanet_recurrence(&query, &key, &value, g, beta, &state, tile_size);
             if query.device().is_cuda() {
                 record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused.is_some());
             }
-            fused
-        } else {
-            None
-        };
-        let (output, next_state) = if let Some(fused_sequence) = fused_sequence {
-            fused_sequence
-        } else {
-            // The portable recurrence consumes one Q/K head per value head.
-            // Native Qwen3.8 stores 16 Q/K heads and 48 value heads, so expand
-            // with Transformers' repeat-interleave ordering before fallback.
-            let (query, key) = if self.num_v_heads == self.num_k_heads {
-                (query, key)
-            } else {
-                let repeats = self.num_v_heads / self.num_k_heads;
-                if query.device().is_cuda() {
-                    record_cuda_head_expansion_materialization();
-                    record_cuda_head_expansion_materialization();
-                }
-                (
-                    repeat_interleave_head_states_seq(&query, repeats)?,
-                    repeat_interleave_head_states_seq(&key, repeats)?,
-                )
-            };
-            if self.tiled_recurrence_enabled {
-                let fused_sequence = try_tiled_deltanet_recurrence(
-                    &query,
-                    &key,
-                    &value,
-                    &g,
-                    &beta,
-                    &current_state,
-                    tile_size,
-                );
-                if query.device().is_cuda() {
-                    record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused_sequence.is_some());
-                }
-                if let Some(fused_sequence) = fused_sequence {
-                    fused_sequence
-                } else {
-                    recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
-                }
-            } else {
-                recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
+            if let Some(fused) = fused {
+                return Ok(fused);
             }
-        };
-        // Sequence kernels may return the final state as a view into their
-        // packed output. Detach only this fixed-size escape value, using
-        // Candle-managed storage rather than an application private buffer.
-        *recurrent_state = Some(deep_copy_tensor_storage(&next_state)?);
+        }
+        recurrent_gated_delta_sequence(&query, &key, &value, g, beta, state)
+    }
 
-        let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
-        let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
-        let output = self.norm.forward(&output, &z, false)?;
-        let output = output
-            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
-            .to_dtype(residual_dtype)?;
-        self.out_proj.forward(&output).map_err(Error::from)
+    /// Resolve the grouped DeltaNet prefill (`kernels::cuda::
+    /// qwen38_deltanet_sequence`) at load. It needs 128-dim key heads, value
+    /// heads grouped over key heads and a value width divisible by 16, and
+    /// turns on only after [`Self::gdn_prefill_self_check`] passes on this
+    /// device. The kernel has no weights, so one verdict per geometry
+    /// (`shared`) serves every layer. `IZWI_QWEN38_GDN_PREFILL=legacy`
+    /// keeps today's recurrence.
+    fn resolve_gdn_prefill(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        allow_cpu: bool,
+        shared: &mut Option<([usize; 4], Qwen38FastPath)>,
+    ) {
+        let geometry = [
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        ];
+        self.gdn_prefill_path = if let Some(path) =
+            decode_gate(GDN_PREFILL_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !qwen38_deltanet_sequence_supported(
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        ) {
+            Qwen38FastPath::legacy(
+                "the grouped DeltaNet prefill needs 128-dim key heads, value heads grouped over key heads and a value width divisible by 16",
+            )
+        } else if let Some((_, path)) = shared.as_ref().filter(|(seen, _)| *seen == geometry) {
+            path.clone()
+        } else {
+            let path = match self.gdn_prefill_self_check(device) {
+                Ok(()) => Qwen38FastPath::Fused,
+                Err(error) => Qwen38FastPath::self_check_failed("DeltaNet prefill", &error),
+            };
+            *shared = Some((geometry, path.clone()));
+            path
+        };
+        self.gdn_prefill = self.gdn_prefill_path.is_fused();
+    }
+
+    /// The grouped prefill kernel against today's recurrence (split, L2
+    /// norms, head expansion, the tiled or portable recurrence) on synthetic
+    /// inputs at this layer's geometry: 37 tokens, crossing the legacy
+    /// path's 16-token tiles and the kernel's one-token prefetch, from a
+    /// non-zero state. Outputs and final states must agree to 1e-4 relative
+    /// L2 and 1e-3 of the largest value per element (NaN-safe).
+    fn gdn_prefill_self_check(&self, device: &Device) -> Result<()> {
+        const TOKENS: usize = 37;
+        let (heads, key_dim, value_dim) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let conv_dim = 2 * self.num_k_heads * key_dim + heads * value_dim;
+        let tensor = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor> {
+            Ok(Tensor::from_vec(values, shape, &Device::Cpu)?.to_device(device)?)
+        };
+        // Pseudo-random (xorshift) inputs: a sinusoid's structure lets a
+        // wrong key-head mapping through at a fraction of a percent.
+        let noise =
+            |rows: usize, width: usize, seed: u64| probe_activations(rows, width, DType::F32, seed);
+        let mixed_qkv = tensor(noise(TOKENS, conv_dim, 31), &[1, TOKENS, conv_dim])?;
+        let g = tensor(
+            noise(TOKENS, heads, 32)
+                .iter()
+                .map(|v| -(0.02 + 0.5 * v.abs()))
+                .collect(),
+            &[1, TOKENS, heads],
+        )?;
+        let beta = tensor(
+            noise(TOKENS, heads, 33)
+                .iter()
+                .map(|v| 0.5 + 0.45 * v.clamp(-1.0, 1.0))
+                .collect(),
+            &[1, TOKENS, heads],
+        )?;
+        let state = tensor(
+            noise(heads * key_dim, value_dim, 34)
+                .iter()
+                .map(|v| 0.1 * v)
+                .collect(),
+            &[1, heads, key_dim, value_dim],
+        )?;
+        let (output, next_state) = qwen38_deltanet_sequence(
+            &mixed_qkv,
+            &g,
+            &beta,
+            &state,
+            self.num_k_heads,
+            heads,
+            key_dim,
+            value_dim,
+        )?;
+        let (query, key, value) = self.normalized_qkv(&mixed_qkv, TOKENS)?;
+        let (expected, expected_state) =
+            self.legacy_sequence_recurrence(query, key, value, &g, &beta, state)?;
+        compare_values(
+            "DeltaNet prefill output",
+            &host_values(&output)?,
+            &host_values(&expected)?,
+            1e-4,
+            1e-3,
+        )?;
+        compare_values(
+            "DeltaNet prefill state",
+            &host_values(&next_state)?,
+            &host_values(&expected_state)?,
+            1e-4,
+            1e-3,
+        )
     }
 
     fn depthwise_conv_sequence(
@@ -2674,138 +4706,720 @@ impl Qwen38GatedRmsNorm {
     }
 }
 
-pub(super) fn native_fp8_selected(
-    device: &Device,
-    target: ProjectionMaterialization,
-    shape: [usize; 2],
-    performance: &CudaPerformanceConfig,
-) -> bool {
-    use crate::kernels::cuda::fp8::{provider_auto_preferred, provider_supported};
-    use crate::performance::CudaProjectionBackend;
-    let dtype = match target {
-        ProjectionMaterialization::F32 => DType::F32,
-        ProjectionMaterialization::F16 => DType::F16,
-        ProjectionMaterialization::BF16 => DType::BF16,
-    };
-    performance.enabled()
-        && match performance.projection_backend {
-            CudaProjectionBackend::Q8 => false,
-            CudaProjectionBackend::Auto => {
-                provider_auto_preferred(device, dtype, shape[0], shape[1])
+/// What one load's block-FP8 checks resolved, for the diagnostics.
+#[derive(Debug, Default)]
+pub(super) struct Qwen38Fp8Outcomes {
+    /// One entry per block-FP8 projection group: packed, or why not.
+    pub(super) packing: Vec<Qwen38FastPath>,
+    /// Metal: one entry per checked FP8 projection kind (GEMV or rerouted).
+    pub(super) gemv: Vec<Qwen38FastPath>,
+    /// CUDA: one entry per checked FP8 projection kind: the dequantized
+    /// prefill GEMM, or why the kind keeps the compact kernel.
+    pub(super) prefill_gemm: Vec<Qwen38FastPath>,
+}
+
+/// Load-scoped state shared by every projection one model load
+/// materializes: the checkpoint, the residency policy, the device, and the
+/// bookkeeping of the load-time FP8 checks and packing.
+pub(super) struct Qwen38WeightLoader<'a> {
+    pub(super) tensors: &'a IndexedSafetensors,
+    pub(super) policy: &'a Qwen38ResidencyPolicy,
+    pub(super) device: &'a Device,
+    pub(super) block: [usize; 2],
+    pub(super) target: ProjectionMaterialization,
+    /// Projection kinds (layer index removed) whose resident FP8 form has
+    /// passed the check against the original checkpoint bytes.
+    checked: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// One entry per block-FP8 projection group: packed, or why not.
+    packing: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// Metal: one entry per checked FP8 projection kind: the GEMV passed,
+    /// or the kind was rerouted through dequantize + matmul.
+    gemv: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// Metal: projection kinds whose GEMV failed its check.
+    dequant_kinds: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// CUDA: one entry per checked FP8 projection kind: the dequantized
+    /// prefill GEMM passed its check, or why the kind keeps `mm`.
+    prefill_gemm: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// The prefill GEMM's verdict per checked projection kind.
+    prefill_gemm_kinds: std::cell::RefCell<std::collections::BTreeMap<String, bool>>,
+    /// Tests: corrupt the scales of every FP8 projection this loader
+    /// materializes, to prove the load-time check fails closed.
+    #[cfg(test)]
+    pub(super) corrupt_fp8_scales: std::cell::Cell<bool>,
+}
+
+/// Activation rows of the load-time FP8 check: decode, verification and a
+/// prefill-sized span, so every kernel the projection runs is compared.
+const FP8_CHECK_ROWS: [usize; 3] = [1, 4, 16];
+/// Output-row stride of the load-time FP8 check (plus every pack boundary).
+const FP8_CHECK_ROW_STRIDE: usize = 61;
+
+impl<'a> Qwen38WeightLoader<'a> {
+    pub(super) fn new(
+        tensors: &'a IndexedSafetensors,
+        policy: &'a Qwen38ResidencyPolicy,
+        device: &'a Device,
+        block: [usize; 2],
+        target: ProjectionMaterialization,
+    ) -> Self {
+        Self {
+            tensors,
+            policy,
+            device,
+            block,
+            target,
+            checked: Default::default(),
+            packing: Default::default(),
+            gemv: Default::default(),
+            dequant_kinds: Default::default(),
+            prefill_gemm: Default::default(),
+            prefill_gemm_kinds: Default::default(),
+            #[cfg(test)]
+            corrupt_fp8_scales: Default::default(),
+        }
+    }
+
+    pub(super) fn into_packing(self) -> Vec<Qwen38FastPath> {
+        self.into_outcomes().packing
+    }
+
+    /// What this load's FP8 checks resolved.
+    pub(super) fn into_outcomes(self) -> Qwen38Fp8Outcomes {
+        Qwen38Fp8Outcomes {
+            packing: self.packing.into_inner(),
+            gemv: self.gemv.into_inner(),
+            prefill_gemm: self.prefill_gemm.into_inner(),
+        }
+    }
+
+    /// Whether a freshly materialized projection of `kind` runs the
+    /// dequantized prefill GEMM: the policy resolved it and the kind has not
+    /// failed its check in this load.
+    fn prefill_gemm_for(&self, kind: &str) -> bool {
+        self.policy.fp8_prefill_gemm() && self.prefill_gemm_kinds.borrow().get(kind) != Some(&false)
+    }
+
+    fn fp8_kernel(&self) -> Qwen38Fp8Kernel {
+        if self.device.is_cuda() && self.policy.fp8_vectorized() {
+            Qwen38Fp8Kernel::Vectorized
+        } else if self.device.is_metal() && self.policy.fp8_dequant_only() {
+            Qwen38Fp8Kernel::DequantOnly
+        } else {
+            Qwen38Fp8Kernel::Reference
+        }
+    }
+
+    fn kind(parts: &[(&str, [usize; 2])]) -> String {
+        parts
+            .iter()
+            .map(|(name, _)| projection_kind(name))
+            .collect::<Vec<_>>()
+            .join("+")
+    }
+
+    /// Check a freshly materialized FP8 projection (see
+    /// [`Self::fp8_self_check`]). On Metal a mismatch first reroutes the
+    /// projection kind through dequantize + matmul (the GEMV may be the
+    /// culprit) and checks again; only a second mismatch fails.
+    pub(super) fn checked_fp8(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Result<Qwen38Projection> {
+        let projection = self.checked_fp8_kernels(parts, projection)?;
+        Ok(self.checked_prefill_gemm(parts, projection))
+    }
+
+    /// The dequantized prefill GEMM of a projection that passed its kernel
+    /// checks: once per projection kind, [`fp8_prefill_gemm_check`] compares
+    /// it with the compact kernel and the original checkpoint bytes. A
+    /// mismatch keeps the kind on `mm` (with a diagnostics reason) instead of
+    /// failing the load.
+    fn checked_prefill_gemm(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Qwen38Projection {
+        if !matches!(
+            projection,
+            Qwen38Projection::NativeFp8 {
+                prefill_gemm: true,
+                ..
             }
-            CudaProjectionBackend::NativeFp8 => {
-                provider_supported(device, dtype, shape[0], shape[1])
+        ) {
+            return projection;
+        }
+        let kind = Self::kind(parts);
+        if self.prefill_gemm_kinds.borrow().contains_key(&kind) {
+            return projection;
+        }
+        match fp8_prefill_gemm_check(
+            self.tensors,
+            parts,
+            self.block,
+            &projection,
+            self.target.dtype(),
+            self.device,
+        ) {
+            Ok(()) => {
+                self.prefill_gemm_kinds.borrow_mut().insert(kind, true);
+                self.prefill_gemm.borrow_mut().push(Qwen38FastPath::Fused);
+                projection
+            }
+            Err(error) => {
+                record_fast_path_self_check_failure();
+                tracing::warn!(%error, kind, "Qwen3.8 dequantized FP8 prefill GEMM failed its load-time check; this projection kind keeps the compact FP8 kernel");
+                self.prefill_gemm
+                    .borrow_mut()
+                    .push(Qwen38FastPath::legacy(format!(
+                        "self_check_failed: {kind}: {error}"
+                    )));
+                self.prefill_gemm_kinds.borrow_mut().insert(kind, false);
+                projection
+                    .with_prefill_gemm(false)
+                    .expect("checked projections are native block FP8")
             }
         }
-}
+    }
 
-pub(super) fn native_projection_representation(
-    device: &Device,
-    target: ProjectionMaterialization,
-) -> Qwen38ProjectionRepresentation {
-    if device.is_cuda() {
-        return match target {
-            ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::PackedQ8WithDenseF16,
-            ProjectionMaterialization::BF16 => {
-                Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16
+    /// The kernel checks of [`Self::checked_fp8`] (the decode GEMVs and the
+    /// compact `mm` kernel); see [`Self::fp8_self_check`].
+    fn checked_fp8_kernels(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Result<Qwen38Projection> {
+        let kind = Self::kind(parts);
+        let fresh = !self.checked.borrow().contains(&kind);
+        match self.fp8_self_check(parts, &projection) {
+            Ok(()) => {
+                if fresh && self.device.is_metal() {
+                    self.gemv.borrow_mut().push(match &projection {
+                        Qwen38Projection::NativeFp8 {
+                            kernel: Qwen38Fp8Kernel::DequantOnly,
+                            ..
+                        } => Qwen38FastPath::legacy(format!(
+                            "{}=legacy",
+                            super::residency::FP8_GEMV_ENV
+                        )),
+                        _ => Qwen38FastPath::Fused,
+                    });
+                }
+                Ok(projection)
             }
-            ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
-        };
+            Err(error) if self.device.is_metal() => {
+                let Qwen38Projection::NativeFp8 {
+                    raw,
+                    kernel,
+                    prefill_gemm,
+                } = projection
+                else {
+                    return Err(error);
+                };
+                if kernel == Qwen38Fp8Kernel::DequantOnly {
+                    return Err(error);
+                }
+                let rerouted = Qwen38Projection::NativeFp8 {
+                    raw,
+                    kernel: Qwen38Fp8Kernel::DequantOnly,
+                    prefill_gemm,
+                };
+                self.fp8_self_check(parts, &rerouted).map_err(|second| {
+                    Error::ModelLoadError(format!(
+                        "{error}; with dequantize + matmul only: {second}"
+                    ))
+                })?;
+                record_fast_path_self_check_failure();
+                tracing::warn!(%error, kind, "Qwen3.8 Metal FP8 GEMV failed its check; this projection kind runs dequantize + matmul");
+                self.dequant_kinds.borrow_mut().insert(kind);
+                self.gemv.borrow_mut().push(Qwen38FastPath::legacy(format!(
+                    "self_check_failed: {error}"
+                )));
+                Ok(rerouted)
+            }
+            Err(error) => Err(error),
+        }
     }
-    match target {
-        ProjectionMaterialization::F32 => Qwen38ProjectionRepresentation::ExpandedF32,
-        ProjectionMaterialization::F16 => Qwen38ProjectionRepresentation::ExpandedF16,
-        ProjectionMaterialization::BF16 => Qwen38ProjectionRepresentation::ExpandedBf16,
+
+    /// The parts' bytes as one raw block-FP8 projection on the device.
+    fn materialize_fp8(&self, parts: &[(&str, [usize; 2])]) -> Result<Qwen38Projection> {
+        let raw = self
+            .tensors
+            .materialize_block_fp8_raw_group(parts, self.block, self.device)?;
+        #[cfg(test)]
+        let raw = if self.corrupt_fp8_scales.get() {
+            super::native::RawBlockFp8Projection {
+                scales: (&raw.scales * 1.5)?,
+                ..raw
+            }
+        } else {
+            raw
+        };
+        let kind = Self::kind(parts);
+        let kernel = if self.dequant_kinds.borrow().contains(&kind) {
+            Qwen38Fp8Kernel::DequantOnly
+        } else {
+            self.fp8_kernel()
+        };
+        Ok(Qwen38Projection::NativeFp8 {
+            raw,
+            kernel,
+            prefill_gemm: self.prefill_gemm_for(&kind),
+        })
+    }
+
+    /// Check a resident FP8 projection (one part, or a pack of `parts` in
+    /// row order) against a host reference built from the ORIGINAL per-part
+    /// checkpoint bytes and scales, never from the uploaded copy: sampled
+    /// output rows, every pack boundary, at 1, 4 and 16 activation rows,
+    /// through the compact kernels (the prefill GEMM has its own check).
+    /// Runs once per projection kind (layer index removed).
+    pub(super) fn fp8_self_check(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: &Qwen38Projection,
+    ) -> Result<()> {
+        let kind = Self::kind(parts);
+        if self.checked.borrow().contains(&kind) {
+            return Ok(());
+        }
+        let compact = projection.with_prefill_gemm(false);
+        fp8_projection_check(
+            self.tensors,
+            parts,
+            self.block,
+            compact.as_ref().unwrap_or(projection),
+            self.target.dtype(),
+            self.device,
+        )
+        .map_err(|error| Error::ModelLoadError(format!("{kind}: {error}")))?;
+        self.checked.borrow_mut().insert(kind);
+        Ok(())
     }
 }
 
-pub(super) fn load_native_projection(
+/// `model.language_model.layers.7.mlp.down_proj.weight` -> `mlp.down_proj`;
+/// MTP names keep an `mtp:` tag.
+fn projection_kind(name: &str) -> String {
+    let stem = name.strip_suffix(".weight").unwrap_or(name);
+    let (tag, rest) = if let Some(rest) = stem.strip_prefix("mtp.layers.") {
+        ("mtp:", rest)
+    } else if let Some(rest) = stem.strip_prefix("model.language_model.layers.") {
+        ("", rest)
+    } else {
+        return stem.to_string();
+    };
+    format!(
+        "{tag}{}",
+        rest.split_once('.').map_or(rest, |(_, rest)| rest)
+    )
+}
+
+/// Output rows a load-time FP8 check samples and their original
+/// checkpoint bytes: every [`FP8_CHECK_ROW_STRIDE`]th row, both sides of every
+/// pack and scale-block boundary, the last row and `extra` rows, each with
+/// `(bytes, the part's scale grid, row block in the part)`.
+struct Fp8CheckReference {
+    k: usize,
+    total: usize,
+    sampled: Vec<usize>,
+    rows: Vec<(Vec<u8>, std::sync::Arc<Vec<f32>>, usize)>,
+}
+
+impl Fp8CheckReference {
+    fn new(
+        tensors: &IndexedSafetensors,
+        parts: &[(&str, [usize; 2])],
+        block: [usize; 2],
+        extra: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
+        let k = parts
+            .first()
+            .map(|(_, shape)| shape[1])
+            .ok_or_else(|| Error::ModelLoadError("empty FP8 check".into()))?;
+        let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
+        let mut rows: std::collections::BTreeSet<usize> =
+            (0..total).step_by(FP8_CHECK_ROW_STRIDE).collect();
+        let mut offset = 0usize;
+        for (_, shape) in parts {
+            for row in [
+                offset.wrapping_sub(1),
+                offset,
+                offset + 1,
+                offset + 127,
+                offset + 128,
+            ] {
+                if row < total {
+                    rows.insert(row);
+                }
+            }
+            offset += shape[0];
+        }
+        rows.insert(total - 1);
+        rows.extend(extra.into_iter().filter(|row| *row < total));
+        let mut references = Vec::with_capacity(rows.len());
+        let mut offset = 0usize;
+        for (name, shape) in parts {
+            let local: Vec<usize> = rows
+                .range(offset..offset + shape[0])
+                .map(|row| row - offset)
+                .collect();
+            if !local.is_empty() {
+                let (bytes, scales) = tensors.block_fp8_rows(name, *shape, block, &local)?;
+                let scales = std::sync::Arc::new(scales);
+                for (index, row) in local.iter().enumerate() {
+                    references.push((
+                        bytes[index * k..(index + 1) * k].to_vec(),
+                        scales.clone(),
+                        row / block[0],
+                    ));
+                }
+            }
+            offset += shape[0];
+        }
+        Ok(Self {
+            k,
+            total,
+            sampled: rows.into_iter().collect(),
+            rows: references,
+        })
+    }
+
+    /// `(actual, expected)` at the sampled rows for `m` activation rows `x`
+    /// and the projection's `[m, total]` output.
+    fn sampled(
+        &self,
+        block: [usize; 2],
+        x: &[f32],
+        output: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let m = x.len() / self.k;
+        if output.len() != m * self.total {
+            return Err(Error::ModelLoadError(format!(
+                "FP8 check produced {} values, expected {}",
+                output.len(),
+                m * self.total
+            )));
+        }
+        let scale_cols = self.k.div_ceil(block[1]);
+        let mut actual = Vec::with_capacity(m * self.sampled.len());
+        let mut expected = Vec::with_capacity(m * self.sampled.len());
+        for (row_index, activations) in x.chunks(self.k).enumerate() {
+            for (row, (bytes, scales, row_block)) in self.sampled.iter().zip(&self.rows) {
+                actual.push(output[row_index * self.total + row]);
+                expected.push(fp8_row_dot(
+                    bytes,
+                    scales,
+                    *row_block,
+                    scale_cols,
+                    block[1],
+                    activations,
+                ));
+            }
+        }
+        Ok((actual, expected))
+    }
+}
+
+/// `projection` on `m` probe rows (seeded) of the activation dtype, on the
+/// host as F32 `(activations, output)`.
+fn fp8_check_forward(
+    projection: &Qwen38Projection,
+    m: usize,
+    k: usize,
+    activation: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let x = probe_activations(m, k, activation, seed);
+    let input = Tensor::from_vec(x.clone(), (1, m, k), &Device::Cpu)?
+        .to_dtype(activation)?
+        .to_device(device)?;
+    let output = projection
+        .forward(&input)?
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok((x, output))
+}
+
+/// The comparison behind [`Qwen38WeightLoader::fp8_self_check`]. Tolerance:
+/// 1% relative L2 and 2% of the largest reference magnitude per element,
+/// NaN-safe; the reference multiplies the same activation-dtype-rounded
+/// inputs the device sees.
+pub(super) fn fp8_projection_check(
     tensors: &IndexedSafetensors,
+    parts: &[(&str, [usize; 2])],
+    block: [usize; 2],
+    projection: &Qwen38Projection,
+    activation: DType,
+    device: &Device,
+) -> Result<()> {
+    let reference = Fp8CheckReference::new(tensors, parts, block, [])?;
+    for (seed, m) in FP8_CHECK_ROWS.into_iter().enumerate() {
+        let (x, output) = fp8_check_forward(
+            projection,
+            m,
+            reference.k,
+            activation,
+            101 + seed as u64,
+            device,
+        )?;
+        let (actual, expected) = reference.sampled(block, &x, &output)?;
+        compare_values(
+            &format!("block-FP8 check at {m} rows"),
+            &actual,
+            &expected,
+            0.01,
+            0.02,
+        )?;
+    }
+    Ok(())
+}
+
+/// Activation rows of the load-time prefill GEMM check: the switch-over (one
+/// `mm` tile) and a multi-tile span.
+const FP8_PREFILL_CHECK_ROWS: [usize; 2] = [FP8_PREFILL_GEMM_MIN_ROWS, 64];
+
+/// The check behind [`Qwen38WeightLoader::checked_prefill_gemm`], at the
+/// projection's real geometry and at 16 and 64 activation rows: the
+/// dequantized GEMM's COMPLETE output against the compact `mm` kernel on
+/// the same resident tensors, and its sampled rows (plus both sides of every
+/// dequantization tile boundary) against a host reference from the original
+/// checkpoint bytes. Same tolerances as [`fp8_projection_check`], NaN-safe.
+pub(super) fn fp8_prefill_gemm_check(
+    tensors: &IndexedSafetensors,
+    parts: &[(&str, [usize; 2])],
+    block: [usize; 2],
+    projection: &Qwen38Projection,
+    activation: DType,
+    device: &Device,
+) -> Result<()> {
+    let (gemm, compact) = match (
+        projection.with_prefill_gemm(true),
+        projection.with_prefill_gemm(false),
+    ) {
+        (Some(gemm), Some(compact)) => (gemm, compact),
+        _ => {
+            return Err(Error::ModelLoadError(
+                "the prefill GEMM check needs a native block-FP8 projection".into(),
+            ))
+        }
+    };
+    let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
+    let k = parts.first().map_or(0, |(_, shape)| shape[1]);
+    let tile = crate::kernels::cuda::fp8::dequant_gemm_tile_rows(total, k).max(1);
+    let boundaries = (tile..total).step_by(tile).flat_map(|row| [row - 1, row]);
+    let reference = Fp8CheckReference::new(tensors, parts, block, boundaries)?;
+    for (seed, m) in FP8_PREFILL_CHECK_ROWS.into_iter().enumerate() {
+        let seed = 211 + seed as u64;
+        let (x, output) = fp8_check_forward(&gemm, m, reference.k, activation, seed, device)?;
+        let (_, compact) = fp8_check_forward(&compact, m, reference.k, activation, seed, device)?;
+        compare_values(
+            &format!("prefill GEMM vs the compact FP8 kernel at {m} rows"),
+            &output,
+            &compact,
+            0.01,
+            0.02,
+        )?;
+        let (actual, expected) = reference.sampled(block, &x, &output)?;
+        compare_values(
+            &format!("prefill GEMM vs the checkpoint bytes at {m} rows"),
+            &actual,
+            &expected,
+            0.01,
+            0.02,
+        )?;
+    }
+    Ok(())
+}
+
+/// Load one projection in the form the residency policy chose. A native FP8
+/// projection is checked against the original checkpoint bytes before it is
+/// published; a mismatch fails the load and poisons the policy, so the retry
+/// resolves (and admission prices) the fallback.
+pub(super) fn load_native_projection(
+    loader: &Qwen38WeightLoader<'_>,
     name: &str,
     shape: [usize; 2],
-    block: [usize; 2],
-    target: ProjectionMaterialization,
-    device: &Device,
-    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38Projection> {
-    if device.is_cuda() && tensors.tensor_info(name)?.dtype == SafeDType::F8_E4M3 {
-        if native_fp8_selected(device, target, shape, performance) {
-            return tensors
-                .materialize_block_fp8_raw(name, shape, block, device)
-                .map(Qwen38Projection::NativeFp8);
+    let tensors = loader.tensors;
+    let info = tensors.tensor_info(name)?;
+    match loader
+        .policy
+        .projection_form(info.dtype, shape, loader.block)
+    {
+        Qwen38WeightForm::RawFp8 => {
+            let projection = loader.materialize_fp8(&[(name, shape)])?;
+            loader
+                .checked_fp8(&[(name, shape)], projection)
+                .map_err(|error| {
+                    record_fast_path_self_check_failure();
+                    let reason = error.to_string();
+                    loader.policy.poison_projections(&reason);
+                    tracing::warn!(%reason, "Qwen3.8 native FP8 load-time check failed");
+                    let remedy = if loader.device.is_metal() {
+                        "The next load expands projections to F16; set IZWI_METAL_PROJECTION_BACKEND=expanded to skip native FP8 on Metal"
+                    } else {
+                        "The next load keeps Q8_0 projections; set IZWI_QWEN38_FP8_PROJECTIONS=legacy (or IZWI_CUDA_PROJECTION_BACKEND=q8) to skip native FP8"
+                    };
+                    Error::ModelLoadError(format!(
+                        "Qwen3.8 native block-FP8 self_check_failed: {reason}. {remedy}"
+                    ))
+                })
         }
-        return tensors
-            .materialize_q8_projection(name, shape, block, device)
-            .map(Qwen38Projection::Quantized);
+        Qwen38WeightForm::Q8_0 => tensors
+            .materialize_q8_projection_parallel(&[(name, shape)], loader.block, loader.device)
+            .map(Qwen38Projection::Quantized),
+        Qwen38WeightForm::Dense(_) => tensors
+            .materialize_projection(name, shape, loader.block, loader.target, loader.device)
+            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None))),
     }
-    tensors
-        .materialize_projection(name, shape, block, target, device)
-        .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))
 }
 
+/// Load the LM head in the form the residency policy chose. A block-FP8 head
+/// that fails its quality gate or device check fails the load closed and
+/// poisons the head's FP8 form, so the retry admits and loads the dense head.
+fn load_lm_head(
+    loader: &Qwen38WeightLoader<'_>,
+    shape: [usize; 2],
+) -> Result<(Qwen38Projection, (Qwen38FastPath, Option<f64>))> {
+    let name = "lm_head.weight";
+    if loader.policy.lm_head_form(shape) == Qwen38WeightForm::Q8_0 {
+        // The CPU's Q8_0 head, requantized from the BF16 mapping in row tiles.
+        return Ok((
+            loader
+                .tensors
+                .materialize_dense_as_q8(name, shape, loader.device)
+                .map(Qwen38Projection::Quantized)?,
+            (
+                Qwen38FastPath::legacy("the CPU LM head is Q8_0, not block FP8"),
+                None,
+            ),
+        ));
+    }
+    if loader.policy.lm_head_form(shape) != Qwen38WeightForm::RawFp8 {
+        let reason = match loader.policy.fp8_lm_head() {
+            Qwen38FastPath::Legacy { reason } => reason.clone(),
+            Qwen38FastPath::Fused => "outside the FP8 kernel contract".into(),
+        };
+        return Ok((
+            load_native_projection(loader, name, shape)?,
+            (Qwen38FastPath::legacy(reason), None),
+        ));
+    }
+    match super::lm_head::quantize_lm_head_from_checkpoint(
+        loader.tensors,
+        name,
+        shape,
+        loader.device,
+        loader.target.dtype(),
+        loader.fp8_kernel(),
+    )? {
+        Ok(head) => Ok((
+            head.projection,
+            (Qwen38FastPath::Fused, Some(head.gate_relative_l2)),
+        )),
+        Err(reason) => {
+            record_fast_path_self_check_failure();
+            loader.policy.poison_lm_head(&reason);
+            tracing::warn!(%reason, "Qwen3.8 block-FP8 LM head failed its checks");
+            Err(Error::ModelLoadError(format!(
+                "Qwen3.8 block-FP8 LM head self_check_failed: {reason}. The next load keeps the dense head; set IZWI_QWEN38_FP8_LM_HEAD=legacy to skip it"
+            )))
+        }
+    }
+}
+
+/// Load row-compatible projections as one packed matrix when the residency
+/// policy packs their (shared) form, else separately. A block-FP8 pack needs
+/// whole 128-row scale blocks in every part but the last; it is checked
+/// against the original per-part bytes, and a pack that fails is dropped and
+/// rebuilt from separate parts (the same bytes).
 fn load_native_projection_group(
-    tensors: &IndexedSafetensors,
+    loader: &Qwen38WeightLoader<'_>,
     projections: &[(&str, [usize; 2])],
-    block: [usize; 2],
-    target: ProjectionMaterialization,
-    device: &Device,
-    performance: &CudaPerformanceConfig,
 ) -> Result<Qwen38ProjectionGroup> {
+    let tensors = loader.tensors;
     let load_separate = || {
         projections
             .iter()
-            .map(|(name, shape)| {
-                load_native_projection(tensors, name, *shape, block, target, device, performance)
-            })
+            .map(|(name, shape)| load_native_projection(loader, name, *shape))
             .collect::<Result<Vec<_>>>()
             .map(Qwen38ProjectionGroup::Separate)
     };
-    if !(device.is_cuda()
-        && performance.enabled()
-        && performance.packed_projections.enabled()
-        && projection_group_geometry_compatible(projections))
-    {
+    let forms = projections
+        .iter()
+        .map(|(name, shape)| {
+            tensors.tensor_info(name).map(|info| {
+                loader
+                    .policy
+                    .projection_form(info.dtype, *shape, loader.block)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fp8 = forms.first() == Some(&Qwen38WeightForm::RawFp8);
+    let packable =
+        loader.policy.packing_allowed(&forms) && projection_group_geometry_compatible(projections);
+    if !packable {
+        if forms.contains(&Qwen38WeightForm::RawFp8) {
+            loader.packing.borrow_mut().push(Qwen38FastPath::legacy(
+                if forms.iter().all(|f| *f == forms[0]) {
+                    "packing off"
+                } else {
+                    "mixed resident forms"
+                },
+            ));
+        }
         return load_separate();
     }
-
-    let all_fp8 = projections.iter().all(|(name, _)| {
-        tensors
-            .tensor_info(name)
-            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
-    });
-    let any_fp8 = projections.iter().any(|(name, _)| {
-        tensors
-            .tensor_info(name)
-            .is_ok_and(|info| info.dtype == SafeDType::F8_E4M3)
-    });
-    // Do not merge different persistent representations. The separate path
-    // remains the safe fallback for unusual checkpoint variants.
-    if any_fp8 && !all_fp8 {
-        return load_separate();
-    }
-
-    // A direct native provider owns exact source blocks; use separate
-    // projections when their row boundaries cannot safely share one scale grid.
-    if all_fp8
-        && projections
-            .iter()
-            .any(|(_, shape)| native_fp8_selected(device, target, *shape, performance))
-    {
-        return load_separate();
-    }
-    let projection = if device.is_cuda() && all_fp8 {
-        tensors
-            .materialize_q8_projection_group(projections, block, device)
-            .map(Qwen38Projection::Quantized)?
-    } else {
-        tensors
-            .materialize_projection_group(projections, block, target, device)
-            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))?
+    let widths = projections.iter().map(|(_, shape)| shape[0]).collect();
+    let projection = match forms[0] {
+        Qwen38WeightForm::RawFp8 => {
+            let aligned = projections
+                .iter()
+                .take(projections.len() - 1)
+                .all(|(_, shape)| shape[0].is_multiple_of(loader.block[0]));
+            if !aligned {
+                loader.packing.borrow_mut().push(Qwen38FastPath::legacy(
+                    "a part does not end on a 128-row scale block",
+                ));
+                return load_separate();
+            }
+            let packed = loader
+                .materialize_fp8(projections)
+                .and_then(|projection| loader.checked_fp8(projections, projection));
+            match packed {
+                Ok(projection) => {
+                    loader.packing.borrow_mut().push(Qwen38FastPath::Fused);
+                    projection
+                }
+                Err(error) => {
+                    record_fast_path_self_check_failure();
+                    tracing::warn!(
+                        %error,
+                        "Qwen3.8 packed block-FP8 projection failed its check; loading the parts separately"
+                    );
+                    loader
+                        .packing
+                        .borrow_mut()
+                        .push(Qwen38FastPath::legacy(format!(
+                            "self_check_failed: {error}"
+                        )));
+                    return load_separate();
+                }
+            }
+        }
+        Qwen38WeightForm::Q8_0 => tensors
+            .materialize_q8_projection_parallel(projections, loader.block, loader.device)
+            .map(Qwen38Projection::Quantized)?,
+        Qwen38WeightForm::Dense(_) => tensors
+            .materialize_projection_group(projections, loader.block, loader.target, loader.device)
+            .map(|weight| Qwen38Projection::Dense(Linear::new(weight, None)))?,
     };
-    Ok(Qwen38ProjectionGroup::Packed {
-        projection,
-        widths: projections.iter().map(|(_, shape)| shape[0]).collect(),
-    })
+    debug_assert!(fp8 == matches!(projection, Qwen38Projection::NativeFp8 { .. }));
+    Ok(Qwen38ProjectionGroup::Packed { projection, widths })
 }
 
 fn projection_group_geometry_compatible(projections: &[(&str, [usize; 2])]) -> bool {
@@ -2855,12 +5469,164 @@ pub(super) fn load_native_zero_centered_norm(
     name: &str,
     length: usize,
     eps: f64,
-    target: ProjectionMaterialization,
     device: &Device,
 ) -> Result<Qwen38RmsNorm> {
-    let weight = tensors.materialize_dense_tensor(name, &[length], target, device)?;
+    // The shifted gain stays F32 whatever the plan's activation dtype: `1 + w`
+    // rounded to BF16 loses up to ~0.4% per channel. `Qwen38RmsNorm` runs the
+    // norm in the gain's dtype, as HF does.
+    let weight = tensors.materialize_dense_tensor(
+        name,
+        &[length],
+        ProjectionMaterialization::F32,
+        device,
+    )?;
     let weight = (weight + 1.0)?;
-    Ok(Qwen38RmsNorm { weight, eps })
+    Ok(Qwen38RmsNorm::new(weight, eps))
+}
+
+/// The convolution and recurrent state of a linear-attention layer.
+fn linear_state(
+    state: &mut Qwen38LayerRuntimeState,
+) -> Result<(&mut Option<ConvRingState>, &mut Option<Tensor>)> {
+    match state {
+        Qwen38LayerRuntimeState::Linear {
+            conv_state,
+            recurrent_state,
+        } => Ok((conv_state, recurrent_state)),
+        Qwen38LayerRuntimeState::Full => Err(Error::InferenceError(
+            "Qwen3.8 layer runtime state does not match linear-attention layer".to_string(),
+        )),
+    }
+}
+
+/// Qwen3.8's channel-major causal-conv decode step. `x` holds `conv_dim`
+/// values (F32, BF16 or F16), `weight` is `[C, 4]` F32 and `history` the
+/// `[C, 3]` F32 history, oldest first. Returns fresh `(silu(conv) [C] F32,
+/// next history [C, 3] F32)`. CUDA runs q38's own conv kernel; the CPU
+/// reference (`gdn::conv_decode`, the same tap formula) serves tests.
+fn qwen38_conv_decode(x: &Tensor, weight: &Tensor, history: &Tensor) -> Result<(Tensor, Tensor)> {
+    let conv_dim = x.elem_count();
+    if x.device().is_cuda() {
+        let (output, next) = crate::kernels::cuda::try_qwen38_causal_conv_decode(
+            &x.reshape((1, 1, conv_dim))?,
+            weight,
+            history,
+        )
+        .ok_or_else(|| {
+            Error::InferenceError("Qwen3.8 CUDA conv decode rejected its inputs".into())
+        })?;
+        return Ok((output.flatten_all()?, next));
+    }
+    if !x.device().is_cpu() {
+        return Err(Error::InferenceError(
+            "Qwen3.8 fused conv decode runs on CUDA (and the CPU reference) only".into(),
+        ));
+    }
+    let slots = (0..gdn::CONV_TAPS - 1)
+        .map(|slot| history.narrow(1, slot, 1))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let (output, next) = gdn::conv_decode(x, weight, [&slots[0], &slots[1], &slots[2]])?;
+    Ok((output, next.t()?.contiguous()?))
+}
+
+/// Resolve the fused norm path for `dtype` activations on `device`, running
+/// `self_check` only when everything else allows the kernel.
+pub(super) fn resolve_norm_path(
+    switches: &Qwen38CudaSwitches,
+    device: &Device,
+    allow_cpu: bool,
+    dtype: DType,
+    self_check: impl FnOnce() -> Result<()>,
+) -> Qwen38FastPath {
+    if let Some(path) = decode_gate(FUSED_NORM_ENV, switches, device, allow_cpu) {
+        path
+    } else if !matches!(dtype, DType::F16 | DType::BF16) {
+        Qwen38FastPath::legacy(format!(
+            "fused RMSNorm needs 16-bit activations, the plan computes in {dtype:?}"
+        ))
+    } else if !norm::supported(device, dtype) {
+        Qwen38FastPath::legacy("fused RMSNorm needs SM80+")
+    } else {
+        match self_check() {
+            Ok(()) => Qwen38FastPath::Fused,
+            Err(error) => Qwen38FastPath::self_check_failed("RMSNorm", &error),
+        }
+    }
+}
+
+/// Compare the fused add + RMSNorm and plain RMSNorm with `norm`'s own gain
+/// against the composition (`forward_retaining`) on `device`, over three
+/// `dtype` rows: the rounded residual sum exactly, the outputs to rounding.
+pub(super) fn norm_self_check(norm: &Qwen38RmsNorm, device: &Device, dtype: DType) -> Result<()> {
+    norm_self_check_with_gain(norm, &norm.weight, device, dtype)
+}
+
+/// [`norm_self_check`] with `gain` handed to the fused kernels; the
+/// composition always uses the norm's own gain.
+fn norm_self_check_with_gain(
+    norm: &Qwen38RmsNorm,
+    gain: &Tensor,
+    device: &Device,
+    dtype: DType,
+) -> Result<()> {
+    if norm.weight.dtype() != DType::F32 {
+        return Err(Error::InferenceError(
+            "the norm gain is not F32; nothing to fuse".into(),
+        ));
+    }
+    let hidden = norm.weight.elem_count();
+    let tensor = |seed: f32| -> Result<Tensor> {
+        Ok(Tensor::from_vec(
+            self_check_wave(3 * hidden, seed, 3.0),
+            (3, 1, hidden),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?
+        .to_device(device)?)
+    };
+    let (residual, delta) = (tensor(1.0)?, tensor(2.0)?);
+    let eps = norm.eps as f32;
+    let (sum, fused) = norm::add_rms_norm(&residual, &delta, gain, eps)?;
+    let expected_sum = (&residual + &delta)?;
+    let (expected, _) = norm.forward_retaining(&expected_sum)?;
+    compare_values(
+        "fused residual sum",
+        &host_values(&sum)?,
+        &host_values(&expected_sum)?,
+        1e-6,
+        1e-6,
+    )?;
+    compare_values(
+        "fused add+RMSNorm",
+        &host_values(&fused)?,
+        &host_values(&expected)?,
+        0.01,
+        0.02,
+    )?;
+    let plain = norm::rms_norm(&residual, gain, eps)?;
+    let (plain_expected, _) = norm.forward_retaining(&residual)?;
+    compare_values(
+        "fused RMSNorm",
+        &host_values(&plain)?,
+        &host_values(&plain_expected)?,
+        0.01,
+        0.02,
+    )
+}
+
+/// Deterministic self-check input: `scale * sin((i + seed) * phi)`.
+fn self_check_wave(len: usize, seed: f32, scale: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * scale)
+        .collect()
+}
+
+/// All values of `tensor` as host F32.
+fn host_values(tensor: &Tensor) -> Result<Vec<f32>> {
+    Ok(tensor
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?)
 }
 
 fn normalize_conv_kernel(
@@ -2956,8 +5722,21 @@ fn build_mrope(
         }
     }
 
-    let emb = Tensor::from_vec(interleaved, (1, 1, half_dim), device)?.to_dtype(dtype)?;
-    Ok((emb.cos()?, emb.sin()?))
+    // Take cos/sin of the F32 angles and cast only the results, as HF does
+    // (`emb.cos()` / `emb.sin()` in fp32, then `.to(x.dtype)`). Rounding the
+    // angle to the plan dtype first puts BF16's 8-bit mantissa on
+    // `position * inv_freq` (at theta 1e7 the fastest pairs drift ~0.1 rad
+    // within a few hundred tokens and rotate randomly by ~4K) and overflows
+    // an F16 angle to inf (NaN cos/sin) past position 65504. The trigonometry
+    // runs on the host because Candle compiles its Metal kernels with fast
+    // math, whose F32 cos/sin miss by ~1e-4 at position 4K and ~1e-2 at 262K.
+    let trig = interleaved
+        .iter()
+        .map(|angle| angle.cos())
+        .chain(interleaved.iter().map(|angle| angle.sin()))
+        .collect::<Vec<_>>();
+    let trig = Tensor::from_vec(trig, (2, 1, 1, half_dim), device)?.to_dtype(dtype)?;
+    Ok((trig.i(0)?, trig.i(1)?))
 }
 
 fn build_mrope_plan(
@@ -3513,6 +6292,12 @@ mod tests {
             kernel_size: 1,
             tiled_recurrence_enabled: false,
             tiled_recurrence_tile_size_override: None,
+            fused_gdn: None,
+            fused_gdn_path: Default::default(),
+            alpha_beta_rows: None,
+            alpha_beta_gemv_path: Default::default(),
+            gdn_prefill: false,
+            gdn_prefill_path: Default::default(),
         };
         let input = Tensor::from_vec(
             vec![0.2f32, -0.1, 0.3, 0.4, -0.3, 0.5, 0.1, 0.2],
@@ -3724,6 +6509,38 @@ mod tests {
         assert_eq!(state.allocated_session_bytes(), Some(3 * 32 * 4));
     }
 
+    /// A projection in a foreign dtype must fail at the ring, leaving it
+    /// untouched, instead of poisoning it with a mixed-dtype slot that a later
+    /// `cat` or multiply fails on, whichever storage form the ring is in.
+    #[test]
+    fn conv_ring_decode_push_rejects_dtype_drift() {
+        let slots = (0..3)
+            .map(|_| Tensor::zeros((4, 1), DType::F32, &Device::Cpu).unwrap())
+            .collect();
+        let staged = Tensor::zeros((4, 3), DType::F32, &Device::Cpu).unwrap();
+        for mut ring in [
+            ConvRingState::from_slots(slots),
+            ConvRingState::from_staged(staged).unwrap(),
+        ] {
+            for dtype in [DType::BF16, DType::F16] {
+                let current = Tensor::ones((4, 1), dtype, &Device::Cpu).unwrap();
+                let error = ring.push_decode(&current).unwrap_err().to_string();
+                assert!(error.contains("dtype drift"), "{error}");
+            }
+            let history = ring.contiguous_history().unwrap();
+            assert_eq!(history.dtype(), DType::F32);
+            assert_eq!(history.to_vec2::<f32>().unwrap(), vec![vec![0.0; 3]; 4]);
+
+            let current = Tensor::ones((4, 1), DType::F32, &Device::Cpu).unwrap();
+            ring.push_decode(&current)
+                .expect("a matching projection is accepted");
+            assert_eq!(
+                ring.contiguous_history().unwrap().to_vec2::<f32>().unwrap(),
+                vec![vec![0.0, 0.0, 1.0]; 4]
+            );
+        }
+    }
+
     #[test]
     fn contiguous_conv_history_stages_without_new_storage() {
         let history =
@@ -3860,6 +6677,78 @@ mod tests {
             assert!((cos_vals[0][0][idx] - expected_theta.cos()).abs() < 1e-5);
             assert!((sin_vals[0][0][idx] - expected_theta.sin()).abs() < 1e-5);
         }
+    }
+
+    /// Half-precision plans (BF16 CUDA, F16 Metal) must round cos/sin, never
+    /// the angle: at long positions a BF16 angle is phase noise and an F16
+    /// angle overflows to inf. Each `(dtype, tolerance)` plan built on
+    /// `device` must match the cos/sin of the exact F32 angle.
+    fn assert_mrope_plan_rounds_only_cos_sin(device: &Device, plans: &[(DType, f64)]) {
+        // Qwen3.8-27B rotary geometry: 64 rotary dims, theta 1e7.
+        let rope_dim = 64;
+        let inv_freqs = build_rope_inv_freqs(rope_dim, 10_000_000.0).unwrap();
+        let positions = [4_096usize, 30_000, 70_000, 262_143];
+        let position_ids = positions.map(|position| [position; 3]);
+        for &(dtype, tolerance) in plans {
+            let plan = build_mrope_plan(
+                rope_dim,
+                &position_ids,
+                &[11, 11, 10],
+                &inv_freqs,
+                device,
+                dtype,
+            )
+            .unwrap();
+            for (values, trig) in [
+                (plan.cos.as_ref().unwrap(), f64::cos as fn(f64) -> f64),
+                (plan.sin.as_ref().unwrap(), f64::sin),
+            ] {
+                assert_eq!(values.dtype(), dtype);
+                let values = values
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for (index, value) in values.iter().enumerate() {
+                    let (row, pair) = (index / inv_freqs.len(), index % inv_freqs.len());
+                    // The exact F32 angle HF and the plan both compute.
+                    let angle = positions[row] as f32 * inv_freqs[pair];
+                    let expected = trig(f64::from(angle));
+                    assert!(
+                        (f64::from(*value) - expected).abs() < tolerance,
+                        "{dtype:?} position {} pair {pair}: {value} vs {expected}",
+                        positions[row]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mrope_plan_keeps_long_position_angles_in_f32() {
+        assert_mrope_plan_rounds_only_cos_sin(
+            &Device::Cpu,
+            &[
+                (DType::F32, 1e-5),
+                // Half an ulp near 1, plus slack: 2^-9 for BF16, 2^-12 for F16.
+                (DType::BF16, 4e-3),
+                (DType::F16, 1e-3),
+            ],
+        );
+    }
+
+    /// The Metal plan's tables must match too: Candle's fast-math Metal
+    /// cos/sin would already miss the F32 tolerance at position 4096.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn mrope_plan_keeps_long_position_angles_in_f32_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; qwen38 mrope metal leg not run");
+            return;
+        };
+        assert_mrope_plan_rounds_only_cos_sin(&device, &[(DType::F32, 1e-5), (DType::F16, 1e-3)]);
     }
 
     #[test]
@@ -4087,4 +6976,15 @@ mod tests {
 }
 
 #[cfg(test)]
+mod fast_path_tests;
+#[cfg(test)]
 mod verification_tests;
+
+#[cfg(test)]
+mod golden_tests;
+
+#[cfg(test)]
+mod fp8_residency_tests;
+
+#[cfg(test)]
+mod graph_tests;

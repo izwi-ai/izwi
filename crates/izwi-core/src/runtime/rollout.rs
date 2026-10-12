@@ -1,8 +1,9 @@
 //! Fail-closed rollout policy for physical inference-state providers.
 //!
 //! Provider selection is part of the resolved state plan, not a best-effort
-//! runtime fallback. The one process-level override supported here can only
-//! demote a certified optimized provider to its certified portable provider.
+//! runtime fallback. The process-level overrides here only fall back: one
+//! demotes a certified optimized provider to its certified portable provider,
+//! the other restores a host synchronization after every Metal KV mutation.
 
 use std::ffi::OsStr;
 
@@ -13,47 +14,60 @@ use crate::kv::v2::{PagedOperationImplementation, ResolvedStatePlan};
 use crate::runtime::adapters::CapabilityKind;
 
 pub(crate) const DISABLE_OPTIMIZED_KV_PROVIDER_ENV: &str = "IZWI_KV_DISABLE_OPTIMIZED_PROVIDER";
+/// Kill switch for Metal KV epoch fences: when set, every Metal KV mutation
+/// drains the device before returning its fence, as before epoch fences.
+pub(crate) const METAL_EAGER_KV_FENCES_ENV: &str = "IZWI_KV_METAL_EAGER_FENCES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvProviderRollout {
     optimized_provider_enabled: bool,
+    metal_eager_fences: bool,
 }
 
 impl KvProviderRollout {
     pub(crate) fn from_process_env() -> Result<Self> {
-        Self::from_disable_optimized_value(
+        Self::from_values(
             std::env::var_os(DISABLE_OPTIMIZED_KV_PROVIDER_ENV).as_deref(),
+            std::env::var_os(METAL_EAGER_KV_FENCES_ENV).as_deref(),
         )
     }
 
-    fn from_disable_optimized_value(value: Option<&OsStr>) -> Result<Self> {
-        let disable_optimized = match value {
-            None => false,
-            Some(value) => {
-                let value = value.to_str().ok_or_else(|| {
-                    invalid(format!(
-                        "{DISABLE_OPTIMIZED_KV_PROVIDER_ENV} must contain UTF-8"
-                    ))
-                })?;
-                match value.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => true,
-                    "0" | "false" | "no" | "off" => false,
-                    _ => {
-                        return Err(invalid(format!(
-                            "{DISABLE_OPTIMIZED_KV_PROVIDER_ENV} must be one of \
-                             1/true/yes/on or 0/false/no/off, got `{value}`"
-                        )))
-                    }
-                }
-            }
-        };
+    fn from_values(
+        disable_optimized: Option<&OsStr>,
+        metal_eager_fences: Option<&OsStr>,
+    ) -> Result<Self> {
         Ok(Self {
-            optimized_provider_enabled: !disable_optimized,
+            optimized_provider_enabled: !strict_bool(
+                DISABLE_OPTIMIZED_KV_PROVIDER_ENV,
+                disable_optimized,
+            )?,
+            metal_eager_fences: strict_bool(METAL_EAGER_KV_FENCES_ENV, metal_eager_fences)?,
         })
     }
 
     pub(crate) const fn optimized_provider_enabled(self) -> bool {
         self.optimized_provider_enabled
+    }
+
+    pub(crate) const fn metal_eager_fences(self) -> bool {
+        self.metal_eager_fences
+    }
+}
+
+/// An unset switch is off; a set one must be an explicit boolean.
+fn strict_bool(name: &str, value: Option<&OsStr>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| invalid(format!("{name} must contain UTF-8")))?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(invalid(format!(
+            "{name} must be one of 1/true/yes/on or 0/false/no/off, got `{value}`"
+        ))),
     }
 }
 
@@ -140,16 +154,16 @@ mod tests {
 
     #[test]
     fn optimized_provider_is_enabled_without_an_operator_override() {
-        assert!(KvProviderRollout::from_disable_optimized_value(None)
-            .unwrap()
-            .optimized_provider_enabled());
+        let rollout = KvProviderRollout::from_values(None, None).unwrap();
+        assert!(rollout.optimized_provider_enabled());
+        assert!(!rollout.metal_eager_fences());
     }
 
     #[test]
     fn optimized_provider_kill_switch_accepts_only_explicit_booleans() {
         for value in ["1", "true", "YES", "on"] {
             assert!(
-                !KvProviderRollout::from_disable_optimized_value(Some(OsStr::new(value)))
+                !KvProviderRollout::from_values(Some(OsStr::new(value)), None)
                     .unwrap()
                     .optimized_provider_enabled(),
                 "{value}"
@@ -157,18 +171,38 @@ mod tests {
         }
         for value in ["0", "false", "NO", "off"] {
             assert!(
-                KvProviderRollout::from_disable_optimized_value(Some(OsStr::new(value)))
+                KvProviderRollout::from_values(Some(OsStr::new(value)), None)
                     .unwrap()
                     .optimized_provider_enabled(),
                 "{value}"
             );
         }
 
-        let error =
-            KvProviderRollout::from_disable_optimized_value(Some(OsStr::new("maybe"))).unwrap_err();
+        let error = KvProviderRollout::from_values(Some(OsStr::new("maybe")), None).unwrap_err();
         assert!(error
             .to_string()
             .contains(DISABLE_OPTIMIZED_KV_PROVIDER_ENV));
+        assert!(error.to_string().contains("1/true/yes/on"));
+    }
+
+    #[test]
+    fn metal_eager_fence_kill_switch_accepts_only_explicit_booleans() {
+        for value in ["1", "true", "YES", "on"] {
+            let rollout = KvProviderRollout::from_values(None, Some(OsStr::new(value))).unwrap();
+            assert!(rollout.metal_eager_fences(), "{value}");
+            assert!(rollout.optimized_provider_enabled(), "{value}");
+        }
+        for value in ["0", "false", "NO", "off"] {
+            assert!(
+                !KvProviderRollout::from_values(None, Some(OsStr::new(value)))
+                    .unwrap()
+                    .metal_eager_fences(),
+                "{value}"
+            );
+        }
+
+        let error = KvProviderRollout::from_values(None, Some(OsStr::new("maybe"))).unwrap_err();
+        assert!(error.to_string().contains(METAL_EAGER_KV_FENCES_ENV));
         assert!(error.to_string().contains("1/true/yes/on"));
     }
 

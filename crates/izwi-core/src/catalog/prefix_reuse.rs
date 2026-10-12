@@ -126,7 +126,10 @@ impl ModelFamily {
         match self {
             // DS1.5: hybrid qwen3.8 publishes committed pages on attention
             // domains and transactional tensor snapshots on recurrent/conv
-            // domains. The parity legs ran on the CPU and Metal lanes.
+            // domains, at each chat turn's declared history boundary. The
+            // parity legs ran on the CPU and Metal lanes. CUDA is default-on
+            // by operator decision (2026-10-12) before its attach leg has
+            // run on a GPU; the GPU pre-flight runs it.
             Self::Qwen38Chat => match backend {
                 BackendKind::Cpu => supported(
                     PrefixReuseEvidenceLevel::ProcessParity,
@@ -136,9 +139,9 @@ impl ModelFamily {
                     PrefixReuseEvidenceLevel::ProcessParity,
                     "metal-feature parity leg bit-identical to the CPU lane (DS1.5)",
                 ),
-                BackendKind::Cuda => not_enabled(
-                    PrefixReuseEvidenceLevel::NotRun,
-                    "no CUDA lane parity evidence; DS1.6 requires lane parity before default-on",
+                BackendKind::Cuda => supported(
+                    PrefixReuseEvidenceLevel::ContractDeclared,
+                    "default-on by operator decision ahead of CUDA evidence: CPU and Metal have process parity, and the GPU pre-flight runs the qwen38 device attach test (cuda_attached_history_matches_the_fresh_run, IZWI_REQUIRE_CUDA_TEST_DEVICE=1); IZWI_QWEN38_PREFIX_REUSE=0 or IZWI_ENABLE_PREFIX_CACHING=0 turns it off",
                 ),
             },
             // DS1.2 dense enablement: contracts publish committed pages and
@@ -281,17 +284,32 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_hybrid_prefix_reuse_engages_only_on_parity_lanes() {
+    fn qwen38_hybrid_prefix_reuse_engages_on_every_lane() {
         let variant = ModelVariant::Qwen3827BFp8;
-        assert!(variant.prefix_reuse_support(BackendKind::Cpu).engages());
-        assert_eq!(
-            variant.prefix_reuse_support(BackendKind::Cpu).evidence,
-            PrefixReuseEvidenceLevel::ProcessParity
-        );
-        assert!(variant.prefix_reuse_support(BackendKind::Metal).engages());
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            let cell = variant.prefix_reuse_support(backend);
+            assert!(cell.engages(), "{backend:?}");
+            assert_eq!(cell.evidence, PrefixReuseEvidenceLevel::ProcessParity);
+        }
+        // CUDA is default-on ahead of its evidence, says so, and names the
+        // device test and the switches.
         let cuda = variant.prefix_reuse_support(BackendKind::Cuda);
-        assert!(!cuda.engages());
-        assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::NotRun);
+        assert!(cuda.engages());
+        assert_eq!(cuda.evidence, PrefixReuseEvidenceLevel::ContractDeclared);
+        assert!(cuda
+            .reason
+            .contains("cuda_attached_history_matches_the_fresh_run"));
+        assert!(cuda.reason.contains("IZWI_QWEN38_PREFIX_REUSE=0"));
+        assert!(prefix_reuse_engages(
+            variant,
+            BackendKind::Cuda,
+            PrefixReuseMode::CatalogAuto
+        ));
+        assert!(!prefix_reuse_engages(
+            variant,
+            BackendKind::Cuda,
+            PrefixReuseMode::Disabled
+        ));
     }
 
     // Note: the dense fixture-suite cell (Qwen3Chat | Gemma3Chat) currently has
@@ -335,17 +353,19 @@ mod tests {
 
     #[test]
     fn explicit_mode_bypasses_the_catalog_and_disabled_mode_blocks() {
-        let variant = ModelVariant::Qwen3827BFp8;
+        // Qwen3.6 on Metal is a not-enabled cell.
+        let opt_in = ModelVariant::Qwen36Moe35BA3BFp8;
         assert!(prefix_reuse_engages(
-            variant,
-            BackendKind::Cuda,
+            opt_in,
+            BackendKind::Metal,
             PrefixReuseMode::Explicit
         ));
         assert!(!prefix_reuse_engages(
-            variant,
-            BackendKind::Cuda,
+            opt_in,
+            BackendKind::Metal,
             PrefixReuseMode::CatalogAuto
         ));
+        let variant = ModelVariant::Qwen3827BFp8;
         assert!(prefix_reuse_engages(
             variant,
             BackendKind::Cpu,

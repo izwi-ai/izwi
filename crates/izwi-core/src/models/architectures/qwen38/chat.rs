@@ -4,6 +4,11 @@
 mod attach_tests;
 mod device_sampling;
 #[cfg(test)]
+mod history_attach_tests;
+mod pipeline;
+#[cfg(test)]
+mod pipeline_tests;
+#[cfg(test)]
 pub(crate) mod recovery_tests;
 mod timing;
 
@@ -12,6 +17,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use candle_core::{DType, IndexOp, Tensor, D};
@@ -44,18 +50,29 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 use super::cache::qwen38_composite_cache_contract_with_mtp;
 use super::mtp::{AdaptiveMtp, Qwen38MtpDepth, Qwen38MtpHead, Qwen38MtpPairBatch};
 use super::native::{ProjectionMaterialization, Qwen38NativeCheckpoint, QWEN38_27B_FP8_REVISION};
+use super::residency::Qwen38ResidencyPolicy;
 use super::telemetry::{
     record_cuda_kv_provider, record_mtp_nonfinite_draft_fallback, record_mtp_policy,
     record_mtp_round, record_mtp_round_timing, record_mtp_scalar_target_token,
     record_sampling_bounded_cuda, record_sampling_device_argmax, record_sampling_host,
     snapshot as qwen38_optimization_telemetry_snapshot,
 };
-use super::text::{Qwen38ProjectionRepresentation, Qwen38TextModel, Qwen38TextRuntimeState};
+use super::text::{Qwen38TextModel, Qwen38TextRuntimeState};
 
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
+/// Prefill chunk on CUDA once the dequantized prefill GEMM runs. Its weight
+/// dequantization (~40 ms per pass over the 27B trunk, estimated) is paid
+/// once per chunk, so 1,024 tokens amortize it over four times the span of
+/// 256 while one chunk stays ~130 ms (estimate). Wider spans reach the model
+/// only for an isolated request: the scheduler grants the preferred span
+/// when nothing else is decoding or waiting (`prefill_chunk_for`), so
+/// concurrent decode keeps the engine's 96-192-token spans. SGLang caps
+/// hybrid GDN prefill at 2,048 because 8k chunks stall decode by ~600 ms.
+const CUDA_GEMM_PREFILL_CHUNK_SIZE: usize = 1024;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+const PREFILL_CHUNK_ENV: &str = "IZWI_QWEN38_PREFILL_CHUNK_SIZE";
 const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN38_CUDA_BF16_KV";
 const MTP_ENABLED_ENV: &str = "IZWI_QWEN38_MTP";
 const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
@@ -65,6 +82,148 @@ const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
 const DEFAULT_MTP_ENABLED: bool = true;
 const DEFAULT_MTP_DRAFT_TOKENS: usize = 1;
 const MAX_MTP_DRAFT_TOKENS: usize = 3;
+/// Decode tokens per engine step under CUDA graph decode without MTP
+/// (`IZWI_QWEN38_DECODE_QUANTUM`, 1-64; 1 is one token per step).
+pub(crate) const DECODE_QUANTUM_ENV: &str = "IZWI_QWEN38_DECODE_QUANTUM";
+const DEFAULT_DECODE_QUANTUM: usize = 8;
+/// Kill switch for pipelined graph decode (`legacy`, `off`, `0`, `false`):
+/// a graph-decode quantum then runs its steps one at a time.
+pub(crate) const DECODE_PIPELINE_ENV: &str = "IZWI_QWEN38_DECODE_PIPELINE";
+/// Qwen3.8-only kill switch for cross-turn prefix reuse (`0`, `false`, `no`,
+/// `off`). The global switches (`IZWI_ENABLE_PREFIX_CACHING=0`,
+/// `IZWI_PREFIX_REUSE_AUTO=0`) turn it off for every model.
+pub(crate) const PREFIX_REUSE_ENV: &str = "IZWI_QWEN38_PREFIX_REUSE";
+
+/// Strict boolean for [`PREFIX_REUSE_ENV`]; unset keeps the registry's
+/// decision.
+fn qwen38_prefix_reuse_switch(raw: Option<&str>) -> Result<bool> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase) {
+        None => Ok(true),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => Ok(true),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => Ok(false),
+        Some(value) => Err(Error::ConfigError(format!(
+            "{PREFIX_REUSE_ENV} must be a boolean, got `{value}`"
+        ))),
+    }
+}
+
+/// How the load decided cross-turn prefix reuse, and the prefills since:
+/// `prefix_reuse` in the runtime diagnostics. A prefill attached at a shared
+/// history prefix starts at the attached cursor and computes only the rest.
+#[derive(Debug, Default)]
+pub(crate) struct Qwen38PrefixReuse {
+    /// The registry engaged prefix reuse for this model on its backend (the
+    /// catalog cell in catalog-auto mode, or the operator's explicit switch).
+    requested: bool,
+    /// [`PREFIX_REUSE_ENV`] turned it off for Qwen3.8.
+    switched_off: bool,
+    attached_prefills: AtomicU64,
+    fresh_prefills: AtomicU64,
+    reused_prompt_tokens: AtomicU64,
+    prefilled_prompt_tokens: AtomicU64,
+    last_reused_tokens: AtomicU64,
+    last_prompt_tokens: AtomicU64,
+}
+
+impl Qwen38PrefixReuse {
+    fn new(requested: bool, switched_off: bool) -> Self {
+        Self {
+            requested,
+            switched_off,
+            ..Self::default()
+        }
+    }
+
+    /// A request's prefill starts with `reused` of its `prompt` tokens
+    /// already resident (zero unless it attached a shared prefix).
+    fn record_prefill(&self, reused: usize, prompt: usize) {
+        let counter = if reused > 0 {
+            &self.attached_prefills
+        } else {
+            &self.fresh_prefills
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        let (reused, prompt) = (reused as u64, prompt as u64);
+        self.reused_prompt_tokens
+            .fetch_add(reused, AtomicOrdering::Relaxed);
+        self.prefilled_prompt_tokens
+            .fetch_add(prompt.saturating_sub(reused), AtomicOrdering::Relaxed);
+        self.last_reused_tokens
+            .store(reused, AtomicOrdering::Relaxed);
+        self.last_prompt_tokens
+            .store(prompt, AtomicOrdering::Relaxed);
+    }
+}
+
+fn decode_quantum_tokens() -> usize {
+    decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
+}
+
+fn decode_quantum_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|tokens| (1..=64).contains(tokens))
+        .unwrap_or(DEFAULT_DECODE_QUANTUM)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEVICE_SAMPLING_FOR_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: sample through the device sampler's portable references off CUDA
+/// in this thread (step by step and pipelined alike) until the guard drops.
+#[cfg(test)]
+pub(crate) fn force_device_sampling_for_tests() -> ForcedDeviceSampling {
+    DEVICE_SAMPLING_FOR_TESTS.with(|forced| forced.set(true));
+    ForcedDeviceSampling
+}
+
+#[cfg(test)]
+pub(crate) struct ForcedDeviceSampling;
+
+#[cfg(test)]
+impl Drop for ForcedDeviceSampling {
+    fn drop(&mut self) {
+        DEVICE_SAMPLING_FOR_TESTS.with(|forced| forced.set(false));
+    }
+}
+
+/// Graph-decode quanta the scheduler granted, for `cuda_graphs.decode_quantum`
+/// in the diagnostics: whether the multi-token quantum actually reached the
+/// model, and how wide.
+#[derive(Debug, Default)]
+pub(crate) struct GraphQuantumCounters {
+    quanta: AtomicU64,
+    tokens: AtomicU64,
+    pipelined_quanta: AtomicU64,
+    last_granted: AtomicU64,
+    max_granted: AtomicU64,
+}
+
+impl GraphQuantumCounters {
+    fn record(&self, granted: usize, committed: usize, pipelined: bool) {
+        let granted = granted as u64;
+        self.quanta.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tokens
+            .fetch_add(committed as u64, AtomicOrdering::Relaxed);
+        if pipelined {
+            self.pipelined_quanta.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.last_granted.store(granted, AtomicOrdering::Relaxed);
+        self.max_granted.fetch_max(granted, AtomicOrdering::Relaxed);
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "quanta": self.quanta.load(AtomicOrdering::Relaxed),
+            "input_tokens": self.tokens.load(AtomicOrdering::Relaxed),
+            "pipelined_quanta": self.pipelined_quanta.load(AtomicOrdering::Relaxed),
+            "granted_last": self.last_granted.load(AtomicOrdering::Relaxed),
+            "granted_max": self.max_granted.load(AtomicOrdering::Relaxed),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Qwen38MtpPolicy {
@@ -232,13 +391,37 @@ fn qwen38_projection_materialization_policy(
     }
 }
 
-fn qwen38_prefill_chunk_size() -> usize {
-    std::env::var("IZWI_QWEN38_PREFILL_CHUNK_SIZE")
+/// Tokens per prefill forward for a load on `backend`: 1,024 on CUDA when
+/// the dequantized prefill GEMM runs (`prefill_gemm`), 256 otherwise.
+/// `IZWI_QWEN38_PREFILL_CHUNK_SIZE` (1-2,048) overrides both. Admission
+/// prices the same chunk ([`prefill_working_set_bytes`]).
+pub(crate) fn qwen38_prefill_chunk_tokens(backend: BackendKind, prefill_gemm: bool) -> usize {
+    let default = if backend == BackendKind::Cuda && prefill_gemm {
+        CUDA_GEMM_PREFILL_CHUNK_SIZE
+    } else {
+        DEFAULT_PREFILL_CHUNK_SIZE
+    };
+    std::env::var(PREFILL_CHUNK_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
+        .unwrap_or(default)
         .min(MAX_PREFILL_CHUNK_SIZE)
+}
+
+/// Transient bytes of one prefill forward of `chunk_tokens` tokens: per
+/// token the activation bound of one continuous-decode row (every
+/// activation of the widest layer, counted in F32), which covers the F32
+/// DeltaNet intermediates, the packed gate/up output and the norm
+/// temporaries a prefill row holds at once. About 392 MiB at 1,024 tokens
+/// on the 27B trunk.
+pub(crate) fn prefill_working_set_bytes(
+    cfg: &Qwen38TextConfig,
+    chunk_tokens: usize,
+) -> Result<u64> {
+    continuous_decode_workspace_per_row_bytes(cfg, 0, None)?
+        .checked_mul(chunk_tokens as u64)
+        .ok_or_else(|| Error::ModelLoadError("Qwen3.8 prefill working set overflow".into()))
 }
 
 /// Fully prepared Qwen3.8 text prefill input. The runtime carries this exact
@@ -249,6 +432,9 @@ pub struct Qwen38PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
+    /// Tokens of the stable history: everything before the final assistant
+    /// generation header, which the conversation's next turn renders again.
+    history_boundary: Option<usize>,
 }
 
 impl Qwen38PreparedPrompt {
@@ -256,9 +442,32 @@ impl Qwen38PreparedPrompt {
         &self.prompt_ids
     }
 
+    /// The prompt's stable-history boundary in tokens (see
+    /// [`history_boundary`]); the engine snapshots hybrid state at its
+    /// interval floor so the next turn attaches there.
+    pub(crate) fn history_boundary(&self) -> Option<usize> {
+        self.history_boundary
+    }
+
     pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
         &self.prompt_positions
     }
+}
+
+/// Tokens of a rendered prompt's stable history: everything before its final
+/// `<|im_start|>`, the assistant generation header every Qwen3.8 render ends
+/// with. The conversation's next turn renders exactly these tokens again: an
+/// answer re-renders differently from the tokens that were generated (the
+/// template rebuilds its `<think>` block, and drops it for earlier turns when
+/// `preserve_thinking` is off), so nothing after the header is shared.
+/// `<|im_start|>` is a special token, so the encoding splits there and the
+/// prefix is a token boundary. A render that diverges earlier (a changed
+/// system prompt or tool list) only shortens the token-exact prefix match.
+fn history_boundary(prompt_ids: &[u32], im_start: u32) -> Option<usize> {
+    prompt_ids
+        .iter()
+        .rposition(|id| *id == im_start)
+        .filter(|boundary| *boundary > 0)
 }
 
 fn resolve_prepared_prompt<F>(
@@ -656,6 +865,7 @@ pub struct Qwen38TextConfig {
 
 #[derive(Debug, Clone)]
 struct SpecialTokenIds {
+    im_start: u32,
     im_end: u32,
     eos: u32,
     eos_alt: Option<u32>,
@@ -708,7 +918,7 @@ impl Qwen38Tokenizer {
                 Error::TokenizationError(format!("Missing required Qwen3.8 token {token}"))
             })
         };
-        required("<|im_start|>")?;
+        let im_start = required("<|im_start|>")?;
         let im_end = required("<|im_end|>")?;
         required(IMAGE_PAD_PLACEHOLDER)?;
         required(VIDEO_PAD_PLACEHOLDER)?;
@@ -730,6 +940,7 @@ impl Qwen38Tokenizer {
             vocab_size: inner.vocab_size(),
             inner,
             specials: SpecialTokenIds {
+                im_start,
                 im_end,
                 eos,
                 eos_alt,
@@ -810,58 +1021,35 @@ pub struct Qwen38ChatModel {
     text_model: Qwen38TextModel,
     mtp_policy: Qwen38MtpPolicy,
     mtp_head: Option<Qwen38MtpHead>,
+    /// The cache contract shares prefixes (the registry engaged reuse and
+    /// [`PREFIX_REUSE_ENV`] did not turn it off); an MTP head still keeps
+    /// every domain private.
     prefix_caching: bool,
+    prefix_reuse: Qwen38PrefixReuse,
+    graph_quantum: GraphQuantumCounters,
+    /// Device timings of the hot kernels measured once at load (CUDA;
+    /// `text/kernel_timings.rs`), reported under `kernel_timings`.
+    kernel_timings: serde_json::Value,
 }
 
-fn qwen38_fp8_execution_mode(
-    projection_representation: Qwen38ProjectionRepresentation,
-) -> &'static str {
-    match projection_representation {
-        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16
-        | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => {
-            "native_block_fp8_explicit_with_compact_q8_fallback"
-        }
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
-        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => "q8_0_compressed_fallback",
-        Qwen38ProjectionRepresentation::ExpandedF32
-        | Qwen38ProjectionRepresentation::ExpandedF16
-        | Qwen38ProjectionRepresentation::ExpandedBf16 => "expanded_fallback",
-    }
-}
-
-fn qwen38_fp8_fallback_reason(
-    projection_representation: Qwen38ProjectionRepresentation,
-) -> &'static str {
-    match projection_representation {
-        Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackF16 | Qwen38ProjectionRepresentation::NativeFp8WithQ8FallbackBf16 => "explicit native FP8 provider; unsupported shapes remain compact Q8; Auto retains tuned Q8 until device performance is established",
-        Qwen38ProjectionRepresentation::PackedQ8WithDenseF16
-        | Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16 => {
-            "CUDA applies weight_scale_inv during scale-aware FP8 dequantization and then requantizes projections to Q8_0 for Candle execution; native FP8 execution is not runtime-certified"
-        }
-        Qwen38ProjectionRepresentation::ExpandedF32
-        | Qwen38ProjectionRepresentation::ExpandedF16
-        | Qwen38ProjectionRepresentation::ExpandedBf16 => {
-            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Qwen38RepresentationDiagnostics {
     resident_representation: &'static str,
-    fp8_execution_mode: &'static str,
-    fallback_reason: &'static str,
+    fp8_execution_mode: String,
+    fallback_reason: String,
     runtime_compute_dtype: &'static str,
 }
 
+/// Diagnostics of the residency policy a model was loaded under.
 fn qwen38_representation_diagnostics(
-    projection_representation: Qwen38ProjectionRepresentation,
+    policy: &Qwen38ResidencyPolicy,
 ) -> Qwen38RepresentationDiagnostics {
+    let representation = policy.representation();
     Qwen38RepresentationDiagnostics {
-        resident_representation: projection_representation.as_str(),
-        fp8_execution_mode: qwen38_fp8_execution_mode(projection_representation),
-        fallback_reason: qwen38_fp8_fallback_reason(projection_representation),
-        runtime_compute_dtype: projection_representation.compute_dtype(),
+        resident_representation: representation.as_str(),
+        fp8_execution_mode: policy.execution_mode(),
+        fallback_reason: policy.fallback_reason(),
+        runtime_compute_dtype: representation.compute_dtype(),
     }
 }
 
@@ -895,42 +1083,54 @@ impl Qwen38ChatModel {
                 "Unsupported Qwen3.8 chat variant: {variant}"
             )));
         }
+        let prefix_reuse_switch =
+            qwen38_prefix_reuse_switch(std::env::var(PREFIX_REUSE_ENV).ok().as_deref())?;
         let checkpoint =
             Qwen38NativeCheckpoint::open_with_options(model_dir, &performance.loading)?;
-        let mtp_enabled = if device.device.is_cuda() {
-            performance.cuda.enabled() && performance.cuda.mtp.enabled()
-        } else {
-            performance.cuda.mtp.enabled()
-        };
-        let mtp_policy = if mtp_enabled {
+        let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
+        let text_config = checkpoint.config.text.clone();
+        let projection_materialization = qwen38_projection_materialization(&device)?;
+        // The same resolution load admission priced (cached device gates).
+        let residency = Qwen38ResidencyPolicy::resolve(
+            &device.device,
+            projection_materialization,
+            performance,
+            &checkpoint.tensors,
+            &checkpoint.config,
+        );
+        let mtp_policy = if residency.mtp_loaded() {
             Qwen38MtpPolicy::Enabled {
                 draft_tokens: performance.cuda.mtp_draft_tokens,
             }
         } else {
             Qwen38MtpPolicy::Disabled
         };
-        let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
-        let text_config = checkpoint.config.text.clone();
-        let projection_materialization = qwen38_projection_materialization(&device)?;
-        let text_model = Qwen38TextModel::load_native_with_performance(
+        let text_model = Qwen38TextModel::load_native_with_policy(
             &checkpoint.tensors,
             &checkpoint.config,
             &device.device,
             projection_materialization,
             &performance.cuda,
+            &residency,
         )?;
         let mtp_head = match mtp_policy {
             Qwen38MtpPolicy::Disabled => None,
-            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native_with_performance(
+            Qwen38MtpPolicy::Enabled { .. } => Some(Qwen38MtpHead::load_native_with_policy(
                 &checkpoint.tensors,
                 &checkpoint.config,
                 &checkpoint.mtp,
                 &device.device,
                 projection_materialization,
                 &performance.cuda,
+                &residency,
             )?),
         };
         record_mtp_policy(mtp_policy.enabled());
+        // After every load-time check: the timings run the resolved paths.
+        let kernel_timings = text_model.kernel_timings();
+        if kernel_timings["status"] == "measured" {
+            info!(timings = %kernel_timings, "Qwen3.8 load-time kernel timings");
+        }
         let projection_representation = text_model.projection_representation();
         let device_kind = BackendKind::from(device.kind);
         let cuda_compute_capability = device.capabilities.cuda_compute_capability;
@@ -945,16 +1145,22 @@ impl Qwen38ChatModel {
             revision = QWEN38_27B_FP8_REVISION,
             tensors = checkpoint.tensors.tensor_count(),
             resident_representation = projection_representation.as_str(),
-            fp8_execution_mode = qwen38_fp8_execution_mode(projection_representation),
+            fp8_execution_mode = %residency.execution_mode(),
             mtp_enabled = mtp_policy.enabled(),
+            mtp_decision = residency.mtp_decision(),
             mtp_draft_tokens = mtp_policy.draft_tokens(),
+            prefix_reuse = prefix_reuse && prefix_reuse_switch && !mtp_policy.enabled(),
+            cuda_graphs = %text_model.cuda_graphs_summary()["phase"],
             "Loaded native Qwen3.8 text checkpoint"
         );
         Ok(Self {
             device_kind,
             performance: performance.clone(),
             load_timing: checkpoint.tensors.loading_diagnostics(),
-            prefill_chunk_size: qwen38_prefill_chunk_size(),
+            prefill_chunk_size: qwen38_prefill_chunk_tokens(
+                device_kind,
+                text_model.prefill_gemm_active(),
+            ),
             cuda_compute_capability,
             kv_storage_provider,
             variant,
@@ -963,8 +1169,22 @@ impl Qwen38ChatModel {
             text_model,
             mtp_policy,
             mtp_head,
-            prefix_caching: prefix_reuse,
+            prefix_caching: prefix_reuse && prefix_reuse_switch,
+            prefix_reuse: Qwen38PrefixReuse::new(prefix_reuse, !prefix_reuse_switch),
+            graph_quantum: GraphQuantumCounters::default(),
+            kernel_timings,
         })
+    }
+
+    /// Prefill span this model prefers for an isolated request: its chunk
+    /// on CUDA once the dequantized prefill GEMM runs (the GEMM's weight
+    /// expansion amortizes over the span), else the engine's threshold (0).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        if self.device_kind == BackendKind::Cuda && self.text_model.prefill_gemm_active() {
+            self.prefill_chunk_size
+        } else {
+            0
+        }
     }
 
     pub(crate) fn sustained_cuda_mtp_quantum(&self) -> bool {
@@ -974,21 +1194,52 @@ impl Qwen38ChatModel {
             && self.mtp_policy.enabled()
     }
 
+    /// Whether this model's multi-token quantum outlives the request's soft
+    /// scheduling SLA: the CUDA MTP quantum, or the graph-decode quantum
+    /// (no MTP head). An interactive or streaming request passes that SLA
+    /// (0.65-0.75 s at normal priority) early in almost every stream, after
+    /// which the scheduler would grant one token per step for the rest of
+    /// it. The quantum still yields to waiting or co-batched work and to hard
+    /// deadlines, and the scheduler grants it only to a loaded CUDA model.
+    pub(crate) fn sustained_decode_quantum(&self) -> bool {
+        self.sustained_cuda_mtp_quantum()
+            || (self.mtp_head.is_none()
+                && self.text_model.graph_decode()
+                && self.preferred_decode_tokens() > 1)
+    }
+
+    /// Device bytes the decode graphs may hold: the figure admission
+    /// charged (`Qwen38ResidencyPolicy::graph_capacity_bytes`).
     pub(crate) fn graph_cache_capacity_bytes(&self) -> u64 {
-        if self.device_kind == BackendKind::Cuda
-            && self.performance.cuda.enabled()
-            && self.performance.cuda.decode_graphs.enabled()
-        {
-            (8 * 1024 * 1024) * (1 + u64::from(self.mtp_head.is_some()))
-        } else {
-            0
-        }
+        self.text_model
+            .residency()
+            .graph_capacity_bytes(&self.text_config, &self.performance)
+            .unwrap_or(0)
     }
 
     fn device_sampling_enabled(&self) -> bool {
+        #[cfg(test)]
+        if DEVICE_SAMPLING_FOR_TESTS.with(std::cell::Cell::get) {
+            return true;
+        }
         self.device_kind == BackendKind::Cuda
             && self.performance.cuda.enabled()
             && self.performance.cuda.device_sampling.enabled()
+    }
+
+    /// Why a graph-decode quantum may not pipeline its steps, if it may not:
+    /// pipelining chooses tokens with the device sampler, so it needs the
+    /// device sampler the step-by-step decode uses.
+    fn pipelining_refusal(&self) -> Option<String> {
+        if crate::models::architectures::qwen38::fast_path::legacy_requested(DECODE_PIPELINE_ENV) {
+            Some(format!("{DECODE_PIPELINE_ENV}=legacy"))
+        } else if !self.device_sampling_enabled() {
+            Some(
+                "pipelined decode chooses tokens with the CUDA device sampler, which is off".into(),
+            )
+        } else {
+            None
+        }
     }
 
     fn sample_next_token(
@@ -1083,15 +1334,29 @@ impl Qwen38ChatModel {
     }
 
     pub fn runtime_compute_dtype(&self) -> Option<&'static str> {
-        Some(
-            qwen38_representation_diagnostics(self.text_model.projection_representation())
-                .runtime_compute_dtype,
-        )
+        Some(self.text_model.projection_representation().compute_dtype())
     }
 
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
-        let projection_representation = self.text_model.projection_representation();
-        let representation = qwen38_representation_diagnostics(projection_representation);
+        let representation = qwen38_representation_diagnostics(self.text_model.residency());
+        let residency_paths = self.text_model.residency().diagnostics();
+        // Per projection kind once the policy planned the prefill GEMM;
+        // otherwise the policy's own reason.
+        let prefill_gemm_checks: Vec<_> = self
+            .text_model
+            .fp8_prefill_gemm_checks()
+            .iter()
+            .chain(
+                self.mtp_head
+                    .iter()
+                    .flat_map(|head| head.fp8_prefill_gemm_checks().iter()),
+            )
+            .collect();
+        let fp8_prefill_gemm = if prefill_gemm_checks.is_empty() {
+            residency_paths["fp8_prefill_gemm"].clone()
+        } else {
+            super::fast_path::summarize(prefill_gemm_checks)
+        };
         let optimization_counters = qwen38_optimization_telemetry_snapshot();
         let draft_acceptance_rate = ratio_or_none(
             optimization_counters.mtp_accepted_draft_tokens_total,
@@ -1151,8 +1416,14 @@ impl Qwen38ChatModel {
                     "disabled"
                 },
                 "transient_memory_bound": "chunk_shaped",
-                "chunk_override": "IZWI_QWEN38_PREFILL_CHUNK_SIZE",
+                "fp8_projection_path": "rows >= 16: dequantized weight tiles (<= 128 MiB) + cuBLAS once checked per projection kind (fast_paths.fp8_prefill_gemm); otherwise the compact FP8 mm kernel",
+                "fp8_projection_switch": super::residency::FP8_PREFILL_GEMM_ENV,
+                "fp8_prefill_scratch_bytes": self.text_model.residency().prefill_scratch_bytes(),
+                "chunk_override": PREFILL_CHUNK_ENV,
                 "maximum_chunk_tokens": MAX_PREFILL_CHUNK_SIZE,
+                "cuda_prefill_gemm_chunk_tokens": CUDA_GEMM_PREFILL_CHUNK_SIZE,
+                "preferred_span_tokens": self.preferred_prefill_tokens(),
+                "preferred_span_policy": "an isolated request (nothing decoding or waiting) prefills the whole chunk in one engine step; otherwise the engine's chunk threshold applies",
             },
             "mtp": {
                 "enabled": self.mtp_policy.enabled(),
@@ -1164,6 +1435,8 @@ impl Qwen38ChatModel {
                 "adaptive_depth_bounds": [0, 3],
                 "prefix_commit": "compact_recurrence_reconstruction_without_target_weight_replay",
                 "default_enabled": DEFAULT_MTP_ENABLED,
+                "default_policy": "auto: on, except off on CUDA when graph decode is planned (IZWI_QWEN38_MTP=1 keeps it)",
+                "decision": self.text_model.residency().mtp_decision(),
                 "default_draft_tokens": DEFAULT_MTP_DRAFT_TOKENS,
                 "enabled_switch": MTP_ENABLED_ENV,
                 "depth_switch": MTP_DRAFT_TOKENS_ENV,
@@ -1198,16 +1471,53 @@ impl Qwen38ChatModel {
                 "regions": ["residual_add_then_rms_norm", "explicit_native_fp8_gate_up_silu_down"],
                 "max_verification_rows": 4,
                 "target_layer_limit": 8,
+                "retired_by_cuda_graph_decode": self.text_model.graph_decode(),
                 "target_counters": self.text_model.graph_diagnostics(),
                 "mtp_counters": self.mtp_head.as_ref().map(Qwen38MtpHead::graph_diagnostics),
                 "maximum_cache_bytes": self.graph_cache_capacity_bytes(),
                 "ownership": "model_owned_serialized_graphs_with_stable_inputs_outputs_and_weights",
                 "fallback": "shape_or_capture_failure_negative_cached_eager_region",
                 "q8_mlp_capture": "excluded_unretainable_candle_global_scratch",
+                "packed_fp8_mlp_capture": "deferred_to_phase3",
                 "full_model_capture": false,
                 "runtime_validated": false,
             },
+            "cuda_graphs": self.cuda_graphs_diagnostics(),
+            "prefix_reuse": self.prefix_reuse_diagnostics(),
+            "kernel_timings": self.kernel_timings,
             "optimization_evidence": optimization_evidence,
+            "fast_paths": {
+                "target": self.text_model.fast_path_diagnostics(),
+                "mtp": self.mtp_head.as_ref().map(Qwen38MtpHead::fast_path_diagnostics),
+                "fp8_projections": residency_paths["fp8_projections"],
+                "fp8_gemv": residency_paths["fp8_gemv"],
+                "fp8_prefill_gemm": fp8_prefill_gemm,
+                "fp8_lm_head": self.text_model.fp8_lm_head_diagnostics(),
+                "metal_fp8_gemv": super::fast_path::summarize(
+                    self.text_model.fp8_gemv_checks().iter().chain(
+                        self.mtp_head
+                            .iter()
+                            .flat_map(|head| head.fp8_gemv_checks().iter()),
+                    ),
+                ),
+                "fp8_packing": super::fast_path::summarize(
+                    self.text_model.fp8_packing().iter().chain(
+                        self.mtp_head
+                            .iter()
+                            .flat_map(|head| head.fp8_packing().iter()),
+                    ),
+                ),
+                "self_check_failures_total": optimization_counters.fast_path_self_check_failures_total,
+                "resolution": "load_time_self_check_at_checkpoint_geometry",
+                "runtime_validated": false,
+            },
+            "metal": {
+                "projection_backend": self.performance.metal.projection_backend,
+                "gemv_max_rows": 8,
+                "prefill": "dequantize_to_transient_f16_then_matmul",
+                "prefill_scratch_bytes": self.text_model.residency().prefill_scratch_bytes(),
+                "runtime_validated": false,
+            },
             "vision_enabled": false,
         })
     }
@@ -1262,17 +1572,25 @@ impl Qwen38ChatModel {
             && self.performance.cuda.mtp_in_continuous.enabled()
     }
 
+    /// Decode inputs this model would like per engine step: the MTP round
+    /// width with an MTP head; the graph-decode quantum
+    /// (`IZWI_QWEN38_DECODE_QUANTUM`, default 8) under CUDA graph decode;
+    /// otherwise one.
     pub(crate) fn preferred_decode_tokens(&self) -> usize {
-        self.mtp_policy.draft_tokens().map_or(1, |draft_tokens| {
-            if self.device_kind == BackendKind::Cuda
-                && self.performance.cuda.enabled()
-                && self.performance.cuda.mtp_adaptive
-            {
-                4
-            } else {
-                draft_tokens.saturating_add(1)
+        match self.mtp_policy.draft_tokens() {
+            Some(draft_tokens) => {
+                if self.device_kind == BackendKind::Cuda
+                    && self.performance.cuda.enabled()
+                    && self.performance.cuda.mtp_adaptive
+                {
+                    4
+                } else {
+                    draft_tokens.saturating_add(1)
+                }
             }
-        })
+            None if self.text_model.graph_decode() => decode_quantum_tokens(),
+            None => 1,
+        }
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -1298,6 +1616,8 @@ impl Qwen38ChatModel {
                     .into(),
             ));
         }
+        self.prefix_reuse
+            .record_prefill(0, prepared.prompt_ids.len());
         let mut text_state = self.text_model.new_state();
         let (logits, final_target_hidden) = match (&self.mtp_head, mtp_cache.as_mut()) {
             (Some(head), Some(mtp_cache)) => self.prefill_text_and_mtp_physical(
@@ -1586,6 +1906,8 @@ impl Qwen38ChatModel {
             initial_penalty_history(&prepared.prompt_ids, max_new_tokens, track_history);
         let mut rng = SimpleRng::new(config.seed);
         let draft_rng = rng.fork();
+        self.prefix_reuse
+            .record_prefill(prefill_start, prepared.prompt_ids.len());
         Ok(ChatDecodeState {
             replay: None,
             prepared: prepared.clone(),
@@ -1664,6 +1986,14 @@ impl Qwen38ChatModel {
             return Err(Error::InferenceError(format!(
                 "Qwen3.8 chunked prefill cache holds {} tokens but the next span starts at {start}",
                 state.physical_kv.context_len()
+            )));
+        }
+        // Above token zero the hybrid state must already hold the history
+        // (an earlier span's, or a restored prefix snapshot). Prefilling from
+        // fresh zero state there would silently drop it.
+        if start > 0 && !state.text_state.linear_state_initialized() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 prefill resumes at token {start} without hybrid state; an attached prefix must restore its snapshot first"
             )));
         }
         let compute_logits = span_end == total;
@@ -1876,12 +2206,14 @@ impl Qwen38ChatModel {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let hidden = head.forward_steps_batch(
-                &embeddings,
-                &target.hidden_states,
-                &positions,
-                &mut mtp_caches,
-            )?;
+            let target_hidden = target.hidden_states.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "Qwen3.8 MTP rows need the target hidden states, which graph decode omits"
+                        .into(),
+                )
+            })?;
+            let hidden =
+                head.forward_steps_batch(&embeddings, target_hidden, &positions, &mut mtp_caches)?;
             Some(hidden)
         } else {
             None
@@ -2432,15 +2764,39 @@ impl Qwen38ChatModel {
         if self.mtp_head.is_some() {
             return self.decode_mtp_quantum(state, input_budget.max(1));
         }
+        if self.text_model.graph_decode() {
+            return self.decode_graph_quantum(state, input_budget.max(1));
+        }
+        // One step per call without graph decode, as before it.
+        self.decode_scalar_step(state)
+    }
 
+    /// One scalar decode step: forward the pending token (through graph
+    /// decode when it resolved, on the batched single-row path), sample the
+    /// next token from the output, publish it.
+    fn decode_scalar_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
         let mut input_tokens_committed = 0;
         if let Some(pending) = state.pending_token.take() {
-            state.unconsumed_output = Some(self.text_model.forward_token_id_at_physical(
-                pending,
-                [state.next_text_position; 3],
-                &mut state.text_state,
-                &mut state.physical_kv,
-            )?);
+            let position = [state.next_text_position; 3];
+            state.unconsumed_output = Some(if self.text_model.graph_decode() {
+                // Graph decode lives on the batched single-row path.
+                self.text_model
+                    .forward_token_ids_batch_at_physical(
+                        &[pending],
+                        &[position],
+                        &mut [&mut state.text_state],
+                        &mut [&mut state.physical_kv],
+                    )?
+                    .logits
+                    .i((0, 0))?
+            } else {
+                self.text_model.forward_token_id_at_physical(
+                    pending,
+                    position,
+                    &mut state.text_state,
+                    &mut state.physical_kv,
+                )?
+            });
             state.next_text_position += 1;
             input_tokens_committed = 1;
         }
@@ -2478,6 +2834,225 @@ impl Qwen38ChatModel {
         state.pending_token = Some(next);
         let delta = self.publish_token(state, next)?;
         Ok(self.decode_step_result(state, delta, input_tokens_committed))
+    }
+
+    /// A graph-decode quantum: up to `budget` decode steps in one engine call.
+    /// Once the whole-step graph replays they are pipelined (step k+1 queued
+    /// before token k is read back); until then, or when the request cannot
+    /// pipeline, they run one at a time. Reports one logprob per emitted
+    /// token.
+    fn decode_graph_quantum(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<ChatDecodeStep> {
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        let mut pipelined = false;
+        // Each step replaces the pending logprobs; the quantum reports them all.
+        let mut logprobs = Vec::new();
+        let mut iteration = 0usize;
+        while iteration < budget && !state.finished {
+            if let Some(step) = self.decode_quantum_pipelined(state, budget - iteration)? {
+                delta.push_str(&step.delta);
+                committed += step.input_tokens_committed;
+                pipelined = true;
+                break;
+            }
+            let step = self.decode_scalar_step(state)?;
+            iteration += 1;
+            logprobs.append(&mut state.pending_logprobs);
+            delta.push_str(&step.delta);
+            committed += step.input_tokens_committed;
+            if step.finished {
+                break;
+            }
+        }
+        state.pending_logprobs = logprobs;
+        self.graph_quantum.record(budget, committed, pipelined);
+        Ok(self.decode_step_result(state, delta, committed))
+    }
+
+    /// The rest of a quantum with each next step queued before the current
+    /// token is read back (the whole-step graph replaying). Every step
+    /// forwards the pending token and chooses the next one on the device
+    /// (`pipeline::DeviceSelector`, the step-by-step device sampler's
+    /// choice), which feeds the next step's input slot. The host reads token
+    /// k while step k+1 runs, then commits step k's KV write and publishes
+    /// the token as a scalar step does. A token that finishes the stream
+    /// discards the queued step: its DeltaNet outputs are dropped (they are
+    /// fresh buffers, and the row's state goes back to the one after the
+    /// committed step) and its KV slot stays uncommitted (the step waits for
+    /// its writes when dropped). `Ok(None)`: the request or the graph cannot
+    /// pipeline (fewer than two steps left, logprobs, replay, an MTP head, no
+    /// pending token, the device sampler off, or the graph not replaying);
+    /// the caller decodes step by step.
+    fn decode_quantum_pipelined(
+        &self,
+        state: &mut ChatDecodeState,
+        budget: usize,
+    ) -> Result<Option<ChatDecodeStep>> {
+        struct Queued {
+            step: super::text::EnqueuedGraphStep,
+            token: pipeline::PendingToken,
+            state_after: Qwen38TextRuntimeState,
+        }
+        let model = &self.text_model;
+        let Some(pending) = state.pending_token else {
+            return Ok(None);
+        };
+        // The output cap ends the stream exactly; nothing is queued past it.
+        let budget = budget.min(state.max_new_tokens.saturating_sub(state.tokens_generated));
+        if budget < 2
+            || state.finished
+            || state.replay.is_some()
+            || state.config.logprobs
+            || self.mtp_head.is_some()
+            || state.unconsumed_output.is_some()
+            || state.bootstrap_token.is_some()
+            || self.pipelining_refusal().is_some()
+            || !model.graph_step_ready()
+        {
+            return Ok(None);
+        }
+        let history: &[u32] = if state.track_history {
+            &state.history_ids
+        } else {
+            &[]
+        };
+        let mut selector = pipeline::DeviceSelector::new(
+            model.device(),
+            self.tokenizer.vocab_size,
+            &state.config,
+            state.track_history,
+            history,
+        )?;
+        let base = state.next_text_position;
+        let Some(first) = model.enqueue_graph_step(
+            Some(pending),
+            base,
+            &mut state.text_state,
+            &state.physical_kv,
+        )?
+        else {
+            return Ok(None);
+        };
+        state.pending_token = None;
+        state.pending_logprobs.clear();
+        let token_slot = model.graph_step_token().ok_or_else(|| {
+            Error::InferenceError("the Qwen3.8 whole-step graph has no step buffer".into())
+        })??;
+        let draw = |rng: &mut SimpleRng, draws: bool| if draws { rng.next_f32() } else { 0.0 };
+        let uniform = draw(&mut state.rng, selector.draws());
+        let mut current = Queued {
+            token: selector.select(&first.logits, &token_slot, uniform)?,
+            step: first,
+            state_after: state.text_state.clone(),
+        };
+        let mut launched = 1usize;
+        let mut delta = String::new();
+        let mut committed = 0usize;
+        loop {
+            let next = if launched < budget {
+                match model.enqueue_graph_step(
+                    None,
+                    base + launched,
+                    &mut state.text_state,
+                    &state.physical_kv,
+                )? {
+                    Some(step) => {
+                        launched += 1;
+                        let uniform = draw(&mut state.rng, selector.draws());
+                        Some(Queued {
+                            token: selector.select(&step.logits, &token_slot, uniform)?,
+                            step,
+                            state_after: state.text_state.clone(),
+                        })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let token = selector.wait(current.token)?;
+            model.commit_enqueued_step(current.step, &mut state.physical_kv)?;
+            state.next_text_position += 1;
+            committed += 1;
+            // Publish as the scalar step does.
+            if state.track_history {
+                state.history_ids.push(token);
+            }
+            state.pending_token = Some(token);
+            delta.push_str(&self.publish_token(state, token)?);
+            match next {
+                // The queued step already forwards this token.
+                Some(next) if !state.finished => {
+                    state.pending_token = None;
+                    current = next;
+                }
+                // The stream ended: discard the queued step.
+                Some(discarded) => {
+                    state.text_state = current.state_after;
+                    drop(discarded);
+                    break;
+                }
+                None => break,
+            }
+        }
+        Ok(Some(self.decode_step_result(state, delta, committed)))
+    }
+
+    /// `cuda_graphs` in the diagnostics: graph decode's resolution, phase and
+    /// counters, and the decode quantum it asks the scheduler for.
+    /// Cross-turn prefix reuse: whether this load shares prefixes and why,
+    /// where a chat turn's shared history ends, and the prompt tokens every
+    /// prefill since reused or computed. The managed cache's own counters
+    /// (`kv_cache.counters` and `kv_cache.models[]` in `/v1/metrics`) show
+    /// hits, misses, snapshot publications and the snapshot budget.
+    fn prefix_reuse_diagnostics(&self) -> serde_json::Value {
+        let shared = self.prefix_caching && !self.mtp_policy.enabled();
+        let reason = if shared {
+            "engaged: committed KV pages and hybrid-state snapshots are shared at each turn's history boundary"
+        } else if self.prefix_reuse.switched_off {
+            "off: IZWI_QWEN38_PREFIX_REUSE turned it off for Qwen3.8"
+        } else if !self.prefix_caching {
+            "off: not engaged for this backend (the catalog cell is not supported here, or IZWI_ENABLE_PREFIX_CACHING=0 / IZWI_PREFIX_REUSE_AUTO=0)"
+        } else {
+            "off: the MTP head is loaded; its draft attention state has no prefix snapshot, so every domain stays private (CUDA leaves the head out by default; IZWI_QWEN38_MTP=1 loads it)"
+        };
+        let counters = &self.prefix_reuse;
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        serde_json::json!({
+            "engaged": shared,
+            "reason": reason,
+            "requested": counters.requested,
+            "switch": PREFIX_REUSE_ENV,
+            "history_boundary": "before the prompt's final <|im_start|> (the assistant generation header)",
+            "snapshot_interval_tokens": default_kv_page_size(),
+            "attached_prefills": load(&counters.attached_prefills),
+            "fresh_prefills": load(&counters.fresh_prefills),
+            "reused_prompt_tokens": load(&counters.reused_prompt_tokens),
+            "prefilled_prompt_tokens": load(&counters.prefilled_prompt_tokens),
+            "last_prefill": {
+                "reused_tokens": load(&counters.last_reused_tokens),
+                "prompt_tokens": load(&counters.last_prompt_tokens),
+            },
+            "managed_counters": "runtime_metrics.kv_cache: counters.prefix_hits, prefix_misses, reused_tokens, tensor_snapshot_publishes, tensor_snapshot_attaches; models[].prefix_snapshots, prefix_snapshot_bytes, prefix_snapshot_budget_bytes",
+        })
+    }
+
+    fn cuda_graphs_diagnostics(&self) -> serde_json::Value {
+        let mut summary = self.text_model.cuda_graphs_summary();
+        let mut quantum = self.graph_quantum.summary();
+        quantum["preferred"] = serde_json::json!(self.preferred_decode_tokens());
+        quantum["sustained"] = serde_json::json!(self.sustained_decode_quantum());
+        quantum["switch"] = serde_json::json!(DECODE_QUANTUM_ENV);
+        quantum["pipelining"] = match self.pipelining_refusal() {
+            None => serde_json::json!({ "backend": "fused" }),
+            Some(reason) => serde_json::json!({ "backend": "legacy", "reason": reason }),
+        };
+        summary["decode_quantum"] = quantum;
+        summary
     }
 
     fn decode_step_result(
@@ -3017,10 +3592,12 @@ impl Qwen38ChatModel {
         }
         let prompt_ids = self.tokenizer.encode_text(&prompt)?;
         let prompt_positions = build_text_positions(prompt_ids.len());
+        let history_boundary = history_boundary(&prompt_ids, self.tokenizer.specials.im_start);
         Ok(Qwen38PreparedPrompt {
             next_text_position: prompt_positions.len(),
             prompt_ids,
             prompt_positions,
+            history_boundary,
         })
     }
 }
@@ -3962,6 +4539,37 @@ mod tests {
     }
 
     #[test]
+    fn prefill_chunk_follows_the_backend_and_the_prefill_gemm_with_an_override() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(PREFILL_CHUNK_ENV);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cuda, true), 1024);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cuda, false), 256);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Metal, true), 256);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cpu, true), 256);
+        for (value, expected) in [("512", 512), ("0", 1024), ("junk", 1024), ("999999", 2048)] {
+            std::env::set_var(PREFILL_CHUNK_ENV, value);
+            assert_eq!(
+                qwen38_prefill_chunk_tokens(BackendKind::Cuda, true),
+                expected,
+                "{value}"
+            );
+        }
+        std::env::set_var(PREFILL_CHUNK_ENV, "64");
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cpu, false), 64);
+        std::env::remove_var(PREFILL_CHUNK_ENV);
+        // Admission prices one decode row's activation bound per prefill
+        // token: 392 MiB for a 1,024-token chunk of the 27B trunk.
+        let cfg = shipped_workspace_config();
+        assert_eq!(
+            prefill_working_set_bytes(&cfg, 1024).unwrap(),
+            401_408 * 1024
+        );
+        assert_eq!(prefill_working_set_bytes(&cfg, 256).unwrap(), 401_408 * 256);
+    }
+
+    #[test]
     fn terminal_mtp_rows_are_identified_before_anchor_retention() {
         assert!(sample_finishes_row(true, 0, 32));
         assert!(sample_finishes_row(false, 31, 32));
@@ -3992,6 +4600,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
+            history_boundary: None,
         };
         assert_eq!(prepared.prompt_ids(), &[1, 2, 3]);
         assert_eq!(
@@ -4005,6 +4614,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reused.prompt_ids(), prepared.prompt_ids());
+    }
+
+    #[test]
+    fn prefix_reuse_switch_is_a_strict_boolean_defaulting_on() {
+        assert!(qwen38_prefix_reuse_switch(None).unwrap());
+        for on in ["1", "true", " YES ", "on"] {
+            assert!(qwen38_prefix_reuse_switch(Some(on)).unwrap(), "{on}");
+        }
+        for off in ["0", "false", "No", "off"] {
+            assert!(!qwen38_prefix_reuse_switch(Some(off)).unwrap(), "{off}");
+        }
+        let error = qwen38_prefix_reuse_switch(Some("maybe")).unwrap_err();
+        assert!(error.to_string().contains(PREFIX_REUSE_ENV), "{error}");
+    }
+
+    #[test]
+    fn prefix_reuse_counts_attached_and_fresh_prefill_tokens() {
+        let reuse = Qwen38PrefixReuse::new(true, false);
+        reuse.record_prefill(0, 100);
+        reuse.record_prefill(64, 180);
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        assert_eq!(load(&reuse.fresh_prefills), 1);
+        assert_eq!(load(&reuse.attached_prefills), 1);
+        assert_eq!(load(&reuse.reused_prompt_tokens), 64);
+        assert_eq!(load(&reuse.prefilled_prompt_tokens), 100 + 116);
+        assert_eq!(load(&reuse.last_reused_tokens), 64);
+        assert_eq!(load(&reuse.last_prompt_tokens), 180);
     }
 
     #[test]
@@ -4137,71 +4773,108 @@ mod tests {
     }
 
     #[test]
-    fn cuda_diagnostics_identify_q8_0_fallback_without_changing_portable_modes() {
-        let cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseBf16;
+    fn diagnostics_follow_the_residency_policy_on_every_backend() {
+        use super::super::residency::Qwen38ResidencyPolicy;
+        use super::super::text::Qwen38ProjectionRepresentation;
+        let performance = crate::performance::PerformanceConfig::default();
+        // CUDA without its device gates (the static estimate) keeps Q8_0.
+        let cuda = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cuda,
+            &performance,
+        ));
         assert_eq!(
-            cuda_representation.as_str(),
+            cuda.resident_representation,
             "q8_0_requantized_projections_with_dense_bf16"
         );
-        assert_eq!(
-            qwen38_fp8_execution_mode(cuda_representation),
-            "q8_0_compressed_fallback"
+        assert_eq!(cuda.runtime_compute_dtype, "bf16");
+        assert!(
+            cuda.fp8_execution_mode.starts_with("q8_0_fallback:"),
+            "{}",
+            cuda.fp8_execution_mode
         );
-        assert!(qwen38_fp8_fallback_reason(cuda_representation).contains("weight_scale_inv"));
-        assert!(qwen38_fp8_fallback_reason(cuda_representation)
-            .contains("native FP8 execution is not runtime-certified"));
-        let f16_cuda_representation = Qwen38ProjectionRepresentation::PackedQ8WithDenseF16;
+        assert!(cuda.fallback_reason.contains("weight_scale_inv"));
         assert_eq!(
-            f16_cuda_representation.as_str(),
+            Qwen38ProjectionRepresentation::PackedQ8WithDenseF16.as_str(),
             "q8_0_requantized_projections_with_dense_f16"
         );
-        assert_eq!(f16_cuda_representation.compute_dtype(), "f16");
         assert_eq!(
-            qwen38_fp8_execution_mode(f16_cuda_representation),
-            "q8_0_compressed_fallback"
+            Qwen38ProjectionRepresentation::PackedQ8WithDenseF16.compute_dtype(),
+            "f16"
         );
-        let f16_diagnostics = qwen38_representation_diagnostics(f16_cuda_representation);
-        assert_eq!(
-            f16_diagnostics.resident_representation,
-            "q8_0_requantized_projections_with_dense_f16"
-        );
-        assert_eq!(f16_diagnostics.runtime_compute_dtype, "f16");
-        let bf16_diagnostics = qwen38_representation_diagnostics(cuda_representation);
-        assert_eq!(
-            bf16_diagnostics.resident_representation,
-            "q8_0_requantized_projections_with_dense_bf16"
-        );
-        assert_eq!(bf16_diagnostics.runtime_compute_dtype, "bf16");
 
-        assert_eq!(
-            Qwen38ProjectionRepresentation::ExpandedF32.as_str(),
-            "expanded_f32"
+        // Native block FP8 reports its self-checked mode.
+        let native = qwen38_representation_diagnostics(
+            &Qwen38ResidencyPolicy::forced_native_fp8_for_tests(ProjectionMaterialization::BF16),
         );
         assert_eq!(
-            Qwen38ProjectionRepresentation::ExpandedF16.as_str(),
-            "expanded_f16"
+            native.resident_representation,
+            "native_block_fp8_with_q8_fallback_dense_bf16"
         );
         assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF32),
-            "expanded_fallback"
+            native.fp8_execution_mode,
+            "native_block_fp8_auto_self_checked"
         );
+        assert!(native.fallback_reason.contains("not runtime-certified"));
+
+        // The CPU keeps Q8_0 projections, or its F32 expansion when told to.
+        let cpu = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cpu,
+            &performance,
+        ));
         assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedF16),
-            "expanded_fallback"
+            cpu.resident_representation,
+            "q8_0_projections_with_dense_f32"
         );
+        assert_eq!(cpu.runtime_compute_dtype, "f32");
+        assert_eq!(cpu.fp8_execution_mode, "q8_0_cpu_requantized");
+        assert!(cpu
+            .fallback_reason
+            .contains("IZWI_CPU_PROJECTION_BACKEND=expanded"));
+        let mut cpu_expanded = crate::performance::PerformanceConfig::default();
+        cpu_expanded.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+        let cpu = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Cpu,
+            &cpu_expanded,
+        ));
+        assert_eq!(cpu.resident_representation, "expanded_f32");
+        assert_eq!(cpu.fp8_execution_mode, "expanded_fallback");
         assert_eq!(
-            qwen38_fp8_execution_mode(Qwen38ProjectionRepresentation::ExpandedBf16),
-            "expanded_fallback"
+            cpu.fallback_reason,
+            "cpu.projection_backend=expanded: native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path"
         );
-        let expanded_reason =
-            "native block-FP8 GEMM is not runtime-certified; using the scale-exact expanded path";
+        // Metal keeps raw block FP8 in a Metal build, and expands to F16
+        // when told to (or without the Metal kernels).
+        let metal = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Metal,
+            &performance,
+        ));
+        if cfg!(feature = "metal") {
+            assert_eq!(
+                metal.resident_representation,
+                "native_block_fp8_with_dense_f16"
+            );
+            assert_eq!(
+                metal.fp8_execution_mode,
+                "native_block_fp8_auto_self_checked"
+            );
+            assert!(metal.fallback_reason.contains("transient F16"));
+        } else {
+            assert_eq!(metal.resident_representation, "expanded_f16");
+            assert!(metal.fallback_reason.contains("need a Metal build"));
+        }
+        assert_eq!(metal.runtime_compute_dtype, "f16");
+        let mut expanded = crate::performance::PerformanceConfig::default();
+        expanded.metal.projection_backend = crate::performance::MetalProjectionBackend::Expanded;
+        let metal = qwen38_representation_diagnostics(&Qwen38ResidencyPolicy::resolve_static(
+            BackendKind::Metal,
+            &expanded,
+        ));
+        assert_eq!(metal.resident_representation, "expanded_f16");
+        assert_eq!(metal.fp8_execution_mode, "expanded_fallback");
+        assert_eq!(metal.fallback_reason, "metal.projection_backend=expanded");
         assert_eq!(
-            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF32),
-            expanded_reason
-        );
-        assert_eq!(
-            qwen38_fp8_fallback_reason(Qwen38ProjectionRepresentation::ExpandedF16),
-            expanded_reason
+            Qwen38ProjectionRepresentation::ExpandedBf16.as_str(),
+            "expanded_bf16"
         );
     }
 
@@ -4285,5 +4958,177 @@ mod tests {
         let prompt = render_prompt(&history_messages(), &config, true).unwrap();
         assert!(!prompt.contains("reasoning first"));
         assert!(prompt.contains("Final answer<|im_end|>"));
+    }
+
+    fn byte_level_char(byte: u8) -> char {
+        let mut bytes: Vec<u8> = (b'!'..=b'~')
+            .chain(b'\xA1'..=b'\xAC')
+            .chain(b'\xAE'..=b'\xFF')
+            .collect();
+        let mut codepoints: Vec<u32> = bytes.iter().map(|byte| u32::from(*byte)).collect();
+        let mut next = 0u32;
+        for candidate in 0..=u8::MAX {
+            if !bytes.contains(&candidate) {
+                bytes.push(candidate);
+                codepoints.push(256 + next);
+                next += 1;
+            }
+        }
+        let index = bytes
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("the byte-level alphabet covers every byte");
+        char::from_u32(codepoints[index]).expect("valid byte-level codepoint")
+    }
+
+    /// Byte-level BPE whose Qwen3.8 special tokens (the chat markers, the
+    /// think tags, the media pads) encode atomically, as in the published
+    /// tokenizer.
+    fn byte_level_tokenizer() -> Qwen38Tokenizer {
+        let mut tokens: Vec<String> = (0..=u8::MAX)
+            .map(|byte| byte_level_char(byte).to_string())
+            .collect();
+        let mut specials = Vec::new();
+        for literal in [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            IMAGE_PAD_PLACEHOLDER,
+            VIDEO_PAD_PLACEHOLDER,
+            "<think>",
+            "</think>",
+        ] {
+            specials.push((literal.to_string(), tokens.len() as u32));
+            tokens.push(literal.to_string());
+        }
+        let mut token_types = vec![1; 256];
+        token_types.extend([3; 7]);
+        let mut inner =
+            Tokenizer::from_gguf_bpe(&tokens, &[], Some("qwen35"), false).expect("tokenizer");
+        inner
+            .register_gguf_token_types(&tokens, &token_types)
+            .expect("atomic special tokens");
+        let id = |literal: &str| {
+            specials
+                .iter()
+                .find(|(token, _)| token == literal)
+                .map(|(_, id)| *id)
+                .unwrap()
+        };
+        let special_ids = SpecialTokenIds {
+            im_start: id("<|im_start|>"),
+            im_end: id("<|im_end|>"),
+            eos: id("<|im_end|>"),
+            eos_alt: Some(id("<|endoftext|>")),
+        };
+        specials.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        Qwen38Tokenizer {
+            vocab_size: inner.vocab_size(),
+            specials: special_ids,
+            inner,
+            literal_special_tokens: specials,
+            chat_template: String::new(),
+            default_enable_thinking: true,
+        }
+    }
+
+    /// The declared history boundary is exactly what the next turn shares:
+    /// across three turns, with thinking on and off, every reasoning effort,
+    /// preserved and dropped reasoning, tools, Unicode and reasoning inside
+    /// the answers, each render reproduces the previous render's tokens up to
+    /// its boundary, and the boundary opens the assistant generation header.
+    #[test]
+    fn next_turn_shares_the_declared_history_boundary() {
+        let tokenizer = byte_level_tokenizer();
+        let im_start = tokenizer.specials.im_start;
+        let tool = serde_json::json!({"type": "function", "function": {"name": "lookup"}});
+        for (thinking, effort, preserve, tools) in [
+            (None, None, None, Vec::new()),
+            (Some(false), None, None, Vec::new()),
+            (
+                Some(true),
+                Some(ChatReasoningEffort::Low),
+                Some(false),
+                Vec::new(),
+            ),
+            (
+                Some(true),
+                Some(ChatReasoningEffort::Medium),
+                None,
+                vec![tool.clone()],
+            ),
+            (
+                Some(false),
+                Some(ChatReasoningEffort::Xhigh),
+                Some(false),
+                vec![tool],
+            ),
+        ] {
+            let config = ChatGenerationConfig {
+                request: ChatRequestConfig {
+                    enable_thinking: thinking,
+                    reasoning_effort: effort,
+                    preserve_thinking: preserve,
+                    tools,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let message = |role, content: &str| ChatMessage {
+                role,
+                content: content.to_string(),
+            };
+            let mut conversation = vec![
+                message(ChatRole::System, "Be precise."),
+                message(ChatRole::User, "First question — café 中文 🌍"),
+            ];
+            let answers = [
+                "<think>\nreasoning one\n</think>\n\nFirst answer.",
+                "reasoning two</think>\nSecond answer ✓",
+                "Third answer, no reasoning",
+            ];
+            let mut previous: Option<(Vec<u32>, usize)> = None;
+            for (turn, answer) in answers.iter().enumerate() {
+                let prompt = render_prompt(&conversation, &config, true).unwrap();
+                let ids = tokenizer.encode_text(&prompt).unwrap();
+                let boundary = history_boundary(&ids, im_start).expect("declared boundary");
+                assert_eq!(ids[boundary], im_start);
+                assert!(tokenizer
+                    .inner
+                    .decode_with_special_tokens(&ids[boundary..])
+                    .unwrap()
+                    .starts_with("<|im_start|>assistant\n"));
+                if let Some((previous_ids, previous_boundary)) = &previous {
+                    assert!(boundary > *previous_boundary);
+                    assert_eq!(
+                        &ids[..*previous_boundary],
+                        &previous_ids[..*previous_boundary],
+                        "turn {turn} ({config:?}) diverges inside the previous history"
+                    );
+                }
+                previous = Some((ids, boundary));
+                conversation.push(message(ChatRole::Assistant, answer));
+                conversation.push(message(ChatRole::User, "Follow-up ✓"));
+            }
+        }
+        assert_eq!(history_boundary(&[im_start, 7, 8], im_start), None);
+        assert_eq!(history_boundary(&[1, 2, 3], im_start), None);
+        assert_eq!(history_boundary(&[1, im_start, 3], im_start), Some(1));
+    }
+
+    /// The boundary reaches the engine request through the registry's
+    /// prepared prompt, which is how the scheduler and the managed cache see it.
+    #[test]
+    fn the_registry_prepared_prompt_carries_the_boundary() {
+        let prepared = Qwen38PreparedPrompt {
+            prompt_ids: vec![1, 2, 3],
+            prompt_positions: build_text_positions(3),
+            next_text_position: 3,
+            history_boundary: Some(2),
+        };
+        let native = crate::models::registry::NativeChatPreparedPrompt::Qwen38(prepared);
+        assert_eq!(native.managed_snapshot_boundary(), Some(2));
     }
 }

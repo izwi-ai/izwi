@@ -14,6 +14,16 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_q8_projection_calls_total: u64,
     pub cuda_native_fp8_projection_calls_total: u64,
     pub cuda_dense_projection_calls_total: u64,
+    pub cuda_fp8_gemv_vectorized_calls_total: u64,
+    pub cuda_fp8_gemv_reference_calls_total: u64,
+    pub cuda_fp8_packed_projection_calls_total: u64,
+    pub cuda_fp8_prefill_gemm_calls_total: u64,
+    pub cuda_fp8_lm_head_calls_total: u64,
+    pub cuda_bf16_lm_head_calls_total: u64,
+    pub metal_fp8_gemv_calls_total: u64,
+    pub metal_fp8_dequant_matmul_calls_total: u64,
+    pub cpu_q8_matmul_calls_total: u64,
+    pub cpu_q8_tiled_prefill_calls_total: u64,
     pub cuda_attention_dtype_casts_total: u64,
     pub cuda_bf16_kv_provider_selected_total: u64,
     pub cuda_f16_kv_fallback_selected_total: u64,
@@ -37,6 +47,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_deltanet_prefill_attempts_total: u64,
     pub cuda_deltanet_prefill_success_total: u64,
     pub cuda_deltanet_prefill_fallback_total: u64,
+    pub cuda_deltanet_grouped_prefill_attempts_total: u64,
+    pub cuda_deltanet_grouped_prefill_success_total: u64,
+    pub cuda_deltanet_grouped_prefill_fallback_total: u64,
     pub cuda_causal_conv_prefill_attempts_total: u64,
     pub cuda_causal_conv_prefill_success_total: u64,
     pub cuda_causal_conv_prefill_fallback_total: u64,
@@ -45,6 +58,18 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_causal_conv_decode_fallback_total: u64,
     pub cuda_rope_kernel_success_total: u64,
     pub cuda_rope_manual_fallback_total: u64,
+    pub cuda_fused_gdn_decode_attempts_total: u64,
+    pub cuda_fused_gdn_decode_success_total: u64,
+    pub cuda_fused_gdn_decode_fallback_total: u64,
+    pub cuda_fused_qk_norm_rope_total: u64,
+    pub cuda_fused_qk_norm_rope_kv_total: u64,
+    pub cuda_qk_rope_chain_total: u64,
+    pub cuda_fused_attn_gate_total: u64,
+    pub cuda_attn_gate_composition_total: u64,
+    pub cuda_fused_rms_norm_total: u64,
+    pub cuda_fused_add_rms_norm_total: u64,
+    pub cuda_rms_norm_composition_total: u64,
+    pub fast_path_self_check_failures_total: u64,
     pub sampling_device_argmax_total: u64,
     pub sampling_bounded_cuda_attempts_total: u64,
     pub sampling_bounded_cuda_success_total: u64,
@@ -83,6 +108,16 @@ counters!(
     CUDA_Q8_PROJECTION_CALLS,
     CUDA_NATIVE_FP8_PROJECTION_CALLS,
     CUDA_DENSE_PROJECTION_CALLS,
+    CUDA_FP8_GEMV_VECTORIZED_CALLS,
+    CUDA_FP8_GEMV_REFERENCE_CALLS,
+    CUDA_FP8_PACKED_PROJECTION_CALLS,
+    CUDA_FP8_PREFILL_GEMM_CALLS,
+    CUDA_FP8_LM_HEAD_CALLS,
+    CUDA_BF16_LM_HEAD_CALLS,
+    METAL_FP8_GEMV_CALLS,
+    METAL_FP8_DEQUANT_MATMUL_CALLS,
+    CPU_Q8_MATMUL_CALLS,
+    CPU_Q8_TILED_PREFILL_CALLS,
     CUDA_ATTENTION_DTYPE_CASTS,
     CUDA_BF16_KV_PROVIDER_SELECTED,
     CUDA_F16_KV_FALLBACK_SELECTED,
@@ -106,6 +141,9 @@ counters!(
     CUDA_DELTANET_PREFILL_ATTEMPTS,
     CUDA_DELTANET_PREFILL_SUCCESS,
     CUDA_DELTANET_PREFILL_FALLBACK,
+    CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS,
+    CUDA_DELTANET_GROUPED_PREFILL_SUCCESS,
+    CUDA_DELTANET_GROUPED_PREFILL_FALLBACK,
     CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
     CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
     CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
@@ -114,6 +152,18 @@ counters!(
     CUDA_CAUSAL_CONV_DECODE_FALLBACK,
     CUDA_ROPE_KERNEL_SUCCESS,
     CUDA_ROPE_MANUAL_FALLBACK,
+    CUDA_FUSED_GDN_DECODE_ATTEMPTS,
+    CUDA_FUSED_GDN_DECODE_SUCCESS,
+    CUDA_FUSED_GDN_DECODE_FALLBACK,
+    CUDA_FUSED_QK_NORM_ROPE,
+    CUDA_FUSED_QK_NORM_ROPE_KV,
+    CUDA_QK_ROPE_CHAIN,
+    CUDA_FUSED_ATTN_GATE,
+    CUDA_ATTN_GATE_COMPOSITION,
+    CUDA_FUSED_RMS_NORM,
+    CUDA_FUSED_ADD_RMS_NORM,
+    CUDA_RMS_NORM_COMPOSITION,
+    FAST_PATH_SELF_CHECK_FAILURES,
     SAMPLING_DEVICE_ARGMAX,
     SAMPLING_BOUNDED_CUDA_ATTEMPTS,
     SAMPLING_BOUNDED_CUDA_SUCCESS,
@@ -156,8 +206,14 @@ pub(crate) enum CudaKernelPath {
     DeltaNetDecode,
     DeltaNetSpecializedDecode,
     DeltaNetPrefill,
+    /// A prefill span through the grouped DeltaNet sequence kernel (success)
+    /// or handed back to today's recurrence (fallback).
+    DeltaNetGroupedPrefill,
     CausalConvPrefill,
     CausalConvDecode,
+    /// A row the resolved fused GDN decode took (success) or handed back to
+    /// today's decode (fallback). Production resolves it on CUDA only.
+    FusedGdnDecode,
 }
 
 pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
@@ -169,6 +225,57 @@ pub(crate) fn record_cuda_projection(path: CudaProjectionPath) {
         CudaProjectionPath::Q8 => CUDA_Q8_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
         CudaProjectionPath::Dense => CUDA_DENSE_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+/// One CUDA block-FP8 decode call (at most four rows): through the
+/// vectorized GEMV, or the reference GEMV.
+pub(crate) fn record_cuda_fp8_gemv(vectorized: bool) {
+    if vectorized {
+        CUDA_FP8_GEMV_VECTORIZED_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FP8_GEMV_REFERENCE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA LM-head projection (target logits or an MTP draft): through the
+/// block-FP8 head, or the dense (BF16/F16) head.
+pub(crate) fn record_cuda_lm_head(fp8: bool) {
+    if fp8 {
+        CUDA_FP8_LM_HEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_BF16_LM_HEAD_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One Metal block-FP8 projection call: through the FP8 GEMV (decode rows),
+/// or expanded to F16 and multiplied (prefill spans).
+pub(crate) fn record_metal_fp8_projection(gemv: bool) {
+    if gemv {
+        METAL_FP8_GEMV_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        METAL_FP8_DEQUANT_MATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CPU Q8_0 projection call: Candle's Q8_0 matmul (decode rows), or the
+/// tiled F32 expansion + matmul (prefill spans).
+pub(crate) fn record_cpu_q8_projection(tiled: bool) {
+    if tiled {
+        CPU_Q8_TILED_PREFILL_CALLS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CPU_Q8_MATMUL_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA call of a packed block-FP8 projection group.
+pub(crate) fn record_cuda_fp8_packed_projection() {
+    CUDA_FP8_PACKED_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One CUDA block-FP8 projection over a long span (prefill) through the
+/// dequantized-tile dense GEMM instead of the compact `mm` kernel.
+pub(crate) fn record_cuda_fp8_prefill_gemm() {
+    CUDA_FP8_PREFILL_GEMM_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_cuda_attention_dtype_casts(count: usize) {
@@ -223,6 +330,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_DELTANET_PREFILL_SUCCESS,
             &CUDA_DELTANET_PREFILL_FALLBACK,
         ),
+        CudaKernelPath::DeltaNetGroupedPrefill => (
+            &CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS,
+            &CUDA_DELTANET_GROUPED_PREFILL_SUCCESS,
+            &CUDA_DELTANET_GROUPED_PREFILL_FALLBACK,
+        ),
         CudaKernelPath::CausalConvPrefill => (
             &CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
             &CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
@@ -232,6 +344,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_CAUSAL_CONV_DECODE_ATTEMPTS,
             &CUDA_CAUSAL_CONV_DECODE_SUCCESS,
             &CUDA_CAUSAL_CONV_DECODE_FALLBACK,
+        ),
+        CudaKernelPath::FusedGdnDecode => (
+            &CUDA_FUSED_GDN_DECODE_ATTEMPTS,
+            &CUDA_FUSED_GDN_DECODE_SUCCESS,
+            &CUDA_FUSED_GDN_DECODE_FALLBACK,
         ),
     };
     attempts.fetch_add(1, Ordering::Relaxed);
@@ -248,6 +365,54 @@ pub(crate) fn record_cuda_rope(selected: bool) {
     } else {
         CUDA_ROPE_MANUAL_FALLBACK.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One norm through the fused kernel: `add` when it also performed the
+/// preceding residual add. Production resolves the fused norms on CUDA only;
+/// the portable reference that tests resolve counts here too.
+pub(crate) fn record_fused_rms_norm(add: bool) {
+    if add {
+        CUDA_FUSED_ADD_RMS_NORM.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FUSED_RMS_NORM.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA norm through the Candle composition (cast, norm, cast for a
+/// half-precision activation).
+pub(crate) fn record_cuda_rms_norm_composition() {
+    CUDA_RMS_NORM_COMPOSITION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One decode token's q/k through the fused norm + RoPE kernel: `kv` when the
+/// same launch wrote its K/V into the paged cache. Production resolves it on
+/// CUDA only; the portable reference that tests resolve counts here too.
+pub(crate) fn record_fused_qk_norm_rope(kv: bool) {
+    if kv {
+        CUDA_FUSED_QK_NORM_ROPE_KV.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CUDA_FUSED_QK_NORM_ROPE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One CUDA decode token's q/k through the norm, plan and rotary chain.
+pub(crate) fn record_cuda_qk_rope_chain() {
+    CUDA_QK_ROPE_CHAIN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One attention output gated by the fused kernel (any device, see above).
+pub(crate) fn record_fused_attn_gate() {
+    CUDA_FUSED_ATTN_GATE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One CUDA attention output gated by the sigmoid and multiply composition.
+pub(crate) fn record_cuda_attn_gate_composition() {
+    CUDA_ATTN_GATE_COMPOSITION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A fused fast path disagreed with its composition at load and stayed off.
+pub(crate) fn record_fast_path_self_check_failure() {
+    FAST_PATH_SELF_CHECK_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_sampling_device_argmax() {
@@ -347,6 +512,16 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_q8_projection_calls_total: load!(CUDA_Q8_PROJECTION_CALLS),
         cuda_native_fp8_projection_calls_total: load!(CUDA_NATIVE_FP8_PROJECTION_CALLS),
         cuda_dense_projection_calls_total: load!(CUDA_DENSE_PROJECTION_CALLS),
+        cuda_fp8_gemv_vectorized_calls_total: load!(CUDA_FP8_GEMV_VECTORIZED_CALLS),
+        cuda_fp8_gemv_reference_calls_total: load!(CUDA_FP8_GEMV_REFERENCE_CALLS),
+        cuda_fp8_packed_projection_calls_total: load!(CUDA_FP8_PACKED_PROJECTION_CALLS),
+        cuda_fp8_prefill_gemm_calls_total: load!(CUDA_FP8_PREFILL_GEMM_CALLS),
+        cuda_fp8_lm_head_calls_total: load!(CUDA_FP8_LM_HEAD_CALLS),
+        cuda_bf16_lm_head_calls_total: load!(CUDA_BF16_LM_HEAD_CALLS),
+        metal_fp8_gemv_calls_total: load!(METAL_FP8_GEMV_CALLS),
+        metal_fp8_dequant_matmul_calls_total: load!(METAL_FP8_DEQUANT_MATMUL_CALLS),
+        cpu_q8_matmul_calls_total: load!(CPU_Q8_MATMUL_CALLS),
+        cpu_q8_tiled_prefill_calls_total: load!(CPU_Q8_TILED_PREFILL_CALLS),
         cuda_attention_dtype_casts_total: load!(CUDA_ATTENTION_DTYPE_CASTS),
         cuda_bf16_kv_provider_selected_total: load!(CUDA_BF16_KV_PROVIDER_SELECTED),
         cuda_f16_kv_fallback_selected_total: load!(CUDA_F16_KV_FALLBACK_SELECTED),
@@ -376,6 +551,9 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_deltanet_prefill_attempts_total: load!(CUDA_DELTANET_PREFILL_ATTEMPTS),
         cuda_deltanet_prefill_success_total: load!(CUDA_DELTANET_PREFILL_SUCCESS),
         cuda_deltanet_prefill_fallback_total: load!(CUDA_DELTANET_PREFILL_FALLBACK),
+        cuda_deltanet_grouped_prefill_attempts_total: load!(CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS),
+        cuda_deltanet_grouped_prefill_success_total: load!(CUDA_DELTANET_GROUPED_PREFILL_SUCCESS),
+        cuda_deltanet_grouped_prefill_fallback_total: load!(CUDA_DELTANET_GROUPED_PREFILL_FALLBACK),
         cuda_causal_conv_prefill_attempts_total: load!(CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS),
         cuda_causal_conv_prefill_success_total: load!(CUDA_CAUSAL_CONV_PREFILL_SUCCESS),
         cuda_causal_conv_prefill_fallback_total: load!(CUDA_CAUSAL_CONV_PREFILL_FALLBACK),
@@ -384,6 +562,18 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_causal_conv_decode_fallback_total: load!(CUDA_CAUSAL_CONV_DECODE_FALLBACK),
         cuda_rope_kernel_success_total: load!(CUDA_ROPE_KERNEL_SUCCESS),
         cuda_rope_manual_fallback_total: load!(CUDA_ROPE_MANUAL_FALLBACK),
+        cuda_fused_gdn_decode_attempts_total: load!(CUDA_FUSED_GDN_DECODE_ATTEMPTS),
+        cuda_fused_gdn_decode_success_total: load!(CUDA_FUSED_GDN_DECODE_SUCCESS),
+        cuda_fused_gdn_decode_fallback_total: load!(CUDA_FUSED_GDN_DECODE_FALLBACK),
+        cuda_fused_qk_norm_rope_total: load!(CUDA_FUSED_QK_NORM_ROPE),
+        cuda_fused_qk_norm_rope_kv_total: load!(CUDA_FUSED_QK_NORM_ROPE_KV),
+        cuda_qk_rope_chain_total: load!(CUDA_QK_ROPE_CHAIN),
+        cuda_fused_attn_gate_total: load!(CUDA_FUSED_ATTN_GATE),
+        cuda_attn_gate_composition_total: load!(CUDA_ATTN_GATE_COMPOSITION),
+        cuda_fused_rms_norm_total: load!(CUDA_FUSED_RMS_NORM),
+        cuda_fused_add_rms_norm_total: load!(CUDA_FUSED_ADD_RMS_NORM),
+        cuda_rms_norm_composition_total: load!(CUDA_RMS_NORM_COMPOSITION),
+        fast_path_self_check_failures_total: load!(FAST_PATH_SELF_CHECK_FAILURES),
         sampling_device_argmax_total: load!(SAMPLING_DEVICE_ARGMAX),
         sampling_bounded_cuda_attempts_total: load!(SAMPLING_BOUNDED_CUDA_ATTEMPTS),
         sampling_bounded_cuda_success_total: load!(SAMPLING_BOUNDED_CUDA_SUCCESS),

@@ -86,10 +86,8 @@ async fn main() -> anyhow::Result<()> {
         enable_prefix_caching,
         prefix_reuse_catalog_auto,
         managed_prefix_cache_salt,
-        max_prefix_cache_pages: parse_env(
-            "IZWI_MAX_PREFIX_CACHE_PAGES",
-            engine_defaults.max_prefix_cache_pages,
-        )?,
+        // Unset stays automatic: each model sizes its prefix budget at load.
+        max_prefix_cache_pages: parse_optional_env("IZWI_MAX_PREFIX_CACHE_PAGES")?,
         enable_chunked_prefill,
         chunked_prefill_threshold: parse_env(
             "IZWI_CHUNKED_PREFILL_THRESHOLD",
@@ -1103,6 +1101,22 @@ where
             .map_err(|error| anyhow::anyhow!("invalid {name}: {error}")),
         Err(_) => Ok(fallback),
     }
+}
+
+/// `None` when the variable is unset, so an automatic default stays automatic.
+fn parse_optional_env<T>(name: &str) -> anyhow::Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
+        })
+        .transpose()
 }
 
 /// Read a tri-state env flag: `None` when unset or unrecognized, so an

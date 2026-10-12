@@ -459,7 +459,7 @@ impl ModelVariant {
         if self.is_qwen38_fp8() {
             return CudaSupportInfo::new(
                 CudaSupportLevel::CandleCudaGeneric,
-                "Qwen3.8 block-scaled FP8 is eligible on Candle CUDA through a scale-aware Q8_0 compressed projection fallback; this is not native FP8 execution, and source review is not runtime validation",
+                "Qwen3.8 block-scaled FP8 projections run natively on Candle CUDA by default: raw block-FP8 weights on the compact FP8 kernels (16-bit activations, software FP8 decode), enabled only after device gates and load-time checks against the checkpoint bytes, with a scale-aware Q8_0 fallback; source review is not runtime validation",
             );
         }
 
@@ -526,7 +526,7 @@ impl ModelVariant {
         if self.is_qwen38_fp8() {
             return CudaQuantizationInfo::new(
                 CudaQuantizationSupportLevel::CandleQuantizedGeneric,
-                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; CUDA applies weight_scale_inv before converting projections to resident Q8_0 Candle weights, a compressed fallback rather than native FP8 execution",
+                "Qwen3.8 stores 128x128 block-scaled FP8 Safetensors weights; with CUDA performance optimizations on (the default) projections stay resident as raw block FP8 and the fp8 projection kernel applies weight_scale_inv per GEMM once the device gates and load-time checks pass; projection_backend = \"q8\", IZWI_QWEN38_FP8_PROJECTIONS=legacy or a failed check falls back to applying weight_scale_inv and requantizing projections to resident Q8_0",
             );
         }
 
@@ -744,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_fp8_cuda_metadata_reports_q8_0_compressed_fallback() {
+    fn qwen38_fp8_cuda_metadata_reports_native_block_fp8_with_q8_0_fallback() {
         let variant = ModelVariant::Qwen3827BFp8;
         let support = variant.cuda_support();
         let quantization = variant.cuda_quantization();
@@ -756,15 +756,22 @@ mod tests {
             CudaExecutionStatus::EligibleUnverified
         );
         assert!(support.reason.contains("block-scaled"));
-        assert!(support.reason.contains("scale-aware Q8_0"));
-        assert!(support.reason.contains("not native FP8"));
+        assert!(support
+            .reason
+            .contains("run natively on Candle CUDA by default"));
+        assert!(support.reason.contains("load-time checks"));
+        assert!(support.reason.contains("scale-aware Q8_0 fallback"));
+        assert!(support.reason.contains("not runtime validation"));
         assert_eq!(
             quantization.level,
             CudaQuantizationSupportLevel::CandleQuantizedGeneric
         );
+        assert!(quantization.reason.contains("raw block FP8"));
         assert!(quantization.reason.contains("weight_scale_inv"));
+        assert!(quantization
+            .reason
+            .contains("IZWI_QWEN38_FP8_PROJECTIONS=legacy"));
         assert!(quantization.reason.contains("Q8_0"));
-        assert!(quantization.reason.contains("rather than native FP8"));
 
         let quantized_gemm = variant
             .cuda_operator_capabilities()

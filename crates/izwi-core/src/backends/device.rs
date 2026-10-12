@@ -650,6 +650,20 @@ pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
     device
 }
 
+/// A Metal device with its own command queue, for tests whose fences must not
+/// be completed by another test's drain on the shared device. Guarded like
+/// [`metal_device_if_available`]: `Ok(None)` when the Metal runtime or this
+/// ordinal is unavailable, so Candle's constructor is never entered there.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn private_metal_device_for_tests(
+    ordinal: usize,
+) -> candle_core::Result<Option<Device>> {
+    if metal_device_if_available(ordinal).is_none() {
+        return Ok(None);
+    }
+    Device::new_metal(ordinal).map(Some)
+}
+
 impl DeviceSelector {
     fn try_metal_at(ordinal: usize) -> Option<DeviceProfile> {
         if let Some(device) = metal_device_if_available(ordinal) {

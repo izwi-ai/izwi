@@ -612,6 +612,8 @@ impl ModelVariant {
             Self::Qwen359BGguf => 16.0,
             // Backend-specific admission replaces this coarse catalog hint:
             // packed FP8 CUDA needs less, while the CPU F32 fallback needs more.
+            // No load path reads it as Qwen3.8's footprint; it is not shown to
+            // users either (`ModelInfo` carries no memory figure).
             Self::Qwen3827BFp8 => 80.0,
             // Same contract as Qwen38_27B_FP8: backend-specific admission
             // replaces this hint. 140.0 is the worst-case CPU F32 expanded

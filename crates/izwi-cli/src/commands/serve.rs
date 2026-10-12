@@ -267,10 +267,12 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
         "IZWI_ENABLE_CHUNKED_PREFILL",
         args.runtime.enable_chunked_prefill.to_string(),
     );
-    cmd.env(
-        "IZWI_MAX_PREFIX_CACHE_PAGES",
-        args.runtime.max_prefix_cache_pages.to_string(),
-    );
+    // An unset prefix page budget stays unset, so the child sizes it per
+    // model; exporting the default would pin it as an explicit choice.
+    match args.runtime.max_prefix_cache_pages {
+        Some(pages) => cmd.env("IZWI_MAX_PREFIX_CACHE_PAGES", pages.to_string()),
+        None => cmd.env_remove("IZWI_MAX_PREFIX_CACHE_PAGES"),
+    };
     cmd.env(
         "IZWI_CHUNKED_PREFILL_THRESHOLD",
         args.runtime.chunked_prefill_threshold.to_string(),
@@ -685,7 +687,7 @@ mod tests {
                 enable_prefix_caching: false,
                 prefix_reuse_catalog_auto: false,
                 managed_prefix_cache_salt: None,
-                max_prefix_cache_pages: 128,
+                max_prefix_cache_pages: None,
                 enable_chunked_prefill: false,
                 chunked_prefill_threshold: 192,
                 max_retained_sequences: 8,
@@ -731,6 +733,26 @@ mod tests {
             command_env(&cmd, "IZWI_MODELS_DIR").as_deref(),
             Some("/tmp/models")
         );
+    }
+
+    #[test]
+    fn server_command_exports_only_an_explicit_prefix_page_budget() {
+        let mut cmd = Command::new("unused-server");
+        configure_server_command(&mut cmd, &sample_args()).unwrap();
+        assert!(cmd
+            .get_envs()
+            .any(|(name, value)| name == "IZWI_MAX_PREFIX_CACHE_PAGES" && value.is_none()));
+
+        for pages in [0, 4_096] {
+            let mut args = sample_args();
+            args.runtime.max_prefix_cache_pages = Some(pages);
+            let mut cmd = Command::new("unused-server");
+            configure_server_command(&mut cmd, &args).unwrap();
+            assert_eq!(
+                command_env(&cmd, "IZWI_MAX_PREFIX_CACHE_PAGES"),
+                Some(pages.to_string())
+            );
+        }
     }
 
     #[test]

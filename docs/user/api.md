@@ -887,11 +887,21 @@ value into the distinct `qwen35_chat` family.
 
 For a CUDA-loaded Qwen3.8 model,
 `runtime_diagnostics.family_diagnostics.resident_representation` is
+`native_block_fp8_with_q8_fallback_dense_bf16` and `fp8_execution_mode` is
+`native_block_fp8_auto_self_checked` (or `native_block_fp8_explicit_self_checked`
+when `projection_backend = "native_fp8"` was set): projections stay resident as the
+checkpoint's block-FP8 bytes and run on the compact FP8 kernels after the load's
+device gates and checks against the checkpoint bytes. When those gates fail or a
+fallback is requested, the representation is
 `q8_0_requantized_projections_with_dense_bf16` and `fp8_execution_mode` is
-`q8_0_compressed_fallback`. The accompanying `fallback_reason` records that
-the runtime applied the block scales before Q8_0 requantization. These values
-describe a compressed Candle fallback, not native FP8 execution. CPU and Metal
-continue to report `expanded_f32` and `expanded_f16` respectively.
+`q8_0_fallback:<reason>`; `fallback_reason` explains the choice either way. The
+per-path outcomes appear under `fast_paths.fp8_projections`, `fast_paths.fp8_gemv`,
+`fast_paths.fp8_packing` and `fast_paths.fp8_lm_head` (the block-FP8 LM head, a
+deliberate precision reduction, with its observed gate error). On Metal the
+representation is `native_block_fp8_with_dense_f16` (or `expanded_f16` with
+`IZWI_METAL_PROJECTION_BACKEND=expanded`), with the per-kind GEMV checks under
+`fast_paths.metal_fp8_gemv`; the CPU reports `q8_0_projections_with_dense_f32`
+(or `expanded_f32` with `IZWI_CPU_PROJECTION_BACKEND=expanded`).
 
 | Method | Path | Notes |
 |--------|------|-------|

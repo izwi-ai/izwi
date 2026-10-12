@@ -54,8 +54,10 @@ pub(crate) fn device_is_sm80_or_newer(device: &Device) -> bool {
     false
 }
 
-/// Until exact-device measurements establish a winning route, Auto retains Q8.
-/// Explicit native-FP8 selection can use the structurally supported provider.
+/// No device-independent recommendation: a family that defaults to the
+/// compact provider gates it with its own device checks (Qwen3.8 does so in
+/// its residency policy, with [`verify_decode_kernels_at`] and a real-weight
+/// probe). Explicit native-FP8 selection can use the supported provider.
 pub fn provider_auto_preferred(_device: &Device, _dtype: DType, _n: usize, _k: usize) -> bool {
     false
 }
@@ -79,6 +81,10 @@ enum DecodeKernel {
     Reference,
     /// The vectorized GEMV (errors if the call is not eligible).
     Vectorized,
+    /// The vectorized GEMV for an eligible call (at most four aligned rows),
+    /// the reference kernels otherwise. The caller owns the verification, so
+    /// the process-wide flag is neither read nor set.
+    VectorizedWhenEligible,
 }
 
 /// Compare the vectorized decode GEMV against the reference kernel on
@@ -88,6 +94,15 @@ pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
     if vectorized_decode_enabled() {
         return Ok(());
     }
+    verify_vectorized_decode(device)?;
+    VECTORIZED_DECODE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// The check behind [`verify_and_enable_vectorized_decode`], without touching
+/// the process-wide flag: a family that selects the kernel per call (through
+/// [`block_fp8_projection_selecting`]) keeps its own verdict.
+pub fn verify_vectorized_decode(device: &Device) -> Result<()> {
     if !device.is_cuda() {
         candle_core::bail!("the vectorized FP8 decode GEMV runs on CUDA only")
     }
@@ -138,20 +153,218 @@ pub fn verify_and_enable_vectorized_decode(device: &Device) -> Result<()> {
             }
         }
     }
-    VECTORIZED_DECODE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// Outcome of [`verify_decode_kernels_at`]: the reference kernels (`mv` for
+/// up to four rows, `mm` above) must pass for the call to succeed; the
+/// vectorized GEMV's verdict is reported separately so a caller can keep the
+/// reference decode when only the vectorized kernel disagrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeKernelGate {
+    pub vectorized: std::result::Result<(), String>,
+}
+
+/// Compare every compact-FP8 kernel on `device` with the portable reference
+/// at a caller-chosen inner dimension `k` (the checkpoint's real K values) and
+/// `n_rows` synthetic output channels: the vectorized GEMV and the reference
+/// GEMV at one to four activation rows, the prefill kernel at 5, 8 and 17.
+/// Weights mix every finite E4M3 byte and every 128x128 block has its own
+/// scale; activations are rounded to `dtype` before the host reference runs,
+/// so the comparison sees only kernel error. Tolerance: 1% relative L2 and 2%
+/// of the largest reference magnitude per element (NaN-safe). Sets no flag.
+pub fn verify_decode_kernels_at(
+    device: &Device,
+    dtype: DType,
+    n_rows: usize,
+    k: usize,
+) -> Result<DecodeKernelGate> {
+    if n_rows == 0 || k == 0 {
+        candle_core::bail!("FP8 kernel gate needs a non-empty geometry")
+    }
+    let raw = (0..n_rows * k)
+        .map(|i| {
+            let mixed = (i.wrapping_mul(0x9E37_79B1) >> 17) as u8;
+            if mixed & 0x7f == 0x7f {
+                mixed ^ 0x41
+            } else {
+                mixed
+            }
+        })
+        .collect::<Vec<_>>();
+    let scale_shape = (n_rows.div_ceil(128), k.div_ceil(128));
+    let scales = (0..scale_shape.0 * scale_shape.1)
+        .map(|i| 1e-3 * (1.0 + (i % 17) as f32 * 0.37))
+        .collect::<Vec<_>>();
+    let host_w = Tensor::from_vec(raw, (n_rows, k), &Device::Cpu)?;
+    let host_s = Tensor::from_vec(scales, scale_shape, &Device::Cpu)?;
+    let w = host_w.to_device(device)?;
+    let s = host_s.to_device(device)?;
+    let host = |t: Tensor| -> Result<Vec<f32>> {
+        t.to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let compare = |label: &str,
+                   actual: &[f32],
+                   expected: &[f32]|
+     -> std::result::Result<(), String> {
+        let mut err = 0f64;
+        let mut norm = 0f64;
+        let mut max_ref = 0f32;
+        let mut max_err = 0f32;
+        for (a, e) in actual.iter().zip(expected) {
+            let diff = (a - e).abs();
+            let diff = if diff.is_finite() {
+                diff
+            } else {
+                f32::INFINITY
+            };
+            err += f64::from(diff).powi(2);
+            norm += f64::from(*e).powi(2);
+            max_ref = max_ref.max(e.abs());
+            max_err = max_err.max(diff);
+        }
+        let relative = (err / norm.max(f64::MIN_POSITIVE)).sqrt();
+        if actual.len() != expected.len()
+            || !relative.is_finite()
+            || relative > 0.01
+            || max_err > 0.02 * max_ref.max(f32::MIN_POSITIVE)
+        {
+            return Err(format!(
+                "{label} at n={n_rows} k={k} {dtype:?}: relative L2 {relative:.4}, max error {max_err} vs max |ref| {max_ref}"
+            ));
+        }
+        Ok(())
+    };
+    let mut vectorized = Ok(());
+    for m in [1usize, 2, 3, 4, 5, 8, 17] {
+        let x = Tensor::from_vec(
+            (0..m * k)
+                .map(|i| ((i as f32 + 0.5) * 0.754_877_7).sin() * 2.0)
+                .collect::<Vec<_>>(),
+            (m, k),
+            &Device::Cpu,
+        )?
+        .to_dtype(dtype)?;
+        let expected = host(project(
+            &x.to_dtype(DType::F32)?,
+            &host_w,
+            &host_s,
+            DecodeKernel::Reference,
+        )?)?;
+        let x = x.to_device(device)?;
+        let reference = host(project(&x, &w, &s, DecodeKernel::Reference)?)?;
+        let kernel = if m <= 4 {
+            "reference GEMV"
+        } else {
+            "prefill GEMM"
+        };
+        compare(&format!("FP8 {kernel} m={m}"), &reference, &expected)
+            .map_err(candle_core::Error::Msg)?;
+        if m <= 4 && vectorized.is_ok() {
+            vectorized = match project(&x, &w, &s, DecodeKernel::Vectorized).and_then(host) {
+                Ok(actual) => compare(&format!("FP8 vectorized GEMV m={m}"), &actual, &expected),
+                Err(error) => Err(format!("FP8 vectorized GEMV m={m}: {error}")),
+            };
+        }
+    }
+    Ok(DecodeKernelGate { vectorized })
 }
 
 pub fn block_fp8_projection(input: &Tensor, weights: &Tensor, scales: &Tensor) -> Result<Tensor> {
     project(input, weights, scales, DecodeKernel::Auto)
 }
 
-fn project(
+/// [`block_fp8_projection`] with the decode kernel chosen per call instead of
+/// by the process-wide flag: `vectorized` runs the vectorized GEMV on eligible
+/// calls (at most four aligned rows) and the reference kernels otherwise;
+/// `false` always runs the reference kernels.
+pub fn block_fp8_projection_selecting(
     input: &Tensor,
     weights: &Tensor,
     scales: &Tensor,
-    kernel: DecodeKernel,
+    vectorized: bool,
 ) -> Result<Tensor> {
+    project(
+        input,
+        weights,
+        scales,
+        if vectorized {
+            DecodeKernel::VectorizedWhenEligible
+        } else {
+            DecodeKernel::Reference
+        },
+    )
+}
+
+/// Upper bound of the dequantized weight tile that
+/// [`block_fp8_projection_dequant_gemm`] holds at once: the whole extra
+/// transient of the long-span path (its output is the projection's own).
+pub const DEQUANT_GEMM_TILE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Output rows per dequantized tile of an `[n, k]` projection: the whole
+/// 128-row scale blocks whose 16-bit expansion fits
+/// [`DEQUANT_GEMM_TILE_BYTES`] (at least one block), at most `n`.
+pub fn dequant_gemm_tile_rows(n: usize, k: usize) -> usize {
+    let blocks = DEQUANT_GEMM_TILE_BYTES / k.saturating_mul(2 * 128).max(1);
+    (blocks.max(1) * 128).min(n)
+}
+
+/// Block-FP8 projection for long activation spans (prefill): each tile of
+/// [`dequant_gemm_tile_rows`] output rows is expanded to the activation dtype
+/// (`decode(byte) * block scale`, rounded once) and multiplied by a dense
+/// GEMM (cuBLAS with F32 accumulation on CUDA) that writes straight into the
+/// tile's columns of the output. One tile is resident at a time. Same
+/// geometry contract as [`block_fp8_projection`]; CUDA takes F16/BF16
+/// activations, the portable reference also F32.
+pub fn block_fp8_projection_dequant_gemm(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+) -> Result<Tensor> {
+    let (n, k) = weights.dims2()?;
+    dequant_gemm_tiled(input, weights, scales, dequant_gemm_tile_rows(n, k))
+}
+
+/// [`block_fp8_projection_dequant_gemm`] with an explicit tile height (a
+/// multiple of 128), so tests can cross tile boundaries at small geometry.
+pub(crate) fn dequant_gemm_tiled(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    tile_rows: usize,
+) -> Result<Tensor> {
+    let (n, k) = validate_projection(input, weights, scales)?;
+    if tile_rows == 0 || (!tile_rows.is_multiple_of(128) && tile_rows < n) {
+        candle_core::bail!("dequantized FP8 GEMM tiles must hold whole 128-row scale blocks")
+    }
+    if input.device().is_cuda() && !matches!(input.dtype(), DType::F16 | DType::BF16) {
+        candle_core::bail!("the dequantized FP8 GEMM takes F16/BF16 activations on CUDA")
+    }
+    if input.device().is_metal() {
+        candle_core::bail!("the dequantized FP8 GEMM has no Metal implementation")
+    }
+    input.contiguous()?.apply_op3_no_bwd(
+        &weights.contiguous()?,
+        &scales.contiguous()?,
+        &DequantGemm {
+            n,
+            k,
+            tile_rows: tile_rows.min(n),
+        },
+    )
+}
+
+/// The compact projection contract shared by every entry: `[n, k]` E4M3FN
+/// bytes, their `[ceil(n/128), ceil(k/128)]` F32 scales, activations with
+/// last dimension `k` on the same device, and on CUDA the provider geometry.
+fn validate_projection(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+) -> Result<(usize, usize)> {
     let (n, k) = weights.dims2()?;
     if input.rank() == 0
         || input.dim(candle_core::D::Minus1)? != k
@@ -169,6 +382,16 @@ fn project(
     if input.device().is_cuda() && !provider_supported(input.device(), input.dtype(), n, k) {
         candle_core::bail!("unsupported compact FP8 CUDA provider geometry or dtype")
     }
+    Ok((n, k))
+}
+
+fn project(
+    input: &Tensor,
+    weights: &Tensor,
+    scales: &Tensor,
+    kernel: DecodeKernel,
+) -> Result<Tensor> {
+    let (n, k) = validate_projection(input, weights, scales)?;
     input.contiguous()?.apply_op3_no_bwd(
         &weights.contiguous()?,
         &scales.contiguous()?,
@@ -400,7 +623,7 @@ impl CustomOp3 for Projection {
                     && match self.kernel {
                         DecodeKernel::Auto => vectorized_decode_enabled(),
                         DecodeKernel::Reference => false,
-                        DecodeKernel::Vectorized => true,
+                        DecodeKernel::Vectorized | DecodeKernel::VectorizedWhenEligible => true,
                     };
                 if self.kernel == DecodeKernel::Vectorized && !vectorized {
                     candle_core::bail!(
@@ -471,6 +694,217 @@ impl CustomOp3 for Projection {
         };
         let mut dims = xl.dims().to_vec();
         *dims.last_mut().unwrap() = self.n;
+        Ok((
+            candle_core::CudaStorage {
+                slice,
+                device: device.clone(),
+            },
+            Shape::from(dims),
+        ))
+    }
+}
+
+/// [`block_fp8_projection_dequant_gemm`]'s op: `tile_rows` output rows at a
+/// time are expanded to the activation dtype and multiplied densely.
+struct DequantGemm {
+    n: usize,
+    k: usize,
+    tile_rows: usize,
+}
+
+impl CustomOp3 for DequantGemm {
+    fn name(&self) -> &'static str {
+        "block-fp8-dequant-gemm"
+    }
+
+    /// The portable reference: every weight rounded to the activation dtype
+    /// exactly as the device tile holds it, F32 accumulation over all of K,
+    /// the result rounded to the activation dtype.
+    fn cpu_fwd(
+        &self,
+        x: &CpuStorage,
+        xl: &Layout,
+        w: &CpuStorage,
+        wl: &Layout,
+        s: &CpuStorage,
+        sl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let CpuStorage::U8(w) = w else {
+            candle_core::bail!("FP8 bytes required")
+        };
+        let CpuStorage::F32(s) = s else {
+            candle_core::bail!("FP8 F32 scales required")
+        };
+        let (xs, xe) = xl
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg("contiguous FP8 input required".into()))?;
+        let (dtype, x): (DType, Vec<f32>) = match x {
+            CpuStorage::F32(v) => (DType::F32, v[xs..xe].to_vec()),
+            CpuStorage::F16(v) => (DType::F16, v[xs..xe].iter().map(|v| v.to_f32()).collect()),
+            CpuStorage::BF16(v) => (DType::BF16, v[xs..xe].iter().map(|v| v.to_f32()).collect()),
+            _ => candle_core::bail!("FP8 activation dtype"),
+        };
+        let round = |v: f32| match dtype {
+            DType::F16 => half::f16::from_f32(v).to_f32(),
+            DType::BF16 => half::bf16::from_f32(v).to_f32(),
+            _ => v,
+        };
+        let (n, k) = (self.n, self.k);
+        let m = x.len() / k;
+        let column_blocks = k.div_ceil(128);
+        let mut y = vec![0f32; m * n];
+        let mut row = vec![0f32; k];
+        for output in 0..n {
+            for (column, value) in row.iter_mut().enumerate() {
+                let scale = s[sl.start_offset() + (output / 128) * column_blocks + column / 128];
+                *value = round(decode_e4m3fn(w[wl.start_offset() + output * k + column]) * scale);
+            }
+            for (activations, out) in x.chunks_exact(k).zip(y.chunks_exact_mut(n)) {
+                out[output] = activations
+                    .iter()
+                    .zip(&row)
+                    .fold(0f32, |total, (a, b)| a.mul_add(*b, total));
+            }
+        }
+        let mut dims = xl.dims().to_vec();
+        *dims.last_mut().unwrap() = n;
+        let storage = match dtype {
+            DType::F16 => CpuStorage::F16(y.into_iter().map(half::f16::from_f32).collect()),
+            DType::BF16 => CpuStorage::BF16(y.into_iter().map(half::bf16::from_f32).collect()),
+            _ => CpuStorage::F32(y),
+        };
+        Ok((storage, Shape::from(dims)))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        x: &candle_core::CudaStorage,
+        xl: &Layout,
+        w: &candle_core::CudaStorage,
+        wl: &Layout,
+        s: &candle_core::CudaStorage,
+        sl: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::cublas::{result as cublas, sys as cublas_sys};
+        use candle_core::cuda_backend::cudarc::driver::{
+            DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
+        };
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+        let device = x.device();
+        let (n, k) = (self.n, self.k);
+        let m = xl.shape().elem_count() / k;
+        let tile_rows = self.tile_rows.min(n);
+        if m == 0
+            || tile_rows == 0
+            || [m, n, k, tile_rows].iter().any(|v| *v > i32::MAX as usize)
+            || m.checked_mul(n).is_none_or(|v| v > i32::MAX as usize)
+            || tile_rows
+                .checked_mul(k)
+                .is_none_or(|v| v > i32::MAX as usize)
+        {
+            candle_core::bail!("dequantized FP8 GEMM size overflow")
+        }
+        let CudaStorageSlice::U8(w) = &w.slice else {
+            candle_core::bail!("FP8 bytes required")
+        };
+        let CudaStorageSlice::F32(s) = &s.slice else {
+            candle_core::bail!("FP8 scales required")
+        };
+        let w = w.slice(wl.start_offset()..wl.start_offset() + n * k);
+        let s = s.slice(sl.start_offset()..sl.start_offset() + n.div_ceil(128) * k.div_ceil(128));
+        let stream = device.cuda_stream();
+        let blas = device.cublas_handle();
+        macro_rules! run {
+            ($v:ident, $ty:ty, $dequant:literal, $data:ident) => {{
+                let CudaStorageSlice::$v(x) = &x.slice else {
+                    unreachable!()
+                };
+                let x = x.slice(xl.start_offset()..xl.start_offset() + m * k);
+                // SAFETY: every tile row is written by the dequant kernel
+                // before the GEMM reads it, and the GEMMs write every output
+                // element (the tiles cover all n rows).
+                let mut tile = unsafe { device.alloc::<$ty>(tile_rows * k)? };
+                let mut out = unsafe { device.alloc::<$ty>(m * n)? };
+                let dequant = device.get_or_load_custom_func(
+                    $dequant,
+                    "izwi_qwen38_fp8",
+                    super::cuda_ptx::FP8,
+                )?;
+                let (alpha, beta) = (1f32, 0f32);
+                for row0 in (0..n).step_by(tile_rows) {
+                    let rows = tile_rows.min(n - row0);
+                    {
+                        let mut b = dequant.builder();
+                        b.arg(&w);
+                        b.arg(&s);
+                        b.arg(&mut tile);
+                        candle_core::builder_arg!(b, row0 as i32, rows as i32, k as i32);
+                        let threads = (rows * k).div_ceil(4);
+                        // SAFETY: the tile holds rows * k elements and the
+                        // compact bytes/scales were validated for n * k.
+                        unsafe {
+                            b.launch(LaunchConfig {
+                                grid_dim: (threads.div_ceil(256) as u32, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                        }
+                        .w()?;
+                    }
+                    let (a_ptr, _a) = tile.device_ptr(&stream);
+                    let (b_ptr, _b) = x.device_ptr(&stream);
+                    let (c_ptr, _c) = out.device_ptr_mut(&stream);
+                    // Row-major y[m, n] = x[m, k] W[n, k]^T is column-major
+                    // Y[n, m] = W^T X: the tile's rows land in columns
+                    // row0.. of every output row (ldc = n).
+                    // SAFETY: the pointers are live device allocations on
+                    // the handle's stream with the leading dimensions given.
+                    unsafe {
+                        cublas::gemm_ex(
+                            *blas.handle(),
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                            rows as i32,
+                            m as i32,
+                            k as i32,
+                            (&alpha) as *const f32 as *const _,
+                            a_ptr as *const _,
+                            cublas_sys::cudaDataType_t::$data,
+                            k as i32,
+                            b_ptr as *const _,
+                            cublas_sys::cudaDataType_t::$data,
+                            k as i32,
+                            (&beta) as *const f32 as *const _,
+                            (c_ptr + (row0 * std::mem::size_of::<$ty>()) as u64) as *mut _,
+                            cublas_sys::cudaDataType_t::$data,
+                            n as i32,
+                            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        )
+                    }
+                    .map_err(|e| candle_core::Error::Msg(format!("dequantized FP8 GEMM: {e:?}")))?;
+                }
+                CudaStorageSlice::$v(out)
+            }};
+        }
+        let slice = match &x.slice {
+            CudaStorageSlice::F16(_) => {
+                run!(F16, half::f16, "qwen38_fp8_dequant_rows_f16", CUDA_R_16F)
+            }
+            CudaStorageSlice::BF16(_) => {
+                run!(
+                    BF16,
+                    half::bf16,
+                    "qwen38_fp8_dequant_rows_bf16",
+                    CUDA_R_16BF
+                )
+            }
+            _ => candle_core::bail!("the dequantized FP8 GEMM takes F16/BF16 activations"),
+        };
+        let mut dims = xl.dims().to_vec();
+        *dims.last_mut().unwrap() = n;
         Ok((
             candle_core::CudaStorage {
                 slice,
@@ -697,6 +1131,207 @@ mod tests {
         let s = Tensor::zeros((2, 1), DType::F32, &Device::Cpu).unwrap();
         assert!(block_fp8_projection(&x, &w, &s).is_err());
     }
+    #[test]
+    fn selecting_projection_and_kernel_gate_run_on_the_portable_reference() {
+        let (n, k) = (128usize, 256usize);
+        let w = Tensor::from_vec(
+            (0..n * k)
+                .map(|i| [0x38u8, 0xb4, 0x41, 0x0c][i % 4])
+                .collect::<Vec<_>>(),
+            (n, k),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let s = Tensor::from_vec(vec![0.5f32, 2.0], (1, 2), &Device::Cpu).unwrap();
+        let x = Tensor::from_vec(
+            (0..3 * k)
+                .map(|i| (i % 9) as f32 * 0.1 - 0.4)
+                .collect::<Vec<_>>(),
+            (3, k),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let reference = block_fp8_projection(&x, &w, &s)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for vectorized in [false, true] {
+            assert_eq!(
+                block_fp8_projection_selecting(&x, &w, &s, vectorized)
+                    .unwrap()
+                    .to_vec2::<f32>()
+                    .unwrap(),
+                reference
+            );
+        }
+        // The gate compares the device kernels with the portable reference;
+        // on the CPU both are the reference, so it must pass at any K.
+        for k in [128usize, 384] {
+            let gate = verify_decode_kernels_at(&Device::Cpu, DType::F32, 192, k).unwrap();
+            assert_eq!(gate.vectorized, Ok(()));
+        }
+        assert!(verify_decode_kernels_at(&Device::Cpu, DType::F32, 0, 128).is_err());
+        assert!(verify_vectorized_decode(&Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn dequant_gemm_tiles_hold_whole_scale_blocks_within_the_cap() {
+        // The 27B trunk's widest packs and its deepest projection.
+        assert_eq!(dequant_gemm_tile_rows(34816, 5120), 13056);
+        assert_eq!(dequant_gemm_tile_rows(16384, 5120), 13056);
+        assert_eq!(dequant_gemm_tile_rows(5120, 17408), 3840);
+        assert_eq!(dequant_gemm_tile_rows(5120, 6144), 5120);
+        for (n, k) in [
+            (34816usize, 5120usize),
+            (5120, 17408),
+            (14336, 5120),
+            (64, 128),
+        ] {
+            let rows = dequant_gemm_tile_rows(n, k);
+            assert!(rows == n || rows.is_multiple_of(128), "{n}x{k}: {rows}");
+            assert!(rows * k * 2 <= DEQUANT_GEMM_TILE_BYTES, "{n}x{k}: {rows}");
+        }
+        // One scale block at least, even past the cap.
+        assert_eq!(dequant_gemm_tile_rows(4096, 1 << 20), 128);
+        assert_eq!(dequant_gemm_tile_rows(64, 128), 64);
+    }
+
+    /// The portable dequantized GEMM is the compact projection with each
+    /// weight rounded to the activation dtype: exact to F32 summation order
+    /// for F32 activations, within 16-bit rounding for BF16/F16, at row
+    /// counts across the switch-over and several scale blocks on both axes.
+    #[test]
+    fn dequant_gemm_tracks_the_compact_projection_on_the_portable_reference() {
+        let (n, k) = (320usize, 384usize);
+        let raw = (0..n * k)
+            .map(|i| match (i.wrapping_mul(0x9E37_79B1) >> 17) as u8 {
+                b if b & 0x7f == 0x7f => 0x38,
+                b => b,
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..3 * 3)
+            .map(|i| 1e-3 * (1.0 + (i % 7) as f32 * 0.43))
+            .collect::<Vec<_>>();
+        let w = Tensor::from_vec(raw, (n, k), &Device::Cpu).unwrap();
+        let s = Tensor::from_vec(scales, (3, 3), &Device::Cpu).unwrap();
+        let host = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        for m in [1usize, 16, 17, 64] {
+            let x = Tensor::from_vec(
+                (0..m * k)
+                    .map(|i| ((i as f32 + 0.25) * 0.618_034).sin())
+                    .collect::<Vec<_>>(),
+                (1, m, k),
+                &Device::Cpu,
+            )
+            .unwrap();
+            for (dtype, tolerance) in [
+                (DType::F32, 1e-5f32),
+                (DType::BF16, 2e-2),
+                (DType::F16, 4e-3),
+            ] {
+                let x = x.to_dtype(dtype).unwrap();
+                let gemm = block_fp8_projection_dequant_gemm(&x, &w, &s).unwrap();
+                assert_eq!(gemm.dtype(), dtype);
+                assert_eq!(gemm.dims(), [1, m, n]);
+                let tiled = host(dequant_gemm_tiled(&x, &w, &s, 128).unwrap());
+                let (gemm, reference) =
+                    (host(gemm), host(block_fp8_projection(&x, &w, &s).unwrap()));
+                assert_eq!(gemm, tiled, "the tile height must not change the result");
+                let largest = reference.iter().fold(0f32, |a, v| a.max(v.abs()));
+                for (index, (a, e)) in gemm.iter().zip(&reference).enumerate() {
+                    let error = (a - e).abs();
+                    assert!(
+                        error.is_finite() && error <= tolerance * largest,
+                        "{dtype:?} m={m} index {index}: {a} vs {e}"
+                    );
+                }
+            }
+        }
+        // Tiles hold whole scale blocks unless one tile covers every row.
+        let x = Tensor::zeros((2, k), DType::F32, &Device::Cpu).unwrap();
+        assert!(dequant_gemm_tiled(&x, &w, &s, 100).is_err());
+        assert!(dequant_gemm_tiled(&x, &w, &s, 0).is_err());
+        assert!(dequant_gemm_tiled(&x, &w, &s, 333).is_ok());
+        let bad_scales = Tensor::zeros((2, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(block_fp8_projection_dequant_gemm(&x, &w, &bad_scales).is_err());
+    }
+
+    /// The kernel gate Qwen3.8 runs before admitting native FP8, at the
+    /// checkpoint's real inner dimensions, without touching the process flag.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_fp8_kernel_gate_passes_at_qwen38_k() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        for k in [5120usize, 6144, 17408] {
+            let gate = verify_decode_kernels_at(&device, DType::BF16, 1024, k)
+                .unwrap_or_else(|e| panic!("reference kernels at K={k}: {e}"));
+            assert_eq!(gate.vectorized, Ok(()), "vectorized GEMV at K={k}");
+        }
+        verify_vectorized_decode(&device).unwrap();
+    }
+
+    /// Per-call kernel selection: the vectorized and the reference GEMV agree
+    /// at decode row counts, and prefill rows take the GEMM either way.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_selecting_reference_vs_vectorized_match() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        let (n, k) = (1024usize, 5120usize);
+        let raw: Vec<u8> = (0..n * k)
+            .map(|i| match (i.wrapping_mul(0x9E37_79B1) >> 17) as u8 {
+                b if b & 0x7f == 0x7f => 0x38,
+                b => b,
+            })
+            .collect();
+        let w = Tensor::from_vec(raw, (n, k), &device).unwrap();
+        let s = Tensor::from_vec(
+            (0..8 * 40)
+                .map(|i| 1e-3 * (1 + i % 11) as f32)
+                .collect::<Vec<_>>(),
+            (8, 40),
+            &device,
+        )
+        .unwrap();
+        for m in [1usize, 3, 4, 9] {
+            let x = Tensor::from_vec(
+                (0..m * k)
+                    .map(|i| ((i as f32) * 0.37).sin())
+                    .collect::<Vec<_>>(),
+                (m, k),
+                &device,
+            )
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+            let host = |vectorized| {
+                block_fp8_projection_selecting(&x, &w, &s, vectorized)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let (reference, vectorized) = (host(false), host(true));
+            let scale = reference.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+            for (a, b) in vectorized.iter().zip(&reference) {
+                assert!((a - b).abs() <= 0.02 * scale, "m={m}: {a} vs {b}");
+            }
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn cuda_projection_decode_verify_prefill_match_portable_reference() {
@@ -758,6 +1393,63 @@ mod tests {
                         (a - e).abs() <= 0.03 + e.abs() * 0.008,
                         "{dtype:?} M={m}: {a} != {e}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The dequantized GEMM on CUDA against the compact `mm` kernel at the
+    /// trunk's widest pack and deepest projection, across the 16-row
+    /// switch-over, with the production tiles and with 1024-row tiles so the
+    /// cuBLAS output offsets (ldc = n) cross several boundaries.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_dequant_gemm_matches_the_compact_kernel_at_trunk_geometry() {
+        let Some(device) = super::super::cuda_test_device() else {
+            return;
+        };
+        for (n, k) in [(34816usize, 5120usize), (5120, 17408)] {
+            let raw: Vec<u8> = (0..n * k)
+                .map(|i| match (i.wrapping_mul(0x9E37_79B1) >> 17) as u8 {
+                    b if b & 0x7f == 0x7f => 0x38,
+                    b => b,
+                })
+                .collect();
+            let scale_shape = (n.div_ceil(128), k.div_ceil(128));
+            let scales: Vec<f32> = (0..scale_shape.0 * scale_shape.1)
+                .map(|i| 1e-3 * (1.0 + (i % 13) as f32 * 0.29))
+                .collect();
+            let w = Tensor::from_vec(raw, (n, k), &device).unwrap();
+            let s = Tensor::from_vec(scales, scale_shape, &device).unwrap();
+            for m in [16usize, 64, 257] {
+                let x = Tensor::from_vec(
+                    (0..m * k)
+                        .map(|i| ((i as f32) * 0.754_877_7).sin())
+                        .collect::<Vec<_>>(),
+                    (m, k),
+                    &device,
+                )
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+                let host = |t: Tensor| {
+                    t.to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let compact = host(project(&x, &w, &s, DecodeKernel::Reference).unwrap());
+                let largest = compact.iter().fold(0f32, |a, v| a.max(v.abs()));
+                for tile_rows in [dequant_gemm_tile_rows(n, k), 1024] {
+                    let gemm = host(dequant_gemm_tiled(&x, &w, &s, tile_rows).unwrap());
+                    for (index, (a, e)) in gemm.iter().zip(&compact).enumerate() {
+                        assert!(
+                            (a - e).abs() <= 0.02 * largest,
+                            "n={n} k={k} m={m} tiles {tile_rows} index {index}: {a} vs {e}"
+                        );
+                    }
                 }
             }
         }

@@ -416,14 +416,20 @@ pub fn try_qwen38_causal_conv_sequence(
     try_qwen_hybrid_causal_conv_sequence(input, weight, history)
 }
 
+/// Qwen3.8 single-token causal conv. `input` is the QKV projection row in its
+/// own dtype (F32, BF16 or F16: a 16-bit row skips the F32 cast); the weight
+/// `[C, 4]` and the history `[C, 3]` are F32, and so are both outputs.
 pub fn try_qwen38_causal_conv_decode(
     input: &Tensor,
     weight: &Tensor,
     history: &Tensor,
 ) -> Option<(Tensor, Tensor)> {
-    if !cuda_tensor_pair_supported(input, weight)
-        || !cuda_tensor_pair_supported(input, history)
-        || input.dtype() != DType::F32
+    if !cuda_tensor_supported(input)
+        || !input.device().same_device(weight.device())
+        || !input.device().same_device(history.device())
+        || !matches!(input.dtype(), DType::F32 | DType::BF16 | DType::F16)
+        || weight.dtype() != DType::F32
+        || history.dtype() != DType::F32
     {
         return None;
     }
@@ -463,6 +469,98 @@ pub fn try_qwen38_causal_conv_decode(
         .reshape((conv_dim, history_len))
         .ok()?;
     Some((output, next_history))
+}
+
+/// [`try_qwen38_causal_conv_decode`] with the history in and out taken from a
+/// device state table ([`gdn::StateTable`]: entry 0 is the `[C, 3]` F32
+/// history, oldest first; entry 3 receives the next history): the CUDA-graph
+/// form, whose captured launch does not bake per-step state addresses. Runs
+/// the direct kernel's body. Returns the activated output `[C]` F32.
+#[cfg(feature = "cuda")]
+pub fn qwen38_causal_conv_decode_table(
+    input: &Tensor,
+    weight: &Tensor,
+    table: gdn::StateTable,
+) -> candle_core::Result<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+    let conv_dim = input.elem_count();
+    if !cuda_tensor_supported(input)
+        || !input.device().same_device(weight.device())
+        || !matches!(input.dtype(), DType::F32 | DType::BF16 | DType::F16)
+        || weight.dtype() != DType::F32
+        || weight.dims() != [conv_dim, 4]
+        || conv_dim == 0
+        || conv_dim
+            .checked_mul(4)
+            .is_none_or(|elements| elements > i32::MAX as usize)
+    {
+        candle_core::bail!(
+            "invalid Qwen3.8 table conv decode contract: input {:?} {:?}, weight {:?} {:?}",
+            input.dims(),
+            input.dtype(),
+            weight.dims(),
+            weight.dtype()
+        )
+    }
+    let device = input.device().as_cuda_device()?;
+    let input = input.contiguous()?;
+    let weight = weight.contiguous()?;
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    let (candle_core::Storage::Cuda(input_storage), candle_core::Storage::Cuda(weight_storage)) =
+        (&*input_storage, &*weight_storage)
+    else {
+        candle_core::bail!("Qwen3.8 table conv decode needs CUDA tensors")
+    };
+    let CudaStorageSlice::F32(weight_slice) = &weight_storage.slice else {
+        candle_core::bail!("Qwen3.8 table conv decode weight must be F32")
+    };
+    let Some((weight_start, weight_end)) = weight_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 table conv decode weight must be contiguous")
+    };
+    let Some((input_start, input_end)) = input_layout.contiguous_offsets() else {
+        candle_core::bail!("Qwen3.8 table conv decode input must be contiguous")
+    };
+    let weight_view = weight_slice.slice(weight_start..weight_end);
+    // SAFETY: one thread writes each output channel.
+    let output = unsafe { device.alloc::<f32>(conv_dim)? };
+    let config = LaunchConfig::for_num_elems((conv_dim * 4) as u32);
+    macro_rules! launch {
+        ($slice:expr, $name:literal) => {{
+            let input_view = $slice.slice(input_start..input_end);
+            let function = device.get_or_load_custom_func(
+                $name,
+                "izwi_qwen38_causal_conv_decode",
+                cuda_ptx::QWEN38,
+            )?;
+            let mut builder = function.builder();
+            builder.arg(&input_view);
+            builder.arg(&weight_view);
+            candle_core::builder_arg!(builder, table.address, table.slot as i32);
+            builder.arg(&output);
+            candle_core::builder_arg!(builder, conv_dim as i32);
+            // SAFETY: argument order and types match the kernel; the table
+            // entries are F32 buffers of the documented sizes.
+            unsafe { builder.launch(config) }.w()?;
+        }};
+    }
+    match &input_storage.slice {
+        CudaStorageSlice::F32(slice) => launch!(slice, "qwen38_causal_conv_decode_table_f32"),
+        CudaStorageSlice::BF16(slice) => launch!(slice, "qwen38_causal_conv_decode_table_bf16"),
+        CudaStorageSlice::F16(slice) => launch!(slice, "qwen38_causal_conv_decode_table_f16"),
+        _ => candle_core::bail!("Qwen3.8 table conv decode input must be F32, BF16 or F16"),
+    }
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+            output,
+            device.clone(),
+        )),
+        conv_dim,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 fn try_qwen_hybrid_causal_conv_sequence(
@@ -627,6 +725,287 @@ pub fn try_qwen38_deltanet_decode(
         .reshape((1, value_heads, key_dim, value_dim))
         .ok()?;
     Some((output, next_state))
+}
+
+/// Key rows of the state the Qwen3.8 grouped DeltaNet sequence kernel holds
+/// in registers (sixteen per lane, eight lanes per value column).
+pub const QWEN38_DELTANET_SEQUENCE_KEY_DIM: usize = 128;
+/// Value columns per block of that kernel (four per warp, four warps).
+const QWEN38_DELTANET_SEQUENCE_COLUMNS: usize = 16;
+
+/// Whether [`qwen38_deltanet_sequence`] serves a linear-attention layout:
+/// 128-dim key heads, value heads grouped over key heads, and a value width
+/// that is a multiple of 16.
+pub fn qwen38_deltanet_sequence_supported(
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> bool {
+    key_dim == QWEN38_DELTANET_SEQUENCE_KEY_DIM
+        && key_heads > 0
+        && value_heads > 0
+        && value_heads.is_multiple_of(key_heads)
+        && value_dim > 0
+        && value_dim.is_multiple_of(QWEN38_DELTANET_SEQUENCE_COLUMNS)
+}
+
+/// Qwen3.8 Gated DeltaNet prefill over one chunk, straight from the conv
+/// output's native grouped layout: one launch on CUDA (`qwen38.cu`
+/// `qwen38_deltanet_sequence_f32`, register-resident state, in-kernel q/k L2
+/// norms, value head `v` reading key head `v / (value_heads / key_heads)`),
+/// the same recurrence as a portable reference on the CPU. No expanded q/k
+/// or concatenated qkv is made.
+///
+/// `mixed_qkv` is `[1, sequence, conv_dim]` F32 (q | k | v), `g` (the log
+/// decay) and `beta` are `[1, sequence, value_heads]` F32, and
+/// `initial_state` is `[1, value_heads, key_dim, value_dim]` F32. Returns the
+/// output `[1, sequence, value_heads, value_dim]` and the final state
+/// `[1, value_heads, key_dim, value_dim]`, both views of one packed buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen38_deltanet_sequence(
+    mixed_qkv: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let (batch, sequence, conv_dim) = mixed_qkv.dims3()?;
+    let width = key_heads
+        .checked_mul(key_dim)
+        .and_then(|width| width.checked_mul(2))
+        .and_then(|width| width.checked_add(value_heads.checked_mul(value_dim)?));
+    let same = |tensor: &Tensor| {
+        tensor.dtype() == DType::F32 && tensor.device().same_device(mixed_qkv.device())
+    };
+    if !qwen38_deltanet_sequence_supported(key_heads, value_heads, key_dim, value_dim)
+        || batch != 1
+        || sequence == 0
+        || width != Some(conv_dim)
+        || g.dims() != [1, sequence, value_heads]
+        || beta.dims() != [1, sequence, value_heads]
+        || initial_state.dims() != [1, value_heads, key_dim, value_dim]
+        || ![mixed_qkv, g, beta, initial_state].into_iter().all(same)
+    {
+        candle_core::bail!(
+            "invalid Qwen3.8 DeltaNet sequence contract: mixed {:?}, g {:?}, beta {:?}, state {:?}",
+            mixed_qkv.dims(),
+            g.dims(),
+            beta.dims(),
+            initial_state.dims()
+        )
+    }
+    let gates = Tensor::cat(
+        &[&g.unsqueeze(D::Minus1)?, &beta.unsqueeze(D::Minus1)?],
+        D::Minus1,
+    )?
+    .contiguous()?;
+    let packed = mixed_qkv.contiguous()?.apply_op3_no_bwd(
+        &gates,
+        &initial_state.contiguous()?,
+        &Qwen38DeltaNetSequenceOp {
+            sequence,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        },
+    )?;
+    let output_elements = sequence * value_heads * value_dim;
+    let state_elements = value_heads * key_dim * value_dim;
+    Ok((
+        packed
+            .narrow(0, 0, output_elements)?
+            .reshape((1, sequence, value_heads, value_dim))?,
+        packed
+            .narrow(0, output_elements, state_elements)?
+            .reshape((1, value_heads, key_dim, value_dim))?,
+    ))
+}
+
+struct Qwen38DeltaNetSequenceOp {
+    sequence: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+}
+
+impl CustomOp3 for Qwen38DeltaNetSequenceOp {
+    fn name(&self) -> &'static str {
+        "qwen38-deltanet-sequence"
+    }
+
+    /// The portable reference: the kernel's recurrence in F32, per value
+    /// head and token: decay the state, recall with the normalized key,
+    /// update with the beta-scaled delta, read out with the normalized,
+    /// 1/sqrt(key_dim)-scaled query.
+    fn cpu_fwd(
+        &self,
+        qkv: &CpuStorage,
+        qkv_layout: &Layout,
+        gates: &CpuStorage,
+        gates_layout: &Layout,
+        state: &CpuStorage,
+        state_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        fn slice<'a>(
+            storage: &'a CpuStorage,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<&'a [f32]> {
+            let CpuStorage::F32(values) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(&values[start..end])
+        }
+        let qkv = slice(qkv, qkv_layout, "mixed_qkv")?;
+        let gates = slice(gates, gates_layout, "gates")?;
+        let state = slice(state, state_layout, "initial_state")?;
+        let (dk, dv, hv) = (self.key_dim, self.value_dim, self.value_heads);
+        let repeats = hv / self.key_heads;
+        let key_width = self.key_heads * dk;
+        let conv_dim = 2 * key_width + hv * dv;
+        let query_scale = (dk as f32).sqrt().recip();
+        let output_elements = self.sequence * hv * dv;
+        let mut packed = vec![0f32; output_elements + hv * dk * dv];
+        let (outputs, final_state) = packed.split_at_mut(output_elements);
+        final_state.copy_from_slice(state);
+        let norm = |values: &[f32]| {
+            (values.iter().map(|v| v * v).sum::<f32>() + 1e-6)
+                .sqrt()
+                .recip()
+        };
+        for (value_head, head_state) in final_state.chunks_exact_mut(dk * dv).enumerate() {
+            let key_head = value_head / repeats;
+            for t in 0..self.sequence {
+                let row = &qkv[t * conv_dim..(t + 1) * conv_dim];
+                let query = &row[key_head * dk..(key_head + 1) * dk];
+                let key = &row[key_width + key_head * dk..key_width + (key_head + 1) * dk];
+                let value =
+                    &row[2 * key_width + value_head * dv..2 * key_width + (value_head + 1) * dv];
+                let (query_norm, key_norm) = (norm(query), norm(key));
+                let gate = &gates[(t * hv + value_head) * 2..][..2];
+                let (decay, beta) = (gate[0].exp(), gate[1]);
+                head_state.iter_mut().for_each(|s| *s *= decay);
+                for (column, value) in value.iter().enumerate() {
+                    let recalled: f32 = key
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| k * head_state[i * dv + column])
+                        .sum();
+                    let update = (value - recalled * key_norm) * beta * key_norm;
+                    let mut output = 0f32;
+                    for (i, (k, q)) in key.iter().zip(query).enumerate() {
+                        let s = &mut head_state[i * dv + column];
+                        *s = k.mul_add(update, *s);
+                        output = q.mul_add(*s, output);
+                    }
+                    outputs[(t * hv + value_head) * dv + column] =
+                        output * query_norm * query_scale;
+                }
+            }
+        }
+        let elements = packed.len();
+        Ok((CpuStorage::F32(packed), Shape::from_dims(&[elements])))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        qkv: &candle_core::CudaStorage,
+        qkv_layout: &Layout,
+        gates: &candle_core::CudaStorage,
+        gates_layout: &Layout,
+        state: &candle_core::CudaStorage,
+        state_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        fn contiguous_slice<'a>(
+            storage: &'a CudaStorageSlice,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
+        {
+            let CudaStorageSlice::F32(slice) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(slice.slice(start..end))
+        }
+
+        let conv_dim = 2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim;
+        // The kernel reads q and k rows as 16-byte vectors.
+        if !qkv_layout.start_offset().is_multiple_of(4) || !conv_dim.is_multiple_of(4) {
+            candle_core::bail!("the Qwen3.8 DeltaNet sequence kernel needs 16-byte aligned rows")
+        }
+        if [
+            self.sequence,
+            self.key_heads,
+            self.value_heads,
+            self.value_dim,
+        ]
+        .iter()
+        .any(|v| *v > i32::MAX as usize)
+        {
+            candle_core::bail!("Qwen3.8 DeltaNet sequence geometry overflow")
+        }
+        let qkv_slice = contiguous_slice(&qkv.slice, qkv_layout, "mixed_qkv")?;
+        let gates_slice = contiguous_slice(&gates.slice, gates_layout, "gates")?;
+        let state_slice = contiguous_slice(&state.slice, state_layout, "initial_state")?;
+        let device = qkv.device();
+        let output_elements = self.sequence * self.value_heads * self.value_dim;
+        let state_elements = self.value_heads * self.key_dim * self.value_dim;
+        // SAFETY: the kernel writes every output and final-state element.
+        let output = unsafe { device.alloc::<f32>(output_elements + state_elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_deltanet_sequence_f32",
+            "izwi_qwen38_deltanet_decode",
+            cuda_ptx::QWEN38,
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (
+                (self.value_dim / QWEN38_DELTANET_SEQUENCE_COLUMNS) as u32,
+                self.value_heads as u32,
+                1,
+            ),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = function.builder();
+        builder.arg(&qkv_slice);
+        builder.arg(&gates_slice);
+        builder.arg(&state_slice);
+        builder.arg(&output);
+        candle_core::builder_arg!(
+            builder,
+            self.sequence as i32,
+            self.key_heads as i32,
+            self.value_heads as i32,
+            self.value_dim as i32
+        );
+        // SAFETY: argument types and launch dimensions match the kernel;
+        // the geometry was validated by `qwen38_deltanet_sequence`.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            Shape::from_dims(&[output_elements + state_elements]),
+        ))
+    }
 }
 
 pub fn try_tiled_deltanet_recurrence(
@@ -2091,27 +2470,29 @@ impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
         history_layout: &Layout,
     ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::cudarc::driver::{
+            CudaSlice, CudaView, LaunchConfig, PushKernelArg,
+        };
         use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
 
-        fn contiguous_slice<'a>(
-            storage: &'a CudaStorageSlice,
+        fn contiguous<'a, T>(
+            slice: &'a CudaSlice<T>,
             layout: &Layout,
             name: &str,
-        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
-        {
-            let CudaStorageSlice::F32(slice) = storage else {
-                candle_core::bail!("{name} must use F32 storage")
-            };
+        ) -> candle_core::Result<CudaView<'a, T>> {
             let Some((start, end)) = layout.contiguous_offsets() else {
                 candle_core::bail!("{name} must be contiguous")
             };
             Ok(slice.slice(start..end))
         }
 
-        let input_slice = contiguous_slice(&input.slice, input_layout, "input")?;
-        let weight_slice = contiguous_slice(&weight.slice, weight_layout, "weight")?;
-        let history_slice = contiguous_slice(&history.slice, history_layout, "history")?;
+        let (CudaStorageSlice::F32(weight_slice), CudaStorageSlice::F32(history_slice)) =
+            (&weight.slice, &history.slice)
+        else {
+            candle_core::bail!("Qwen3.8 decode convolution weight and history must be F32")
+        };
+        let weight_slice = contiguous(weight_slice, weight_layout, "weight")?;
+        let history_slice = contiguous(history_slice, history_layout, "history")?;
         let total_elements = self.conv_dim.checked_mul(4).ok_or_else(|| {
             candle_core::Error::Msg("Qwen3.8 CUDA decode convolution overflow".to_string())
         })?;
@@ -2121,20 +2502,31 @@ impl CustomOp3 for CudaQwen38CausalConvDecodeOp {
         let device = input.device();
         // SAFETY: the custom kernel writes every element before the storage is observed.
         let output = unsafe { device.alloc::<f32>(total_elements)? };
-        let function = device.get_or_load_custom_func(
-            "qwen38_causal_conv_decode_f32",
-            "izwi_qwen38_causal_conv_decode",
-            cuda_ptx::QWEN38,
-        )?;
         let config = LaunchConfig::for_num_elems(total_elements as u32);
-        let mut builder = function.builder();
-        builder.arg(&input_slice);
-        builder.arg(&weight_slice);
-        builder.arg(&history_slice);
-        builder.arg(&output);
-        candle_core::builder_arg!(builder, self.conv_dim as i32);
-        // SAFETY: argument types and element bounds match the CUDA kernel signature.
-        unsafe { builder.launch(config) }.w()?;
+        macro_rules! launch {
+            ($slice:expr, $name:literal) => {{
+                let input_slice = contiguous($slice, input_layout, "input")?;
+                let function = device.get_or_load_custom_func(
+                    $name,
+                    "izwi_qwen38_causal_conv_decode",
+                    cuda_ptx::QWEN38,
+                )?;
+                let mut builder = function.builder();
+                builder.arg(&input_slice);
+                builder.arg(&weight_slice);
+                builder.arg(&history_slice);
+                builder.arg(&output);
+                candle_core::builder_arg!(builder, self.conv_dim as i32);
+                // SAFETY: argument types and element bounds match the CUDA kernel signature.
+                unsafe { builder.launch(config) }.w()?;
+            }};
+        }
+        match &input.slice {
+            CudaStorageSlice::F32(slice) => launch!(slice, "qwen38_causal_conv_decode_f32"),
+            CudaStorageSlice::BF16(slice) => launch!(slice, "qwen38_causal_conv_decode_bf16"),
+            CudaStorageSlice::F16(slice) => launch!(slice, "qwen38_causal_conv_decode_f16"),
+            _ => candle_core::bail!("Qwen3.8 decode convolution input must be F32, BF16 or F16"),
+        }
 
         Ok((
             candle_core::CudaStorage {
@@ -3174,6 +3566,10 @@ mod tests {
     fn qwen38_cuda_source_uses_independent_decode_symbol() {
         let source = include_str!("cuda/qwen38.cu");
         assert!(source.contains("qwen38_causal_conv_decode_f32"));
+        // 16-bit projection rows enter the conv without an F32 cast.
+        assert!(source.contains("qwen38_causal_conv_decode_bf16"));
+        assert!(source.contains("qwen38_causal_conv_decode_f16"));
+        assert!(source.contains("float(input[channel]) * weight[weight_base + 3]"));
         assert!(source.contains("qwen38_deltanet_decode_f32"));
         assert!(source.contains("qwen38_silu_mul_decode_f32"));
         assert!(source.contains("qwen38_l2_norm_decode_f32"));
@@ -3801,6 +4197,90 @@ pub(crate) fn cuda_test_device() -> Option<candle_core::Device> {
 #[cfg(all(test, feature = "cuda"))]
 mod qwen38_dtype_device_tests {
     use super::*;
+
+    /// The table-addressed conv runs the direct kernel's body: the same
+    /// output, and the same next history written where table entry 3 points,
+    /// for every input dtype at the 27B width. The history it reads (entry
+    /// 0) is untouched, and so is the rest of the table's target buffer.
+    #[test]
+    fn cuda_qwen38_table_conv_decode_matches_the_direct_kernel() {
+        let Some(device) = cuda_test_device() else {
+            return;
+        };
+        let conv_dim = 10_240;
+        let values = |n: usize, seed: f32| {
+            (0..n)
+                .map(|i| ((i as f32 + seed) * 0.754_877_7).sin() * 1.5)
+                .collect::<Vec<f32>>()
+        };
+        let host = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let weight = Tensor::from_vec(values(conv_dim * 4, 1.0), (conv_dim, 4), &device).unwrap();
+        let history = Tensor::from_vec(values(conv_dim * 3, 2.0), (conv_dim, 3), &device).unwrap();
+        let history_before = host(&history);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let input = Tensor::from_vec(values(conv_dim, 3.0), (1, 1, conv_dim), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let (direct, direct_next) =
+                try_qwen38_causal_conv_decode(&input, &weight, &history).expect("direct kernel");
+            // The next history lands in the middle of a larger buffer.
+            let target = Tensor::full(7f32, 3 * conv_dim + 64, &device).unwrap();
+            let next = target.narrow(0, 32, 3 * conv_dim).unwrap();
+            let mut table =
+                segment_graph::DeviceTable::new(&device, 2 * gdn::TABLE_ENTRIES).unwrap();
+            let entries = [
+                gdn::f32_address(&history).unwrap(),
+                0,
+                0,
+                gdn::f32_address(&next).unwrap(),
+                0,
+                0,
+            ];
+            table.write(gdn::TABLE_ENTRIES, &entries).unwrap();
+            let output = qwen38_causal_conv_decode_table(
+                &input,
+                &weight,
+                gdn::StateTable {
+                    address: table.address(),
+                    slot: gdn::TABLE_ENTRIES,
+                },
+            )
+            .unwrap();
+            assert_eq!(output.dims(), [conv_dim]);
+            assert_eq!(host(&output), host(&direct), "{dtype:?} output");
+            assert_eq!(host(&next), host(&direct_next), "{dtype:?} next history");
+            let target = host(&target);
+            assert!(target[..32]
+                .iter()
+                .chain(&target[32 + 3 * conv_dim..])
+                .all(|v| *v == 7.0));
+            assert_eq!(
+                host(&history),
+                history_before,
+                "{dtype:?} read-only history"
+            );
+        }
+        // The contract refuses a wrong weight shape before any launch.
+        let input = Tensor::zeros((1, 1, conv_dim), DType::BF16, &device).unwrap();
+        assert!(qwen38_causal_conv_decode_table(
+            &input,
+            &weight.narrow(0, 0, 8).unwrap(),
+            gdn::StateTable {
+                address: 0,
+                slot: 0
+            },
+        )
+        .is_err());
+    }
+
     #[test]
     fn cuda_qwen38_f16_bf16_epilogues_execute_for_verification_rows() {
         let Some(device) = cuda_test_device() else {

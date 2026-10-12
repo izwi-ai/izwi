@@ -103,6 +103,7 @@ fn prepared_prompt() -> Qwen38PreparedPrompt {
         prompt_ids: (0..8).collect(),
         prompt_positions: (0..8).map(|position| [position; 3]).collect(),
         next_text_position: 8,
+        history_boundary: None,
     }
 }
 
@@ -392,6 +393,34 @@ fn attached_prefill_matches_the_fresh_run_and_fails_closed_on_bad_spans() {
             total,
         )
         .is_err());
+
+    // An attach that skips the snapshot restore fails closed instead of
+    // prefilling the residual from zero hybrid state.
+    let mut unrestored = model
+        .begin_chunked_prefill_state_physical(
+            &[],
+            4,
+            &greedy_config(),
+            Some(&prepared),
+            target.view(&[0, 10, 11], fork_cursor),
+            Some(mtp.view(&[10, 11], 0)),
+        )
+        .unwrap();
+    let error = model
+        .continue_chunked_prefill_physical(
+            &mut unrestored,
+            &[],
+            &greedy_config(),
+            Some(&prepared),
+            fork_cursor,
+            total,
+            total,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("without hybrid state"),
+        "{error}"
+    );
 
     // A fresh (non-attached) sequence restores nothing and stays usable.
     let mut fresh = model

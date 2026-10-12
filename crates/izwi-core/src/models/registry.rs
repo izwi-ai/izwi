@@ -3734,11 +3734,8 @@ impl NativeChatModel {
     pub fn preferred_prefill_tokens(&self) -> usize {
         match self {
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
-            Self::Qwen3(_)
-            | Self::Qwen35(_)
-            | Self::Qwen38(_)
-            | Self::Gemma3(_)
-            | Self::Lfm2(_) => 0,
+            Self::Qwen38(model) => model.preferred_prefill_tokens(),
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
         }
     }
 
@@ -3750,9 +3747,12 @@ impl NativeChatModel {
     /// values.
     pub fn speculative_decode_profile(&self) -> (usize, bool, bool) {
         match self {
+            // The MTP quantum (solo, plus the DS9.4 continuous envelope) or
+            // the graph-decode quantum (no MTP head); either is sustained
+            // past the soft SLA on CUDA.
             Self::Qwen38(model) => (
                 model.preferred_decode_tokens(),
-                model.sustained_cuda_mtp_quantum(),
+                model.sustained_decode_quantum(),
                 model.mtp_in_continuous_enabled(),
             ),
             // Solo speculative quanta plus, with a loaded head, the DS9.4
@@ -4462,7 +4462,8 @@ impl NativeChatPreparedPrompt {
     pub fn managed_snapshot_boundary(&self) -> Option<usize> {
         match self {
             Self::Qwen36Moe(prepared) => prepared.history_boundary(),
-            Self::Qwen35(_) | Self::Qwen38(_) => None,
+            Self::Qwen38(prepared) => prepared.history_boundary(),
+            Self::Qwen35(_) => None,
         }
     }
 
@@ -6008,6 +6009,11 @@ impl ModelRegistry {
     pub fn with_prefix_reuse_mode(mut self, prefix_reuse: PrefixReuseMode) -> Self {
         self.prefix_reuse = prefix_reuse;
         self
+    }
+
+    /// The prefix-reuse decision mode this registry's loads apply.
+    pub(crate) fn prefix_reuse_mode(&self) -> PrefixReuseMode {
+        self.prefix_reuse
     }
 
     pub(crate) fn publish_effective_context(

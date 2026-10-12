@@ -1,3 +1,228 @@
+# Plan — Qwen3.8-27B-FP8 load admission failure + inference performance — 2026-10-11
+
+Branch `perf-qwen38` (base `main` @ `abf3f26f`). Evidence and per-phase detail are in
+`tasks/qwen38-performance-admission-research-2026-10-11.md`; the reports are in
+`tasks/qwen38-performance-evidence-2026-10-11/`.
+
+**Decision (user, 2026-10-11).** Qwen3.6 and Qwen3.8 stay separate. Fast paths are ported into
+`q38/`'s own trunk, which may call the generic kernels under `kernels/`. Qwen3.6 orchestration is a
+reference, not a dependency; Qwen3.6 numerics are unchanged.
+
+**Root causes (confirmed in code).**
+- **Load refusal.**
+  - CUDA automatic rows = device memory ÷ 256 MiB (316 retained + 316 staged on an 80 GB H100).
+  - The CUDA fit charged 156.9 MB/sequence of recurrent state for all of them: 99.2 GB > 85 GB.
+  - Result: "CUDA managed context cannot fit the model-authored minimum" on every CUDA GPU.
+- **Slowness.**
+  - Auto ran Q8_0, not FP8, and Q8 blocked graphs.
+  - Per token: ~2,200 eager launches/allocations plus 3 syncs.
+  - MTP rounds added a 144 MiB state copy and host-side full-vocab verify.
+  - Bar: vLLM runs 77–79 t/s on an H100 at concurrency 1.
+
+Phase 0 — admission
+- [x] 1 Automatic staged rows = step launch width (`18640294`). Batch formation no longer prepares
+      rows it cannot launch.
+- [x] 2 Automatic CUDA rows fitted to the model's state, ≤ `IZWI_CUDA_STATE_BUDGET_FRACTION` (0.25)
+      of the post-weight budget, with the CPU admission matrix (`7f207479`). Rows on an 80 GB H100:
+      - Qwen3.8: 67 retained + 8 staged, 11.8 GB of state.
+      - Qwen3.6: 172 + 8, 11.9 GB of state (was 41.6 GB).
+- [x] 3 Unfittable CUDA state plans are refused before weights stream (`e3483b63`).
+- [x] 4 (deviation from the plan) The catalog's 80 GiB figure is displayed nowhere. The one real
+      consumer was the Metal OOM retry, now fixed to use the per-backend load peak (`662c2b2f`).
+
+Phase 1 — correctness and harness
+- [x] 5 Qwen3.8 HF golden-parity fixture and generator (`9152317d`). CPU 5.9e-5 against a 2e-3
+      bound; the Metal leg is at the F16 floor.
+- [x] 6 M-RoPE cos/sin from F32 angles, with the trig on the host (Metal fast math is imprecise)
+      (`1714ecb9`).
+- [x] 7 Zero-centered norm gains kept in F32 (`e26d7178`).
+- [x] 8 Conv-ring dtype guard restored (`e62cbedc`).
+- [ ] 9 T0 telemetry: partly covered by the per-path `fast_paths`/`cuda_graphs` diagnostics and the
+      KV host-synchronization counters. Still open: the census found the MTP call site passes 0 to
+      `mtp_target_replay_tokens_total`; verify and feed it.
+
+Phase 2 — CUDA port into q38/
+- [x] 13 Fused add + RMSNorm, plus the `qwen38/fast_path.rs` scaffolding (`d6b26c65`).
+- [x] 12 Fused GDN decode: q38 conv with BF16/F16 entries plus `gdn::recurrent_decode` (`d26b2944`).
+- [x] 14 Fused q/k norm + RoPE + KV write; fused gated output (`e53ad096`).
+- [x] 10 Native block-FP8 projections by default on CUDA, with the unified residency policy
+      (`qwen38/residency.rs`), gated before admission and self-checked at load (`fb08201a`).
+- [x] 11 FP8 LM head on CUDA (`4a1351d4`).
+
+Phases 6/7 — Metal and CPU
+- [x] 15 Metal KV epoch fences: 1 host sync per step instead of 16 (`0acc5f3a`).
+- [x] 16 Raw block-FP8 residency on Metal: 54.65 → 31.0 GB (`a838eac9`).
+- [x] 17 Q8_0 residency on CPU: 109.3 → 33.0 GB (`4d7f003c`). Logits sit 4.4% from F32 on the FP8
+      fixture; the golden test is pinned to `expanded`.
+
+Phase 3 — graphs
+- [x] A DeltaNet α/β projection through the router GEMV (`544ba8fd`).
+- [x] B Table-addressed Qwen3.8 conv decode (`c1d956bf`).
+- [x] 18 Piecewise (segment) CUDA graphs (`81af8570`).
+- [x] 19 Whole-step CUDA graph (`7c2b2058`).
+- [x] 20 Multi-token quanta plus pipelining on graph decode (`2f24a3b3`).
+- [x] 21 MTP `auto` → off on CUDA when graph decode is planned (`e38eb5c9`). **Needs the H100 A/B**;
+      roll back with `IZWI_QWEN38_MTP=1`.
+- [x] style: rustfmt the format-gated `kernels/cuda.rs` (`dd600ba8`).
+
+Later
+- [ ] Phase 4: MTP on the graph path (k+1 state slots, graphed verify, device speculative sampling,
+      quantized draft LM head).
+- [ ] Phase 5: chunked GDN prefill, FP8 tensor-core GEMM for M>8, CUDA prefix reuse for Qwen3.8,
+      optional FP8 KV.
+- [ ] Phase 8: GGUF path via qwen35 (24 GB GPUs, 32 GB Macs).
+- [ ] A4: lease accounting for state and snapshots (the H1 incident class).
+- [ ] T0 remainder (see item 9).
+
+Hardware checks on the next H100 deploy (cannot run here):
+- Qwen3.8 reaches Ready with no row variables; `kv_cache.models[]` shows 67/8 rows.
+- `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib --features cuda`. This covers the
+  fused-kernel parity, the FP8 kernel gate, segments/whole-step reaching replay and the KV-growth
+  recapture.
+- Diagnostics:
+  - `fast_paths` all `fused`;
+  - `projection_backend` native FP8;
+  - `cuda_graphs.whole_step.phase = replay`;
+  - `pipelined > 0`;
+  - `decode_quantum.granted_max = 8`.
+- Fixed prompt: default (graph decode) vs `IZWI_QWEN38_MTP=1` vs `IZWI_CUDA_PROJECTION_BACKEND=q8`.
+  Record tokens, ms, t/s and the GPU type. Expected ~70–85 t/s against the 10–20 t/s baseline.
+- TTFT at about 1.2k prompt tokens (prefill moved from Q8 MMQ to the FP8 WMMA kernel).
+
+## Review (2026-10-12)
+
+Twenty-four commits on `perf-qwen38` (`5573126c..dd600ba8`). Each lane ran per commit; the lead
+re-ran the whole set on the integrated head:
+- `izwi-core` lib on CPU, `--features metal` and `izwi-server` lib;
+- `izwi-serving-worker` backend_parity on Metal;
+- clippy `-D warnings -A deprecated` (workspace, Metal, and CUDA with a fake nvcc);
+- the CI rustfmt gate and `git diff --check`.
+
+Known flakes, unrelated to this branch and filed separately:
+- `izwi-server` `cancellation_retains_capacity_until_non_cooperative_executor_teardown` (timing,
+  under load);
+- `qwen38` `replay_of_partial_prefill_preserves_known_mtp_successor` ("Checkpoint shard changed");
+- intermittent SIGSEGV in the Metal test binary (suspected `set_var`/`getenv` races).
+
+No CUDA path has executed on a GPU. Every CUDA fast path self-checks at load or warmup and falls
+back, with a diagnostics reason, on mismatch.
+
+## Field round 1 — H100 deploy of `b1d51b89` (2026-10-12)
+
+**Readings.**
+- Cold start: 2,135 tokens in 76,689 ms (28 t/s; includes model load inside the first request).
+- Warm run: 3,224 tokens in 53,974 ms (60 t/s).
+- Second chat turn: failed after one token with a BatchWorkspace admission error.
+- Live diagnostics (read through the SSH tunnel):
+  - graph decode active: whole-step `replay`, 5,380 replays, 4,707 pipelined;
+  - every fast path `fused`, 0 self-check failures;
+  - prefill ~100 tok/s (prefill_ms_avg 9,412, TTFT p50 3.0 s / p95 13.9 s).
+
+**Root causes.**
+- **Second-turn failure.** The model's pending claim, 14,030,602,240 B, was 86 lazy state rows
+  (13,492,813,824) plus the graph-decode claim (537,788,416).
+  - Committed state rows were never recorded as materialized, so each live row was charged twice.
+  - About 0.88 GB of lazy CUDA context growth (modules, cuBLAS, graph pools) then ate the 1 GiB
+    margin, and driver-free memory fell 25,370,624 B below pending.
+  - The refusal failed a running stream after 3 retries that all read the same cached capacity
+    sample.
+- **Prefill.**
+  - Prompt chunks ran the software-decode FP8 WMMA `mm` kernel.
+  - Every DeltaNet layer tried the tiled kernel, failed on 16/48 heads, then expanded heads per
+    chunk.
+  - Qwen3.8 never declared a preferred prefill span, so the scheduler cut prompts at 192 tokens.
+
+**Fixes (on `perf-qwen38`).**
+- [x] `6d42ad78` Prefill projections run as dequantized BF16 GEMMs (bounded 128 MiB tiles, cuBLAS),
+      self-checked against `mm` and the checkpoint bytes.
+- [x] `a79bd6c8` Qwen3.8 grouped register-resident DeltaNet prefill kernel; no expansion and no
+      doomed attempt.
+- [x] `48d8d852` 1,024-token CUDA prefill chunks for isolated requests, declared to the scheduler;
+      the activations are charged as a pending claim.
+- [x] `e9f6ac50` Recurrent state rows are recorded as materialized on the model lease.
+- [x] `a1cc21f5` Comment explaining why the graph-decode claim stays pending.
+- [x] `a8e3151e` A refused batch workspace waits up to 5 s for capacity instead of failing the
+      stream (`workspace_waits{retried,recovered,exhausted}`).
+- [x] `a7ca7a93` `/v1/metrics` coordinator gains `materialized_` / `pending_` /
+      `untracked_device_memory_bytes`.
+- [x] `cf03481b` Load-time `kernel_timings`: FP8 GEMV GB/s per kind, GEMM TFLOP/s, and the DeltaNet
+      chunk time.
+- [x] `69092e5d` CUDA context reserve = max(1 GiB, 3% of device), 2.55 GB on the H100.
+      `IZWI_CUDA_CONTEXT_RESERVE_BYTES` overrides it.
+
+**Next deploy should show.**
+- A second and third chat turn succeed.
+- `coordinator.untracked_device_memory_bytes` is ~0.62 GB after load and ~1.49 GB after traffic,
+  then flat. Growth per turn means a leak.
+- `pending_device_memory_bytes` falls by 156,893,184 per live row.
+- `workspace_waits.exhausted = 0`.
+- `fast_paths.fp8_prefill_gemm` and `gdn_prefill` are fused.
+- `chunk_tokens = preferred_span_tokens = 1024`.
+- TTFT and `prefill_ms_avg` fall by an order of magnitude.
+- `kernel_timings.status = measured`. Use its GEMV GB/s to target decode (16.7 ms/token against a
+  ~8 ms floor).
+- Ops: set `IZWI_PRELOAD_MODELS=Qwen3.8-27B-FP8` so the first request does not pay the load.
+
+## Field round 2 — H100 deploy of `6f14a0c2` (2026-10-12)
+
+**Readings.**
+- Cold start: 2,598 tokens / 83,444 ms (31 t/s; model load inside the request).
+- Second run: 3,084 tokens / 50,915 ms (61 t/s).
+- `/v1/metrics`:
+  - 0 failures and 0 workspace waits;
+  - TTFT p50 0.78 s / p95 0.95 s (was 3.0 / 13.9 s); prefill ≈ 2,200 tok/s;
+  - pure decode ≈ 14.3 ms/token (~70 t/s);
+  - `untracked_device_memory_bytes` 1.54 GB (predicted ~1.49).
+- `kernel_timings`: FP8 GEMV 2.11–2.44 TB/s per kind, LM head 2.70 TB/s. Layer-weighted, that is
+  ≈ 11.0 ms/token at ~2.33 TB/s; the reported "weighted" 9.96 ms is not layer-weighted.
+
+**Why not Qwen3.6's ~160 t/s.** Same engineering, different physics.
+- Qwen3.6 streams ~3.6 GB/token and is latency-bound at ~6 ms. Qwen3.8 streams 25.6 GB/token,
+  so its roofline is ~131 t/s at 100% bandwidth with zero overhead.
+- vLLM's single-stream H100 figure is 77–79 t/s. 150+ t/s needs MTP on the graph path.
+- Plan: `tasks/qwen38-decode-improvement-plan-2026-10-12.md`.
+  - Phase A: top-k-first sampler, diagnostics, quantum carry, preload → ~76–78 t/s.
+  - Phase B: GEMV v3 at ≥2.9 TB/s (hardware E4M3 cvt; the Modal H100 build already uses compute
+    cap 90) → ~93 t/s.
+  - Phase C: fusions, PDL, state ring → ~100–106 t/s.
+  - Phase D: MTP k=1–3 on graphs → 150–180 t/s.
+  - Batched-decode graphs are a separate track.
+- [ ] Phase A
+- [ ] Phase B
+- [ ] Phase C
+- [ ] Phase D
+- [ ] Batched decode graphs
+
+**Prefix reuse for Qwen3.8 (implemented and enabled by default, including CUDA).**
+- [x] `3c64ed4f` A bounded hybrid prefix-snapshot budget (`IZWI_MAX_PREFIX_SNAPSHOTS`, default 8 ×
+      156,893,184 B) is reserved at load and recorded materialized while held.
+- [x] `af67cf2f` Stable-history boundary at the final `<|im_start|>`; snapshot at the last full
+      64-token page below it.
+- [x] `572ce68d` A resumed prefill with no hybrid state fails closed.
+- [x] `2567b4ef` History-attach tests through production loading on CPU and Metal (exact restore);
+      the CUDA leg is gated and must pass on the H100.
+- [x] `285e4598` Reuse diagnostics plus `IZWI_QWEN38_PREFIX_REUSE` (off-switch).
+- [x] `0d73c214` The CUDA startup check keeps the configured prefix page budget.
+- [x] `f990bbbf` Catalog: Qwen3.8 reuses chat history by default on CUDA.
+- [x] `0216dbab` Unset prefix page budget on CUDA = max(128, KV arena/4): 2,442 pages ≈ 156k tokens
+      on the H100. Index-held pages are reclaimed LRU-first by admission. Explicit
+      `IZWI_MAX_PREFIX_CACHE_PAGES` still wins.
+- MTP-on keeps sharing off. CPU/Metal load MTP by default, so reuse there needs
+  `IZWI_QWEN38_MTP=0`.
+
+**Next deploy checks.**
+- `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib --features cuda history_attach`.
+- Load log shows `prefix_reuse=true`, `prefix_snapshot_rows=8`; `kv_cache` `prefix_capacity_pages` ≈ 2,442.
+- On turn 2:
+  - `tensor_snapshot_attaches` / `prefix_hits` +1;
+  - `usage.prompt_tokens_details.cached_tokens` = turn 1's boundary rounded down to 64;
+  - TTFT falls.
+- Idle: pending + materialized == reserved; `untracked_device_memory_bytes` flat.
+- Zero-code A/Bs for the decode plan:
+  - `temperature: 0` vs the default (sampler cost);
+  - `IZWI_QWEN38_DECODE_QUANTUM=32` (quantum boundary);
+  - `IZWI_PRELOAD_MODELS=Qwen3.8-27B-FP8` (cold start).
+
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.

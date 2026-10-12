@@ -157,6 +157,8 @@ pub const ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES: &str =
     "engine.executor.physical_workspace_current_bytes";
 pub const ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES: &str =
     "engine.executor.physical_workspace_high_water_bytes";
+pub const ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_WAITS_TOTAL: &str =
+    "engine.executor.physical_workspace_waits_total";
 
 pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
@@ -472,6 +474,10 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         name: ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
         description: "Process high-water workspace bytes held by physical dispatches by domain.",
     },
+    EngineMetricDescriptor {
+        name: ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_WAITS_TOTAL,
+        description: "Refused batch workspaces by outcome: retried after a backoff, recovered by a later admission, or exhausted after the wait budget.",
+    },
 ];
 
 static ENGINE_STREAM_BACKPRESSURE_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -573,6 +579,8 @@ static ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+static ENGINE_PHYSICAL_WORKSPACE_WAITS: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct EngineDispatchStateMetricsSnapshot {
@@ -637,6 +645,45 @@ impl EngineDeadlinePhaseMetricsSnapshot {
             ("model_execution", self.model_execution),
             ("stream_delivery", self.stream_delivery),
             ("terminal_delivery", self.terminal_delivery),
+        ]
+    }
+}
+
+/// What became of one refused batch workspace for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineWorkspaceWaitOutcome {
+    /// Deferred to a later attempt inside the wait budget.
+    Retried,
+    /// A session that had waited was admitted.
+    Recovered,
+    /// The wait budget elapsed without an admission; the session failed.
+    Exhausted,
+}
+
+impl EngineWorkspaceWaitOutcome {
+    const fn index(self) -> usize {
+        match self {
+            Self::Retried => 0,
+            Self::Recovered => 1,
+            Self::Exhausted => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EngineWorkspaceWaitMetricsSnapshot {
+    pub retried: u64,
+    pub recovered: u64,
+    pub exhausted: u64,
+}
+
+impl EngineWorkspaceWaitMetricsSnapshot {
+    pub fn labeled_values(self) -> [(&'static str, u64); 3] {
+        [
+            ("retried", self.retried),
+            ("recovered", self.recovered),
+            ("exhausted", self.exhausted),
         ]
     }
 }
@@ -838,6 +885,7 @@ pub struct EnginePhysicalExecutionMetricsSnapshot {
     pub defers: EnginePhysicalDeferMetricsSnapshot,
     pub workspace_current: EngineWorkspaceDomainMetricsSnapshot,
     pub workspace_high_water: EngineWorkspaceDomainMetricsSnapshot,
+    pub workspace_waits: EngineWorkspaceWaitMetricsSnapshot,
 }
 
 /// Drop-scoped accounting prevents cancellation or unwind from leaving the
@@ -927,6 +975,10 @@ pub(crate) fn record_engine_physical_permit_wait(duration: Duration) {
         &ENGINE_PHYSICAL_PERMIT_WAIT_OBSERVATIONS,
         &ENGINE_PHYSICAL_PERMIT_WAIT_MAX_NANOS,
     );
+}
+
+pub(crate) fn record_engine_workspace_wait(outcome: EngineWorkspaceWaitOutcome) {
+    saturating_atomic_add(&ENGINE_PHYSICAL_WORKSPACE_WAITS[outcome.index()], 1);
 }
 
 pub(crate) fn record_engine_physical_fallback(reason: EnginePhysicalFallbackReason) {
@@ -1349,6 +1401,11 @@ pub fn engine_physical_execution_metrics_snapshot() -> EnginePhysicalExecutionMe
             device: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[1].load(Ordering::Relaxed),
             unified: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[2].load(Ordering::Relaxed),
             temporary: ENGINE_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES[3].load(Ordering::Relaxed),
+        },
+        workspace_waits: EngineWorkspaceWaitMetricsSnapshot {
+            retried: ENGINE_PHYSICAL_WORKSPACE_WAITS[0].load(Ordering::Relaxed),
+            recovered: ENGINE_PHYSICAL_WORKSPACE_WAITS[1].load(Ordering::Relaxed),
+            exhausted: ENGINE_PHYSICAL_WORKSPACE_WAITS[2].load(Ordering::Relaxed),
         },
     }
 }
@@ -1879,6 +1936,7 @@ mod tests {
             ENGINE_EXECUTOR_PHYSICAL_DEFERS_TOTAL,
             ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
             ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
+            ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_WAITS_TOTAL,
         ] {
             assert!(names.contains(metric), "missing physical metric {metric}");
         }

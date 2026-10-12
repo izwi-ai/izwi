@@ -140,9 +140,9 @@ streaming sequence.
 
 Qwen3.8 is registered as its own `Qwen38Chat` runtime family. It does not
 inherit Qwen3.5 backend certification, state-conformance evidence, or media
-capabilities. Its CUDA deployment uses a
-[scale-aware Q8_0 compressed fallback](/support-matrix#qwen38-cuda-weight-residency),
-not native FP8 execution.
+capabilities. On CUDA its projections run as
+[native block FP8](/support-matrix#qwen38-cuda-weight-residency) by default, with a
+scale-aware Q8_0 fallback.
 
 ---
 
@@ -188,6 +188,73 @@ Set it to `1` or remove the variable to restore the default.
 Other model families keep their existing admission policy until they implement the
 published-sequence replay contract.
 
+Hybrid models (Qwen3.8 and Qwen3.6) keep a fixed block of recurrent state for every
+conversation they hold at once (about 157 MB per conversation for Qwen3.8 and 66 MB for
+Qwen3.6). When `IZWI_MAX_RETAINED_SEQUENCES` is unset, the server sizes this
+automatically at load: recurrent state may use up to a quarter of the memory left after
+the weights, and the rest holds the KV cache. It never keeps fewer conversations than the
+decode width (8 on CUDA). The chat-history snapshots below come out of the same quarter.
+On an 80 GB H100 that is about 68 conversations plus 8 history snapshots for Qwen3.8,
+and about 160 plus 8 for Qwen3.6. Further requests wait for a slot and start as soon as
+one finishes.
+The load log line `Fitted CUDA resident state rows and context` and the
+`retained_sequence_capacity` field under `kv_cache.models[]` in `/v1/metrics` show the
+chosen size. To give recurrent state a different share, set a value between 0 and 1:
+
+```bash
+export IZWI_CUDA_STATE_BUDGET_FRACTION=0.4
+```
+
+Setting `IZWI_MAX_RETAINED_SEQUENCES` explicitly turns the automatic sizing off. The
+server then reserves exactly that many conversations, plus `IZWI_MAX_STAGED_TRANSACTIONS`
+in-flight copies (by default the decode width), and refuses the load with the byte
+figures if they do not fit.
+
+### Chat history reuse
+
+Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA and Qwen3.6 on
+CPU and CUDA do not recompute the history they already processed (Qwen3.8 on CPU and
+Metal too, once its MTP draft head is off with `IZWI_QWEN38_MTP=0`). A
+turn's prompt is split before its final assistant header (earlier answers are
+re-rendered, so only the history up to there repeats in the next turn); the server
+keeps the KV pages of that history and a snapshot of the recurrent state at its last
+full 64-token page. The next turn of the conversation attaches there and prefills only
+the previous answer and the new message, which shortens time to first token on long
+conversations. A history shorter than one page has no snapshot, so after a very short
+first prompt the third turn is the first to reuse.
+
+Snapshots are bounded: `IZWI_MAX_PREFIX_SNAPSHOTS` (default 8) snapshots per model,
+about 157 MB each for Qwen3.8, reserved at load. The least recently used snapshot is
+dropped first, so up to 8 conversations continue with their history reused at once;
+others prefill in full. History pages share the KV cache and are released when a
+request needs the room. A conversation's whole history must fit the prefix page
+budget (`IZWI_MAX_PREFIX_CACHE_PAGES`); longer conversations prefill in full. With
+thinking on, answers often run to several thousand tokens, so on CUDA the budget
+defaults to a quarter of the model's KV arena, which is allocated at load either way:
+about 2,400 pages of 64 tokens (over 150,000 tokens of history) for Qwen3.8 on an
+80 GB H100. On CPU and Metal the default is 128 pages (8,192 tokens). The model's
+`kv_cache.models[].arenas[].prefix_capacity_pages` in `/v1/metrics` shows the
+effective budget. A value you set applies as set, for example:
+
+```bash
+export IZWI_MAX_PREFIX_CACHE_PAGES=4096
+```
+
+To see it working, compare `usage.prompt_tokens_details.cached_tokens` on a second
+turn (the reused tokens) with `prompt_tokens`, or read `prefix_reuse` in the model's
+runtime diagnostics (`attached_prefills`, `reused_prompt_tokens`) and
+`kv_cache.counters.tensor_snapshot_attaches` in `/v1/metrics`. To turn reuse off
+for Qwen3.8 only:
+
+```bash
+export IZWI_QWEN38_PREFIX_REUSE=0
+```
+
+`IZWI_ENABLE_PREFIX_CACHING=0` turns it off for every model. A Qwen3.8 load with its MTP
+draft head (`IZWI_QWEN38_MTP=1` on CUDA; the default on CPU and Metal) keeps its
+history private and prefills every turn in full: the draft head's attention state has
+no snapshot to attach.
+
 Use separate conversations, or independent `/v1/chat/completions` requests, for
 concurrent answers. Sends to the same conversation remain ordered. The playground
 allows one active stream per mounted view; separate tabs can use separate conversations.
@@ -202,10 +269,27 @@ Temporary batch workspace pressure is also handled before model execution: the
 scheduler reduces batch width or resumable prefill size and retries the same
 request without repeating streamed output. Under persistent pressure it can
 suspend eligible Qwen3.8 requests. Progress from competing work keeps waiting
-requests eligible; repeated failures with no progress still return an explicit
-capacity error. Requests that cannot fit alone cannot be guaranteed to finish.
-Capacity diagnostics group pending reservations by owner class to distinguish
-model, request, and workspace promises from materialized memory.
+requests eligible; a request that is refused for 5 seconds with no progress
+anywhere returns an explicit capacity error. Requests that cannot fit alone
+cannot be guaranteed to finish. Capacity diagnostics group pending reservations
+by owner class to distinguish model, request, and workspace promises from
+materialized memory.
+
+When it sizes the KV cache at load, the CUDA server keeps part of the GPU free
+for memory that CUDA allocates later without a reservation: kernels and library
+workspaces loaded on first use, CUDA graphs, and per-step scratch. This reserve
+is the larger of 1 GiB and 3% of GPU memory (about 2.55 GB on an 80 GB H100). The
+load log line `Fitted CUDA resident state rows and context` reports it as
+`context_reserve_bytes`. `coordinator.untracked_device_memory_bytes` in
+`/v1/metrics` shows how much memory that reserve is covering. Compare it right
+after loading with its value after a few requests: if it grows by more than the
+reserve, set a larger reserve in bytes before restarting the server:
+
+```bash
+export IZWI_CUDA_CONTEXT_RESERVE_BYTES=4294967296
+```
+
+A larger reserve leaves less memory for the KV cache.
 
 For a controlled hardware acceptance run, use
 `scripts/bench/run-cuda-chat-concurrency.py` as documented in

@@ -92,29 +92,125 @@ and realtime route families. Detailed preview behavior is documented in the
 
 ### Qwen3.8 CUDA weight residency
 
-`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the source
-artifact, but the current CUDA path does not execute native FP8 matrix
-multiplication. It applies each projection's `weight_scale_inv`, requantizes
-the projection to resident Candle Q8_0 weights, and retains source-dense tensors
-as BF16. Runtime diagnostics identify this as
-`resident_representation: q8_0_requantized_projections_with_dense_bf16` and
-`fp8_execution_mode: q8_0_compressed_fallback`.
+`Qwen3.8-27B-FP8` keeps its official block-scaled FP8 checkpoint as the resident
+format on CUDA by default. Projections stay as the checkpoint's E4M3 bytes plus one
+F32 scale per 128x128 block (about 24.7 GB), and the compact FP8 kernels apply
+`weight_scale_inv` inside every matrix multiplication with 16-bit activations
+(software FP8 decode, not FP8 Tensor Core arithmetic). Row-compatible projections
+are packed into one matrix. Runtime diagnostics report
+`resident_representation: native_block_fp8_with_q8_fallback_dense_bf16` and
+`fp8_execution_mode: native_block_fp8_auto_self_checked`.
 
-This compressed fallback is designed to fit 40/48 GB-class CUDA devices with a
-resource-fitted context, subject to actual free VRAM and allocator headroom. It
-must not be described as native FP8 execution or as CUDA-certified until the
-corresponding NVIDIA evidence is retained. The earlier fully expanded BF16
-weight plan required an 80 GB-class device; CPU and Metal continue to use their
-expanded F32 and F16 representations respectively.
+The runtime enables this only after checks on the device, before load admission:
+every projection shape must fit the kernel contract, the kernels must match a
+reference at the checkpoint's real inner dimensions, and a probe on real weights
+read from the checkpoint must match a host reference built from the same bytes.
+The load then checks each kind of projection, packs included, against the original
+checkpoint bytes. If any check fails, the model loads with the compressed Q8_0
+fallback instead (`weight_scale_inv` applied, then requantized to resident Candle
+Q8_0, about 26.2 GB), reported as `q8_0_requantized_projections_with_dense_bf16`
+and `fp8_execution_mode: q8_0_fallback:<reason>`. A check that fails during
+loading fails that load, and the next load uses Q8_0 with matching memory
+admission. Set `IZWI_CUDA_PROJECTION_BACKEND=q8` or
+`IZWI_QWEN38_FP8_PROJECTIONS=legacy` to choose Q8_0, and
+`IZWI_QWEN38_FP8_GEMV=legacy` to keep the reference decode kernel.
+
+With native block FP8, the LM head (2.54 GB in BF16) is also quantized at load to
+the same block-FP8 format (1.27 GB), which the target logits and every MTP draft
+read. This is a deliberate precision reduction: a host quality gate compares FP8
+and BF16 logits on probe rows across the vocabulary before the head is used, and
+`fast_paths.fp8_lm_head` reports the observed error. Logits stay BF16. Set
+`IZWI_QWEN38_FP8_LM_HEAD=legacy` to keep the BF16 head.
+
+Both representations are designed to fit 40/48 GB-class CUDA devices with a
+resource-fitted context, subject to actual free VRAM and allocator headroom. Native
+block FP8 is not CUDA-certified until the corresponding NVIDIA evidence is
+retained.
+
+### Qwen3.8 Metal weight residency
+
+On Apple Silicon, `Qwen3.8-27B-FP8` also keeps its projections as the checkpoint's
+block-FP8 bytes (about 28.9 GiB resident including a 1 GiB prefill scratch, against
+about 51 GiB for the F16 expansion), so 48 GB and 64 GB Macs can load it. Decode
+rows (up to 8) run an FP8 matrix-vector kernel that decodes E4M3 in software with
+F32 accumulation; longer prefill spans expand each projection to a transient F16
+matrix for one matrix multiplication. The LM head and the other dense tensors stay
+F16. Every kind of projection is checked against the original checkpoint bytes at
+load; a projection whose matrix-vector kernel disagrees runs the expansion instead,
+and a check that still fails fails that load, after which the next load expands to
+F16. Diagnostics report `resident_representation: native_block_fp8_with_dense_f16`.
+Set `IZWI_METAL_PROJECTION_BACKEND=expanded` (or `[runtime.performance.metal]
+projection_backend = "expanded"`) to expand to F16 at load.
+
+### Qwen3.8 CPU weight residency
+
+On the CPU, `Qwen3.8-27B-FP8` keeps its block-FP8 projections and its LM head as
+Q8_0 (the block scales applied, then requantized to 8-bit blocks of 32 values),
+about 30.7 GiB resident instead of about 102 GiB for the F32 expansion; the
+embedding and other dense tensors stay F32. Decode runs Candle's Q8_0 matrix
+multiplication, which also quantizes activations to 8 bits; prompt spans longer
+than 8 tokens expand row tiles of the weights to F32 for one F32 matrix
+multiplication. This changes CPU numerics: on the test fixtures, logits sit 2-4%
+(relative L2) from the F32 expansion, and greedy tokens can flip at near-ties.
+Diagnostics report `resident_representation: q8_0_projections_with_dense_f32`. Set
+`IZWI_CPU_PROJECTION_BACKEND=expanded` (or `[runtime.performance.cpu]
+projection_backend = "expanded"`) to keep the F32 expansion, and
+`IZWI_QWEN38_CPU_LM_HEAD=dense` to keep only the head in F32.
 
 ### Qwen3.8 multi-token prediction defaults
 
-Native Qwen3.8 MTP is enabled by default with one draft token on CPU, Metal,
-and CUDA. No environment variables are required for that default. Set
-`IZWI_QWEN38_MTP=0` and restart or reload the model to disable MTP. The
+Native Qwen3.8 MTP is enabled by default with one draft token on CPU and
+Metal. On CUDA the default (`cuda.mtp = "auto"`) leaves the MTP head out
+whenever CUDA graph decode is planned (see below): until MTP verification
+also runs in CUDA graphs, one graph launch per token is expected to beat
+MTP's eager draft and verify rounds. The head still loads on CUDA when graph
+decode is not planned (`IZWI_QWEN38_CUDA_GRAPHS=legacy`,
+`IZWI_CUDA_DECODE_GRAPHS=off`, `IZWI_CUDA_FUSED_DECODE=off`, or the Q8_0
+projection fallback). Set `IZWI_QWEN38_MTP=1` (or `IZWI_CUDA_MTP=1`) to load
+the head on CUDA anyway, and `IZWI_QWEN38_MTP=0` to disable MTP everywhere;
+restart or reload the model after changing either. The runtime diagnostics
+report the decision as `optimization_evidence.mtp.decision`. This CUDA
+default awaits a fixed-prompt throughput comparison on the H100; until then,
+`IZWI_QWEN38_MTP=1` restores the previous behavior. The
 `IZWI_QWEN38_MTP_DRAFT_TOKENS` setting controls proposal depth rather than
 enablement; its default is `1`, and supported explicit values are `1` through
 `3`.
+
+### Qwen3.8 CUDA graph decode
+
+On CUDA, single-row decode without an MTP head runs through captured CUDA
+graphs when the projections are native block FP8 and the fused decode kernels
+pass their load-time checks:
+
+- The whole step (the token embedding, all 64 layers, the final norm and the
+  block-FP8 LM head) is one graph, driven by a device step buffer that holds
+  the token, position, KV slot and block table. Where it does not apply (an
+  image position, or `IZWI_QWEN38_STEP_GRAPH=legacy`), 17 graph segments run
+  with attention eager between them.
+- Each graph is warmed eagerly, with its logits checked against the standard
+  decode on a copy of the row state, then captured and verified twice against
+  an eager run before it replays. A KV arena that grows forces a recapture.
+  Any failure turns graph decode off for the process with the reason in the
+  diagnostics, and decode continues on the eager fused path.
+- A decode quantum of up to 8 tokens per engine step
+  (`IZWI_QWEN38_DECODE_QUANTUM`, 1 to 64) keeps its width past a request's soft
+  scheduling deadline while the row decodes alone. Once the whole-step graph
+  replays, the quantum queues step k+1 before it reads token k, choosing tokens
+  with the device sampler (greedy or seeded sampling with penalties). Requests
+  that ask for logprobs decode one step at a time.
+- Load admission reserves graph decode's working memory, three recurrent-state
+  slabs plus 64 MiB (about 513 MiB for the 27B checkpoint), whenever graph
+  decode is planned.
+
+`cuda_graphs` in the runtime diagnostics reports the resolution, the phase
+(`warm`, `capture`, `verify`, `replay` or `disabled`), the counters, and the
+whole-step graph and decode quantum. Switches: `IZWI_QWEN38_CUDA_GRAPHS=legacy`
+(Qwen3.8 only), `IZWI_CUDA_DECODE_GRAPHS=off` (every model family),
+`IZWI_QWEN38_STEP_GRAPH=legacy` (segments only),
+`IZWI_QWEN38_DECODE_PIPELINE=legacy` (one step at a time) and
+`IZWI_QWEN38_FUSED_AB_GEMV=legacy` (cuBLAS for the DeltaNet alpha/beta
+projection). CUDA graph decode is not CUDA-certified until the corresponding
+NVIDIA evidence is retained.
 
 ---
 
@@ -216,7 +312,7 @@ buffers while the runtime orchestrates longer inputs.
 | Dense `float16`, `bfloat16`, `float32` KV | Supported by configuration boundary | Backend/model negotiation can still reject an exact incompatible cell. |
 | `int8` / `q4` KV | Unsupported | Parsed for migration diagnostics, then rejected before model readiness. |
 | CUDA FP8 E4M3 KV | Experimental, blocked | Kernel experiments exist, but scaled storage, scale-aware mutation/accounting, and NVIDIA evidence are incomplete. Arena and direct dispatch both fail closed to dense KV. |
-| Prefix reuse | Opt-in | Disabled by default; requires a non-empty isolation namespace and an independently bounded page budget. |
+| Prefix reuse | Catalog default | Engaged per model and backend where the catalog cell is supported (Qwen3.8 on CPU, Metal and CUDA, without its MTP head; Qwen3.6 on CPU and CUDA), with a per-process namespace and bounded page and snapshot budgets. `IZWI_ENABLE_PREFIX_CACHING=0` turns it off; `IZWI_QWEN38_PREFIX_REUSE=0` for Qwen3.8 alone. |
 | Optimized-provider demotion | Supported | Set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`; this can only demote to the validated Portable route. |
 | Tiered/offloaded or distributed KV | Not supported | No production ownership or eviction contract is published for these modes. |
 

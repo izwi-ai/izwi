@@ -29,9 +29,12 @@ An explicit current configuration looks like:
   "kv_page_size": 64,
   "enable_prefix_caching": false,
   "managed_prefix_cache_salt": null,
-  "max_prefix_cache_pages": 128
+  "max_prefix_cache_pages": null
 }
 ```
+
+A `null` (or omitted) `max_prefix_cache_pages` is automatic; see
+[Prefix isolation and capacity](#prefix-isolation-and-capacity).
 
 The public `EngineCoreConfig` uses the equivalent field name `block_size`.
 Both public configuration surfaces default to 64. Environment-based backend
@@ -91,13 +94,18 @@ maximum-length request, startup fails.
 
 ## Prefix isolation and capacity
 
-Prefix reuse starts disabled. To enable it, set all three fields:
+The server engages prefix reuse in catalog-auto mode by default: a model
+shares prefixes on the backends where its catalog cell is supported (see the
+[support matrix](/support-matrix)), under a per-process namespace unless you
+set one. `IZWI_ENABLE_PREFIX_CACHING=0` (or `IZWI_PREFIX_REUSE_AUTO=0`) turns it
+off for every model. To enable it explicitly for every model instead, set the
+first two fields; the page budget is optional:
 
 ```json
 {
   "enable_prefix_caching": true,
   "managed_prefix_cache_salt": "production/tenant-42",
-  "max_prefix_cache_pages": 128
+  "max_prefix_cache_pages": 4096
 }
 ```
 
@@ -107,9 +115,12 @@ config file `[runtime]` keys (`enable_prefix_caching`,
 (`IZWI_ENABLE_PREFIX_CACHING`, `IZWI_MANAGED_PREFIX_CACHE_SALT`,
 `IZWI_MAX_PREFIX_CACHE_PAGES`). Note that a model must also opt in through its
 cache contract: dense families (Qwen3, Gemma3, Voxtral, VibeVoice) participate,
-while hybrid families (Qwen3.5, Qwen3.8) currently declare prefix reuse
-disabled because their recurrent and convolution state has no checkpoint
-boundary for shared spans.
+and so do the hybrid chat families Qwen3.8 and Qwen3.6, which snapshot their
+recurrent and convolution state at each chat turn's history boundary (see
+[Hybrid prefix snapshots](#hybrid-prefix-snapshots)). Qwen3.5 and LFM2 keep
+their hybrid state private. `IZWI_QWEN38_PREFIX_REUSE=0` turns reuse off for
+Qwen3.8 alone, and a Qwen3.8 load with its MTP head (`IZWI_QWEN38_MTP=1` on
+CUDA, the default elsewhere) keeps every domain private.
 
 Use a stable, non-secret namespace that changes whenever tenants or deployments
 must not share cache entries. Never reuse one namespace across mutually
@@ -119,8 +130,35 @@ already change.
 
 Capacity is measured in physical pages. The effective prefix bound is the
 smaller of `max_prefix_cache_pages` and the pages left after reserving one
-`max_sequence_length` request. Watch these runtime fields:
+`max_sequence_length` request. A chat turn can only attach history whose
+whole page chain is still indexed, so a conversation longer than the page
+budget stops reusing its history.
 
+When `max_prefix_cache_pages` is not set, the budget is automatic: 128 pages
+of 64 tokens (8,192 tokens) on CPU and Metal, and per model on CUDA. A model
+whose CUDA KV arena is allocated in full at load (Qwen3.8 and Qwen3.6) gets a
+quarter of that arena, never less than 128 pages: about 2,400 pages (over
+150,000 tokens of history) for Qwen3.8 on an 80 GB H100. Those pages occupy
+memory that is already allocated, and a request that needs pages held only
+by the prefix index evicts them, least recently used first, so the larger
+budget never holds a request back. Other CUDA models keep 128 pages.
+
+An explicit value, from the config file or `IZWI_MAX_PREFIX_CACHE_PAGES`,
+applies to every model as set (startup rejects `0` while prefix reuse is on;
+turn reuse off with `IZWI_ENABLE_PREFIX_CACHING=0` instead). CUDA keeps it
+unclamped, for example `IZWI_MAX_PREFIX_CACHE_PAGES=4096` (one 262,144-token
+conversation). CPU and Metal clamp it to the 1,024-page baseline minus one
+maximum-length request. Config files that `izwi config edit` created before
+the automatic budget existed contain `max_prefix_cache_pages = 128`; delete
+that line to use the automatic budget.
+
+`runtime.kv_cache_policy` reports the configured budget, or the 128-page
+floor when it is automatic; each model's effective budget is
+`models[].arenas[].prefix_capacity_pages` in the runtime KV snapshot. Watch
+these runtime fields:
+
+- `models[].arenas[].prefix_capacity_pages`, the effective prefix page
+  budget of each arena;
 - `counters.prefix_hits`, `prefix_misses`, `prefix_evictions`,
   `prefix_copy_on_write_pages`, `prefix_rejections`, and
   `prefix_retained_pages`;
@@ -133,6 +171,31 @@ High rejection or eviction rates with low reuse mean the prefix budget or
 workload grouping should be reconsidered. Monotonic retained pages after
 requests drain indicate a lifecycle defect; disable prefix reuse and investigate
 before expanding capacity.
+
+### Hybrid prefix snapshots
+
+Hybrid models (recurrent or convolution state beside attention, such as
+Qwen3.6 and Qwen3.8) can attach a shared prefix only where a committed
+snapshot of that state exists. Each snapshot is one row of the model's
+recurrent state (156,893,184 bytes for Qwen3.8-27B) and outlives the request
+that published it, so snapshots have their own budget:
+
+- `IZWI_MAX_PREFIX_SNAPSHOTS` (engine field `max_prefix_snapshots`, default
+  8) bounds the snapshots one model may hold. `0` keeps hybrid state private,
+  so hybrid prefixes never attach.
+- The budget is fitted and reserved at load beside the state rows: on CUDA it
+  comes out of the automatic rows' state share (`IZWI_CUDA_STATE_BUDGET_FRACTION`),
+  so automatic retained rows shrink by the snapshot count and KV is
+  unchanged; explicit rows keep their count and the KV reach pays instead.
+- A held snapshot is recorded as materialized on the model lease (each
+  allocation once, also when a live session shares it); eviction returns its
+  bytes to the pending claim before they are freed.
+
+Watch `models[].prefix_snapshot_capacity`, `prefix_snapshot_budget_bytes`,
+`prefix_snapshots`, `prefix_snapshot_bytes` and `materialized_tensor_bytes`,
+plus the `tensor_snapshot_publishes`, `tensor_snapshot_attaches`,
+`tensor_snapshot_truncations` and `tensor_snapshot_evictions` counters.
+`prefix_snapshot_bytes` never exceeds the budget.
 
 ## CUDA build and provider controls
 
@@ -187,6 +250,19 @@ IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1 izwi serve --backend cuda
 Boolean values are strict: `1/true/yes/on` disables Optimized, while
 `0/false/no/off` enables normal promotion. Invalid values fail startup.
 
+On Metal, KV writes, page zeroes, and page copies are queued without a host
+wait. The first wait on any of their fences, normally the decode step's batch
+seal, drains the device once for every mutation queued before it. Managed KV
+telemetry then reports about one `host_synchronizations` per decode step
+instead of one per attention-layer write. To restore one device
+synchronization per mutation for an incident or comparison run:
+
+```bash
+IZWI_KV_METAL_EAGER_FENCES=1 izwi serve --backend metal
+```
+
+It takes the same strict boolean values.
+
 ## Benchmark methodology
 
 The checked-in microbenchmark uses the public physical arena ABI and emits
@@ -226,10 +302,13 @@ exact hardware and shape cell.
 
 Rollback is policy-only; ABI v1 and model-owned KV are not available.
 
-1. Disable prefix reuse with `enable_prefix_caching: false`. Restart and confirm
-   health reports `prefix.mode: disabled`.
+1. Disable prefix reuse with `enable_prefix_caching: false` (environment:
+   `IZWI_ENABLE_PREFIX_CACHING=0`; for Qwen3.8 alone,
+   `IZWI_QWEN38_PREFIX_REUSE=0`). Restart and confirm health reports
+   `prefix.mode: disabled`, or the model's `prefix_reuse.engaged: false`.
 2. On CUDA, set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`. Restart and confirm the
-   exact route selects Portable rather than Optimized.
+   exact route selects Portable rather than Optimized. On Metal, set
+   `IZWI_KV_METAL_EAGER_FENCES=1` to synchronize after every KV mutation again.
 3. If the CUDA backend itself is suspect, explicitly select CPU or Metal and
    confirm `requested_backend_available` and `selected_backend` in health.
 4. Drain or restart the process before changing page size or dtype; never mix

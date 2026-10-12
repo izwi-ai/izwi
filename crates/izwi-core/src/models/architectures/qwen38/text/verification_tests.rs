@@ -18,10 +18,7 @@ fn dense(output: usize, input: usize, scale: f32) -> Qwen38Projection {
     ))
 }
 fn norm(width: usize) -> Qwen38RmsNorm {
-    Qwen38RmsNorm {
-        weight: Tensor::ones(width, DType::F32, &Device::Cpu).unwrap(),
-        eps: 1e-6,
-    }
+    Qwen38RmsNorm::new(Tensor::ones(width, DType::F32, &Device::Cpu).unwrap(), 1e-6)
 }
 fn mlp() -> Qwen38Mlp {
     Qwen38Mlp {
@@ -76,6 +73,12 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         kernel_size: 4,
         tiled_recurrence_enabled: false,
         tiled_recurrence_tile_size_override: None,
+        fused_gdn: None,
+        fused_gdn_path: Default::default(),
+        alpha_beta_rows: None,
+        alpha_beta_gemv_path: Default::default(),
+        gdn_prefill: false,
+        gdn_prefill_path: Default::default(),
     };
     let full = Qwen38FullAttention {
         qkv_proj: Qwen38ProjectionGroup::Separate(vec![
@@ -94,10 +97,24 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         mrope_sections: vec![1, 0, 0],
         rope_kernel_enabled: false,
         rope_inv_freqs: build_rope_inv_freqs(2, 10_000.0).unwrap(),
+        fused_qk: None,
+        fused_qk_path: Default::default(),
+        fused_kv_write: false,
+        fused_kv_write_path: Default::default(),
+        fused_gate: false,
+        fused_gate_path: Default::default(),
     };
     Qwen38TextModel {
         device: device.clone(),
         projection_representation: Qwen38ProjectionRepresentation::ExpandedF32,
+        residency: Qwen38ResidencyPolicy::resolve_static(
+            crate::backends::BackendKind::Cpu,
+            &crate::performance::PerformanceConfig::default(),
+        ),
+        fp8_packing: Vec::new(),
+        fp8_gemv_checks: Vec::new(),
+        fp8_prefill_gemm_checks: Vec::new(),
+        fp8_lm_head: (Qwen38FastPath::legacy("not loaded"), None),
         token_embeddings: Embedding::new(
             Tensor::from_vec(
                 (0..32).map(|i| ((i * 3 % 11) as f32 - 5.0) * 0.1).collect(),
@@ -130,6 +147,10 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         output_norm: norm(4),
         output: dense(8, 4, 0.11),
         finite_diagnostics_enabled: false,
+        fused_norm_path: Default::default(),
+        decode_graphs: None,
+        decode_graphs_path: Default::default(),
+        max_context_tokens: 64,
     }
 }
 fn cache() -> PhysicalPagedKvCache {
@@ -334,18 +355,22 @@ fn cancellation_restores_checkpoint_and_verification_budget_is_bounded() {
 #[test]
 fn native_mlp_graph_closure_matches_eager_and_retains_every_intermediate() {
     fn raw(n: usize, k: usize) -> Qwen38Projection {
-        Qwen38Projection::NativeFp8(super::super::native::RawBlockFp8Projection {
-            weights: Tensor::from_vec(
-                (0..n * k).map(|i| 0x30u8 + (i % 8) as u8).collect(),
-                (n, k),
-                &Device::Cpu,
-            )
-            .unwrap(),
-            scales: Tensor::full(0.02f32, (1, 1), &Device::Cpu).unwrap(),
-            shape: [n, k],
-            scale_shape: [1, 1],
-            block_shape: [128, 128],
-        })
+        Qwen38Projection::NativeFp8 {
+            raw: super::super::native::RawBlockFp8Projection {
+                weights: Tensor::from_vec(
+                    (0..n * k).map(|i| 0x30u8 + (i % 8) as u8).collect(),
+                    (n, k),
+                    &Device::Cpu,
+                )
+                .unwrap(),
+                scales: Tensor::full(0.02f32, (1, 1), &Device::Cpu).unwrap(),
+                shape: [n, k],
+                scale_shape: [1, 1],
+                block_shape: [128, 128],
+            },
+            kernel: Qwen38Fp8Kernel::Reference,
+            prefill_gemm: false,
+        }
     }
     let mlp = Qwen38Mlp {
         graphs: Arc::new(TensorIsland::default()),

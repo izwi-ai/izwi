@@ -122,6 +122,23 @@ fn effective_physical_execution_parallelism(
     }
 }
 
+/// Automatic staged-transaction rows. A sequence stages at most one managed
+/// transaction, from batch formation until its step commits, and one engine
+/// step launches at most `candidate_dispatch_limit` physical batches of at
+/// most `tensor_width` rows (formation defers rows it cannot launch before
+/// staging them). The memory-derived row ceiling bounds retained sessions
+/// only; staged rows past the launch width are reserved state never used.
+fn automatic_staged_transaction_rows(
+    tensor_width: usize,
+    candidate_dispatch_limit: usize,
+    retained_rows: usize,
+) -> usize {
+    tensor_width
+        .max(1)
+        .saturating_mul(candidate_dispatch_limit.max(1))
+        .min(retained_rows.max(1))
+}
+
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         return (*msg).to_string();
@@ -2993,8 +3010,10 @@ impl RuntimeService {
         // resolver can degrade instead of failing startup on a zero budget.
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
-        let cache_policy =
-            config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
+        let cache_policy = config.resolved_kv_cache_policy(startup_policy_capacity_pages(
+            backend_context.backend_kind,
+            &config,
+        ))?;
         if prefix_engaged
             && matches!(
                 cache_policy.effective.prefix,
@@ -3013,6 +3032,9 @@ impl RuntimeService {
         let selected_backend_kind = backend_context.backend_kind;
         // Zero means automatic administrative capacity, not zero usable rows.
         // This is only an upper bound: each loaded model fits exact physical state.
+        // Automatic staged rows are resolved below from the launch width.
+        let automatic_retained_sequences = config.max_retained_sequences == 0;
+        let automatic_staged_transactions = config.max_staged_transactions == 0;
         let automatic_rows = if selected_backend_kind == BackendKind::Cuda {
             backend_context
                 .device
@@ -3026,7 +3048,6 @@ impl RuntimeService {
         for rows in [
             &mut config.max_scheduler_batch_size,
             &mut config.max_retained_sequences,
-            &mut config.max_staged_transactions,
         ] {
             if *rows == 0 {
                 *rows = automatic_rows;
@@ -3053,6 +3074,7 @@ impl RuntimeService {
         core_config.max_physical_in_flight = config.max_physical_in_flight;
         core_config.max_retained_sequences = config.max_retained_sequences.max(1);
         core_config.max_staged_transactions = config.max_staged_transactions.max(1);
+        core_config.automatic_row_limits.retained_sequences = automatic_retained_sequences;
         core_config.max_queued_requests = config.max_queued_requests.max(1);
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
@@ -3064,10 +3086,10 @@ impl RuntimeService {
         // the resolved namespace verbatim), but the auto marker is carried so
         // the core's own budget check degrades instead of failing startup.
         core_config.prefix_reuse_catalog_auto = config.prefix_reuse_catalog_auto;
-        core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
-            PrefixCachePolicy::Disabled => 0,
-            PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
-        };
+        core_config.max_prefix_cache_pages = engine_core_prefix_cache_pages(
+            config.max_prefix_cache_pages,
+            &cache_policy.effective.prefix,
+        );
         // After the prefix settings: CUDA sizes its page cap for a maximum-
         // length request plus the prefix budget.
         core_config.apply_backend_context_capacity(config.portable_context_ceiling());
@@ -3083,6 +3105,19 @@ impl RuntimeService {
         core_config.kv_offload_max_promotion_pages = config.kv_offload_max_promotion_pages;
 
         let mut worker_config = WorkerConfig::from(&core_config);
+        if automatic_staged_transactions {
+            let staged = automatic_staged_transaction_rows(
+                worker_config.max_tensor_batch_size,
+                core_config
+                    .resolved_physical_execution_capacity()
+                    .candidate_dispatch_limit
+                    .get(),
+                core_config.max_retained_sequences,
+            );
+            config.max_staged_transactions = staged;
+            core_config.max_staged_transactions = staged;
+            core_config.automatic_row_limits.staged_transactions = true;
+        }
         worker_config.models_dir = config.models_dir.clone();
         worker_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         worker_config.kv_page_size = config.kv_page_size.max(1);
@@ -7640,6 +7675,12 @@ izwi_inference_coordinator_reserved_host_memory_bytes {}\n\
 izwi_inference_coordinator_reserved_device_memory_bytes {}\n\
 # TYPE izwi_inference_coordinator_reserved_unified_memory_bytes gauge\n\
 izwi_inference_coordinator_reserved_unified_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_materialized_device_memory_bytes gauge\n\
+izwi_inference_coordinator_materialized_device_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_pending_device_memory_bytes gauge\n\
+izwi_inference_coordinator_pending_device_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_untracked_device_memory_bytes gauge\n\
+izwi_inference_coordinator_untracked_device_memory_bytes {}\n\
 # TYPE izwi_inference_coordinator_admitted_total counter\n\
 izwi_inference_coordinator_admitted_total {}\n\
 # TYPE izwi_inference_coordinator_rejected_total counter\n\
@@ -7657,6 +7698,9 @@ izwi_inference_coordinator_poisoned {}\n",
             snapshot.reserved_host_memory_bytes,
             snapshot.reserved_device_memory_bytes,
             snapshot.reserved_unified_memory_bytes,
+            snapshot.materialized_device_memory_bytes,
+            snapshot.pending_device_memory_bytes,
+            snapshot.untracked_device_memory_bytes,
             snapshot.admitted_total,
             snapshot.rejected_total,
             snapshot.expired_total,
@@ -7803,6 +7847,129 @@ fn requested_backend_unavailable_message(
     format!(
         "Requested backend `{requested}` is not available on this runtime (selected `{selected}`)"
     )
+}
+
+/// Page capacity the startup cache-policy check assumes. CPU and Metal keep
+/// the portable baseline (`EngineCoreConfig::default().max_blocks`). CUDA
+/// sizes its logical page cap for one maximum-length request plus the prefix
+/// budget (`EngineCoreConfig::apply_backend_context_capacity`) and fits the
+/// arena itself from device memory, so the baseline must not clamp a CUDA
+/// prefix budget: chat history reuse needs a budget as long as the
+/// conversations it serves, and retained prefix pages live inside the fitted
+/// arena, evicted when a request needs them.
+fn startup_policy_capacity_pages(backend: BackendKind, config: &EngineConfig) -> usize {
+    let portable = EngineCoreConfig::default().max_blocks;
+    if backend != BackendKind::Cuda {
+        return portable;
+    }
+    let request_pages = config
+        .portable_context_ceiling()
+        .max(1)
+        .div_ceil(config.kv_page_size.max(1));
+    portable.max(request_pages.saturating_add(config.prefix_cache_pages_or_default()))
+}
+
+/// The prefix page budget the engine core receives: zero when reuse is
+/// disabled, an operator's budget as the startup check resolved it (possibly
+/// clamped), and unset when the operator left it unset, so that each model
+/// sizes its prefix index from its own KV arena at load (`prefix_index_pages`
+/// in the managed cache) from the same default floor.
+fn engine_core_prefix_cache_pages(
+    configured: Option<usize>,
+    effective: &PrefixCachePolicy,
+) -> Option<usize> {
+    match effective {
+        PrefixCachePolicy::Disabled => Some(0),
+        PrefixCachePolicy::Namespaced { max_pages, .. } => configured.map(|_| *max_pages),
+    }
+}
+
+#[cfg(test)]
+mod startup_policy_capacity_tests {
+    use super::{engine_core_prefix_cache_pages, startup_policy_capacity_pages};
+    use crate::backends::BackendKind;
+    use crate::config::{EngineConfig, PrefixCachePolicy};
+
+    /// A 4,096-page prefix budget (one 262,144-token conversation) survives
+    /// the CUDA startup check unclamped; CPU and Metal still clamp it to the
+    /// portable baseline minus one request.
+    #[test]
+    fn cuda_startup_check_keeps_the_configured_prefix_budget() {
+        let config = EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            max_prefix_cache_pages: Some(4_096),
+            kv_page_size: 64,
+            ..EngineConfig::default()
+        };
+        let pages = |backend| match config
+            .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, &config))
+            .unwrap()
+            .effective
+            .prefix
+        {
+            PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
+            PrefixCachePolicy::Disabled => 0,
+        };
+        assert_eq!(pages(BackendKind::Cuda), 4_096);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(pages(backend), 1_024 - 4_096 / 64, "{backend:?}");
+        }
+        // The shipped default budget is unchanged everywhere.
+        let default = EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            ..EngineConfig::default()
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(
+                startup_policy_capacity_pages(backend, &default),
+                1_024,
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// The engine core receives an unset prefix budget unset (each model
+    /// sizes its own at load), an operator's budget as the startup check
+    /// resolved it, and zero when reuse is disabled. An explicit zero still
+    /// fails enabled reuse at startup, as before.
+    #[test]
+    fn engine_core_receives_an_unset_prefix_budget_unset() {
+        let config = |pages| EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            max_prefix_cache_pages: pages,
+            kv_page_size: 64,
+            ..EngineConfig::default()
+        };
+        let core_pages = |config: &EngineConfig, backend| {
+            let policy = config
+                .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, config))
+                .unwrap();
+            engine_core_prefix_cache_pages(config.max_prefix_cache_pages, &policy.effective.prefix)
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(core_pages(&config(None), backend), None, "{backend:?}");
+            let zero = config(Some(0));
+            assert!(zero
+                .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, &zero))
+                .is_err());
+        }
+        assert_eq!(
+            core_pages(&config(Some(4_096)), BackendKind::Cuda),
+            Some(4_096)
+        );
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(core_pages(&config(Some(4_096)), backend), Some(960));
+        }
+        for configured in [None, Some(0), Some(128)] {
+            assert_eq!(
+                engine_core_prefix_cache_pages(configured, &PrefixCachePolicy::Disabled),
+                Some(0)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9553,6 +9720,9 @@ mod tests {
         assert!(payload.contains("izwi_inference_coordinator_reserved_host_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_unified_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_materialized_device_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_pending_device_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_untracked_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_draining 0"));
         assert!(payload.contains("izwi_inference_coordinator_poisoned 0"));
 
@@ -9625,6 +9795,7 @@ mod tests {
             token_capacity: 160,
             bytes_per_page: 128,
             physical_bytes: 1_280,
+            prefix_capacity_pages: 0,
             coordinator: ManagedKvCoordinatorSnapshot {
                 capacity_pages: 10,
                 allocated_pages,
@@ -9641,11 +9812,19 @@ mod tests {
             device_ordinal: Some(0),
             resident_paged_bytes: 1_280,
             authorized_tensor_bytes: 0,
+            materialized_tensor_bytes: 0,
             physical_bytes: 1_280,
             registered_sessions: 1,
             single_sequence_token_capacity: 160,
             aggregate_token_capacity: 160,
             full_context_sequence_capacity: 1,
+            retained_sequence_capacity: None,
+            staged_transaction_capacity: None,
+            tensor_bytes_per_sequence: None,
+            prefix_snapshot_capacity: None,
+            prefix_snapshot_budget_bytes: 0,
+            prefix_snapshots: 0,
+            prefix_snapshot_bytes: 0,
             incremental_claim_sessions: 0,
             arenas: vec![arena(allocated_pages)],
         };
@@ -10109,6 +10288,41 @@ mod tests {
             .coordinator_job_for_request(&plain_tts)
             .expect("coordinator job");
         assert_eq!(plain_tts_spec.resources, expected_plain_tts);
+    }
+
+    #[test]
+    fn automatic_staged_rows_resolve_to_the_step_launch_width() {
+        // CUDA: width 8, one candidate, 316 memory-derived rows on an H100.
+        assert_eq!(automatic_staged_transaction_rows(8, 1, 316), 8);
+        // Shadow/concurrent candidates each hold their own launched rows.
+        assert_eq!(automatic_staged_transaction_rows(8, 4, 316), 32);
+        // Staged rows never exceed retained rows.
+        assert_eq!(automatic_staged_transaction_rows(8, 1, 4), 4);
+
+        let automatic = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_retained_sequences: 0,
+            max_staged_transactions: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(automatic.config().max_retained_sequences, 8);
+        assert_eq!(automatic.config().max_staged_transactions, 2);
+        let core = automatic.core_engine.config();
+        assert_eq!(core.max_staged_transactions, 2);
+        assert!(core.automatic_row_limits.retained_sequences);
+        assert!(core.automatic_row_limits.staged_transactions);
+
+        let explicit = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_staged_transactions: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(explicit.config().max_staged_transactions, 3);
+        let core = explicit.core_engine.config();
+        assert_eq!(core.max_staged_transactions, 3);
+        assert!(!core.automatic_row_limits.staged_transactions);
     }
 
     #[test]

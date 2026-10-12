@@ -131,6 +131,21 @@ template<class T> __device__ void mv2(const T* x,const unsigned char* w,const fl
     if(lane==0 && m<M) y[(size_t)m*N+n]=T(acc[m]*256.f);
   }
 }
+// Long-span prefill: output rows [row0, row0 + rows) of a block-FP8 matrix
+// expanded to T (value * block scale, rounded once) into a [rows, K] tile that
+// a dense GEMM (cuBLAS) then multiplies. Elementwise: each thread expands four
+// consecutive bytes of one row, which share one block scale (K % 128 == 0).
+template<class T> __device__ void dequant_rows(const unsigned char* w,const float* s,T* out,int row0,int rows,int K) {
+  const size_t i=((size_t)blockIdx.x*blockDim.x+threadIdx.x)*4;
+  if(i>=(size_t)rows*K) return;
+  const int r=(int)(i/(size_t)K), k=(int)(i%(size_t)K), row=row0+r;
+  const float scale=s[(size_t)(row>>7)*(K>>7)+(k>>7)];
+  const unsigned char* src=w+(size_t)row*K+k;
+  #pragma unroll
+  for(int j=0;j<4;++j) out[i+j]=T(e4m3(src[j])*scale);
+}
+extern "C" __global__ void qwen38_fp8_dequant_rows_f16(const unsigned char*w,const float*s,__half*out,int row0,int rows,int K){dequant_rows(w,s,out,row0,rows,K);}
+extern "C" __global__ void qwen38_fp8_dequant_rows_bf16(const unsigned char*w,const float*s,__nv_bfloat16*out,int row0,int rows,int K){dequant_rows(w,s,out,row0,rows,K);}
 #define EXPORT(T,S) \
 extern "C" __global__ void qwen38_fp8_mv_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mv(x,w,s,y,M,N,K);} \
 extern "C" __global__ void qwen38_fp8_mm_##S(const T*x,const unsigned char*w,const float*s,T*y,int M,int N,int K){mm(x,w,s,y,M,N,K);}

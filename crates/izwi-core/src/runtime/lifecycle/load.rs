@@ -196,6 +196,20 @@ struct ManagedChatCapacityPolicy {
     fit_cuda_resident_context: bool,
 }
 
+fn qwen36moe_state_geometry(
+    text: &crate::models::architectures::qwen36moe::native::Qwen36MoeTextConfig,
+) -> HybridStateGeometry {
+    HybridStateGeometry {
+        block_count: text.block_count,
+        full_attention_interval: text.full_attention_interval,
+        ssm_state_size: text.ssm_state_size,
+        ssm_group_count: text.ssm_group_count,
+        ssm_time_step_rank: text.ssm_time_step_rank,
+        ssm_inner_size: text.ssm_time_step_rank * text.ssm_value_head_dim,
+        ssm_conv_kernel: text.ssm_conv_kernel,
+    }
+}
+
 fn managed_chat_capacity_policy(
     variant: ModelVariant,
     backend: BackendKind,
@@ -208,6 +222,127 @@ fn managed_chat_capacity_policy(
             crate::catalog::ModelFamily::Qwen38Chat | crate::catalog::ModelFamily::Qwen35MoeChat
         ) && backend == BackendKind::Cuda,
     }
+}
+
+/// Gated DeltaNet geometry that sizes one sequence's recurrent state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HybridStateGeometry {
+    block_count: usize,
+    full_attention_interval: usize,
+    ssm_state_size: usize,
+    ssm_group_count: usize,
+    ssm_time_step_rank: usize,
+    ssm_inner_size: usize,
+    ssm_conv_kernel: usize,
+}
+
+/// F32 recurrent and convolution state of one sequence, summed over the
+/// linear-attention layers: the bytes the hybrid chat contracts (Qwen3.8,
+/// Qwen3.5/3.6-MoE) authorize per retained or staged row.
+fn hybrid_recurrent_state_bytes_per_sequence(geometry: HybridStateGeometry) -> Result<u64> {
+    let HybridStateGeometry {
+        block_count,
+        full_attention_interval,
+        ssm_state_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_inner_size,
+        ssm_conv_kernel,
+    } = geometry;
+    if full_attention_interval == 0
+        || ssm_conv_kernel == 0
+        || ssm_time_step_rank == 0
+        || !ssm_inner_size.is_multiple_of(ssm_time_step_rank)
+    {
+        return Err(Error::ModelLoadError(
+            "hybrid recurrent state geometry is invalid".into(),
+        ));
+    }
+    let linear_layers = block_count - block_count / full_attention_interval;
+    let recurrent = ssm_time_step_rank
+        .checked_mul(ssm_state_size)
+        .and_then(|elements| elements.checked_mul(ssm_inner_size / ssm_time_step_rank));
+    let convolution = ssm_state_size
+        .checked_mul(ssm_group_count)
+        .and_then(|keys| keys.checked_mul(2))
+        .and_then(|width| width.checked_add(ssm_inner_size))
+        .and_then(|width| width.checked_mul(ssm_conv_kernel - 1));
+    recurrent
+        .and_then(|recurrent| recurrent.checked_add(convolution?))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .and_then(|bytes| bytes.checked_mul(linear_layers))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| Error::ModelLoadError("hybrid recurrent state size overflow".into()))
+}
+
+/// Recurrent state the CUDA resident fit must hold right after the weights:
+/// its fewest rows (the staged width when retained rows are automatic, the
+/// operator's rows otherwise) plus the committed prefix snapshots reserved
+/// beside them, each priced at the model's per-row bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaStateFloor {
+    retained_rows: usize,
+    staged_rows: usize,
+    /// Prefix snapshot budget when reuse engages for the model (an upper
+    /// bound: a contract that keeps its state private reserves none).
+    snapshot_rows: usize,
+    per_sequence_bytes: u64,
+    automatic_rows: bool,
+}
+
+impl CudaStateFloor {
+    fn bytes(self) -> Result<u64> {
+        self.retained_rows
+            .checked_add(self.staged_rows)
+            .and_then(|rows| rows.checked_add(self.snapshot_rows))
+            .and_then(|rows| u64::try_from(rows).ok())
+            .and_then(|rows| rows.checked_mul(self.per_sequence_bytes))
+            .ok_or_else(|| Error::ModelLoadError("CUDA recurrent state floor overflow".into()))
+    }
+}
+
+/// Price the recurrent state floor before any weight streams. A plan whose
+/// weights, floor state and safety reserve exceed the device can never pass
+/// the resident fit, so it fails here with the fit's guidance. Otherwise the
+/// load authorization also covers the floor, so a resident model in the way
+/// is evicted, or the load refused, before the weights are read.
+fn admit_cuda_state_floor(
+    variant: ModelVariant,
+    plan: &ModelResourcePlan,
+    floor: CudaStateFloor,
+    safety_reserve_bytes: u64,
+    device_capacity: ResourceAmount,
+) -> Result<ResourceVector> {
+    let (ResourceAmount::Known(weights_bytes), ResourceAmount::Known(load_peak_bytes)) = (
+        plan.resident_authorization.device_bytes,
+        plan.load_authorization.device_bytes,
+    ) else {
+        return Err(Error::ModelLoadError(format!(
+            "{variant} CUDA weight plan must be known before state admission"
+        )));
+    };
+    let minimum_state_bytes = floor.bytes()?;
+    let required_bytes = weights_bytes
+        .checked_add(minimum_state_bytes)
+        .and_then(|bytes| bytes.checked_add(safety_reserve_bytes))
+        .ok_or_else(|| Error::ModelLoadError("CUDA state floor overflow".into()))?;
+    if let ResourceAmount::Known(device_bytes) = device_capacity {
+        if required_bytes > device_bytes {
+            let guidance = if floor.automatic_rows {
+                crate::engine::CUDA_AUTOMATIC_ROWS_GUIDANCE
+            } else {
+                crate::engine::CUDA_EXPLICIT_ROWS_GUIDANCE
+            };
+            return Err(Error::ModelLoadError(format!(
+                "CUDA managed context cannot fit the model-authored minimum before loading {variant}: retained_sequences={}, staged_transactions={}, prefix_snapshots={}, per_sequence_state_bytes={}, minimum_state_bytes={minimum_state_bytes}, weights_bytes={weights_bytes}, safety_reserve={safety_reserve_bytes}, device_capacity={device_bytes}; {guidance}",
+                floor.retained_rows, floor.staged_rows, floor.snapshot_rows, floor.per_sequence_bytes,
+            )));
+        }
+    }
+    Ok(ResourceVector {
+        device_bytes: ResourceAmount::Known(load_peak_bytes.max(required_bytes)),
+        ..plan.load_authorization
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,58 +364,21 @@ struct ModelMemoryEstimate {
     resident_bytes: u64,
 }
 
-const QWEN38_FP8_ELEMENTS: u64 = 24_699_207_680;
-const QWEN38_BF16_ELEMENTS: u64 = 3_082_220_272;
 const QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 const QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-const QWEN38_Q8_0_BLOCK_ELEMENTS: u64 = 32;
-const QWEN38_Q8_0_BLOCK_BYTES: u64 = 34;
 
-fn qwen38_representation_memory_estimate(backend: BackendKind) -> ModelMemoryEstimate {
-    let resident_bytes = match backend {
-        BackendKind::Cpu => QWEN38_FP8_ELEMENTS
-            .checked_add(QWEN38_BF16_ELEMENTS)
-            .and_then(|elements| elements.checked_mul(4))
-            .expect("Qwen3.8 F32 residency is a compile-time bounded value"),
-        BackendKind::Metal => QWEN38_FP8_ELEMENTS
-            .checked_add(QWEN38_BF16_ELEMENTS)
-            .and_then(|elements| elements.checked_mul(2))
-            .expect("Qwen3.8 F16 residency is a compile-time bounded value"),
-        BackendKind::Cuda => {
-            // Every source FP8 matrix uses 128x128 blocks, so its element count
-            // is independently divisible by Q8_0's 32-element block width.
-            // Keep ceil division here so a future inventory remains
-            // conservative if that checkpoint invariant changes.
-            let q8_blocks = QWEN38_FP8_ELEMENTS
-                .checked_add(QWEN38_Q8_0_BLOCK_ELEMENTS - 1)
-                .expect("Qwen3.8 Q8_0 block rounding is a compile-time bounded value")
-                / QWEN38_Q8_0_BLOCK_ELEMENTS;
-            let q8_bytes = q8_blocks
-                .checked_mul(QWEN38_Q8_0_BLOCK_BYTES)
-                .expect("Qwen3.8 Q8_0 residency is a compile-time bounded value");
-            let bf16_bytes = QWEN38_BF16_ELEMENTS
-                .checked_mul(2)
-                .expect("Qwen3.8 BF16 residency is a compile-time bounded value");
-            q8_bytes
-                .checked_add(bf16_bytes)
-                .expect("Qwen3.8 CUDA residency is a compile-time bounded value")
-        }
-    };
-    let load_peak_bytes = match backend {
-        BackendKind::Cpu | BackendKind::Metal => resident_bytes
-            .checked_add(QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES)
-            .expect("Qwen3.8 expanded load peak is a compile-time bounded value"),
-        // Host-side F32 decode/conversion has a separate authorization. Device
-        // load admission adds only the bounded QTensor quantize/upload overlap.
-        BackendKind::Cuda => resident_bytes
-            .checked_add(QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES)
-            .expect("Qwen3.8 CUDA load peak is a compile-time bounded value"),
-    };
-    ModelMemoryEstimate {
-        load_peak_bytes,
-        resident_bytes,
-    }
+/// Static estimate of the pinned Qwen3.8-27B checkpoint on `backend`, priced
+/// by the Qwen3.8 residency policy over the checkpoint's tensor list (the
+/// same pricing load admission applies to a real checkpoint). The CUDA arm
+/// is not the CUDA admission path: without the device it cannot run the
+/// native block-FP8 gates, so it prices Q8_0 (an upper bound).
+fn qwen38_representation_memory_estimate(
+    backend: BackendKind,
+    performance: &crate::performance::PerformanceConfig,
+) -> ModelMemoryEstimate {
+    qwen38_memory::static_estimate(backend, performance)
+        .expect("the pinned Qwen3.8 inventory prices without overflow")
 }
 
 fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
@@ -320,6 +418,43 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
             .resident_bytes
             .checked_add(memo_bytes)
             .expect("catalog model residency estimate overflowed"),
+    }
+}
+
+/// Static load peak that decides whether a Metal OOM retry can fit. The
+/// catalog's `memory_required_gb` is one coarse figure for every backend (80
+/// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
+/// these checkpoints use the per-backend representation estimate that load
+/// admission prices instead.
+fn retry_load_peak_bytes(
+    variant: ModelVariant,
+    backend: BackendKind,
+    performance: &crate::performance::PerformanceConfig,
+) -> u64 {
+    let catalog = || model_memory_estimate(variant).load_peak_bytes;
+    match variant {
+        ModelVariant::Qwen3827BFp8
+            if !crate::models::architectures::qwen38::native::synthetic_geometry_enabled() =>
+        {
+            qwen38_representation_memory_estimate(backend, performance).load_peak_bytes
+        }
+        ModelVariant::Qwen36Moe35BA3BFp8
+            if !crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() =>
+        {
+            let peak = qwen36moe_memory::resource_plan(backend, performance).map(|plan| {
+                let peak = plan.load_authorization;
+                match backend {
+                    BackendKind::Cpu => peak.host_bytes,
+                    BackendKind::Metal => peak.unified_bytes,
+                    BackendKind::Cuda => peak.device_bytes,
+                }
+            });
+            match peak {
+                Ok(ResourceAmount::Known(bytes)) => bytes,
+                _ => catalog(),
+            }
+        }
+        _ => catalog(),
     }
 }
 
@@ -484,7 +619,10 @@ fn portable_model_memory_estimate(
     model_path: &Path,
 ) -> Result<ModelMemoryEstimate> {
     if variant == ModelVariant::Qwen3827BFp8 {
-        return Ok(qwen38_representation_memory_estimate(backend));
+        return Ok(qwen38_representation_memory_estimate(
+            backend,
+            &crate::performance::PerformanceConfig::default(),
+        ));
     }
     let catalog = model_memory_estimate(variant);
     estimate_from_tensor_inventory(catalog, checkpoint_tensor_inventory(model_path)?)
@@ -528,19 +666,6 @@ fn model_resource_plan(backend: BackendKind, estimate: ModelMemoryEstimate) -> M
         resident_authorization,
         deferred_resident_authorization: ResourceVector::zero(),
     }
-}
-
-fn qwen38_resource_plan(backend: BackendKind) -> ModelResourcePlan {
-    let estimate = qwen38_representation_memory_estimate(backend);
-    let mut plan = model_resource_plan(backend, estimate);
-    if backend == BackendKind::Cuda {
-        // CUDA retains Q8_0 projections plus the checkpoint's BF16 tensors.
-        // Host memory only holds the callback-scoped shard/dequantization and
-        // requantization window, not a second full resident representation.
-        plan.load_authorization.host_bytes =
-            ResourceAmount::Known(QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES);
-    }
-    plan
 }
 
 /// Fixture-mode qwen38 estimate (synthetic geometry opt-in): derived from the
@@ -1275,20 +1400,21 @@ impl ModelLifecycleController {
     ) -> Result<ModelResourcePlan> {
         let backend = self.backend_router.context().backend_kind;
         if variant == ModelVariant::Qwen3827BFp8 {
-            if backend == BackendKind::Cuda {
-                return qwen38_memory::resource_plan(
-                    model_path,
-                    &self.backend_router.context().device.device,
-                    &self.config.performance,
-                );
-            }
-            if crate::models::architectures::qwen38::native::synthetic_geometry_enabled() {
+            if backend != BackendKind::Cuda
+                && crate::models::architectures::qwen38::native::synthetic_geometry_enabled()
+            {
                 // Fixture load (benchmark/CI): price the actual checkpoint
                 // instead of the pinned 27B constants.
                 let estimate = qwen38_synthetic_fixture_estimate(model_path)?;
                 return Ok(model_resource_plan(backend, estimate));
             }
-            return Ok(qwen38_resource_plan(backend));
+            // Every backend prices the checkpoint under the residency policy
+            // the loader resolves (CUDA runs its cached device gates here).
+            return qwen38_memory::resource_plan(
+                model_path,
+                &self.backend_router.context().device.device,
+                &self.config.performance,
+            );
         }
         if variant == ModelVariant::Qwen36Moe35BA3BFp8 {
             if crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() {
@@ -1312,6 +1438,65 @@ impl ModelLifecycleController {
             portable_model_memory_estimate(backend, variant, model_path)?
         };
         Ok(model_resource_plan(backend, estimate))
+    }
+
+    /// The recurrent state floor of a model whose CUDA context is fitted
+    /// against resident headroom; `None` for every other load.
+    fn cuda_state_floor(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+    ) -> Result<Option<CudaStateFloor>> {
+        let policy =
+            managed_chat_capacity_policy(variant, self.backend_router.context().backend_kind);
+        if !policy.fit_cuda_resident_context {
+            return Ok(None);
+        }
+        let per_sequence_bytes = match variant {
+            ModelVariant::Qwen3827BFp8 => qwen38_memory::per_sequence_state_bytes(model_path)?,
+            ModelVariant::Qwen36Moe35BA3BFp8 => {
+                use crate::models::architectures::qwen36moe::native as qwen36moe;
+                if qwen36moe::synthetic_geometry_enabled() {
+                    // Fixture loads do not have the pinned 35B geometry.
+                    return Ok(None);
+                }
+                hybrid_recurrent_state_bytes_per_sequence(qwen36moe_state_geometry(
+                    &qwen36moe::pinned_native_config().text,
+                ))?
+            }
+            _ => return Ok(None),
+        };
+        let engine = self.core_engine.config();
+        let staged_rows = match policy.staged_transaction_rows {
+            Some(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
+            None => engine.max_staged_transactions,
+        };
+        let automatic_rows = engine.automatic_row_limits.retained_sequences;
+        let retained_rows = if automatic_rows {
+            staged_rows.min(engine.max_retained_sequences)
+        } else {
+            engine.max_retained_sequences
+        };
+        // The fit reserves the prefix snapshot budget beside the rows when
+        // the model shares hybrid prefixes (see `prefix_snapshot_rows_for`).
+        let snapshot_rows = if engine.enable_prefix_caching
+            && engine.prefix_cache_pages_or_default() > 0
+            && crate::catalog::prefix_reuse_engages(
+                variant,
+                BackendKind::Cuda,
+                self.model_registry.prefix_reuse_mode(),
+            ) {
+            usize::try_from(engine.max_prefix_snapshots).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        Ok(Some(CudaStateFloor {
+            retained_rows,
+            staged_rows: staged_rows.min(retained_rows),
+            snapshot_rows,
+            per_sequence_bytes,
+            automatic_rows,
+        }))
     }
 
     async fn ensure_portable_memory_before_load(
@@ -1500,7 +1685,7 @@ impl ModelLifecycleController {
         // OOM and would burn another GGUF read + F16 materialization + fence
         // (tens of seconds) before poisoning. Skip straight to the poison.
         let backend = self.backend_router.context().backend_kind;
-        let required_bytes = model_memory_estimate(variant).load_peak_bytes;
+        let required_bytes = retry_load_peak_bytes(variant, backend, &self.config.performance);
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
@@ -1567,9 +1752,32 @@ impl ModelLifecycleController {
         let artifacts_ms = load_started.elapsed().as_secs_f64() * 1000.0;
         let admission_started = Instant::now();
 
+        // Price the plan, and refuse one that can never fit, before evicting
+        // anything for it.
+        let mut resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
+        if let Some(floor) = self.cuda_state_floor(variant, &acquired.model_path)? {
+            let device_capacity = self
+                .coordinator
+                .resource_authority()
+                .snapshot()
+                .physical
+                .capacity
+                .device_bytes;
+            // The same reserve the context fit keeps after the weights load.
+            let safety_reserve_bytes = self
+                .core_engine
+                .config()
+                .cuda_context_reserve_bytes(device_capacity);
+            resource_plan.load_authorization = admit_cuda_state_floor(
+                variant,
+                &resource_plan,
+                floor,
+                safety_reserve_bytes,
+                device_capacity,
+            )?;
+        }
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
-        let resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
         let portable_load_bytes = match self.backend_router.context().backend_kind {
             BackendKind::Cpu => resource_plan.load_authorization.host_bytes,
             BackendKind::Metal => resource_plan.load_authorization.unified_bytes,
@@ -2708,8 +2916,16 @@ impl ModelLifecycleController {
                     Ok("0" | "false") | Err(_) => false,
                     Ok(value) => return Err(Error::ConfigError(format!("invalid IZWI_FISH_NATIVE_BATCHING={value}; expected true or false"))),
                 };
+                // Automatic staged rows are sized for tensor-width launches. Fish
+                // fits its own autoregressive width (no tensor arena backs its
+                // transactions), so it reads an automatic limit as automatic.
+                let fish_limits = if self.core_engine.config().automatic_row_limits.staged_transactions {
+                    std::borrow::Cow::Owned(crate::config::EngineConfig { max_staged_transactions: 0, ..self.config.clone() })
+                } else {
+                    std::borrow::Cow::Borrowed(&self.config)
+                };
                 let capacity = crate::runtime::fish_capacity::ResolvedFishServingCapacity::resolve(
-                    model.config(), &self.config, headroom, native_batching,
+                    model.config(), &fish_limits, headroom, native_batching,
                 )?;
                 tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
                 bundle_draft.seal_fish_capacity(capacity.clone())?;
@@ -2977,13 +3193,11 @@ mod tests {
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
         model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
         portable_invocation_context_intent,
-        qwen38_representation_memory_estimate, qwen38_resource_plan, residency_budget_has_capacity,
+        qwen38_representation_memory_estimate, residency_budget_has_capacity,
         select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
-        QWEN38_BF16_ELEMENTS, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
-        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_FP8_ELEMENTS,
-        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES, QWEN38_Q8_0_BLOCK_BYTES,
-        QWEN38_Q8_0_BLOCK_ELEMENTS,
+        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
+        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -3257,24 +3471,111 @@ mod tests {
         assert_eq!(estimate.load_peak_bytes, 9_562_500);
     }
 
+    /// Element census of the pinned Qwen3.8-27B checkpoint by resident class,
+    /// computed independently of the residency policy's tensor list.
+    mod qwen38_27b {
+        /// Block-FP8 projections: 48 DeltaNet layers x 382,730,240, 16
+        /// attention layers x 372,244,480, and the MTP layer's 372,244,480.
+        pub const TRUNK_FP8: u64 = 48 * 382_730_240 + 16 * 372_244_480;
+        pub const MTP_FP8: u64 = 372_244_480;
+        /// Embedding and LM head (248,320 x 5,120 each).
+        pub const EMBEDDING: u64 = 1_271_398_400;
+        pub const LM_HEAD: u64 = 1_271_398_400;
+        /// DeltaNet a/b projections, kept in the activation dtype.
+        pub const TRUNK_DENSE: u64 = 48 * 2 * 48 * 5_120;
+        /// Norm gains (F32 since C2) and DeltaNet math/conv (F32).
+        pub const TRUNK_F32: u64 =
+            5_120 + 64 * 2 * 5_120 + 16 * 2 * 256 + 48 * (128 + 48 + 48 + 10_240 * 4);
+        pub const MTP_DENSE: u64 = 5_120 * 10_240;
+        pub const MTP_F32: u64 = 5 * 5_120 + 2 * 256;
+        /// F32 block scales of raw block FP8 (one per 128x128 block).
+        pub const TRUNK_SCALES: u64 = 48 * 23_360 + 16 * 22_720;
+        pub const MTP_SCALES: u64 = 22_720;
+        /// The source checkpoint's BF16 elements also include a 460,730,096
+        /// element vision tower the text runtime never loads.
+        pub const VISION: u64 = 460_730_096;
+    }
+
+    fn qwen38_resource_plan(backend: BackendKind) -> super::ModelResourcePlan {
+        super::qwen38_memory::static_resource_plan(
+            backend,
+            &crate::performance::PerformanceConfig::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn qwen38_resource_plan_prices_backend_resident_representations() {
-        let cpu = qwen38_representation_memory_estimate(BackendKind::Cpu);
-        let metal = qwen38_representation_memory_estimate(BackendKind::Metal);
-        let cuda = qwen38_representation_memory_estimate(BackendKind::Cuda);
-        let elements = QWEN38_FP8_ELEMENTS + QWEN38_BF16_ELEMENTS;
-        let q8_0_bytes =
-            QWEN38_FP8_ELEMENTS.div_ceil(QWEN38_Q8_0_BLOCK_ELEMENTS) * QWEN38_Q8_0_BLOCK_BYTES;
+        use qwen38_27b::*;
+        let default = crate::performance::PerformanceConfig::default();
+        let estimate = |backend| qwen38_representation_memory_estimate(backend, &default);
+        let (cpu, metal, cuda) = (
+            estimate(BackendKind::Cpu),
+            estimate(BackendKind::Metal),
+            estimate(BackendKind::Cuda),
+        );
+        let fp8 = TRUNK_FP8 + MTP_FP8;
+        assert_eq!(fp8, 24_699_207_680);
+        let dense = EMBEDDING + LM_HEAD + TRUNK_DENSE + MTP_DENSE;
+        let f32_bytes = (TRUNK_F32 + MTP_F32) * 4;
+        // The old static figure priced every BF16 source element (vision
+        // included) at two bytes, and the F32 gains at two as well.
+        assert_eq!(
+            dense + TRUNK_F32 + MTP_F32 + VISION,
+            3_082_220_272,
+            "census accounts for every BF16 checkpoint element"
+        );
 
-        assert_eq!(cpu.resident_bytes, elements * 4);
-        assert_eq!(metal.resident_bytes, elements * 2);
-        assert_eq!(cuda.resident_bytes, q8_0_bytes + QWEN38_BF16_ELEMENTS * 2);
-        assert_eq!(cuda.resident_bytes, 32_407_348_704);
+        // The CPU keeps projections and the LM head as Q8_0 (34 bytes per 32
+        // elements) and the rest F32; `expanded` expands everything to F32.
+        assert_eq!(
+            cpu.resident_bytes,
+            (fp8 + LM_HEAD) / 32 * 34 + (dense - LM_HEAD) * 4 + f32_bytes
+        );
+        assert_eq!(cpu.resident_bytes, 32_994_136_064);
+        let mut cpu_expanded = crate::performance::PerformanceConfig::default();
+        cpu_expanded.cpu.projection_backend = crate::performance::CpuProjectionBackend::Expanded;
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Cpu, &cpu_expanded).resident_bytes,
+            109_282_791_424
+        );
+        assert_eq!((fp8 + dense) * 4 + f32_bytes, 109_282_791_424);
+        // Metal keeps raw block FP8 (bytes + F32 block scales) with F16 dense
+        // tensors and the 1 GiB F16 prefill scratch; a build without the
+        // Metal kernels expands to F16.
+        let scratch =
+            crate::models::architectures::qwen38::residency::METAL_FP8_PREFILL_DEQUANT_BYTES;
+        let metal_native = fp8 + (TRUNK_SCALES + MTP_SCALES) * 4 + dense * 2 + f32_bytes + scratch;
+        let metal_expanded = (fp8 + dense) * 2 + f32_bytes;
+        if cfg!(feature = "metal") {
+            assert_eq!(metal.resident_bytes, metal_native);
+            assert_eq!(metal.resident_bytes, 31_027_303_168);
+            // Fits a 48 GB Mac's 32.4 GiB budget (with a little context);
+            // a 32 GB Mac's 21.6 GiB budget refuses it.
+            const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+            assert!((metal.load_peak_bytes as f64) < 32.4 * GIB);
+            assert!((metal.load_peak_bytes as f64) > 21.6 * GIB);
+            let plan = qwen38_resource_plan(BackendKind::Metal);
+            assert_eq!(
+                plan.deferred_resident_authorization.unified_bytes,
+                ResourceAmount::Known(scratch)
+            );
+        } else {
+            assert_eq!(metal.resident_bytes, metal_expanded);
+        }
+        assert_eq!(metal_expanded, 54_646_738_944);
+        // CUDA's static arm prices Q8_0 (34 bytes per 32 elements), plus the
+        // F32 rows the DeltaNet alpha/beta router GEMV keeps beside the
+        // dense pair.
+        assert_eq!(
+            cuda.resident_bytes,
+            fp8 / 32 * 34 + dense * 2 + f32_bytes + TRUNK_DENSE * 4
+        );
+        assert_eq!(cuda.resident_bytes, 31_585_603_584);
         assert_eq!(
             cuda.load_peak_bytes,
             cuda.resident_bytes + QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES
         );
-        assert_eq!(cuda.load_peak_bytes, 32_675_784_160);
         assert_eq!(
             cpu.load_peak_bytes - cpu.resident_bytes,
             QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES
@@ -3295,6 +3596,39 @@ mod tests {
         assert_eq!(
             cuda_plan.resident_authorization.device_bytes,
             ResourceAmount::Known(cuda.resident_bytes)
+        );
+
+        // Admission follows the loader's MTP rule: without the head its
+        // projections, fc and norms are not charged.
+        let mut no_mtp = crate::performance::PerformanceConfig::default();
+        no_mtp.cuda.mtp = crate::performance::OptimizationMode::Off;
+        let mtp_metal = if cfg!(feature = "metal") {
+            MTP_FP8 + MTP_SCALES * 4 + MTP_DENSE * 2 + MTP_F32 * 4
+        } else {
+            (MTP_FP8 + MTP_DENSE) * 2 + MTP_F32 * 4
+        };
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Metal, &no_mtp).resident_bytes,
+            metal.resident_bytes - mtp_metal
+        );
+        // `metal.projection_backend = "expanded"` prices the F16 expansion.
+        let mut expanded = crate::performance::PerformanceConfig::default();
+        expanded.metal.projection_backend = crate::performance::MetalProjectionBackend::Expanded;
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Metal, &expanded).resident_bytes,
+            metal_expanded
+        );
+        // Off CUDA the CUDA master switch does not govern MTP; on CUDA it does.
+        let mut cuda_off = crate::performance::PerformanceConfig::default();
+        cuda_off.cuda.mode = crate::performance::OptimizationMode::Off;
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Metal, &cuda_off),
+            metal
+        );
+        // The master switch also turns the alpha/beta GEMV (and its rows) off.
+        assert_eq!(
+            qwen38_representation_memory_estimate(BackendKind::Cuda, &cuda_off).resident_bytes,
+            cuda.resident_bytes - MTP_FP8 / 32 * 34 - MTP_DENSE * 2 - MTP_F32 * 4 - TRUNK_DENSE * 4
         );
     }
 
@@ -3330,6 +3664,140 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_config_state_bytes_match_its_contract() {
+        use super::{hybrid_recurrent_state_bytes_per_sequence, qwen36moe_state_geometry};
+        use crate::models::architectures::qwen36moe::{
+            cache::qwen35_composite_cache_contract_with_mtp, native::pinned_native_config,
+            native_model::qwen35_text_config_from_native,
+        };
+        let native = pinned_native_config();
+        let from_config =
+            hybrid_recurrent_state_bytes_per_sequence(qwen36moe_state_geometry(&native.text))
+                .unwrap();
+        // The bytes the managed planner authorizes per row for the real
+        // contract builder, so the pre-load formula cannot drift from it.
+        let contract = qwen35_composite_cache_contract_with_mtp(
+            &qwen35_text_config_from_native(&native.text),
+            candle_core::DType::BF16,
+            64,
+            false,
+            false,
+        )
+        .unwrap();
+        let plan = crate::backends::state::negotiate_state_plan(
+            &contract,
+            &crate::backends::state::StateBackendPlanRequest {
+                backend: BackendKind::Cpu,
+                device_ordinal: None,
+                page_tokens_hint: Some(64),
+                storage_dtype_hint: None,
+            },
+        )
+        .unwrap();
+        let (_, tensor) = crate::engine::plan_managed_state_capacity(
+            &plan,
+            ModelInstanceId::new(36),
+            crate::engine::ManagedStateCapacityRequest {
+                total_paged_pages: 64,
+                logical_token_reach: None,
+                retained_sequence_rows: 1,
+                staged_transaction_rows: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_config, tensor.unwrap().per_sequence_bytes());
+        assert_eq!(from_config, 65_863_680);
+    }
+
+    #[test]
+    fn cuda_state_floor_refuses_an_unfittable_plan_before_weights() {
+        use super::{admit_cuda_state_floor, CudaStateFloor};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const H100_BYTES: u64 = 85_017_624_576;
+        const QWEN38_ROW_BYTES: u64 = 156_893_184;
+        let plan = qwen38_resource_plan(BackendKind::Cuda);
+        let ResourceAmount::Known(weights) = plan.resident_authorization.device_bytes else {
+            panic!("Qwen3.8 CUDA residency must be known");
+        };
+        let floor = |rows, automatic_rows| CudaStateFloor {
+            retained_rows: rows,
+            staged_rows: rows.min(8),
+            snapshot_rows: 0,
+            per_sequence_bytes: QWEN38_ROW_BYTES,
+            automatic_rows,
+        };
+        let admit = |floor, capacity| {
+            admit_cuda_state_floor(
+                ModelVariant::Qwen3827BFp8,
+                &plan,
+                floor,
+                GIB,
+                ResourceAmount::Known(capacity),
+            )
+        };
+
+        // The decode-width floor fits an H100 and joins the load authorization.
+        let authorization = admit(floor(8, true), H100_BYTES).unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 16 * QWEN38_ROW_BYTES + GIB)
+        );
+        assert_eq!(authorization.host_bytes, plan.load_authorization.host_bytes);
+
+        // The pre-fix automatic rows, now explicit, can never fit.
+        let legacy = CudaStateFloor {
+            retained_rows: 316,
+            staged_rows: 316,
+            snapshot_rows: 0,
+            per_sequence_bytes: QWEN38_ROW_BYTES,
+            automatic_rows: false,
+        };
+        let message = admit(legacy, H100_BYTES).unwrap_err().to_string();
+        assert!(message.contains("before loading Qwen3.8"), "{message}");
+        assert!(
+            message.contains("minimum_state_bytes=99156492288"),
+            "{message}"
+        );
+        assert!(message.contains("IZWI_MAX_RETAINED_SEQUENCES"), "{message}");
+
+        // Automatic rows on a GPU smaller than the weights name the staged knob.
+        let message = admit(floor(8, true), 24 * GIB).unwrap_err().to_string();
+        assert!(
+            message.contains("IZWI_MAX_STAGED_TRANSACTIONS"),
+            "{message}"
+        );
+        assert!(
+            message.contains("per_sequence_state_bytes=156893184"),
+            "{message}"
+        );
+
+        // Unknown capacity defers to live admission, still pricing the floor.
+        let authorization = admit_cuda_state_floor(
+            ModelVariant::Qwen3827BFp8,
+            &plan,
+            floor(8, true),
+            GIB,
+            ResourceAmount::Unknown,
+        )
+        .unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 16 * QWEN38_ROW_BYTES + GIB)
+        );
+
+        // With prefix reuse engaged, the floor also holds the snapshot budget.
+        let shared = CudaStateFloor {
+            snapshot_rows: 8,
+            ..floor(8, true)
+        };
+        let authorization = admit(shared, H100_BYTES).unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 24 * QWEN38_ROW_BYTES + GIB)
+        );
+    }
+
+    #[test]
     fn qwen38_cuda_q8_0_plan_fits_reported_l40s_available_bytes() {
         const REPORTED_L40S_AVAILABLE_BYTES: u64 = 47_196_667_904;
 
@@ -3338,13 +3806,15 @@ mod tests {
         else {
             panic!("Qwen3.8 CUDA device load peak must be known")
         };
-        let old_expanded_load_peak_bytes = (QWEN38_FP8_ELEMENTS + QWEN38_BF16_ELEMENTS) * 2
-            + QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES;
+        // Every FP8 and BF16 source element at two bytes, plus the portable
+        // conversion scratch: the old fully expanded CUDA plan.
+        let old_expanded_load_peak_bytes =
+            (24_699_207_680 + 3_082_220_272) * 2 + QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES;
         assert_eq!(
             plan.load_authorization.host_bytes,
             ResourceAmount::Known(8_589_934_592)
         );
-        assert_eq!(device_load_peak_bytes, 32_675_784_160);
+        assert_eq!(device_load_peak_bytes, 31_854_039_040);
         assert_eq!(old_expanded_load_peak_bytes, 56_636_597_728);
         assert!(device_load_peak_bytes < REPORTED_L40S_AVAILABLE_BYTES);
         assert!(old_expanded_load_peak_bytes > REPORTED_L40S_AVAILABLE_BYTES);
@@ -3388,6 +3858,33 @@ mod tests {
             )
             .expect_err("CUDA load must reserve the complete 8 GiB host conversion window");
         assert!(matches!(error, Error::Overloaded(_)));
+    }
+
+    #[test]
+    fn metal_oom_retry_judges_hybrid_checkpoints_by_their_backend_load_peak() {
+        use super::retry_load_peak_bytes;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let _env_guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let performance = crate::performance::PerformanceConfig::default();
+        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance);
+
+        // Qwen3.8 on Metal (raw block FP8, about 29.9 GiB at load; 51.9 GiB
+        // expanded to F16) sits far below the 80 GiB catalog figure that used
+        // to veto every retry on a 96 GB Mac.
+        let qwen38_metal = peak(ModelVariant::Qwen3827BFp8, BackendKind::Metal);
+        assert_eq!(
+            qwen38_metal,
+            qwen38_representation_memory_estimate(BackendKind::Metal, &performance).load_peak_bytes
+        );
+        assert!(qwen38_metal < 54 * GIB);
+        assert!(peak(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Metal) < 140 * GIB);
+        // Variants without a representation plan keep the catalog estimate.
+        assert_eq!(
+            peak(ModelVariant::Kokoro82M, BackendKind::Metal),
+            model_memory_estimate(ModelVariant::Kokoro82M).load_peak_bytes
+        );
     }
 
     #[test]

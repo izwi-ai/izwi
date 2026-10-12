@@ -9,10 +9,12 @@
 //! - Fallback to Candle operations for unsupported backends and kernels
 
 pub mod buffer_pool;
+pub mod cpu_q8;
 pub mod cuda;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
+pub mod metal_fp8;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
 

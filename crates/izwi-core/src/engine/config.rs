@@ -7,8 +7,9 @@ use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 use crate::config::{
     resolve_kv_cache_policy, BatchSizePreference, PhysicalExecutionCapacity, PhysicalExecutionMode,
-    PhysicalInFlightLimit, ResolvedKvCachePolicy,
+    PhysicalInFlightLimit, ResolvedKvCachePolicy, DEFAULT_MAX_PREFIX_CACHE_PAGES,
 };
+use crate::engine::ResourceAmount;
 use crate::model::ModelVariant;
 use crate::Result;
 
@@ -58,6 +59,16 @@ pub(crate) fn tts_explicit_output_limit(
     variant.tts_max_output_frames_hint().unwrap_or(configured)
 }
 
+/// Managed-state row limits resolved by the runtime instead of the operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AutomaticRowLimits {
+    /// `max_retained_sequences` was zero and resolved to the administrative
+    /// ceiling. CUDA resident fitting may then retain fewer rows.
+    pub(crate) retained_sequences: bool,
+    /// `max_staged_transactions` was zero and resolved to the step launch width.
+    pub(crate) staged_transactions: bool,
+}
+
 /// Configuration for the engine core.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreConfig {
@@ -93,6 +104,12 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_max_staged_transactions")]
     pub max_staged_transactions: usize,
 
+    /// Row limits the operator left automatic. An automatic limit is a
+    /// runtime-sized default rather than an operator contract, so a model
+    /// that fits its own rows may differ from it.
+    #[serde(skip)]
+    pub(crate) automatic_row_limits: AutomaticRowLimits,
+
     /// Maximum admitted jobs in the runtime inference queue.
     #[serde(default = "default_max_queued_requests")]
     pub max_queued_requests: usize,
@@ -111,6 +128,12 @@ pub struct EngineCoreConfig {
     /// command-buffer overhead.
     #[serde(default = "default_portable_context_reserve_bytes")]
     pub(crate) portable_context_reserve_bytes: u64,
+
+    /// Operator override for the CUDA context safety reserve (see
+    /// [`Self::cuda_context_reserve_bytes`]), from
+    /// IZWI_CUDA_CONTEXT_RESERVE_BYTES: a positive byte count.
+    #[serde(default = "default_cuda_context_reserve_override_bytes")]
+    pub(crate) cuda_context_reserve_override_bytes: Option<u64>,
 
     /// Maximum number of tokens per step (token budget)
     #[serde(default = "default_max_tokens_per_step")]
@@ -142,9 +165,19 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
 
-    /// Hard upper bound for retained committed-prefix pages.
-    #[serde(default = "default_max_prefix_cache_pages")]
-    pub max_prefix_cache_pages: usize,
+    /// Hard upper bound for retained committed-prefix pages. `None` is
+    /// automatic: [`DEFAULT_MAX_PREFIX_CACHE_PAGES`], raised per model to a
+    /// quarter of a CUDA KV arena that is fully allocated at load.
+    #[serde(default)]
+    pub max_prefix_cache_pages: Option<usize>,
+
+    /// Committed prefix snapshots of hybrid recurrent state (one row each) a
+    /// snapshot-sharing model may hold beyond its live rows. They are fitted
+    /// and reserved with the rows at load. Set with IZWI_MAX_PREFIX_SNAPSHOTS
+    /// (0 keeps hybrid state private, so hybrid prefixes never attach);
+    /// default 8.
+    #[serde(default = "default_max_prefix_snapshots")]
+    pub max_prefix_snapshots: u32,
 
     /// Host KV pool budget in bytes for hierarchical offload (DS4). Zero (the
     /// default) keeps the feature fully dormant.
@@ -183,6 +216,12 @@ pub struct EngineCoreConfig {
     /// Operators can disable it with IZWI_CUDA_INCREMENTAL_CHAT=0.
     #[serde(default = "default_cuda_incremental_chat")]
     pub enable_cuda_incremental_chat: bool,
+
+    /// Share of the post-weight CUDA budget that retained recurrent state may
+    /// take when retained rows are automatic; the rest backs KV pages. Set
+    /// with IZWI_CUDA_STATE_BUDGET_FRACTION in (0, 1]; default 0.25.
+    #[serde(default = "default_cuda_state_budget_fraction")]
+    pub cuda_state_budget_fraction: f64,
 
     /// Threshold for chunked prefill (tokens)
     #[serde(default = "default_chunked_prefill_threshold")]
@@ -305,6 +344,55 @@ fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
     value.is_none_or(|value| matches!(value, "1" | "true" | "on"))
 }
 
+pub(crate) const DEFAULT_CUDA_STATE_BUDGET_FRACTION: f64 = 0.25;
+
+fn default_max_prefix_snapshots() -> u32 {
+    max_prefix_snapshots_from_env(std::env::var("IZWI_MAX_PREFIX_SNAPSHOTS").ok().as_deref())
+}
+
+fn max_prefix_snapshots_from_env(value: Option<&str>) -> u32 {
+    let default = crate::engine::cache::managed::DEFAULT_PREFIX_SNAPSHOT_ROWS;
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(rows) if rows <= 1_024 => rows,
+        _ => {
+            tracing::warn!(
+                value,
+                default,
+                "Ignoring IZWI_MAX_PREFIX_SNAPSHOTS that is not a snapshot count in 0..=1024"
+            );
+            default
+        }
+    }
+}
+
+fn default_cuda_state_budget_fraction() -> f64 {
+    cuda_state_budget_fraction_from_env(
+        std::env::var("IZWI_CUDA_STATE_BUDGET_FRACTION")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn cuda_state_budget_fraction_from_env(value: Option<&str>) -> f64 {
+    let Some(value) = value else {
+        return DEFAULT_CUDA_STATE_BUDGET_FRACTION;
+    };
+    match value.trim().parse::<f64>() {
+        Ok(fraction) if fraction > 0.0 && fraction <= 1.0 => fraction,
+        _ => {
+            tracing::warn!(
+                value,
+                default = DEFAULT_CUDA_STATE_BUDGET_FRACTION,
+                "Ignoring IZWI_CUDA_STATE_BUDGET_FRACTION outside (0, 1]"
+            );
+            DEFAULT_CUDA_STATE_BUDGET_FRACTION
+        }
+    }
+}
+
 fn default_chunked_prefill() -> bool {
     false
 }
@@ -396,6 +484,50 @@ fn default_max_decode_tokens_per_request() -> usize {
 fn default_portable_context_reserve_bytes() -> u64 {
     1024 * 1024 * 1024
 }
+
+/// Share of CUDA device memory, in percent, that the resident-context fit
+/// keeps free when it exceeds `portable_context_reserve_bytes`.
+pub(crate) const CUDA_CONTEXT_RESERVE_PERCENT: u64 = 3;
+
+fn default_cuda_context_reserve_override_bytes() -> Option<u64> {
+    cuda_context_reserve_override_from_env(
+        std::env::var("IZWI_CUDA_CONTEXT_RESERVE_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn cuda_context_reserve_override_from_env(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    match value.trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => Some(bytes),
+        _ => {
+            tracing::warn!(
+                value,
+                "Ignoring IZWI_CUDA_CONTEXT_RESERVE_BYTES that is not a positive byte count"
+            );
+            None
+        }
+    }
+}
+
+/// The larger of `floor_bytes` and [`CUDA_CONTEXT_RESERVE_PERCENT`] of the
+/// device, unless an operator set the reserve explicitly.
+fn cuda_context_reserve_bytes(
+    floor_bytes: u64,
+    device_capacity: ResourceAmount,
+    override_bytes: Option<u64>,
+) -> u64 {
+    if let Some(bytes) = override_bytes {
+        return bytes;
+    }
+    match device_capacity {
+        ResourceAmount::Known(capacity) => {
+            floor_bytes.max(capacity.saturating_mul(CUDA_CONTEXT_RESERVE_PERCENT) / 100)
+        }
+        ResourceAmount::Unknown => floor_bytes,
+    }
+}
 fn default_enable_prefix_caching() -> bool {
     false
 }
@@ -418,10 +550,6 @@ fn default_kv_offload_max_promotion_pages() -> usize {
     64
 }
 
-fn default_max_prefix_cache_pages() -> usize {
-    128
-}
-
 impl Default for EngineCoreConfig {
     fn default() -> Self {
         Self {
@@ -433,10 +561,12 @@ impl Default for EngineCoreConfig {
             max_physical_in_flight: PhysicalInFlightLimit::default(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
+            automatic_row_limits: AutomaticRowLimits::default(),
             max_queued_requests: default_max_queued_requests(),
             max_seq_len: default_max_seq_len(),
             portable_context_auto: false,
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
+            cuda_context_reserve_override_bytes: default_cuda_context_reserve_override_bytes(),
             max_tokens_per_step: default_max_tokens_per_step(),
             block_size: default_block_size(),
             kv_cache_dtype: default_kv_cache_dtype(),
@@ -444,7 +574,8 @@ impl Default for EngineCoreConfig {
             scheduling_policy: SchedulingPolicy::default(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
-            max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            max_prefix_cache_pages: None,
+            max_prefix_snapshots: default_max_prefix_snapshots(),
             kv_host_pool_budget_bytes: 0,
             kv_offload_high_watermark: default_kv_offload_high_watermark(),
             kv_offload_low_watermark: default_kv_offload_low_watermark(),
@@ -453,6 +584,7 @@ impl Default for EngineCoreConfig {
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_chunked_prefill(),
             enable_cuda_incremental_chat: default_cuda_incremental_chat(),
+            cuda_state_budget_fraction: default_cuda_state_budget_fraction(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
@@ -480,6 +612,26 @@ impl Default for EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
+    /// Device memory the CUDA resident-context fit leaves outside every
+    /// reservation (the decode workspace reserve is added on top).
+    ///
+    /// After the fit, CUDA keeps allocating memory that no reservation
+    /// tracks: kernel modules and library workspaces (cuBLAS) loaded on first
+    /// use, local memory grown for the kernels that need it, CUDA graph pools,
+    /// and per-step transients. On the H100 field deploy of Qwen3.8 that grew
+    /// by about 0.88 GB over the first turns, against a 1 GiB reserve, and
+    /// left 132 MB for every later admission. Part of it scales with the
+    /// device (SMs, graph pools for larger models), so the reserve is the
+    /// larger of `portable_context_reserve_bytes` (1 GiB) and 3% of device
+    /// memory: 2.55 GB on an 80 GB H100. CPU and Metal do not use it.
+    pub(crate) fn cuda_context_reserve_bytes(&self, device_capacity: ResourceAmount) -> u64 {
+        cuda_context_reserve_bytes(
+            self.portable_context_reserve_bytes,
+            device_capacity,
+            self.cuda_context_reserve_override_bytes,
+        )
+    }
+
     pub fn cuda_incremental_chat_enabled(&self) -> bool {
         self.backend == BackendKind::Cuda && self.enable_cuda_incremental_chat
     }
@@ -516,7 +668,7 @@ impl EngineCoreConfig {
         // explicit enablement fails startup. The arena grows on demand, so
         // this raises the logical cap only.
         let prefix_pages = if self.enable_prefix_caching {
-            self.max_prefix_cache_pages
+            self.prefix_cache_pages_or_default()
         } else {
             0
         };
@@ -525,13 +677,20 @@ impl EngineCoreConfig {
             .max(required_pages.saturating_add(prefix_pages));
     }
 
+    /// The configured prefix page budget, or the default when it is
+    /// automatic (the floor each model's automatic budget starts from).
+    pub(crate) fn prefix_cache_pages_or_default(&self) -> usize {
+        self.max_prefix_cache_pages
+            .unwrap_or(DEFAULT_MAX_PREFIX_CACHE_PAGES)
+    }
+
     pub fn resolved_kv_cache_policy(&self) -> Result<ResolvedKvCachePolicy> {
         resolve_kv_cache_policy(
             self.block_size,
             &self.kv_cache_dtype,
             self.enable_prefix_caching,
             self.managed_prefix_cache_salt.as_deref(),
-            self.max_prefix_cache_pages,
+            self.prefix_cache_pages_or_default(),
             self.max_blocks,
             self.max_seq_len,
             // Catalog-auto reuse degrades instead of failing startup when the
@@ -592,6 +751,35 @@ mod managed_kv_default_tests {
         }
         for value in ["0", "false", "off", "", "invalid"] {
             assert!(!super::cuda_incremental_chat_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn prefix_snapshot_budget_parses_a_bounded_count() {
+        use super::max_prefix_snapshots_from_env;
+        assert_eq!(max_prefix_snapshots_from_env(None), 8);
+        assert_eq!(max_prefix_snapshots_from_env(Some(" 16 ")), 16);
+        assert_eq!(max_prefix_snapshots_from_env(Some("0")), 0);
+        for invalid in ["-1", "many", "", "1025", "2.5"] {
+            assert_eq!(max_prefix_snapshots_from_env(Some(invalid)), 8, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn cuda_state_budget_fraction_accepts_only_a_positive_share() {
+        use super::{cuda_state_budget_fraction_from_env, DEFAULT_CUDA_STATE_BUDGET_FRACTION};
+        assert_eq!(
+            cuda_state_budget_fraction_from_env(None),
+            DEFAULT_CUDA_STATE_BUDGET_FRACTION
+        );
+        assert_eq!(cuda_state_budget_fraction_from_env(Some(" 0.4 ")), 0.4);
+        assert_eq!(cuda_state_budget_fraction_from_env(Some("1")), 1.0);
+        for value in ["0", "-0.1", "1.5", "NaN", "", "quarter"] {
+            assert_eq!(
+                cuda_state_budget_fraction_from_env(Some(value)),
+                DEFAULT_CUDA_STATE_BUDGET_FRACTION,
+                "{value:?}"
+            );
         }
     }
 
@@ -723,7 +911,7 @@ mod managed_kv_default_tests {
             max_blocks: 1024,
             enable_prefix_caching: true,
             managed_prefix_cache_salt: Some("tenant".into()),
-            max_prefix_cache_pages: 256,
+            max_prefix_cache_pages: Some(256),
             ..EngineCoreConfig::default()
         };
 
@@ -813,6 +1001,212 @@ mod managed_kv_default_tests {
             assert_eq!(
                 tts_explicit_output_limit(backend, ModelVariant::Voxtral4BTts2603, 4096),
                 1500
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cuda_context_reserve_tests {
+    use super::{
+        cuda_context_reserve_bytes, cuda_context_reserve_override_from_env, EngineCoreConfig,
+    };
+    use crate::engine::{
+        BatchId, CapacitySource, ExecutionGroupId, PhysicalCapacityProvider,
+        PhysicalCapacitySnapshot, ReservationClass, ReservationOwner, ResourceAmount,
+        ResourceAuthority, ResourceLease, ResourceVector,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// The H100 the field failure ran on (`physical_capacity` in its refusal).
+    const H100_BYTES: u64 = 85_064_286_208;
+
+    #[test]
+    fn cuda_context_reserve_scales_with_the_device_above_a_floor() {
+        // 3% of the H100, versus the 1 GiB the fit used to keep.
+        assert_eq!(
+            cuda_context_reserve_bytes(GIB, ResourceAmount::Known(H100_BYTES), None),
+            2_551_928_586
+        );
+        // Small devices keep the floor; unknown capacity cannot scale it.
+        assert_eq!(
+            cuda_context_reserve_bytes(GIB, ResourceAmount::Known(24 * GIB), None),
+            GIB
+        );
+        assert_eq!(
+            cuda_context_reserve_bytes(GIB, ResourceAmount::Unknown, None),
+            GIB
+        );
+        // An operator value wins in both directions.
+        for bytes in [GIB / 2, 4 * GIB] {
+            assert_eq!(
+                cuda_context_reserve_bytes(GIB, ResourceAmount::Known(H100_BYTES), Some(bytes)),
+                bytes
+            );
+        }
+        let config = EngineCoreConfig {
+            cuda_context_reserve_override_bytes: None,
+            ..EngineCoreConfig::default()
+        };
+        assert_eq!(
+            config.cuda_context_reserve_bytes(ResourceAmount::Known(H100_BYTES)),
+            2_551_928_586
+        );
+    }
+
+    #[test]
+    fn cuda_context_reserve_override_accepts_only_a_positive_byte_count() {
+        assert_eq!(cuda_context_reserve_override_from_env(None), None);
+        assert_eq!(
+            cuda_context_reserve_override_from_env(Some(" 2147483648 ")),
+            Some(2 * GIB)
+        );
+        for value in ["0", "-1", "2GiB", "1.5", ""] {
+            assert_eq!(
+                cuda_context_reserve_override_from_env(Some(value)),
+                None,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeviceFree {
+        available: AtomicU64,
+    }
+
+    impl PhysicalCapacityProvider for DeviceFree {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            let device = |bytes| ResourceVector {
+                device_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            };
+            PhysicalCapacitySnapshot {
+                capacity: device(H100_BYTES),
+                available: device(self.available.load(Ordering::SeqCst)),
+                source: CapacitySource::Test,
+            }
+        }
+    }
+
+    fn device(bytes: u64) -> ResourceVector {
+        ResourceVector {
+            device_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        }
+    }
+
+    struct FieldDeploy {
+        authority: Arc<ResourceAuthority>,
+        provider: Arc<DeviceFree>,
+        _leases: [ResourceLease; 2],
+    }
+
+    /// The H100 field deploy of Qwen3.8 on b1d51b89, replayed against a
+    /// reserve. The fit fills KV until free memory minus every pending claim
+    /// equals the reserve plus the decode workspace reserve. Then the first
+    /// turns commit a state row (recorded as materialized) and grow memory
+    /// no reservation tracks by `UNTRACKED_GROWTH`, and a 64 MiB request claim
+    /// is pending.
+    fn field_after_first_turns(reserve: u64) -> FieldDeploy {
+        // Model pending: 86 state rows x 156,893,184 + graph decode.
+        const MODEL_PENDING: u64 = 14_030_602_240;
+        // In use before the fit: the CUDA context and its baseline pools.
+        const CONTEXT_BASELINE: u64 = 615_918_464;
+        // Eight decode rows x 401,408 B, added to the reserve by the fit.
+        const DECODE_RESERVE: u64 = 3_211_264;
+        const STATE_ROW: u64 = 156_893_184;
+        const REQUEST_PENDING: u64 = 64 * 1024 * 1024;
+        let free_at_fit = MODEL_PENDING + reserve + DECODE_RESERVE;
+        let resident = H100_BYTES - CONTEXT_BASELINE - free_at_fit;
+        let provider = Arc::new(DeviceFree {
+            available: AtomicU64::new(free_at_fit),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let model = authority
+            .reserve_with_initial_materialized(
+                ReservationOwner::new(ReservationClass::Model, "qwen38"),
+                device(resident + MODEL_PENDING),
+                device(resident),
+            )
+            .unwrap();
+        provider
+            .available
+            .fetch_sub(STATE_ROW + UNTRACKED_GROWTH, Ordering::SeqCst);
+        model
+            .record_materialized_usage(device(resident + STATE_ROW))
+            .unwrap();
+        let request = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "second-turn"),
+                device(REQUEST_PENDING),
+            )
+            .unwrap();
+        FieldDeploy {
+            authority,
+            provider,
+            _leases: [model, request],
+        }
+    }
+
+    /// Untracked device memory that grew after the fit in the field, from
+    /// the refusal: with the row recorded, 1 GiB + 3,211,264 - 64 MiB -
+    /// 877,920,256 leaves the 131,923,968 B margin the fixed build has.
+    const UNTRACKED_GROWTH: u64 = 877_920_256;
+
+    fn workspace_fits(authority: &Arc<ResourceAuthority>, bytes: u64) -> bool {
+        authority
+            .reserve_batch_workspace(ExecutionGroupId::new(1), BatchId::new(1), device(bytes))
+            .is_ok()
+    }
+
+    #[test]
+    fn scaled_cuda_reserve_absorbs_twice_the_untracked_growth_measured_in_the_field() {
+        const DECODE_ROW_WORKSPACE: u64 = 401_408;
+        let old_reserve = GIB;
+        let new_reserve = EngineCoreConfig {
+            cuda_context_reserve_override_bytes: None,
+            ..EngineCoreConfig::default()
+        }
+        .cuda_context_reserve_bytes(ResourceAmount::Known(H100_BYTES));
+
+        for (reserve, margin) in [(old_reserve, 131_923_968), (new_reserve, 1_610_110_730)] {
+            let FieldDeploy {
+                authority,
+                provider,
+                _leases,
+            } = field_after_first_turns(reserve);
+            // The margin is exact, and both reserves pass the field step.
+            assert!(workspace_fits(&authority, DECODE_ROW_WORKSPACE));
+            assert!(workspace_fits(&authority, margin));
+            assert!(!workspace_fits(&authority, margin + 1));
+            // What no reservation tracks: the baseline plus the growth.
+            let snapshot = authority.snapshot();
+            let (
+                ResourceAmount::Known(capacity),
+                ResourceAmount::Known(available),
+                ResourceAmount::Known(materialized),
+            ) = (
+                snapshot.physical.capacity.device_bytes,
+                snapshot.physical.available.device_bytes,
+                snapshot.materialized.device_bytes,
+            )
+            else {
+                panic!("the field authority reports known device bytes");
+            };
+            assert_eq!(capacity - available - materialized, 1_493_838_720);
+
+            // The same growth again (another kernel set, larger library
+            // workspaces, a graph recapture): 1 GiB cannot absorb it.
+            provider
+                .available
+                .fetch_sub(UNTRACKED_GROWTH, Ordering::SeqCst);
+            assert_eq!(
+                workspace_fits(&authority, DECODE_ROW_WORKSPACE),
+                reserve == new_reserve,
+                "reserve {reserve}"
             );
         }
     }

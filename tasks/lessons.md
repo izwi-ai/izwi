@@ -194,4 +194,38 @@
 - Probes and health checks must not call APIs that consume shared error state. cudarc's `bind_to_thread` returns and clears whatever a `Drop` latched on the context, so a capacity probe using `CudaContext::mem_get_info` failed on another component's error and reported it as missing memory. Observers should query the driver directly and log their own failures.
 - A model-side engine preference is only a request. Qwen3.6 asked for 8-token decode quanta, but the scheduler grants them only before a request's soft SLA, which is about 0.7 s for normal-priority interactive and streaming chat, unless the model opts into `sustained_decode_quantum`. On the H100 the pipeline therefore ran for about 22 quanta in roughly 5,500 tokens. Before relying on a scheduler grant, trace every gate in `decode_token_quanta` with production request settings, and test the grant after the deadline has passed. Give every new fast path a diagnostics counter (here `whole_step.pipelined`), so the first deploy shows whether it actually engaged.
 - A bit-exact comparison between two runs is only an invariant if both runs execute the same op shapes. The Qwen3.6 attach test compared an attached run (prefilled from the fork) with a fresh run (prefilled in one span). The matmul row counts differed, and x86's CPU kernels rounded a few rows differently in the last ulp. aarch64 happened to agree, so the test passed locally and failed on every Linux CI run. Before asserting bit equality, make both sides take identical chunk and span boundaries, or assert a tolerance. CI runs on x86 and the dev machine on ARM, so anything that only passes on one architecture needs checking on the other.
-- CI pins `dtolnay/rust-toolchain@stable`, so new stable clippy lints (1.99's `chunks_exact_to_as_chunks`) fail the `-D warnings` gate with no repo change. Before pushing, run the hygiene clippy with the current stable (`cargo +<latest> clippy --workspace --all-targets`, `TAURI_CONFIG` as in `check-backend-truth.sh`), not only the local default toolchain.
+- CI pins `dtolnay/rust-toolchain@stable`, so new stable clippy lints (1.99's `chunks_exact_to_as_chunks`) fail the `-D warnings` gate with no repo change. Before pushing, run the hygiene clippy with the current stable (`cargo +<latest> clippy --workspace --all-targets`, `TAURI_CONFIG` as in `check-backend-truth.sh`), not only the local default toolchain. Run the WHOLE lane under the CI toolchain, `RUSTUP_TOOLCHAIN=<latest stable> bash scripts/ci/check-backend-truth.sh hygiene`, because the script calls plain `cargo`. On 2026-10-12 a push verified with the script under the default 1.93 toolchain failed CI's 1.99 clippy on five `chunks_exact` sites, even though this lesson already existed.
+- Model families that were deliberately forked into their own modules stay separate unless the user
+  asks otherwise. For Qwen3.8 I recommended moving it onto the Qwen3.6 trunk to inherit the fast
+  paths; the user rejected re-coupling the families. Plan ports into each family's own trunk, and
+  reuse only the generic infrastructure under `kernels/` (kernels take geometry as parameters;
+  they are not family code). Offer convergence only as a clearly labeled alternative, never as
+  the recommendation, when a module header documents the fork as intentional.
+- Before planning or implementing on a named branch, check what it contains relative to the
+  branch the research was done on (`git rev-list --count A..B`, `git cat-file -e B:path`). The
+  Qwen3.8 plan assumed kernels that existed only on an unmerged branch; the new branch sat at
+  `main` without them until main was updated.
+- Candle compiles its Metal kernels with fast math, so F32 `cos`/`sin` on the Metal device are not
+  exact: errors are ~1e-4 at position 4K and ~1e-2 at 262K. Precision-critical tables such as RoPE
+  cos/sin belong on the host, uploaded once. "Compute in F32" does not make a device kernel exact;
+  check it against an F64 host reference on each device.
+- A fake `nvcc` for compile-only CUDA checks must honour every output flag the build scripts pass
+  (`-o`, `--output-directory`/`-odir`). One that ignored `--output-directory` dropped zero-byte
+  `.ptx` files into the cargo registry's candle-kernels source and into the crate. Those would be
+  embedded as empty kernels in a later real CUDA build. After any fake-nvcc run, check for
+  zero-byte `*.ptx` under `~/.cargo/registry/src` and `crates/`.
+- Parallel worktree agents each build their own `target/` (7–10 GB here), and the session
+  scratchpad has a ~10 GB quota shared with other sessions. Check free disk and scratch usage before
+  fanning out, keep large logs under `target/`, and remove a worktree as soon as its commits are
+  cherry-picked. Two agents hit ENOSPC mid-verification on 2026-10-11.
+- A documented admission gap is a release blocker once a change spends the margin it relies on.
+  The never-materialized recurrent-state reservation (A4) was recorded as "later". Then graph
+  decode, larger prefill chunks and lazy CUDA context growth consumed the 1 GiB margin, and the
+  H100 failed every second chat turn. Before shipping a change that adds device allocations after
+  the load-time fit, check that every reservation records materialization (pending + materialized
+  == reserved, with nothing counted twice). Size the safety reserve from the measured
+  post-fit growth (the `untracked_device_memory_bytes` gauge), not a fixed 1 GiB.
+- Self-check and parity inputs must be unstructured. Sinusoidal test inputs let a wrong DeltaNet
+  head mapping through at 0.21%; xorshift inputs exposed it at 133%. Likewise, verify a model-side
+  preference's EFFECTIVE value in field diagnostics. Qwen3.8's 256-token prefill chunk never
+  applied, because the model never declared a preferred span and the scheduler cut prompts at 192.
