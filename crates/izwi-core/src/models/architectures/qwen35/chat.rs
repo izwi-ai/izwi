@@ -402,10 +402,83 @@ pub(crate) struct Qwen35Tokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
-    literal_special_tokens: Vec<(String, u32)>,
+    literal_special_tokens: SpecialTokenMatcher,
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
+}
+
+/// Literal special tokens matched in one pass over a prompt. At each byte
+/// only the tokens starting with that byte are tried, longest first, so a
+/// match is the earliest position and then the longest token there. Prompts
+/// with thousands of `<|image_pad|>` tokens stay linear; a per-match search
+/// of the remaining text for every special token was quadratic.
+#[derive(Debug, Clone)]
+struct SpecialTokenMatcher {
+    tokens: Vec<(String, u32)>,
+    /// Indices into `tokens` by first byte, longest token first.
+    by_first_byte: Vec<Vec<usize>>,
+}
+
+/// A prompt piece: plain text for the BPE tokenizer, or a special token id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSegment<'a> {
+    Text(&'a str),
+    Special(u32),
+}
+
+impl SpecialTokenMatcher {
+    /// Tokens sorted longest first (then lexically) with duplicates removed;
+    /// the first id listed for a duplicated string wins.
+    fn new(mut tokens: Vec<(String, u32)>) -> Self {
+        tokens.retain(|(token, _)| !token.is_empty());
+        tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        tokens.dedup_by(|(left, _), (right, _)| left == right);
+        let mut by_first_byte = vec![Vec::new(); 256];
+        for (index, (token, _)) in tokens.iter().enumerate() {
+            by_first_byte[usize::from(token.as_bytes()[0])].push(index);
+        }
+        Self {
+            tokens,
+            by_first_byte,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The first special token at or after byte `start`, as
+    /// `(byte offset, byte length, id)`. Tokens are valid UTF-8 and begin
+    /// with a leading byte, so every match starts on a char boundary.
+    fn next_match(&self, text: &str, start: usize) -> Option<(usize, usize, u32)> {
+        let bytes = text.as_bytes();
+        (start..bytes.len()).find_map(|offset| {
+            self.by_first_byte[usize::from(bytes[offset])]
+                .iter()
+                .map(|index| &self.tokens[*index])
+                .find(|(token, _)| bytes[offset..].starts_with(token.as_bytes()))
+                .map(|(token, id)| (offset, token.len(), *id))
+        })
+    }
+
+    fn segments<'a>(&self, text: &'a str) -> Vec<PromptSegment<'a>> {
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        while let Some((start, len, id)) = self.next_match(text, offset) {
+            if start > offset {
+                segments.push(PromptSegment::Text(&text[offset..start]));
+            }
+            segments.push(PromptSegment::Special(id));
+            offset = start + len;
+        }
+        if offset < text.len() {
+            segments.push(PromptSegment::Text(&text[offset..]));
+        }
+        segments
+    }
 }
 
 #[derive(Debug)]
@@ -493,10 +566,7 @@ impl Qwen35Tokenizer {
                 |(id, entry)| id.parse::<u32>().ok().map(|id| (entry.content.clone(), id)),
             ));
         }
-        literal_special_tokens.sort_by(|(left, _), (right, _)| {
-            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
-        });
-        literal_special_tokens.dedup_by(|(left, _), (right, _)| left == right);
+        let literal_special_tokens = SpecialTokenMatcher::new(literal_special_tokens);
 
         Ok(Self {
             inner,
@@ -522,38 +592,12 @@ impl Qwen35Tokenizer {
         }
 
         let mut ids = Vec::new();
-        let mut offset = 0usize;
-        while offset < text.len() {
-            let tail = &text[offset..];
-            let mut next_match: Option<(usize, &str, u32)> = None;
-            for (token, token_id) in &self.literal_special_tokens {
-                if let Some(rel_idx) = tail.find(token) {
-                    let candidate = (rel_idx, token.as_str(), *token_id);
-                    match next_match {
-                        None => next_match = Some(candidate),
-                        Some((best_idx, best_token, _)) => {
-                            if rel_idx < best_idx
-                                || (rel_idx == best_idx && token.len() > best_token.len())
-                            {
-                                next_match = Some(candidate);
-                            }
-                        }
-                    }
-                }
+        for segment in self.literal_special_tokens.segments(text) {
+            match segment {
+                PromptSegment::Text(text) => ids.extend(self.inner.encode(text)?),
+                PromptSegment::Special(id) => ids.push(id),
             }
-
-            let Some((rel_idx, matched_token, matched_id)) = next_match else {
-                ids.extend(self.inner.encode(tail)?);
-                break;
-            };
-
-            if rel_idx > 0 {
-                ids.extend(self.inner.encode(&tail[..rel_idx])?);
-            }
-            ids.push(matched_id);
-            offset += rel_idx + matched_token.len();
         }
-
         Ok(ids)
     }
 
@@ -2425,7 +2469,7 @@ mod tests {
                 eos: im_end,
                 eos_alt: Some(eos_alt),
             },
-            literal_special_tokens: vec![
+            literal_special_tokens: SpecialTokenMatcher::new(vec![
                 ("<|im_start|>".to_string(), im_start),
                 ("<|endoftext|>".to_string(), eos_alt),
                 ("<|image_pad|>".to_string(), image_pad),
@@ -2433,11 +2477,103 @@ mod tests {
                 ("<|im_end|>".to_string(), im_end),
                 ("</think>".to_string(), think_close),
                 ("<think>".to_string(), think_open),
-            ],
+            ]),
             chat_template: String::new(),
             default_enable_thinking: false,
             bos_token: None,
         }
+    }
+
+    /// The previous quadratic matcher, kept as the reference: the earliest
+    /// occurrence of any token, the longest token on a tie.
+    fn reference_segments<'a>(tokens: &[(String, u32)], text: &'a str) -> Vec<PromptSegment<'a>> {
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let tail = &text[offset..];
+            let best = tokens
+                .iter()
+                .filter_map(|(token, id)| tail.find(token.as_str()).map(|at| (at, token, *id)))
+                .min_by(|left, right| left.0.cmp(&right.0).then(right.1.len().cmp(&left.1.len())));
+            let Some((at, token, id)) = best else {
+                segments.push(PromptSegment::Text(tail));
+                break;
+            };
+            if at > 0 {
+                segments.push(PromptSegment::Text(&tail[..at]));
+            }
+            segments.push(PromptSegment::Special(id));
+            offset += at + token.len();
+        }
+        segments
+    }
+
+    #[test]
+    fn special_token_matcher_agrees_with_the_quadratic_reference() {
+        let tokens = vec![
+            ("<|im_start|>".to_string(), 1),
+            ("<|im_end|>".to_string(), 2),
+            ("<|image_pad|>".to_string(), 3),
+            ("<think>".to_string(), 4),
+            ("</think>".to_string(), 5),
+            ("<|im".to_string(), 6),
+            ("é<|".to_string(), 7),
+        ];
+        let matcher = SpecialTokenMatcher::new(tokens.clone());
+        let pieces = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|image_pad|>",
+            "<think>",
+            "</think>",
+            "<|im",
+            "<|",
+            "<",
+            "|",
+            ">",
+            "im_",
+            "end",
+            "think",
+            "/",
+            "é",
+            "日本",
+            " ",
+            "a",
+            "\n",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for case in 0..2_000 {
+            let mut text = String::new();
+            for _ in 0..(case % 40) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                text.push_str(pieces[(state % pieces.len() as u64) as usize]);
+            }
+            assert_eq!(
+                matcher.segments(&text),
+                reference_segments(&tokens, &text),
+                "{text:?}"
+            );
+        }
+        // The longest token wins where several start at one byte.
+        assert_eq!(
+            matcher.segments("x<|im_end|>"),
+            vec![PromptSegment::Text("x"), PromptSegment::Special(2)]
+        );
+        assert!(matcher.segments("").is_empty());
+    }
+
+    #[test]
+    fn special_token_matcher_stays_linear_on_long_image_prompts() {
+        let matcher = SpecialTokenMatcher::new(vec![
+            ("<|image_pad|>".to_string(), 3),
+            ("<|im_end|>".to_string(), 2),
+        ]);
+        let text = format!("start{}end", "<|image_pad|>".repeat(20_000));
+        let segments = matcher.segments(&text);
+        assert_eq!(segments.len(), 20_002);
+        assert_eq!(segments[1], PromptSegment::Special(3));
     }
 
     fn local_model_dir(name: &str) -> PathBuf {
