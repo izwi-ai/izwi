@@ -44,9 +44,12 @@ pub use config::{
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
-    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptTokenizer,
-    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
-    GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
+    render_granite_speech_prompt, GraniteSpeechLanguage, GraniteSpeechPrompt,
+    GraniteSpeechPromptOptions, GraniteSpeechPromptProfile, GraniteSpeechPromptTokenizer,
+    GraniteSpeechRenderedPrompt, GraniteSpeechSpecialTokens, GraniteSpeechTask,
+    GRANITE_SPEECH_BASE_ASR_INSTRUCTION, GRANITE_SPEECH_KEYWORD_ASR_INSTRUCTION,
+    GRANITE_SPEECH_PLUS_ASR_INSTRUCTION, GRANITE_SPEECH_SPEAKER_INSTRUCTION,
+    GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
 };
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
@@ -2072,6 +2075,9 @@ fn granite_diagnostics(
         "prompt_prefix_tokens": prompt.prefix_text_token_count,
         "prompt_audio_placeholders": prompt.audio_token_positions.len(),
         "prompt": {
+            "profile": prompt.profile.name(),
+            "task": prompt.task.name(),
+            "instruction": prompt.instruction,
             "prompt_tokens": generation.stats.prompt_tokens,
             "prefix_tokens": prompt.prefix_text_token_count,
             "audio_placeholders": prompt.audio_token_positions.len(),
@@ -2960,7 +2966,10 @@ mod tests {
             input_features: vec![vec![0.0; 160]],
         };
         let prompt = GraniteSpeechPrompt {
+            profile: GraniteSpeechPromptProfile::Plus,
+            task: GraniteSpeechTask::WordTimestamps,
             text: "<|audio|>".to_string(),
+            instruction: GRANITE_SPEECH_TIMESTAMP_INSTRUCTION.to_string(),
             input_ids: vec![100_352],
             audio_token_positions: vec![0],
             prefix_text_token_count: 0,
@@ -3166,5 +3175,11 @@ mod tests {
         assert_eq!(diagnostics["timings_ms"]["model_non_generation"], 2.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
+        assert_eq!(diagnostics["prompt"]["profile"], "plus");
+        assert_eq!(diagnostics["prompt"]["task"], "word_timestamps");
+        assert_eq!(
+            diagnostics["prompt"]["instruction"],
+            GRANITE_SPEECH_TIMESTAMP_INSTRUCTION
+        );
     }
 }
