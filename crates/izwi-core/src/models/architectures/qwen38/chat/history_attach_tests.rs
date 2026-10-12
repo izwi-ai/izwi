@@ -154,6 +154,7 @@ fn chat_model(
         mtp_policy: Qwen38MtpPolicy::Disabled,
         mtp_head: None,
         prefix_caching: true,
+        prefix_reuse: Qwen38PrefixReuse::default(),
         graph_quantum: GraphQuantumCounters::default(),
         kernel_timings: serde_json::Value::Null,
     }
@@ -576,6 +577,17 @@ fn assert_attach_matches_fresh(
     assert!(
         error.to_string().contains("without hybrid state"),
         "{error}"
+    );
+
+    // The diagnostics count the prefills: two from zero, two attached.
+    let reuse = model.prefix_reuse_diagnostics();
+    assert_eq!(reuse["engaged"], true, "{reuse}");
+    assert_eq!(reuse["fresh_prefills"], 2, "{reuse}");
+    assert_eq!(reuse["attached_prefills"], 2, "{reuse}");
+    assert_eq!(reuse["reused_prompt_tokens"], 2 * FORK as u64, "{reuse}");
+    assert_eq!(
+        reuse["last_prefill"]["reused_tokens"], FORK as u64,
+        "{reuse}"
     );
 }
 

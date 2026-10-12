@@ -169,6 +169,7 @@ pub(crate) fn model_fixture(hybrid: bool) -> Qwen38ChatModel {
         mtp_policy: Qwen38MtpPolicy::Enabled { draft_tokens: 2 },
         mtp_head: Some(mtp_head),
         prefix_caching: false,
+        prefix_reuse: Qwen38PrefixReuse::default(),
         graph_quantum: GraphQuantumCounters::default(),
         kernel_timings: serde_json::Value::Null,
     }

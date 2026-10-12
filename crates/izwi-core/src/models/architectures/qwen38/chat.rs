@@ -89,6 +89,71 @@ const DEFAULT_DECODE_QUANTUM: usize = 8;
 /// Kill switch for pipelined graph decode (`legacy`, `off`, `0`, `false`):
 /// a graph-decode quantum then runs its steps one at a time.
 pub(crate) const DECODE_PIPELINE_ENV: &str = "IZWI_QWEN38_DECODE_PIPELINE";
+/// Qwen3.8-only kill switch for cross-turn prefix reuse (`0`, `false`, `no`,
+/// `off`). The global switches (`IZWI_ENABLE_PREFIX_CACHING=0`,
+/// `IZWI_PREFIX_REUSE_AUTO=0`) turn it off for every model.
+pub(crate) const PREFIX_REUSE_ENV: &str = "IZWI_QWEN38_PREFIX_REUSE";
+
+/// Strict boolean for [`PREFIX_REUSE_ENV`]; unset keeps the registry's
+/// decision.
+fn qwen38_prefix_reuse_switch(raw: Option<&str>) -> Result<bool> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase) {
+        None => Ok(true),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => Ok(true),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => Ok(false),
+        Some(value) => Err(Error::ConfigError(format!(
+            "{PREFIX_REUSE_ENV} must be a boolean, got `{value}`"
+        ))),
+    }
+}
+
+/// How the load decided cross-turn prefix reuse, and the prefills since:
+/// `prefix_reuse` in the runtime diagnostics. A prefill attached at a shared
+/// history prefix starts at the attached cursor and computes only the rest.
+#[derive(Debug, Default)]
+pub(crate) struct Qwen38PrefixReuse {
+    /// The registry engaged prefix reuse for this model on its backend (the
+    /// catalog cell in catalog-auto mode, or the operator's explicit switch).
+    requested: bool,
+    /// [`PREFIX_REUSE_ENV`] turned it off for Qwen3.8.
+    switched_off: bool,
+    attached_prefills: AtomicU64,
+    fresh_prefills: AtomicU64,
+    reused_prompt_tokens: AtomicU64,
+    prefilled_prompt_tokens: AtomicU64,
+    last_reused_tokens: AtomicU64,
+    last_prompt_tokens: AtomicU64,
+}
+
+impl Qwen38PrefixReuse {
+    fn new(requested: bool, switched_off: bool) -> Self {
+        Self {
+            requested,
+            switched_off,
+            ..Self::default()
+        }
+    }
+
+    /// A request's prefill starts with `reused` of its `prompt` tokens
+    /// already resident (zero unless it attached a shared prefix).
+    fn record_prefill(&self, reused: usize, prompt: usize) {
+        let counter = if reused > 0 {
+            &self.attached_prefills
+        } else {
+            &self.fresh_prefills
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+        let (reused, prompt) = (reused as u64, prompt as u64);
+        self.reused_prompt_tokens
+            .fetch_add(reused, AtomicOrdering::Relaxed);
+        self.prefilled_prompt_tokens
+            .fetch_add(prompt.saturating_sub(reused), AtomicOrdering::Relaxed);
+        self.last_reused_tokens
+            .store(reused, AtomicOrdering::Relaxed);
+        self.last_prompt_tokens
+            .store(prompt, AtomicOrdering::Relaxed);
+    }
+}
 
 fn decode_quantum_tokens() -> usize {
     decode_quantum_from(std::env::var(DECODE_QUANTUM_ENV).ok().as_deref())
@@ -956,7 +1021,11 @@ pub struct Qwen38ChatModel {
     text_model: Qwen38TextModel,
     mtp_policy: Qwen38MtpPolicy,
     mtp_head: Option<Qwen38MtpHead>,
+    /// The cache contract shares prefixes (the registry engaged reuse and
+    /// [`PREFIX_REUSE_ENV`] did not turn it off); an MTP head still keeps
+    /// every domain private.
     prefix_caching: bool,
+    prefix_reuse: Qwen38PrefixReuse,
     graph_quantum: GraphQuantumCounters,
     /// Device timings of the hot kernels measured once at load (CUDA;
     /// `text/kernel_timings.rs`), reported under `kernel_timings`.
@@ -1014,6 +1083,8 @@ impl Qwen38ChatModel {
                 "Unsupported Qwen3.8 chat variant: {variant}"
             )));
         }
+        let prefix_reuse_switch =
+            qwen38_prefix_reuse_switch(std::env::var(PREFIX_REUSE_ENV).ok().as_deref())?;
         let checkpoint =
             Qwen38NativeCheckpoint::open_with_options(model_dir, &performance.loading)?;
         let tokenizer = Qwen38Tokenizer::load_hf(model_dir)?;
@@ -1078,6 +1149,7 @@ impl Qwen38ChatModel {
             mtp_enabled = mtp_policy.enabled(),
             mtp_decision = residency.mtp_decision(),
             mtp_draft_tokens = mtp_policy.draft_tokens(),
+            prefix_reuse = prefix_reuse && prefix_reuse_switch && !mtp_policy.enabled(),
             cuda_graphs = %text_model.cuda_graphs_summary()["phase"],
             "Loaded native Qwen3.8 text checkpoint"
         );
@@ -1097,7 +1169,8 @@ impl Qwen38ChatModel {
             text_model,
             mtp_policy,
             mtp_head,
-            prefix_caching: prefix_reuse,
+            prefix_caching: prefix_reuse && prefix_reuse_switch,
+            prefix_reuse: Qwen38PrefixReuse::new(prefix_reuse, !prefix_reuse_switch),
             graph_quantum: GraphQuantumCounters::default(),
             kernel_timings,
         })
@@ -1410,6 +1483,7 @@ impl Qwen38ChatModel {
                 "runtime_validated": false,
             },
             "cuda_graphs": self.cuda_graphs_diagnostics(),
+            "prefix_reuse": self.prefix_reuse_diagnostics(),
             "kernel_timings": self.kernel_timings,
             "optimization_evidence": optimization_evidence,
             "fast_paths": {
@@ -1542,6 +1616,8 @@ impl Qwen38ChatModel {
                     .into(),
             ));
         }
+        self.prefix_reuse
+            .record_prefill(0, prepared.prompt_ids.len());
         let mut text_state = self.text_model.new_state();
         let (logits, final_target_hidden) = match (&self.mtp_head, mtp_cache.as_mut()) {
             (Some(head), Some(mtp_cache)) => self.prefill_text_and_mtp_physical(
@@ -1830,6 +1906,8 @@ impl Qwen38ChatModel {
             initial_penalty_history(&prepared.prompt_ids, max_new_tokens, track_history);
         let mut rng = SimpleRng::new(config.seed);
         let draft_rng = rng.fork();
+        self.prefix_reuse
+            .record_prefill(prefill_start, prepared.prompt_ids.len());
         Ok(ChatDecodeState {
             replay: None,
             prepared: prepared.clone(),
@@ -2926,6 +3004,43 @@ impl Qwen38ChatModel {
 
     /// `cuda_graphs` in the diagnostics: graph decode's resolution, phase and
     /// counters, and the decode quantum it asks the scheduler for.
+    /// Cross-turn prefix reuse: whether this load shares prefixes and why,
+    /// where a chat turn's shared history ends, and the prompt tokens every
+    /// prefill since reused or computed. The managed cache's own counters
+    /// (`kv_cache.counters` and `kv_cache.models[]` in `/v1/metrics`) show
+    /// hits, misses, snapshot publications and the snapshot budget.
+    fn prefix_reuse_diagnostics(&self) -> serde_json::Value {
+        let shared = self.prefix_caching && !self.mtp_policy.enabled();
+        let reason = if shared {
+            "engaged: committed KV pages and hybrid-state snapshots are shared at each turn's history boundary"
+        } else if self.prefix_reuse.switched_off {
+            "off: IZWI_QWEN38_PREFIX_REUSE turned it off for Qwen3.8"
+        } else if !self.prefix_caching {
+            "off: not engaged for this backend (the catalog cell is not supported here, or IZWI_ENABLE_PREFIX_CACHING=0 / IZWI_PREFIX_REUSE_AUTO=0)"
+        } else {
+            "off: the MTP head is loaded; its draft attention state has no prefix snapshot, so every domain stays private (CUDA leaves the head out by default; IZWI_QWEN38_MTP=1 loads it)"
+        };
+        let counters = &self.prefix_reuse;
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        serde_json::json!({
+            "engaged": shared,
+            "reason": reason,
+            "requested": counters.requested,
+            "switch": PREFIX_REUSE_ENV,
+            "history_boundary": "before the prompt's final <|im_start|> (the assistant generation header)",
+            "snapshot_interval_tokens": default_kv_page_size(),
+            "attached_prefills": load(&counters.attached_prefills),
+            "fresh_prefills": load(&counters.fresh_prefills),
+            "reused_prompt_tokens": load(&counters.reused_prompt_tokens),
+            "prefilled_prompt_tokens": load(&counters.prefilled_prompt_tokens),
+            "last_prefill": {
+                "reused_tokens": load(&counters.last_reused_tokens),
+                "prompt_tokens": load(&counters.last_prompt_tokens),
+            },
+            "managed_counters": "runtime_metrics.kv_cache: counters.prefix_hits, prefix_misses, reused_tokens, tensor_snapshot_publishes, tensor_snapshot_attaches; models[].prefix_snapshots, prefix_snapshot_bytes, prefix_snapshot_budget_bytes",
+        })
+    }
+
     fn cuda_graphs_diagnostics(&self) -> serde_json::Value {
         let mut summary = self.text_model.cuda_graphs_summary();
         let mut quantum = self.graph_quantum.summary();
@@ -4499,6 +4614,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reused.prompt_ids(), prepared.prompt_ids());
+    }
+
+    #[test]
+    fn prefix_reuse_switch_is_a_strict_boolean_defaulting_on() {
+        assert!(qwen38_prefix_reuse_switch(None).unwrap());
+        for on in ["1", "true", " YES ", "on"] {
+            assert!(qwen38_prefix_reuse_switch(Some(on)).unwrap(), "{on}");
+        }
+        for off in ["0", "false", "No", "off"] {
+            assert!(!qwen38_prefix_reuse_switch(Some(off)).unwrap(), "{off}");
+        }
+        let error = qwen38_prefix_reuse_switch(Some("maybe")).unwrap_err();
+        assert!(error.to_string().contains(PREFIX_REUSE_ENV), "{error}");
+    }
+
+    #[test]
+    fn prefix_reuse_counts_attached_and_fresh_prefill_tokens() {
+        let reuse = Qwen38PrefixReuse::new(true, false);
+        reuse.record_prefill(0, 100);
+        reuse.record_prefill(64, 180);
+        let load = |counter: &AtomicU64| counter.load(AtomicOrdering::Relaxed);
+        assert_eq!(load(&reuse.fresh_prefills), 1);
+        assert_eq!(load(&reuse.attached_prefills), 1);
+        assert_eq!(load(&reuse.reused_prompt_tokens), 64);
+        assert_eq!(load(&reuse.prefilled_prompt_tokens), 100 + 116);
+        assert_eq!(load(&reuse.last_reused_tokens), 64);
+        assert_eq!(load(&reuse.last_prompt_tokens), 180);
     }
 
     #[test]
