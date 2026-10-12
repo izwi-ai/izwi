@@ -321,7 +321,8 @@ fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
 
 /// Install the caller's ASR decode budget. An omitted budget is marked
 /// automatic so duration-aware families (Granite, LFM2.5 Audio long-form) may
-/// derive it per chunk instead of applying the request default.
+/// derive it per chunk, and Parakeet preparation may size it from the encoder
+/// frame count, instead of applying the request default.
 fn apply_asr_max_tokens(
     request: &mut EngineCoreRequest,
     variant: ModelVariant,

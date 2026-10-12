@@ -6117,10 +6117,12 @@ impl NativeExecutor {
             .rows
             .iter_mut()
             .map(|row| {
+                let max_tokens = requests[row.index].params.max_tokens;
                 let active = row.lease.require_state_mut()?;
                 Ok(ParakeetRetainedDecodeBatchRow {
                     artifact: active.artifact.as_ref(),
                     state: &mut active.state,
+                    max_tokens,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

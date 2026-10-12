@@ -106,6 +106,30 @@ impl ParakeetPreprocessor {
         })
     }
 
+    /// A NeMo-default preprocessor (Hann window, Slaney filterbank) for tests
+    /// that never read weights.
+    #[cfg(test)]
+    pub(super) fn for_tests(device: Device) -> Self {
+        let window = hann_window(WIN_LENGTH);
+        let mut padded_window = vec![0f32; N_FFT];
+        let offset = (N_FFT - WIN_LENGTH) / 2;
+        padded_window[offset..offset + WIN_LENGTH].copy_from_slice(&window);
+        Self {
+            device,
+            _window: window,
+            padded_window,
+            fb: mel_filterbank(
+                SAMPLE_RATE,
+                N_FFT,
+                DEFAULT_N_MELS,
+                0.0,
+                SAMPLE_RATE as f32 / 2.0,
+            ),
+            n_mels: DEFAULT_N_MELS,
+            n_freqs: N_FFT / 2 + 1,
+        }
+    }
+
     pub fn compute_features(&self, audio: &[f32]) -> Result<(Tensor, usize)> {
         let (features, valid_frames, _upload_ms) =
             self.compute_features_with_upload_timing(audio)?;
@@ -173,8 +197,7 @@ impl ParakeetPreprocessor {
             }
         }
 
-        // NeMo get_seq_len for center=True case: floor(seq_len / hop_length)
-        let valid_frames = audio.len() / HOP_LENGTH;
+        let valid_frames = valid_feature_frames(audio.len());
 
         // normalize per_feature (along time)
         normalize_per_feature(
@@ -199,6 +222,12 @@ impl ParakeetPreprocessor {
 
         Ok((features, valid_frames.min(frame_count), upload_ms))
     }
+}
+
+/// NeMo `get_seq_len` for `center=True`: `floor(samples / hop_length)`. The
+/// STFT emits one more (padding) frame, which is masked to zero.
+pub(super) const fn valid_feature_frames(samples: usize) -> usize {
+    samples / HOP_LENGTH
 }
 
 fn elapsed_ms(started: Instant) -> f64 {

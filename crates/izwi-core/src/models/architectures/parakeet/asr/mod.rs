@@ -71,14 +71,6 @@ pub(crate) struct ParakeetPreparedEncoderArtifact {
 }
 
 impl ParakeetPreparedEncoderArtifact {
-    pub(crate) fn decode_budget(&self, max_symbols: usize) -> Result<usize> {
-        self.encoded_len
-            .checked_mul(max_symbols)
-            .and_then(|value| value.checked_mul(8))
-            .map(|value| value.max(1))
-            .ok_or_else(|| Error::Overloaded("Parakeet retained decode budget overflowed".into()))
-    }
-
     pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&self.encoded).ok_or_else(|| {
@@ -86,10 +78,39 @@ impl ParakeetPreparedEncoderArtifact {
         })?;
         Ok(accounting.bytes())
     }
+}
 
-    pub(crate) const fn encoded_len(&self) -> usize {
-        self.encoded_len
+/// Encoder frames (E) the front end produces for `samples` at `sample_rate`:
+/// the same resampled length, `N / hop` valid feature frames and ×8
+/// subsampling the encoder itself uses, so preparation can size the decode
+/// before any audio is encoded.
+pub(crate) fn parakeet_encoded_len_for_samples(samples: usize, sample_rate: u32) -> usize {
+    let resampled = resampled_len(samples, sample_rate, SAMPLE_RATE);
+    subsampled_len_3x(preprocessor::valid_feature_frames(resampled))
+}
+
+/// Upper bound on the labels TDT greedy decoding can emit: at most
+/// `max_symbols` per encoder frame, so `E × max_symbols` bounds every
+/// transcript of this input.
+pub(crate) fn parakeet_max_emittable_tokens(
+    samples: usize,
+    sample_rate: u32,
+    max_symbols: usize,
+) -> Result<usize> {
+    if sample_rate == 0 {
+        return Err(Error::InvalidInput(
+            "Parakeet sample rate must be greater than zero".into(),
+        ));
     }
+    let encoded_len = parakeet_encoded_len_for_samples(samples, sample_rate);
+    if encoded_len == 0 {
+        return Err(Error::InvalidInput(
+            "Parakeet audio is shorter than one 80 ms encoder frame".into(),
+        ));
+    }
+    encoded_len
+        .checked_mul(max_symbols.max(1))
+        .ok_or_else(|| Error::Overloaded("Parakeet decode budget overflowed".into()))
 }
 
 #[derive(Clone)]
@@ -104,11 +125,15 @@ pub(crate) struct ParakeetRetainedDecodeState {
     assembled: String,
     counters: ParakeetDecodeCounters,
     finished: bool,
+    stop_reason: Option<&'static str>,
 }
 
 pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
     pub(crate) artifact: &'a ParakeetPreparedEncoderArtifact,
     pub(crate) state: &'a mut ParakeetRetainedDecodeState,
+    /// The request's decode budget. The scheduler stops scheduling a row at
+    /// this many tokens, so the row must finish here rather than strand.
+    pub(crate) max_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +251,11 @@ impl ParakeetAsrModel {
         physical::parakeet_physical_state_spec(stage_graphs)
     }
 
+    /// Labels TDT greedy decoding may emit per encoder frame.
+    pub(crate) const fn max_symbols_per_frame(&self) -> usize {
+        self.max_symbols
+    }
+
     pub(crate) fn prepare_retained_encoder(
         &self,
         audio: &[f32],
@@ -256,6 +286,13 @@ impl ParakeetAsrModel {
             return Err(Error::InferenceError(
                 "Parakeet encoder produced no decodable frames".into(),
             ));
+        }
+        // Preparation sized the decode budget from the sample count alone.
+        let budgeted_len = parakeet_encoded_len_for_samples(audio.len(), sample_rate);
+        if encoded_len != budgeted_len {
+            return Err(Error::InferenceError(format!(
+                "Parakeet encoder produced {encoded_len} frames but its decode budget assumed {budgeted_len}"
+            )));
         }
         let encoded = encoded.narrow(1, 0, encoded_len)?;
         Ok(ParakeetPreparedEncoderArtifact {
@@ -303,6 +340,7 @@ impl ParakeetAsrModel {
                     assembled: String::new(),
                     counters: ParakeetDecodeCounters::default(),
                     finished: false,
+                    stop_reason: None,
                 })
             })
             .collect()
@@ -394,21 +432,25 @@ impl ParakeetAsrModel {
         artifact: &ParakeetPreparedEncoderArtifact,
         state: &ParakeetRetainedDecodeState,
     ) -> ParakeetAsrTranscriptionOutput {
+        let mut diagnostics = serde_json::json!({
+            "input_samples": artifact.input_samples,
+            "input_sample_rate": artifact.input_sample_rate,
+            "resampled_samples": artifact.resampled_samples,
+            "feature_frames": artifact.feature_frames,
+            "encoded_frames": artifact.encoded_len,
+            "tdt_joint_steps": state.counters.tdt_joint_steps,
+            "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
+            "tdt_blank_steps": state.counters.tdt_blank_steps,
+            "host_argmax_reads": state.counters.host_argmax_reads,
+            "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
+        });
+        if let Some(stop_reason) = state.stop_reason {
+            diagnostics["stop_reason"] = stop_reason.into();
+        }
         ParakeetAsrTranscriptionOutput {
             text: state.assembled.clone(),
             language: artifact.language.clone(),
-            diagnostics: Some(serde_json::json!({
-                "input_samples": artifact.input_samples,
-                "input_sample_rate": artifact.input_sample_rate,
-                "resampled_samples": artifact.resampled_samples,
-                "feature_frames": artifact.feature_frames,
-                "encoded_frames": artifact.encoded_len,
-                "tdt_joint_steps": state.counters.tdt_joint_steps,
-                "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
-                "tdt_blank_steps": state.counters.tdt_blank_steps,
-                "host_argmax_reads": state.counters.host_argmax_reads,
-                "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
-            })),
+            diagnostics: Some(diagnostics),
         }
     }
 
@@ -531,9 +573,18 @@ impl ParakeetAsrModel {
                         .saturating_mul(self.max_symbols)
                         .saturating_mul(8)
                         .max(512);
-                    row.state.finished = row.state.t >= row.artifact.encoded_len
-                        || row.state.guard_steps >= guard_limit;
-                    row.state.counters.tdt_emitted_tokens = row.state.token_ids.len();
+                    let tokens = row.state.token_ids.len();
+                    // Every frame emitting `max_symbols` labels exhausts the
+                    // input as surely as the cursor passing its end does.
+                    let exhausted = row.state.t >= row.artifact.encoded_len
+                        || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
+                    let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+                    if budget_reached {
+                        row.state.stop_reason = Some("max_tokens");
+                    }
+                    row.state.finished =
+                        exhausted || budget_reached || row.state.guard_steps >= guard_limit;
+                    row.state.counters.tdt_emitted_tokens = tokens;
                     steps.push(ParakeetRetainedDecodeStep {
                         delta,
                         text: row.state.assembled.clone(),
@@ -2066,13 +2117,21 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
         .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
 }
 
+fn resampled_len(len: usize, src_rate: u32, dst_rate: u32) -> usize {
+    if src_rate == dst_rate || len < 2 {
+        return len;
+    }
+    let ratio = dst_rate as f64 / src_rate as f64;
+    ((len as f64) * ratio).round().max(1.0) as usize
+}
+
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     if src_rate == dst_rate || audio.len() < 2 {
         return audio.to_vec();
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
+    let out_len = resampled_len(audio.len(), src_rate, dst_rate);
 
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
@@ -2088,9 +2147,16 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_1d, Joint, LstmCell, Predictor, PRED_HIDDEN};
+    use super::{
+        argmax_1d, parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
+        ConvSubsamplingDw, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetNetwork,
+        ParakeetPreparedEncoderArtifact, ParakeetPreprocessor, ParakeetRetainedDecodeBatchRow,
+        ParakeetRetainedDecodeStep, Predictor, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+    };
+    use crate::error::Error;
+    use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
-    use candle_nn::Linear;
+    use candle_nn::{Conv2d, Conv2dConfig, Linear};
 
     fn zero_lstm(device: &Device) -> LstmCell {
         LstmCell {
@@ -2108,6 +2174,159 @@ mod tests {
             lstm_l1: zero_lstm(device),
             blank_idx: 2,
         }
+    }
+
+    const FORCED_ENCODER_DIM: usize = 3;
+
+    /// A model whose joint always emits label 0 with duration 0, so every
+    /// encoder frame emits exactly `max_symbols` labels. The encoder is a
+    /// placeholder: the retained decode only reads the prepared artifact.
+    fn forced_label_model(device: &Device) -> ParakeetAsrModel {
+        let placeholder_conv = || {
+            Conv2d::new(
+                Tensor::zeros((1, 1, 1, 1), DType::F32, device).unwrap(),
+                None,
+                Conv2dConfig::default(),
+            )
+        };
+        let predictor = zero_predictor(device);
+        let joint = Joint {
+            pred: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, PRED_HIDDEN), DType::F32, device).unwrap(),
+                None,
+            ),
+            enc: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, FORCED_ENCODER_DIM), DType::F32, device).unwrap(),
+                None,
+            ),
+            // Labels [0, 1, blank] then durations [0, 1].
+            out: Linear::new(
+                Tensor::zeros((5, PRED_HIDDEN), DType::F32, device).unwrap(),
+                Some(Tensor::new(&[4f32, 1.0, 0.0, 3.0, 0.0], device).unwrap()),
+            ),
+            num_classes_with_blank: 3,
+            num_durations: 2,
+        };
+        let blank_idx = predictor.blank_idx;
+        let num_durations = joint.num_durations;
+        ParakeetAsrModel {
+            variant: ModelVariant::ParakeetTdt06BV3,
+            _artifacts: None,
+            decoder: ParakeetDecoder::Vocab(vec!["\u{2581}a".into(), "\u{2581}b".into()]),
+            preprocessor: ParakeetPreprocessor::for_tests(device.clone()),
+            network: ParakeetNetwork {
+                pre_encode: ConvSubsamplingDw {
+                    conv0: placeholder_conv(),
+                    conv2: placeholder_conv(),
+                    conv3: placeholder_conv(),
+                    conv5: placeholder_conv(),
+                    conv6: placeholder_conv(),
+                    out: Linear::new(Tensor::zeros((1, 1), DType::F32, device).unwrap(), None),
+                },
+                layers: Vec::new(),
+                predictor,
+                joint,
+                blank_idx,
+                num_durations,
+            },
+            blank_idx,
+            num_durations,
+            max_symbols: DEFAULT_MAX_SYMBOLS,
+        }
+    }
+
+    fn zero_artifact(device: &Device, encoded_len: usize) -> ParakeetPreparedEncoderArtifact {
+        ParakeetPreparedEncoderArtifact {
+            encoded: Tensor::zeros((1, encoded_len, FORCED_ENCODER_DIM), DType::F32, device)
+                .unwrap(),
+            encoded_len,
+            input_samples: encoded_len * 1280,
+            input_sample_rate: 16_000,
+            resampled_samples: encoded_len * 1280,
+            feature_frames: encoded_len * 8,
+            language: None,
+        }
+    }
+
+    fn decode_until_finished(
+        model: &ParakeetAsrModel,
+        artifact: &ParakeetPreparedEncoderArtifact,
+        max_tokens: usize,
+    ) -> (Vec<ParakeetRetainedDecodeStep>, serde_json::Value) {
+        let mut state = model.start_retained_decode().unwrap();
+        let mut steps = Vec::new();
+        while steps
+            .last()
+            .is_none_or(|step: &ParakeetRetainedDecodeStep| !step.finished)
+        {
+            assert!(steps.len() <= 1_000, "retained decode never finished");
+            let mut rows = [ParakeetRetainedDecodeBatchRow {
+                artifact,
+                state: &mut state,
+                max_tokens,
+            }];
+            steps.extend(model.retained_decode_step_batch(&mut rows).unwrap());
+        }
+        let diagnostics = model
+            .retained_decode_output(artifact, &state)
+            .diagnostics
+            .unwrap();
+        (steps, diagnostics)
+    }
+
+    #[test]
+    fn parakeet_encoded_len_follows_front_end_geometry() {
+        // test.wav: 3.6 s -> 360 valid feature frames -> 45 encoder frames.
+        assert_eq!(parakeet_encoded_len_for_samples(57_600, 16_000), 45);
+        assert_eq!(parakeet_encoded_len_for_samples(172_800, 48_000), 45);
+        // 29.7 s -> 2970 feature frames -> ceil(2970 / 8) frames.
+        assert_eq!(parakeet_encoded_len_for_samples(475_200, 16_000), 372);
+        assert_eq!(parakeet_encoded_len_for_samples(159, 16_000), 0);
+        assert_eq!(parakeet_encoded_len_for_samples(160, 16_000), 1);
+
+        assert_eq!(
+            parakeet_max_emittable_tokens(475_200, 16_000, DEFAULT_MAX_SYMBOLS).unwrap(),
+            3_720
+        );
+        assert!(matches!(
+            parakeet_max_emittable_tokens(159, 16_000, DEFAULT_MAX_SYMBOLS),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            parakeet_max_emittable_tokens(16_000, 0, DEFAULT_MAX_SYMBOLS),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn retained_decode_finishes_at_max_tokens_with_stop_reason() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        let artifact = zero_artifact(&device, 4);
+
+        let (steps, diagnostics) = decode_until_finished(&model, &artifact, 5);
+
+        assert_eq!(steps.len(), 5);
+        assert!(steps[..4].iter().all(|step| !step.finished));
+        assert_eq!(steps[4].tokens_generated, 5);
+        assert_eq!(diagnostics["stop_reason"], "max_tokens");
+        assert_eq!(diagnostics["tdt_emitted_tokens"], 5);
+    }
+
+    #[test]
+    fn retained_decode_at_emittable_bound_ends_without_cap() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        let artifact = zero_artifact(&device, 4);
+        let bound = artifact.encoded_len * DEFAULT_MAX_SYMBOLS;
+
+        let (steps, diagnostics) = decode_until_finished(&model, &artifact, bound);
+
+        // Every frame emits max_symbols labels, so the bound is exactly the
+        // transcript: the decode ends there without reporting a cap.
+        assert_eq!(steps.last().unwrap().tokens_generated, bound);
+        assert_eq!(steps.len(), bound);
+        assert!(diagnostics.get("stop_reason").is_none());
     }
 
     #[test]

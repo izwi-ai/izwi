@@ -720,6 +720,23 @@ fn asr_encoder_retained_resources(
     retained_artifact_resources(backend, host_bytes, accelerator_bytes)
 }
 
+/// Parakeet's decode budget is the input's emittable-label bound, not the
+/// portable token context: its recurrent predictor keeps no per-token state,
+/// so the context limits nothing, while long dense audio exceeds 4096 labels.
+/// A caller's `max_tokens` is kept below the bound by the sequence clamp.
+fn install_parakeet_decode_budget(
+    request: &mut EngineCoreRequest,
+    max_emittable_tokens: usize,
+) -> Result<()> {
+    if request.asr_auto_max_tokens {
+        request.params.max_tokens = max_emittable_tokens;
+    }
+    let sequence_tokens = max_emittable_tokens
+        .checked_add(1)
+        .ok_or_else(|| Error::Overloaded("Parakeet decode budget overflowed".into()))?;
+    request.install_prepared_sequence_input_tokens(1, sequence_tokens)
+}
+
 /// Fish's request lease owns host preparation buffers and the eventual artifact.
 /// Codec tensor workspace is leased separately by the physical batch runner.
 pub(super) fn fish_s2_preparation_resources(
@@ -5538,11 +5555,12 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
         let model_arc = model.model_arc();
-        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref() else {
+        let crate::models::registry::NativeAsrModel::Parakeet(parakeet) = model_arc.as_ref() else {
             return Err(Error::ModelLoadError(
                 "Parakeet registry lease crossed model family".into(),
             ));
         };
+        let max_symbols = parakeet.max_symbols_per_frame();
         let residency = residency_lease.ok_or_else(|| {
             Error::InferenceError("Parakeet preparation requires model residency".into())
         })?;
@@ -5559,20 +5577,20 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .ok_or_else(|| {
-                Error::ModelLoadError(format!("Parakeet model {variant} has no effective context"))
-            })?;
         let prepared = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let max_emittable_tokens =
+                    crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
+                        samples.len(),
+                        sample_rate,
+                        max_symbols,
+                    )?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                request.install_prepared_sequence_input_tokens(1, context_limit)?;
+                install_parakeet_decode_budget(&mut request, max_emittable_tokens)?;
                 Ok(request)
             })
             .await?;
@@ -9905,6 +9923,29 @@ mod tests {
                 .as_deref(),
             Some("None")
         );
+    }
+
+    #[test]
+    fn parakeet_decode_budget_tracks_emittable_labels() {
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        // 29.7 s at 16 kHz: 372 encoder frames × 10 labels.
+        let max_emittable =
+            crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
+                475_200, 16_000, 10,
+            )
+            .unwrap();
+        assert_eq!(max_emittable, 3_720);
+        let request = |max_tokens: usize, auto: bool| {
+            let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+            request.params.max_tokens = max_tokens;
+            request.asr_auto_max_tokens = auto;
+            install_parakeet_decode_budget(&mut request, max_emittable).unwrap();
+            request.params.max_tokens
+        };
+
+        assert_eq!(request(2048, true), max_emittable);
+        assert_eq!(request(5, false), 5);
+        assert_eq!(request(50_000, false), max_emittable);
     }
 
     #[tokio::test]

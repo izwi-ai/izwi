@@ -5544,10 +5544,21 @@ impl RequestProcessor {
 
         request.stream_policy.validate()?;
 
+        // Parakeet preparation already bounded max_tokens by the input's
+        // emittable labels (E × max_symbols). Long audio exceeds the token
+        // context, which limits nothing in Parakeet's decode, so only an
+        // unprepared Parakeet request keeps the context clamp.
+        let output_bound_prepared = request.task_type == TaskType::ASR
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::ParakeetAsr)
+            && request.prepared_sequence_input_tokens.is_some();
+
         // Validate and clamp parameters
         self.validate_params(
             request.task_type,
             request.model_variant,
+            output_bound_prepared,
             &mut request.params,
         )?;
 
@@ -5563,6 +5574,7 @@ impl RequestProcessor {
         &self,
         task_type: TaskType,
         model_variant: Option<crate::model::ModelVariant>,
+        output_bound_prepared: bool,
         params: &mut GenerationParams,
     ) -> Result<()> {
         // Clamp temperature
@@ -5589,6 +5601,7 @@ impl RequestProcessor {
                         .unwrap_or(self.config.max_seq_len);
                     params.max_tokens.min(tts_limit)
                 }
+                _ if output_bound_prepared => params.max_tokens,
                 _ => params.max_tokens.min(self.config.max_seq_len),
             };
         }
@@ -7017,6 +7030,32 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn test_request_processor_keeps_prepared_parakeet_decode_budget() {
+        let config = EngineCoreConfig::default();
+        let max_seq_len = config.max_seq_len;
+        let budget = max_seq_len * 4;
+        let processor = RequestProcessor::new(config);
+        let parakeet = |prepared: bool| {
+            let mut request = EngineCoreRequest::asr("UklGRg==")
+                .with_model_variant(ModelVariant::ParakeetTdt06BV3);
+            request.params.max_tokens = budget;
+            if prepared {
+                request
+                    .install_prepared_sequence_input_tokens(1, budget + 1)
+                    .expect("Parakeet budget installs");
+            }
+            processor
+                .process(request)
+                .expect("request should process")
+                .params
+                .max_tokens
+        };
+
+        assert_eq!(parakeet(true), budget);
+        assert_eq!(parakeet(false), max_seq_len);
     }
 
     #[test]
