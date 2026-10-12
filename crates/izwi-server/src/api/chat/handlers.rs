@@ -117,6 +117,21 @@ pub struct CreateThreadMessageRequest {
 pub struct ChatGenerationStats {
     pub tokens_generated: usize,
     pub generation_time_ms: f64,
+    /// The engine's per-phase timing (queue, prefill, decode wall time and
+    /// tokens, TTFT). The chat UI derives decode speed from it, because
+    /// `generation_time_ms` includes queue wait and prompt processing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<izwi_core::engine::LatencyBreakdown>,
+}
+
+impl ChatGenerationStats {
+    fn from_generation(generation: &izwi_core::ChatGeneration) -> Self {
+        Self {
+            tokens_generated: generation.tokens_generated,
+            generation_time_ms: generation.generation_time_ms,
+            timing: generation.latency_breakdown.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -378,10 +393,7 @@ pub async fn create_thread_message(
         model_id,
         user_message,
         assistant_message,
-        stats: ChatGenerationStats {
-            tokens_generated: generation.tokens_generated,
-            generation_time_ms: generation.generation_time_ms,
-        },
+        stats: ChatGenerationStats::from_generation(&generation),
     };
 
     Ok(Json(response).into_response())
@@ -453,10 +465,7 @@ async fn create_streaming_thread_message(
                                 thread_id: thread_id_for_task.clone(),
                                 model_id: model_id_for_task.clone(),
                                 assistant_message,
-                                stats: ChatGenerationStats {
-                                    tokens_generated: generation.tokens_generated,
-                                    generation_time_ms: generation.generation_time_ms,
-                                },
+                                stats: ChatGenerationStats::from_generation(&generation),
                             })
                             .unwrap_or_default(),
                             Err(err) => {
@@ -598,6 +607,49 @@ fn map_store_or_not_found(err: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn generation_with_timing(
+        timing: Option<izwi_core::engine::LatencyBreakdown>,
+    ) -> izwi_core::ChatGeneration {
+        izwi_core::ChatGeneration {
+            latency_breakdown: timing,
+            finish_reason: None,
+            text: "done".to_string(),
+            prompt_tokens: 12,
+            tokens_generated: 40,
+            generation_time_ms: 2_000.0,
+            cached_prompt_tokens: None,
+            logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn thread_stats_carry_the_engine_timing_for_decode_speed() {
+        let timing: izwi_core::engine::LatencyBreakdown = serde_json::from_value(json!({
+            "queue_wait_ms": 300.0,
+            "prefill_ms": 1_200.0,
+            "decode_ms": 380.0,
+            "decode_wall_ms": 400.0,
+            "decode_tokens": 39,
+            "ttft_ms": 1_550.0,
+            "total_ms": 2_000.0,
+            "prefill_steps": 2,
+            "decode_steps": 39,
+        }))
+        .expect("timing fixture");
+
+        let stats = ChatGenerationStats::from_generation(&generation_with_timing(Some(timing)));
+        let value = serde_json::to_value(&stats).expect("stats serialize");
+        assert_eq!(value["tokens_generated"], 40);
+        assert_eq!(value["generation_time_ms"], 2_000.0);
+        assert_eq!(value["timing"]["decode_wall_ms"], 400.0);
+        assert_eq!(value["timing"]["decode_tokens"], 39);
+        assert_eq!(value["timing"]["ttft_ms"], 1_550.0);
+
+        let untimed = ChatGenerationStats::from_generation(&generation_with_timing(None));
+        let value = serde_json::to_value(&untimed).expect("stats serialize");
+        assert!(value.get("timing").is_none(), "{value}");
+    }
 
     #[test]
     fn flattens_thread_text_parts() {

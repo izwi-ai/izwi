@@ -8,6 +8,7 @@ import {
   isQwen38ThinkingModel,
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
+  summarizeChatStats,
   supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
   systemPromptForModel,
@@ -219,5 +220,54 @@ describe("chat playground support", () => {
         },
       ],
     });
+  });
+
+  it("reports decode speed and TTFT when the engine measured them", () => {
+    expect(
+      summarizeChatStats({
+        tokens_generated: 41,
+        generation_time_ms: 2_000,
+        timing: {
+          queue_wait_ms: 300,
+          prefill_ms: 1_200,
+          decode_ms: 380,
+          decode_wall_ms: 400,
+          decode_tokens: 40,
+          ttft_ms: 1_550,
+          total_ms: 2_000,
+        },
+      }),
+    ).toEqual({
+      tokens: 41,
+      totalMs: 2_000,
+      tokensPerSecond: 100,
+      decodeOnly: true,
+      ttftMs: 1_550,
+    });
+  });
+
+  it("falls back to tokens over total time without decode timing", () => {
+    expect(
+      summarizeChatStats({ tokens_generated: 48, generation_time_ms: 240 }),
+    ).toEqual({
+      tokens: 48,
+      totalMs: 240,
+      tokensPerSecond: 200,
+      decodeOnly: false,
+      ttftMs: null,
+    });
+    expect(
+      summarizeChatStats({
+        tokens_generated: 1,
+        generation_time_ms: 0,
+        timing: {
+          queue_wait_ms: 0,
+          prefill_ms: 0,
+          decode_ms: 0,
+          ttft_ms: null,
+          total_ms: 0,
+        },
+      }),
+    ).toMatchObject({ tokensPerSecond: 0, decodeOnly: false, ttftMs: null });
   });
 });
