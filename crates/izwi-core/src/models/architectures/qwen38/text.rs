@@ -13,6 +13,7 @@ use super::chat::Qwen38TextConfig;
 use super::fast_path::{
     compare_values, decode_gate, summarize, Qwen38CudaSwitches, Qwen38FastPath, FUSED_AB_GEMV_ENV,
     FUSED_ATTN_GATE_ENV, FUSED_GDN_ENV, FUSED_KV_WRITE_ENV, FUSED_NORM_ENV, FUSED_QK_ROPE_ENV,
+    GDN_PREFILL_ENV,
 };
 use super::native::{
     IndexedSafetensors, ProjectionMaterialization, Qwen38LayerType, Qwen38NativeConfig,
@@ -39,6 +40,7 @@ use crate::kernels::cuda::gate;
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
 use crate::kernels::cuda::norm;
 use crate::kernels::cuda::rope::{self, MropePosition, QkNormRopeSpec};
+use crate::kernels::cuda::{qwen38_deltanet_sequence, qwen38_deltanet_sequence_supported};
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen38_causal_conv_decode, try_qwen38_causal_conv_sequence,
@@ -1133,6 +1135,11 @@ struct Qwen38LinearAttention {
     /// graphs. Resolved at load.
     alpha_beta_rows: Option<Tensor>,
     alpha_beta_gemv_path: Qwen38FastPath,
+    /// Grouped prefill (`kernels::cuda::qwen38_deltanet_sequence`): one
+    /// launch per chunk straight from the conv output, no expanded q/k.
+    /// Resolved at load; verification spans keep today's path.
+    gdn_prefill: bool,
+    gdn_prefill_path: Qwen38FastPath,
 }
 
 /// One synthetic row of DeltaNet decode projections for the fused self-check.
@@ -1868,11 +1875,13 @@ impl Qwen38TextModel {
     pub(super) fn resolve_fast_paths(&mut self, switches: &Qwen38CudaSwitches, allow_cpu: bool) {
         self.resolve_fused_norms(switches, allow_cpu);
         let dtype = self.activation_dtype();
+        let mut gdn_prefill = None;
         for layer in &mut self.layers {
             match &mut layer.mixer {
                 Qwen38Mixer::Linear(linear) => {
                     linear.resolve_fused_gdn(switches, &self.device, dtype, allow_cpu);
                     linear.resolve_alpha_beta_gemv(switches, &self.device, dtype, allow_cpu);
+                    linear.resolve_gdn_prefill(switches, &self.device, allow_cpu, &mut gdn_prefill);
                 }
                 Qwen38Mixer::Full(attention) => {
                     attention.resolve_fused_attention(switches, &self.device, dtype, allow_cpu)
@@ -1894,6 +1903,10 @@ impl Qwen38TextModel {
             "rms_norm": summarize([&self.fused_norm_path]),
             "gdn_decode": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
                 Qwen38Mixer::Linear(linear) => Some(&linear.fused_gdn_path),
+                Qwen38Mixer::Full(_) => None,
+            })),
+            "gdn_prefill": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => Some(&linear.gdn_prefill_path),
                 Qwen38Mixer::Full(_) => None,
             })),
             "gdn_alpha_beta_gemv": summarize(self.layers.iter().filter_map(|layer| match &layer.mixer {
@@ -3462,6 +3475,8 @@ impl Qwen38LinearAttention {
             fused_gdn_path: Qwen38FastPath::default(),
             alpha_beta_rows: None,
             alpha_beta_gemv_path: Qwen38FastPath::default(),
+            gdn_prefill: false,
+            gdn_prefill_path: Qwen38FastPath::default(),
         })
     }
 
@@ -4215,7 +4230,94 @@ impl Qwen38LinearAttention {
 
         let convolution_input = verification.as_ref().map(|_| mixed_qkv.clone());
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
+        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
+            return Err(Error::InferenceError(format!(
+                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
 
+        let current_state = if let Some(state) = recurrent_state.take() {
+            state
+        } else {
+            if mixed_qkv.device().is_cuda() {
+                record_cuda_state_initial_allocation();
+            }
+            Tensor::zeros(
+                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                DType::F32,
+                mixed_qkv.device(),
+            )?
+        };
+
+        let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
+        let g = g.reshape((1, seq_len, self.num_v_heads))?;
+        // The grouped kernel reads the conv output as is. Verification keeps
+        // today's path: it retains the normalized q/k for prefix recovery.
+        let grouped = if self.gdn_prefill && verification.is_none() {
+            let result = qwen38_deltanet_sequence(
+                &mixed_qkv,
+                &g,
+                &beta,
+                &current_state,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+            );
+            if mixed_qkv.device().is_cuda() {
+                record_cuda_kernel(CudaKernelPath::DeltaNetGroupedPrefill, result.is_ok());
+            }
+            match result {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    tracing::warn!(%error, "Qwen3.8 grouped DeltaNet prefill failed; using the legacy recurrence");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (output, next_state) = match grouped {
+            Some(result) => result,
+            None => {
+                let (query, key, value) = self.normalized_qkv(&mixed_qkv, seq_len)?;
+                if let Some(retained) = verification {
+                    *retained = Some(Qwen38LinearVerification {
+                        initial: initial.expect("recording retains initial state"),
+                        convolution_input: convolution_input.expect("recording retains conv input"),
+                        query: query.clone(),
+                        key: key.clone(),
+                        value: value.clone(),
+                        g: g.clone(),
+                        beta: beta.clone(),
+                    });
+                }
+                self.legacy_sequence_recurrence(query, key, value, &g, &beta, current_state)?
+            }
+        };
+        // Sequence kernels may return the final state as a view into their
+        // packed output. Detach only this fixed-size escape value, using
+        // Candle-managed storage rather than an application private buffer.
+        *recurrent_state = Some(deep_copy_tensor_storage(&next_state)?);
+
+        let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
+        let output = self.norm.forward(&output, &z, false)?;
+        let output = output
+            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
+            .to_dtype(residual_dtype)?;
+        self.out_proj.forward(&output).map_err(Error::from)
+    }
+
+    /// Split a conv output `[1, seq, conv_dim]` into L2-normalized query and
+    /// key `[1, seq, key heads, key dim]` and the value `[1, seq, value
+    /// heads, value dim]`, as the legacy prefill recurrence consumes them.
+    fn normalized_qkv(
+        &self,
+        mixed_qkv: &Tensor,
+        seq_len: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let key_width = self.num_k_heads * self.head_k_dim;
         let value_width = self.num_v_heads * self.head_v_dim;
         let query = mixed_qkv.narrow(2, 0, key_width)?.reshape((
@@ -4236,114 +4338,170 @@ impl Qwen38LinearAttention {
             self.num_v_heads,
             self.head_v_dim,
         ))?;
+        Ok((
+            l2norm(&query, 1e-6, self.fused_decode)?,
+            l2norm(&key, 1e-6, self.fused_decode)?,
+            value,
+        ))
+    }
 
-        let query = l2norm(&query, 1e-6, self.fused_decode)?;
-        let key = l2norm(&key, 1e-6, self.fused_decode)?;
-        if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
-            return Err(Error::InferenceError(format!(
-                "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
-                self.num_v_heads, self.num_k_heads
-            )));
-        }
-
-        let current_state = if let Some(state) = recurrent_state.take() {
-            state
+    /// Today's prefill recurrence over normalized q/k: the tiled sequence
+    /// kernel when enabled, the portable recurrence otherwise. Both take one
+    /// q/k head per value head, so a grouped layout (16 key / 48 value heads)
+    /// is first expanded in Transformers' repeat-interleave order; the
+    /// kernel is never tried on the unexpanded heads it rejects.
+    fn legacy_sequence_recurrence(
+        &self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        state: Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let seq_len = query.dim(1)?;
+        let (query, key) = if self.num_v_heads == self.num_k_heads {
+            (query, key)
         } else {
-            if value.device().is_cuda() {
-                record_cuda_state_initial_allocation();
+            let repeats = self.num_v_heads / self.num_k_heads;
+            if query.device().is_cuda() {
+                record_cuda_head_expansion_materialization();
+                record_cuda_head_expansion_materialization();
             }
-            Tensor::zeros(
-                (1, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                value.dtype(),
-                value.device(),
-            )?
+            (
+                repeat_interleave_head_states_seq(&query, repeats)?,
+                repeat_interleave_head_states_seq(&key, repeats)?,
+            )
         };
-
-        let beta = beta.reshape((1, seq_len, self.num_v_heads))?;
-        let g = g.reshape((1, seq_len, self.num_v_heads))?;
-        if let Some(retained) = verification {
-            *retained = Some(Qwen38LinearVerification {
-                initial: initial.expect("recording retains initial state"),
-                convolution_input: convolution_input.expect("recording retains conv input"),
-                query: query.clone(),
-                key: key.clone(),
-                value: value.clone(),
-                g: g.clone(),
-                beta: beta.clone(),
-            });
-        }
-        let tile_size =
-            qwen38_tiled_recurrence_tile_size(seq_len, self.tiled_recurrence_tile_size_override);
-        let fused_sequence = if self.tiled_recurrence_enabled {
-            let fused = try_tiled_deltanet_recurrence(
-                &query,
-                &key,
-                &value,
-                &g,
-                &beta,
-                &current_state,
-                tile_size,
+        if self.tiled_recurrence_enabled {
+            let tile_size = qwen38_tiled_recurrence_tile_size(
+                seq_len,
+                self.tiled_recurrence_tile_size_override,
             );
+            let fused =
+                try_tiled_deltanet_recurrence(&query, &key, &value, g, beta, &state, tile_size);
             if query.device().is_cuda() {
                 record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused.is_some());
             }
-            fused
-        } else {
-            None
-        };
-        let (output, next_state) = if let Some(fused_sequence) = fused_sequence {
-            fused_sequence
-        } else {
-            // The portable recurrence consumes one Q/K head per value head.
-            // Native Qwen3.8 stores 16 Q/K heads and 48 value heads, so expand
-            // with Transformers' repeat-interleave ordering before fallback.
-            let (query, key) = if self.num_v_heads == self.num_k_heads {
-                (query, key)
-            } else {
-                let repeats = self.num_v_heads / self.num_k_heads;
-                if query.device().is_cuda() {
-                    record_cuda_head_expansion_materialization();
-                    record_cuda_head_expansion_materialization();
-                }
-                (
-                    repeat_interleave_head_states_seq(&query, repeats)?,
-                    repeat_interleave_head_states_seq(&key, repeats)?,
-                )
-            };
-            if self.tiled_recurrence_enabled {
-                let fused_sequence = try_tiled_deltanet_recurrence(
-                    &query,
-                    &key,
-                    &value,
-                    &g,
-                    &beta,
-                    &current_state,
-                    tile_size,
-                );
-                if query.device().is_cuda() {
-                    record_cuda_kernel(CudaKernelPath::DeltaNetPrefill, fused_sequence.is_some());
-                }
-                if let Some(fused_sequence) = fused_sequence {
-                    fused_sequence
-                } else {
-                    recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
-                }
-            } else {
-                recurrent_gated_delta_sequence(&query, &key, &value, &g, &beta, current_state)?
+            if let Some(fused) = fused {
+                return Ok(fused);
             }
-        };
-        // Sequence kernels may return the final state as a view into their
-        // packed output. Detach only this fixed-size escape value, using
-        // Candle-managed storage rather than an application private buffer.
-        *recurrent_state = Some(deep_copy_tensor_storage(&next_state)?);
+        }
+        recurrent_gated_delta_sequence(&query, &key, &value, g, beta, state)
+    }
 
-        let output = output.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
-        let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
-        let output = self.norm.forward(&output, &z, false)?;
-        let output = output
-            .reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?
-            .to_dtype(residual_dtype)?;
-        self.out_proj.forward(&output).map_err(Error::from)
+    /// Resolve the grouped DeltaNet prefill (`kernels::cuda::
+    /// qwen38_deltanet_sequence`) at load. It needs 128-dim key heads, value
+    /// heads grouped over key heads and a value width divisible by 16, and
+    /// turns on only after [`Self::gdn_prefill_self_check`] passes on this
+    /// device. The kernel has no weights, so one verdict per geometry
+    /// (`shared`) serves every layer. `IZWI_QWEN38_GDN_PREFILL=legacy`
+    /// keeps today's recurrence.
+    fn resolve_gdn_prefill(
+        &mut self,
+        switches: &Qwen38CudaSwitches,
+        device: &Device,
+        allow_cpu: bool,
+        shared: &mut Option<([usize; 4], Qwen38FastPath)>,
+    ) {
+        let geometry = [
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        ];
+        self.gdn_prefill_path = if let Some(path) =
+            decode_gate(GDN_PREFILL_ENV, switches, device, allow_cpu)
+        {
+            path
+        } else if !qwen38_deltanet_sequence_supported(
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        ) {
+            Qwen38FastPath::legacy(
+                "the grouped DeltaNet prefill needs 128-dim key heads, value heads grouped over key heads and a value width divisible by 16",
+            )
+        } else if let Some((_, path)) = shared.as_ref().filter(|(seen, _)| *seen == geometry) {
+            path.clone()
+        } else {
+            let path = match self.gdn_prefill_self_check(device) {
+                Ok(()) => Qwen38FastPath::Fused,
+                Err(error) => Qwen38FastPath::self_check_failed("DeltaNet prefill", &error),
+            };
+            *shared = Some((geometry, path.clone()));
+            path
+        };
+        self.gdn_prefill = self.gdn_prefill_path.is_fused();
+    }
+
+    /// The grouped prefill kernel against today's recurrence (split, L2
+    /// norms, head expansion, the tiled or portable recurrence) on synthetic
+    /// inputs at this layer's geometry: 37 tokens, crossing the legacy
+    /// path's 16-token tiles and the kernel's one-token prefetch, from a
+    /// non-zero state. Outputs and final states must agree to 1e-4 relative
+    /// L2 and 1e-3 of the largest value per element (NaN-safe).
+    fn gdn_prefill_self_check(&self, device: &Device) -> Result<()> {
+        const TOKENS: usize = 37;
+        let (heads, key_dim, value_dim) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+        let conv_dim = 2 * self.num_k_heads * key_dim + heads * value_dim;
+        let tensor = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor> {
+            Ok(Tensor::from_vec(values, shape, &Device::Cpu)?.to_device(device)?)
+        };
+        // Pseudo-random (xorshift) inputs: a sinusoid's structure lets a
+        // wrong key-head mapping through at a fraction of a percent.
+        let noise =
+            |rows: usize, width: usize, seed: u64| probe_activations(rows, width, DType::F32, seed);
+        let mixed_qkv = tensor(noise(TOKENS, conv_dim, 31), &[1, TOKENS, conv_dim])?;
+        let g = tensor(
+            noise(TOKENS, heads, 32)
+                .iter()
+                .map(|v| -(0.02 + 0.5 * v.abs()))
+                .collect(),
+            &[1, TOKENS, heads],
+        )?;
+        let beta = tensor(
+            noise(TOKENS, heads, 33)
+                .iter()
+                .map(|v| 0.5 + 0.45 * v.clamp(-1.0, 1.0))
+                .collect(),
+            &[1, TOKENS, heads],
+        )?;
+        let state = tensor(
+            noise(heads * key_dim, value_dim, 34)
+                .iter()
+                .map(|v| 0.1 * v)
+                .collect(),
+            &[1, heads, key_dim, value_dim],
+        )?;
+        let (output, next_state) = qwen38_deltanet_sequence(
+            &mixed_qkv,
+            &g,
+            &beta,
+            &state,
+            self.num_k_heads,
+            heads,
+            key_dim,
+            value_dim,
+        )?;
+        let (query, key, value) = self.normalized_qkv(&mixed_qkv, TOKENS)?;
+        let (expected, expected_state) =
+            self.legacy_sequence_recurrence(query, key, value, &g, &beta, state)?;
+        compare_values(
+            "DeltaNet prefill output",
+            &host_values(&output)?,
+            &host_values(&expected)?,
+            1e-4,
+            1e-3,
+        )?;
+        compare_values(
+            "DeltaNet prefill state",
+            &host_values(&next_state)?,
+            &host_values(&expected_state)?,
+            1e-4,
+            1e-3,
+        )
     }
 
     fn depthwise_conv_sequence(
@@ -6090,6 +6248,8 @@ mod tests {
             fused_gdn_path: Default::default(),
             alpha_beta_rows: None,
             alpha_beta_gemv_path: Default::default(),
+            gdn_prefill: false,
+            gdn_prefill_path: Default::default(),
         };
         let input = Tensor::from_vec(
             vec![0.2f32, -0.1, 0.3, 0.4, -0.3, 0.5, 0.1, 0.2],

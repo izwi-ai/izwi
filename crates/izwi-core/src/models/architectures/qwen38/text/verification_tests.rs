@@ -77,6 +77,8 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         fused_gdn_path: Default::default(),
         alpha_beta_rows: None,
         alpha_beta_gemv_path: Default::default(),
+        gdn_prefill: false,
+        gdn_prefill_path: Default::default(),
     };
     let full = Qwen38FullAttention {
         qkv_proj: Qwen38ProjectionGroup::Separate(vec![

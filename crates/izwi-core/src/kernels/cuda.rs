@@ -727,6 +727,287 @@ pub fn try_qwen38_deltanet_decode(
     Some((output, next_state))
 }
 
+/// Key rows of the state the Qwen3.8 grouped DeltaNet sequence kernel holds
+/// in registers (sixteen per lane, eight lanes per value column).
+pub const QWEN38_DELTANET_SEQUENCE_KEY_DIM: usize = 128;
+/// Value columns per block of that kernel (four per warp, four warps).
+const QWEN38_DELTANET_SEQUENCE_COLUMNS: usize = 16;
+
+/// Whether [`qwen38_deltanet_sequence`] serves a linear-attention layout:
+/// 128-dim key heads, value heads grouped over key heads, and a value width
+/// that is a multiple of 16.
+pub fn qwen38_deltanet_sequence_supported(
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> bool {
+    key_dim == QWEN38_DELTANET_SEQUENCE_KEY_DIM
+        && key_heads > 0
+        && value_heads > 0
+        && value_heads.is_multiple_of(key_heads)
+        && value_dim > 0
+        && value_dim.is_multiple_of(QWEN38_DELTANET_SEQUENCE_COLUMNS)
+}
+
+/// Qwen3.8 Gated DeltaNet prefill over one chunk, straight from the conv
+/// output's native grouped layout: one launch on CUDA (`qwen38.cu`
+/// `qwen38_deltanet_sequence_f32`, register-resident state, in-kernel q/k L2
+/// norms, value head `v` reading key head `v / (value_heads / key_heads)`),
+/// the same recurrence as a portable reference on the CPU. No expanded q/k
+/// or concatenated qkv is made.
+///
+/// `mixed_qkv` is `[1, sequence, conv_dim]` F32 (q | k | v), `g` (the log
+/// decay) and `beta` are `[1, sequence, value_heads]` F32, and
+/// `initial_state` is `[1, value_heads, key_dim, value_dim]` F32. Returns the
+/// output `[1, sequence, value_heads, value_dim]` and the final state
+/// `[1, value_heads, key_dim, value_dim]`, both views of one packed buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen38_deltanet_sequence(
+    mixed_qkv: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    initial_state: &Tensor,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let (batch, sequence, conv_dim) = mixed_qkv.dims3()?;
+    let width = key_heads
+        .checked_mul(key_dim)
+        .and_then(|width| width.checked_mul(2))
+        .and_then(|width| width.checked_add(value_heads.checked_mul(value_dim)?));
+    let same = |tensor: &Tensor| {
+        tensor.dtype() == DType::F32 && tensor.device().same_device(mixed_qkv.device())
+    };
+    if !qwen38_deltanet_sequence_supported(key_heads, value_heads, key_dim, value_dim)
+        || batch != 1
+        || sequence == 0
+        || width != Some(conv_dim)
+        || g.dims() != [1, sequence, value_heads]
+        || beta.dims() != [1, sequence, value_heads]
+        || initial_state.dims() != [1, value_heads, key_dim, value_dim]
+        || ![mixed_qkv, g, beta, initial_state].into_iter().all(same)
+    {
+        candle_core::bail!(
+            "invalid Qwen3.8 DeltaNet sequence contract: mixed {:?}, g {:?}, beta {:?}, state {:?}",
+            mixed_qkv.dims(),
+            g.dims(),
+            beta.dims(),
+            initial_state.dims()
+        )
+    }
+    let gates = Tensor::cat(
+        &[&g.unsqueeze(D::Minus1)?, &beta.unsqueeze(D::Minus1)?],
+        D::Minus1,
+    )?
+    .contiguous()?;
+    let packed = mixed_qkv.contiguous()?.apply_op3_no_bwd(
+        &gates,
+        &initial_state.contiguous()?,
+        &Qwen38DeltaNetSequenceOp {
+            sequence,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        },
+    )?;
+    let output_elements = sequence * value_heads * value_dim;
+    let state_elements = value_heads * key_dim * value_dim;
+    Ok((
+        packed
+            .narrow(0, 0, output_elements)?
+            .reshape((1, sequence, value_heads, value_dim))?,
+        packed
+            .narrow(0, output_elements, state_elements)?
+            .reshape((1, value_heads, key_dim, value_dim))?,
+    ))
+}
+
+struct Qwen38DeltaNetSequenceOp {
+    sequence: usize,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+}
+
+impl CustomOp3 for Qwen38DeltaNetSequenceOp {
+    fn name(&self) -> &'static str {
+        "qwen38-deltanet-sequence"
+    }
+
+    /// The portable reference: the kernel's recurrence in F32, per value
+    /// head and token: decay the state, recall with the normalized key,
+    /// update with the beta-scaled delta, read out with the normalized,
+    /// 1/sqrt(key_dim)-scaled query.
+    fn cpu_fwd(
+        &self,
+        qkv: &CpuStorage,
+        qkv_layout: &Layout,
+        gates: &CpuStorage,
+        gates_layout: &Layout,
+        state: &CpuStorage,
+        state_layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        fn slice<'a>(
+            storage: &'a CpuStorage,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<&'a [f32]> {
+            let CpuStorage::F32(values) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(&values[start..end])
+        }
+        let qkv = slice(qkv, qkv_layout, "mixed_qkv")?;
+        let gates = slice(gates, gates_layout, "gates")?;
+        let state = slice(state, state_layout, "initial_state")?;
+        let (dk, dv, hv) = (self.key_dim, self.value_dim, self.value_heads);
+        let repeats = hv / self.key_heads;
+        let key_width = self.key_heads * dk;
+        let conv_dim = 2 * key_width + hv * dv;
+        let query_scale = (dk as f32).sqrt().recip();
+        let output_elements = self.sequence * hv * dv;
+        let mut packed = vec![0f32; output_elements + hv * dk * dv];
+        let (outputs, final_state) = packed.split_at_mut(output_elements);
+        final_state.copy_from_slice(state);
+        let norm = |values: &[f32]| {
+            (values.iter().map(|v| v * v).sum::<f32>() + 1e-6)
+                .sqrt()
+                .recip()
+        };
+        for (value_head, head_state) in final_state.chunks_exact_mut(dk * dv).enumerate() {
+            let key_head = value_head / repeats;
+            for t in 0..self.sequence {
+                let row = &qkv[t * conv_dim..(t + 1) * conv_dim];
+                let query = &row[key_head * dk..(key_head + 1) * dk];
+                let key = &row[key_width + key_head * dk..key_width + (key_head + 1) * dk];
+                let value =
+                    &row[2 * key_width + value_head * dv..2 * key_width + (value_head + 1) * dv];
+                let (query_norm, key_norm) = (norm(query), norm(key));
+                let gate = &gates[(t * hv + value_head) * 2..][..2];
+                let (decay, beta) = (gate[0].exp(), gate[1]);
+                head_state.iter_mut().for_each(|s| *s *= decay);
+                for (column, value) in value.iter().enumerate() {
+                    let recalled: f32 = key
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| k * head_state[i * dv + column])
+                        .sum();
+                    let update = (value - recalled * key_norm) * beta * key_norm;
+                    let mut output = 0f32;
+                    for (i, (k, q)) in key.iter().zip(query).enumerate() {
+                        let s = &mut head_state[i * dv + column];
+                        *s = k.mul_add(update, *s);
+                        output = q.mul_add(*s, output);
+                    }
+                    outputs[(t * hv + value_head) * dv + column] =
+                        output * query_norm * query_scale;
+                }
+            }
+        }
+        let elements = packed.len();
+        Ok((CpuStorage::F32(packed), Shape::from_dims(&[elements])))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        qkv: &candle_core::CudaStorage,
+        qkv_layout: &Layout,
+        gates: &candle_core::CudaStorage,
+        gates_layout: &Layout,
+        state: &candle_core::CudaStorage,
+        state_layout: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        fn contiguous_slice<'a>(
+            storage: &'a CudaStorageSlice,
+            layout: &Layout,
+            name: &str,
+        ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>>
+        {
+            let CudaStorageSlice::F32(slice) = storage else {
+                candle_core::bail!("{name} must use F32 storage")
+            };
+            let Some((start, end)) = layout.contiguous_offsets() else {
+                candle_core::bail!("{name} must be contiguous")
+            };
+            Ok(slice.slice(start..end))
+        }
+
+        let conv_dim = 2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim;
+        // The kernel reads q and k rows as 16-byte vectors.
+        if !qkv_layout.start_offset().is_multiple_of(4) || !conv_dim.is_multiple_of(4) {
+            candle_core::bail!("the Qwen3.8 DeltaNet sequence kernel needs 16-byte aligned rows")
+        }
+        if [
+            self.sequence,
+            self.key_heads,
+            self.value_heads,
+            self.value_dim,
+        ]
+        .iter()
+        .any(|v| *v > i32::MAX as usize)
+        {
+            candle_core::bail!("Qwen3.8 DeltaNet sequence geometry overflow")
+        }
+        let qkv_slice = contiguous_slice(&qkv.slice, qkv_layout, "mixed_qkv")?;
+        let gates_slice = contiguous_slice(&gates.slice, gates_layout, "gates")?;
+        let state_slice = contiguous_slice(&state.slice, state_layout, "initial_state")?;
+        let device = qkv.device();
+        let output_elements = self.sequence * self.value_heads * self.value_dim;
+        let state_elements = self.value_heads * self.key_dim * self.value_dim;
+        // SAFETY: the kernel writes every output and final-state element.
+        let output = unsafe { device.alloc::<f32>(output_elements + state_elements)? };
+        let function = device.get_or_load_custom_func(
+            "qwen38_deltanet_sequence_f32",
+            "izwi_qwen38_deltanet_decode",
+            cuda_ptx::QWEN38,
+        )?;
+        let config = LaunchConfig {
+            grid_dim: (
+                (self.value_dim / QWEN38_DELTANET_SEQUENCE_COLUMNS) as u32,
+                self.value_heads as u32,
+                1,
+            ),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = function.builder();
+        builder.arg(&qkv_slice);
+        builder.arg(&gates_slice);
+        builder.arg(&state_slice);
+        builder.arg(&output);
+        candle_core::builder_arg!(
+            builder,
+            self.sequence as i32,
+            self.key_heads as i32,
+            self.value_heads as i32,
+            self.value_dim as i32
+        );
+        // SAFETY: argument types and launch dimensions match the kernel;
+        // the geometry was validated by `qwen38_deltanet_sequence`.
+        unsafe { builder.launch(config) }.w()?;
+        Ok((
+            candle_core::CudaStorage {
+                slice: CudaStorageSlice::F32(output),
+                device: device.clone(),
+            },
+            Shape::from_dims(&[output_elements + state_elements]),
+        ))
+    }
+}
+
 pub fn try_tiled_deltanet_recurrence(
     queries: &Tensor,
     keys: &Tensor,

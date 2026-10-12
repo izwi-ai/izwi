@@ -399,3 +399,135 @@ extern "C" __global__ void qwen38_deltanet_decode_f32(
     packed_output[value_head * value_dim + value_idx] = result;
   }
 }
+
+// Qwen3.8 Gated DeltaNet prefill: one launch runs a chunk's whole token loop
+// on the conv output's native grouped layout.
+//
+// Register-resident (the design of llama.cpp's and MLX's GDN kernels): eight
+// lanes own one value column of one value head, each holding 16 of the 128
+// key rows of that column's state in registers for the whole token loop; the
+// two dot products per token are 8-lane shuffle reductions, so the state is
+// read once and written once per launch. Value head v reads key head
+// v / (value_heads / key_heads) (HF grouped order): no expanded q/k exists.
+// q and k are L2-normalized in the kernel, x * rsqrt(sum x^2 + 1e-6), and q is
+// scaled by 1/sqrt(key_dim), as the composition does.
+//   mixed_qkv     [sequence, conv_dim] F32 conv output, q | k | v, rows
+//                 16-byte aligned (conv_dim % 4 == 0)
+//   gates         [sequence, value_heads, 2] F32 (log decay g, beta)
+//   initial_state [value_heads, 128, value_dim] F32
+//   packed_output [sequence, value_heads, value_dim] outputs, then the final
+//                 [value_heads, 128, value_dim] state
+// grid (value_dim / 16, value_heads), 128 threads: four columns per warp.
+#define QWEN38_GDN_SEQ_KEY_DIM 128
+#define QWEN38_GDN_SEQ_LANES 8
+#define QWEN38_GDN_SEQ_KEYS (QWEN38_GDN_SEQ_KEY_DIM / QWEN38_GDN_SEQ_LANES)
+#define QWEN38_GDN_SEQ_COLUMNS 16
+__device__ __forceinline__ void qwen38_gdn_load16(const float* source, float* target) {
+#pragma unroll
+  for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; i += 4) {
+    const float4 v = *reinterpret_cast<const float4*>(source + i);
+    target[i] = v.x;
+    target[i + 1] = v.y;
+    target[i + 2] = v.z;
+    target[i + 3] = v.w;
+  }
+}
+extern "C" __global__ void __launch_bounds__(128) qwen38_deltanet_sequence_f32(
+    const float* __restrict__ mixed_qkv,
+    const float* __restrict__ gates,
+    const float* __restrict__ initial_state,
+    float* __restrict__ packed_output,
+    int sequence,
+    int key_heads,
+    int value_heads,
+    int value_dim) {
+  const int lane = threadIdx.x & 31;
+  const int part = lane & (QWEN38_GDN_SEQ_LANES - 1);
+  const int column = blockIdx.x * QWEN38_GDN_SEQ_COLUMNS + (threadIdx.x >> 3);
+  const int value_head = blockIdx.y;
+  const int key_head = value_head / (value_heads / key_heads);
+  const int key_width = key_heads * QWEN38_GDN_SEQ_KEY_DIM;
+  const size_t conv_dim = (size_t)key_width * 2 + (size_t)value_heads * value_dim;
+  const int key0 = part * QWEN38_GDN_SEQ_KEYS;
+  const size_t state_base = (size_t)value_head * QWEN38_GDN_SEQ_KEY_DIM * value_dim;
+  const float* query_row = mixed_qkv + key_head * QWEN38_GDN_SEQ_KEY_DIM + key0;
+  const float* key_row = query_row + key_width;
+  const float* value_row = mixed_qkv + (size_t)key_width * 2 + (size_t)value_head * value_dim + column;
+  const float* gate_row = gates + (size_t)value_head * 2;
+  const size_t gate_stride = (size_t)value_heads * 2;
+  const float query_scale = rsqrtf((float)QWEN38_GDN_SEQ_KEY_DIM);
+
+  float state[QWEN38_GDN_SEQ_KEYS];
+#pragma unroll
+  for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+    state[i] = initial_state[state_base + (size_t)(key0 + i) * value_dim + column];
+  }
+  // Token t's inputs are loaded during token t - 1: the loads do not depend
+  // on the state, so they overlap the serial reductions.
+  float query[QWEN38_GDN_SEQ_KEYS], key[QWEN38_GDN_SEQ_KEYS];
+  qwen38_gdn_load16(query_row, query);
+  qwen38_gdn_load16(key_row, key);
+  float value = value_row[0], g = gate_row[0], beta = gate_row[1];
+  for (int t = 0; t < sequence; ++t) {
+    float next_query[QWEN38_GDN_SEQ_KEYS], next_key[QWEN38_GDN_SEQ_KEYS];
+    float next_value = 0.0f, next_g = 0.0f, next_beta = 0.0f;
+    if (t + 1 < sequence) {
+      const size_t row = (size_t)(t + 1) * conv_dim;
+      qwen38_gdn_load16(query_row + row, next_query);
+      qwen38_gdn_load16(key_row + row, next_key);
+      next_value = value_row[row];
+      next_g = gate_row[(size_t)(t + 1) * gate_stride];
+      next_beta = gate_row[(size_t)(t + 1) * gate_stride + 1];
+    } else {
+#pragma unroll
+      for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+        next_query[i] = 0.0f;
+        next_key[i] = 0.0f;
+      }
+    }
+    const float decay = expf(g);
+    float recalled = 0.0f, key_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+      state[i] *= decay;
+      recalled = fmaf(key[i], state[i], recalled);
+      key_squares = fmaf(key[i], key[i], key_squares);
+    }
+#pragma unroll
+    for (int offset = QWEN38_GDN_SEQ_LANES / 2; offset > 0; offset >>= 1) {
+      recalled += __shfl_xor_sync(0xffffffffu, recalled, offset);
+      key_squares += __shfl_xor_sync(0xffffffffu, key_squares, offset);
+    }
+    const float key_norm = rsqrtf(key_squares + 1.0e-6f);
+    const float update = (value - recalled * key_norm) * beta * key_norm;
+    float output = 0.0f, query_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+      state[i] = fmaf(key[i], update, state[i]);
+      output = fmaf(query[i], state[i], output);
+      query_squares = fmaf(query[i], query[i], query_squares);
+    }
+#pragma unroll
+    for (int offset = QWEN38_GDN_SEQ_LANES / 2; offset > 0; offset >>= 1) {
+      output += __shfl_xor_sync(0xffffffffu, output, offset);
+      query_squares += __shfl_xor_sync(0xffffffffu, query_squares, offset);
+    }
+    if (part == 0) {
+      packed_output[((size_t)t * value_heads + value_head) * value_dim + column] =
+          output * rsqrtf(query_squares + 1.0e-6f) * query_scale;
+    }
+#pragma unroll
+    for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+      query[i] = next_query[i];
+      key[i] = next_key[i];
+    }
+    value = next_value;
+    g = next_g;
+    beta = next_beta;
+  }
+  float* final_state = packed_output + (size_t)sequence * value_heads * value_dim;
+#pragma unroll
+  for (int i = 0; i < QWEN38_GDN_SEQ_KEYS; ++i) {
+    final_state[state_base + (size_t)(key0 + i) * value_dim + column] = state[i];
+  }
+}

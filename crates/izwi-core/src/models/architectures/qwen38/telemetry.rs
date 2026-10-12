@@ -47,6 +47,9 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_deltanet_prefill_attempts_total: u64,
     pub cuda_deltanet_prefill_success_total: u64,
     pub cuda_deltanet_prefill_fallback_total: u64,
+    pub cuda_deltanet_grouped_prefill_attempts_total: u64,
+    pub cuda_deltanet_grouped_prefill_success_total: u64,
+    pub cuda_deltanet_grouped_prefill_fallback_total: u64,
     pub cuda_causal_conv_prefill_attempts_total: u64,
     pub cuda_causal_conv_prefill_success_total: u64,
     pub cuda_causal_conv_prefill_fallback_total: u64,
@@ -138,6 +141,9 @@ counters!(
     CUDA_DELTANET_PREFILL_ATTEMPTS,
     CUDA_DELTANET_PREFILL_SUCCESS,
     CUDA_DELTANET_PREFILL_FALLBACK,
+    CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS,
+    CUDA_DELTANET_GROUPED_PREFILL_SUCCESS,
+    CUDA_DELTANET_GROUPED_PREFILL_FALLBACK,
     CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
     CUDA_CAUSAL_CONV_PREFILL_SUCCESS,
     CUDA_CAUSAL_CONV_PREFILL_FALLBACK,
@@ -200,6 +206,9 @@ pub(crate) enum CudaKernelPath {
     DeltaNetDecode,
     DeltaNetSpecializedDecode,
     DeltaNetPrefill,
+    /// A prefill span through the grouped DeltaNet sequence kernel (success)
+    /// or handed back to today's recurrence (fallback).
+    DeltaNetGroupedPrefill,
     CausalConvPrefill,
     CausalConvDecode,
     /// A row the resolved fused GDN decode took (success) or handed back to
@@ -320,6 +329,11 @@ pub(crate) fn record_cuda_kernel(path: CudaKernelPath, selected: bool) {
             &CUDA_DELTANET_PREFILL_ATTEMPTS,
             &CUDA_DELTANET_PREFILL_SUCCESS,
             &CUDA_DELTANET_PREFILL_FALLBACK,
+        ),
+        CudaKernelPath::DeltaNetGroupedPrefill => (
+            &CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS,
+            &CUDA_DELTANET_GROUPED_PREFILL_SUCCESS,
+            &CUDA_DELTANET_GROUPED_PREFILL_FALLBACK,
         ),
         CudaKernelPath::CausalConvPrefill => (
             &CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS,
@@ -537,6 +551,9 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_deltanet_prefill_attempts_total: load!(CUDA_DELTANET_PREFILL_ATTEMPTS),
         cuda_deltanet_prefill_success_total: load!(CUDA_DELTANET_PREFILL_SUCCESS),
         cuda_deltanet_prefill_fallback_total: load!(CUDA_DELTANET_PREFILL_FALLBACK),
+        cuda_deltanet_grouped_prefill_attempts_total: load!(CUDA_DELTANET_GROUPED_PREFILL_ATTEMPTS),
+        cuda_deltanet_grouped_prefill_success_total: load!(CUDA_DELTANET_GROUPED_PREFILL_SUCCESS),
+        cuda_deltanet_grouped_prefill_fallback_total: load!(CUDA_DELTANET_GROUPED_PREFILL_FALLBACK),
         cuda_causal_conv_prefill_attempts_total: load!(CUDA_CAUSAL_CONV_PREFILL_ATTEMPTS),
         cuda_causal_conv_prefill_success_total: load!(CUDA_CAUSAL_CONV_PREFILL_SUCCESS),
         cuda_causal_conv_prefill_fallback_total: load!(CUDA_CAUSAL_CONV_PREFILL_FALLBACK),

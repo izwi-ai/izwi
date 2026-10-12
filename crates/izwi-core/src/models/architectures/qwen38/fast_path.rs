@@ -21,6 +21,10 @@ use crate::performance::{CudaPerformanceConfig, OptimizationMode};
 pub(crate) const FUSED_NORM_ENV: &str = "IZWI_QWEN38_FUSED_NORM";
 /// Kill switch for the fused DeltaNet (GDN) decode.
 pub(crate) const FUSED_GDN_ENV: &str = "IZWI_QWEN38_FUSED_GDN";
+/// Switch for the grouped DeltaNet prefill kernel (`auto`, or `legacy`/
+/// `off`/`0`/`false`): prefill expands q/k to the value heads and runs
+/// today's recurrence.
+pub(crate) const GDN_PREFILL_ENV: &str = "IZWI_QWEN38_GDN_PREFILL";
 /// Kill switch for the fused q/k norm + partial M-RoPE.
 pub(crate) const FUSED_QK_ROPE_ENV: &str = "IZWI_QWEN38_FUSED_QK_ROPE";
 /// Kill switch for the K/V write from the fused q/k launch.

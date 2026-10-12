@@ -461,6 +461,8 @@ fn gdn_mixer(
         fused_gdn_path: Qwen38FastPath::default(),
         alpha_beta_rows: None,
         alpha_beta_gemv_path: Qwen38FastPath::default(),
+        gdn_prefill: false,
+        gdn_prefill_path: Qwen38FastPath::default(),
     }
 }
 
@@ -1049,6 +1051,198 @@ fn cuda_fused_gdn_matches_legacy_q38_kernels_48_heads() {
         &host_values(&expected).unwrap(),
         0.01,
         0.03,
+    );
+}
+
+/// `[1, rows, hidden]` prefill input in `dtype`.
+fn gdn_prefill_input(
+    rows: usize,
+    hidden: usize,
+    seed: f32,
+    device: &Device,
+    dtype: DType,
+) -> Tensor {
+    Tensor::from_vec(
+        self_check_wave(rows * hidden, seed, 1.0),
+        (1, rows, hidden),
+        &Device::Cpu,
+    )
+    .unwrap()
+    .to_dtype(dtype)
+    .unwrap()
+    .to_device(device)
+    .unwrap()
+}
+
+/// Two consecutive prefill spans (the second from the first's non-zero
+/// state) through `legacy` and `grouped`: outputs, conv histories and
+/// recurrent states must agree.
+fn assert_grouped_prefill_tracks_legacy(
+    legacy: &Qwen38LinearAttention,
+    grouped: &Qwen38LinearAttention,
+    hidden: usize,
+    device: &Device,
+    dtype: DType,
+    tolerance: (f64, f32),
+) {
+    let (mut legacy_state, mut grouped_state) = (
+        initialized_state(legacy, device),
+        initialized_state(grouped, device),
+    );
+    for (span, rows) in [(0, 20usize), (1, 7)] {
+        let input = gdn_prefill_input(rows, hidden, 3.0 + span as f32 * 41.0, device, dtype);
+        let expected = legacy.forward_sequence(&input, &mut legacy_state).unwrap();
+        let actual = grouped
+            .forward_sequence(&input, &mut grouped_state)
+            .unwrap();
+        assert_close(
+            &format!("prefill span {span}"),
+            &host_values(&actual).unwrap(),
+            &host_values(&expected).unwrap(),
+            tolerance.0,
+            tolerance.1,
+        );
+    }
+    let (grouped_values, legacy_values) = (
+        linear_state_values(&grouped_state),
+        linear_state_values(&legacy_state),
+    );
+    assert_close(
+        "conv history",
+        &grouped_values.0,
+        &legacy_values.0,
+        1e-6,
+        1e-6,
+    );
+    assert_close(
+        "recurrent state",
+        &grouped_values.1,
+        &legacy_values.1,
+        tolerance.0,
+        tolerance.1,
+    );
+}
+
+/// The grouped DeltaNet prefill at the 27B trunk's layout (16 key heads, 48
+/// value heads, 128-dim) resolves against its portable reference, tracks
+/// today's expanded recurrence over two spans, and leaves verification spans
+/// (which retain q/k for recovery) on today's path.
+#[test]
+fn grouped_gdn_prefill_resolves_and_tracks_the_expanded_recurrence() {
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let legacy = gdn_mixer(16, 48, 64, &Device::Cpu, DType::F32);
+    let mut grouped = gdn_mixer(16, 48, 64, &Device::Cpu, DType::F32);
+    let mut shared = None;
+    grouped.resolve_gdn_prefill(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        true,
+        &mut shared,
+    );
+    assert_eq!(grouped.gdn_prefill_path, Qwen38FastPath::Fused);
+    assert!(grouped.gdn_prefill);
+    assert_eq!(
+        shared.as_ref().map(|(geometry, _)| *geometry),
+        Some([16, 48, 128, 128])
+    );
+    assert_grouped_prefill_tracks_legacy(
+        &legacy,
+        &grouped,
+        64,
+        &Device::Cpu,
+        DType::F32,
+        (1e-5, 1e-4),
+    );
+
+    let input = gdn_prefill_input(3, 64, 9.0, &Device::Cpu, DType::F32);
+    let mut recorded = None;
+    let mut state = initialized_state(&grouped, &Device::Cpu);
+    grouped
+        .forward_sequence_recording(&input, &mut state, Some(&mut recorded))
+        .unwrap();
+    let recorded = recorded.expect("verification spans record their q/k");
+    assert_eq!(recorded.query.dims(), [1, 3, 16, 128]);
+
+    // Production keeps it off the CPU; the switch and an unsupported layout
+    // keep today's recurrence with a reason.
+    let mut off_cpu = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F32);
+    off_cpu.resolve_gdn_prefill(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        false,
+        &mut None,
+    );
+    assert!(!off_cpu.gdn_prefill);
+    std::env::set_var(GDN_PREFILL_ENV, "legacy");
+    let mut switched = gdn_mixer(2, 6, 64, &Device::Cpu, DType::F32);
+    switched.resolve_gdn_prefill(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        true,
+        &mut None,
+    );
+    std::env::remove_var(GDN_PREFILL_ENV);
+    assert_eq!(
+        switched.gdn_prefill_path,
+        Qwen38FastPath::legacy("IZWI_QWEN38_GDN_PREFILL=legacy")
+    );
+    let mut ungrouped = gdn_mixer(4, 6, 64, &Device::Cpu, DType::F32);
+    ungrouped.resolve_gdn_prefill(
+        &Qwen38CudaSwitches::default(),
+        &Device::Cpu,
+        true,
+        &mut None,
+    );
+    assert!(!ungrouped.gdn_prefill);
+    assert!(
+        matches!(&ungrouped.gdn_prefill_path, Qwen38FastPath::Legacy { reason } if reason.contains("grouped")),
+        "{:?}",
+        ungrouped.gdn_prefill_path
+    );
+}
+
+/// The grouped DeltaNet prefill on CUDA at the 27B trunk's layout resolves
+/// through its load-time self-check and tracks today's prefill (expanded q/k
+/// through the tiled qwen35 kernel), with no head expansion on its spans.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_grouped_gdn_prefill_matches_the_expanded_qwen35_kernel_48_heads() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let _guard = counters_lock();
+    let mut legacy = gdn_mixer(16, 48, 256, &device, DType::BF16);
+    legacy.tiled_recurrence_enabled = true;
+    let mut grouped = gdn_mixer(16, 48, 256, &device, DType::BF16);
+    grouped.resolve_gdn_prefill(&Qwen38CudaSwitches::default(), &device, false, &mut None);
+    assert_eq!(grouped.gdn_prefill_path, Qwen38FastPath::Fused);
+    let mut grouped_state = initialized_state(&grouped, &device);
+    let before = telemetry::snapshot();
+    grouped
+        .forward_sequence(
+            &gdn_prefill_input(256, 256, 5.0, &device, DType::BF16),
+            &mut grouped_state,
+        )
+        .unwrap();
+    let after = telemetry::snapshot();
+    assert_eq!(
+        after.cuda_deltanet_grouped_prefill_success_total
+            - before.cuda_deltanet_grouped_prefill_success_total,
+        1
+    );
+    assert_eq!(
+        after.cuda_head_expansion_materializations_total,
+        before.cuda_head_expansion_materializations_total
+    );
+    assert_grouped_prefill_tracks_legacy(
+        &legacy,
+        &grouped,
+        256,
+        &device,
+        DType::BF16,
+        (1e-3, 1e-2),
     );
 }
 
