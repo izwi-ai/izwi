@@ -241,6 +241,43 @@ fn resolve_asr_execution_audio(
     ))
 }
 
+/// Executor path for an ASR request that no realtime or retained-sequence
+/// executor claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicAsrRoute {
+    /// The prepared LFM2.5 Audio lease chunks and decodes the audio itself.
+    Lfm25AudioLongForm,
+    /// The generic path, which resolves a `NativeAsrModel` (or Voxtral) lease.
+    Generic,
+}
+
+/// Audio-chat models are loaded only as audio-chat leases, never into the
+/// `NativeAsrModel` registry that the generic path resolves. Route their
+/// long-form requests to the dedicated executor and fail closed otherwise,
+/// instead of reporting a loaded model as missing.
+fn atomic_asr_route(
+    request: &EngineCoreRequest,
+    variant: crate::model::ModelVariant,
+) -> Result<AtomicAsrRoute> {
+    if !variant.is_audio_chat() {
+        return Ok(AtomicAsrRoute::Generic);
+    }
+    if variant.family() == ModelFamily::Lfm25Audio && request.uses_asr_long_form_atomic() {
+        return Ok(AtomicAsrRoute::Lfm25AudioLongForm);
+    }
+    Err(Error::InvalidInput(format!(
+        "ASR request {} for audio-chat model {variant} has no retained or long-form route",
+        request.id
+    )))
+}
+
+/// LFM2.5 Audio sizes each long-form chunk's decode budget from the chunk's
+/// duration. Only a caller-set limit overrides that; the request default would
+/// otherwise replace it for every chunk.
+fn lfm25_audio_asr_long_form_max_tokens(request: &EngineCoreRequest) -> Option<usize> {
+    (!request.asr_auto_max_tokens).then_some(request.params.max_tokens)
+}
+
 fn begins_resumable_asr_prefill_state(
     scheduled: &ScheduledRequest,
     resumable_prefill: bool,
@@ -3585,6 +3622,101 @@ impl NativeExecutor {
         .with_managed_cache_completions(completions))
     }
 
+    /// Run audio that LFM2.5 Audio preparation planned as several chunks. The
+    /// model chunks, decodes and merges internally, using the prepared lease
+    /// and the atomic stage's main-backbone invocation workspace.
+    fn lfm25_audio_asr_long_form_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        let model = request
+            .prepared_lfm25_audio_asr_model_lease_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError("LFM2.5 Audio long-form ASR lost model residency".into())
+            })?;
+        let (execution_audio, sample_rate, audio_decode_ms) =
+            resolve_asr_execution_audio(request, ModelFamily::Lfm25Audio, || {
+                Self::run_blocking(|| decode_request_audio_with_rate(request))
+            })?;
+        let samples = execution_audio.samples();
+        let max_tokens = lfm25_audio_asr_long_form_max_tokens(request);
+        let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
+        let mut leases =
+            super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+        let transcription = Self::run_blocking(|| {
+            let mut sequence = 0usize;
+            let mut stream_err: Option<Error> = None;
+            let mut emit = |delta: &str| {
+                let Some(tx) = stream_tx.as_ref() else {
+                    return;
+                };
+                if stream_err.is_none() {
+                    if let Err(err) = Self::stream_text_with_policy(
+                        tx,
+                        stream_policy,
+                        &request.id,
+                        &mut sequence,
+                        delta.to_string(),
+                    ) {
+                        stream_err = Some(err);
+                    }
+                }
+            };
+            let transcription = model
+                .transcribe_long_form_with_callback_from_invocation_workspace(
+                    samples,
+                    sample_rate,
+                    max_tokens,
+                    &mut leases,
+                    &mut emit,
+                )?;
+            if let Some(err) = stream_err {
+                return Err(err);
+            }
+            if let Some(tx) = stream_tx.as_ref() {
+                Self::stream_final_marker_with_policy(
+                    tx,
+                    stream_policy,
+                    &request.id,
+                    &mut sequence,
+                )?;
+            }
+            Ok(transcription)
+        })?;
+        let completions = leases.release()?;
+        if completions.len() != 2 {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio long-form ASR returned an incomplete physical-state completion set"
+                    .into(),
+            ));
+        }
+        let samples_len = samples.len();
+
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                streamed_samples: None,
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: samples_len as f32 / sample_rate as f32,
+            }),
+            text: Some(transcription.text),
+            input_transcription: None,
+            tokens_processed: request.num_prompt_tokens(),
+            tokens_generated: (samples_len / 256).max(1),
+            finished: true,
+            phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
+            asr_diagnostics: Self::with_audio_decode_timing(
+                transcription.diagnostics,
+                audio_decode_ms,
+            ),
+            error: None,
+            logprobs: Vec::new(),
+        }))
+    }
+
     fn lfm25_audio_asr_sequence_request(
         &self,
         request: &EngineCoreRequest,
@@ -6641,6 +6773,12 @@ impl NativeExecutor {
                 "retained ASR state was routed outside a retained sequence executor".to_string(),
             ));
         }
+        match atomic_asr_route(request, variant)? {
+            AtomicAsrRoute::Lfm25AudioLongForm => {
+                return self.lfm25_audio_asr_long_form_request(request, scheduled);
+            }
+            AtomicAsrRoute::Generic => {}
+        }
         let mut managed_cache = None;
         let language = request.asr_language_for_execution();
         let asr_prompt = request.asr_prompt_for_execution();
@@ -8311,6 +8449,89 @@ mod tests {
         assert_eq!(audio.samples(), &[0.25, -0.5, 0.75]);
         assert_eq!(sample_rate, 16_000);
         assert_eq!(decode_ms, 0.0);
+    }
+
+    #[test]
+    fn lfm_long_form_asr_routes_to_its_own_executor_not_the_generic_path() {
+        let lfm = ModelVariant::Lfm25Audio15BGguf;
+        let mut long_form = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(lfm);
+        long_form.install_prepared_asr_long_form_atomic().unwrap();
+        assert_eq!(
+            super::atomic_asr_route(&long_form, lfm).unwrap(),
+            super::AtomicAsrRoute::Lfm25AudioLongForm
+        );
+
+        // Native ASR families keep the generic path, long-form or not.
+        for variant in [
+            ModelVariant::Qwen3Asr06BGguf,
+            ModelVariant::VibeVoiceAsr,
+            ModelVariant::ParakeetTdt06BV3,
+        ] {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            assert_eq!(
+                super::atomic_asr_route(&request, variant).unwrap(),
+                super::AtomicAsrRoute::Generic
+            );
+            request.install_prepared_asr_long_form_atomic().unwrap();
+            assert_eq!(
+                super::atomic_asr_route(&request, variant).unwrap(),
+                super::AtomicAsrRoute::Generic
+            );
+        }
+    }
+
+    #[test]
+    fn audio_chat_asr_without_a_long_form_route_fails_closed_before_registry_lookup() {
+        // An empty registry makes any `NativeAsrModel` lookup report the model
+        // as not loaded, which is the failure this guard replaces.
+        let executor = NativeExecutor::new(crate::engine::WorkerConfig {
+            model_registry: Some(Arc::new(crate::models::ModelRegistry::new(
+                std::path::PathBuf::new(),
+                crate::backends::DeviceProfile::cpu(),
+            ))),
+            ..Default::default()
+        });
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        for streaming in [true, false] {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            request.streaming = streaming;
+            let scheduled = ScheduledRequest {
+                plan_id: 1,
+                request_id: request.id.clone(),
+                sequence_id: 1,
+                num_tokens: 1,
+                is_prefill: true,
+                num_computed_tokens: 0,
+                work: WorkUnit::AtomicJob { kind: "asr".into() },
+            };
+
+            let error = executor
+                .transcribe_request_with_managed_cache(&request, &scheduled, None)
+                .expect_err("audio-chat ASR without a long-form route must fail closed");
+
+            assert!(
+                matches!(&error, crate::error::Error::InvalidInput(message)
+                    if message.contains("has no retained or long-form route")),
+                "streaming={streaming}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_long_form_asr_passes_only_a_caller_set_max_tokens() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3])
+            .with_model_variant(ModelVariant::Lfm25Audio15BGguf);
+        request.asr_auto_max_tokens = true;
+        assert_eq!(super::lfm25_audio_asr_long_form_max_tokens(&request), None);
+
+        request.asr_auto_max_tokens = false;
+        request.params.max_tokens = 96;
+        assert_eq!(
+            super::lfm25_audio_asr_long_form_max_tokens(&request),
+            Some(96)
+        );
     }
 
     #[test]

@@ -310,6 +310,24 @@ fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     (variant.family() == ModelFamily::GraniteSpeechAsr).then_some(GRANITE_ASR_AUTO_MAX_TOKENS)
 }
 
+/// Install the caller's ASR decode budget. An omitted budget is marked
+/// automatic so duration-aware families (Granite, LFM2.5 Audio long-form) may
+/// derive it per chunk instead of applying the request default.
+fn apply_asr_max_tokens(
+    request: &mut EngineCoreRequest,
+    variant: ModelVariant,
+    max_tokens: Option<usize>,
+) {
+    if let Some(max_tokens) = max_tokens {
+        request.params.max_tokens = max_tokens;
+        return;
+    }
+    request.asr_auto_max_tokens = true;
+    if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
+        request.params.max_tokens = auto_max_tokens;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RealtimeAsrSessionLimits {
     max_sessions: usize,
@@ -2314,12 +2332,7 @@ impl RuntimeService {
                 }
                 .with_prompt(prompt);
                 let mut request = runtime_request.into_engine_request();
-                if let Some(max_tokens) = max_tokens {
-                    request.params.max_tokens = max_tokens;
-                } else if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
-                    request.params.max_tokens = auto_max_tokens;
-                    request.asr_auto_max_tokens = true;
-                }
+                apply_asr_max_tokens(&mut request, variant, max_tokens);
                 Ok(request)
             },
         )
@@ -5395,6 +5408,28 @@ mod tests {
             granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn omitted_asr_max_tokens_is_automatic_and_explicit_budget_is_kept() {
+        let default_max_tokens = EngineCoreRequest::asr_bytes(vec![1]).params.max_tokens;
+        let lfm = ModelVariant::Lfm25Audio15BGguf;
+
+        let mut omitted = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(lfm);
+        apply_asr_max_tokens(&mut omitted, lfm, None);
+        assert!(omitted.asr_auto_max_tokens);
+        assert_eq!(omitted.params.max_tokens, default_max_tokens);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(lfm);
+        apply_asr_max_tokens(&mut explicit, lfm, Some(96));
+        assert!(!explicit.asr_auto_max_tokens);
+        assert_eq!(explicit.params.max_tokens, 96);
+
+        let granite = ModelVariant::GraniteSpeech412BPlus;
+        let mut granite_auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut granite_auto, granite, None);
+        assert!(granite_auto.asr_auto_max_tokens);
+        assert_eq!(granite_auto.params.max_tokens, GRANITE_ASR_AUTO_MAX_TOKENS);
     }
 
     #[test]

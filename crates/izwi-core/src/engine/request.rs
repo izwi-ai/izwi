@@ -1116,7 +1116,8 @@ pub struct EngineCoreRequest {
     pub audio_bytes: Option<Vec<u8>>,
     /// Optional ASR initial prompt/context hint.
     pub asr_prompt: Option<String>,
-    /// Whether ASR max_tokens was filled by a model-specific automatic heuristic.
+    /// Whether the caller left ASR max_tokens unset, so `params.max_tokens` is
+    /// a default or model-specific ceiling that duration-aware families narrow.
     pub asr_auto_max_tokens: bool,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
