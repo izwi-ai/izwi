@@ -46,6 +46,7 @@ use super::executor::{
 use super::metrics::{
     record_engine_execution_outcome, record_engine_physical_batch,
     record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
+    record_engine_workspace_wait, EngineWorkspaceWaitOutcome,
 };
 use super::output::OutputProcessor;
 use super::request::{
@@ -443,11 +444,32 @@ impl PhysicalBatchAssembly {
     }
 }
 
+/// One session's run of refused batch workspaces.
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceWait {
+    started: Instant,
+    /// Attempts since the last shape reduction; drives the backoff.
+    attempts: u32,
+}
+
+impl WorkspaceWait {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            attempts: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LifecycleRetryPolicy {
     max_execution_retries: u32,
     execution_backoff_base: Duration,
     execution_backoff_max: Duration,
+    /// How long a session may keep retrying a refused batch workspace while
+    /// no other session makes progress. A refusal happens before device
+    /// entry, so retrying is exact; this replaces the attempt budget.
+    workspace_wait_budget: Duration,
     cleanup_backoff_base: Duration,
     cleanup_backoff_max: Duration,
     cleanup_budget_per_step: usize,
@@ -459,6 +481,9 @@ impl Default for LifecycleRetryPolicy {
             max_execution_retries: 3,
             execution_backoff_base: Duration::from_millis(5),
             execution_backoff_max: Duration::from_millis(200),
+            // Several CUDA capacity samples (fresh for 250 ms, stale for at
+            // most 1 s): three attempts 35 ms apart all read the same sample.
+            workspace_wait_budget: Duration::from_secs(5),
             cleanup_backoff_base: Duration::from_millis(25),
             cleanup_backoff_max: Duration::from_secs(1),
             cleanup_budget_per_step: 16,
@@ -543,6 +568,8 @@ pub struct EngineCore {
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
+    /// Each session's current run of refused batch workspaces.
+    workspace_waits: HashMap<super::SessionKey, WorkspaceWait>,
     workspace_row_limits: HashMap<super::SessionKey, usize>,
     workspace_pressure: HashMap<super::SessionKey, super::scheduler::ScheduledRequest>,
     retry_policy: LifecycleRetryPolicy,
@@ -1225,6 +1252,7 @@ impl EngineCore {
             // Other work can release live workspace/request reservations. A
             // progressing owner must not exhaust a waiting stream's budget.
             self.execution_retry_attempts.remove(session);
+            self.workspace_waits.remove(session);
         }
     }
 
@@ -1253,6 +1281,10 @@ impl EngineCore {
             // A smaller physical shape is a new attempt at fitting; only
             // unchanged failures consume the bounded no-progress retry budget.
             self.execution_retry_attempts.remove(&session);
+            if let Some(wait) = self.workspace_waits.get_mut(&session) {
+                // Retry the smaller shape promptly; the wait keeps its clock.
+                wait.attempts = 0;
+            }
         } else {
             self.workspace_pressure.insert(session, scheduled.clone());
         }
@@ -1664,10 +1696,42 @@ impl EngineCore {
             }
         };
 
-        if Self::is_workspace_backpressure(&result) {
+        let workspace_backpressure = Self::is_workspace_backpressure(&result);
+        if workspace_backpressure {
             self.observe_workspace_retry(&plan.session);
         }
         let retry_attempt = match &mut result.disposition {
+            ExecutionDisposition::Failed(failure)
+                if workspace_backpressure && failure.retry != RetryDisposition::Never =>
+            {
+                // The refusal came before device entry, so the step is retried
+                // exactly. It waits for capacity on a wall-clock budget: a few
+                // attempts milliseconds apart would all read one cached
+                // capacity sample, and fail a running stream for nothing.
+                let wait = self
+                    .workspace_waits
+                    .entry(plan.session.clone())
+                    .or_insert_with(WorkspaceWait::start);
+                wait.attempts = wait.attempts.saturating_add(1);
+                let (attempts, waited) = (wait.attempts, wait.started.elapsed());
+                if waited < self.retry_policy.workspace_wait_budget {
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Retried);
+                    Some(attempts)
+                } else {
+                    self.workspace_waits.remove(&plan.session);
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Exhausted);
+                    let message = format!(
+                        "executor retry budget exhausted after {attempts} attempts over {:.1}s of workspace backpressure: {}",
+                        waited.as_secs_f64(),
+                        failure.message
+                    );
+                    failure.retry = RetryDisposition::Never;
+                    failure.message = message.clone();
+                    result.output.finished = true;
+                    result.output.error = Some(message);
+                    None
+                }
+            }
             ExecutionDisposition::Failed(failure) if failure.retry != RetryDisposition::Never => {
                 let attempts = self
                     .execution_retry_attempts
@@ -1690,6 +1754,11 @@ impl EngineCore {
             }
             _ => {
                 self.execution_retry_attempts.remove(&plan.session);
+                if self.workspace_waits.remove(&plan.session).is_some()
+                    && result.provenance.dispatch_state != DispatchState::NotStarted
+                {
+                    record_engine_workspace_wait(EngineWorkspaceWaitOutcome::Recovered);
+                }
                 None
             }
         };
@@ -3172,6 +3241,7 @@ impl EngineCore {
             execution_retry_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
+            workspace_waits: HashMap::new(),
             workspace_row_limits: HashMap::new(),
             workspace_pressure: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
@@ -3575,6 +3645,7 @@ impl EngineCore {
         self.active_stream_batches
             .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.workspace_waits.remove(session);
     }
 
     fn request_managed_session_release(&mut self, session: &super::SessionKey) -> bool {
@@ -4294,6 +4365,7 @@ impl EngineCore {
             // the original streams and let the protected survivor try again.
             for row in &blocked {
                 self.execution_retry_attempts.remove(&row.session_key());
+                self.workspace_waits.remove(&row.session_key());
             }
         }
 
@@ -5764,6 +5836,7 @@ impl EngineCore {
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
         self.workspace_retry_progress.clear();
+        self.workspace_waits.clear();
         self.workspace_row_limits.clear();
         self.workspace_pressure.clear();
         self.initialized = false;
@@ -8559,8 +8632,17 @@ mod tests {
         core.execution_retry_attempts.insert(session.clone(), 1);
         core.observe_workspace_retry(&session);
         assert_eq!(core.execution_retry_attempts[&session], 1);
+        // Peer progress restarts the wall-clock wait too.
+        core.workspace_waits
+            .insert(session.clone(), WorkspaceWait::start());
+        core.workspace_progress_epoch += 1;
+        core.observe_workspace_retry(&session);
+        assert!(!core.workspace_waits.contains_key(&session));
+        core.workspace_waits
+            .insert(session.clone(), WorkspaceWait::start());
         core.clear_exact_execution_state(&session);
         assert!(!core.workspace_retry_progress.contains_key(&session));
+        assert!(!core.workspace_waits.contains_key(&session));
     }
 
     #[test]
@@ -8783,69 +8865,157 @@ mod tests {
         }
     }
 
+    async fn retry_budget_test_core() -> (EngineCore, ScheduledRequest) {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 8,
+                ..Default::default()
+            },
+            executor,
+        )
+        .unwrap();
+        core.retry_policy.max_execution_retries = 2;
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let mut request = EngineCoreRequest::tts("retry budget");
+        request.id = "retry-budget".to_string();
+        request.prompt_tokens = vec![1];
+        core.add_request(request).unwrap();
+        core.refresh_scheduler_execution_profiles().await;
+        let scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+        (core, scheduled)
+    }
+
+    fn assert_retry_budget_terminal(committed: Option<CommittedExecutorOutput>, expected: &str) {
+        let committed = committed.expect("retry budget must terminalize");
+        assert!(
+            committed
+                .output
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains(expected)),
+            "{:?}",
+            committed.output.error
+        );
+        assert!(matches!(
+            committed.disposition,
+            ExecutionDisposition::Failed(ExecutionFailure {
+                retry: RetryDisposition::Never,
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn retry_budget_exhaustion_terminalizes_the_exact_session() {
-        for workspace in [false, true] {
-            let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
-                Mutex::new(Vec::new()),
-            ))));
-            let mut core = EngineCore::new_with_unified_executor(
-                EngineCoreConfig {
-                    max_batch_size: 1,
-                    max_tokens_per_step: 8,
-                    ..Default::default()
-                },
-                executor,
-            )
-            .unwrap();
-            core.retry_policy.max_execution_retries = 2;
-            core.retry_policy.execution_backoff_base = Duration::ZERO;
-            core.retry_policy.execution_backoff_max = Duration::ZERO;
-            let mut request = EngineCoreRequest::tts("retry budget");
-            request.id = "retry-budget".to_string();
-            request.prompt_tokens = vec![1];
-            core.add_request(request).unwrap();
-            core.refresh_scheduler_execution_profiles().await;
-
-            let mut scheduled = core.scheduler.schedule().prefill_requests.remove(0);
-            let session = scheduled.session_key();
-            if workspace {
-                core.incremental_stream_sessions.insert(session.clone());
-            }
-            for attempt in 1..=3 {
-                core.begin_execution_plan(&scheduled).await.unwrap();
-                let committed = core
-                    .commit_executor_result(
-                        if workspace {
-                            workspace_rejection(&scheduled, 1)
-                        } else {
-                            retryable_step_result(&scheduled, RetryDisposition::RetrySameSession)
-                        },
-                        1.0,
-                    )
-                    .await;
-                if attempt <= 2 {
-                    assert!(committed.is_none());
-                    scheduled = core.scheduler.schedule().prefill_requests.remove(0);
-                    assert_eq!(scheduled.session_key(), session);
-                } else {
-                    let committed = committed.expect("retry budget must terminalize");
-                    assert_eq!(committed.session, session);
-                    assert!(committed
-                        .output
-                        .error
-                        .as_deref()
-                        .is_some_and(|message| message.contains("retry budget exhausted")));
-                    assert!(matches!(
-                        committed.disposition,
-                        ExecutionDisposition::Failed(ExecutionFailure {
-                            retry: RetryDisposition::Never,
-                            ..
-                        })
-                    ));
-                }
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        for attempt in 1..=3 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            let committed = core
+                .commit_executor_result(
+                    retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                    1.0,
+                )
+                .await;
+            if attempt <= 2 {
+                assert!(committed.is_none());
+                scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+                assert_eq!(scheduled.session_key(), session);
+            } else {
+                assert_eq!(committed.as_ref().map(|c| &c.session), Some(&session));
+                assert_retry_budget_terminal(committed, "retry budget exhausted after 2 attempts");
             }
         }
+    }
+
+    /// The H100 field failure (b1d51b89): a running stream's decode workspace
+    /// was refused 25 MB short, retried 5, 10 and 20 ms later against the same
+    /// cached capacity sample, and failed after three attempts in ~35 ms. A
+    /// refused workspace now waits on a wall-clock budget instead.
+    #[tokio::test]
+    async fn refused_workspace_waits_on_a_wall_clock_budget_not_the_attempt_budget() {
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        core.incremental_stream_sessions.insert(session.clone());
+        let before = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        // Well past max_execution_retries (2): every refusal defers.
+        for attempt in 1..=6 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            let committed = core
+                .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+                .await;
+            assert!(
+                committed.is_none(),
+                "refusal {attempt} failed the stream: {:?}",
+                committed.map(|c| c.output.error)
+            );
+            assert_eq!(core.workspace_waits[&session].attempts, attempt);
+            assert!(!core.execution_retry_attempts.contains_key(&session));
+            scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+            assert_eq!(scheduled.session_key(), session);
+        }
+        // Once the wait has lasted its budget, the next refusal fails it.
+        core.workspace_waits.get_mut(&session).unwrap().started =
+            Instant::now() - core.retry_policy.workspace_wait_budget;
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let committed = core
+            .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+            .await;
+        assert_retry_budget_terminal(
+            committed,
+            "retry budget exhausted after 7 attempts over 5.0s of workspace backpressure",
+        );
+        assert!(!core.workspace_waits.contains_key(&session));
+        let after = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        assert!(after.retried >= before.retried + 6);
+        assert!(after.exhausted > before.exhausted);
+    }
+
+    #[tokio::test]
+    async fn admitted_workspace_ends_the_wait_and_keeps_the_attempt_budget() {
+        let (mut core, mut scheduled) = retry_budget_test_core().await;
+        let session = scheduled.session_key();
+        let before = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        for _ in 0..4 {
+            core.begin_execution_plan(&scheduled).await.unwrap();
+            assert!(core
+                .commit_executor_result(workspace_rejection(&scheduled, 1), 1.0)
+                .await
+                .is_none());
+            scheduled = core.scheduler.schedule().prefill_requests.remove(0);
+        }
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        let mut output = workspace_rejection(&scheduled, 1).output;
+        output.error = None;
+        output.tokens_processed = 1;
+        let committed = core
+            .commit_executor_result(ExecutorStepResult::new(&scheduled, output), 1.0)
+            .await;
+        assert!(committed.is_none_or(|c| c.output.error.is_none()));
+        assert!(!core.workspace_waits.contains_key(&session));
+        let after = crate::engine::engine_physical_execution_metrics_snapshot().workspace_waits;
+        assert!(after.recovered > before.recovered);
+        // The refusals did not spend the attempt budget of other failures.
+        scheduled = core
+            .scheduler
+            .schedule()
+            .prefill_requests
+            .pop()
+            .or_else(|| core.scheduler.schedule().decode_requests.pop())
+            .expect("the session continues");
+        core.begin_execution_plan(&scheduled).await.unwrap();
+        assert!(core
+            .commit_executor_result(
+                retryable_step_result(&scheduled, RetryDisposition::RetrySameSession),
+                1.0,
+            )
+            .await
+            .is_none());
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ use crate::engine::{
     ENGINE_EXECUTOR_PHYSICAL_PERMIT_WAIT_SECONDS_TOTAL,
     ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_CURRENT_BYTES,
     ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_HIGH_WATER_BYTES,
+    ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_WAITS_TOTAL,
 };
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
@@ -1283,6 +1284,12 @@ pub(crate) fn push_engine_physical_execution_metrics(
         "domain",
         &snapshot.workspace_high_water.labeled_values(),
     );
+    push_engine_labeled_metric(
+        payload,
+        ENGINE_EXECUTOR_PHYSICAL_WORKSPACE_WAITS_TOTAL,
+        "outcome",
+        &snapshot.workspace_waits.labeled_values(),
+    );
 }
 
 fn push_engine_metric_help(payload: &mut String, name: &str, prometheus_name: &str) {
@@ -1706,6 +1713,7 @@ mod tests {
         physical.defers.workspace_capacity = 2;
         physical.workspace_current.device = 1024;
         physical.workspace_high_water.device = 2048;
+        physical.workspace_waits.recovered = 4;
 
         let json = serde_json::to_value(EngineRuntimeTelemetrySnapshot {
             physical_execution: physical,
@@ -1766,6 +1774,13 @@ mod tests {
             "izwi_engine_executor_physical_workspace_high_water_bytes{domain=\"device\"} 2048"
         ));
         assert!(payload.contains("# HELP izwi_engine_executor_physical_batch_fill_ratio"));
+        assert!(payload.contains(
+            "izwi_engine_executor_physical_workspace_waits_total{outcome=\"recovered\"} 4"
+        ));
+        assert_eq!(
+            json["physical_execution"]["workspace_waits"]["recovered"],
+            serde_json::json!(4)
+        );
     }
 
     #[tokio::test]
