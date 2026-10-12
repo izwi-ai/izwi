@@ -357,11 +357,14 @@ fn load_qwen35_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
-    _performance: &crate::performance::PerformanceConfig,
+    performance: &crate::performance::PerformanceConfig,
     _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
-        model_dir, variant, device,
+    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load_with_performance(
+        model_dir,
+        variant,
+        device,
+        performance,
     )?))
 }
 

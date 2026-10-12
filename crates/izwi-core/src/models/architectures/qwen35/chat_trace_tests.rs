@@ -204,7 +204,11 @@ fn qwen35_local_decode_trace() {
     }
     let mut batch_max_diff = 0f32;
     for (step, token) in tokens.iter().enumerate().take(TRACE_STEPS - 1) {
-        assert_eq!(batch_rows, vec![*token; 2], "batch rows diverged at step {step}");
+        assert_eq!(
+            batch_rows,
+            vec![*token; 2],
+            "batch rows diverged at step {step}"
+        );
         let mut state_refs = batch_states.iter_mut().collect::<Vec<_>>();
         let mut cache_refs = caches.iter_mut().collect::<Vec<_>>();
         let logits = text
@@ -242,6 +246,7 @@ fn qwen35_local_decode_trace() {
         "steps": steps,
         "batch_vs_solo_max_top_logit_diff": batch_max_diff,
         "telemetry": text.telemetry().snapshot(),
+        "gdn_decode": text.gdn_decode_summary(),
     });
     std::fs::write(&out, serde_json::to_string_pretty(&trace).expect("json")).expect("write");
     eprintln!("trace written to {out}: tokens {tokens:?}, batch diff {batch_max_diff}");

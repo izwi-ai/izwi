@@ -32,6 +32,7 @@ use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen35_composite_cache_contract;
+use super::fast_path::Qwen35CudaSwitches;
 use super::telemetry::{Qwen35Telemetry, SamplerPath};
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
@@ -1120,6 +1121,23 @@ impl InferenceStateContractProvider for Qwen35ChatModel {
 
 impl Qwen35ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        Self::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            &crate::performance::PerformanceConfig::default(),
+        )
+    }
+
+    /// Load and resolve the fused fast paths under the global performance
+    /// switches (`cuda.mode`, `cuda.fused_decode`; CUDA only) and the
+    /// `IZWI_QWEN35_*` switches.
+    pub fn load_with_performance(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        performance: &crate::performance::PerformanceConfig,
+    ) -> Result<Self> {
         let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
         let mmproj_path = model_dir.join("mmproj-F16.gguf");
 
@@ -1154,7 +1172,11 @@ impl Qwen35ChatModel {
         let text_config = parse_text_config(&text_loader)?;
         debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
         let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
-        let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
+        let mut text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
+        text_model.resolve_fast_paths(
+            Qwen35CudaSwitches::from_performance(backend, &performance.cuda),
+            false,
+        );
 
         let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
         let projector_checkpoint = projector_loader.get_model_info();
@@ -1284,6 +1306,7 @@ impl Qwen35ChatModel {
                 "preferred_decode_tokens": 1,
                 "sustained_decode_quantum": false,
             },
+            "gdn_decode": self.exec.text_model.gdn_decode_summary(),
             "counters": self.exec.text_model.telemetry().snapshot(),
         })
     }
