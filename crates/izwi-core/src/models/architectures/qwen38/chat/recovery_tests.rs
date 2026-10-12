@@ -169,6 +169,7 @@ pub(crate) fn model_fixture(hybrid: bool) -> Qwen38ChatModel {
         mtp_head: Some(mtp_head),
         prefix_caching: false,
         graph_quantum: GraphQuantumCounters::default(),
+        kernel_timings: serde_json::Value::Null,
     }
 }
 

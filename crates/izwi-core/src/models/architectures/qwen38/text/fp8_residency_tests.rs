@@ -400,6 +400,89 @@ fn forced_prefill_gemm_resolves_per_kind_and_falls_back_on_a_failed_check() {
     );
 }
 
+/// The load-time kernel timings run on CUDA only and honour their switch;
+/// the CPU stand-in reports why it skipped them.
+#[test]
+fn load_time_kernel_timings_are_cuda_only_and_switchable() {
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::F32;
+    let _forced = force_cpu_native_fp8_for_tests();
+    let model = load(
+        &checkpoint,
+        target,
+        &resolve(&checkpoint, target, &PerformanceConfig::default()),
+    )
+    .unwrap();
+    assert_eq!(model.kernel_timings()["status"], "cuda_only");
+    std::env::set_var(super::kernel_timings::LOAD_TIMINGS_ENV, "off");
+    let off = model.kernel_timings();
+    std::env::remove_var(super::kernel_timings::LOAD_TIMINGS_ENV);
+    assert_eq!(off["status"], "off");
+    assert_eq!(off["switch"], "IZWI_QWEN38_LOAD_TIMINGS");
+}
+
+/// On CUDA the load-time timings measure every kind through production
+/// loading: positive GEMV bandwidth per kind, the prefill GEMM per kind at
+/// 256 rows, the compact kernel against it, and the grouped DeltaNet chunk.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_load_time_kernel_timings_measure_every_path() {
+    let Some(device) = crate::kernels::cuda::cuda_test_device() else {
+        return;
+    };
+    let (_dir, checkpoint) = fixture();
+    let performance = PerformanceConfig::default();
+    let target = ProjectionMaterialization::BF16;
+    let policy = Qwen38ResidencyPolicy::resolve(
+        &device,
+        target,
+        &performance,
+        &checkpoint.tensors,
+        &checkpoint.config,
+    );
+    let model = Qwen38TextModel::load_native_with_policy(
+        &checkpoint.tensors,
+        &checkpoint.config,
+        &device,
+        target,
+        &performance.cuda,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(
+        summarize(model.fp8_prefill_gemm_checks())["backend"],
+        "fused",
+        "the prefill GEMM resolves through production loading"
+    );
+    let timings = model.kernel_timings();
+    assert_eq!(timings["status"], "measured", "{timings}");
+    let kinds = timings["decode_fp8"]["kinds"].as_array().unwrap();
+    assert!(kinds.len() >= 6, "{timings}");
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| kind["gb_per_s"].as_f64().unwrap() > 0.0),
+        "{timings}"
+    );
+    let prefill = timings["prefill_projections"]["kinds"].as_array().unwrap();
+    assert!(
+        prefill
+            .iter()
+            .all(|kind| kind["gemm_tflop_per_s"].as_f64().unwrap() > 0.0),
+        "{timings}"
+    );
+    assert!(
+        timings["prefill_projections"]["compact_vs_gemm"]["mm_ms_256_rows"]
+            .as_f64()
+            .is_some()
+    );
+    assert_eq!(timings["deltanet_prefill"]["path"], "grouped", "{timings}");
+    assert!(timings["wall_ms"].as_f64().unwrap() < 2_000.0, "{timings}");
+}
+
 /// The block-FP8 LM head beside native FP8 projections: quantized at load
 /// from the BF16 mapping, gated, and a deliberate precision reduction that
 /// stays within a few percent of the dense head's logits.

@@ -59,6 +59,7 @@ use crate::models::shared::telemetry::{
 
 #[path = "decode_graph.rs"]
 mod decode_graph;
+mod kernel_timings;
 
 pub struct Qwen38TextModel {
     device: Device,

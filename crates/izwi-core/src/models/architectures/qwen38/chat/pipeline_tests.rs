@@ -95,6 +95,7 @@ fn chat_model(checkpoint: &Qwen38NativeCheckpoint, graphs: bool) -> Qwen38ChatMo
         mtp_head: None,
         prefix_caching: false,
         graph_quantum: GraphQuantumCounters::default(),
+        kernel_timings: serde_json::Value::Null,
     }
 }
 

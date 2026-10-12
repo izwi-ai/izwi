@@ -87,12 +87,94 @@ impl PendingCudaTimer {
         }
     }
 }
+/// Mean device milliseconds per call of `work` on `device`'s stream: two
+/// raw driver events around `iterations` calls, after `warmup` untimed calls
+/// (module loads, allocator growth). The context is made current and
+/// the events are created, recorded, waited on and destroyed through raw
+/// driver calls only: cudarc's safe event and context wrappers bind through
+/// `bind_to_thread`, which returns and clears an error another component
+/// latched on the context, so a measurement could fail on, or swallow,
+/// someone else's error. `None` off CUDA; a driver failure is this
+/// measurement's own error.
+pub fn device_ms_per_call(
+    device: &Device,
+    warmup: usize,
+    iterations: usize,
+    mut work: impl FnMut() -> Result<()>,
+) -> Result<Option<f64>> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::cuda_backend::cudarc::driver::{result, sys};
+        let Ok(cuda) = device.as_cuda_device() else {
+            return Ok(None);
+        };
+        let failed = |what: &str, error: result::DriverError| {
+            candle_core::Error::Msg(format!("CUDA timing {what} failed: {error:?}"))
+        };
+        let stream = cuda.cuda_stream();
+        // SAFETY: the device keeps its context alive for this call.
+        unsafe { result::ctx::set_current(stream.context().cu_ctx()) }
+            .map_err(|e| failed("context", e))?;
+        for _ in 0..warmup {
+            work()?;
+        }
+        struct Events(Vec<sys::CUevent>);
+        impl Drop for Events {
+            fn drop(&mut self) {
+                for event in &self.0 {
+                    // SAFETY: created below and destroyed exactly once.
+                    let _ = unsafe { result::event::destroy(*event) };
+                }
+            }
+        }
+        let mut events = Events(Vec::with_capacity(2));
+        for _ in 0..2 {
+            events.0.push(
+                result::event::create(sys::CUevent_flags::CU_EVENT_DEFAULT)
+                    .map_err(|e| failed("event creation", e))?,
+            );
+        }
+        let iterations = iterations.max(1);
+        // SAFETY: live events and the device's stream on the current context.
+        unsafe { result::event::record(events.0[0], stream.cu_stream()) }
+            .map_err(|e| failed("start record", e))?;
+        for _ in 0..iterations {
+            work()?;
+        }
+        // SAFETY: as above; the elapsed time is read after the end event
+        // completed, from two timing-enabled events on one stream.
+        let ms = unsafe {
+            result::event::record(events.0[1], stream.cu_stream())
+                .map_err(|e| failed("end record", e))?;
+            result::event::synchronize(events.0[1]).map_err(|e| failed("synchronize", e))?;
+            result::event::elapsed(events.0[0], events.0[1]).map_err(|e| failed("elapsed", e))?
+        };
+        if !ms.is_finite() || ms < 0.0 {
+            candle_core::bail!("invalid CUDA event elapsed time {ms}")
+        }
+        Ok(Some(f64::from(ms) / iterations as f64))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (device, warmup, iterations, &mut work);
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn no_cuda_timer_for_cpu() {
         assert!(CudaTimer::start(&Device::Cpu).unwrap().is_none());
+        let mut calls = 0;
+        let measured = device_ms_per_call(&Device::Cpu, 1, 3, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(measured.is_none());
+        assert_eq!(calls, 0, "no work runs off CUDA");
     }
     #[test]
     fn pending_timing_can_be_owned_by_a_request_across_workers() {
@@ -115,4 +197,13 @@ fn cuda_timer_reads_completed_interval_without_adding_a_fence() {
     // This is the normal consumer readback; try_elapsed itself never fences.
     let _ = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     assert!(pending.try_elapsed().unwrap().is_some());
+    let mut calls = 0;
+    let ms = device_ms_per_call(&device, 1, 4, || {
+        calls += 1;
+        x.sqr().map(drop)
+    })
+    .unwrap()
+    .expect("CUDA measures");
+    assert_eq!(calls, 5, "one warm-up call and four timed calls");
+    assert!(ms.is_finite() && ms >= 0.0, "{ms}");
 }

@@ -928,6 +928,9 @@ pub struct Qwen38ChatModel {
     mtp_head: Option<Qwen38MtpHead>,
     prefix_caching: bool,
     graph_quantum: GraphQuantumCounters,
+    /// Device timings of the hot kernels measured once at load (CUDA;
+    /// `text/kernel_timings.rs`), reported under `kernel_timings`.
+    kernel_timings: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1022,6 +1025,11 @@ impl Qwen38ChatModel {
             )?),
         };
         record_mtp_policy(mtp_policy.enabled());
+        // After every load-time check: the timings run the resolved paths.
+        let kernel_timings = text_model.kernel_timings();
+        if kernel_timings["status"] == "measured" {
+            info!(timings = %kernel_timings, "Qwen3.8 load-time kernel timings");
+        }
         let projection_representation = text_model.projection_representation();
         let device_kind = BackendKind::from(device.kind);
         let cuda_compute_capability = device.capabilities.cuda_compute_capability;
@@ -1061,6 +1069,7 @@ impl Qwen38ChatModel {
             mtp_head,
             prefix_caching: prefix_reuse,
             graph_quantum: GraphQuantumCounters::default(),
+            kernel_timings,
         })
     }
 
@@ -1371,6 +1380,7 @@ impl Qwen38ChatModel {
                 "runtime_validated": false,
             },
             "cuda_graphs": self.cuda_graphs_diagnostics(),
+            "kernel_timings": self.kernel_timings,
             "optimization_evidence": optimization_evidence,
             "fast_paths": {
                 "target": self.text_model.fast_path_diagnostics(),
