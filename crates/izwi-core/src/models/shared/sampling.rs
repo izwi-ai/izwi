@@ -778,6 +778,9 @@ fn finite_argmax(values: &[f32]) -> Result<u32> {
 enum SamplingTensorCacheInput {
     Mask(Vec<u8>),
     Indices(Vec<u32>),
+    /// `0..len` as U32. Candle builds `arange` on the host, so an uncached
+    /// full-vocabulary range uploads ~1 MB per sampled token.
+    Arange(u32),
 }
 
 struct SamplingTensorCacheEntry {
@@ -806,6 +809,10 @@ fn cached_sampling_tensor(device: &Device, input: SamplingTensorCacheInput) -> R
                         SamplingTensorCacheInput::Indices(left),
                         SamplingTensorCacheInput::Indices(right),
                     ) => left == right,
+                    (
+                        SamplingTensorCacheInput::Arange(left),
+                        SamplingTensorCacheInput::Arange(right),
+                    ) => left == right,
                     _ => false,
                 }
         }) {
@@ -823,6 +830,7 @@ fn cached_sampling_tensor(device: &Device, input: SamplingTensorCacheInput) -> R
             SamplingTensorCacheInput::Indices(values) => {
                 Tensor::from_vec(values.clone(), values.len(), device)?
             }
+            SamplingTensorCacheInput::Arange(len) => Tensor::arange(0u32, *len, device)?,
         };
         if cache.len() == DEVICE_SAMPLING_TENSOR_CACHE_ENTRIES {
             cache.pop_front();
@@ -1193,7 +1201,10 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
         )));
     }
     let mut candidate_values = values.contiguous()?;
-    let mut candidate_indices = Tensor::arange(0u32, length as u32, values.device())?;
+    let mut candidate_indices = cached_sampling_tensor(
+        values.device(),
+        SamplingTensorCacheInput::Arange(length as u32),
+    )?;
     loop {
         let length = candidate_values.dim(0)?;
         if length <= DEVICE_SORT_CHUNK {

@@ -581,8 +581,34 @@ impl Qwen35TextModel {
     ) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
         let hidden = self.token_embeddings.forward(&input)?;
-        let hidden = self.forward_hidden_physical(&hidden, &[position_ids], state, cache)?;
-        self.forward_hidden_to_logits(&hidden)
+        self.forward_hidden_to_logits_physical(&hidden, position_ids, state, cache)
+    }
+
+    /// One token's layers and LM head. The KV writes are sealed after the LM
+    /// head is enqueued, so the device keeps working while the host waits on
+    /// the write fences (the batched decode already orders it this way).
+    fn forward_hidden_to_logits_physical(
+        &self,
+        hidden: &Tensor,
+        position_ids: [usize; 3],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.forward_hidden_physical_prepared(hidden, &[position_ids], state, cache)?;
+        match self.forward_hidden_to_logits(&hidden) {
+            Ok(logits) => {
+                cache.commit_prepared(prepared)?;
+                Ok(logits)
+            }
+            // Committing zero tokens drains every write and exposes none.
+            Err(error) => match cache.commit_prepared_prefix(prepared, 0) {
+                Ok(()) => Err(error),
+                Err(drain) => Err(Error::InferenceError(format!(
+                    "Qwen3.5 LM head failed: {error}; KV write drain also failed: {drain}"
+                ))),
+            },
+        }
     }
 
     pub(crate) fn forward_token_ids_batch_at_physical(
@@ -749,9 +775,7 @@ impl Qwen35TextModel {
         state: &mut Qwen35TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
-        let hidden =
-            self.forward_hidden_physical(input_embedding, &[position_ids], state, cache)?;
-        self.forward_hidden_to_logits(&hidden)
+        self.forward_hidden_to_logits_physical(input_embedding, position_ids, state, cache)
     }
 
     pub(crate) fn prefill_input_embeddings_physical(
@@ -784,6 +808,21 @@ impl Qwen35TextModel {
         state: &mut Qwen35TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.forward_hidden_physical_prepared(input, position_ids, state, cache)?;
+        cache.commit_prepared(prepared)?;
+        Ok(hidden)
+    }
+
+    /// The layers of one span, with its KV writes enqueued but not yet
+    /// sealed. The caller must commit or abort the returned step.
+    fn forward_hidden_physical_prepared(
+        &self,
+        input: &Tensor,
+        position_ids: &[[usize; 3]],
+        state: &mut Qwen35TextRuntimeState,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
         self.validate_runtime_state(state)?;
         let (_, sequence_len, hidden_size) = input.dims3()?;
         if sequence_len == 0
@@ -851,8 +890,7 @@ impl Qwen35TextModel {
                 "Qwen3.5 physical attention did not cover every sparse layer".into(),
             ));
         }
-        cache.commit_prepared(prepared)?;
-        Ok(hidden)
+        Ok((hidden, prepared))
     }
 
     pub fn forward_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {

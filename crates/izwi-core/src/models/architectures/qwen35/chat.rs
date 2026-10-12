@@ -2225,37 +2225,6 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
         .ok_or_else(|| no_valid_logits_error(values))
 }
 
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
-        2 => {
-            let (rows, _cols) = logits.dims2()?;
-            if rows != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected Qwen3.5 logits shape for argmax: {:?}",
-                    logits.shape().dims()
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3.5 logits rank for argmax: {rank}"
-            )))
-        }
-    };
-
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    let selected = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
-    record_host_read(DType::U32, 1);
-    Ok(selected)
-}
-
 fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
@@ -2288,12 +2257,14 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     } else {
         logits
     };
-    let selected = argmax(&clamped)?;
-    let selected_logit = clamped
-        .i(selected as usize)?
-        .to_dtype(DType::F32)?
-        .to_scalar::<f32>()?;
-    record_host_read(DType::F32, 1);
+    // One readback carries the argmax and the logit it selected. Indices
+    // stay exact in F32 (vocabularies are far below 2^24).
+    let index = clamped.argmax(D::Minus1)?.reshape(1)?;
+    let selected_logit = clamped.to_dtype(DType::F32)?.gather(&index, 0)?;
+    let packed =
+        Tensor::cat(&[&index.to_dtype(DType::F32)?, &selected_logit], 0)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, packed.len());
+    let (selected, selected_logit) = (packed[0] as u32, packed[1]);
     if selected_logit.is_finite() {
         return Ok(selected);
     }
@@ -2865,6 +2836,49 @@ mod tests {
         assert!(unconsumed.is_none());
         assert!(
             take_quantum_sample(&mut unconsumed, 4, &config, history, &mut quantum_rng).is_err()
+        );
+    }
+
+    #[test]
+    fn greedy_sampling_reads_the_index_and_its_logit_back_once() {
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
+        };
+        let sample = |values: Vec<f32>, vocab: usize| {
+            let logits = Tensor::from_vec(values.clone(), values.len(), &candle_core::Device::Cpu)
+                .expect("logits");
+            let before = thread_host_reads();
+            let (token, path) = sample_next_token_traced(
+                &logits,
+                vocab,
+                &config,
+                PenaltyHistory::uniform(&[]),
+                &mut SimpleRng::new(7),
+            )
+            .expect("sample");
+            (token, path, thread_host_reads() - before)
+        };
+
+        // Finite winner: one packed readback. The vocabulary limit hides
+        // the larger out-of-vocabulary logit.
+        assert_eq!(
+            sample(vec![0.5, 3.0, -1.0, 9.0], 3),
+            (1, SamplerPath::Greedy, 1)
+        );
+        // A non-finite winner falls back to one full-row read.
+        assert_eq!(
+            sample(vec![0.5, f32::INFINITY, 2.0, -1.0], 4),
+            (2, SamplerPath::Greedy, 2)
         );
     }
 
