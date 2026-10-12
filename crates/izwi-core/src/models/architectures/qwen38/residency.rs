@@ -50,6 +50,10 @@ use crate::performance::{
 pub(crate) const FP8_PROJECTIONS_ENV: &str = "IZWI_QWEN38_FP8_PROJECTIONS";
 /// Kill switch for the vectorized FP8 decode GEMV: the reference GEMV runs.
 pub(crate) const FP8_GEMV_ENV: &str = "IZWI_QWEN38_FP8_GEMV";
+/// Switch for the dequantized prefill GEMM (`auto`, or `legacy`/`off`/`0`/
+/// `false`): long spans of CUDA block-FP8 projections run the compact `mm`
+/// kernel instead of a bounded BF16/F16 weight tile plus cuBLAS.
+pub(crate) const FP8_PREFILL_GEMM_ENV: &str = "IZWI_QWEN38_FP8_PREFILL_GEMM";
 pub(crate) use super::lm_head::FP8_LM_HEAD_ENV;
 /// Keeps the CPU LM head in F32 (`dense`, `legacy`, `off`, `0`, `false`)
 /// while the CPU projections are Q8_0.
@@ -206,6 +210,9 @@ pub(crate) struct Qwen38ResidencyPolicy {
     fp8_device: Fp8Device,
     /// The vectorized decode GEMV (CUDA): verified and not switched off.
     fp8_gemv: Qwen38FastPath,
+    /// The dequantized prefill GEMM (CUDA): planned and not switched off.
+    /// Each projection kind still passes its own load-time check first.
+    fp8_prefill_gemm: Qwen38FastPath,
     /// Pack row-compatible projections into one matrix.
     packing: bool,
     /// The LM head quantized to block FP8 (with native FP8 projections).
@@ -481,6 +488,11 @@ impl Qwen38ResidencyPolicy {
             } else {
                 Qwen38FastPath::Fused
             },
+            fp8_prefill_gemm: Qwen38FastPath::legacy(if metal_native {
+                "Metal prefill expands to F16 for one matmul"
+            } else {
+                "native block FP8 not selected"
+            }),
             packing: metal_native
                 || (backend == BackendKind::Cpu && plan == Qwen38ProjectionPlan::Q8)
                 || backend == BackendKind::Cuda
@@ -631,6 +643,13 @@ impl Qwen38ResidencyPolicy {
         } else {
             Qwen38FastPath::Fused
         };
+        self.fp8_prefill_gemm = if legacy_requested(FP8_PREFILL_GEMM_ENV) {
+            Qwen38FastPath::legacy(format!("{FP8_PREFILL_GEMM_ENV}=legacy"))
+        } else if !device.is_cuda() {
+            Qwen38FastPath::legacy("the dequantized prefill GEMM runs on CUDA only")
+        } else {
+            Qwen38FastPath::Fused
+        };
     }
 
     /// A native-FP8 policy on the CPU, where the portable reference kernel
@@ -754,6 +773,19 @@ impl Qwen38ResidencyPolicy {
         self.fp8_gemv.is_fused()
     }
 
+    /// Whether CUDA block-FP8 projections may run long spans through the
+    /// dequantized prefill GEMM (each kind after its own load-time check).
+    pub(crate) fn fp8_prefill_gemm(&self) -> bool {
+        matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
+            && self.fp8_prefill_gemm.is_fused()
+    }
+
+    /// Tests: plan the prefill GEMM on the CPU stand-in for the FP8 kernels.
+    #[cfg(test)]
+    pub(crate) fn force_fp8_prefill_gemm_for_tests(&mut self) {
+        self.fp8_prefill_gemm = Qwen38FastPath::Fused;
+    }
+
     /// Metal: whether every FP8 projection skips the GEMV (dequantize +
     /// matmul for every row count), from `IZWI_QWEN38_FP8_GEMV=legacy`.
     pub(crate) fn fp8_dequant_only(&self) -> bool {
@@ -763,12 +795,15 @@ impl Qwen38ResidencyPolicy {
     }
 
     /// Lazily allocated model-owned scratch the resident estimate includes:
-    /// the transient F16 expansion of Metal FP8 prefill.
+    /// the transient F16 expansion of Metal FP8 prefill, or on CUDA the one
+    /// dequantized weight tile of the prefill GEMM.
     pub(crate) fn prefill_scratch_bytes(&self) -> u64 {
         if self.backend == BackendKind::Metal
             && matches!(self.plan, Qwen38ProjectionPlan::NativeFp8 { .. })
         {
             METAL_FP8_PREFILL_DEQUANT_BYTES
+        } else if self.backend == BackendKind::Cuda && self.fp8_prefill_gemm() {
+            fp8::DEQUANT_GEMM_TILE_BYTES as u64
         } else {
             0
         }
@@ -910,7 +945,7 @@ impl Qwen38ResidencyPolicy {
     pub(crate) fn fallback_reason(&self) -> String {
         match self.plan {
             Qwen38ProjectionPlan::NativeFp8 { .. } if self.backend == BackendKind::Metal => "block-FP8 projections stay resident on Metal as the checkpoint's E4M3 bytes; up to 8 rows run the FP8 GEMV and longer spans expand to a transient F16 matrix for one matrix multiplication, after a load-time check of every projection kind against the original checkpoint bytes; the LM head and dense tensors stay F16".into(),
-            Qwen38ProjectionPlan::NativeFp8 { .. } => "block-FP8 projections stay resident as the checkpoint's E4M3 bytes and run on the compact FP8 kernels (16-bit activations, software FP8 decode) after device gates and a load-time check against the original checkpoint bytes; not runtime-certified on CUDA hardware".into(),
+            Qwen38ProjectionPlan::NativeFp8 { .. } => "block-FP8 projections stay resident as the checkpoint's E4M3 bytes and run on the compact FP8 kernels (16-bit activations, software FP8 decode) after device gates and a load-time check against the original checkpoint bytes; spans of 16 rows or more expand bounded weight tiles (128 MiB) to the activation dtype for cuBLAS once the projection kind passes its prefill check (IZWI_QWEN38_FP8_PREFILL_GEMM=legacy keeps the compact kernel); not runtime-certified on CUDA hardware".into(),
             Qwen38ProjectionPlan::Q8 if self.backend == BackendKind::Cpu && self.fallback.is_none() => "the CPU keeps block-FP8 projections (K divisible by 32) and the LM head as Q8_0: weight_scale_inv applied, then requantized (activations are quantized to Q8_0 in decode); decode rows run Candle's Q8_0 matmul and longer spans expand row tiles to F32 for one F32 matmul; the embedding and other dense tensors stay F32; IZWI_CPU_PROJECTION_BACKEND=expanded keeps the F32 expansion".into(),
             Qwen38ProjectionPlan::Q8 => format!(
                 "CUDA applies weight_scale_inv and requantizes projections to Q8_0: {}",
@@ -933,6 +968,7 @@ impl Qwen38ResidencyPolicy {
         serde_json::json!({
             "fp8_projections": summarize([&projections]),
             "fp8_gemv": summarize([&self.fp8_gemv]),
+            "fp8_prefill_gemm": summarize([&self.fp8_prefill_gemm]),
             "fp8_execution_mode": self.execution_mode(),
         })
     }

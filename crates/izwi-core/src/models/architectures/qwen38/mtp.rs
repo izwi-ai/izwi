@@ -309,6 +309,8 @@ pub(crate) struct Qwen38MtpHead {
     fp8_packing: Vec<Qwen38FastPath>,
     /// Metal: the GEMV check outcome of every FP8 projection kind.
     fp8_gemv_checks: Vec<Qwen38FastPath>,
+    /// CUDA: the dequantized prefill GEMM of every FP8 projection kind.
+    fp8_prefill_gemm_checks: Vec<Qwen38FastPath>,
 }
 
 impl Qwen38MtpHead {
@@ -431,8 +433,14 @@ impl Qwen38MtpHead {
             fused_norm_path: Qwen38FastPath::default(),
             fp8_packing: Vec::new(),
             fp8_gemv_checks: Vec::new(),
+            fp8_prefill_gemm_checks: Vec::new(),
         };
-        (head.fp8_packing, head.fp8_gemv_checks) = loader.into_outcomes();
+        let outcomes = loader.into_outcomes();
+        (
+            head.fp8_packing,
+            head.fp8_gemv_checks,
+            head.fp8_prefill_gemm_checks,
+        ) = (outcomes.packing, outcomes.gemv, outcomes.prefill_gemm);
         head.resolve_fast_paths(&Qwen38CudaSwitches::for_device(device, performance), false);
         Ok(head)
     }
@@ -490,6 +498,11 @@ impl Qwen38MtpHead {
     /// Metal: the GEMV check outcome of every FP8 projection kind.
     pub(crate) fn fp8_gemv_checks(&self) -> &[Qwen38FastPath] {
         &self.fp8_gemv_checks
+    }
+
+    /// CUDA: the dequantized prefill GEMM of every FP8 projection kind.
+    pub(crate) fn fp8_prefill_gemm_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_prefill_gemm_checks
     }
 
     pub(crate) fn projection_representation(&self) -> Qwen38ProjectionRepresentation {

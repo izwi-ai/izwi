@@ -172,9 +172,13 @@ pub(super) fn resource_plan(
     // CUDA graph decode's working memory when the policy plans it, else the
     // bounded TensorIsland caches (the same figure the chat model reports).
     let graphs = policy.graph_capacity_bytes(&checkpoint.config.text, performance)?;
+    // The prefill GEMM's one dequantized weight tile when the policy plans
+    // it: lazily allocated like the graphs, so also a pending claim.
+    let prefill_scratch = policy.prefill_scratch_bytes();
+    let deferred = graphs.checked_add(prefill_scratch).ok_or_else(overflow)?;
     let resident_bytes = weights
         .checked_add(DEVICE_ALIGNMENT_RESERVE)
-        .and_then(|n| n.checked_add(graphs))
+        .and_then(|n| n.checked_add(deferred))
         .ok_or_else(overflow)?;
     // This extra device overlap covers initialization outputs and allocator
     // padding. Every projection is uploaded into its final allocation once.
@@ -213,10 +217,11 @@ pub(super) fn resource_plan(
     // The bounded graph cache is allocated lazily. Do not mark it physically
     // materialized before state/context fitting: that would let KV consume its
     // headroom. Keeping this small claim pending is conservative after capture.
-    plan.deferred_resident_authorization.device_bytes = ResourceAmount::Known(graphs);
+    plan.deferred_resident_authorization.device_bytes = ResourceAmount::Known(deferred);
     tracing::info!(
         weights_bytes = weights,
         graph_capacity_bytes = graphs,
+        prefill_scratch_bytes = prefill_scratch,
         resident_bytes,
         host_staging_bytes = scratch,
         representation = policy.representation().as_str(),

@@ -20,7 +20,7 @@ use super::native::{
 use super::residency::{fp8_row_dot, probe_activations, Qwen38ResidencyPolicy, Qwen38WeightForm};
 use super::telemetry::{
     record_cpu_q8_projection, record_cuda_attention_dtype_casts, record_cuda_attn_gate_composition,
-    record_cuda_fp8_gemv, record_cuda_fp8_packed_projection,
+    record_cuda_fp8_gemv, record_cuda_fp8_packed_projection, record_cuda_fp8_prefill_gemm,
     record_cuda_head_expansion_materialization, record_cuda_kernel, record_cuda_lm_head,
     record_cuda_projection, record_cuda_qk_rope_chain, record_cuda_rms_norm_composition,
     record_cuda_rope, record_cuda_state_initial_allocation, record_fast_path_self_check_failure,
@@ -67,6 +67,9 @@ pub struct Qwen38TextModel {
     fp8_packing: Vec<Qwen38FastPath>,
     /// Metal: one entry per checked FP8 projection kind (GEMV or rerouted).
     fp8_gemv_checks: Vec<Qwen38FastPath>,
+    /// CUDA: one entry per checked FP8 projection kind (prefill GEMM or why
+    /// the kind keeps the compact kernel).
+    fp8_prefill_gemm_checks: Vec<Qwen38FastPath>,
     /// The LM head as block FP8 (or why not), with the host gate's
     /// relative L2 error against the BF16 head.
     fp8_lm_head: (Qwen38FastPath, Option<f64>),
@@ -678,10 +681,15 @@ pub(super) struct Qwen38Mlp {
 
 pub(super) enum Qwen38Projection {
     /// The checkpoint's block-FP8 bytes and F32 block scales, executed by the
-    /// compact FP8 kernels with the decode kernel chosen at load.
+    /// compact FP8 kernels with the decode kernel chosen at load. With
+    /// `prefill_gemm`, spans of [`FP8_PREFILL_GEMM_MIN_ROWS`] rows or more
+    /// expand bounded weight tiles to the activation dtype for a dense GEMM
+    /// (`fp8::block_fp8_projection_dequant_gemm`) instead; it is set only
+    /// after the projection kind passed its load-time check.
     NativeFp8 {
         raw: super::native::RawBlockFp8Projection,
         kernel: Qwen38Fp8Kernel,
+        prefill_gemm: bool,
     },
     Quantized(QMatMul),
     Dense(Linear),
@@ -707,6 +715,16 @@ const METAL_FP8_GEMV_MAX_ROWS: usize = 8;
 const CPU_Q8_MATMUL_MAX_ROWS: usize = 8;
 /// Weight rows the CPU Q8_0 prefill expands at a time (42 MB at K = 5120).
 const CPU_Q8_PREFILL_TILE_ROWS: usize = 2048;
+/// Activation rows from which a CUDA block-FP8 projection with the prefill
+/// GEMM resolved runs it instead of the compact `mm` kernel. `mm` computes
+/// 16-row output tiles and decodes every weight byte in software once per
+/// tile, so at 16 rows and up its cost grows with the span while the
+/// dequantized path's weight traffic (1 byte read, 2 written and read again
+/// per weight, all tiles) stays fixed and cuBLAS runs at tensor-core rate.
+/// Below one `mm` tile, `mm` reads each weight byte once and keeps the
+/// smaller traffic. The load-time timings report both paths at 16 rows so the
+/// crossover can be checked on the device.
+pub(super) const FP8_PREFILL_GEMM_MIN_ROWS: usize = 16;
 
 enum Qwen38ProjectionGroup {
     Separate(Vec<Qwen38Projection>),
@@ -844,8 +862,27 @@ impl Module for Qwen38Projection {
             });
         }
         match self {
-            Self::NativeFp8 { raw, kernel } => {
+            Self::NativeFp8 {
+                raw,
+                kernel,
+                prefill_gemm,
+            } => {
                 let vectorized = *kernel == Qwen38Fp8Kernel::Vectorized;
+                if *prefill_gemm
+                    && input.elem_count() / raw.shape[1].max(1) >= FP8_PREFILL_GEMM_MIN_ROWS
+                {
+                    if input.device().is_cuda() {
+                        record_cuda_fp8_prefill_gemm();
+                    }
+                    let output = crate::kernels::cuda::fp8::block_fp8_projection_dequant_gemm(
+                        input,
+                        &raw.weights,
+                        &raw.scales,
+                    )?;
+                    #[cfg(test)]
+                    let output = prefill_gemm_fault::apply(output)?;
+                    return Ok(output);
+                }
                 if input.device().is_metal() {
                     let rows = input.elem_count() / raw.shape[1].max(1);
                     if *kernel == Qwen38Fp8Kernel::DequantOnly || rows > METAL_FP8_GEMV_MAX_ROWS {
@@ -891,6 +928,54 @@ impl Module for Qwen38Projection {
                 projection.forward(input)
             }
             Self::Dense(projection) => projection.forward(input),
+        }
+    }
+}
+
+impl Qwen38Projection {
+    /// A native block-FP8 projection with the prefill GEMM switched to
+    /// `enabled` (same resident tensors); `None` for other forms.
+    pub(super) fn with_prefill_gemm(&self, enabled: bool) -> Option<Self> {
+        match self {
+            Self::NativeFp8 { raw, kernel, .. } => Some(Self::NativeFp8 {
+                raw: raw.clone(),
+                kernel: *kernel,
+                prefill_gemm: enabled,
+            }),
+            Self::Quantized(_) | Self::Dense(_) => None,
+        }
+    }
+}
+
+/// Tests: a fault injected into the dequantized prefill GEMM's output only
+/// (x1.5), so the load-time check and its fallback can be RED-checked.
+#[cfg(test)]
+pub(super) mod prefill_gemm_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(in crate::models::architectures::qwen38) struct Injected;
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            FAULT.with(|fault| fault.set(false));
+        }
+    }
+
+    /// Corrupt every prefill GEMM on this thread until the guard drops.
+    pub(in crate::models::architectures::qwen38) fn inject() -> Injected {
+        FAULT.with(|fault| fault.set(true));
+        Injected
+    }
+
+    pub(super) fn apply(output: candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
+        if FAULT.with(Cell::get) {
+            output * 1.5
+        } else {
+            Ok(output)
         }
     }
 }
@@ -1169,13 +1254,14 @@ impl Qwen38TextModel {
                 mlp,
             });
         }
-        let (fp8_packing, fp8_gemv_checks) = loader.into_outcomes();
+        let outcomes = loader.into_outcomes();
         let mut model = Self {
             device: device.clone(),
             projection_representation,
             residency: policy.clone(),
-            fp8_packing,
-            fp8_gemv_checks,
+            fp8_packing: outcomes.packing,
+            fp8_gemv_checks: outcomes.gemv,
+            fp8_prefill_gemm_checks: outcomes.prefill_gemm,
             fp8_lm_head,
             token_embeddings,
             layers,
@@ -1977,6 +2063,11 @@ impl Qwen38TextModel {
     /// Metal: the GEMV check outcome of every FP8 projection kind.
     pub(super) fn fp8_gemv_checks(&self) -> &[Qwen38FastPath] {
         &self.fp8_gemv_checks
+    }
+
+    /// CUDA: the dequantized prefill GEMM per checked FP8 projection kind.
+    pub(super) fn fp8_prefill_gemm_checks(&self) -> &[Qwen38FastPath] {
+        &self.fp8_prefill_gemm_checks
     }
 
     /// `fast_paths.fp8_lm_head`: the head's form and its observed error.
@@ -4409,6 +4500,18 @@ impl Qwen38GatedRmsNorm {
     }
 }
 
+/// What one load's block-FP8 checks resolved, for the diagnostics.
+#[derive(Debug, Default)]
+pub(super) struct Qwen38Fp8Outcomes {
+    /// One entry per block-FP8 projection group: packed, or why not.
+    pub(super) packing: Vec<Qwen38FastPath>,
+    /// Metal: one entry per checked FP8 projection kind (GEMV or rerouted).
+    pub(super) gemv: Vec<Qwen38FastPath>,
+    /// CUDA: one entry per checked FP8 projection kind: the dequantized
+    /// prefill GEMM, or why the kind keeps the compact kernel.
+    pub(super) prefill_gemm: Vec<Qwen38FastPath>,
+}
+
 /// Load-scoped state shared by every projection one model load
 /// materializes: the checkpoint, the residency policy, the device, and the
 /// bookkeeping of the load-time FP8 checks and packing.
@@ -4428,6 +4531,11 @@ pub(super) struct Qwen38WeightLoader<'a> {
     gemv: std::cell::RefCell<Vec<Qwen38FastPath>>,
     /// Metal: projection kinds whose GEMV failed its check.
     dequant_kinds: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// CUDA: one entry per checked FP8 projection kind: the dequantized
+    /// prefill GEMM passed its check, or why the kind keeps `mm`.
+    prefill_gemm: std::cell::RefCell<Vec<Qwen38FastPath>>,
+    /// The prefill GEMM's verdict per checked projection kind.
+    prefill_gemm_kinds: std::cell::RefCell<std::collections::BTreeMap<String, bool>>,
     /// Tests: corrupt the scales of every FP8 projection this loader
     /// materializes, to prove the load-time check fails closed.
     #[cfg(test)]
@@ -4458,18 +4566,31 @@ impl<'a> Qwen38WeightLoader<'a> {
             packing: Default::default(),
             gemv: Default::default(),
             dequant_kinds: Default::default(),
+            prefill_gemm: Default::default(),
+            prefill_gemm_kinds: Default::default(),
             #[cfg(test)]
             corrupt_fp8_scales: Default::default(),
         }
     }
 
     pub(super) fn into_packing(self) -> Vec<Qwen38FastPath> {
-        self.into_outcomes().0
+        self.into_outcomes().packing
     }
 
-    /// (packing per FP8 group, Metal GEMV check per FP8 kind).
-    pub(super) fn into_outcomes(self) -> (Vec<Qwen38FastPath>, Vec<Qwen38FastPath>) {
-        (self.packing.into_inner(), self.gemv.into_inner())
+    /// What this load's FP8 checks resolved.
+    pub(super) fn into_outcomes(self) -> Qwen38Fp8Outcomes {
+        Qwen38Fp8Outcomes {
+            packing: self.packing.into_inner(),
+            gemv: self.gemv.into_inner(),
+            prefill_gemm: self.prefill_gemm.into_inner(),
+        }
+    }
+
+    /// Whether a freshly materialized projection of `kind` runs the
+    /// dequantized prefill GEMM: the policy resolved it and the kind has not
+    /// failed its check in this load.
+    fn prefill_gemm_for(&self, kind: &str) -> bool {
+        self.policy.fp8_prefill_gemm() && self.prefill_gemm_kinds.borrow().get(kind) != Some(&false)
     }
 
     fn fp8_kernel(&self) -> Qwen38Fp8Kernel {
@@ -4499,6 +4620,69 @@ impl<'a> Qwen38WeightLoader<'a> {
         parts: &[(&str, [usize; 2])],
         projection: Qwen38Projection,
     ) -> Result<Qwen38Projection> {
+        let projection = self.checked_fp8_kernels(parts, projection)?;
+        Ok(self.checked_prefill_gemm(parts, projection))
+    }
+
+    /// The dequantized prefill GEMM of a projection that passed its kernel
+    /// checks: once per projection kind, [`fp8_prefill_gemm_check`] compares
+    /// it with the compact kernel and the original checkpoint bytes. A
+    /// mismatch keeps the kind on `mm` (with a diagnostics reason) instead of
+    /// failing the load.
+    fn checked_prefill_gemm(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Qwen38Projection {
+        if !matches!(
+            projection,
+            Qwen38Projection::NativeFp8 {
+                prefill_gemm: true,
+                ..
+            }
+        ) {
+            return projection;
+        }
+        let kind = Self::kind(parts);
+        if self.prefill_gemm_kinds.borrow().contains_key(&kind) {
+            return projection;
+        }
+        match fp8_prefill_gemm_check(
+            self.tensors,
+            parts,
+            self.block,
+            &projection,
+            self.target.dtype(),
+            self.device,
+        ) {
+            Ok(()) => {
+                self.prefill_gemm_kinds.borrow_mut().insert(kind, true);
+                self.prefill_gemm.borrow_mut().push(Qwen38FastPath::Fused);
+                projection
+            }
+            Err(error) => {
+                record_fast_path_self_check_failure();
+                tracing::warn!(%error, kind, "Qwen3.8 dequantized FP8 prefill GEMM failed its load-time check; this projection kind keeps the compact FP8 kernel");
+                self.prefill_gemm
+                    .borrow_mut()
+                    .push(Qwen38FastPath::legacy(format!(
+                        "self_check_failed: {kind}: {error}"
+                    )));
+                self.prefill_gemm_kinds.borrow_mut().insert(kind, false);
+                projection
+                    .with_prefill_gemm(false)
+                    .expect("checked projections are native block FP8")
+            }
+        }
+    }
+
+    /// The kernel checks of [`Self::checked_fp8`] (the decode GEMVs and the
+    /// compact `mm` kernel); see [`Self::fp8_self_check`].
+    fn checked_fp8_kernels(
+        &self,
+        parts: &[(&str, [usize; 2])],
+        projection: Qwen38Projection,
+    ) -> Result<Qwen38Projection> {
         let kind = Self::kind(parts);
         let fresh = !self.checked.borrow().contains(&kind);
         match self.fp8_self_check(parts, &projection) {
@@ -4518,7 +4702,12 @@ impl<'a> Qwen38WeightLoader<'a> {
                 Ok(projection)
             }
             Err(error) if self.device.is_metal() => {
-                let Qwen38Projection::NativeFp8 { raw, kernel } = projection else {
+                let Qwen38Projection::NativeFp8 {
+                    raw,
+                    kernel,
+                    prefill_gemm,
+                } = projection
+                else {
                     return Err(error);
                 };
                 if kernel == Qwen38Fp8Kernel::DequantOnly {
@@ -4527,6 +4716,7 @@ impl<'a> Qwen38WeightLoader<'a> {
                 let rerouted = Qwen38Projection::NativeFp8 {
                     raw,
                     kernel: Qwen38Fp8Kernel::DequantOnly,
+                    prefill_gemm,
                 };
                 self.fp8_self_check(parts, &rerouted).map_err(|second| {
                     Error::ModelLoadError(format!(
@@ -4559,18 +4749,24 @@ impl<'a> Qwen38WeightLoader<'a> {
         } else {
             raw
         };
-        let kernel = if self.dequant_kinds.borrow().contains(&Self::kind(parts)) {
+        let kind = Self::kind(parts);
+        let kernel = if self.dequant_kinds.borrow().contains(&kind) {
             Qwen38Fp8Kernel::DequantOnly
         } else {
             self.fp8_kernel()
         };
-        Ok(Qwen38Projection::NativeFp8 { raw, kernel })
+        Ok(Qwen38Projection::NativeFp8 {
+            raw,
+            kernel,
+            prefill_gemm: self.prefill_gemm_for(&kind),
+        })
     }
 
     /// Check a resident FP8 projection (one part, or a pack of `parts` in
     /// row order) against a host reference built from the ORIGINAL per-part
     /// checkpoint bytes and scales, never from the uploaded copy: sampled
-    /// output rows, every pack boundary, at 1, 4 and 16 activation rows.
+    /// output rows, every pack boundary, at 1, 4 and 16 activation rows,
+    /// through the compact kernels (the prefill GEMM has its own check).
     /// Runs once per projection kind (layer index removed).
     pub(super) fn fp8_self_check(
         &self,
@@ -4581,11 +4777,12 @@ impl<'a> Qwen38WeightLoader<'a> {
         if self.checked.borrow().contains(&kind) {
             return Ok(());
         }
+        let compact = projection.with_prefill_gemm(false);
         fp8_projection_check(
             self.tensors,
             parts,
             self.block,
-            projection,
+            compact.as_ref().unwrap_or(projection),
             self.target.dtype(),
             self.device,
         )
@@ -4612,6 +4809,135 @@ fn projection_kind(name: &str) -> String {
     )
 }
 
+/// Output rows a load-time FP8 check samples and their original
+/// checkpoint bytes: every [`FP8_CHECK_ROW_STRIDE`]th row, both sides of every
+/// pack and scale-block boundary, the last row and `extra` rows, each with
+/// `(bytes, the part's scale grid, row block in the part)`.
+struct Fp8CheckReference {
+    k: usize,
+    total: usize,
+    sampled: Vec<usize>,
+    rows: Vec<(Vec<u8>, std::sync::Arc<Vec<f32>>, usize)>,
+}
+
+impl Fp8CheckReference {
+    fn new(
+        tensors: &IndexedSafetensors,
+        parts: &[(&str, [usize; 2])],
+        block: [usize; 2],
+        extra: impl IntoIterator<Item = usize>,
+    ) -> Result<Self> {
+        let k = parts
+            .first()
+            .map(|(_, shape)| shape[1])
+            .ok_or_else(|| Error::ModelLoadError("empty FP8 check".into()))?;
+        let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
+        let mut rows: std::collections::BTreeSet<usize> =
+            (0..total).step_by(FP8_CHECK_ROW_STRIDE).collect();
+        let mut offset = 0usize;
+        for (_, shape) in parts {
+            for row in [
+                offset.wrapping_sub(1),
+                offset,
+                offset + 1,
+                offset + 127,
+                offset + 128,
+            ] {
+                if row < total {
+                    rows.insert(row);
+                }
+            }
+            offset += shape[0];
+        }
+        rows.insert(total - 1);
+        rows.extend(extra.into_iter().filter(|row| *row < total));
+        let mut references = Vec::with_capacity(rows.len());
+        let mut offset = 0usize;
+        for (name, shape) in parts {
+            let local: Vec<usize> = rows
+                .range(offset..offset + shape[0])
+                .map(|row| row - offset)
+                .collect();
+            if !local.is_empty() {
+                let (bytes, scales) = tensors.block_fp8_rows(name, *shape, block, &local)?;
+                let scales = std::sync::Arc::new(scales);
+                for (index, row) in local.iter().enumerate() {
+                    references.push((
+                        bytes[index * k..(index + 1) * k].to_vec(),
+                        scales.clone(),
+                        row / block[0],
+                    ));
+                }
+            }
+            offset += shape[0];
+        }
+        Ok(Self {
+            k,
+            total,
+            sampled: rows.into_iter().collect(),
+            rows: references,
+        })
+    }
+
+    /// `(actual, expected)` at the sampled rows for `m` activation rows `x`
+    /// and the projection's `[m, total]` output.
+    fn sampled(
+        &self,
+        block: [usize; 2],
+        x: &[f32],
+        output: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let m = x.len() / self.k;
+        if output.len() != m * self.total {
+            return Err(Error::ModelLoadError(format!(
+                "FP8 check produced {} values, expected {}",
+                output.len(),
+                m * self.total
+            )));
+        }
+        let scale_cols = self.k.div_ceil(block[1]);
+        let mut actual = Vec::with_capacity(m * self.sampled.len());
+        let mut expected = Vec::with_capacity(m * self.sampled.len());
+        for (row_index, activations) in x.chunks(self.k).enumerate() {
+            for (row, (bytes, scales, row_block)) in self.sampled.iter().zip(&self.rows) {
+                actual.push(output[row_index * self.total + row]);
+                expected.push(fp8_row_dot(
+                    bytes,
+                    scales,
+                    *row_block,
+                    scale_cols,
+                    block[1],
+                    activations,
+                ));
+            }
+        }
+        Ok((actual, expected))
+    }
+}
+
+/// `projection` on `m` probe rows (seeded) of the activation dtype, on the
+/// host as F32 `(activations, output)`.
+fn fp8_check_forward(
+    projection: &Qwen38Projection,
+    m: usize,
+    k: usize,
+    activation: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let x = probe_activations(m, k, activation, seed);
+    let input = Tensor::from_vec(x.clone(), (1, m, k), &Device::Cpu)?
+        .to_dtype(activation)?
+        .to_device(device)?;
+    let output = projection
+        .forward(&input)?
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok((x, output))
+}
+
 /// The comparison behind [`Qwen38WeightLoader::fp8_self_check`]. Tolerance:
 /// 1% relative L2 and 2% of the largest reference magnitude per element,
 /// NaN-safe; the reference multiplies the same activation-dtype-rounded
@@ -4624,87 +4950,76 @@ pub(super) fn fp8_projection_check(
     activation: DType,
     device: &Device,
 ) -> Result<()> {
-    let k = parts
-        .first()
-        .map(|(_, shape)| shape[1])
-        .ok_or_else(|| Error::ModelLoadError("empty FP8 check".into()))?;
-    let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
-    let mut rows: std::collections::BTreeSet<usize> =
-        (0..total).step_by(FP8_CHECK_ROW_STRIDE).collect();
-    let mut offset = 0usize;
-    for (_, shape) in parts {
-        for row in [
-            offset.wrapping_sub(1),
-            offset,
-            offset + 1,
-            offset + 127,
-            offset + 128,
-        ] {
-            if row < total {
-                rows.insert(row);
-            }
-        }
-        offset += shape[0];
-    }
-    rows.insert(total - 1);
-    // (global row, part bytes row, scales of the part, row block in the part)
-    let scale_cols = k.div_ceil(block[1]);
-    let mut references = Vec::with_capacity(rows.len());
-    let mut offset = 0usize;
-    for (name, shape) in parts {
-        let local: Vec<usize> = rows
-            .range(offset..offset + shape[0])
-            .map(|row| row - offset)
-            .collect();
-        if !local.is_empty() {
-            let (bytes, scales) = tensors.block_fp8_rows(name, *shape, block, &local)?;
-            let scales = std::sync::Arc::new(scales);
-            for (index, row) in local.iter().enumerate() {
-                references.push((
-                    bytes[index * k..(index + 1) * k].to_vec(),
-                    scales.clone(),
-                    row / block[0],
-                ));
-            }
-        }
-        offset += shape[0];
-    }
-    let sampled: Vec<usize> = rows.into_iter().collect();
+    let reference = Fp8CheckReference::new(tensors, parts, block, [])?;
     for (seed, m) in FP8_CHECK_ROWS.into_iter().enumerate() {
-        let x = probe_activations(m, k, activation, 101 + seed as u64);
-        let input = Tensor::from_vec(x.clone(), (1, m, k), &Device::Cpu)?
-            .to_dtype(activation)?
-            .to_device(device)?;
-        let output = projection
-            .forward(&input)?
-            .to_dtype(DType::F32)?
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        if output.len() != m * total {
-            return Err(Error::ModelLoadError(format!(
-                "FP8 check produced {} values, expected {}",
-                output.len(),
-                m * total
-            )));
-        }
-        let mut actual = Vec::with_capacity(m * sampled.len());
-        let mut expected = Vec::with_capacity(m * sampled.len());
-        for (row_index, activations) in x.chunks(k).enumerate() {
-            for (row, (bytes, scales, row_block)) in sampled.iter().zip(&references) {
-                actual.push(output[row_index * total + row]);
-                expected.push(fp8_row_dot(
-                    bytes,
-                    scales,
-                    *row_block,
-                    scale_cols,
-                    block[1],
-                    activations,
-                ));
-            }
-        }
+        let (x, output) = fp8_check_forward(
+            projection,
+            m,
+            reference.k,
+            activation,
+            101 + seed as u64,
+            device,
+        )?;
+        let (actual, expected) = reference.sampled(block, &x, &output)?;
         compare_values(
             &format!("block-FP8 check at {m} rows"),
+            &actual,
+            &expected,
+            0.01,
+            0.02,
+        )?;
+    }
+    Ok(())
+}
+
+/// Activation rows of the load-time prefill GEMM check: the switch-over (one
+/// `mm` tile) and a multi-tile span.
+const FP8_PREFILL_CHECK_ROWS: [usize; 2] = [FP8_PREFILL_GEMM_MIN_ROWS, 64];
+
+/// The check behind [`Qwen38WeightLoader::checked_prefill_gemm`], at the
+/// projection's real geometry and at 16 and 64 activation rows: the
+/// dequantized GEMM's COMPLETE output against the compact `mm` kernel on
+/// the same resident tensors, and its sampled rows (plus both sides of every
+/// dequantization tile boundary) against a host reference from the original
+/// checkpoint bytes. Same tolerances as [`fp8_projection_check`], NaN-safe.
+pub(super) fn fp8_prefill_gemm_check(
+    tensors: &IndexedSafetensors,
+    parts: &[(&str, [usize; 2])],
+    block: [usize; 2],
+    projection: &Qwen38Projection,
+    activation: DType,
+    device: &Device,
+) -> Result<()> {
+    let (gemm, compact) = match (
+        projection.with_prefill_gemm(true),
+        projection.with_prefill_gemm(false),
+    ) {
+        (Some(gemm), Some(compact)) => (gemm, compact),
+        _ => {
+            return Err(Error::ModelLoadError(
+                "the prefill GEMM check needs a native block-FP8 projection".into(),
+            ))
+        }
+    };
+    let total: usize = parts.iter().map(|(_, shape)| shape[0]).sum();
+    let k = parts.first().map_or(0, |(_, shape)| shape[1]);
+    let tile = crate::kernels::cuda::fp8::dequant_gemm_tile_rows(total, k).max(1);
+    let boundaries = (tile..total).step_by(tile).flat_map(|row| [row - 1, row]);
+    let reference = Fp8CheckReference::new(tensors, parts, block, boundaries)?;
+    for (seed, m) in FP8_PREFILL_CHECK_ROWS.into_iter().enumerate() {
+        let seed = 211 + seed as u64;
+        let (x, output) = fp8_check_forward(&gemm, m, reference.k, activation, seed, device)?;
+        let (_, compact) = fp8_check_forward(&compact, m, reference.k, activation, seed, device)?;
+        compare_values(
+            &format!("prefill GEMM vs the compact FP8 kernel at {m} rows"),
+            &output,
+            &compact,
+            0.01,
+            0.02,
+        )?;
+        let (actual, expected) = reference.sampled(block, &x, &output)?;
+        compare_values(
+            &format!("prefill GEMM vs the checkpoint bytes at {m} rows"),
             &actual,
             &expected,
             0.01,

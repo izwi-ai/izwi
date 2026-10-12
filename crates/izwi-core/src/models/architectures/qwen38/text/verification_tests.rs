@@ -111,6 +111,7 @@ fn model_with_value_heads(value_heads: usize) -> Qwen38TextModel {
         ),
         fp8_packing: Vec::new(),
         fp8_gemv_checks: Vec::new(),
+        fp8_prefill_gemm_checks: Vec::new(),
         fp8_lm_head: (Qwen38FastPath::legacy("not loaded"), None),
         token_embeddings: Embedding::new(
             Tensor::from_vec(
@@ -366,6 +367,7 @@ fn native_mlp_graph_closure_matches_eager_and_retains_every_intermediate() {
                 block_shape: [128, 128],
             },
             kernel: Qwen38Fp8Kernel::Reference,
+            prefill_gemm: false,
         }
     }
     let mlp = Qwen38Mlp {

@@ -17,6 +17,7 @@ pub(crate) struct Qwen38OptimizationTelemetrySnapshot {
     pub cuda_fp8_gemv_vectorized_calls_total: u64,
     pub cuda_fp8_gemv_reference_calls_total: u64,
     pub cuda_fp8_packed_projection_calls_total: u64,
+    pub cuda_fp8_prefill_gemm_calls_total: u64,
     pub cuda_fp8_lm_head_calls_total: u64,
     pub cuda_bf16_lm_head_calls_total: u64,
     pub metal_fp8_gemv_calls_total: u64,
@@ -107,6 +108,7 @@ counters!(
     CUDA_FP8_GEMV_VECTORIZED_CALLS,
     CUDA_FP8_GEMV_REFERENCE_CALLS,
     CUDA_FP8_PACKED_PROJECTION_CALLS,
+    CUDA_FP8_PREFILL_GEMM_CALLS,
     CUDA_FP8_LM_HEAD_CALLS,
     CUDA_BF16_LM_HEAD_CALLS,
     METAL_FP8_GEMV_CALLS,
@@ -259,6 +261,12 @@ pub(crate) fn record_cpu_q8_projection(tiled: bool) {
 /// One CUDA call of a packed block-FP8 projection group.
 pub(crate) fn record_cuda_fp8_packed_projection() {
     CUDA_FP8_PACKED_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One CUDA block-FP8 projection over a long span (prefill) through the
+/// dequantized-tile dense GEMM instead of the compact `mm` kernel.
+pub(crate) fn record_cuda_fp8_prefill_gemm() {
+    CUDA_FP8_PREFILL_GEMM_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_cuda_attention_dtype_casts(count: usize) {
@@ -493,6 +501,7 @@ pub(crate) fn snapshot() -> Qwen38OptimizationTelemetrySnapshot {
         cuda_fp8_gemv_vectorized_calls_total: load!(CUDA_FP8_GEMV_VECTORIZED_CALLS),
         cuda_fp8_gemv_reference_calls_total: load!(CUDA_FP8_GEMV_REFERENCE_CALLS),
         cuda_fp8_packed_projection_calls_total: load!(CUDA_FP8_PACKED_PROJECTION_CALLS),
+        cuda_fp8_prefill_gemm_calls_total: load!(CUDA_FP8_PREFILL_GEMM_CALLS),
         cuda_fp8_lm_head_calls_total: load!(CUDA_FP8_LM_HEAD_CALLS),
         cuda_bf16_lm_head_calls_total: load!(CUDA_BF16_LM_HEAD_CALLS),
         metal_fp8_gemv_calls_total: load!(METAL_FP8_GEMV_CALLS),

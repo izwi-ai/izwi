@@ -261,6 +261,145 @@ fn forced_native_fp8_trunk_tracks_the_expanded_f32_load() {
     }
 }
 
+/// Every native block-FP8 trunk projection, as `(kind tag, prefill GEMM)`.
+fn fp8_prefill_gemm_flags(model: &Qwen38TextModel) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut single = |projection: &Qwen38Projection| {
+        if let Qwen38Projection::NativeFp8 { prefill_gemm, .. } = projection {
+            flags.push(*prefill_gemm);
+        }
+    };
+    for layer in &model.layers {
+        let groups = [
+            &layer.mlp.gate_up,
+            match &layer.mixer {
+                Qwen38Mixer::Linear(linear) => &linear.qkv_z_proj,
+                Qwen38Mixer::Full(attention) => &attention.qkv_proj,
+            },
+        ];
+        for group in groups {
+            match group {
+                Qwen38ProjectionGroup::Separate(parts) => parts.iter().for_each(&mut single),
+                Qwen38ProjectionGroup::Packed { projection, .. } => single(projection),
+            }
+        }
+        single(&layer.mlp.down);
+        match &layer.mixer {
+            Qwen38Mixer::Linear(linear) => single(&linear.out_proj),
+            Qwen38Mixer::Full(attention) => single(&attention.o_proj),
+        }
+    }
+    flags
+}
+
+/// The hidden states of one 20-row prefill (above the 16-row switch-over).
+fn long_prefill_hidden(model: &Qwen38TextModel, checkpoint: &Qwen38NativeCheckpoint) -> Vec<f32> {
+    let arena = GoldenArena::new(&checkpoint.config, &Device::Cpu, DType::F32);
+    let tokens: Vec<u32> = (0..20u32).map(|i| (i * 37 + 5) % 500).collect();
+    let positions: Vec<[usize; 3]> = (0..tokens.len()).map(|p| [p, p, p]).collect();
+    let mut state = model.new_state();
+    let mut cache = arena.session(0);
+    model
+        .prefill_token_ids_with_hidden_physical(&tokens, &positions, &mut state, &mut cache, false)
+        .unwrap()
+        .expect("prefill output")
+        .hidden_states
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+}
+
+/// The dequantized prefill GEMM through production loading on the CPU
+/// stand-in: every projection kind passes its load-time check and takes the
+/// GEMM, a 20-row prefill tracks the compact-kernel load to F32 rounding,
+/// and the prefill really runs the GEMM (a fault injected into the GEMM's
+/// output after load moves the result). RED: with the fault injected during
+/// load every kind fails its check, keeps the compact kernel with a
+/// `self_check_failed` reason, and the load still succeeds; the switch keeps
+/// the policy off.
+#[test]
+fn forced_prefill_gemm_resolves_per_kind_and_falls_back_on_a_failed_check() {
+    let _env = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_dir, checkpoint) = fixture();
+    let target = ProjectionMaterialization::F32;
+    let _forced = force_cpu_native_fp8_for_tests();
+    let compact_policy = resolve(&checkpoint, target, &PerformanceConfig::default());
+    assert!(
+        !compact_policy.fp8_prefill_gemm(),
+        "the CPU stand-in leaves the CUDA prefill GEMM off unless forced"
+    );
+    let compact = load(&checkpoint, target, &compact_policy).unwrap();
+    assert!(fp8_prefill_gemm_flags(&compact).iter().all(|flag| !flag));
+    assert_eq!(
+        summarize(compact.fp8_prefill_gemm_checks())["backend"],
+        "none"
+    );
+    let reference = long_prefill_hidden(&compact, &checkpoint);
+
+    let mut policy = compact_policy.clone();
+    policy.force_fp8_prefill_gemm_for_tests();
+    assert!(policy.fp8_prefill_gemm());
+    let gemm = load(&checkpoint, target, &policy).unwrap();
+    let flags = fp8_prefill_gemm_flags(&gemm);
+    assert!(
+        !flags.is_empty() && flags.iter().all(|flag| *flag),
+        "{flags:?}"
+    );
+    let summary = summarize(gemm.fp8_prefill_gemm_checks());
+    assert_eq!(summary["backend"], "fused", "{summary}");
+    // Packed qkvz, DeltaNet out, packed qkv, attention out, gate_up, down.
+    assert_eq!(summary["fused_layers"], 6, "{summary}");
+    let hidden = long_prefill_hidden(&gemm, &checkpoint);
+    let error = relative_l2(&hidden, &reference);
+    assert!(
+        error < 1e-5,
+        "prefill GEMM vs compact kernel: relative L2 {error}"
+    );
+    {
+        let _fault = prefill_gemm_fault::inject();
+        let faulted = long_prefill_hidden(&gemm, &checkpoint);
+        assert!(
+            relative_l2(&faulted, &reference) > 1e-2,
+            "the 20-row prefill must run the prefill GEMM"
+        );
+    }
+
+    let failures = crate::models::architectures::qwen38::telemetry::snapshot()
+        .fast_path_self_check_failures_total;
+    let fallback = {
+        let _fault = prefill_gemm_fault::inject();
+        load(&checkpoint, target, &policy).unwrap()
+    };
+    assert!(fp8_prefill_gemm_flags(&fallback).iter().all(|flag| !flag));
+    let summary = summarize(fallback.fp8_prefill_gemm_checks());
+    assert_eq!(summary["backend"], "legacy", "{summary}");
+    assert_eq!(summary["legacy_layers"], 6, "{summary}");
+    let reasons = summary["legacy_reasons"].to_string();
+    assert!(reasons.contains("self_check_failed"), "{reasons}");
+    assert!(reasons.contains("diverges"), "{reasons}");
+    assert!(
+        crate::models::architectures::qwen38::telemetry::snapshot()
+            .fast_path_self_check_failures_total
+            >= failures + 6
+    );
+    assert_eq!(long_prefill_hidden(&fallback, &checkpoint), reference);
+
+    std::env::set_var(
+        crate::models::architectures::qwen38::residency::FP8_PREFILL_GEMM_ENV,
+        "legacy",
+    );
+    let switched = resolve(&checkpoint, target, &PerformanceConfig::default());
+    std::env::remove_var(crate::models::architectures::qwen38::residency::FP8_PREFILL_GEMM_ENV);
+    assert!(!switched.fp8_prefill_gemm());
+    assert_eq!(
+        switched.diagnostics()["fp8_prefill_gemm"]["legacy_reasons"][0],
+        "IZWI_QWEN38_FP8_PREFILL_GEMM=legacy"
+    );
+}
+
 /// The block-FP8 LM head beside native FP8 projections: quantized at load
 /// from the BF16 mapping, gated, and a deliberate precision reduction that
 /// stays within a few percent of the dense head's logits.
@@ -379,19 +518,28 @@ fn fp8_load_check_rejects_a_swapped_pack_and_a_wrong_scale() {
             .materialize_block_fp8_raw_group(order, block, &Device::Cpu)
             .unwrap(),
         kernel: Qwen38Fp8Kernel::Reference,
+        prefill_gemm: false,
     };
     check(&pack(&parts)).expect("the true pack passes");
     let swapped = check(&pack(&[parts[1], parts[0]])).unwrap_err();
     assert!(swapped.to_string().contains("diverges"), "{swapped}");
 
-    let Qwen38Projection::NativeFp8 { mut raw, kernel } = pack(&parts) else {
+    let Qwen38Projection::NativeFp8 {
+        mut raw, kernel, ..
+    } = pack(&parts)
+    else {
         unreachable!()
     };
     let mut scales = raw.scales.flatten_all().unwrap().to_vec1::<f32>().unwrap();
     // One block of the z part (scale row 11 of 16): 3x too large.
     scales[11 * 2] *= 3.0;
     raw.scales = Tensor::from_vec(scales, (16, 2), &Device::Cpu).unwrap();
-    let wrong_scale = check(&Qwen38Projection::NativeFp8 { raw, kernel }).unwrap_err();
+    let wrong_scale = check(&Qwen38Projection::NativeFp8 {
+        raw,
+        kernel,
+        prefill_gemm: false,
+    })
+    .unwrap_err();
     assert!(
         wrong_scale.to_string().contains("diverges"),
         "{wrong_scale}"
@@ -633,6 +781,7 @@ fn a_failed_single_check_fails_closed_and_the_retry_loads_q8() {
     let corrupted = Qwen38Projection::NativeFp8 {
         raw,
         kernel: Qwen38Fp8Kernel::Reference,
+        prefill_gemm: false,
     };
     assert!(loader
         .fp8_self_check(&[(name, [256, 512])], &corrupted)
@@ -904,6 +1053,7 @@ fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
             .materialize_block_fp8_raw_group(order, block, &device)
             .unwrap(),
         kernel,
+        prefill_gemm: false,
     };
     let check = |projection: &Qwen38Projection| {
         fp8_projection_check(
@@ -918,7 +1068,10 @@ fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
     for kernel in [Qwen38Fp8Kernel::Reference, Qwen38Fp8Kernel::DequantOnly] {
         check(&pack(&parts, kernel)).expect("the true pack passes");
         assert!(check(&pack(&[parts[1], parts[0]], kernel)).is_err());
-        let Qwen38Projection::NativeFp8 { mut raw, kernel } = pack(&parts, kernel) else {
+        let Qwen38Projection::NativeFp8 {
+            mut raw, kernel, ..
+        } = pack(&parts, kernel)
+        else {
             unreachable!()
         };
         let mut scales = raw
@@ -931,7 +1084,12 @@ fn metal_fp8_check_rejects_bad_packs_and_the_gemv_switch_reroutes() {
             .unwrap();
         scales[5] *= 3.0;
         raw.scales = Tensor::from_vec(scales, &raw.scale_shape, &device).unwrap();
-        assert!(check(&Qwen38Projection::NativeFp8 { raw, kernel }).is_err());
+        assert!(check(&Qwen38Projection::NativeFp8 {
+            raw,
+            kernel,
+            prefill_gemm: false,
+        })
+        .is_err());
     }
 
     std::env::set_var(FP8_GEMV_ENV, "legacy");
@@ -997,6 +1155,7 @@ fn metal_fp8_kernels_match_the_host_reference_at_qwen38_shapes() {
                 block_shape: [128, 128],
             },
             kernel: Qwen38Fp8Kernel::Reference,
+            prefill_gemm: false,
         };
         let sampled: Vec<usize> = (0..n).step_by(61).chain([n - 1]).collect();
         for &m in rows {

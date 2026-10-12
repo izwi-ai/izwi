@@ -118,6 +118,8 @@ pub(crate) fn quantize_lm_head_from_checkpoint(
             block_shape: [BLOCK, BLOCK],
         },
         kernel,
+        // The head projects one row per prefill chunk (the last).
+        prefill_gemm: false,
     };
     let input = Tensor::from_vec(probe, (1, cols), &Device::Cpu)?
         .to_dtype(activation)?
