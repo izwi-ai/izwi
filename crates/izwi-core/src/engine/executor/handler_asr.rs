@@ -278,6 +278,54 @@ fn lfm25_audio_asr_long_form_max_tokens(request: &EngineCoreRequest) -> Option<u
     (!request.asr_auto_max_tokens).then_some(request.params.max_tokens)
 }
 
+/// Physical model call the generic ASR path makes for a `NativeAsrModel`
+/// family, in every mode (streaming or not, single pass or per chunk). Each
+/// route runs against the lifecycle-owned invocation workspace. There is no
+/// route to the registry's workspace-less APIs: Qwen3 cannot run there at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalAsrRoute {
+    Qwen3,
+    VibeVoice,
+    GraniteSpeech,
+    Whisper,
+    Parakeet,
+    Nemotron,
+}
+
+/// Every family is listed, so a new one has to choose a physical route here
+/// or fail with a typed error before any model call.
+fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
+    match family {
+        ModelFamily::Qwen3Asr => Ok(PhysicalAsrRoute::Qwen3),
+        ModelFamily::VibeVoiceAsr => Ok(PhysicalAsrRoute::VibeVoice),
+        ModelFamily::GraniteSpeechAsr => Ok(PhysicalAsrRoute::GraniteSpeech),
+        ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
+        ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
+        ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
+        // Voxtral and LFM2.5 Audio have their own executors; the forced
+        // aligner and the remaining families do not transcribe.
+        ModelFamily::Voxtral
+        | ModelFamily::Lfm25Audio
+        | ModelFamily::Qwen3ForcedAligner
+        | ModelFamily::Qwen3Tts
+        | ModelFamily::KokoroTts
+        | ModelFamily::VoxtralTts
+        | ModelFamily::VibeVoiceTts
+        | ModelFamily::FishS2Tts
+        | ModelFamily::SortformerDiarization
+        | ModelFamily::Qwen3Chat
+        | ModelFamily::Qwen3MoeChat
+        | ModelFamily::Qwen35Chat
+        | ModelFamily::Qwen35MoeChat
+        | ModelFamily::Qwen38Chat
+        | ModelFamily::Lfm2Chat
+        | ModelFamily::Gemma3Chat
+        | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
+            "{family:?} has no physical ASR route on the generic executor path"
+        ))),
+    }
+}
+
 fn begins_resumable_asr_prefill_state(
     scheduled: &ScheduledRequest,
     resumable_prefill: bool,
@@ -7201,6 +7249,7 @@ impl NativeExecutor {
                 return Ok((details.text, details.diagnostics));
             }
 
+            let route = physical_asr_route(family)?;
             let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
             let (streaming_low_latency, allow_speech_planner) =
@@ -7245,8 +7294,8 @@ impl NativeExecutor {
                             sr,
                             &generation_options,
                         );
-                        let mut details = match family {
-                            ModelFamily::Qwen3Asr => {
+                        let mut details = match route {
+                            PhysicalAsrRoute::Qwen3 => {
                                 with_single_invocation_cache(request, scheduled, |cache| {
                                     model.transcribe_qwen3_with_details_and_prompt_physical(
                                         chunk_audio,
@@ -7257,7 +7306,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::VibeVoiceAsr => {
+                            PhysicalAsrRoute::VibeVoice => {
                                 if let Some(emit) = partial {
                                     return with_vibevoice_invocation_state(
                                         request,
@@ -7290,7 +7339,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::GraniteSpeechAsr => {
+                            PhysicalAsrRoute::GraniteSpeech => {
                                 with_single_invocation_cache(request, scheduled, |cache| {
                                     model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
                                         chunk_audio,
@@ -7303,7 +7352,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::WhisperAsr => {
+                            PhysicalAsrRoute::Whisper => {
                                 if let Some(emit) = partial {
                                     return with_whisper_invocation_state(
                                         request,
@@ -7340,7 +7389,7 @@ impl NativeExecutor {
                                     },
                                 )?
                             }
-                            ModelFamily::ParakeetAsr => {
+                            PhysicalAsrRoute::Parakeet => {
                                 if let Some(emit) = partial {
                                     return with_single_invocation_tensor(
                                         request,
@@ -7369,7 +7418,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::NemotronAsr => {
+                            PhysicalAsrRoute::Nemotron => {
                                 if let Some(emit) = partial {
                                     return with_nemotron_offline_state(
                                         request,
@@ -7406,14 +7455,6 @@ impl NativeExecutor {
                                     },
                                 )?
                             }
-                            _ => model.transcribe_with_details_prompt_prefix_and_options(
-                                chunk_audio,
-                                sr,
-                                language,
-                                asr_prompt,
-                                prefix_text,
-                                chunk_generation_options.clone(),
-                            )?,
                         };
                         if matches!(family, ModelFamily::GraniteSpeechAsr) {
                             details = Self::recover_granite_chunk_loop(
@@ -7471,8 +7512,20 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let text = match family {
-                        ModelFamily::VibeVoiceAsr => {
+                    let text = match route {
+                        PhysicalAsrRoute::Qwen3 => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model.transcribe_qwen3_with_callback_and_prompt_physical(
+                                    samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    &mut emit,
+                                    cache,
+                                )
+                            })?
+                        }
+                        PhysicalAsrRoute::VibeVoice => {
                             with_vibevoice_invocation_state(request, scheduled, |leases| {
                                 model
                                     .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
@@ -7486,7 +7539,7 @@ impl NativeExecutor {
                                     )
                             })?
                         }
-                        ModelFamily::GraniteSpeechAsr => {
+                        PhysicalAsrRoute::GraniteSpeech => {
                             with_single_invocation_cache(request, scheduled, |cache| {
                                 model
                                     .transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
@@ -7500,7 +7553,7 @@ impl NativeExecutor {
                                     )
                             })?
                         }
-                        ModelFamily::WhisperAsr => with_whisper_invocation_state(
+                        PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
                             scheduled,
                             |self_kv, cross_kv| {
@@ -7515,7 +7568,7 @@ impl NativeExecutor {
                                 )
                             },
                         )?,
-                        ModelFamily::ParakeetAsr => {
+                        PhysicalAsrRoute::Parakeet => {
                             with_single_invocation_tensor(request, scheduled, |state| {
                                 model.transcribe_parakeet_with_callback_physical(
                                     samples,
@@ -7526,7 +7579,7 @@ impl NativeExecutor {
                                 )
                             })?
                         }
-                        ModelFamily::NemotronAsr => with_nemotron_offline_state(
+                        PhysicalAsrRoute::Nemotron => with_nemotron_offline_state(
                             request,
                             scheduled,
                             |predictor, acoustic| {
@@ -7541,14 +7594,6 @@ impl NativeExecutor {
                                 )
                             },
                         )?,
-                        _ => model.transcribe_with_callback_and_prompt_and_options(
-                            samples,
-                            sample_rate,
-                            language,
-                            asr_prompt,
-                            segment_generation_options.clone(),
-                            &mut emit,
-                        )?,
                     };
                     if let Some(err) = stream_err {
                         return Err(err);
@@ -7562,8 +7607,8 @@ impl NativeExecutor {
                     return Ok((text, None));
                 }
             }
-            let details = match family {
-                ModelFamily::Qwen3Asr => {
+            let details = match route {
+                PhysicalAsrRoute::Qwen3 => {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model.transcribe_qwen3_with_details_and_prompt_physical(
                             samples,
@@ -7574,7 +7619,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::VibeVoiceAsr => {
+                PhysicalAsrRoute::VibeVoice => {
                     with_vibevoice_invocation_state(request, scheduled, |leases| {
                         model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                             samples,
@@ -7586,7 +7631,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::GraniteSpeechAsr => {
+                PhysicalAsrRoute::GraniteSpeech => {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model
                             .transcribe_granite_speech_with_details_and_prompt_and_options_physical(
@@ -7599,7 +7644,7 @@ impl NativeExecutor {
                             )
                     })?
                 }
-                ModelFamily::WhisperAsr => {
+                PhysicalAsrRoute::Whisper => {
                     with_whisper_invocation_state(request, scheduled, |self_kv, cross_kv| {
                         model.transcribe_whisper_with_details_and_prompt_physical(
                             samples,
@@ -7611,7 +7656,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::ParakeetAsr => {
+                PhysicalAsrRoute::Parakeet => {
                     with_single_invocation_tensor(request, scheduled, |state| {
                         model.transcribe_parakeet_with_details_physical(
                             samples,
@@ -7621,7 +7666,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::NemotronAsr => {
+                PhysicalAsrRoute::Nemotron => {
                     with_nemotron_offline_state(request, scheduled, |predictor, acoustic| {
                         model.transcribe_nemotron_with_details_and_prompt_physical(
                             samples,
@@ -7633,13 +7678,6 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                _ => model.transcribe_with_details_and_prompt_and_options(
-                    samples,
-                    sample_rate,
-                    language,
-                    asr_prompt,
-                    segment_generation_options,
-                )?,
             };
             Ok((details.text, details.diagnostics))
         })?;
@@ -8479,6 +8517,61 @@ mod tests {
             assert_eq!(
                 super::atomic_asr_route(&request, variant).unwrap(),
                 super::AtomicAsrRoute::Generic
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_single_pass_qwen_asr_takes_a_physical_route() {
+        // Preparation marks 60 s of Qwen3 audio long-form (30 s offline
+        // chunks), but the streaming plan fits it in one chunk, so the request
+        // reaches the single-pass streaming dispatch.
+        let sample_rate = 16_000;
+        let samples = vec![0.0_f32; 60 * sample_rate as usize];
+        let model_window_secs = Some(120.0);
+        assert!(crate::engine::qwen3_asr_requires_long_form(
+            &samples,
+            sample_rate,
+            model_window_secs
+        ));
+        let (streaming_low_latency, allow_speech_planner) =
+            NativeExecutor::asr_chunk_plan_streaming_args(true, false);
+        assert!(!NativeExecutor::asr_chunk_plan(
+            &samples,
+            sample_rate,
+            model_window_secs,
+            streaming_low_latency,
+            allow_speech_planner,
+        )
+        .requires_chunk_path());
+
+        assert_eq!(
+            super::physical_asr_route(ModelFamily::Qwen3Asr).unwrap(),
+            super::PhysicalAsrRoute::Qwen3
+        );
+        // Every family loaded as a `NativeAsrModel` has a physical route, so
+        // no ASR request can reach a workspace-less model call.
+        for variant in ModelVariant::all()
+            .iter()
+            .filter(|variant| variant.is_asr())
+        {
+            assert!(
+                super::physical_asr_route(variant.family()).is_ok(),
+                "{variant}"
+            );
+        }
+        for family in [
+            ModelFamily::Voxtral,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::Qwen3ForcedAligner,
+            ModelFamily::Qwen3Chat,
+        ] {
+            assert!(
+                matches!(
+                    super::physical_asr_route(family),
+                    Err(crate::error::Error::InvalidInput(_))
+                ),
+                "{family:?}"
             );
         }
     }
