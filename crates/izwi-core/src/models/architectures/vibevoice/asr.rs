@@ -10,7 +10,7 @@ use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::backends::state::{PhysicalStateTransactionId, TensorStateArena};
 use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
@@ -541,6 +541,11 @@ impl VibeVoiceAsrModel {
             input_sample_rate,
             self.preprocessor.target_sample_rate(),
         )?;
+        if processed_samples == 0 {
+            return Err(Error::InvalidInput(
+                "VibeVoice-ASR audio input produced no samples after preprocessing".into(),
+            ));
+        }
         if !retained_tokenizer_geometry_supported(
             self.config.acoustic_tokenizer_config.causal,
             &self.config.acoustic_tokenizer_config.encoder_ratios,
@@ -564,7 +569,7 @@ impl VibeVoiceAsrModel {
             return Ok(VibeVoiceAsrPreparationDecision::LegacyInvocation);
         }
         let audio_seconds =
-            processed_samples as f32 / self.preprocessor.target_sample_rate() as f32;
+            processed_samples as f64 / f64::from(self.preprocessor.target_sample_rate());
         let extra = prompt_instruction(language, prompt);
         let prepared_prompt =
             self.tokenizer
@@ -757,7 +762,7 @@ impl VibeVoiceAsrModel {
             Tensor::from_vec(encoder_audio, (1, 1, encoder_samples), &self.device.device)?
                 .to_dtype(self.dtype)?;
         let audio_seconds =
-            processed_audio.len() as f32 / self.preprocessor.target_sample_rate() as f32;
+            processed_audio.len() as f64 / f64::from(self.preprocessor.target_sample_rate());
         let extra = prompt_instruction(language, prompt);
         let prepared_prompt =
             self.tokenizer
@@ -1607,7 +1612,7 @@ impl VibeVoiceAsrModel {
             ));
         }
         let target_sample_rate = self.preprocessor.target_sample_rate();
-        let audio_seconds = processed_audio.len() as f32 / target_sample_rate as f32;
+        let audio_seconds = processed_audio.len() as f64 / f64::from(target_sample_rate);
         let compress_ratio = self.preprocessor.speech_tok_compress_ratio.max(1);
         let expected_acoustic_frames = asr_placeholder_count(processed_audio.len(), compress_ratio);
         let mut encoder_audio = processed_audio.clone();
@@ -2398,18 +2403,21 @@ fn nonzero_sha256(hasher: Sha256) -> [u8; 32] {
     identity
 }
 
+/// The prompt's "extra info" (hotwords/context). VibeVoice-ASR has no
+/// language input: the model detects the language itself, and an injected
+/// language sentence would force the hotword template it was not trained
+/// with, so a language hint is only logged.
 fn prompt_instruction(language: Option<&str>, prompt: Option<&str>) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(language) = language.filter(|value| {
-        let value = value.trim();
-        !value.is_empty() && !value.eq_ignore_ascii_case("auto")
-    }) {
-        parts.push(format!("The spoken language is {}.", language.trim()));
+    if let Some(language) = language
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
+    {
+        debug!("VibeVoice-ASR has no language input; ignoring language hint {language:?}");
     }
-    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
-        parts.push(prompt.trim().to_string());
-    }
-    (!parts.is_empty()).then(|| parts.join(" "))
+    prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn pad_feature_rows(rows: &[Tensor], valid_lengths: &[usize]) -> Result<Tensor> {
@@ -2849,7 +2857,21 @@ fn preprocess_asr_audio(
     sample_rate: u32,
     config: &VibeVoicePreprocessorConfig,
 ) -> Result<(Vec<f32>, VibeVoiceAsrPreprocessStats)> {
-    let mut resampled = resample_linear(audio, sample_rate, config.target_sample_rate())?;
+    // The reference resamples with librosa (soxr), so use the band-limited
+    // FFT resampler. It must not see a non-finite sample: rubato 0.15 panics
+    // on one (an unwrapped realfft error) instead of zeroing that sample.
+    let finite_audio;
+    let audio = if audio.iter().all(|sample| sample.is_finite()) {
+        audio
+    } else {
+        finite_audio = audio
+            .iter()
+            .map(|&sample| if sample.is_finite() { sample } else { 0.0 })
+            .collect::<Vec<_>>();
+        &finite_audio
+    };
+    let mut resampled =
+        crate::audio::resample_mono_high_quality(audio, sample_rate, config.target_sample_rate())?;
     for sample in &mut resampled {
         if !sample.is_finite() {
             *sample = 0.0;
@@ -3004,45 +3026,23 @@ fn tokenizer_chunk_ranges(total_samples: usize, chunk_samples: usize) -> Vec<(us
     ranges
 }
 
+/// Length `preprocess_asr_audio` will produce, so the prepared geometry is
+/// priced before any resampling: `resample_mono_high_quality` keeps an equal
+/// rate as is and otherwise rounds the duration to the nearest target sample.
 fn resampled_sample_count(input_samples: usize, src_rate: u32, dst_rate: u32) -> Result<usize> {
     if src_rate == 0 || dst_rate == 0 {
         return Err(Error::InvalidInput(
             "Audio sample rates must be non-zero".into(),
         ));
     }
-    if src_rate == dst_rate || input_samples == 0 {
+    if src_rate == dst_rate {
         return Ok(input_samples);
     }
-    Ok(
-        ((input_samples as f64) * (dst_rate as f64 / src_rate as f64))
-            .round()
-            .max(1.0) as usize,
-    )
-}
-
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if src_rate == 0 || dst_rate == 0 {
-        return Err(Error::InvalidInput(
-            "Sample rates must be positive for VibeVoice-ASR resampling".to_string(),
-        ));
-    }
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for idx in 0..out_len {
-        let src_pos = idx as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let right = (left + 1).min(audio.len() - 1);
-        let frac = (src_pos - left as f64) as f32;
-        out.push(audio[left] * (1.0 - frac) + audio[right] * frac);
-    }
-    Ok(out)
+    Ok(crate::audio::target_sample_count(
+        input_samples,
+        src_rate,
+        dst_rate,
+    ))
 }
 
 #[cfg(test)]
@@ -3491,10 +3491,91 @@ mod tests {
         assert!(second.take_managed_write_completions().is_empty());
     }
 
+    fn reference_rate_preprocessor() -> VibeVoicePreprocessorConfig {
+        VibeVoicePreprocessorConfig {
+            sampling_rate: 24_000,
+            speech_tok_compress_ratio: 3_200,
+            normalize_audio: false,
+            target_db_fs: -25.0,
+            eps: 1e-6,
+        }
+    }
+
     #[test]
-    fn resample_linear_preserves_identity_rate() {
-        let audio = vec![0.0, 0.5, -0.25];
-        assert_eq!(resample_linear(&audio, 24_000, 24_000).unwrap(), audio);
+    fn preprocessed_length_matches_the_prepared_geometry() {
+        let config = reference_rate_preprocessor();
+        for (rate, samples) in [
+            (24_000u32, 24_001usize),
+            (16_000, 16_000),
+            (16_000, 16_001),
+            (44_100, 44_101),
+            (48_000, 48_001),
+            (8_000, 7_999),
+            (22_050, 1),
+            (96_000, 3),
+            (96_000, 1),
+        ] {
+            let audio = (0..samples)
+                .map(|index| (index as f32 * 0.01).sin() * 0.5)
+                .collect::<Vec<_>>();
+            let (processed, _) = preprocess_asr_audio(&audio, rate, &config).unwrap();
+            assert_eq!(
+                processed.len(),
+                resampled_sample_count(samples, rate, 24_000).unwrap(),
+                "{samples} samples at {rate} Hz"
+            );
+            if rate == 24_000 {
+                assert_eq!(processed, audio);
+            }
+        }
+        assert_eq!(
+            resampled_sample_count(96_000, 96_000, 24_000).unwrap(),
+            24_000
+        );
+        assert_eq!(resampled_sample_count(1, 96_000, 24_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn preprocess_band_limits_before_downsampling() {
+        // 15 kHz is above the 12 kHz Nyquist of the 24 kHz model rate. The
+        // reference (librosa/soxr) removes it; linear interpolation of a
+        // 48 kHz input keeps every other sample and aliases it to 9 kHz at
+        // full level (RMS 0.71).
+        let tone = (0..48_000)
+            .map(|index| (std::f32::consts::TAU * 15_000.0 * index as f32 / 48_000.0).sin())
+            .collect::<Vec<_>>();
+        let (processed, _) =
+            preprocess_asr_audio(&tone, 48_000, &reference_rate_preprocessor()).unwrap();
+
+        assert_eq!(processed.len(), 24_000);
+        let rms = audio_rms(&processed);
+        assert!(rms < 0.05, "RMS {rms}");
+    }
+
+    #[test]
+    fn preprocess_zeroes_a_non_finite_sample_without_blanking_its_block() {
+        let mut audio = vec![0.5f32; 16_000];
+        audio[8_000] = f32::NAN;
+        let (processed, _) =
+            preprocess_asr_audio(&audio, 16_000, &reference_rate_preprocessor()).unwrap();
+
+        assert_eq!(processed.len(), 24_000);
+        assert!(processed.iter().all(|sample| sample.is_finite()));
+        // Unsanitized, the NaN panics inside rubato. Zeroed, it only dents
+        // the signal near output 12000; the rest of its FFT block is intact.
+        for (index, sample) in processed.iter().enumerate().take(11_500).skip(7_000) {
+            assert!((sample - 0.5).abs() < 0.05, "sample {index} = {sample}");
+        }
+    }
+
+    #[test]
+    fn language_hint_does_not_change_the_prompt() {
+        assert_eq!(prompt_instruction(Some("en"), None), None);
+        assert_eq!(prompt_instruction(Some("auto"), Some("   ")), None);
+        assert_eq!(
+            prompt_instruction(Some("en"), Some("  Microsoft, VibeVoice  ")).as_deref(),
+            Some("Microsoft, VibeVoice")
+        );
     }
 
     #[test]

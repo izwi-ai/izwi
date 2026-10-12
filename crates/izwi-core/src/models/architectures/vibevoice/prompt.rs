@@ -13,6 +13,27 @@ use crate::tokenizer::Tokenizer;
 const TTS_SYSTEM_PROMPT: &str = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
 const ASR_SYSTEM_PROMPT: &str =
     "You are a helpful assistant that transcribes audio input into text output in JSON format.";
+const ASR_TRANSCRIPTION_KEYS: &str = "Start time, End time, Speaker ID, Content";
+
+/// The user turn's text after the speech placeholders, exactly as the
+/// reference processor builds it (`vibevoice_asr_processor.py`, VibeVoice
+/// @16fb2cb1): the duration with two decimals and, when present, the trimmed
+/// context ("hotwords") as extra info.
+fn vibevoice_asr_user_suffix(audio_seconds: f64, extra_info: Option<&str>) -> String {
+    let seconds = if audio_seconds.is_finite() {
+        audio_seconds.max(0.0)
+    } else {
+        0.0
+    };
+    match extra_info.map(str::trim).filter(|extra| !extra.is_empty()) {
+        Some(extra) => format!(
+            "This is a {seconds:.2} seconds audio, with extra info: {extra}\n\nPlease transcribe it with these keys: {ASR_TRANSCRIPTION_KEYS}"
+        ),
+        None => format!(
+            "This is a {seconds:.2} seconds audio, please transcribe it with these keys: {ASR_TRANSCRIPTION_KEYS}"
+        ),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeVoiceSpecialTokens {
@@ -131,7 +152,7 @@ impl VibeVoicePromptTokenizer {
 
     pub fn build_asr_prompt(
         &self,
-        audio_seconds: f32,
+        audio_seconds: f64,
         acoustic_frames: usize,
         extra_instruction: Option<&str>,
     ) -> Result<VibeVoiceAsrPrompt> {
@@ -149,20 +170,11 @@ impl VibeVoicePromptTokenizer {
         ));
         let end = input_ids.len();
         input_ids.push(self.specials.object_ref_end);
-        input_ids.extend(self.encode_text(&format!(
-            "\nThis is a {:.2} seconds audio,",
-            audio_seconds.max(0.0)
-        ))?);
-        if let Some(extra) = extra_instruction.filter(|extra| !extra.trim().is_empty()) {
-            input_ids.extend(self.encode_text(" with extra info: ")?);
-            input_ids.extend(self.encode_text(extra.trim())?);
-            input_ids.extend(self.encode_text("\n\n")?);
-        } else {
-            input_ids.extend(self.encode_text(" ")?);
-        }
-        input_ids.extend(self.encode_text(
-            "please transcribe it with these keys: Start time, End time, Speaker ID, Content",
-        )?);
+        // The reference tokenizes the whole user turn as one string, which the
+        // special tokens split; "\n" + suffix is a single ordinary span, so
+        // encode it in one call to keep merges such as `Ġplease`.
+        let suffix = vibevoice_asr_user_suffix(audio_seconds, extra_instruction);
+        input_ids.extend(self.encode_text(&format!("\n{suffix}"))?);
         input_ids.push(self.specials.im_end);
         input_ids.extend(self.encode_text("\n")?);
         self.push_role_header(&mut input_ids, "assistant")?;
@@ -333,6 +345,83 @@ mod tests {
             .expect_err("mixed script error");
 
         assert!(format!("{err}").contains("Speaker N"));
+    }
+
+    #[test]
+    fn asr_user_suffix_matches_reference_strings() {
+        let plain = "This is a 1.00 seconds audio, please transcribe it with these keys: \
+                     Start time, End time, Speaker ID, Content";
+        assert_eq!(vibevoice_asr_user_suffix(1.0, None), plain);
+        assert_eq!(vibevoice_asr_user_suffix(1.0, Some(" \n\t ")), plain);
+        assert_eq!(
+            vibevoice_asr_user_suffix(2.5, Some("  Microsoft, VibeVoice\n")),
+            "This is a 2.50 seconds audio, with extra info: Microsoft, VibeVoice\n\n\
+             Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
+        );
+        // Python's `{:.2f}` rounds the exact binary value, ties to even, as
+        // Rust does: 3000/24000 = 0.125 gives 0.12. The duration must be f64:
+        // 1080/24000 is 0.04 in f64 but 0.05 once narrowed to f32.
+        assert!(vibevoice_asr_user_suffix(3_000.0 / 24_000.0, None).starts_with("This is a 0.12 "));
+        assert!(vibevoice_asr_user_suffix(1_080.0 / 24_000.0, None).starts_with("This is a 0.04 "));
+        assert!(vibevoice_asr_user_suffix(f64::NAN, None).starts_with("This is a 0.00 "));
+    }
+
+    /// Prompt ids from the reference processor (VibeVoice @16fb2cb1) with the
+    /// Qwen/Qwen2.5-7B tokenizer (main @d1497293) and vLLM's generation prompt.
+    #[test]
+    #[ignore = "needs a Qwen2.5 tokenizer: set IZWI_TEST_QWEN25_TOKENIZER to its tokenizer.json or directory"]
+    fn asr_prompt_token_ids_match_reference_goldens() {
+        const HEADER: [u32; 25] = [
+            151644, 8948, 198, 2610, 525, 264, 10950, 17847, 429, 1356, 55136, 7699, 1946, 1119,
+            1467, 2550, 304, 4718, 3561, 13, 151645, 198, 151644, 872, 198,
+        ];
+        const KEYS: [u32; 18] = [
+            1356, 3114, 432, 448, 1493, 6894, 25, 5145, 882, 11, 3972, 882, 11, 29073, 3034, 11,
+            8883, 151645,
+        ];
+        const TAIL: [u32; 4] = [198, 151644, 77091, 198];
+        // 4486 is `Ġplease` and 5100 `ĠMicrosoft`: encoding the suffix in
+        // pieces split each into `Ġ` (220) plus the bare word.
+        let plain_1s = [
+            198, 1986, 374, 264, 220, 16, 13, 15, 15, 6486, 7699, 11, 4486,
+        ];
+        let hotwords_1s = [
+            198, 1986, 374, 264, 220, 16, 13, 15, 15, 6486, 7699, 11, 448, 4960, 3546, 25, 5100,
+            11, 647, 23549, 51167, 271, 5501,
+        ];
+        let plain_2_5s = [
+            198, 1986, 374, 264, 220, 17, 13, 20, 15, 6486, 7699, 11, 4486,
+        ];
+        let expected = |frames: usize, suffix: &[u32]| {
+            let mut ids = HEADER.to_vec();
+            ids.push(151646);
+            ids.extend(std::iter::repeat_n(151648, frames));
+            ids.push(151647);
+            ids.extend_from_slice(suffix);
+            ids.extend_from_slice(&KEYS);
+            ids.extend_from_slice(&TAIL);
+            ids
+        };
+
+        let path = std::env::var_os("IZWI_TEST_QWEN25_TOKENIZER")
+            .map(std::path::PathBuf::from)
+            .expect("set IZWI_TEST_QWEN25_TOKENIZER to a Qwen2.5 tokenizer.json or its directory");
+        let dir = if path.is_file() {
+            path.parent().expect("tokenizer directory").to_path_buf()
+        } else {
+            path
+        };
+        let tokenizer = VibeVoicePromptTokenizer::load(&dir, 152_064).expect("Qwen2.5 tokenizer");
+        for (seconds, frames, extra, suffix, len) in [
+            (1.0, 3, None, &plain_1s[..], 65),
+            (1.0, 3, Some(" Microsoft, VibeVoice "), &hotwords_1s[..], 75),
+            (2.5, 8, None, &plain_2_5s[..], 70),
+        ] {
+            let prompt = tokenizer.build_asr_prompt(seconds, frames, extra).unwrap();
+            assert_eq!(prompt.input_ids, expected(frames, suffix));
+            assert_eq!(prompt.input_ids.len(), len);
+            assert_eq!(prompt.acoustic_input_range, 26..26 + frames);
+        }
     }
 }
 
