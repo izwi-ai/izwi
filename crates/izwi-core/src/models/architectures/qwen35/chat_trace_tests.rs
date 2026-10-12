@@ -172,6 +172,7 @@ fn qwen35_local_decode_trace() {
         .expect("prefill logits");
     let mut steps = Vec::with_capacity(TRACE_STEPS);
     let mut tokens = Vec::with_capacity(TRACE_STEPS);
+    let mut decode_ms = Vec::with_capacity(TRACE_STEPS);
     for step in 0..TRACE_STEPS {
         let row = logits_row(&logits);
         let top = top_logits(&row, vocab);
@@ -182,6 +183,7 @@ fn qwen35_local_decode_trace() {
             "sum": row[..vocab].iter().map(|value| f64::from(*value)).sum::<f64>(),
         }));
         tokens.push(token);
+        let started = std::time::Instant::now();
         logits = text
             .forward_token_id_at_physical(
                 token,
@@ -190,7 +192,17 @@ fn qwen35_local_decode_trace() {
                 &mut solo_cache,
             )
             .expect("decode");
+        // One scalar readback waits for the device, so the interval covers
+        // the whole forward, not just its enqueue.
+        logits
+            .argmax(D::Minus1)
+            .and_then(|index| index.to_dtype(DType::U32))
+            .and_then(|index| index.to_scalar::<u32>())
+            .expect("decode sync");
+        decode_ms.push(started.elapsed().as_secs_f64() * 1000.0);
     }
+    decode_ms.sort_by(f64::total_cmp);
+    let median_decode_ms = decode_ms[decode_ms.len() / 2];
 
     // Batch: two copies of the prompt decoded as one two-row batch.
     let mut batch_states = [text.new_state(), text.new_state()];
@@ -245,9 +257,13 @@ fn qwen35_local_decode_trace() {
         "tokens": tokens,
         "steps": steps,
         "batch_vs_solo_max_top_logit_diff": batch_max_diff,
+        "median_decode_ms": median_decode_ms,
         "telemetry": text.telemetry().snapshot(),
         "gdn_decode": text.gdn_decode_summary(),
     });
     std::fs::write(&out, serde_json::to_string_pretty(&trace).expect("json")).expect("write");
-    eprintln!("trace written to {out}: tokens {tokens:?}, batch diff {batch_max_diff}");
+    eprintln!(
+        "trace written to {out}: tokens {tokens:?}, batch diff {batch_max_diff}, \
+         median decode {median_decode_ms:.2} ms"
+    );
 }
