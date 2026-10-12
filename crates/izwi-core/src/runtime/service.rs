@@ -5623,9 +5623,13 @@ impl RuntimeService {
             .ok()
             .and_then(|frames| frames.checked_mul(1024 * 16))
             .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
-        let workspace_bytes = materialized_elements
-            .checked_mul(4)
-            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        // Windowed encoding caps the quadratic attention terms at one window;
+        // only the host features and the stitched output grow with length.
+        let preparation_bytes =
+            crate::models::architectures::parakeet::asr::parakeet_preparation_bytes(
+                resampled,
+                self.backend_router.context().backend_kind,
+            )?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         let prep_spec = JobSpec {
             request_id: prepared.id.clone(),
@@ -5660,8 +5664,8 @@ impl RuntimeService {
             materialized_elements,
             retained_artifact_resources(
                 self.backend_router.context().backend_kind,
-                0,
-                workspace_bytes,
+                preparation_bytes.host_bytes,
+                preparation_bytes.device_bytes()?,
             )?,
         );
         let cancellation = PreparationCancellation::default();
@@ -5675,6 +5679,9 @@ impl RuntimeService {
         )?;
         let language = prepared.asr_language_for_execution().map(str::to_owned);
         let model_for_preparation = model.clone();
+        let encoder_cancellation = cancellation.clone();
+        let encoder_request_id = prepared.id.clone();
+        let encoder_deadline = prepared.deadline;
         let mut guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
@@ -5694,11 +5701,31 @@ impl RuntimeService {
                         "Parakeet preparation crossed model family".into(),
                     ));
                 };
-                let artifact = Arc::new(model.prepare_retained_encoder(
+                // Checked between encoder windows, so a disconnected or
+                // expired request releases the device within one window.
+                let checkpoint = || {
+                    if encoder_cancellation.is_cancelled() {
+                        return Err(Error::Cancelled(encoder_request_id.clone()));
+                    }
+                    if encoder_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(Error::Timeout(encoder_request_id.clone()));
+                    }
+                    Ok(())
+                };
+                let artifact = match model.prepare_retained_encoder(
                     samples.as_ref(),
                     sample_rate,
                     language.as_deref(),
-                )?);
+                    &checkpoint,
+                ) {
+                    Ok(artifact) => Arc::new(artifact),
+                    // A row error keeps its kind; a batch error is reported
+                    // as an inference failure.
+                    Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
+                        return Ok(vec![Err(error)]);
+                    }
+                    Err(error) => return Err(error),
+                };
                 let accelerator_bytes = artifact.resident_tensor_bytes()?;
                 if accelerator_bytes > retained_device_ceiling {
                     return Err(Error::InferenceError(format!(

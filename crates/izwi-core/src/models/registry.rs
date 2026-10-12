@@ -2562,6 +2562,9 @@ impl NativeAsrModel {
     pub fn max_audio_seconds_hint(&self) -> Option<f32> {
         match self {
             Self::Qwen3(model) => model.max_audio_seconds_hint(),
+            // Parakeet encodes long audio in bounded windows itself, up to the
+            // global decoded-audio cap. A hint here would also re-chunk the
+            // diarization pipeline's transcription.
             Self::Parakeet(_) => None,
             Self::Nemotron(model) => model.max_audio_seconds_hint(),
             Self::WhisperTurbo(model) => model.max_audio_seconds_hint(),
@@ -2577,6 +2580,7 @@ impl NativeAsrModel {
     pub(crate) fn audio_token_rate(&self) -> Option<f32> {
         match self {
             Self::Qwen3(model) => Some(model.audio_token_rate()),
+            // Transducer: audio never enters a decoder prompt.
             Self::Parakeet(_) => None,
             Self::Nemotron(_) => None,
             Self::WhisperTurbo(_) => None,

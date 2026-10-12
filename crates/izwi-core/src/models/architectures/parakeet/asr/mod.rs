@@ -4,6 +4,7 @@ mod nemo;
 mod physical;
 mod preprocessor;
 
+use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ use crate::backends::state::{
     InvocationTensorComponentValue, InvocationTensorUpdateV2, PhysicalStateTransactionId,
     StateComponentValue, TensorStateArena,
 };
-use crate::backends::DeviceProfile;
+use crate::backends::{BackendKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -35,7 +36,7 @@ use crate::tokenizer::Tokenizer;
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
-use preprocessor::ParakeetPreprocessor;
+use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 
 const SAMPLE_RATE: u32 = 16_000;
 const PRED_HIDDEN: usize = 640;
@@ -80,6 +81,192 @@ impl EncoderGeometry {
     }
 }
 
+/// Long audio is encoded in overlapping windows of encoder frames instead of
+/// one full-attention pass whose memory grows as T². Each window keeps only
+/// its centre, so every kept frame sees `left_context` frames before it and
+/// `right_context` after it unless it lies at the real start or end of the
+/// audio. One TDT decode then runs over the stitched frames, which keeps the
+/// predictor state and frame timestamps continuous across seams. This is
+/// NVIDIA's chunked-inference recipe for this model with simulated
+/// streaming (left/chunk/right buffers, one decode over concatenated outputs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderWindowing {
+    frames: usize,
+    left_context: usize,
+    right_context: usize,
+}
+
+impl EncoderWindowing {
+    /// 81.92 s windows with 10.24 s of context on each side, keeping 61.44 s.
+    /// A power-of-two window keeps Metal's pooled buffers exactly sized, and
+    /// 128 frames of context exceed the 96 frames over which 24 layers of
+    /// kernel-9 convolutions spread window-edge effects.
+    const V3: Self = Self {
+        frames: 1024,
+        left_context: 128,
+        right_context: 128,
+    };
+}
+
+/// One encoder window in encoder frames: `[start, end)` is encoded and
+/// `[keep_start, keep_end)` is copied into the stitched output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderWindow {
+    start: usize,
+    end: usize,
+    keep_start: usize,
+    keep_end: usize,
+}
+
+impl EncoderWindow {
+    /// The log-mel columns that produce this window's frames: whole groups
+    /// of the ×8 subsampling, clipped to the spectrogram. Stopping at
+    /// `8 · end` also drops the STFT padding column when the valid frames are
+    /// a multiple of 8, where it would add an encoder frame NeMo masks.
+    fn feature_columns(&self, feature_frames: usize) -> Range<usize> {
+        self.start * SUBSAMPLING_FACTOR..(self.end * SUBSAMPLING_FACTOR).min(feature_frames)
+    }
+}
+
+/// Plans windows of exactly `window` frames over `encoded_len` frames. The
+/// first window keeps `[0, window - right)`; each later one starts `left`
+/// frames before the previous kept range ends, and the last is shifted left
+/// to end at the audio's end. Inputs of at most `window` frames are a single
+/// window, which is the whole-utterance encode.
+fn plan_encoder_windows(
+    encoded_len: usize,
+    window: usize,
+    left: usize,
+    right: usize,
+) -> Result<Vec<EncoderWindow>> {
+    if encoded_len <= window {
+        return Ok((encoded_len > 0)
+            .then_some(EncoderWindow {
+                start: 0,
+                end: encoded_len,
+                keep_start: 0,
+                keep_end: encoded_len,
+            })
+            .into_iter()
+            .collect());
+    }
+    if window <= left.saturating_add(right) {
+        return Err(Error::InvalidInput(format!(
+            "Parakeet encoder window {window} leaves no centre between contexts {left} and {right}"
+        )));
+    }
+    let mut windows = Vec::with_capacity(encoded_len.div_ceil(window - left - right) + 1);
+    let mut keep_start = 0usize;
+    loop {
+        let start = keep_start.saturating_sub(left);
+        let end = start + window;
+        if end >= encoded_len {
+            windows.push(EncoderWindow {
+                start: encoded_len - window,
+                end: encoded_len,
+                keep_start,
+                keep_end: encoded_len,
+            });
+            return Ok(windows);
+        }
+        let keep_end = end - right;
+        windows.push(EncoderWindow {
+            start,
+            end,
+            keep_start,
+            keep_end,
+        });
+        keep_start = keep_end;
+    }
+}
+
+/// Peak preparation memory beyond the weights and the retained artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParakeetPreparationBytes {
+    /// Host log-mel pipeline: mono copy, pre-emphasis and padded copies,
+    /// power spectrum and log-mel.
+    pub(crate) host_bytes: u64,
+    /// One encoder window's peak: the first subsampling convolution and its
+    /// ReLU copy, the attention scores and `rel_shift` buffers, and the
+    /// per-frame activations of a layer.
+    pub(crate) window_bytes: u64,
+    /// The stitched `[1, E, D]` output, copied into the exact-size retained
+    /// artifact at the end.
+    pub(crate) output_bytes: u64,
+}
+
+impl ParakeetPreparationBytes {
+    pub(crate) fn device_bytes(self) -> Result<u64> {
+        self.window_bytes
+            .checked_add(self.output_bytes)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))
+    }
+}
+
+/// Prices the windowed encode of `samples` 16 kHz samples. Windows bound
+/// the quadratic attention terms at `W` frames whatever the length; Metal
+/// pools round every buffer up to a power of two.
+pub(crate) fn parakeet_preparation_bytes(
+    samples: usize,
+    backend: BackendKind,
+) -> Result<ParakeetPreparationBytes> {
+    const F32_BYTES: u64 = 4;
+    const HOST_BYTES_PER_SAMPLE: u64 = 22;
+    // About six [T, ff_dim] activations are live inside a layer at once: the
+    // feed-forward block's linear, sigmoid and product, plus residual and
+    // convolution-module buffers (report 11 sizes them as 98,304·T bytes).
+    const LAYER_ACTIVATIONS: u64 = 6;
+    let geometry = EncoderGeometry::V3;
+    let overflow = || Error::Overloaded("Parakeet preparation bytes overflowed".into());
+    let round = |bytes: u64| -> Result<u64> {
+        if backend == BackendKind::Metal {
+            bytes.checked_next_power_of_two().ok_or_else(overflow)
+        } else {
+            Ok(bytes)
+        }
+    };
+    let as_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let valid_frames = preprocessor::valid_feature_frames(samples);
+    let encoded_len = as_u64(subsampled_len_3x(valid_frames))?;
+    // The STFT emits one padding frame past the valid ones.
+    let window = as_u64(subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames))?;
+    let (channels, mel_bins) = (
+        as_u64(geometry.subsampling_channels)?,
+        as_u64(geometry.mel_bins)?,
+    );
+    let (heads, dim, ff_dim) = (
+        as_u64(geometry.heads)?,
+        as_u64(geometry.dim)?,
+        as_u64(geometry.ff_dim)?,
+    );
+    let multiply = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |product, value| product.checked_mul(*value))
+            .ok_or_else(overflow)
+    };
+    // conv0 output [channels, 8T/2, mels/2] and its ReLU copy.
+    let subsampling = multiply(&[2, channels, 4 * window, mel_bins / 2, F32_BYTES])?;
+    let scores = multiply(&[heads, window, window, F32_BYTES])?;
+    // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+    let rel_shift = multiply(&[heads, window, 2 * window, F32_BYTES])?;
+    let activation = multiply(&[window, ff_dim, F32_BYTES])?;
+    let window_bytes = [
+        round(subsampling)?,
+        round(scores)?,
+        multiply(&[3, round(rel_shift)?])?,
+        multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+    .ok_or_else(overflow)?;
+    Ok(ParakeetPreparationBytes {
+        host_bytes: multiply(&[as_u64(samples)?, HOST_BYTES_PER_SAMPLE])?,
+        window_bytes,
+        output_bytes: round(multiply(&[encoded_len, dim, F32_BYTES])?)?,
+    })
+}
+
 pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
     pub language: Option<String>,
@@ -95,6 +282,10 @@ pub(crate) struct ParakeetPreparedEncoderArtifact {
     resampled_samples: usize,
     feature_frames: usize,
     language: Option<String>,
+    windowing: EncoderWindowing,
+    encoder_windows: usize,
+    log_mel_ms: f64,
+    encode_ms: f64,
 }
 
 impl ParakeetPreparedEncoderArtifact {
@@ -211,6 +402,7 @@ pub struct ParakeetAsrModel {
     blank_idx: usize,
     num_durations: usize,
     max_symbols: usize,
+    encoder_windowing: EncoderWindowing,
 }
 
 enum ParakeetDecoder {
@@ -283,11 +475,14 @@ impl ParakeetAsrModel {
         self.max_symbols
     }
 
+    /// Encodes the audio into the artifact the retained decode reads.
+    /// `checkpoint` runs between encoder windows; its error aborts the encode.
     pub(crate) fn prepare_retained_encoder(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetPreparedEncoderArtifact> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".into()));
@@ -297,42 +492,59 @@ impl ParakeetAsrModel {
                 "Parakeet sample rate must be greater than zero".into(),
             ));
         }
+        let log_mel_started = Instant::now();
         let mono = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
+        let resampled_samples = mono.len();
         let log_mel = self.preprocessor.compute_log_mel(&mono)?;
-        let feature_frames = log_mel.valid_frames();
-        let features =
-            log_mel.normalize_and_upload(0..log_mel.frames(), self.preprocessor.device())?;
-        let mut timings = ParakeetTimings::default();
-        let (encoded, encoded_len) =
-            self.network
-                .encoder
-                .encode_with_timings(&features, feature_frames, &mut timings)?;
-        if encoded_len == 0 {
-            return Err(Error::InferenceError(
-                "Parakeet encoder produced no decodable frames".into(),
-            ));
-        }
+        drop(mono);
+        let log_mel_ms = elapsed_ms(log_mel_started);
+        let encode_started = Instant::now();
+        let encoded = self.encode_log_mel(&log_mel, &mut ParakeetTimings::default(), checkpoint)?;
+        let encode_ms = elapsed_ms(encode_started);
         // Preparation sized the decode budget from the sample count alone.
         let budgeted_len = parakeet_encoded_len_for_samples(audio.len(), sample_rate);
-        if encoded_len != budgeted_len {
+        if encoded.encoded_len != budgeted_len {
             return Err(Error::InferenceError(format!(
-                "Parakeet encoder produced {encoded_len} frames but its decode budget assumed {budgeted_len}"
+                "Parakeet encoder produced {} frames but its decode budget assumed {budgeted_len}",
+                encoded.encoded_len
             )));
         }
-        let encoded = encoded.narrow(1, 0, encoded_len)?;
         Ok(ParakeetPreparedEncoderArtifact {
-            encoded: deep_copy_tensor_storage(&encoded)?,
-            encoded_len,
+            encoded: deep_copy_tensor_storage(&encoded.encoded)?,
+            encoded_len: encoded.encoded_len,
             input_samples: audio.len(),
             input_sample_rate: sample_rate,
-            resampled_samples: mono.len(),
-            feature_frames,
+            resampled_samples,
+            feature_frames: log_mel.valid_frames(),
             language: language.map(ToOwned::to_owned),
+            windowing: self.encoder_windowing,
+            encoder_windows: encoded.windows,
+            log_mel_ms,
+            encode_ms,
         })
+    }
+
+    /// Runs the windowed encoder over a host log-mel, normalizing each
+    /// window's columns over that window as NVIDIA's chunked inference does.
+    fn encode_log_mel(
+        &self,
+        log_mel: &ParakeetLogMel,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let device = self.preprocessor.device();
+        self.network.encoder.encode_windows(
+            log_mel.frames(),
+            subsampled_len_3x(log_mel.valid_frames()),
+            self.encoder_windowing,
+            &mut |columns| log_mel.normalize_and_upload(columns, device),
+            timings,
+            checkpoint,
+        )
     }
 
     pub(crate) fn start_retained_decode(&self) -> Result<ParakeetRetainedDecodeState> {
@@ -467,6 +679,12 @@ impl ParakeetAsrModel {
             "resampled_samples": artifact.resampled_samples,
             "feature_frames": artifact.feature_frames,
             "encoded_frames": artifact.encoded_len,
+            "encoder_windows": artifact.encoder_windows,
+            "encoder_window_frames": artifact.windowing.frames,
+            "encoder_window_left_context": artifact.windowing.left_context,
+            "encoder_window_right_context": artifact.windowing.right_context,
+            "log_mel_ms": artifact.log_mel_ms,
+            "encode_ms": artifact.encode_ms,
             "tdt_joint_steps": state.counters.tdt_joint_steps,
             "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
             "tdt_blank_steps": state.counters.tdt_blank_steps,
@@ -700,6 +918,7 @@ impl ParakeetAsrModel {
             blank_idx,
             num_durations,
             max_symbols: DEFAULT_MAX_SYMBOLS,
+            encoder_windowing: EncoderWindowing::V3,
         })
     }
 
@@ -829,15 +1048,13 @@ impl ParakeetAsrModel {
         let log_mel = self.preprocessor.compute_log_mel(&mono_16khz)?;
         let feature_frames = log_mel.valid_frames();
         timings.feature_extract_ms = elapsed_ms(feature_started);
-        let upload_started = Instant::now();
-        let features =
-            log_mel.normalize_and_upload(0..log_mel.frames(), self.preprocessor.device())?;
-        timings.feature_upload_ms = elapsed_ms(upload_started);
 
-        let (encoded, encoded_len) =
-            self.network
-                .encoder
-                .encode_with_timings(&features, feature_frames, &mut timings)?;
+        let ParakeetEncoded {
+            encoded,
+            encoded_len,
+            windows: encoder_windows,
+        } = self.encode_log_mel(&log_mel, &mut timings, &|| Ok(()))?;
+        drop(log_mel);
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
@@ -888,6 +1105,8 @@ impl ParakeetAsrModel {
             &self.variant,
             self.preprocessor.device(),
             self.network.encoder.geometry,
+            self.encoder_windowing,
+            encoder_windows,
             &timings,
             &decode_counters,
             sample_rate,
@@ -936,6 +1155,8 @@ fn parakeet_diagnostics_json(
     variant: &ModelVariant,
     device: &Device,
     geometry: EncoderGeometry,
+    windowing: EncoderWindowing,
+    encoder_windows: usize,
     timings: &ParakeetTimings,
     decode: &ParakeetDecodeCounters,
     input_sample_rate: u32,
@@ -981,6 +1202,10 @@ fn parakeet_diagnostics_json(
             "conformer_conv_kernel": geometry.conv_kernel,
             "depthwise_conv1d_groups": geometry.dim,
             "subsampling_channels": geometry.subsampling_channels,
+            "encoder_windows": encoder_windows,
+            "encoder_window_frames": windowing.frames,
+            "encoder_window_left_context": windowing.left_context,
+            "encoder_window_right_context": windowing.right_context,
             "metal_softmax_last_dim": device.is_metal(),
             "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(device),
             "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
@@ -1231,29 +1456,109 @@ impl ParakeetEncoder {
         })
     }
 
-    fn encode_with_timings(
+    /// Encodes `encoded_len` frames window by window (see
+    /// [`EncoderWindowing`]). `window_features` returns the
+    /// `[1, mel_bins, columns]` features of a log-mel column range, and
+    /// `checkpoint` runs before every window so a cancelled or expired
+    /// request stops within one window.
+    fn encode_windows(
         &self,
-        features: &Tensor,
         feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
         timings: &mut ParakeetTimings,
-    ) -> Result<(Tensor, usize)> {
-        let pre_encode_started = Instant::now();
-        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
-        timings.pre_encode_ms = elapsed_ms(pre_encode_started);
-
-        let pos_started = Instant::now();
-        let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, self.geometry.dim, x.device())?;
-        timings.pos_emb_ms = elapsed_ms(pos_started);
-
-        let layers_started = Instant::now();
-        for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb)?;
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let plan = plan_encoder_windows(
+            encoded_len,
+            windowing.frames,
+            windowing.left_context,
+            windowing.right_context,
+        )?;
+        if plan.is_empty() {
+            return Err(Error::InferenceError(
+                "Parakeet encoder produced no decodable frames".into(),
+            ));
         }
-        timings.encoder_layers_ms = elapsed_ms(layers_started);
+        let mut stitched: Option<Tensor> = None;
+        let mut pos_emb: Option<Tensor> = None;
+        for window in &plan {
+            checkpoint()?;
+            let upload_started = Instant::now();
+            let features = window_features(window.feature_columns(feature_frames))?;
+            timings.feature_upload_ms += elapsed_ms(upload_started);
 
-        Ok((x, encoded_len))
+            let frames = window.end - window.start;
+            let pre_encode_started = Instant::now();
+            let x = self.pre_encode.forward(&features)?;
+            drop(features);
+            if x.dim(1)? < frames {
+                return Err(Error::InferenceError(format!(
+                    "Parakeet window produced {} encoder frames, expected {frames}",
+                    x.dim(1)?
+                )));
+            }
+            // Attention must see only this window's frames, never one made
+            // purely of STFT padding.
+            let mut x = x.narrow(1, 0, frames)?;
+            timings.pre_encode_ms += elapsed_ms(pre_encode_started);
+
+            // Relative positions depend only on i - j, so one embedding of
+            // the window length serves every window.
+            let pos_started = Instant::now();
+            let pos = match pos_emb.take() {
+                Some(pos) if pos.dim(1)? == 2 * frames - 1 => pos,
+                _ => build_rel_positional_embedding(frames, self.geometry.dim, x.device())?,
+            };
+            timings.pos_emb_ms += elapsed_ms(pos_started);
+
+            let layers_started = Instant::now();
+            for layer in &self.layers {
+                x = layer.forward(&x, &pos)?;
+            }
+            timings.encoder_layers_ms += elapsed_ms(layers_started);
+            pos_emb = Some(pos);
+
+            if plan.len() == 1 {
+                return Ok(ParakeetEncoded {
+                    encoded: x,
+                    encoded_len,
+                    windows: 1,
+                });
+            }
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => Tensor::zeros((1, encoded_len, self.geometry.dim), x.dtype(), x.device())?,
+            };
+            // Copy the kept frames: a narrowed view would keep the whole
+            // window's buffer alive until the end of the encode.
+            let kept = x.narrow(
+                1,
+                window.keep_start - window.start,
+                window.keep_end - window.keep_start,
+            )?;
+            output.slice_set(&kept, 1, window.keep_start)?;
+            drop((kept, x));
+            // Metal returns pooled buffers only at a synchronization point.
+            output.device().synchronize()?;
+            stitched = Some(output);
+        }
+        Ok(ParakeetEncoded {
+            encoded: stitched.ok_or_else(|| {
+                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
+            })?,
+            encoded_len,
+            windows: plan.len(),
+        })
     }
+}
+
+/// The stitched `[1, E, D]` encoder output.
+struct ParakeetEncoded {
+    encoded: Tensor,
+    encoded_len: usize,
+    windows: usize,
 }
 
 fn text_delta(previous: &str, current: &str) -> String {
@@ -1318,7 +1623,7 @@ impl ConvSubsamplingDw {
         })
     }
 
-    fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
+    fn forward(&self, features: &Tensor) -> Result<Tensor> {
         // Input features are [B=1, MELS, T]. Convert to [B, 1, T, MELS]
         let mut x = features.transpose(1, 2)?.unsqueeze(1)?;
 
@@ -1334,15 +1639,10 @@ impl ConvSubsamplingDw {
         x = x.relu()?;
 
         let (b, c, t, f) = x.dims4()?;
-        let x = x
-            .transpose(1, 2)?
+        x.transpose(1, 2)?
             .reshape((b, t, c * f))?
-            .apply(&self.out)?;
-
-        // Padding in the frontend/STFT path can slightly overestimate lengths.
-        // Clamp to the actual encoder time dimension to keep positional shapes valid.
-        let encoded_len = subsampled_len_3x(feature_frames).min(t);
-        Ok((x, encoded_len))
+            .apply(&self.out)
+            .map_err(Error::from)
     }
 }
 
@@ -2189,16 +2489,20 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use super::{
-        argmax_1d, parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
-        subsampled_len_3x, EncoderGeometry, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder,
-        ParakeetEncoder, ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        argmax_1d, build_rel_positional_embedding, parakeet_encoded_len_for_samples,
+        parakeet_max_emittable_tokens, parakeet_preparation_bytes, plan_encoder_windows,
+        subsampled_len_3x, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
+        ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
+        ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
         ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
         DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
-    use crate::error::Error;
+    use crate::backends::BackendKind;
+    use crate::error::{Error, Result};
     use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, VarBuilder};
@@ -2206,7 +2510,7 @@ mod tests {
     /// Small enough to run on CPU in milliseconds; two layers keep conv edge
     /// effects within 4 × 2 + 1 frames of a window boundary.
     const TINY: EncoderGeometry = EncoderGeometry {
-        mel_bins: 16,
+        mel_bins: 128,
         subsampling_channels: 4,
         layers: 2,
         dim: 32,
@@ -2322,9 +2626,68 @@ mod tests {
         ParakeetEncoder::load(vb, geometry).unwrap()
     }
 
-    fn random_features(mel_bins: usize, frames: usize, seed: u64, device: &Device) -> Tensor {
-        let values = XorShift(seed).values(mel_bins * frames, 1.0, 0.0);
-        Tensor::from_vec(values, (1, mel_bins, frames), device).unwrap()
+    fn random_log_mel(frames: usize, valid_frames: usize, seed: u64) -> ParakeetLogMel {
+        let values = XorShift(seed).values(TINY.mel_bins * frames, 4.0, -2.0);
+        ParakeetLogMel::from_parts(values, TINY.mel_bins, frames, valid_frames)
+    }
+
+    /// Today's whole-utterance encode: every log-mel column through one
+    /// pre-encode and one attention pass. `truncate_first` drops the STFT
+    /// padding frame before attention (the windowed encoder's behaviour);
+    /// otherwise it is dropped afterwards, as before windowing.
+    fn whole_utterance_encode(
+        encoder: &ParakeetEncoder,
+        features: &Tensor,
+        encoded_len: usize,
+        truncate_first: bool,
+    ) -> Tensor {
+        let mut x = encoder.pre_encode.forward(features).unwrap();
+        if truncate_first {
+            x = x.narrow(1, 0, encoded_len).unwrap();
+        }
+        let pos =
+            build_rel_positional_embedding(x.dim(1).unwrap(), encoder.geometry.dim, x.device())
+                .unwrap();
+        for layer in &encoder.layers {
+            x = layer.forward(&x, &pos).unwrap();
+        }
+        x.narrow(1, 0, encoded_len).unwrap()
+    }
+
+    fn encode_windows(
+        encoder: &ParakeetEncoder,
+        feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        encoder.encode_windows(
+            feature_frames,
+            encoded_len,
+            windowing,
+            window_features,
+            &mut ParakeetTimings::default(),
+            checkpoint,
+        )
+    }
+
+    /// Largest absolute difference; NaN or infinity counts as infinitely far.
+    fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
+        assert_eq!(left.dims(), right.dims());
+        let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        values(left)
+            .into_iter()
+            .zip(values(right))
+            .map(|(left, right)| {
+                let difference = (left - right).abs();
+                if difference.is_finite() {
+                    difference
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
     }
 
     fn zero_lstm(device: &Device) -> LstmCell {
@@ -2384,6 +2747,7 @@ mod tests {
             blank_idx,
             num_durations,
             max_symbols: DEFAULT_MAX_SYMBOLS,
+            encoder_windowing: EncoderWindowing::V3,
         }
     }
 
@@ -2396,6 +2760,10 @@ mod tests {
             resampled_samples: encoded_len * 1280,
             feature_frames: encoded_len * 8,
             language: None,
+            windowing: EncoderWindowing::V3,
+            encoder_windows: 1,
+            log_mel_ms: 0.0,
+            encode_ms: 0.0,
         }
     }
 
@@ -2481,20 +2849,284 @@ mod tests {
     }
 
     #[test]
-    fn tiny_random_encoder_follows_its_geometry() {
+    fn max_abs_diff_treats_nan_as_infinitely_far() {
         let device = Device::Cpu;
-        let encoder = random_encoder(TINY, 7, &device);
-        let (frames, valid) = (203, 202);
-        let features = random_features(TINY.mel_bins, frames, 9, &device);
+        let finite = Tensor::new(&[1f32, 2.0], &device).unwrap();
+        let with_nan = Tensor::new(&[1f32, f32::NAN], &device).unwrap();
+        assert_eq!(max_abs_diff(&finite, &with_nan), f32::INFINITY);
+        assert_eq!(max_abs_diff(&finite, &finite), 0.0);
+    }
 
-        let (encoded, encoded_len) = encoder
-            .encode_with_timings(&features, valid, &mut ParakeetTimings::default())
+    #[test]
+    fn encoder_window_plan_partitions_frames_with_context() {
+        let w = EncoderWindowing::V3;
+        let plan = |encoded_len| {
+            plan_encoder_windows(encoded_len, w.frames, w.left_context, w.right_context).unwrap()
+        };
+        for encoded_len in [1, 895, 896, 1023, 1024, 1025, 1793, 45_000] {
+            let windows = plan(encoded_len);
+            let mut kept_until = 0;
+            for window in &windows {
+                assert_eq!(window.keep_start, kept_until, "E={encoded_len}");
+                assert!(window.start <= window.keep_start && window.keep_start < window.keep_end);
+                assert!(window.keep_end <= window.end && window.end <= encoded_len);
+                kept_until = window.keep_end;
+                if encoded_len > w.frames {
+                    assert_eq!(window.end - window.start, w.frames, "E={encoded_len}");
+                }
+                assert!(window.start == 0 || window.keep_start - window.start >= w.left_context);
+                assert!(
+                    window.end == encoded_len || window.end - window.keep_end >= w.right_context
+                );
+                // Both STFT tails: valid % 8 != 0 (one padding column past
+                // 8E - 3) and valid % 8 == 0 (padding column at 8E).
+                for feature_frames in [8 * encoded_len - 2, 8 * encoded_len + 1] {
+                    let columns = window.feature_columns(feature_frames);
+                    assert_eq!(columns.start, 8 * window.start);
+                    assert_eq!(columns.end, (8 * window.end).min(feature_frames));
+                    assert_eq!(subsampled_len_3x(columns.len()), window.end - window.start);
+                }
+            }
+            assert_eq!(kept_until, encoded_len, "E={encoded_len}");
+        }
+
+        let whole = |encoded_len| EncoderWindow {
+            start: 0,
+            end: encoded_len,
+            keep_start: 0,
+            keep_end: encoded_len,
+        };
+        assert_eq!(plan(1), vec![whole(1)]);
+        assert_eq!(plan(1024), vec![whole(1024)]);
+        assert_eq!(
+            plan(1025),
+            vec![
+                EncoderWindow {
+                    start: 0,
+                    end: 1024,
+                    keep_start: 0,
+                    keep_end: 896,
+                },
+                EncoderWindow {
+                    start: 1,
+                    end: 1025,
+                    keep_start: 896,
+                    keep_end: 1025,
+                },
+            ]
+        );
+        assert_eq!(plan(1793).len(), 3);
+        // 60 minutes: one 896-frame head, 57 centres of 768 and a tail.
+        assert_eq!(plan(45_000).len(), 59);
+        assert!(plan(0).is_empty());
+        assert!(plan_encoder_windows(2048, 256, 128, 128).is_err());
+    }
+
+    #[test]
+    fn single_window_encode_matches_whole_utterance_encode() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 3, &device);
+        // 203 % 8 != 0: the padding column shares the last encoder frame.
+        // 200 % 8 == 0: it would add a frame, which attention no longer sees.
+        for valid in [203usize, 200] {
+            let frames = valid + 1;
+            let log_mel = random_log_mel(frames, valid, valid as u64);
+            let encoded_len = subsampled_len_3x(valid);
+            let windowed = encode_windows(
+                &encoder,
+                frames,
+                encoded_len,
+                EncoderWindowing::V3,
+                &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                &|| Ok(()),
+            )
             .unwrap();
+            assert_eq!(windowed.windows, 1);
+            assert_eq!(windowed.encoded.dims(), &[1, encoded_len, TINY.dim]);
 
-        assert_eq!(encoded.dims(), &[1, subsampled_len_3x(frames), TINY.dim]);
-        assert_eq!(encoded_len, subsampled_len_3x(valid));
-        let values = encoded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(values.iter().all(|value| value.is_finite()));
+            let features = log_mel.normalize_and_upload(0..frames, &device).unwrap();
+            let before = whole_utterance_encode(&encoder, &features, encoded_len, false);
+            if valid % 8 != 0 {
+                assert_eq!(
+                    windowed.encoded.to_vec3::<f32>().unwrap(),
+                    before.to_vec3::<f32>().unwrap()
+                );
+            } else {
+                let truncated = whole_utterance_encode(&encoder, &features, encoded_len, true);
+                assert!(max_abs_diff(&windowed.encoded, &truncated) <= 1e-5);
+                assert!(max_abs_diff(&windowed.encoded, &before) > 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_encode_with_neutral_attention_matches_whole_utterance_encode() {
+        let device = Device::Cpu;
+        let mut encoder = random_encoder(TINY, 5, &device);
+        // With attention silenced only per-frame blocks and kernel-9
+        // convolutions remain, so context of 4 frames per layer, plus the
+        // first subsampled frame, makes every kept frame exact.
+        for layer in &mut encoder.layers {
+            let weight = layer.self_attn.linear_out.weight().zeros_like().unwrap();
+            layer.self_attn.linear_out = Linear::new(weight, None);
+        }
+        let valid = 8 * 150 + 5;
+        let frames = valid + 1;
+        let encoded_len = subsampled_len_3x(valid);
+        // One normalization for every window, so only stitching can differ.
+        let features = random_log_mel(frames, valid, 21)
+            .normalize_and_upload(0..frames, &device)
+            .unwrap();
+        let reference = whole_utterance_encode(&encoder, &features, encoded_len, true);
+        let windowed = |context: usize| {
+            let windowing = EncoderWindowing {
+                frames: 48,
+                left_context: context,
+                right_context: context,
+            };
+            encode_windows(
+                &encoder,
+                frames,
+                encoded_len,
+                windowing,
+                &mut |columns| {
+                    Ok(features
+                        .narrow(2, columns.start, columns.len())?
+                        .contiguous()?)
+                },
+                &|| Ok(()),
+            )
+            .unwrap()
+        };
+
+        let exact = windowed(4 * TINY.layers + 2);
+        assert!(exact.windows > 3);
+        assert!(max_abs_diff(&exact.encoded, &reference) <= 1e-5);
+        // Too little context leaves window-edge effects in kept frames.
+        assert!(max_abs_diff(&windowed(2).encoded, &reference) > 1e-3);
+    }
+
+    #[test]
+    fn windowed_encode_stops_at_a_cancelled_checkpoint() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 9, &device);
+        let valid = 8 * 100;
+        let log_mel = random_log_mel(valid + 1, valid, 4);
+        let windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 8,
+            right_context: 8,
+        };
+        let encoded_windows = Cell::new(0);
+        let cancelled = Cell::new(false);
+
+        let result = encode_windows(
+            &encoder,
+            valid + 1,
+            subsampled_len_3x(valid),
+            windowing,
+            &mut |columns| {
+                encoded_windows.set(encoded_windows.get() + 1);
+                // The request is cancelled while its first window encodes.
+                cancelled.set(true);
+                log_mel.normalize_and_upload(columns, &device)
+            },
+            &|| {
+                if cancelled.get() {
+                    return Err(Error::Cancelled("parakeet-test".into()));
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(Error::Cancelled(_))));
+        assert_eq!(encoded_windows.get(), 1);
+    }
+
+    #[test]
+    fn retained_encoder_artifact_reports_its_windows() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        model.encoder_windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 10,
+            right_context: 10,
+        };
+        // 4 s: 400 valid feature frames, 50 encoder frames, three windows.
+        let audio = XorShift(13).values(64_037, 0.1, 0.0);
+
+        let artifact = model
+            .prepare_retained_encoder(&audio, 16_000, Some("en"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(artifact.encoded_len, 50);
+        assert_eq!(artifact.encoder_windows, 3);
+        assert_eq!(artifact.encoded.dims(), &[1, 50, TINY.dim]);
+        let state = model.start_retained_decode().unwrap();
+        let diagnostics = model
+            .retained_decode_output(&artifact, &state)
+            .diagnostics
+            .unwrap();
+        assert_eq!(diagnostics["encoded_frames"], 50);
+        assert_eq!(diagnostics["encoder_windows"], 3);
+        assert_eq!(diagnostics["encoder_window_frames"], 32);
+        assert_eq!(diagnostics["encoder_window_left_context"], 10);
+        assert_eq!(diagnostics["encoder_window_right_context"], 10);
+        assert!(diagnostics["encode_ms"].as_f64().is_some());
+
+        let checkpoints = Cell::new(0);
+        let cancelled = model.prepare_retained_encoder(&audio, 16_000, None, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            if checkpoints.get() > 1 {
+                return Err(Error::Cancelled("parakeet-test".into()));
+            }
+            Ok(())
+        });
+        assert!(matches!(cancelled, Err(Error::Cancelled(_))));
+        assert_eq!(checkpoints.get(), 2);
+    }
+
+    #[test]
+    fn preparation_pricing_is_bounded_by_the_window() {
+        const GIB: u64 = 1 << 30;
+        let minute = 60 * 16_000;
+        let total = |samples: usize, backend: BackendKind| {
+            let bytes = parakeet_preparation_bytes(samples, backend).unwrap();
+            bytes.host_bytes + bytes.device_bytes().unwrap()
+        };
+        let backends = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+        for backend in backends {
+            let mut previous = 0;
+            let lengths = (0..=60 * minute)
+                .step_by(16_000 * 7 + 13)
+                .chain(1_300_000..1_320_000)
+                .chain([60 * minute]);
+            let mut lengths = lengths.collect::<Vec<_>>();
+            lengths.sort_unstable();
+            for samples in lengths {
+                let bytes = total(samples, backend);
+                assert!(bytes >= previous, "{backend:?} pricing fell at {samples}");
+                previous = bytes;
+            }
+            assert!(total(60 * minute, backend) <= 5 * GIB / 2, "{backend:?}");
+        }
+
+        // E = 1024 frames: the window term is final from here on and equals
+        // report 11's 832 MiB on every backend (all its buffers are powers
+        // of two at W = 1024).
+        let full_window = parakeet_preparation_bytes(8192 * 160, BackendKind::Cpu)
+            .unwrap()
+            .window_bytes;
+        assert_eq!(full_window, 832 << 20);
+        for minutes in [2, 10, 30, 60] {
+            for backend in backends {
+                let bytes = parakeet_preparation_bytes(minutes * minute, backend).unwrap();
+                assert_eq!(bytes.window_bytes, full_window);
+            }
+        }
+        for samples in [16_000, 7 * minute + 4_321, 60 * minute] {
+            assert!(total(samples, BackendKind::Metal) >= total(samples, BackendKind::Cpu));
+        }
     }
 
     #[test]
