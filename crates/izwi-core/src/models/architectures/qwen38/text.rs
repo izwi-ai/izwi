@@ -2083,6 +2083,13 @@ impl Qwen38TextModel {
         &self.fp8_prefill_gemm_checks
     }
 
+    /// Whether any trunk projection kind runs the dequantized prefill GEMM.
+    pub(super) fn prefill_gemm_active(&self) -> bool {
+        self.fp8_prefill_gemm_checks
+            .iter()
+            .any(Qwen38FastPath::is_fused)
+    }
+
     /// `fast_paths.fp8_lm_head`: the head's form and its observed error.
     pub(super) fn fp8_lm_head_diagnostics(&self) -> serde_json::Value {
         let (path, gate_error) = &self.fp8_lm_head;

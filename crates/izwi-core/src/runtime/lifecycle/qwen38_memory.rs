@@ -7,7 +7,9 @@ use super::{ModelMemoryEstimate, ModelResourcePlan};
 use crate::backends::BackendKind;
 use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen38::chat::Qwen38TextConfig;
+use crate::models::architectures::qwen38::chat::{
+    prefill_working_set_bytes, qwen38_prefill_chunk_tokens, Qwen38TextConfig,
+};
 use crate::models::architectures::qwen38::native::{
     native_tensor_scope, pinned_27b_config, resident_tensor_specs, NativeTensorScope,
     Qwen38NativeCheckpoint, Qwen38NativeConfig,
@@ -175,7 +177,15 @@ pub(super) fn resource_plan(
     // The prefill GEMM's one dequantized weight tile when the policy plans
     // it: lazily allocated like the graphs, so also a pending claim.
     let prefill_scratch = policy.prefill_scratch_bytes();
-    let deferred = graphs.checked_add(prefill_scratch).ok_or_else(overflow)?;
+    // One prefill forward's activations at the chunk the load will use
+    // (allocated per forward, so also a pending claim): a 1,024-token chunk
+    // must not come out of the safety margin.
+    let prefill_chunk = qwen38_prefill_chunk_tokens(BackendKind::Cuda, policy.fp8_prefill_gemm());
+    let prefill_activations = prefill_working_set_bytes(&checkpoint.config.text, prefill_chunk)?;
+    let deferred = graphs
+        .checked_add(prefill_scratch)
+        .and_then(|n| n.checked_add(prefill_activations))
+        .ok_or_else(overflow)?;
     let resident_bytes = weights
         .checked_add(DEVICE_ALIGNMENT_RESERVE)
         .and_then(|n| n.checked_add(deferred))
@@ -222,6 +232,8 @@ pub(super) fn resource_plan(
         weights_bytes = weights,
         graph_capacity_bytes = graphs,
         prefill_scratch_bytes = prefill_scratch,
+        prefill_chunk_tokens = prefill_chunk,
+        prefill_activation_bytes = prefill_activations,
         resident_bytes,
         host_staging_bytes = scratch,
         representation = policy.representation().as_str(),

@@ -3734,11 +3734,8 @@ impl NativeChatModel {
     pub fn preferred_prefill_tokens(&self) -> usize {
         match self {
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
-            Self::Qwen3(_)
-            | Self::Qwen35(_)
-            | Self::Qwen38(_)
-            | Self::Gemma3(_)
-            | Self::Lfm2(_) => 0,
+            Self::Qwen38(model) => model.preferred_prefill_tokens(),
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
         }
     }
 

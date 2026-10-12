@@ -60,7 +60,17 @@ use super::text::{Qwen38TextModel, Qwen38TextRuntimeState};
 const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
+/// Prefill chunk on CUDA once the dequantized prefill GEMM runs. Its weight
+/// dequantization (~40 ms per pass over the 27B trunk, estimated) is paid
+/// once per chunk, so 1,024 tokens amortize it over four times the span of
+/// 256 while one chunk stays ~130 ms (estimate). Wider spans reach the model
+/// only for an isolated request: the scheduler grants the preferred span
+/// when nothing else is decoding or waiting (`prefill_chunk_for`), so
+/// concurrent decode keeps the engine's 96-192-token spans. SGLang caps
+/// hybrid GDN prefill at 2,048 because 8k chunks stall decode by ~600 ms.
+const CUDA_GEMM_PREFILL_CHUNK_SIZE: usize = 1024;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+const PREFILL_CHUNK_ENV: &str = "IZWI_QWEN38_PREFILL_CHUNK_SIZE";
 const CUDA_BF16_KV_ENV: &str = "IZWI_QWEN38_CUDA_BF16_KV";
 const MTP_ENABLED_ENV: &str = "IZWI_QWEN38_MTP";
 const MTP_DRAFT_TOKENS_ENV: &str = "IZWI_QWEN38_MTP_DRAFT_TOKENS";
@@ -314,13 +324,37 @@ fn qwen38_projection_materialization_policy(
     }
 }
 
-fn qwen38_prefill_chunk_size() -> usize {
-    std::env::var("IZWI_QWEN38_PREFILL_CHUNK_SIZE")
+/// Tokens per prefill forward for a load on `backend`: 1,024 on CUDA when
+/// the dequantized prefill GEMM runs (`prefill_gemm`), 256 otherwise.
+/// `IZWI_QWEN38_PREFILL_CHUNK_SIZE` (1-2,048) overrides both. Admission
+/// prices the same chunk ([`prefill_working_set_bytes`]).
+pub(crate) fn qwen38_prefill_chunk_tokens(backend: BackendKind, prefill_gemm: bool) -> usize {
+    let default = if backend == BackendKind::Cuda && prefill_gemm {
+        CUDA_GEMM_PREFILL_CHUNK_SIZE
+    } else {
+        DEFAULT_PREFILL_CHUNK_SIZE
+    };
+    std::env::var(PREFILL_CHUNK_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
+        .unwrap_or(default)
         .min(MAX_PREFILL_CHUNK_SIZE)
+}
+
+/// Transient bytes of one prefill forward of `chunk_tokens` tokens: per
+/// token the activation bound of one continuous-decode row (every
+/// activation of the widest layer, counted in F32), which covers the F32
+/// DeltaNet intermediates, the packed gate/up output and the norm
+/// temporaries a prefill row holds at once. About 392 MiB at 1,024 tokens
+/// on the 27B trunk.
+pub(crate) fn prefill_working_set_bytes(
+    cfg: &Qwen38TextConfig,
+    chunk_tokens: usize,
+) -> Result<u64> {
+    continuous_decode_workspace_per_row_bytes(cfg, 0, None)?
+        .checked_mul(chunk_tokens as u64)
+        .ok_or_else(|| Error::ModelLoadError("Qwen3.8 prefill working set overflow".into()))
 }
 
 /// Fully prepared Qwen3.8 text prefill input. The runtime carries this exact
@@ -1013,7 +1047,10 @@ impl Qwen38ChatModel {
             device_kind,
             performance: performance.clone(),
             load_timing: checkpoint.tensors.loading_diagnostics(),
-            prefill_chunk_size: qwen38_prefill_chunk_size(),
+            prefill_chunk_size: qwen38_prefill_chunk_tokens(
+                device_kind,
+                text_model.prefill_gemm_active(),
+            ),
             cuda_compute_capability,
             kv_storage_provider,
             variant,
@@ -1025,6 +1062,17 @@ impl Qwen38ChatModel {
             prefix_caching: prefix_reuse,
             graph_quantum: GraphQuantumCounters::default(),
         })
+    }
+
+    /// Prefill span this model prefers for an isolated request: its chunk
+    /// on CUDA once the dequantized prefill GEMM runs (the GEMM's weight
+    /// expansion amortizes over the span), else the engine's threshold (0).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        if self.device_kind == BackendKind::Cuda && self.text_model.prefill_gemm_active() {
+            self.prefill_chunk_size
+        } else {
+            0
+        }
     }
 
     pub(crate) fn sustained_cuda_mtp_quantum(&self) -> bool {
@@ -1259,8 +1307,11 @@ impl Qwen38ChatModel {
                 "fp8_projection_path": "rows >= 16: dequantized weight tiles (<= 128 MiB) + cuBLAS once checked per projection kind (fast_paths.fp8_prefill_gemm); otherwise the compact FP8 mm kernel",
                 "fp8_projection_switch": super::residency::FP8_PREFILL_GEMM_ENV,
                 "fp8_prefill_scratch_bytes": self.text_model.residency().prefill_scratch_bytes(),
-                "chunk_override": "IZWI_QWEN38_PREFILL_CHUNK_SIZE",
+                "chunk_override": PREFILL_CHUNK_ENV,
                 "maximum_chunk_tokens": MAX_PREFILL_CHUNK_SIZE,
+                "cuda_prefill_gemm_chunk_tokens": CUDA_GEMM_PREFILL_CHUNK_SIZE,
+                "preferred_span_tokens": self.preferred_prefill_tokens(),
+                "preferred_span_policy": "an isolated request (nothing decoding or waiting) prefills the whole chunk in one engine step; otherwise the engine's chunk threshold applies",
             },
             "mtp": {
                 "enabled": self.mtp_policy.enabled(),
@@ -4320,6 +4371,37 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(covered, prompt_len - 1, "boundaries={boundaries:?}");
         }
+    }
+
+    #[test]
+    fn prefill_chunk_follows_the_backend_and_the_prefill_gemm_with_an_override() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(PREFILL_CHUNK_ENV);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cuda, true), 1024);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cuda, false), 256);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Metal, true), 256);
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cpu, true), 256);
+        for (value, expected) in [("512", 512), ("0", 1024), ("junk", 1024), ("999999", 2048)] {
+            std::env::set_var(PREFILL_CHUNK_ENV, value);
+            assert_eq!(
+                qwen38_prefill_chunk_tokens(BackendKind::Cuda, true),
+                expected,
+                "{value}"
+            );
+        }
+        std::env::set_var(PREFILL_CHUNK_ENV, "64");
+        assert_eq!(qwen38_prefill_chunk_tokens(BackendKind::Cpu, false), 64);
+        std::env::remove_var(PREFILL_CHUNK_ENV);
+        // Admission prices one decode row's activation bound per prefill
+        // token: 392 MiB for a 1,024-token chunk of the 27B trunk.
+        let cfg = shipped_workspace_config();
+        assert_eq!(
+            prefill_working_set_bytes(&cfg, 1024).unwrap(),
+            401_408 * 1024
+        );
+        assert_eq!(prefill_working_set_bytes(&cfg, 256).unwrap(), 401_408 * 256);
     }
 
     #[test]
