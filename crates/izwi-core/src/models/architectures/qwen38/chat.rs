@@ -1908,6 +1908,14 @@ impl Qwen38ChatModel {
                 state.physical_kv.context_len()
             )));
         }
+        // Above token zero the hybrid state must already hold the history
+        // (an earlier span's, or a restored prefix snapshot). Prefilling from
+        // fresh zero state there would silently drop it.
+        if start > 0 && !state.text_state.linear_state_initialized() {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.8 prefill resumes at token {start} without hybrid state; an attached prefix must restore its snapshot first"
+            )));
+        }
         let compute_logits = span_end == total;
         let output = self.text_model.prefill_token_ids_with_hidden_physical(
             &prepared.prompt_ids[start..span_end],

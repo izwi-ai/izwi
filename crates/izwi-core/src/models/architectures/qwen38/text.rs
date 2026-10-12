@@ -323,6 +323,19 @@ impl Qwen38TextRuntimeState {
         Some(())
     }
 
+    /// Whether every DeltaNet layer holds its recurrent state. A fresh state
+    /// holds none until its first prefill zero-initializes it; a span that
+    /// resumes above token zero must find the state its earlier spans (or an
+    /// attached snapshot) left.
+    pub(crate) fn linear_state_initialized(&self) -> bool {
+        self.layers.iter().all(|layer| match layer {
+            Qwen38LayerRuntimeState::Linear {
+                recurrent_state, ..
+            } => recurrent_state.is_some(),
+            Qwen38LayerRuntimeState::Full => true,
+        })
+    }
+
     pub(crate) fn restore_tensor_domains(
         &mut self,
         arena: &TensorStateArena,
