@@ -1134,8 +1134,8 @@ impl Block1D {
             vb.pp("mixer.conv"),
         )?;
         let ffn_dim = 4 * dim;
-        let linear1 = mlx::load_linear_no_bias(dim, ffn_dim, vb.pp("ffn.linear1"))?;
-        let linear2 = mlx::load_linear_no_bias(ffn_dim, dim, vb.pp("ffn.linear2"))?;
+        let linear1 = load_ffn_linear(dim, ffn_dim, config.conv_bias, vb.pp("ffn.linear1"))?;
+        let linear2 = load_ffn_linear(ffn_dim, dim, config.conv_bias, vb.pp("ffn.linear2"))?;
         let gamma = (config.layer_scale_init_value > 0.0)
             .then(|| vb.get((dim,), "gamma"))
             .transpose()?;
@@ -1163,7 +1163,7 @@ impl Block1D {
 
         let residual = &x;
         let ffn_in = self.ffn_norm.forward(&x)?.transpose(1, 2)?;
-        let hidden = self.linear1.forward(&ffn_in)?.gelu()?;
+        let hidden = self.linear1.forward(&ffn_in)?.gelu_erf()?;
         let mut hidden = self.linear2.forward(&hidden)?.transpose(1, 2)?;
         if let Some(gamma) = &self.ffn_gamma {
             hidden = hidden.broadcast_mul(&gamma.reshape((1, gamma.dim(0)?, 1))?)?;
@@ -1182,7 +1182,7 @@ impl Block1D {
 
         let residual = &x;
         let ffn_in = self.ffn_norm.forward(&x)?.transpose(1, 2)?;
-        let hidden = self.linear1.forward(&ffn_in)?.gelu()?;
+        let hidden = self.linear1.forward(&ffn_in)?.gelu_erf()?;
         let mut hidden = self.linear2.forward(&hidden)?.transpose(1, 2)?;
         if let Some(gamma) = &self.ffn_gamma {
             hidden = hidden.broadcast_mul(&gamma.reshape((1, gamma.dim(0)?, 1))?)?;
@@ -1213,7 +1213,7 @@ impl Block1D {
 
         let residual = &x;
         let ffn_in = self.ffn_norm.forward(&x)?.transpose(1, 2)?;
-        let hidden = self.linear1.forward(&ffn_in)?.gelu()?;
+        let hidden = self.linear1.forward(&ffn_in)?.gelu_erf()?;
         let mut hidden = self.linear2.forward(&hidden)?.transpose(1, 2)?;
         if let Some(gamma) = &self.ffn_gamma {
             hidden = hidden.broadcast_mul(&gamma.reshape((1, gamma.dim(0)?, 1))?)?;
@@ -1249,6 +1249,25 @@ impl Block1D {
     ) -> Result<()> {
         self.mixer.collect_streaming_state(&cache.mixer, components)
     }
+}
+
+/// The reference FFN is `Linear(bias) -> ACT2FN["gelu"] -> Linear(bias)` with
+/// `bias = config.conv_bias` (`modular_vibevoice_tokenizer.py`: the encoder and
+/// decoder configs set `bias = conv_bias`, which `Block1D` passes to `FFN`), and
+/// `ACT2FN["gelu"]` is the exact erf GELU. A configured bias the checkpoint
+/// lacks fails the load instead of running without trained parameters.
+fn load_ffn_linear(in_dim: usize, out_dim: usize, bias: bool, vb: VarBuilder) -> Result<Linear> {
+    if !bias {
+        return mlx::load_linear_no_bias(in_dim, out_dim, vb);
+    }
+    let linear = mlx::load_linear(in_dim, out_dim, vb.clone())?;
+    if linear.bias().is_none() {
+        return Err(Error::ModelLoadError(format!(
+            "VibeVoice tokenizer FFN `{}` has no bias although conv_bias is set",
+            vb.prefix()
+        )));
+    }
+    Ok(linear)
 }
 
 struct SConv1d {
@@ -2465,6 +2484,292 @@ mod tests {
             &output.mean.transpose(1, 2).unwrap(),
             0.0,
         );
+    }
+
+    /// Deterministic values in [-0.5, 0.5) (xorshift32).
+    fn pseudo_values(len: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as f32 / u32::MAX as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// A dim-4 depthwise `Block1D` checkpoint with RMSNorm, the mixer conv and
+    /// the FFN, as published under `stages.{s}.{b}`. Bias tensors are scaled
+    /// by `mixer_bias`, `linear1_bias` and `linear2_bias`; `None` omits one.
+    fn block_tensors(
+        mixer_bias: Option<f32>,
+        linear1_bias: Option<f32>,
+        linear2_bias: Option<f32>,
+    ) -> HashMap<String, Tensor> {
+        const DIM: usize = 4;
+        let tensor = |values: Vec<f32>, shape: &[usize]| {
+            Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+        };
+        let scaled = |scale: f32, len: usize, seed: u32| {
+            pseudo_values(len, seed)
+                .into_iter()
+                .map(|value| value * scale)
+                .collect::<Vec<_>>()
+        };
+        let mut tensors = HashMap::new();
+        tensors.insert("norm.weight".to_string(), tensor(vec![1.0; DIM], &[DIM]));
+        tensors.insert(
+            "ffn_norm.weight".to_string(),
+            tensor(vec![1.0; DIM], &[DIM]),
+        );
+        tensors.insert(
+            "mixer.conv.conv.conv.weight".to_string(),
+            tensor(pseudo_values(DIM * 3, 1), &[DIM, 1, 3]),
+        );
+        tensors.insert(
+            "ffn.linear1.weight".to_string(),
+            tensor(pseudo_values(4 * DIM * DIM, 2), &[4 * DIM, DIM]),
+        );
+        tensors.insert(
+            "ffn.linear2.weight".to_string(),
+            tensor(pseudo_values(4 * DIM * DIM, 3), &[DIM, 4 * DIM]),
+        );
+        for (name, scale, len, seed) in [
+            ("mixer.conv.conv.conv.bias", mixer_bias, DIM, 4),
+            ("ffn.linear1.bias", linear1_bias, 4 * DIM, 5),
+            ("ffn.linear2.bias", linear2_bias, DIM, 6),
+        ] {
+            if let Some(scale) = scale {
+                tensors.insert(name.to_string(), tensor(scaled(scale, len, seed), &[len]));
+            }
+        }
+        tensors
+    }
+
+    fn load_block(tensors: HashMap<String, Tensor>, conv_bias: bool) -> Result<Block1D> {
+        let config = TokenizerStackConfig {
+            conv_bias,
+            ..test_stack_config(vec![], vec![1])
+        };
+        Block1D::load(
+            4,
+            &config,
+            VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+        )
+    }
+
+    fn block_input() -> Tensor {
+        Tensor::from_vec(pseudo_values(4 * 6, 7), (1, 4, 6), &Device::Cpu).unwrap()
+    }
+
+    fn max_abs_difference(left: &Tensor, right: &Tensor) -> f32 {
+        left.sub(right)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn block1d_applies_the_published_ffn_biases() {
+        let x = block_input();
+        let forward = |tensors| load_block(tensors, true).unwrap().forward(&x).unwrap();
+        let biased = forward(block_tensors(Some(1.0), Some(1.0), Some(1.0)));
+        let zeroed = forward(block_tensors(Some(1.0), Some(0.0), Some(0.0)));
+        let only_linear2 = forward(block_tensors(Some(1.0), Some(0.0), Some(1.0)));
+
+        assert!(max_abs_difference(&biased, &zeroed) > 1e-2);
+        // linear2's bias lands on the residual unchanged (no layer scale), so
+        // it shifts every frame of its channel by exactly that bias.
+        let linear2_bias = Tensor::from_vec(pseudo_values(4, 6), (1, 4, 1), &Device::Cpu).unwrap();
+        let expected = zeroed.broadcast_add(&linear2_bias).unwrap();
+        assert!(max_abs_difference(&only_linear2, &expected) < 1e-6);
+    }
+
+    #[test]
+    fn block1d_missing_ffn_bias_fails_the_load() {
+        for (missing, tensors) in [
+            (
+                "ffn.linear1.bias",
+                block_tensors(Some(1.0), None, Some(1.0)),
+            ),
+            (
+                "ffn.linear2.bias",
+                block_tensors(Some(1.0), Some(1.0), None),
+            ),
+        ] {
+            let error = load_block(tensors, true)
+                .err()
+                .unwrap_or_else(|| panic!("missing {missing} must fail the load"));
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn block1d_without_conv_bias_loads_and_ignores_biases() {
+        let x = block_input();
+        let without_bias = load_block(block_tensors(None, None, None), false)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let ignored_bias = load_block(block_tensors(Some(1.0), Some(1.0), Some(1.0)), false)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+        let zero_bias = load_block(block_tensors(Some(0.0), Some(0.0), Some(0.0)), true)
+            .unwrap()
+            .forward(&x)
+            .unwrap();
+
+        assert!(max_abs_difference(&without_bias, &zero_bias) < 1e-6);
+        assert!(max_abs_difference(&ignored_bias, &zero_bias) < 1e-6);
+    }
+
+    #[test]
+    fn block1d_ffn_uses_exact_erf_gelu_on_every_forward_path() {
+        let device = Device::Cpu;
+        let linear = |weight: Vec<f32>, shape: (usize, usize)| {
+            Linear::new(Tensor::from_vec(weight, shape, &device).unwrap(), None)
+        };
+        // Identity norms and a zero mixer leave x + linear2(gelu(linear1(x)));
+        // linear1 routes x into hidden unit 0 and linear2 reads it back.
+        let block = Block1D {
+            norm: ConvNorm::Identity,
+            mixer: test_sconv1d(&[0.0, 0.0, 0.0], 0.0),
+            ffn_norm: ConvNorm::Identity,
+            linear1: linear(vec![1.0, 0.0, 0.0, 0.0], (4, 1)),
+            linear2: linear(vec![1.0, 0.0, 0.0, 0.0], (1, 4)),
+            gamma: None,
+            ffn_gamma: None,
+        };
+        let row = Tensor::from_vec(vec![1.0f32, -0.5, 2.0], (1, 1, 3), &device).unwrap();
+        // HF ACT2FN["gelu"] is exact: 0.5·x·(1 + erf(x/√2)) gives 0.8413447 at
+        // 1 (tanh form 0.8411920), -0.1542688 at -0.5 and 1.9544997 at 2.
+        let expected: [f64; 3] = [
+            1.0 + 0.841_344_746_068_542_9,
+            -0.5 - 0.154_268_769_362_993_47,
+            2.0 + 1.954_499_736_103_641_6,
+        ];
+
+        let full = block.forward(&row).unwrap();
+        let mut cache = block.streaming_cache();
+        let streamed = block.forward_streaming(&row, &mut cache).unwrap();
+        let batch = Tensor::cat(&[&row, &row], 0).unwrap();
+        let mut cache = Block1DStreamingCache {
+            mixer: SConv1dStreamingCache {
+                prefix: Some(Tensor::zeros((2, 1, 2), DType::F32, &device).unwrap()),
+            },
+        };
+        let batched = block
+            .forward_streaming_batch(&batch, &mut cache, &[3, 3])
+            .unwrap();
+        for output in [full, streamed, batched] {
+            let values = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(values.len() % expected.len(), 0);
+            for (actual, expected) in values.iter().zip(expected.iter().cycle()) {
+                let error = (f64::from(*actual) - expected).abs();
+                assert!(error < 1e-6, "{actual} vs {expected}");
+            }
+        }
+    }
+
+    /// Hands out zeros and records every tensor name a loader requests.
+    struct RecordingZeros(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl candle_nn::var_builder::SimpleBackend for RecordingZeros {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            _: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            self.0.lock().unwrap().push(name.to_string());
+            Tensor::zeros(shape, dtype, device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn tokenizers_request_every_published_ffn_bias() {
+        // `acoustic_tokenizer_config` and `semantic_tokenizer_config` of
+        // microsoft/VibeVoice-ASR @d0c9efdb; VibeVoice-1.5B @c00898d2 differs
+        // only in `dtype`. Both indexes list exactly these 156 bias tensors.
+        const ACOUSTIC: &str = r#"{"causal": true, "channels": 1, "conv_bias": true,
+            "conv_norm": "none", "corpus_normalize": 0.0, "decoder_depths": null,
+            "decoder_n_filters": 32, "decoder_ratios": [8, 5, 5, 4, 2, 2],
+            "disable_last_norm": true, "encoder_depths": "3-3-3-3-3-3-8",
+            "encoder_n_filters": 32, "encoder_ratios": [8, 5, 5, 4, 2, 2], "fix_std": 0.5,
+            "layer_scale_init_value": 1e-06, "layernorm": "RMSNorm",
+            "layernorm_elementwise_affine": true, "layernorm_eps": 1e-05,
+            "mixer_layer": "depthwise_conv", "pad_mode": "constant",
+            "std_dist_type": "gaussian", "vae_dim": 64, "weight_init_value": 0.01}"#;
+        const SEMANTIC: &str = r#"{"causal": true, "channels": 1, "conv_bias": true,
+            "conv_norm": "none", "corpus_normalize": 0.0, "disable_last_norm": true,
+            "encoder_depths": "3-3-3-3-3-3-8", "encoder_n_filters": 32,
+            "encoder_ratios": [8, 5, 5, 4, 2, 2], "fix_std": 0,
+            "layer_scale_init_value": 1e-06, "layernorm": "RMSNorm",
+            "layernorm_elementwise_affine": true, "layernorm_eps": 1e-05,
+            "mixer_layer": "depthwise_conv", "pad_mode": "constant", "std_dist_type": "none",
+            "vae_dim": 128, "weight_init_value": 0.01}"#;
+        let mut acoustic: VibeVoiceTokenizerConfig = serde_json::from_str(ACOUSTIC).unwrap();
+        let mut semantic: VibeVoiceTokenizerConfig = serde_json::from_str(SEMANTIC).unwrap();
+        // One filter keeps the stages 1-64 channels wide (published: 32-2048);
+        // the tensor names do not depend on the width.
+        acoustic.encoder_n_filters = 1;
+        acoustic.decoder_n_filters = 1;
+        semantic.encoder_n_filters = 1;
+
+        let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let vb = VarBuilder::from_backend(
+            Box::new(RecordingZeros(requested.clone())),
+            DType::F32,
+            Device::Cpu,
+        );
+        VibeVoiceAcousticTokenizer::load(&acoustic, vb.pp("model.acoustic_tokenizer")).unwrap();
+        VibeVoiceSemanticTokenizer::load(&semantic, vb.pp("model.semantic_tokenizer")).unwrap();
+
+        let encoder_depths = [3usize, 3, 3, 3, 3, 3, 8];
+        let decoder_depths = [8usize, 3, 3, 3, 3, 3, 3];
+        let mut expected = HashSet::new();
+        for (stack, depths) in [
+            ("model.acoustic_tokenizer.encoder", encoder_depths),
+            ("model.acoustic_tokenizer.decoder", decoder_depths),
+            ("model.semantic_tokenizer.encoder", encoder_depths),
+        ] {
+            for (stage, depth) in depths.into_iter().enumerate() {
+                for block in 0..depth {
+                    for linear in [1, 2] {
+                        expected.insert(format!(
+                            "{stack}.stages.{stage}.{block}.ffn.linear{linear}.bias"
+                        ));
+                    }
+                }
+            }
+        }
+        let requested = requested
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|name| name.contains(".ffn.") && name.ends_with(".bias"))
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(expected.len(), 156);
+        assert_eq!(requested, expected);
     }
 
     #[test]
