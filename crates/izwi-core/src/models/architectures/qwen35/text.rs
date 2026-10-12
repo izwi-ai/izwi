@@ -30,6 +30,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::cache::{CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN};
 use super::chat::Qwen35TextConfig;
+use super::telemetry::Qwen35Telemetry;
 
 pub struct Qwen35TextModel {
     device: Device,
@@ -38,6 +39,14 @@ pub struct Qwen35TextModel {
     output_norm: RmsNorm,
     output: QMatMul,
     finite_diagnostics_enabled: bool,
+    telemetry: Arc<Qwen35Telemetry>,
+}
+
+/// M-RoPE cos/sin for the token positions of one forward, shaped
+/// `(rows, tokens, rope_dim / 2)` and shared by every full-attention layer.
+struct Qwen35RopeTable {
+    cos: Tensor,
+    sin: Tensor,
 }
 
 #[derive(Clone)]
@@ -132,12 +141,14 @@ impl Qwen35TextRuntimeState {
         Ok(())
     }
 
+    /// Stage the recurrent and convolution state into `transaction` and
+    /// return the number of convolution rings stacked for it.
     pub(crate) fn stage_tensor_domains(
         &mut self,
         arena: &TensorStateArena,
         transaction: PhysicalStateTransactionId,
         target_cursor: u64,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let recurrent_cursor = arena
             .read_transaction_base(transaction, recurrent_domain_v2())?
             .map(|snapshot| snapshot.cursor)
@@ -182,6 +193,7 @@ impl Qwen35TextRuntimeState {
                 tensor: Some(ring_tensor),
             });
         }
+        let conv_ring_stacks = convolution.len();
         arena.stage_replace(
             transaction,
             recurrent_domain_v2(),
@@ -209,7 +221,7 @@ impl Qwen35TextRuntimeState {
                 *recurrent_state = None;
             }
         }
-        Ok(())
+        Ok(conv_ring_stacks)
     }
 }
 
@@ -468,7 +480,28 @@ impl Qwen35TextModel {
             output_norm,
             output,
             finite_diagnostics_enabled,
+            telemetry: Arc::default(),
         })
+    }
+
+    pub(crate) fn telemetry(&self) -> &Arc<Qwen35Telemetry> {
+        &self.telemetry
+    }
+
+    /// The RoPE table for `positions`, or `None` when attention has no
+    /// rotary dimensions. Built once per forward on the host (one upload).
+    fn rope_table(
+        &self,
+        attention: &Qwen35FullAttention,
+        positions: &[[usize; 3]],
+        shape: (usize, usize),
+        dtype: DType,
+    ) -> Result<Option<Qwen35RopeTable>> {
+        let table = attention.rope_table(positions, shape, &self.device, dtype)?;
+        if table.is_some() {
+            self.telemetry.record_rope_host_upload();
+        }
+        Ok(table)
     }
 
     pub fn new_state(&self) -> Qwen35TextRuntimeState {
@@ -567,6 +600,8 @@ impl Qwen35TextModel {
         let execution = (|| -> Result<Tensor> {
             let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
             let mut hidden = self.token_embeddings.forward(&input)?;
+            let rope =
+                self.rope_table(first_full, position_ids, (batch_size, 1), hidden.dtype())?;
             let mut physical_layer = 0usize;
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 let mut layer_states = states
@@ -581,6 +616,7 @@ impl Qwen35TextModel {
                     &hidden,
                     &mut layer_states,
                     position_ids,
+                    rope.as_ref(),
                     &cache_refs,
                     lowered.as_ref(),
                     &metadata,
@@ -721,6 +757,7 @@ impl Qwen35TextModel {
             first_full.head_dim,
             first_full.head_dim,
         )?;
+        let rope = self.rope_table(first_full, position_ids, (1, sequence_len), input.dtype())?;
         let start_pos = cache.context_len();
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
         for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
@@ -735,6 +772,7 @@ impl Qwen35TextModel {
                 &hidden,
                 layer_state,
                 position_ids,
+                rope.as_ref(),
                 cache,
                 &mut prepared,
                 &mut physical_layer,
@@ -863,6 +901,7 @@ impl Qwen35Layer {
         hidden_states: &Tensor,
         state: &mut Qwen35LayerRuntimeState,
         position_ids: &[[usize; 3]],
+        rope: Option<&Qwen35RopeTable>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: &mut usize,
@@ -881,6 +920,7 @@ impl Qwen35Layer {
                 let output = mixer.forward_physical(
                     &normalized,
                     position_ids,
+                    rope,
                     cache,
                     prepared,
                     *physical_layer,
@@ -903,6 +943,7 @@ impl Qwen35Layer {
         hidden_states: &Tensor,
         states: &mut [&mut Qwen35LayerRuntimeState],
         position_ids: &[[usize; 3]],
+        rope: Option<&Qwen35RopeTable>,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -928,6 +969,7 @@ impl Qwen35Layer {
                 let output = mixer.forward_physical_decode_batch(
                     &normalized,
                     position_ids,
+                    rope,
                     caches,
                     slots,
                     metadata,
@@ -1023,6 +1065,7 @@ impl Qwen35FullAttention {
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],
+        rope: Option<&Qwen35RopeTable>,
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         physical_layer: usize,
@@ -1061,11 +1104,11 @@ impl Qwen35FullAttention {
         ))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
-        let (query_states, key_states) = if seq_len == 1 {
-            self.apply_rope(&query_states, &key_states, position_ids[0])?
-        } else {
-            self.apply_rope_sequence(&query_states, &key_states, position_ids)?
-        };
+        let (query_states, key_states) = self.apply_rope(
+            &query_states,
+            &key_states,
+            rope.map(|table| (&table.cos, &table.sin)),
+        )?;
         let queries = query_states
             .reshape((seq_len, self.num_heads, self.head_dim))?
             .contiguous()?;
@@ -1100,6 +1143,7 @@ impl Qwen35FullAttention {
         &self,
         hidden_states: &Tensor,
         position_ids: &[[usize; 3]],
+        rope: Option<&Qwen35RopeTable>,
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -1163,7 +1207,19 @@ impl Qwen35FullAttention {
         for row in 0..batch_size {
             let q_row = query_states.i(row)?.unsqueeze(0)?;
             let k_row = key_states.i(row)?.unsqueeze(0)?;
-            let (q_row, k_row) = self.apply_rope(&q_row, &k_row, position_ids[row])?;
+            let row_rope = rope
+                .map(|table| -> Result<(Tensor, Tensor)> {
+                    Ok((
+                        table.cos.narrow(0, row, 1)?.contiguous()?,
+                        table.sin.narrow(0, row, 1)?.contiguous()?,
+                    ))
+                })
+                .transpose()?;
+            let (q_row, k_row) = self.apply_rope(
+                &q_row,
+                &k_row,
+                row_rope.as_ref().map(|(cos, sin)| (cos, sin)),
+            )?;
             queries.push(q_row.reshape((self.num_heads, self.head_dim))?);
             keys.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
             values.push(
@@ -1213,111 +1269,55 @@ impl Qwen35FullAttention {
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
+    /// Rotate the leading `rope_dim` channels of `query_states` and
+    /// `key_states` (`[batch, tokens, heads, head_dim]`) with a prebuilt
+    /// `(batch, tokens, rope_dim / 2)` cos/sin table. `None` means no rotary
+    /// dimensions.
     fn apply_rope(
         &self,
         query_states: &Tensor,
         key_states: &Tensor,
-        position_ids: [usize; 3],
+        rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<(Tensor, Tensor)> {
-        if self.rope_dim == 0 {
+        let Some((cos, sin)) = rope.filter(|_| self.rope_dim != 0) else {
             return Ok((query_states.clone(), key_states.clone()));
-        }
-        let (cos, sin) = self.mrope(position_ids, query_states.device(), query_states.dtype())?;
-
-        let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
-        let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
-        let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
-            match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
-                Some((query_rot, key_rot)) => {
-                    record_rope_kernel();
-                    (query_rot, key_rot)
-                }
-                None => {
-                    record_rope_manual();
-                    (
-                        apply_rotary_emb(&query_rot, &cos, &sin)?,
-                        apply_rotary_emb(&key_rot, &cos, &sin)?,
-                    )
-                }
-            }
-        } else {
-            record_rope_manual();
-            (
-                apply_rotary_emb(&query_rot, &cos, &sin)?,
-                apply_rotary_emb(&key_rot, &cos, &sin)?,
-            )
         };
-
-        if self.rope_dim == self.head_dim {
-            return Ok((query_rot, key_rot));
-        }
-
-        let query_pass = query_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
-        let key_pass = key_states.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
-        Ok((
-            Tensor::cat(&[&query_rot, &query_pass], 3)?,
-            Tensor::cat(&[&key_rot, &key_pass], 3)?,
-        ))
-    }
-
-    fn apply_rope_sequence(
-        &self,
-        query_states: &Tensor,
-        key_states: &Tensor,
-        position_ids: &[[usize; 3]],
-    ) -> Result<(Tensor, Tensor)> {
-        let seq_len = query_states.dim(1)?;
-        if seq_len != position_ids.len() {
+        let tokens = query_states.dim(1)?;
+        if cos.dims() != [query_states.dim(0)?, tokens, self.rope_dim / 2] {
             return Err(Error::InvalidInput(format!(
-                "Qwen3.5 rotary sequence mismatch: seq_len={}, position_ids={}",
-                seq_len,
-                position_ids.len()
+                "Qwen3.5 rotary table {:?} does not match queries {:?}",
+                cos.dims(),
+                query_states.dims()
             )));
         }
-        if self.rope_dim == 0 {
-            return Ok((query_states.clone(), key_states.clone()));
-        }
-
-        let mut cos_tokens = Vec::with_capacity(seq_len);
-        let mut sin_tokens = Vec::with_capacity(seq_len);
-        for &position_id in position_ids {
-            let (cos, sin) =
-                self.mrope(position_id, query_states.device(), query_states.dtype())?;
-            cos_tokens.push(cos);
-            sin_tokens.push(sin);
-        }
-        let cos_refs: Vec<&Tensor> = cos_tokens.iter().collect();
-        let sin_refs: Vec<&Tensor> = sin_tokens.iter().collect();
-        let cos = Tensor::cat(&cos_refs, 1)?.contiguous()?;
-        let sin = Tensor::cat(&sin_refs, 1)?.contiguous()?;
 
         let query_rot = query_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let key_rot = key_states.narrow(3, 0, self.rope_dim)?.contiguous()?;
         let (query_rot, key_rot) = if self.should_try_rope_kernel(query_states.dtype()) {
-            match try_apply_rope_thd(&query_rot, &key_rot, &cos, &sin)? {
+            match try_apply_rope_thd(&query_rot, &key_rot, cos, sin)? {
                 Some((query_rot, key_rot)) => {
-                    for _ in 0..seq_len {
+                    for _ in 0..tokens {
                         record_rope_kernel();
                     }
                     (query_rot, key_rot)
                 }
                 None => {
-                    for _ in 0..seq_len {
+                    for _ in 0..tokens {
                         record_rope_manual();
                     }
                     (
-                        apply_rotary_emb(&query_rot, &cos, &sin)?,
-                        apply_rotary_emb(&key_rot, &cos, &sin)?,
+                        apply_rotary_emb(&query_rot, cos, sin)?,
+                        apply_rotary_emb(&key_rot, cos, sin)?,
                     )
                 }
             }
         } else {
-            for _ in 0..seq_len {
+            for _ in 0..tokens {
                 record_rope_manual();
             }
             (
-                apply_rotary_emb(&query_rot, &cos, &sin)?,
-                apply_rotary_emb(&key_rot, &cos, &sin)?,
+                apply_rotary_emb(&query_rot, cos, sin)?,
+                apply_rotary_emb(&key_rot, cos, sin)?,
             )
         };
 
@@ -1333,20 +1333,28 @@ impl Qwen35FullAttention {
         ))
     }
 
-    fn mrope(
+    /// Host-built cos/sin table for `positions`, row-major over `shape`
+    /// (`rows * tokens == positions.len()`); `None` without rotary dims.
+    fn rope_table(
         &self,
-        position_ids: [usize; 3],
+        positions: &[[usize; 3]],
+        shape: (usize, usize),
         device: &Device,
         dtype: DType,
-    ) -> Result<(Tensor, Tensor)> {
-        build_mrope(
+    ) -> Result<Option<Qwen35RopeTable>> {
+        if self.rope_dim == 0 {
+            return Ok(None);
+        }
+        let (cos, sin) = build_mrope_table(
             self.rope_dim,
-            position_ids,
+            positions,
+            shape,
             &self.mrope_sections,
             &self.rope_inv_freqs,
             device,
             dtype,
-        )
+        )?;
+        Ok(Some(Qwen35RopeTable { cos, sin }))
     }
 
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {
@@ -1958,14 +1966,15 @@ fn pre_slice_conv_kernel(conv_kernel: &Tensor, kernel_size: usize) -> Result<Vec
     Ok(slices)
 }
 
-fn build_mrope(
+/// Interleaved M-RoPE angles for one position. Each angle is the F32
+/// product `position * inv_freq`, as in HF (`inv_freq` and positions in
+/// fp32), so the rounding matches the reference implementation.
+fn mrope_angles(
     rope_dim: usize,
     position_ids: [usize; 3],
     mrope_sections: &[usize],
     inv_freqs: &[f32],
-    device: &Device,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Vec<f32>> {
     let half_dim = rope_dim / 2;
     if inv_freqs.len() != half_dim {
         return Err(Error::InferenceError(format!(
@@ -2001,9 +2010,50 @@ fn build_mrope(
             }
         }
     }
+    Ok(interleaved)
+}
 
-    let emb = Tensor::from_vec(interleaved, (1, 1, half_dim), device)?.to_dtype(dtype)?;
-    Ok((emb.cos()?, emb.sin()?))
+/// Cos/sin tables `(rows, tokens, rope_dim / 2)` for row-major `positions`.
+///
+/// Built on the host and uploaded in one copy: every full-attention layer
+/// of a forward shares one table, instead of each layer (and, in prefill,
+/// each token) building its own on the device. Cos/sin of the F32 angle are
+/// taken in F64, because Candle compiles its Metal kernels with fast math
+/// (errors near 1e-2 at long positions).
+fn build_mrope_table(
+    rope_dim: usize,
+    positions: &[[usize; 3]],
+    (rows, tokens): (usize, usize),
+    mrope_sections: &[usize],
+    inv_freqs: &[f32],
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let half_dim = rope_dim / 2;
+    if rows.checked_mul(tokens) != Some(positions.len()) || positions.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3.5 rotary table shape ({rows}, {tokens}) does not cover {} positions",
+            positions.len()
+        )));
+    }
+    let table_len = positions.len() * half_dim;
+    let mut values = vec![0f32; table_len * 2];
+    let (cos_values, sin_values) = values.split_at_mut(table_len);
+    for (index, position_ids) in positions.iter().enumerate() {
+        let angles = mrope_angles(rope_dim, *position_ids, mrope_sections, inv_freqs)?;
+        let row = index * half_dim..(index + 1) * half_dim;
+        for ((cos, sin), angle) in cos_values[row.clone()]
+            .iter_mut()
+            .zip(&mut sin_values[row])
+            .zip(angles)
+        {
+            let (angle_sin, angle_cos) = f64::from(angle).sin_cos();
+            *cos = angle_cos as f32;
+            *sin = angle_sin as f32;
+        }
+    }
+    let table = Tensor::from_vec(values, (2, rows, tokens, half_dim), device)?.to_dtype(dtype)?;
+    Ok((table.get(0)?, table.get(1)?))
 }
 
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -2319,10 +2369,10 @@ fn recurrent_gated_delta(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotary_emb, build_mrope, convolution_domain_v2, non_finite_counts, owned_zero_tensor,
-        qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states, repeat_head_states_seq,
-        softplus, ConvRingState, Qwen35GatedRmsNorm, Qwen35LayerRuntimeState,
-        Qwen35LinearAttention, Qwen35TextRuntimeState,
+        apply_rotary_emb, build_mrope_table, convolution_domain_v2, non_finite_counts,
+        owned_zero_tensor, qwen35_rope_kernel_policy, recurrent_domain_v2, repeat_head_states,
+        repeat_head_states_seq, softplus, ConvRingState, Qwen35GatedRmsNorm,
+        Qwen35LayerRuntimeState, Qwen35LinearAttention, Qwen35TextRuntimeState,
     };
     use crate::models::architectures::qwen35::cache::{
         CONVOLUTION_STATE_DOMAIN, RECURRENT_STATE_DOMAIN,
@@ -2678,9 +2728,10 @@ mod tests {
 
     #[test]
     fn build_mrope_uses_half_dim_layout_and_sections() {
-        let (cos, sin) = build_mrope(
+        let (cos, sin) = build_mrope_table(
             12,
-            [3, 5, 7],
+            &[[3, 5, 7]],
+            (1, 1),
             &[2, 2, 2],
             &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             &Device::Cpu,
@@ -2697,6 +2748,88 @@ mod tests {
         for (idx, expected_theta) in expected.iter().enumerate() {
             assert!((cos_vals[0][0][idx] - expected_theta.cos()).abs() < 1e-5);
             assert!((sin_vals[0][0][idx] - expected_theta.sin()).abs() < 1e-5);
+        }
+    }
+
+    /// The table holds cos/sin of each F32 angle `position * inv_freq`
+    /// (the HF rounding), evaluated in F64, in row-major position order.
+    #[test]
+    fn rope_table_rows_follow_positions_and_round_like_hf() {
+        let inv_freqs = super::build_rope_inv_freqs(64, 10_000_000.0).expect("inv freqs");
+        let positions = [[0usize; 3], [7; 3], [4_096; 3], [262_143; 3]];
+        for shape in [(4, 1), (1, 4)] {
+            let (cos, sin) = build_mrope_table(
+                64,
+                &positions,
+                shape,
+                &[11, 11, 10],
+                &inv_freqs,
+                &Device::Cpu,
+                DType::F32,
+            )
+            .expect("table");
+            assert_eq!(cos.dims(), &[shape.0, shape.1, 32]);
+            assert_eq!(sin.dims(), &[shape.0, shape.1, 32]);
+            let cos = cos.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let sin = sin.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (row, position) in positions.iter().enumerate() {
+                for (index, inv_freq) in inv_freqs.iter().enumerate() {
+                    let angle = f64::from(position[0] as f32 * inv_freq);
+                    assert_eq!(cos[row * 32 + index], angle.cos() as f32, "{row}/{index}");
+                    assert_eq!(sin[row * 32 + index], angle.sin() as f32, "{row}/{index}");
+                }
+            }
+        }
+    }
+
+    /// At short positions the host table agrees with the device-built F32
+    /// cos/sin it replaces to within float rounding.
+    #[test]
+    fn rope_table_matches_the_device_built_f32_values() {
+        let inv_freqs = super::build_rope_inv_freqs(64, 10_000_000.0).expect("inv freqs");
+        let positions = (0..48).map(|position| [position; 3]).collect::<Vec<_>>();
+        let (cos, sin) = build_mrope_table(
+            64,
+            &positions,
+            (1, positions.len()),
+            &[11, 11, 10],
+            &inv_freqs,
+            &Device::Cpu,
+            DType::F32,
+        )
+        .expect("table");
+        let angles = positions
+            .iter()
+            .flat_map(|position| inv_freqs.iter().map(move |inv| position[0] as f32 * inv))
+            .collect::<Vec<_>>();
+        let device_angles =
+            Tensor::from_vec(angles, (1, positions.len(), 32), &Device::Cpu).unwrap();
+        for (table, reference) in [
+            (cos, device_angles.cos().unwrap()),
+            (sin, device_angles.sin().unwrap()),
+        ] {
+            let table = table.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let reference = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (value, expected) in table.iter().zip(&reference) {
+                assert!((value - expected).abs() <= 2e-7, "{value} vs {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn rope_table_rejects_a_shape_that_does_not_cover_the_positions() {
+        let inv_freqs = super::build_rope_inv_freqs(64, 10_000_000.0).expect("inv freqs");
+        for (positions, shape) in [(vec![[1usize; 3]; 3], (2, 1)), (Vec::new(), (0, 1))] {
+            assert!(build_mrope_table(
+                64,
+                &positions,
+                shape,
+                &[11, 11, 10],
+                &inv_freqs,
+                &Device::Cpu,
+                DType::F32,
+            )
+            .is_err());
         }
     }
 

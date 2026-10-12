@@ -2,6 +2,7 @@
 
 pub(crate) mod cache;
 pub mod chat;
+pub(crate) mod telemetry;
 pub(crate) mod text;
 mod vision;
 

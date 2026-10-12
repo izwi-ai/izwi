@@ -157,6 +157,18 @@ pub fn record_host_read(dtype: candle_core::DType, elements: usize) {
     HOST_READ_OPS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let bytes = elements.saturating_mul(dtype.size_in_bytes()) as u64;
     HOST_READ_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    THREAD_HOST_READ_OPS.with(|reads| reads.set(reads.get().wrapping_add(1)));
+}
+
+thread_local! {
+    static THREAD_HOST_READ_OPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Host reads recorded on the calling thread so far. The difference between
+/// two calls on one thread counts the reads of a synchronous section (for
+/// example, sampling one token) without counting other threads or models.
+pub fn thread_host_reads() -> u64 {
+    THREAD_HOST_READ_OPS.with(std::cell::Cell::get)
 }
 
 pub fn record_dtype_cast() {

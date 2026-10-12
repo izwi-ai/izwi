@@ -6154,6 +6154,7 @@ impl ModelRegistry {
                     Some(model.supports_incremental_decode()),
                     None,
                     match model.as_ref() {
+                        NativeChatModel::Qwen35(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen36Moe(model) => Some(model.runtime_diagnostics()),
                         _ => None,

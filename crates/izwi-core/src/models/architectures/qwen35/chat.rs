@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
@@ -26,10 +27,12 @@ use crate::models::shared::sampling::{
     bounded_device_sampling_candidates_with_history, device_candidates_cover_top_p,
     sample_device_candidates, PenaltyHistory,
 };
+use crate::models::shared::telemetry::{record_host_read, thread_host_reads};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen35_composite_cache_contract;
+use super::telemetry::{Qwen35Telemetry, SamplerPath};
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
@@ -185,6 +188,8 @@ pub struct ChatDecodeState {
     /// DS9.2: per-request constrained-decoding runtime, present only when
     /// the request asked for `response_format: json_object`.
     grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
+    /// The loaded model's decode counters.
+    telemetry: Arc<Qwen35Telemetry>,
 }
 
 impl ChatDecodeState {
@@ -285,11 +290,13 @@ impl ChatDecodeState {
         transaction: u64,
     ) -> Result<()> {
         let target_cursor = self.physical_kv.context_len() as u64;
-        self.text_state.stage_tensor_domains(
+        let conv_ring_stacks = self.text_state.stage_tensor_domains(
             arena,
             PhysicalStateTransactionId::new(transaction)?,
             target_cursor,
-        )
+        )?;
+        self.telemetry.record_conv_ring_stacks(conv_ring_stacks);
+        Ok(())
     }
 }
 
@@ -721,6 +728,7 @@ impl Qwen35ChatExec {
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
             grammar: self.grammar_runtime(config),
+            telemetry: self.text_model.telemetry().clone(),
         })
     }
 
@@ -863,6 +871,7 @@ impl Qwen35ChatExec {
             )?);
             state.next_text_position += 1;
             input_tokens_committed = 1;
+            state.telemetry.record_solo_decode_step();
         }
 
         let history = penalty_history(
@@ -877,14 +886,16 @@ impl Qwen35ChatExec {
                     "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
                 )
             })?;
-            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token_with_history(
+            let reads_before = thread_host_reads();
+            let (token, raw_logprobs, path) = if let Some(grammar) = state.grammar.as_mut() {
+                let (token, raw_logprobs) = grammar.sample_token_with_history(
                     &output,
                     self.tokenizer.vocab_size,
                     &state.config,
                     history,
                     &mut state.rng,
-                )?
+                )?;
+                (token, raw_logprobs, SamplerPath::Grammar)
             } else {
                 sample_next_token_with_logprobs(
                     &output,
@@ -894,6 +905,9 @@ impl Qwen35ChatExec {
                     &mut state.rng,
                 )?
             };
+            state
+                .telemetry
+                .record_sample(path, thread_host_reads().wrapping_sub(reads_before));
             if let Some(raw) = raw_logprobs {
                 let entry = crate::models::shared::sampling::resolve_token_logprob(
                     &self.tokenizer.inner,
@@ -987,6 +1001,9 @@ impl Qwen35ChatExec {
         )?;
         drop(text_states);
         drop(caches);
+        if let Some(state) = states.first() {
+            state.telemetry.record_batched_decode_step(states.len());
+        }
 
         let mut sampled = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
@@ -997,14 +1014,16 @@ impl Qwen35ChatExec {
             );
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
-            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token_with_history(
+            let reads_before = thread_host_reads();
+            let (token, raw_logprobs, path) = if let Some(grammar) = state.grammar.as_mut() {
+                let (token, raw_logprobs) = grammar.sample_token_with_history(
                     &row_logits,
                     self.tokenizer.vocab_size,
                     &state.config,
                     history,
                     &mut state.rng,
-                )?
+                )?;
+                (token, raw_logprobs, SamplerPath::Grammar)
             } else {
                 sample_next_token_with_logprobs(
                     &row_logits,
@@ -1014,6 +1033,9 @@ impl Qwen35ChatExec {
                     &mut state.rng,
                 )?
             };
+            state
+                .telemetry
+                .record_sample(path, thread_host_reads().wrapping_sub(reads_before));
             let entry = raw_logprobs
                 .map(|raw| {
                     crate::models::shared::sampling::resolve_token_logprob(
@@ -1242,6 +1264,28 @@ impl Qwen35ChatModel {
 
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
+    }
+
+    /// Serving diagnostics for the admin model API: device, storage and
+    /// scheduling preferences, and cumulative decode counters.
+    pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        let kv_dtype = match self.device_kind {
+            BackendKind::Cuda => DType::F16,
+            BackendKind::Cpu | BackendKind::Metal => DType::F32,
+        };
+        serde_json::json!({
+            "family": "qwen35_chat",
+            "device": self.device_kind.as_str(),
+            "compute_dtype": "F32",
+            "kv_dtype": format!("{kv_dtype:?}"),
+            "scheduling": {
+                "preferred_prefill_tokens": self.preferred_prefill_tokens(),
+                "prefill_chunk_tokens": qwen35_prefill_chunk_size(),
+                "preferred_decode_tokens": 1,
+                "sustained_decode_quantum": false,
+            },
+            "counters": self.exec.text_model.telemetry().snapshot(),
+        })
     }
 
     pub(crate) fn start_decode_state_physical(
@@ -1854,7 +1898,8 @@ fn take_quantum_sample(
 }
 
 /// DS9.3: sample a token and, when the request asked for logprobs, resolve
-/// the raw-distribution stats on host. Sampling math is unchanged.
+/// the raw-distribution stats on host. Sampling math is unchanged. Also
+/// returns the sampler path that chose the token.
 fn sample_next_token_with_logprobs(
     logits: &Tensor,
     vocab_size: usize,
@@ -1864,10 +1909,11 @@ fn sample_next_token_with_logprobs(
 ) -> Result<(
     u32,
     Option<crate::models::shared::sampling::RawTokenLogprobs>,
+    SamplerPath,
 )> {
     if !config.logprobs {
-        let token = sample_next_token(logits, vocab_size, config, history, rng)?;
-        return Ok((token, None));
+        let (token, path) = sample_next_token_traced(logits, vocab_size, config, history, rng)?;
+        return Ok((token, None, path));
     }
     let raw_values = logits_to_vec(logits)?;
     let mut values = raw_values.clone();
@@ -1879,7 +1925,7 @@ fn sample_next_token_with_logprobs(
     }
     let (logsumexp, top) =
         crate::models::shared::sampling::raw_logprobs_stats(&values, config.top_logprobs)?;
-    let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+    let (token, path) = sample_next_token_traced(logits, vocab_size, config, history, rng)?;
     let chosen_raw = raw_values
         .get(token as usize)
         .copied()
@@ -1896,6 +1942,7 @@ fn sample_next_token_with_logprobs(
             logprob: chosen_raw - logsumexp,
             top,
         }),
+        path,
     ))
 }
 
@@ -1906,6 +1953,17 @@ fn sample_next_token(
     history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
+    sample_next_token_traced(logits, vocab_size, config, history, rng).map(|(token, _)| token)
+}
+
+/// [`sample_next_token`] plus the sampler path that chose the token.
+fn sample_next_token_traced(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: PenaltyHistory<'_>,
+    rng: &mut SimpleRng,
+) -> Result<(u32, SamplerPath)> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
             "Qwen3.5 sampler received vocab_size=0".to_string(),
@@ -1920,7 +1978,7 @@ fn sample_next_token(
         && config.top_k == 0
         && config.top_p >= 1.0;
     if deterministic_greedy {
-        return argmax_clamped(logits, vocab_size);
+        return argmax_clamped(logits, vocab_size).map(|token| (token, SamplerPath::Greedy));
     }
 
     if let Some(candidates) = bounded_device_sampling_candidates_with_history(
@@ -1937,11 +1995,23 @@ fn sample_next_token(
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
-                return Ok(sampled);
+                return Ok((sampled, SamplerPath::Device));
             }
         }
     }
 
+    sample_on_host(logits, vocab_size, config, history, rng).map(|token| (token, SamplerPath::Host))
+}
+
+/// Exact host sampling over the full logits row: penalties, temperature,
+/// top-k, top-p, then the draw.
+fn sample_on_host(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: PenaltyHistory<'_>,
+    rng: &mut SimpleRng,
+) -> Result<u32> {
     let mut values = logits_to_vec(logits)?;
     truncate_logits_to_vocab(&mut values, vocab_size);
 
@@ -2085,10 +2155,9 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         }
     };
 
-    logits
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()
-        .map_err(Error::from)
+    let values = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, values.len());
+    Ok(values)
 }
 
 fn truncate_logits_to_vocab(values: &mut Vec<f32>, vocab_size: usize) {
@@ -2159,9 +2228,9 @@ fn argmax(logits: &Tensor) -> Result<u32> {
     } else {
         idx.squeeze(0)?
     };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
+    let selected = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
+    record_host_read(DType::U32, 1);
+    Ok(selected)
 }
 
 fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
@@ -2201,6 +2270,7 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
         .i(selected as usize)?
         .to_dtype(DType::F32)?
         .to_scalar::<f32>()?;
+    record_host_read(DType::F32, 1);
     if selected_logit.is_finite() {
         return Ok(selected);
     }
@@ -2210,6 +2280,7 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     // finite candidate when one exists and otherwise returns useful counts for
     // the exact in-vocabulary row in every sampling mode.
     let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, values.len());
     argmax_values(&values)
 }
 
@@ -2911,3 +2982,7 @@ mod tests {
         assert_eq!(next_text_position, 4);
     }
 }
+
+#[cfg(test)]
+#[path = "chat_trace_tests.rs"]
+mod trace_tests;
