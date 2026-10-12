@@ -696,6 +696,15 @@ impl ManagedKvCacheManager {
         )
     }
 
+    /// Device memory the worker's resource authority reports in total.
+    pub(crate) fn device_capacity(&self) -> ResourceAmount {
+        self.resource_authority
+            .as_ref()
+            .map_or(ResourceAmount::Unknown, |authority| {
+                authority.snapshot().physical.capacity.device_bytes
+            })
+    }
+
     pub(crate) fn with_prefix_cache_salt(
         resource_authority: Option<Arc<ResourceAuthority>>,
         salt: Option<[u8; 32]>,

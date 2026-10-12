@@ -222,10 +222,27 @@ Temporary batch workspace pressure is also handled before model execution: the
 scheduler reduces batch width or resumable prefill size and retries the same
 request without repeating streamed output. Under persistent pressure it can
 suspend eligible Qwen3.8 requests. Progress from competing work keeps waiting
-requests eligible; repeated failures with no progress still return an explicit
-capacity error. Requests that cannot fit alone cannot be guaranteed to finish.
-Capacity diagnostics group pending reservations by owner class to distinguish
-model, request, and workspace promises from materialized memory.
+requests eligible; a request that is refused for 5 seconds with no progress
+anywhere returns an explicit capacity error. Requests that cannot fit alone
+cannot be guaranteed to finish. Capacity diagnostics group pending reservations
+by owner class to distinguish model, request, and workspace promises from
+materialized memory.
+
+When it sizes the KV cache at load, the CUDA server keeps part of the GPU free
+for memory that CUDA allocates later without a reservation: kernels and library
+workspaces loaded on first use, CUDA graphs, and per-step scratch. This reserve
+is the larger of 1 GiB and 3% of GPU memory (about 2.55 GB on an 80 GB H100). The
+load log line `Fitted CUDA resident state rows and context` reports it as
+`context_reserve_bytes`. `coordinator.untracked_device_memory_bytes` in
+`/v1/metrics` shows how much memory that reserve is covering. Compare it right
+after loading with its value after a few requests: if it grows by more than the
+reserve, set a larger reserve in bytes before restarting the server:
+
+```bash
+export IZWI_CUDA_CONTEXT_RESERVE_BYTES=4294967296
+```
+
+A larger reserve leaves less memory for the KV cache.
 
 For a controlled hardware acceptance run, use
 `scripts/bench/run-cuda-chat-concurrency.py` as documented in

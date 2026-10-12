@@ -1737,17 +1737,24 @@ impl ModelLifecycleController {
         // anything for it.
         let mut resource_plan = self.model_resource_plan(variant, &acquired.model_path)?;
         if let Some(floor) = self.cuda_state_floor(variant, &acquired.model_path)? {
+            let device_capacity = self
+                .coordinator
+                .resource_authority()
+                .snapshot()
+                .physical
+                .capacity
+                .device_bytes;
+            // The same reserve the context fit keeps after the weights load.
+            let safety_reserve_bytes = self
+                .core_engine
+                .config()
+                .cuda_context_reserve_bytes(device_capacity);
             resource_plan.load_authorization = admit_cuda_state_floor(
                 variant,
                 &resource_plan,
                 floor,
-                self.config.portable_context_reserve_bytes,
-                self.coordinator
-                    .resource_authority()
-                    .snapshot()
-                    .physical
-                    .capacity
-                    .device_bytes,
+                safety_reserve_bytes,
+                device_capacity,
             )?;
         }
         self.ensure_model_budget_before_load(variant, max_loaded_models)

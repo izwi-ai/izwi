@@ -5351,14 +5351,16 @@ impl EngineCore {
                     .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
                 let incremental = self.config.cuda_incremental_chat_enabled();
                 let automatic_rows = self.config.automatic_row_limits.retained_sequences;
+                let context_reserve_bytes = self
+                    .config
+                    .cuda_context_reserve_bytes(self.managed_kv_cache.device_capacity());
                 let fit = self
                     .managed_kv_cache
                     .fit_cuda_resident_logical_token_reach(
                         model_instance,
                         contract,
                         |rows| Self::cuda_pool_upper_bound(context, rows, incremental),
-                        self.config
-                            .portable_context_reserve_bytes
+                        context_reserve_bytes
                             .checked_add(decode_workspace_reserve_bytes)
                             .ok_or_else(|| {
                                 Error::ModelLoadError(
@@ -5381,6 +5383,8 @@ impl EngineCore {
                     per_sequence_state_bytes = fit.per_sequence_state_bytes,
                     resident_state_bytes = fit.resident_state_bytes,
                     logical_token_reach = fit.logical_token_reach,
+                    context_reserve_bytes,
+                    decode_workspace_reserve_bytes,
                     "Fitted CUDA resident state rows and context"
                 );
                 (
