@@ -31,6 +31,7 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::attention::physical::PhysicalPagedKvCheckpoint;
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 
+use super::super::layers::exact_gelu;
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
 use super::config::VoxtralConfig;
 use super::streaming::{
@@ -186,7 +187,15 @@ struct VoxtralRuntimeConfig {
     checkpoint_dtype: Option<DType>,
 }
 
+/// CPU and Metal encode a whole offline request with dense encoder
+/// attention, so they cap it at 1024 audio tokens: 975 after the 49 padding
+/// tokens, or 78 s of audio.
 const PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT: usize = 1024;
+
+/// Longest audio a pipeline should send in one offline invocation, such as
+/// one diarization chunk. 30 s is 424 audio tokens, well inside the portable
+/// cap, and matches the offline route's 30 s chunks.
+pub(crate) const VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT: f32 = 30.0;
 
 /// Longest realtime session when the checkpoint sets no `chunk_length_s`.
 /// The published streaming checkpoint leaves it null, as mistral_common
@@ -196,22 +205,29 @@ const PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT: usize = 1024;
 /// once the encoder runs incrementally.
 const VOXTRAL_REALTIME_DEFAULT_MAX_SESSION_SECONDS: f32 = 30.0;
 
+/// Audio tokens one offline request may decode. Audio past the limit is an
+/// error, never a silently truncated transcript.
 fn voxtral_realtime_offline_frame_limit(
     backend: BackendKind,
     audio_frames: usize,
     model_context_limit: usize,
 ) -> Result<usize> {
-    if backend != BackendKind::Cuda {
-        return Ok(audio_frames.min(PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT));
-    }
-    if model_context_limit == 0 {
-        return Err(Error::ModelLoadError(
-            "Voxtral Realtime reported a zero physical context".into(),
-        ));
-    }
-    if audio_frames > model_context_limit {
+    let (limit, bound) = if backend == BackendKind::Cuda {
+        if model_context_limit == 0 {
+            return Err(Error::ModelLoadError(
+                "Voxtral Realtime reported a zero physical context".into(),
+            ));
+        }
+        (model_context_limit, "loaded model context")
+    } else {
+        (
+            PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT,
+            "CPU/Metal offline limit",
+        )
+    };
+    if audio_frames > limit {
         return Err(Error::InvalidInput(format!(
-            "Voxtral Realtime produced {audio_frames} audio tokens, exceeding its {model_context_limit}-token loaded model context"
+            "Voxtral Realtime needs {audio_frames} audio tokens for this audio, exceeding its {limit}-token {bound}; split the audio into chunks of at most {VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT} s"
         )));
     }
     Ok(audio_frames)
@@ -1060,24 +1076,19 @@ impl VoxtralRealtimeModel {
             .language_model
             .physical_context_limit()
             .ok_or_else(|| Error::ModelLoadError("Voxtral has no attention window".into()))?;
-        if backend == BackendKind::Cuda {
-            let (left_pad, right_pad) = offline_streaming_padding_samples(
-                audio.len(),
-                self.layout.raw_audio_length_per_tok,
-                self.layout.left_pad_tokens,
-                self.layout.right_pad_tokens,
-            );
-            let predicted_audio_frames = left_pad
-                .checked_add(audio.len())
-                .and_then(|samples| samples.checked_add(right_pad))
-                .ok_or_else(|| Error::InvalidInput("Voxtral audio length overflow".into()))?
-                / self.layout.raw_audio_length_per_tok.max(1);
-            voxtral_realtime_offline_frame_limit(
-                backend,
-                predicted_audio_frames,
-                model_context_limit,
-            )?;
-        }
+        // Reject over-long audio before the encoder runs over all of it.
+        let (left_pad, right_pad) = offline_streaming_padding_samples(
+            audio.len(),
+            self.layout.raw_audio_length_per_tok,
+            self.layout.left_pad_tokens,
+            self.layout.right_pad_tokens,
+        );
+        let predicted_audio_frames = left_pad
+            .checked_add(audio.len())
+            .and_then(|samples| samples.checked_add(right_pad))
+            .ok_or_else(|| Error::InvalidInput("Voxtral audio length overflow".into()))?
+            / self.layout.raw_audio_length_per_tok.max(1);
+        voxtral_realtime_offline_frame_limit(backend, predicted_audio_frames, model_context_limit)?;
 
         let padded_audio = self.pad_offline_streaming_audio(&audio);
 
@@ -3524,24 +3535,9 @@ fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>)
     device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
 }
 
-/// GELU activation function
+/// Exact (erf) GELU, as HF and vLLM apply after each stem convolution.
 fn gelu(x: &Tensor) -> Result<Tensor> {
-    let coeff = 0.044715f32;
-    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-    let dtype = x.dtype();
-    let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-    let x3 = x_f32.powf(3.0)?;
-    let coeff_t = Tensor::from_vec(vec![coeff], (1,), x.device())?;
-    let x3 = x3.broadcast_mul(&coeff_t)?;
-    let sqrt_t = Tensor::from_vec(vec![sqrt_2_over_pi], (1,), x.device())?;
-    let inner = (&x_f32 + x3)?.broadcast_mul(&sqrt_t)?;
-    let tanh = inner.tanh()?;
-    let one = Tensor::from_vec(vec![1.0f32], (1,), x.device())?;
-    let half = Tensor::from_vec(vec![0.5f32], (1,), x.device())?;
-    let out = x_f32.broadcast_mul(&one.broadcast_add(&tanh)?)?;
-    let out = out.broadcast_mul(&half)?;
-    out.to_dtype(dtype)
-        .map_err(|e| Error::InferenceError(e.to_string()))
+    exact_gelu(x).map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -3570,6 +3566,7 @@ mod tests {
     use super::{
         append_generated_token, checked_delay_tokens, flush_generated_text, VoxtralRuntimeConfig,
     };
+    use super::{PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT, VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT};
 
     /// Published configs of mistralai/Voxtral-Mini-4B-Realtime-2602 at
     /// revision 2769294d: `params.json` and `config.json` verbatim, plus a
@@ -3764,12 +3761,18 @@ mod tests {
     }
 
     #[test]
-    fn portable_offline_frame_limit_is_unchanged() {
+    fn portable_offline_frame_cap_is_a_hard_error() {
         for backend in [BackendKind::Cpu, BackendKind::Metal] {
             assert_eq!(
-                voxtral_realtime_offline_frame_limit(backend, 8192, 8192).unwrap(),
+                voxtral_realtime_offline_frame_limit(backend, 1024, 8192).unwrap(),
                 1024
             );
+            for frames in [1025, 8192] {
+                let error = voxtral_realtime_offline_frame_limit(backend, frames, 8192)
+                    .expect_err("audio past the portable cap must not be truncated");
+                assert!(matches!(error, crate::error::Error::InvalidInput(_)));
+                assert!(format!("{error}").contains("1024-token CPU/Metal offline limit"));
+            }
         }
     }
 
@@ -4147,5 +4150,24 @@ mod tests {
         assert_eq!(flushed, "\u{FFFD}");
         assert_eq!(assembled, "你\u{FFFD}");
         assert_eq!(deltas, ["你", "\u{FFFD}"]);
+    }
+
+    #[test]
+    fn offline_audio_hint_fits_the_portable_frame_cap() {
+        let (_, _, layout) = published_realtime_layout();
+        let frames = |seconds: f32| {
+            realtime_preparation_geometry_for(
+                (seconds * 16_000.0) as usize,
+                16_000,
+                &layout,
+                VoxtralRealtimePreparationMode::Finish,
+            )
+            .unwrap()
+            .pooled_frames
+        };
+        assert_eq!(frames(VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT), 424);
+        // At 12.5 Hz the 1024-token cap is reached at 78 s of audio.
+        assert_eq!(frames(78.0), PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
+        assert!(frames(78.1) > PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
     }
 }

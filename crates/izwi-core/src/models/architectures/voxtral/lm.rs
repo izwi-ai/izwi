@@ -26,7 +26,7 @@ use crate::models::architectures::qwen3::core::{
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 
-use super::layers::linear_forward_last_dim;
+use super::layers::{exact_gelu, linear_forward_last_dim};
 
 const EMBEDDING_WEIGHT_CANDIDATES: &[&str] = &[
     "embed_tokens.weight",
@@ -975,7 +975,7 @@ impl VoxtralAdaRmsNorm {
     }
 
     fn forward(&self, t_cond: &Tensor) -> Result<Tensor> {
-        let hidden = self.down.forward(t_cond)?.gelu()?;
+        let hidden = exact_gelu(&self.down.forward(t_cond)?)?;
         self.up.forward(&hidden).map_err(Error::from)
     }
 }
@@ -1501,6 +1501,37 @@ mod tests {
         let out = ada.forward(&t_cond).unwrap();
 
         assert_eq!(out.dims(), &[1, 4]);
+    }
+
+    #[test]
+    fn voxtral_ada_rms_norm_uses_exact_gelu() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_cfg();
+        cfg.ada_rms_norm_t_cond = true;
+        cfg.ada_rms_norm_t_cond_dim = 1;
+        // down reads t_cond[0]; up copies the activated value to every lane.
+        let down = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 0.0], (1, 4), &device).unwrap();
+        let up = Tensor::ones((4, 1), DType::F32, &device).unwrap();
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([
+                ("layers.0.ada_rms_norm_t_cond.0.weight".to_string(), down),
+                ("layers.0.ada_rms_norm_t_cond.2.weight".to_string(), up),
+            ]),
+            DType::F32,
+            &device,
+        );
+        let ada = VoxtralAdaRmsNorm::load(&cfg, vb.pp("layers.0"))
+            .unwrap()
+            .unwrap();
+        let t_cond = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 0.0], (1, 4), &device).unwrap();
+
+        let out = ada.forward(&t_cond).unwrap().to_vec2::<f32>().unwrap();
+
+        // HF applies exact GELU inside Ada-norm: gelu_erf(1) = 0.8413447,
+        // where the tanh approximation gives 0.8411920.
+        for value in &out[0] {
+            assert!((f64::from(*value) - 0.841_344_746).abs() < 1e-6, "{value}");
+        }
     }
 
     #[test]
