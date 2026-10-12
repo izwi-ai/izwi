@@ -206,7 +206,7 @@ impl Config {
                 enable_prefix_caching: Some(defaults.enable_prefix_caching),
                 prefix_reuse_catalog_auto: Some(defaults.prefix_reuse_catalog_auto),
                 managed_prefix_cache_salt: defaults.managed_prefix_cache_salt.clone(),
-                max_prefix_cache_pages: Some(defaults.max_prefix_cache_pages),
+                max_prefix_cache_pages: defaults.max_prefix_cache_pages,
                 enable_chunked_prefill: Some(defaults.enable_chunked_prefill),
                 chunked_prefill_threshold: Some(defaults.chunked_prefill_threshold),
                 max_retained_sequences: Some(defaults.max_retained_sequences),

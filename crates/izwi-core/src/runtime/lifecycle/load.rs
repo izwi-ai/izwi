@@ -1480,7 +1480,7 @@ impl ModelLifecycleController {
         // The fit reserves the prefix snapshot budget beside the rows when
         // the model shares hybrid prefixes (see `prefix_snapshot_rows_for`).
         let snapshot_rows = if engine.enable_prefix_caching
-            && engine.max_prefix_cache_pages > 0
+            && engine.prefix_cache_pages_or_default() > 0
             && crate::catalog::prefix_reuse_engages(
                 variant,
                 BackendKind::Cuda,

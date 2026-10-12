@@ -487,7 +487,7 @@ All engine parameters are centralised in `EngineCoreConfig` (`engine/config.rs`)
 | `max_blocks` | `usize` | 1024 | Aggregate physical page capacity |
 | `enable_prefix_caching` | `bool` | `false` | Opt in to committed prefix reuse |
 | `managed_prefix_cache_salt` | `Option<String>` | `None` | Required isolation namespace when prefix reuse is enabled |
-| `max_prefix_cache_pages` | `usize` | 128 | Prefix page bound, clamped to preserve request capacity |
+| `max_prefix_cache_pages` | `Option<usize>` | `None` | Prefix page bound, clamped to preserve request capacity; `None` is 128 pages, or a quarter of a CUDA KV arena allocated in full at load |
 | `enable_chunked_prefill` | `bool` | `false` | Split long prefills across scheduler steps |
 | `chunked_prefill_threshold` | `usize` | 192 | Prompt threshold for chunked prefill |
 | `backend` | `enum` | `auto` | Backend preference (`auto`, `cpu`, `metal`, `cuda`) |

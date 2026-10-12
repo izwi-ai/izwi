@@ -29,9 +29,12 @@ An explicit current configuration looks like:
   "kv_page_size": 64,
   "enable_prefix_caching": false,
   "managed_prefix_cache_salt": null,
-  "max_prefix_cache_pages": 128
+  "max_prefix_cache_pages": null
 }
 ```
+
+A `null` (or omitted) `max_prefix_cache_pages` is automatic; see
+[Prefix isolation and capacity](#prefix-isolation-and-capacity).
 
 The public `EngineCoreConfig` uses the equivalent field name `block_size`.
 Both public configuration surfaces default to 64. Environment-based backend
@@ -95,14 +98,14 @@ The server engages prefix reuse in catalog-auto mode by default: a model
 shares prefixes on the backends where its catalog cell is supported (see the
 [support matrix](/support-matrix)), under a per-process namespace unless you
 set one. `IZWI_ENABLE_PREFIX_CACHING=0` (or `IZWI_PREFIX_REUSE_AUTO=0`) turns it
-off for every model. To enable it explicitly for every model instead, set all
-three fields:
+off for every model. To enable it explicitly for every model instead, set the
+first two fields; the page budget is optional:
 
 ```json
 {
   "enable_prefix_caching": true,
   "managed_prefix_cache_salt": "production/tenant-42",
-  "max_prefix_cache_pages": 128
+  "max_prefix_cache_pages": 4096
 }
 ```
 
@@ -129,14 +132,33 @@ Capacity is measured in physical pages. The effective prefix bound is the
 smaller of `max_prefix_cache_pages` and the pages left after reserving one
 `max_sequence_length` request. A chat turn can only attach history whose
 whole page chain is still indexed, so a conversation longer than the page
-budget (the default 128 pages of 64 tokens is 8,192 tokens) stops reusing
-its history. On CUDA, retained pages live inside the KV arena fitted and
-reserved at load and are evicted when a request needs them, so a deployment
-serving long chats can raise the budget without reserving more memory, for
-example `IZWI_MAX_PREFIX_CACHE_PAGES=4096` (one 262,144-token conversation).
-CPU and Metal clamp the budget to the 1,024-page baseline minus one
-maximum-length request. Watch these runtime fields:
+budget stops reusing its history.
 
+When `max_prefix_cache_pages` is not set, the budget is automatic: 128 pages
+of 64 tokens (8,192 tokens) on CPU and Metal, and per model on CUDA. A model
+whose CUDA KV arena is allocated in full at load (Qwen3.8 and Qwen3.6) gets a
+quarter of that arena, never less than 128 pages: about 2,400 pages (over
+150,000 tokens of history) for Qwen3.8 on an 80 GB H100. Those pages occupy
+memory that is already allocated, and a request that needs pages held only
+by the prefix index evicts them, least recently used first, so the larger
+budget never holds a request back. Other CUDA models keep 128 pages.
+
+An explicit value, from the config file or `IZWI_MAX_PREFIX_CACHE_PAGES`,
+applies to every model as set (startup rejects `0` while prefix reuse is on;
+turn reuse off with `IZWI_ENABLE_PREFIX_CACHING=0` instead). CUDA keeps it
+unclamped, for example `IZWI_MAX_PREFIX_CACHE_PAGES=4096` (one 262,144-token
+conversation). CPU and Metal clamp it to the 1,024-page baseline minus one
+maximum-length request. Config files that `izwi config edit` created before
+the automatic budget existed contain `max_prefix_cache_pages = 128`; delete
+that line to use the automatic budget.
+
+`runtime.kv_cache_policy` reports the configured budget, or the 128-page
+floor when it is automatic; each model's effective budget is
+`models[].arenas[].prefix_capacity_pages` in the runtime KV snapshot. Watch
+these runtime fields:
+
+- `models[].arenas[].prefix_capacity_pages`, the effective prefix page
+  budget of each arena;
 - `counters.prefix_hits`, `prefix_misses`, `prefix_evictions`,
   `prefix_copy_on_write_pages`, `prefix_rejections`, and
   `prefix_retained_pages`;

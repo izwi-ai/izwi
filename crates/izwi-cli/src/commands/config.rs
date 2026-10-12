@@ -100,6 +100,14 @@ async fn get_config(path: &PathBuf, key: &str, _theme: &Theme) -> Result<()> {
         return Ok(());
     }
 
+    if key == "runtime.max_prefix_cache_pages" {
+        println!(
+            "{} not set (automatic: 128 pages, or a quarter of a KV arena fitted at load on CUDA)",
+            key
+        );
+        return Ok(());
+    }
+
     if let Some(default) = Config::default_value_for_key(key) {
         println!("{} not set (default {})", key, default);
         return Ok(());

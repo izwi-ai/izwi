@@ -210,6 +210,9 @@ pub struct ManagedKvArenaRuntimeSnapshot {
     pub token_capacity: u64,
     pub bytes_per_page: u64,
     pub physical_bytes: u64,
+    /// Pages the arena's committed-prefix index may retain: the effective
+    /// prefix page budget for this model (see `prefix_index_pages`).
+    pub prefix_capacity_pages: u64,
     pub coordinator: ManagedKvCoordinatorSnapshot,
     pub operations: ManagedKvOperationSnapshot,
 }
@@ -472,6 +475,10 @@ pub(crate) struct ManagedKvCacheManager {
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
     max_prefix_cache_pages: usize,
+    /// The operator left the prefix page budget unset, so arenas that the
+    /// CUDA resident fit allocates at load size theirs from the arena (see
+    /// [`prefix_index_pages`]).
+    automatic_prefix_cache_pages: bool,
     /// Committed hybrid-state prefix snapshots a snapshot-sharing model may
     /// hold beyond its live rows (see [`Self::prefix_snapshot_rows_for`]).
     prefix_snapshot_rows: u32,
@@ -549,6 +556,7 @@ impl ManagedKvCacheManager {
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
             max_prefix_cache_pages: 0,
+            automatic_prefix_cache_pages: false,
             prefix_snapshot_rows: DEFAULT_PREFIX_SNAPSHOT_ROWS,
             host_offload_policy: None,
             worker_backend: backend,
@@ -774,6 +782,12 @@ impl ManagedKvCacheManager {
         self.prefix_snapshot_rows = rows;
     }
 
+    /// Whether the prefix page budget was left unset (see
+    /// [`prefix_index_pages`]). Takes effect for models loaded afterwards.
+    pub(crate) fn set_automatic_prefix_cache_pages(&mut self, automatic: bool) {
+        self.automatic_prefix_cache_pages = automatic;
+    }
+
     /// The snapshot rows a model with `contract` is fitted and reserved for:
     /// the configured budget when its hybrid contract shares committed
     /// snapshots and prefix caching is engaged (a namespace and a page
@@ -930,6 +944,10 @@ impl ManagedKvCacheManager {
                                 .saturating_mul(u64::from(group.page_tokens)),
                             bytes_per_page: group.bytes_per_page,
                             physical_bytes: arena.resident_bytes(),
+                            prefix_capacity_pages: state
+                                .prefix_indexes
+                                .get(&group.arena)
+                                .map_or(0, |index| usize_to_u64(index.capacity_pages())),
                             coordinator,
                             operations,
                         }
@@ -1305,7 +1323,13 @@ impl ManagedKvCacheManager {
             prefix_indexes.insert(
                 group.arena,
                 CoordinatedPrefixIndex::with_telemetry(
-                    (group.capacity_pages as usize).min(self.max_prefix_cache_pages),
+                    prefix_index_pages(
+                        self.max_prefix_cache_pages,
+                        self.automatic_prefix_cache_pages,
+                        backend,
+                        materialize_cuda_paged_at_load,
+                        group.capacity_pages,
+                    ),
                     self.telemetry.clone(),
                 ),
             );
@@ -3546,6 +3570,41 @@ fn managed_paged_capacity_strategy(
     }
 }
 
+/// Share of a KV arena, allocated in full at load by the CUDA resident fit,
+/// that an automatic prefix page budget may hold: one page in this many.
+const AUTOMATIC_PREFIX_ARENA_SHARE: usize = 4;
+
+/// Page budget of one arena's committed-prefix index.
+///
+/// `budget` is the prefix page budget the cache policy resolved: the
+/// operator's value, or [`crate::config::DEFAULT_MAX_PREFIX_CACHE_PAGES`]
+/// when `automatic`, and zero when prefix reuse is disabled. An operator's
+/// value applies as set, and so does an automatic budget on CPU, on Metal and
+/// on CUDA arenas that grow on demand. On a CUDA arena allocated in full at
+/// load (`materialized_at_load`), an automatic budget rises to a quarter of
+/// the arena. Those pages occupy device memory whether or not the index holds
+/// them, and a request that needs pages held only by the index evicts them,
+/// least recently used first (`evict_lru_excluding` in `prepare_inner`), so
+/// the larger budget only keeps more chat history reusable: a quarter of
+/// Qwen3.8's ~9,700-page arena on an H100 is ~2,400 pages, over 150k
+/// tokens. A budget never exceeds its arena.
+fn prefix_index_pages(
+    budget: usize,
+    automatic: bool,
+    backend: BackendKind,
+    materialized_at_load: bool,
+    arena_pages: u32,
+) -> usize {
+    let arena_pages = usize::try_from(arena_pages).unwrap_or(usize::MAX);
+    let scales = automatic && backend == BackendKind::Cuda && materialized_at_load;
+    let budget = if budget > 0 && scales {
+        budget.max(arena_pages / AUTOMATIC_PREFIX_ARENA_SHARE)
+    } else {
+        budget
+    };
+    budget.min(arena_pages)
+}
+
 /// Maximum simultaneously live page rows for the CUDA arena's current
 /// doubling/quantized contiguous replacement schedule.
 fn cuda_contiguous_replacement_peak_pages(maximum_pages: u32) -> Result<u64> {
@@ -5187,6 +5246,141 @@ mod tests {
                 .values()
                 .all(|coordinator| coordinator.stats().capacity_pages == 8)
         );
+        let snapshot = manager.runtime_snapshot();
+        assert_eq!(snapshot.models[0].arenas[0].prefix_capacity_pages, 2);
+    }
+
+    /// An unset prefix page budget takes a quarter of a CUDA arena that is
+    /// allocated in full at load, never below the default; everywhere else,
+    /// and whenever the operator set a budget (zero included), the resolved
+    /// budget applies as is. No budget exceeds its arena.
+    #[test]
+    fn automatic_prefix_budget_takes_a_quarter_of_a_cuda_arena_allocated_at_load() {
+        use crate::config::DEFAULT_MAX_PREFIX_CACHE_PAGES as DEFAULT;
+        use BackendKind::{Cpu, Cuda, Metal};
+
+        // Qwen3.8 on an H100: 9,769 pages keep 2,442 (156,288 tokens).
+        assert_eq!(prefix_index_pages(DEFAULT, true, Cuda, true, 9_769), 2_442);
+        assert_eq!(prefix_index_pages(DEFAULT, true, Cuda, true, 400), DEFAULT);
+        assert_eq!(prefix_index_pages(DEFAULT, true, Cuda, true, 100), 100);
+        // A CUDA arena that grows on demand, and CPU and Metal arenas.
+        assert_eq!(
+            prefix_index_pages(DEFAULT, true, Cuda, false, 9_769),
+            DEFAULT
+        );
+        for backend in [Cpu, Metal] {
+            for materialized in [false, true] {
+                assert_eq!(
+                    prefix_index_pages(DEFAULT, true, backend, materialized, 9_769),
+                    DEFAULT,
+                    "{backend:?}"
+                );
+            }
+        }
+        for backend in [Cpu, Metal, Cuda] {
+            for pages in [0, 64, 4_096] {
+                assert_eq!(
+                    prefix_index_pages(pages, false, backend, true, 9_769),
+                    pages,
+                    "{backend:?}"
+                );
+            }
+            assert_eq!(
+                prefix_index_pages(4_096, false, backend, true, 1_000),
+                1_000
+            );
+            // Disabled reuse stays disabled.
+            assert_eq!(prefix_index_pages(0, true, backend, true, 9_769), 0);
+        }
+
+        // CPU binding keeps the resolved budget when it is automatic.
+        let model = ModelInstanceId::new(705);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_policy(None, Some([4; 32]), 2);
+        manager.set_automatic_prefix_cache_pages(true);
+        manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                16,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let snapshot = manager.runtime_snapshot();
+        assert_eq!(snapshot.models[0].arenas[0].prefix_capacity_pages, 2);
+    }
+
+    /// Pages held only by the prefix index never hold a request back: when
+    /// the arena has no free page, admission evicts the least recently used
+    /// history and the request proceeds, while newer history stays reusable.
+    #[test]
+    fn admission_reclaims_pages_held_only_by_the_prefix_index() {
+        fn run(
+            manager: &mut ManagedKvCacheManager,
+            runtime: &ManagedKvModelRuntime,
+            txn_id: PlanId,
+            name: &str,
+            tokens: Vec<u32>,
+        ) -> ManagedCacheReservation {
+            let request = prefix_request(ModelInstanceId::new(706), tokens.clone());
+            let session = SessionKey::new(name.into(), 1);
+            let reservation = manager
+                .prepare(
+                    runtime,
+                    txn_id,
+                    &session,
+                    &sequence_work(0, tokens.len()),
+                    Some(&request),
+                )
+                .unwrap_or_else(|error| panic!("{name} was not admitted: {error}"))
+                .expect("managed reservation");
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+            manager.release_session(&session).expect("release");
+            reservation
+        }
+
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([12; 32]));
+        let runtime = manager
+            .bind_request(
+                ModelInstanceId::new(706),
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        // Two finished conversations: the index alone holds 3 of 4 pages.
+        let older = (0..64).collect::<Vec<u32>>();
+        let newer = (500..532).collect::<Vec<u32>>();
+        run(&mut manager, &runtime, 41, "older", older);
+        run(&mut manager, &runtime, 42, "newer", newer.clone());
+        let retained = manager.runtime_snapshot();
+        assert_eq!(retained.counters.prefix_retained_pages, 3);
+        assert_eq!(retained.totals.coordinator.free_pages, 1);
+
+        // An unrelated prompt needs two pages; only one is free.
+        run(
+            &mut manager,
+            &runtime,
+            43,
+            "unrelated",
+            (900..964).collect(),
+        );
+        assert_eq!(manager.telemetry_snapshot().prefix_evictions, 2);
+
+        // The newer conversation's history survived and still attaches.
+        let mut next_turn = newer;
+        next_turn.push(7);
+        let resumed = run(&mut manager, &runtime, 44, "newer-next", next_turn);
+        assert_eq!(resumed.domains[0].execution_start_tokens, 32);
     }
 
     fn composite_tensor_contract() -> InferenceStateContract {

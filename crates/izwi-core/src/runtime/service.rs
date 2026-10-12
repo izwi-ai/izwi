@@ -3086,10 +3086,10 @@ impl RuntimeService {
         // the resolved namespace verbatim), but the auto marker is carried so
         // the core's own budget check degrades instead of failing startup.
         core_config.prefix_reuse_catalog_auto = config.prefix_reuse_catalog_auto;
-        core_config.max_prefix_cache_pages = match &cache_policy.effective.prefix {
-            PrefixCachePolicy::Disabled => 0,
-            PrefixCachePolicy::Namespaced { max_pages, .. } => *max_pages,
-        };
+        core_config.max_prefix_cache_pages = engine_core_prefix_cache_pages(
+            config.max_prefix_cache_pages,
+            &cache_policy.effective.prefix,
+        );
         // After the prefix settings: CUDA sizes its page cap for a maximum-
         // length request plus the prefix budget.
         core_config.apply_backend_context_capacity(config.portable_context_ceiling());
@@ -7866,12 +7866,27 @@ fn startup_policy_capacity_pages(backend: BackendKind, config: &EngineConfig) ->
         .portable_context_ceiling()
         .max(1)
         .div_ceil(config.kv_page_size.max(1));
-    portable.max(request_pages.saturating_add(config.max_prefix_cache_pages))
+    portable.max(request_pages.saturating_add(config.prefix_cache_pages_or_default()))
+}
+
+/// The prefix page budget the engine core receives: zero when reuse is
+/// disabled, an operator's budget as the startup check resolved it (possibly
+/// clamped), and unset when the operator left it unset, so that each model
+/// sizes its prefix index from its own KV arena at load (`prefix_index_pages`
+/// in the managed cache) from the same default floor.
+fn engine_core_prefix_cache_pages(
+    configured: Option<usize>,
+    effective: &PrefixCachePolicy,
+) -> Option<usize> {
+    match effective {
+        PrefixCachePolicy::Disabled => Some(0),
+        PrefixCachePolicy::Namespaced { max_pages, .. } => configured.map(|_| *max_pages),
+    }
 }
 
 #[cfg(test)]
 mod startup_policy_capacity_tests {
-    use super::startup_policy_capacity_pages;
+    use super::{engine_core_prefix_cache_pages, startup_policy_capacity_pages};
     use crate::backends::BackendKind;
     use crate::config::{EngineConfig, PrefixCachePolicy};
 
@@ -7883,7 +7898,7 @@ mod startup_policy_capacity_tests {
         let config = EngineConfig {
             enable_prefix_caching: true,
             managed_prefix_cache_salt: Some("tenant".into()),
-            max_prefix_cache_pages: 4_096,
+            max_prefix_cache_pages: Some(4_096),
             kv_page_size: 64,
             ..EngineConfig::default()
         };
@@ -7911,6 +7926,47 @@ mod startup_policy_capacity_tests {
                 startup_policy_capacity_pages(backend, &default),
                 1_024,
                 "{backend:?}"
+            );
+        }
+    }
+
+    /// The engine core receives an unset prefix budget unset (each model
+    /// sizes its own at load), an operator's budget as the startup check
+    /// resolved it, and zero when reuse is disabled. An explicit zero still
+    /// fails enabled reuse at startup, as before.
+    #[test]
+    fn engine_core_receives_an_unset_prefix_budget_unset() {
+        let config = |pages| EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            max_prefix_cache_pages: pages,
+            kv_page_size: 64,
+            ..EngineConfig::default()
+        };
+        let core_pages = |config: &EngineConfig, backend| {
+            let policy = config
+                .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, config))
+                .unwrap();
+            engine_core_prefix_cache_pages(config.max_prefix_cache_pages, &policy.effective.prefix)
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(core_pages(&config(None), backend), None, "{backend:?}");
+            let zero = config(Some(0));
+            assert!(zero
+                .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, &zero))
+                .is_err());
+        }
+        assert_eq!(
+            core_pages(&config(Some(4_096)), BackendKind::Cuda),
+            Some(4_096)
+        );
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(core_pages(&config(Some(4_096)), backend), Some(960));
+        }
+        for configured in [None, Some(0), Some(128)] {
+            assert_eq!(
+                engine_core_prefix_cache_pages(configured, &PrefixCachePolicy::Disabled),
+                Some(0)
             );
         }
     }
@@ -9739,6 +9795,7 @@ mod tests {
             token_capacity: 160,
             bytes_per_page: 128,
             physical_bytes: 1_280,
+            prefix_capacity_pages: 0,
             coordinator: ManagedKvCoordinatorSnapshot {
                 capacity_pages: 10,
                 allocated_pages,

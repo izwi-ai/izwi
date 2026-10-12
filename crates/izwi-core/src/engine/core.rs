@@ -3216,6 +3216,7 @@ impl EngineCore {
             crate::engine::cache::offload::HostOffloadPolicy::resolve(&config)?,
         );
         managed_kv_cache.set_prefix_snapshot_rows(config.max_prefix_snapshots);
+        managed_kv_cache.set_automatic_prefix_cache_pages(config.max_prefix_cache_pages.is_none());
 
         Ok(Self {
             config,

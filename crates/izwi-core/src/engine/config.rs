@@ -7,7 +7,7 @@ use super::scheduler::SchedulingPolicy;
 use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
 use crate::config::{
     resolve_kv_cache_policy, BatchSizePreference, PhysicalExecutionCapacity, PhysicalExecutionMode,
-    PhysicalInFlightLimit, ResolvedKvCachePolicy,
+    PhysicalInFlightLimit, ResolvedKvCachePolicy, DEFAULT_MAX_PREFIX_CACHE_PAGES,
 };
 use crate::engine::ResourceAmount;
 use crate::model::ModelVariant;
@@ -165,9 +165,11 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_managed_prefix_cache_salt")]
     pub managed_prefix_cache_salt: Option<String>,
 
-    /// Hard upper bound for retained committed-prefix pages.
-    #[serde(default = "default_max_prefix_cache_pages")]
-    pub max_prefix_cache_pages: usize,
+    /// Hard upper bound for retained committed-prefix pages. `None` is
+    /// automatic: [`DEFAULT_MAX_PREFIX_CACHE_PAGES`], raised per model to a
+    /// quarter of a CUDA KV arena that is fully allocated at load.
+    #[serde(default)]
+    pub max_prefix_cache_pages: Option<usize>,
 
     /// Committed prefix snapshots of hybrid recurrent state (one row each) a
     /// snapshot-sharing model may hold beyond its live rows. They are fitted
@@ -548,10 +550,6 @@ fn default_kv_offload_max_promotion_pages() -> usize {
     64
 }
 
-fn default_max_prefix_cache_pages() -> usize {
-    128
-}
-
 impl Default for EngineCoreConfig {
     fn default() -> Self {
         Self {
@@ -576,7 +574,7 @@ impl Default for EngineCoreConfig {
             scheduling_policy: SchedulingPolicy::default(),
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
-            max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            max_prefix_cache_pages: None,
             max_prefix_snapshots: default_max_prefix_snapshots(),
             kv_host_pool_budget_bytes: 0,
             kv_offload_high_watermark: default_kv_offload_high_watermark(),
@@ -670,7 +668,7 @@ impl EngineCoreConfig {
         // explicit enablement fails startup. The arena grows on demand, so
         // this raises the logical cap only.
         let prefix_pages = if self.enable_prefix_caching {
-            self.max_prefix_cache_pages
+            self.prefix_cache_pages_or_default()
         } else {
             0
         };
@@ -679,13 +677,20 @@ impl EngineCoreConfig {
             .max(required_pages.saturating_add(prefix_pages));
     }
 
+    /// The configured prefix page budget, or the default when it is
+    /// automatic (the floor each model's automatic budget starts from).
+    pub(crate) fn prefix_cache_pages_or_default(&self) -> usize {
+        self.max_prefix_cache_pages
+            .unwrap_or(DEFAULT_MAX_PREFIX_CACHE_PAGES)
+    }
+
     pub fn resolved_kv_cache_policy(&self) -> Result<ResolvedKvCachePolicy> {
         resolve_kv_cache_policy(
             self.block_size,
             &self.kv_cache_dtype,
             self.enable_prefix_caching,
             self.managed_prefix_cache_salt.as_deref(),
-            self.max_prefix_cache_pages,
+            self.prefix_cache_pages_or_default(),
             self.max_blocks,
             self.max_seq_len,
             // Catalog-auto reuse degrades instead of failing startup when the
@@ -906,7 +911,7 @@ mod managed_kv_default_tests {
             max_blocks: 1024,
             enable_prefix_caching: true,
             managed_prefix_cache_salt: Some("tenant".into()),
-            max_prefix_cache_pages: 256,
+            max_prefix_cache_pages: Some(256),
             ..EngineCoreConfig::default()
         };
 

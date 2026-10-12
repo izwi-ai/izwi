@@ -73,7 +73,9 @@ pub struct ServeRuntimeConfig {
     pub enable_prefix_caching: bool,
     pub prefix_reuse_catalog_auto: bool,
     pub managed_prefix_cache_salt: Option<String>,
-    pub max_prefix_cache_pages: usize,
+    /// Prefix page budget; `None` leaves it automatic (see
+    /// [`EngineConfig::max_prefix_cache_pages`]).
+    pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: bool,
     pub chunked_prefill_threshold: usize,
     pub max_retained_sequences: usize,
@@ -113,7 +115,7 @@ impl Default for ServeRuntimeConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             prefix_reuse_catalog_auto: PREFIX_REUSE_CATALOG_AUTO_DEFAULT,
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
-            max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            max_prefix_cache_pages: None,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             max_retained_sequences: default_max_retained_sequences(),
@@ -190,7 +192,7 @@ impl ServeRuntimeConfig {
             self.managed_prefix_cache_salt = Some(managed_prefix_cache_salt.clone());
         }
         if let Some(max_prefix_cache_pages) = overrides.max_prefix_cache_pages {
-            self.max_prefix_cache_pages = max_prefix_cache_pages;
+            self.max_prefix_cache_pages = Some(max_prefix_cache_pages);
         }
         if let Some(enable_chunked_prefill) = overrides.enable_chunked_prefill {
             self.enable_chunked_prefill = enable_chunked_prefill;
@@ -406,10 +408,6 @@ fn default_enable_prefix_caching() -> bool {
 
 fn default_managed_prefix_cache_salt() -> Option<String> {
     None
-}
-
-fn default_max_prefix_cache_pages() -> usize {
-    128
 }
 
 fn default_enable_chunked_prefill() -> bool {
@@ -838,7 +836,7 @@ workers = 5
             resolved.managed_prefix_cache_salt.as_deref(),
             Some("tenant-a")
         );
-        assert_eq!(resolved.max_prefix_cache_pages, 64);
+        assert_eq!(resolved.max_prefix_cache_pages, Some(64));
         assert!(resolved.enable_chunked_prefill);
         assert_eq!(resolved.chunked_prefill_threshold, 512);
         assert!(engine.enable_prefix_caching);
@@ -846,10 +844,35 @@ workers = 5
             engine.managed_prefix_cache_salt.as_deref(),
             Some("tenant-a")
         );
-        assert_eq!(engine.max_prefix_cache_pages, 64);
+        assert_eq!(engine.max_prefix_cache_pages, Some(64));
         assert!(engine.enable_chunked_prefill);
         assert_eq!(engine.chunked_prefill_threshold, 512);
         clear_env();
+    }
+
+    /// An unset prefix page budget reaches the engine unset (automatic, sized
+    /// per model at load); a value from any source wins, including zero.
+    #[test]
+    fn prefix_page_budget_stays_automatic_unless_configured() {
+        let unset = ServeRuntimeConfigOverrides::default();
+        let resolved = ServeRuntimeConfig::from_sources(&unset, &unset, &unset);
+        assert_eq!(resolved.max_prefix_cache_pages, None);
+        assert_eq!(resolved.engine_config().max_prefix_cache_pages, None);
+        for pages in [0, 64, 4_096] {
+            let set = ServeRuntimeConfigOverrides {
+                max_prefix_cache_pages: Some(pages),
+                ..ServeRuntimeConfigOverrides::default()
+            };
+            for sources in [
+                [&set, &unset, &unset],
+                [&unset, &set, &unset],
+                [&unset, &unset, &set],
+            ] {
+                let resolved = ServeRuntimeConfig::from_sources(sources[0], sources[1], sources[2]);
+                assert_eq!(resolved.max_prefix_cache_pages, Some(pages));
+                assert_eq!(resolved.engine_config().max_prefix_cache_pages, Some(pages));
+            }
+        }
     }
 
     #[test]

@@ -228,9 +228,13 @@ about 157 MB each for Qwen3.8, reserved at load. The least recently used snapsho
 dropped first, so up to 8 conversations continue with their history reused at once;
 others prefill in full. History pages share the KV cache and are released when a
 request needs the room. A conversation's whole history must fit the prefix page
-budget (`IZWI_MAX_PREFIX_CACHE_PAGES`, default 128 pages of 64 tokens, 8,192 tokens);
-longer conversations prefill in full. With thinking on, answers often run to several
-thousand tokens, so on CUDA set a larger budget for long chats, for example:
+budget (`IZWI_MAX_PREFIX_CACHE_PAGES`); longer conversations prefill in full. With
+thinking on, answers often run to several thousand tokens, so on CUDA the budget
+defaults to a quarter of the model's KV arena, which is allocated at load either way:
+about 2,400 pages of 64 tokens (over 150,000 tokens of history) for Qwen3.8 on an
+80 GB H100. On CPU and Metal the default is 128 pages (8,192 tokens). The model's
+`kv_cache.models[].arenas[].prefix_capacity_pages` in `/v1/metrics` shows the
+effective budget. A value you set applies as set, for example:
 
 ```bash
 export IZWI_MAX_PREFIX_CACHE_PAGES=4096
