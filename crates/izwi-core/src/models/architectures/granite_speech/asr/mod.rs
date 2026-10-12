@@ -58,7 +58,8 @@ pub use runtime::{
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
 pub use transcript::{
-    parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
+    merge_granite_speech_timestamp_chunks, parse_granite_speech_output,
+    GraniteSpeechParsedTranscript, GraniteSpeechSegment, GraniteSpeechTimestampChunk,
     GraniteSpeechTimestampWord,
 };
 
@@ -2136,13 +2137,27 @@ fn granite_diagnostics(
                 "text": segment.text,
             })
         }).collect::<Vec<_>>(),
-        "timestamp_words": parsed.timestamp_words.iter().map(|word| {
-            json!({
-                "word": word.word,
-                "end_time_seconds": word.end_time_seconds,
-            })
-        }).collect::<Vec<_>>(),
+        "timestamp_words": granite_speech_timestamp_words_json(&parsed.timestamp_words),
     })
+}
+
+/// The `timestamp_words` diagnostics schema the OpenAI route reads word
+/// timings from.
+pub(crate) fn granite_speech_timestamp_words_json(
+    words: &[GraniteSpeechTimestampWord],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        words
+            .iter()
+            .map(|word| {
+                json!({
+                    "word": word.word,
+                    "start_time_seconds": word.start_time_seconds,
+                    "end_time_seconds": word.end_time_seconds,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn granite_decode_profile_json(profile: &GraniteSpeechDecodeProfile) -> serde_json::Value {
@@ -3231,6 +3246,11 @@ mod tests {
         assert_eq!(diagnostics["timings_ms"]["model_non_generation"], 2.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
+        assert_eq!(diagnostics["timestamp_words"][0]["start_time_seconds"], 0.0);
+        assert_eq!(
+            diagnostics["timestamp_words"][0]["end_time_seconds"],
+            0.45f32 as f64
+        );
         assert_eq!(diagnostics["prompt"]["profile"], "plus");
         assert_eq!(diagnostics["prompt"]["task"], "word_timestamps");
         assert_eq!(
