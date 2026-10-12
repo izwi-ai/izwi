@@ -26,11 +26,11 @@ use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
     BatchLaneKey, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
     ExecutionDisposition, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
-    FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
-    RealtimeStageOutcome, RealtimeSubphase, RetryDisposition, SequencePhase, StageId,
-    StageShapePolicy, WorkCost, WorkUnit,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureKind,
+    FailureOrigin, FailureScope, FinishReason as ExecutionFinishReason, HealthImpact,
+    ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility, PhysicalBatch,
+    PhysicalLaunchPolicy, PrefillMode, ReadyQuantum, RealtimeStageOutcome, RealtimeSubphase,
+    RetryDisposition, SequencePhase, StageId, StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -113,6 +113,26 @@ impl RequestPhaseTiming {
                 .as_secs_f64()
                 * 1000.0,
         )
+    }
+}
+
+/// Why [`EngineCore::begin_execution_plan`] did not register a plan.
+#[derive(Debug)]
+enum PlanBeginError {
+    /// The request's bound adapter cannot run the work its executor profile
+    /// schedules: no single stage matches it, or the stage's batching
+    /// disagrees with the executor. The binding, the profile and the work
+    /// derived from them are fixed for the session, and the scheduler has
+    /// already fallen back to scalar execution, so a retry selects the same
+    /// work and fails the same way. The request fails terminally.
+    AdapterContract(Error),
+    /// Any other failure rolls the schedule back for the run loop to retry.
+    Engine(Error),
+}
+
+impl From<Error> for PlanBeginError {
+    fn from(error: Error) -> Self {
+        Self::Engine(error)
     }
 }
 
@@ -776,7 +796,7 @@ impl EngineCore {
     async fn begin_execution_plan(
         &mut self,
         scheduled: &super::scheduler::ScheduledRequest,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PlanBeginError> {
         let session = scheduled.session_key();
         if self.active_plans.contains_key(&scheduled.plan_id)
             || self
@@ -787,10 +807,10 @@ impl EngineCore {
                 dispatch.contains_plan(scheduled.plan_id) || dispatch.contains_session(&session)
             })
         {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "execution plan {} duplicates an active session or plan quantum",
                 scheduled.plan_id
-            )));
+            ))));
         }
         let request = self
             .requests
@@ -813,16 +833,17 @@ impl EngineCore {
                     ExecutionMode::Atomic,
                 )
             });
-        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
+        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)
+            .map_err(PlanBeginError::AdapterContract)?;
         if scheduled.is_prefill
             && profile.prefill != PrefillMode::Incremental
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens < request.num_prompt_tokens())
         {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "full-prefill request {} was scheduled as a partial prompt quantum",
                 scheduled.request_id
-            )));
+            ))));
         }
         let mut work = match profile.mode {
             ExecutionMode::Sequence | ExecutionMode::Realtime
@@ -854,7 +875,8 @@ impl EngineCore {
         let bound_stage = request
             .execution_adapter_binding()
             .map(|binding| binding.stage_for_work(&work).cloned())
-            .transpose()?;
+            .transpose()
+            .map_err(PlanBeginError::AdapterContract)?;
         if let WorkUnit::SequenceStep {
             input,
             auxiliary_state,
@@ -862,9 +884,9 @@ impl EngineCore {
         } = &mut work
         {
             if auxiliary_state.is_some() {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "scheduler attempted to author retained auxiliary state".into(),
-                ));
+                )));
             }
             if let Some(stage) = bound_stage.as_ref() {
                 let projected = request.project_auxiliary_state_spans(stage, *input)?;
@@ -884,9 +906,9 @@ impl EngineCore {
                         if span.input().is_empty()
                             || previous_group.is_some_and(|previous| previous >= span.group().get())
                         {
-                            return Err(Error::InferenceError(
+                            return Err(PlanBeginError::Engine(Error::InferenceError(
                                 "projected clocked-state spans are not canonical and unique".into(),
-                            ));
+                            )));
                         }
                         tensor.validate_group_clock(span.group(), span.clock())?;
                         previous_group = Some(span.group().get());
@@ -910,9 +932,9 @@ impl EngineCore {
         };
         if let Some((state_input, auxiliary_state)) = realtime_state {
             if auxiliary_state.is_some() {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "scheduler attempted to author retained realtime state".into(),
-                ));
+                )));
             }
             if let Some(selections) = bound_stage
                 .as_ref()
@@ -932,9 +954,9 @@ impl EngineCore {
                 let mut previous_group = None;
                 for selection in selections {
                     if previous_group.is_some_and(|previous| previous >= selection.group().get()) {
-                        return Err(Error::InferenceError(
+                        return Err(PlanBeginError::Engine(Error::InferenceError(
                             "retained realtime selections are not canonical and unique".into(),
-                        ));
+                        )));
                     }
                     tensor.validate_group_clock(selection.group(), selection.clock())?;
                     spans.push(ClockedStateSpan::new(
@@ -1010,19 +1032,19 @@ impl EngineCore {
             .entry(scheduled.request_id.clone())
             .or_insert_with(|| ExecutionTracker::new(plan.session.clone()));
         if tracker.session() != &plan.session {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "request {} already has a different active session",
                 scheduled.request_id
-            )));
+            ))));
         }
         if tracker.state() == ExecutionState::Queued {
             tracker.transition(ExecutionState::Admitted)?;
         }
         let running_state = match plan.work {
             WorkUnit::PreSequencePreparation { .. } => {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "pre-sequence preparation cannot enter EngineCore execution".to_string(),
-                ));
+                )));
             }
             WorkUnit::SequenceStep {
                 phase: super::SequencePhase::Prefill,
@@ -4414,11 +4436,34 @@ impl EngineCore {
             .chain(prefill_scheduled.iter())
             .cloned()
             .collect::<Vec<_>>();
+        let mut contract_failures = Vec::new();
         for scheduled in &all_scheduled {
-            if let Err(error) = self.begin_execution_plan(scheduled).await {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
+            match self.begin_execution_plan(scheduled).await {
+                Ok(()) => {}
+                Err(PlanBeginError::AdapterContract(error)) => {
+                    contract_failures.push((scheduled.session_key(), error));
+                }
+                Err(PlanBeginError::Engine(error)) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
             }
+        }
+        if !contract_failures.is_empty() {
+            // Rescheduling would select the same unsupported work on every
+            // step. Fail those requests now and commit their terminal outputs;
+            // the rest of this schedule runs on the next step.
+            self.rollback_unexecuted_schedule(&all_scheduled);
+            for (session, error) in contract_failures {
+                self.fail_adapter_contract_mismatch(&session, error).await;
+            }
+            let capacity = self.config.resolved_physical_execution_capacity();
+            return Ok(Some(PreparedEngineStep::with_execution_policy(
+                self.executor.clone(),
+                Vec::new(),
+                self.config.physical_execution_mode,
+                capacity.physical_launch_limit,
+            )));
         }
         let now = Instant::now();
 
@@ -5100,6 +5145,32 @@ impl EngineCore {
                 staged_stream_outputs: Vec::new(),
             });
         true
+    }
+
+    /// Fail a request whose bound adapter cannot run the work its executor
+    /// schedules. Nothing was dispatched, so the session is released like any
+    /// other terminal failure.
+    async fn fail_adapter_contract_mismatch(&mut self, session: &super::SessionKey, error: Error) {
+        warn!(
+            request_id = %session.request_id,
+            session_epoch = session.epoch,
+            error = %error,
+            "Loaded adapter cannot run the scheduled work; failing the request"
+        );
+        let message = format!("execution adapter contract mismatch: {error}");
+        self.terminate_request_session(
+            session,
+            ExecutorOutput::error(session.request_id.clone(), message.clone()),
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::Internal,
+                scope: FailureScope::Row,
+                retry: RetryDisposition::Never,
+                health: HealthImpact::None,
+                message,
+            }),
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted),
+        )
+        .await;
     }
 
     pub(crate) async fn handle_stream_delivery_failure(
@@ -6979,6 +7050,75 @@ mod tests {
         assert!(
             core.pending_terminal_outputs.is_empty(),
             "a completed scheduler session must not receive a second terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_without_a_stage_for_scheduled_work_fails_the_request_once() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let request_id = "no-stage".to_string();
+        let mut request = EngineCoreRequest::tts("no stage").with_model_variant(variant);
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        // The executor schedules sequence work, but the adapter only has an
+        // atomic stage, so no stage matches before or after the scalar fallback.
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.atomic",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: ExecutionGroupId::new(1),
+                model_instance_id: ModelInstanceId::new(2),
+                adapter_instance_id: AdapterInstanceId::new(3),
+                adapter_abi_revision: AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([stage]),
+            })
+            .unwrap();
+        core.add_request(request).unwrap();
+
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("a stage-selection mismatch must not fail the engine step"),
+            );
+            if !core.has_pending_work() {
+                break;
+            }
+        }
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+        assert!(
+            outputs[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no stage for scheduled work")),
+            "{:?}",
+            outputs[0].error
+        );
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted)
+        );
+        assert!(!core.has_request(&request_id));
+        assert!(
+            !core.has_pending_work(),
+            "a failed request must not leave work for the run loop to retry"
         );
     }
 
