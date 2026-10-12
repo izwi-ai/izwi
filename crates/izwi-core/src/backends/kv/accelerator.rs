@@ -3855,11 +3855,9 @@ mod tests {
     #[cfg(feature = "metal")]
     fn private_metal_device() -> Result<Option<Device>> {
         // Feature-only CI must tolerate an unavailable or unsupported Metal
-        // runtime without entering Candle's device constructor.
-        if crate::backends::metal_device_if_available(0).is_none() {
-            return Ok(None);
-        }
-        Ok(Some(Device::new_metal(0)?))
+        // runtime without entering Candle's device constructor; the guarded
+        // constructor lives with the other Metal device construction.
+        Ok(crate::backends::device::private_metal_device_for_tests(0)?)
     }
 
     #[cfg(feature = "metal")]
