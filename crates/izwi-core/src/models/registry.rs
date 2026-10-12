@@ -4462,7 +4462,8 @@ impl NativeChatPreparedPrompt {
     pub fn managed_snapshot_boundary(&self) -> Option<usize> {
         match self {
             Self::Qwen36Moe(prepared) => prepared.history_boundary(),
-            Self::Qwen35(_) | Self::Qwen38(_) => None,
+            Self::Qwen38(prepared) => prepared.history_boundary(),
+            Self::Qwen35(_) => None,
         }
     }
 

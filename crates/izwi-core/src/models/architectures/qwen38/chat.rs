@@ -365,6 +365,9 @@ pub struct Qwen38PreparedPrompt {
     prompt_ids: Vec<u32>,
     prompt_positions: Vec<[usize; 3]>,
     next_text_position: usize,
+    /// Tokens of the stable history: everything before the final assistant
+    /// generation header, which the conversation's next turn renders again.
+    history_boundary: Option<usize>,
 }
 
 impl Qwen38PreparedPrompt {
@@ -372,9 +375,32 @@ impl Qwen38PreparedPrompt {
         &self.prompt_ids
     }
 
+    /// The prompt's stable-history boundary in tokens (see
+    /// [`history_boundary`]); the engine snapshots hybrid state at its
+    /// interval floor so the next turn attaches there.
+    pub(crate) fn history_boundary(&self) -> Option<usize> {
+        self.history_boundary
+    }
+
     pub(crate) fn prompt_positions(&self) -> &[[usize; 3]] {
         &self.prompt_positions
     }
+}
+
+/// Tokens of a rendered prompt's stable history: everything before its final
+/// `<|im_start|>`, the assistant generation header every Qwen3.8 render ends
+/// with. The conversation's next turn renders exactly these tokens again: an
+/// answer re-renders differently from the tokens that were generated (the
+/// template rebuilds its `<think>` block, and drops it for earlier turns when
+/// `preserve_thinking` is off), so nothing after the header is shared.
+/// `<|im_start|>` is a special token, so the encoding splits there and the
+/// prefix is a token boundary. A render that diverges earlier (a changed
+/// system prompt or tool list) only shortens the token-exact prefix match.
+fn history_boundary(prompt_ids: &[u32], im_start: u32) -> Option<usize> {
+    prompt_ids
+        .iter()
+        .rposition(|id| *id == im_start)
+        .filter(|boundary| *boundary > 0)
 }
 
 fn resolve_prepared_prompt<F>(
@@ -772,6 +798,7 @@ pub struct Qwen38TextConfig {
 
 #[derive(Debug, Clone)]
 struct SpecialTokenIds {
+    im_start: u32,
     im_end: u32,
     eos: u32,
     eos_alt: Option<u32>,
@@ -824,7 +851,7 @@ impl Qwen38Tokenizer {
                 Error::TokenizationError(format!("Missing required Qwen3.8 token {token}"))
             })
         };
-        required("<|im_start|>")?;
+        let im_start = required("<|im_start|>")?;
         let im_end = required("<|im_end|>")?;
         required(IMAGE_PAD_PLACEHOLDER)?;
         required(VIDEO_PAD_PLACEHOLDER)?;
@@ -846,6 +873,7 @@ impl Qwen38Tokenizer {
             vocab_size: inner.vocab_size(),
             inner,
             specials: SpecialTokenIds {
+                im_start,
                 im_end,
                 eos,
                 eos_alt,
@@ -3439,10 +3467,12 @@ impl Qwen38ChatModel {
         }
         let prompt_ids = self.tokenizer.encode_text(&prompt)?;
         let prompt_positions = build_text_positions(prompt_ids.len());
+        let history_boundary = history_boundary(&prompt_ids, self.tokenizer.specials.im_start);
         Ok(Qwen38PreparedPrompt {
             next_text_position: prompt_positions.len(),
             prompt_ids,
             prompt_positions,
+            history_boundary,
         })
     }
 }
@@ -4445,6 +4475,7 @@ mod tests {
             prompt_ids: vec![1, 2, 3],
             prompt_positions: build_text_positions(3),
             next_text_position: 3,
+            history_boundary: None,
         };
         assert_eq!(prepared.prompt_ids(), &[1, 2, 3]);
         assert_eq!(
@@ -4775,5 +4806,177 @@ mod tests {
         let prompt = render_prompt(&history_messages(), &config, true).unwrap();
         assert!(!prompt.contains("reasoning first"));
         assert!(prompt.contains("Final answer<|im_end|>"));
+    }
+
+    fn byte_level_char(byte: u8) -> char {
+        let mut bytes: Vec<u8> = (b'!'..=b'~')
+            .chain(b'\xA1'..=b'\xAC')
+            .chain(b'\xAE'..=b'\xFF')
+            .collect();
+        let mut codepoints: Vec<u32> = bytes.iter().map(|byte| u32::from(*byte)).collect();
+        let mut next = 0u32;
+        for candidate in 0..=u8::MAX {
+            if !bytes.contains(&candidate) {
+                bytes.push(candidate);
+                codepoints.push(256 + next);
+                next += 1;
+            }
+        }
+        let index = bytes
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("the byte-level alphabet covers every byte");
+        char::from_u32(codepoints[index]).expect("valid byte-level codepoint")
+    }
+
+    /// Byte-level BPE whose Qwen3.8 special tokens (the chat markers, the
+    /// think tags, the media pads) encode atomically, as in the published
+    /// tokenizer.
+    fn byte_level_tokenizer() -> Qwen38Tokenizer {
+        let mut tokens: Vec<String> = (0..=u8::MAX)
+            .map(|byte| byte_level_char(byte).to_string())
+            .collect();
+        let mut specials = Vec::new();
+        for literal in [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            IMAGE_PAD_PLACEHOLDER,
+            VIDEO_PAD_PLACEHOLDER,
+            "<think>",
+            "</think>",
+        ] {
+            specials.push((literal.to_string(), tokens.len() as u32));
+            tokens.push(literal.to_string());
+        }
+        let mut token_types = vec![1; 256];
+        token_types.extend([3; 7]);
+        let mut inner =
+            Tokenizer::from_gguf_bpe(&tokens, &[], Some("qwen35"), false).expect("tokenizer");
+        inner
+            .register_gguf_token_types(&tokens, &token_types)
+            .expect("atomic special tokens");
+        let id = |literal: &str| {
+            specials
+                .iter()
+                .find(|(token, _)| token == literal)
+                .map(|(_, id)| *id)
+                .unwrap()
+        };
+        let special_ids = SpecialTokenIds {
+            im_start: id("<|im_start|>"),
+            im_end: id("<|im_end|>"),
+            eos: id("<|im_end|>"),
+            eos_alt: Some(id("<|endoftext|>")),
+        };
+        specials.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        Qwen38Tokenizer {
+            vocab_size: inner.vocab_size(),
+            specials: special_ids,
+            inner,
+            literal_special_tokens: specials,
+            chat_template: String::new(),
+            default_enable_thinking: true,
+        }
+    }
+
+    /// The declared history boundary is exactly what the next turn shares:
+    /// across three turns, with thinking on and off, every reasoning effort,
+    /// preserved and dropped reasoning, tools, Unicode and reasoning inside
+    /// the answers, each render reproduces the previous render's tokens up to
+    /// its boundary, and the boundary opens the assistant generation header.
+    #[test]
+    fn next_turn_shares_the_declared_history_boundary() {
+        let tokenizer = byte_level_tokenizer();
+        let im_start = tokenizer.specials.im_start;
+        let tool = serde_json::json!({"type": "function", "function": {"name": "lookup"}});
+        for (thinking, effort, preserve, tools) in [
+            (None, None, None, Vec::new()),
+            (Some(false), None, None, Vec::new()),
+            (
+                Some(true),
+                Some(ChatReasoningEffort::Low),
+                Some(false),
+                Vec::new(),
+            ),
+            (
+                Some(true),
+                Some(ChatReasoningEffort::Medium),
+                None,
+                vec![tool.clone()],
+            ),
+            (
+                Some(false),
+                Some(ChatReasoningEffort::Xhigh),
+                Some(false),
+                vec![tool],
+            ),
+        ] {
+            let config = ChatGenerationConfig {
+                request: ChatRequestConfig {
+                    enable_thinking: thinking,
+                    reasoning_effort: effort,
+                    preserve_thinking: preserve,
+                    tools,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let message = |role, content: &str| ChatMessage {
+                role,
+                content: content.to_string(),
+            };
+            let mut conversation = vec![
+                message(ChatRole::System, "Be precise."),
+                message(ChatRole::User, "First question — café 中文 🌍"),
+            ];
+            let answers = [
+                "<think>\nreasoning one\n</think>\n\nFirst answer.",
+                "reasoning two</think>\nSecond answer ✓",
+                "Third answer, no reasoning",
+            ];
+            let mut previous: Option<(Vec<u32>, usize)> = None;
+            for (turn, answer) in answers.iter().enumerate() {
+                let prompt = render_prompt(&conversation, &config, true).unwrap();
+                let ids = tokenizer.encode_text(&prompt).unwrap();
+                let boundary = history_boundary(&ids, im_start).expect("declared boundary");
+                assert_eq!(ids[boundary], im_start);
+                assert!(tokenizer
+                    .inner
+                    .decode_with_special_tokens(&ids[boundary..])
+                    .unwrap()
+                    .starts_with("<|im_start|>assistant\n"));
+                if let Some((previous_ids, previous_boundary)) = &previous {
+                    assert!(boundary > *previous_boundary);
+                    assert_eq!(
+                        &ids[..*previous_boundary],
+                        &previous_ids[..*previous_boundary],
+                        "turn {turn} ({config:?}) diverges inside the previous history"
+                    );
+                }
+                previous = Some((ids, boundary));
+                conversation.push(message(ChatRole::Assistant, answer));
+                conversation.push(message(ChatRole::User, "Follow-up ✓"));
+            }
+        }
+        assert_eq!(history_boundary(&[im_start, 7, 8], im_start), None);
+        assert_eq!(history_boundary(&[1, 2, 3], im_start), None);
+        assert_eq!(history_boundary(&[1, im_start, 3], im_start), Some(1));
+    }
+
+    /// The boundary reaches the engine request through the registry's
+    /// prepared prompt, which is how the scheduler and the managed cache see it.
+    #[test]
+    fn the_registry_prepared_prompt_carries_the_boundary() {
+        let prepared = Qwen38PreparedPrompt {
+            prompt_ids: vec![1, 2, 3],
+            prompt_positions: build_text_positions(3),
+            next_text_position: 3,
+            history_boundary: Some(2),
+        };
+        let native = crate::models::registry::NativeChatPreparedPrompt::Qwen38(prepared);
+        assert_eq!(native.managed_snapshot_boundary(), Some(2));
     }
 }

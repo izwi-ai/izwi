@@ -103,6 +103,7 @@ fn prepared_prompt() -> Qwen38PreparedPrompt {
         prompt_ids: (0..8).collect(),
         prompt_positions: (0..8).map(|position| [position; 3]).collect(),
         next_text_position: 8,
+        history_boundary: None,
     }
 }
 

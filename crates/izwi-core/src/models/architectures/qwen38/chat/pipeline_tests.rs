@@ -81,6 +81,7 @@ fn chat_model(checkpoint: &Qwen38NativeCheckpoint, graphs: bool) -> Qwen38ChatMo
             inner,
             vocab_size: vocab,
             specials: SpecialTokenIds {
+                im_start: u32::MAX,
                 im_end: 100_000,
                 eos: 100_001,
                 eos_alt: None,
@@ -162,6 +163,7 @@ fn decode(
         prompt_ids: PROMPT.to_vec(),
         prompt_positions: (0..PROMPT.len()).map(|position| [position; 3]).collect(),
         next_text_position: PROMPT.len(),
+        history_boundary: None,
     };
     let mut state = model
         .start_decode_state_physical(
