@@ -336,6 +336,33 @@ impl Qwen38TextRuntimeState {
         })
     }
 
+    /// Host copy of the hybrid state in the order the tensor domains commit
+    /// it: every DeltaNet layer's recurrent state, then every layer's
+    /// convolution history.
+    #[cfg(test)]
+    pub(crate) fn linear_state_values(&self) -> Result<Vec<f32>> {
+        let mut recurrent = Vec::new();
+        let mut convolution = Vec::new();
+        for layer in &self.layers {
+            if let Qwen38LayerRuntimeState::Linear {
+                conv_state,
+                recurrent_state,
+            } = layer
+            {
+                let state = recurrent_state.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 recurrent state was not initialized".into())
+                })?;
+                let ring = conv_state.as_ref().ok_or_else(|| {
+                    Error::InferenceError("Qwen3.8 convolution state was not initialized".into())
+                })?;
+                recurrent.extend(host_values(state)?);
+                convolution.extend(host_values(&ring.staged_tensor()?)?);
+            }
+        }
+        recurrent.extend(convolution);
+        Ok(recurrent)
+    }
+
     pub(crate) fn restore_tensor_domains(
         &mut self,
         arena: &TensorStateArena,

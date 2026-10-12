@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod attach_tests;
 mod device_sampling;
+#[cfg(test)]
+mod history_attach_tests;
 mod pipeline;
 #[cfg(test)]
 mod pipeline_tests;
