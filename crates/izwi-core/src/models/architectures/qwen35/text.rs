@@ -14,6 +14,7 @@ use crate::backends::state::{
 };
 use crate::error::{Error, Result};
 use crate::kernels::cuda::gdn::{self, GdnDecodeSpec};
+use crate::kernels::cuda::rope;
 use crate::kernels::{
     try_fused_gated_delta_recurrent, try_fused_gated_rms_norm, try_fused_l2_norm,
     try_fused_silu_mul, try_qwen35_causal_conv_sequence, try_tiled_deltanet_recurrence,
@@ -41,6 +42,9 @@ use super::telemetry::Qwen35Telemetry;
 /// Environment switch that forces the Candle op chain for DeltaNet decode.
 const FUSED_DECODE_ENV: &str = "IZWI_QWEN35_FUSED_DECODE";
 
+#[path = "decode_graph.rs"]
+mod decode_graph;
+
 pub struct Qwen35TextModel {
     device: Device,
     token_embeddings: Embedding,
@@ -49,6 +53,11 @@ pub struct Qwen35TextModel {
     output: Qwen35Linear,
     finite_diagnostics_enabled: bool,
     telemetry: Arc<Qwen35Telemetry>,
+    /// The checkpoint's context length (the graph's block-table capacity).
+    max_context_tokens: usize,
+    /// Whole-step CUDA graph decode, when resolved (opt-in).
+    decode_graph: Option<decode_graph::Qwen35DecodeGraph>,
+    decode_graph_path: Qwen35FastPath,
 }
 
 /// M-RoPE cos/sin for the token positions of one forward, shaped
@@ -350,6 +359,13 @@ struct Qwen35FullAttention {
     mrope_sections: Vec<usize>,
     rope_kernel_enabled: bool,
     rope_inv_freqs: Vec<f32>,
+    /// F32 head-norm gains and epsilon for the fused graph attention
+    /// (Candle's `RmsNorm` keeps its gain private).
+    q_norm_gain: Tensor,
+    k_norm_gain: Tensor,
+    qk_norm_eps: f64,
+    /// Graph attention inputs, resolved with the decode graph.
+    graph_qk: Option<decode_graph::GraphQk>,
 }
 
 struct Qwen35LinearAttention {
@@ -516,6 +532,9 @@ impl Qwen35TextModel {
             output,
             finite_diagnostics_enabled,
             telemetry: Arc::default(),
+            max_context_tokens: cfg.context_length,
+            decode_graph: None,
+            decode_graph_path: Qwen35FastPath::legacy("unresolved"),
         })
     }
 
@@ -540,6 +559,91 @@ impl Qwen35TextModel {
                 );
             }
         }
+        self.resolve_decode_graph(switches.graphs_off, allow_cpu);
+    }
+
+    /// Resolve whole-step CUDA graph decode after the fused paths it needs.
+    /// `allow_eager` lets tests run the graph body eagerly off CUDA.
+    pub(crate) fn resolve_decode_graph(
+        &mut self,
+        graphs_off: Option<&'static str>,
+        allow_eager: bool,
+    ) {
+        self.decode_graph = None;
+        if self.device.is_cuda() {
+            let device = self.device.clone();
+            for layer in &mut self.layers {
+                if let Qwen35Mixer::Full(attention) = &mut layer.mixer {
+                    attention.graph_qk = None;
+                    if rope::supported(&device, DType::F16, attention.head_dim, attention.rope_dim)
+                        && attention.rope_inv_freqs.len() == attention.rope_dim / 2
+                    {
+                        match decode_graph::GraphQk::new(attention, &device) {
+                            Ok(qk) => attention.graph_qk = Some(qk),
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "Qwen3.5 graph attention inputs failed to load"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        let (graph, path) = decode_graph::Qwen35DecodeGraph::resolve(
+            self,
+            graphs_off,
+            self.max_context_tokens,
+            allow_eager,
+        );
+        self.decode_graph = graph;
+        self.decode_graph_path = path;
+    }
+
+    /// Graph decode resolution and runtime state, for the admin diagnostics.
+    pub(crate) fn decode_graph_summary(&self) -> serde_json::Value {
+        match &self.decode_graph {
+            Some(graph) => graph.summary(),
+            None => summarize([&self.decode_graph_path]),
+        }
+    }
+
+    /// Whether every projection runs through the K-quant MMVQ.
+    fn projections_all_kquant(&self) -> bool {
+        let mut all = true;
+        for layer in &self.layers {
+            let linears: Vec<&Qwen35Linear> = match &layer.mixer {
+                Qwen35Mixer::Linear(mixer) => vec![
+                    &mixer.qkv_proj,
+                    &mixer.gate_proj,
+                    &mixer.beta_proj,
+                    &mixer.alpha_proj,
+                    &mixer.out_proj,
+                ],
+                Qwen35Mixer::Full(attention) => vec![
+                    &attention.q_proj,
+                    &attention.k_proj,
+                    &attention.v_proj,
+                    &attention.o_proj,
+                ],
+            };
+            all &= linears
+                .into_iter()
+                .chain([&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down])
+                .all(|linear| *linear.kquant_path() == Qwen35FastPath::Fused);
+        }
+        all && *self.output.kquant_path() == Qwen35FastPath::Fused
+    }
+
+    fn first_attention(&self) -> Result<&Qwen35FullAttention> {
+        self.layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                Qwen35Mixer::Full(attention) => Some(attention),
+                Qwen35Mixer::Linear(_) => None,
+            })
+            .ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 model has no full-attention layer".into())
+            })
     }
 
     /// Every projection: the layers' in order, then the LM head.
@@ -638,6 +742,18 @@ impl Qwen35TextModel {
         state: &mut Qwen35TextRuntimeState,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        if self.decode_graph.is_some() {
+            // Graph decode serves the one-row batch path.
+            return self
+                .forward_token_ids_batch_at_physical(
+                    &[token_id],
+                    &[position_ids],
+                    &mut [state],
+                    &mut [cache],
+                )?
+                .i((0, 0))
+                .map_err(Error::from);
+        }
         let input = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
         let hidden = self.token_embeddings.forward(&input)?;
         self.forward_hidden_to_logits_physical(&hidden, position_ids, state, cache)
@@ -741,44 +857,59 @@ impl Qwen35TextModel {
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<Tensor> {
-            let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
-            let mut hidden = self.token_embeddings.forward(&input)?;
-            let rope =
-                self.rope_table(first_full, position_ids, (batch_size, 1), hidden.dtype())?;
-            let mut physical_layer = 0usize;
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                let mut layer_states = states
-                    .iter_mut()
-                    .map(|state| &mut state.layers[layer_index])
-                    .collect::<Vec<_>>();
-                for state in layer_states.iter_mut() {
-                    layer.ensure_state_initialized(state, &self.device)?;
-                }
-                let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
-                hidden = layer.forward_physical_decode_batch(
-                    &hidden,
-                    &mut layer_states,
-                    position_ids,
-                    rope.as_ref(),
-                    &cache_refs,
+            if let (1, Some(graph)) = (batch_size, &self.decode_graph) {
+                let cache = &*caches[0];
+                // The graph's warm check: the standard decode on a copy of
+                // the row state, its writes collected and sealed apart.
+                let mut reference_state = states[0].clone();
+                let mut reference = || -> Result<Tensor> {
+                    let mut collector = KvWriteCompletionCollector::new(
+                        first.arena().config(),
+                        lowered.logical_slots(),
+                    )?;
+                    let logits = self.standard_decode_logits(
+                        token_ids,
+                        position_ids,
+                        &mut [&mut reference_state],
+                        &[cache],
+                        first_full,
+                        lowered.as_ref(),
+                        &metadata,
+                        &mut collector,
+                        sparse_layers.len(),
+                    );
+                    let sealed = collector.seal();
+                    let logits = logits?;
+                    sealed?;
+                    Ok(logits)
+                };
+                if let Some(logits) = graph.forward(
+                    self,
+                    token_ids[0],
+                    position_ids[0],
+                    slots[0],
+                    states[0],
+                    cache,
                     lowered.as_ref(),
                     &metadata,
                     &mut completions,
-                    &mut physical_layer,
-                )?;
-                validate_qwen35_finite_tensor(
-                    &hidden,
-                    layer_index,
-                    layer.decode_diagnostic_path(),
-                    self.finite_diagnostics_enabled,
-                )?;
+                    &mut reference,
+                )? {
+                    return Ok(logits);
+                }
             }
-            if physical_layer != sparse_layers.len() {
-                return Err(Error::InferenceError(
-                    "Qwen3.5 batched attention did not cover every sparse layer".into(),
-                ));
-            }
-            self.project_hidden_span(&hidden)
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            self.standard_decode_logits(
+                token_ids,
+                position_ids,
+                states,
+                &cache_refs,
+                first_full,
+                lowered.as_ref(),
+                &metadata,
+                &mut completions,
+                sparse_layers.len(),
+            )
         })();
         let logits = match execution {
             Ok(logits) => logits,
@@ -796,6 +927,61 @@ impl Qwen35TextModel {
             cache.commit_shared_completion(start_positions[row], 1, completion.clone())?;
         }
         Ok(logits)
+    }
+
+    /// The standard decode for `token_ids` (one per row): embedding, every
+    /// layer through the arena's attention, the final norm and the LM head.
+    /// Returns logits `[batch, 1, vocab]`.
+    #[allow(clippy::too_many_arguments)]
+    fn standard_decode_logits(
+        &self,
+        token_ids: &[u32],
+        position_ids: &[[usize; 3]],
+        states: &mut [&mut Qwen35TextRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+        first_full: &Qwen35FullAttention,
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        sparse_layers: usize,
+    ) -> Result<Tensor> {
+        let batch_size = token_ids.len();
+        let input = Tensor::from_slice(token_ids, (batch_size, 1), &self.device)?;
+        let mut hidden = self.token_embeddings.forward(&input)?;
+        let rope = self.rope_table(first_full, position_ids, (batch_size, 1), hidden.dtype())?;
+        let mut physical_layer = 0usize;
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let mut layer_states = states
+                .iter_mut()
+                .map(|state| &mut state.layers[layer_index])
+                .collect::<Vec<_>>();
+            for state in layer_states.iter_mut() {
+                layer.ensure_state_initialized(state, &self.device)?;
+            }
+            hidden = layer.forward_physical_decode_batch(
+                &hidden,
+                &mut layer_states,
+                position_ids,
+                rope.as_ref(),
+                caches,
+                slots,
+                metadata,
+                completions,
+                &mut physical_layer,
+            )?;
+            validate_qwen35_finite_tensor(
+                &hidden,
+                layer_index,
+                layer.decode_diagnostic_path(),
+                self.finite_diagnostics_enabled,
+            )?;
+        }
+        if physical_layer != sparse_layers {
+            return Err(Error::InferenceError(
+                "Qwen3.5 batched attention did not cover every sparse layer".into(),
+            ));
+        }
+        self.project_hidden_span(&hidden)
     }
 
     pub(crate) fn prefill_token_ids_physical(
@@ -1214,6 +1400,22 @@ impl Qwen35FullAttention {
                 cfg.rope_dimension_count.min(cfg.attention_key_length),
                 cfg.rope_freq_base,
             )?,
+            q_norm_gain: source
+                .dense(
+                    &format!("{prefix}.attn_q_norm.weight"),
+                    Some(DType::F32),
+                    device,
+                )?
+                .flatten_all()?,
+            k_norm_gain: source
+                .dense(
+                    &format!("{prefix}.attn_k_norm.weight"),
+                    Some(DType::F32),
+                    device,
+                )?
+                .flatten_all()?,
+            qk_norm_eps: cfg.attention_layer_norm_rms_epsilon,
+            graph_qk: None,
         })
     }
 
@@ -1320,13 +1522,41 @@ impl Qwen35FullAttention {
         }
         let [q_out, k_out, v_out] =
             forward_shared(hidden_states, [&self.q_proj, &self.k_proj, &self.v_proj])?;
+        let attended = self.decode_attend(
+            &q_out,
+            &k_out,
+            &v_out,
+            rope,
+            caches,
+            slots,
+            metadata,
+            completions,
+            physical_layer,
+        )?;
+        self.decode_output(&attended, &q_out)
+    }
+
+    /// The arena's attention for decode rows, from the q/k/v projection
+    /// outputs (`q_out` in the gated `[heads, 2 * head_dim]` layout): q/k
+    /// norms, RoPE, the KV write and the paged decode. Returns
+    /// `[batch, 1, heads * head_dim]` before the output gate.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_attend(
+        &self,
+        q_out: &Tensor,
+        k_out: &Tensor,
+        v_out: &Tensor,
+        rope: Option<&Qwen35RopeTable>,
+        caches: &[&PhysicalPagedKvCache],
+        slots: &dyn KvSlotMap,
+        metadata: &KvDecodeBatchMetadata,
+        completions: &mut KvWriteCompletionCollector,
+        physical_layer: usize,
+    ) -> Result<Tensor> {
+        let batch_size = q_out.dim(0)?;
+        let first = caches[0];
         let q_proj = q_out.reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
         let query_states = q_proj.narrow(3, 0, self.head_dim)?;
-        let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
         let key_states = k_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let value_states = v_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
@@ -1390,12 +1620,21 @@ impl Qwen35FullAttention {
             )
         })?;
         completions.collect(completion)?;
-        let output = output.to_dtype(output_dtype)?.reshape((
-            batch_size,
-            1,
-            self.num_heads * self.head_dim,
-        ))?;
-        let output = (&output * &ops::sigmoid(&gate)?)?;
+        output
+            .to_dtype(output_dtype)?
+            .reshape((batch_size, 1, self.num_heads * self.head_dim))
+            .map_err(Error::from)
+    }
+
+    /// Gate the attention output with the second half of each gated q head,
+    /// then project it back to the hidden size.
+    fn decode_output(&self, attended: &Tensor, q_out: &Tensor) -> Result<Tensor> {
+        let batch_size = attended.dim(0)?;
+        let gate = q_out
+            .reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?
+            .narrow(3, self.head_dim, self.head_dim)?
+            .reshape((batch_size, 1, self.num_heads * self.head_dim))?;
+        let output = (attended * &ops::sigmoid(&gate)?)?;
         self.o_proj.forward(&output)
     }
 

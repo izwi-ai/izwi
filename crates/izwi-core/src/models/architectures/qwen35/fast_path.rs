@@ -38,6 +38,8 @@ pub(crate) struct Qwen35CudaSwitches {
     pub(crate) fused_decode_off: Option<&'static str>,
     /// The izwi-owned K-quant MMVQ projections (`cuda.packed_projections`).
     pub(crate) kquant_off: Option<&'static str>,
+    /// Whole-step CUDA graph decode (`cuda.decode_graphs`).
+    pub(crate) graphs_off: Option<&'static str>,
 }
 
 impl Qwen35CudaSwitches {
@@ -61,6 +63,7 @@ impl Qwen35CudaSwitches {
                 performance.packed_projections,
                 "cuda.packed_projections=off",
             ),
+            graphs_off: off(performance.decode_graphs, "cuda.decode_graphs=off"),
         }
     }
 }

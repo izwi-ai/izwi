@@ -150,8 +150,14 @@ fn qwen35_local_decode_trace() {
         .ok()
         .filter(|profile| profile.kind != crate::backends::DeviceKind::Cpu)
         .unwrap_or_else(DeviceProfile::cpu);
-    let model = Qwen35ChatModel::load(&model_dir, trace_variant(&name), device.clone())
+    let mut model = Qwen35ChatModel::load(&model_dir, trace_variant(&name), device.clone())
         .expect("load checkpoint");
+    // IZWI_QWEN35_TRACE_EAGER_GRAPH=1 decodes through the CUDA graph's step
+    // body, run eagerly with the arena's attention (checks its composition
+    // off CUDA).
+    if std::env::var("IZWI_QWEN35_TRACE_EAGER_GRAPH").is_ok_and(|value| value == "1") {
+        model.exec.text_model.resolve_decode_graph(None, true);
+    }
     let text = &model.exec.text_model;
     let vocab = model.exec.tokenizer.vocab_size;
     let messages = vec![ChatMessage {
@@ -260,6 +266,7 @@ fn qwen35_local_decode_trace() {
         "median_decode_ms": median_decode_ms,
         "telemetry": text.telemetry().snapshot(),
         "gdn_decode": text.gdn_decode_summary(),
+        "decode_graph": text.decode_graph_summary(),
     });
     std::fs::write(&out, serde_json::to_string_pretty(&trace).expect("json")).expect("write");
     eprintln!(
