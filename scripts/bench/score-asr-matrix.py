@@ -13,7 +13,7 @@ import re
 import sys
 import unicodedata
 
-REFERENCES = {"fox": "data/fox.md", "test": "data/test.md"}
+REFERENCES = {"fox": "data/fox.md", "quietfox": "data/fox.md", "test": "data/test.md"}
 EMPTY_EXPECTED = {"silence", "noise"}
 
 

@@ -23,6 +23,7 @@ Options:
                       long600  first 600 s of data/ceo.mp3 (needs ffmpeg)
                       silence  10 s of digital silence, empty transcript expected (needs sox)
                       noise    10 s of pink noise, empty transcript expected (needs sox)
+                      quietfox data/fox.wav attenuated by 20 dB, must still transcribe (needs sox)
   --form <k=v>        Extra multipart field for every request (repeatable),
                       for example --form stream=true or --form max_tokens=256
   --language <code>   Language field (default: en; "none" omits it)
@@ -102,6 +103,10 @@ fixture_path() {
             [[ -f "${FIXTURE_DIR}/noise.wav" ]] || sox -n -r 16000 -c 1 -b 16 \
                 "${FIXTURE_DIR}/noise.wav" synth 10 pinknoise vol 0.05
             echo "${FIXTURE_DIR}/noise.wav" ;;
+        quietfox)
+            [[ -f "${FIXTURE_DIR}/quietfox.wav" ]] || sox "${ROOT}/data/fox.wav" \
+                "${FIXTURE_DIR}/quietfox.wav" vol -20dB
+            echo "${FIXTURE_DIR}/quietfox.wav" ;;
         *) echo "Unknown fixture: ${name}" >&2; return 1 ;;
     esac
 }
