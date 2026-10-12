@@ -224,9 +224,21 @@ pub(super) fn resource_plan(
             .ok_or_else(overflow)?,
     );
     plan.resident_authorization.host_bytes = ResourceAmount::Known(METADATA_RESERVE);
-    // The bounded graph cache is allocated lazily. Do not mark it physically
+    // The graph working memory is allocated lazily. Do not mark it physically
     // materialized before state/context fitting: that would let KV consume its
-    // headroom. Keeping this small claim pending is conservative after capture.
+    // headroom. It stays pending after capture too, on purpose. With graph
+    // decode planned (537,788,416 B for the 27B trunk), all but 64 MiB of it
+    // is three state slabs that decode steps allocate afresh (the next state,
+    // a pipelined step's, a verification scratch), so the claim must outlive
+    // the capture. A slab that commits becomes the row's state, which the
+    // managed lease records as materialized. Only the fixed part
+    // (`GRAPH_DECODE_FIXED_BYTES`: graph pools, the state table, the step
+    // buffer; or the 8 MiB region caches without graph decode) is held
+    // between steps and so is charged twice. Its pools live in the device's
+    // graph memory, which no per-model observation can measure, and
+    // recording an estimate could under-charge. The prefill dequantization
+    // scratch and chunk activations are likewise allocated per prefill chunk
+    // and freed after it, so they stay pending for the same reason.
     plan.deferred_resident_authorization.device_bytes = ResourceAmount::Known(deferred);
     tracing::info!(
         weights_bytes = weights,
