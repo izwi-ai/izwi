@@ -52,10 +52,14 @@ Phase 2 — fused decode in q35/
 - [ ] 13 P2: in-graph attention through the existing F16 kernels (`qk_norm_rope_kv`,
       `paged_decode_adaptive`) with casts, instead of new F32 kernels; fused add+RMSNorm
       later.
-- [ ] 14 K1: izwi-owned K-quant MMVQ through candle-kernels' FFI with project-owned scratch; one
-      input quantization per shared input. CUDA only, self-checked bit-exact against `QMatMul`.
-- [ ] 15 G1: whole-step CUDA graph for B = 1 (step buffer, DeltaNet state slabs through
-      `DeviceTable`, `with_graph_writes` attention, verify-before-replay, eager fallback).
+- [x] 14 K1 `d5d8e384`: izwi-owned K-quant MMVQ through candle-kernels' FFI, caller-owned Q8_1
+      activations, one quantization per shared input. CUDA only; self-checked bit-exact against
+      `QMatMul` at 1 and 3 rows; `IZWI_QWEN35_KQUANT=legacy`. Compile-checked only.
+- [x] 15 G1 `28f3eef8`: whole-step CUDA graph for B = 1, **opt-in** (`IZWI_QWEN35_CUDA_GRAPH=1`).
+      Step buffer, DeltaNet state slabs through `DeviceTable`, `with_graph_writes` + fused q/k
+      RoPE KV write + adaptive split decode (F16 casts). Warm check, two verifies, then replay;
+      eager fallback. The eager body matches main on Metal (0.8B). Capture is compile-checked
+      only.
 - [ ] 16 G0: parity harness with a tiny random GGUF. Meanwhile the opt-in real-checkpoint trace
       (`qwen35_local_decode_trace`) covers parity against main on Metal.
 
@@ -63,7 +67,26 @@ Verification so far: the opt-in trace on Metal through production loading. Qwen3
 DeltaNet layers fused) and Qwen3.5-4B (24/24) decode 32 greedy tokens identical to main, with top
 logits within 1.7e-5 / 4.4e-5. Base traces are kept locally in `target/traces/`.
 
-Phase 3 and later: as in the research doc (graphs, prefix reuse, batching, Metal, CPU, other GPUs).
+Phase 3 and later: as in the research doc (prefix reuse, batching, Metal, CPU, other GPUs).
+
+**Checks on the next H100 deploy** (none of the CUDA paths have run on a GPU yet):
+1. Load Qwen3.5-0.8B and -9B. In `/v1/admin` model diagnostics (`runtime_diagnostics`), expect:
+   - `gdn_decode.backend = fused` and `projections.backend = fused`;
+   - otherwise, `legacy_reasons` names the failed self-check.
+2. Fixed prompt in a new thread. Record the chat page's "t/s decode" and TTFT, and the SHA.
+   Compare with `IZWI_QWEN35_FUSED_DECODE=legacy IZWI_QWEN35_KQUANT=legacy`, which is the old
+   path.
+3. Opt-in graph: restart with `IZWI_QWEN35_CUDA_GRAPH=1`.
+   - `decode_graph.phase` should reach `replay`, with `captures = 1` and `verified = 2`, and
+     `replays` should grow.
+   - On failure it shows `legacy_reasons` and the step falls back to the standard decode.
+   - A sticky CUDA error (all later requests failing) means: restart without the flag and report
+     the log.
+4. Counters: `counters.sampler.device` should dominate. `sampling_host_reads / decode_tokens`
+   should be about 1. `scheduling.preferred_decode_tokens = 8`.
+
+Local verification lane: `qwen35_local_decode_trace` on Metal against the saved `main` traces, plus
+the placeholder-nvcc `cargo check/clippy --features cuda` (fake nvcc under `target/claude/`).
 
 # Plan — Qwen3.8-27B-FP8 load admission failure + inference performance — 2026-10-11
 
