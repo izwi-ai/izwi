@@ -5111,10 +5111,7 @@ impl RuntimeService {
                     model_for_shape.max_audio_seconds_hint(),
                     model_for_shape.audio_token_rate(),
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
+                    |secs| crate::runtime::asr::granite_asr_planned_max_tokens(&request, secs),
                 )?;
                 let long_form = crate::engine::qwen3_asr_requires_long_form(
                     &samples,

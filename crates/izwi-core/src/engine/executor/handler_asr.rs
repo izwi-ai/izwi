@@ -22,7 +22,10 @@ use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
 use crate::models::registry::{
     NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions, NativeAsrModel,
 };
-use crate::runtime::granite_auto_asr_max_tokens_for_duration;
+use crate::runtime::{
+    granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
+    invocation_decode_room,
+};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
@@ -3064,6 +3067,8 @@ impl NativeExecutor {
                 samples.len(),
                 sample_rate,
                 &Self::asr_generation_options(request),
+                self.asr_effective_context(variant)
+                    .zip(model.audio_token_rate()),
             );
             let Some(decode_state) = run_asr_model_call(request, || {
                 Self::run_blocking(|| {
@@ -7257,11 +7262,13 @@ impl NativeExecutor {
                     request.streaming,
                     matches!(family, ModelFamily::WhisperAsr),
                 );
+            let effective_context = self.asr_effective_context(variant);
+            let invocation_context = effective_context.zip(model.audio_token_rate());
             let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
                 model.max_audio_seconds_hint(),
                 model.audio_token_rate(),
-                self.asr_effective_context(variant),
-                |_| MAX_ASR_NEW_TOKENS,
+                effective_context,
+                |secs| asr_planned_decode_tokens(request, family, secs),
             )?;
             let chunk_plan = Self::asr_chunk_plan(
                 samples,
@@ -7293,6 +7300,7 @@ impl NativeExecutor {
                             chunk_audio.len(),
                             sr,
                             &generation_options,
+                            invocation_context,
                         );
                         let mut details = match route {
                             PhysicalAsrRoute::Qwen3 => {
@@ -7457,7 +7465,7 @@ impl NativeExecutor {
                             }
                         };
                         if matches!(family, ModelFamily::GraniteSpeechAsr) {
-                            details = Self::recover_granite_chunk_loop(
+                            details = Self::recover_granite_chunk(
                                 &model,
                                 chunk_audio,
                                 sr,
@@ -7468,6 +7476,7 @@ impl NativeExecutor {
                                 details,
                                 request,
                                 scheduled,
+                                invocation_context,
                             )?;
                         }
                         Ok(AsrChunkTranscription {
@@ -7494,6 +7503,7 @@ impl NativeExecutor {
                 samples.len(),
                 sample_rate,
                 &generation_options,
+                invocation_context,
             );
 
             if request.streaming {
@@ -7752,12 +7762,16 @@ impl NativeExecutor {
             .and_then(|registry| registry.effective_context(variant))
     }
 
+    /// `invocation_context` is the effective context and the family's audio
+    /// token rate, when both are known; Granite's automatic budget is clamped
+    /// to the decode room it leaves after the chunk's prompt.
     fn asr_chunk_generation_options(
         request: &EngineCoreRequest,
         family: ModelFamily,
         chunk_sample_count: usize,
         sample_rate: u32,
         base: &NativeAsrGenerationOptions,
+        invocation_context: Option<(usize, f32)>,
     ) -> NativeAsrGenerationOptions {
         let mut options = base.clone();
         if request.asr_auto_max_tokens
@@ -7765,8 +7779,11 @@ impl NativeExecutor {
             && sample_rate > 0
         {
             let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
-            options.max_new_tokens =
-                granite_auto_asr_max_tokens_for_duration(chunk_seconds).min(base.max_new_tokens);
+            let budget =
+                granite_asr_planned_max_tokens(request, chunk_seconds).min(base.max_new_tokens);
+            options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
+                budget.min(invocation_decode_room(context, rate, chunk_seconds))
+            });
         }
         options.max_new_tokens = options.max_new_tokens.max(1);
         options
@@ -7782,8 +7799,11 @@ impl NativeExecutor {
         recent_word_suffix(prefix_text, Self::granite_asr_prefix_replay_words())
     }
 
+    /// Recover a Granite chunk that stopped on its decode budget: a repetition
+    /// loop is re-decoded with a shorter budget and trimmed, and a plain
+    /// truncation is re-decoded once with a larger one.
     #[allow(clippy::too_many_arguments)]
-    fn recover_granite_chunk_loop(
+    fn recover_granite_chunk(
         model: &crate::models::registry::NativeAsrModel,
         chunk_audio: &[f32],
         sample_rate: u32,
@@ -7794,11 +7814,24 @@ impl NativeExecutor {
         mut details: crate::models::registry::NativeAsrTranscription,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
+        invocation_context: Option<(usize, f32)>,
     ) -> Result<crate::models::registry::NativeAsrTranscription> {
         let Some(original_loop) =
             granite_chunk_loop_signal(&details.text, details.diagnostics.as_ref())
         else {
-            return Ok(details);
+            return Self::retry_truncated_granite_chunk(
+                model,
+                chunk_audio,
+                sample_rate,
+                language,
+                asr_prompt,
+                prefix_text,
+                base_options,
+                details,
+                request,
+                scheduled,
+                invocation_context,
+            );
         };
         let retry_max_tokens = granite_loop_recovery_max_tokens(
             chunk_audio.len(),
@@ -7883,6 +7916,125 @@ impl NativeExecutor {
             Ok(details)
         }
     }
+
+    /// A chunk that spent its whole automatic budget without looping was cut
+    /// off mid-transcript, and the chunk overlap cannot recover a longer tail
+    /// (GRN-1). Re-decode it once at twice the budget. Greedy decoding replays
+    /// the same prefix, so the retry extends the original unless it
+    /// degenerates into a loop that cannot be trimmed.
+    #[allow(clippy::too_many_arguments)]
+    fn retry_truncated_granite_chunk(
+        model: &crate::models::registry::NativeAsrModel,
+        chunk_audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        asr_prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        base_options: &NativeAsrGenerationOptions,
+        mut details: crate::models::registry::NativeAsrTranscription,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        invocation_context: Option<(usize, f32)>,
+    ) -> Result<crate::models::registry::NativeAsrTranscription> {
+        if !granite_chunk_truncated(request.asr_auto_max_tokens, details.diagnostics.as_ref()) {
+            return Ok(details);
+        }
+        let original_max_tokens = base_options.max_new_tokens;
+        let chunk_seconds = if sample_rate > 0 {
+            chunk_audio.len() as f32 / sample_rate as f32
+        } else {
+            0.0
+        };
+        let prompt_tokens = details
+            .diagnostics
+            .as_ref()
+            .and_then(|value| value.get("prompt_tokens"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let decode_room = invocation_context.map(|(context, rate)| {
+            let planned = invocation_decode_room(context, rate, chunk_seconds);
+            prompt_tokens.map_or(planned, |prompt| {
+                planned.min(context.saturating_sub(prompt))
+            })
+        });
+        let Some(retry_max_tokens) = granite_truncation_retry_max_tokens(
+            original_max_tokens,
+            request.params.max_tokens,
+            decode_room,
+        ) else {
+            details.diagnostics = with_granite_truncation_retry_diagnostics(
+                details.diagnostics,
+                original_max_tokens,
+                None,
+                None,
+                false,
+                "not_retried_budget_ceiling",
+            );
+            return Ok(details);
+        };
+
+        let mut retry_options = base_options.clone();
+        retry_options.max_new_tokens = retry_max_tokens;
+        let mut retry = with_single_invocation_cache(request, scheduled, |cache| {
+            model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+                chunk_audio,
+                sample_rate,
+                language,
+                asr_prompt,
+                prefix_text,
+                retry_options,
+                cache,
+            )
+        })?;
+        let retry_stop_reason =
+            granite_decode_stop_reason(retry.diagnostics.as_ref()).map(str::to_owned);
+        let retry_loop = granite_chunk_loop_signal(&retry.text, retry.diagnostics.as_ref());
+        let retry_trim = retry_loop
+            .as_ref()
+            .and_then(|loop_signal| trim_granite_looping_chunk_text(&mut retry.text, loop_signal));
+        let use_retry =
+            !retry.text.trim().is_empty() && (retry_loop.is_none() || retry_trim.is_some());
+        if use_retry {
+            retry.diagnostics = with_granite_truncation_retry_diagnostics(
+                retry.diagnostics,
+                original_max_tokens,
+                Some(retry_max_tokens),
+                retry_stop_reason.as_deref(),
+                true,
+                if retry_trim.is_some() {
+                    "retry_selected_trimmed"
+                } else {
+                    "retry_selected"
+                },
+            );
+            Ok(retry)
+        } else {
+            details.diagnostics = with_granite_truncation_retry_diagnostics(
+                details.diagnostics,
+                original_max_tokens,
+                Some(retry_max_tokens),
+                retry_stop_reason.as_deref(),
+                false,
+                "retry_not_better",
+            );
+            Ok(details)
+        }
+    }
+}
+
+/// Decode budget the invocation solver plans an `audio_seconds` chunk with.
+/// Granite plans with the budget its chunks are decoded with (GRN-6); the
+/// other decoder-prompt families keep the shared reserve.
+fn asr_planned_decode_tokens(
+    request: &EngineCoreRequest,
+    family: ModelFamily,
+    audio_seconds: f32,
+) -> usize {
+    if matches!(family, ModelFamily::GraniteSpeechAsr) {
+        granite_asr_planned_max_tokens(request, audio_seconds)
+    } else {
+        MAX_ASR_NEW_TOKENS
+    }
 }
 
 fn recent_word_suffix(text: &str, max_words: usize) -> String {
@@ -7911,18 +8063,39 @@ impl GranitePhraseLoop {
     }
 }
 
+fn granite_decode_stop_reason(diagnostics: Option<&serde_json::Value>) -> Option<&str> {
+    diagnostics
+        .and_then(|value| value.pointer("/decode/stop_reason"))
+        .and_then(|value| value.as_str())
+}
+
 fn granite_chunk_loop_signal(
     text: &str,
     diagnostics: Option<&serde_json::Value>,
 ) -> Option<GranitePhraseLoop> {
-    if diagnostics
-        .and_then(|value| value.pointer("/decode/stop_reason"))
-        .and_then(|value| value.as_str())
-        != Some("max_tokens")
-    {
+    if granite_decode_stop_reason(diagnostics) != Some("max_tokens") {
         return None;
     }
     repeated_phrase_loop(text)
+}
+
+/// Whether a loop-free Granite chunk was cut off by its automatic budget. A
+/// caller's explicit `max_tokens` is a cap the executor must honour.
+fn granite_chunk_truncated(auto_max_tokens: bool, diagnostics: Option<&serde_json::Value>) -> bool {
+    auto_max_tokens && granite_decode_stop_reason(diagnostics) == Some("max_tokens")
+}
+
+/// Budget for the one re-decode of a truncated Granite chunk: twice the
+/// original, within the request ceiling and the decode room the invocation
+/// context leaves. `None` when no larger budget fits.
+fn granite_truncation_retry_max_tokens(
+    original_max_tokens: usize,
+    ceiling: usize,
+    decode_room: Option<usize>,
+) -> Option<usize> {
+    let doubled = original_max_tokens.saturating_mul(2).min(ceiling);
+    let retry = decode_room.map_or(doubled, |room| doubled.min(room));
+    (retry > original_max_tokens).then_some(retry)
 }
 
 fn repeated_phrase_loop(text: &str) -> Option<GranitePhraseLoop> {
@@ -8113,6 +8286,34 @@ fn with_granite_loop_recovery_diagnostics(
                     "original_words": trim.original_words,
                     "trimmed_words": trim.trimmed_words,
                 })),
+            }),
+        );
+    }
+    Some(diagnostics)
+}
+
+fn with_granite_truncation_retry_diagnostics(
+    diagnostics: Option<serde_json::Value>,
+    original_max_tokens: usize,
+    retry_max_tokens: Option<usize>,
+    retry_stop_reason: Option<&str>,
+    selected_retry: bool,
+    decision: &str,
+) -> Option<serde_json::Value> {
+    let mut diagnostics = diagnostics.unwrap_or_else(|| json!({}));
+    if !diagnostics.is_object() {
+        diagnostics = json!({ "model_diagnostics": diagnostics });
+    }
+    if let Some(root) = diagnostics.as_object_mut() {
+        root.insert(
+            "chunk_truncation_retry".to_string(),
+            json!({
+                "triggered": true,
+                "decision": decision,
+                "selected_retry": selected_retry,
+                "original_max_new_tokens": original_max_tokens,
+                "retry_max_new_tokens": retry_max_tokens,
+                "retry_stop_reason": retry_stop_reason,
             }),
         );
     }
@@ -8713,9 +8914,10 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
-        assert_eq!(options.max_new_tokens, 84);
+        assert_eq!(options.max_new_tokens, 200);
     }
 
     #[test]
@@ -8735,9 +8937,10 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
-        assert_eq!(options.max_new_tokens, 84);
+        assert_eq!(options.max_new_tokens, 200);
         assert!(options.max_new_tokens < request.params.max_tokens);
     }
 
@@ -8758,9 +8961,123 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
         assert_eq!(options.max_new_tokens, 2048);
+    }
+
+    #[test]
+    fn granite_auto_chunk_budget_is_clamped_to_the_context_room() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+        let options = |context: Option<(usize, f32)>| {
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::GraniteSpeechAsr,
+                16_000 * 60,
+                16_000,
+                &base,
+                context,
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(options(None), 400);
+        assert_eq!(options(Some((4_096, 10.0))), 400);
+        // 600 - 128 text reserve - 600 audio tokens leaves nothing: one token.
+        assert_eq!(options(Some((600, 10.0))), 1);
+        // 1000 - 128 - 600 leaves 272 decode tokens.
+        assert_eq!(options(Some((1_000, 10.0))), 272);
+    }
+
+    #[test]
+    fn granite_invocation_solver_plans_with_the_granite_budget() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::GraniteSpeechAsr, 300.0),
+            2_000
+        );
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::Qwen3Asr, 300.0),
+            super::MAX_ASR_NEW_TOKENS
+        );
+
+        // A single streaming segment must leave room for the budget it will
+        // be decoded with: 300 s would need 128 + 3,000 + 2,000 tokens.
+        let limit = crate::runtime::compose_invocation_audio_limit(
+            Some(540.0),
+            Some(10.0),
+            Some(4_096),
+            |secs| super::asr_planned_decode_tokens(&request, ModelFamily::GraniteSpeechAsr, secs),
+        )
+        .unwrap()
+        .unwrap();
+        assert!((237.0..=239.0).contains(&limit), "unexpected limit {limit}");
+    }
+
+    #[test]
+    fn granite_truncated_chunk_retries_once_at_double_budget_within_context() {
+        let max_tokens = serde_json::json!({ "decode": { "stop_reason": "max_tokens" } });
+        let stopped = serde_json::json!({ "decode": { "stop_reason": "stop_token" } });
+        assert!(super::granite_chunk_truncated(true, Some(&max_tokens)));
+        assert!(!super::granite_chunk_truncated(false, Some(&max_tokens)));
+        assert!(!super::granite_chunk_truncated(true, Some(&stopped)));
+        assert!(!super::granite_chunk_truncated(true, None));
+
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(3_668)),
+            Some(400)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, None),
+            Some(400)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(250)),
+            Some(250)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 300, None),
+            Some(300)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(200)),
+            None
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(2048, 2048, None),
+            None
+        );
+    }
+
+    #[test]
+    fn granite_truncation_retry_diagnostics_record_the_decision() {
+        let diagnostics = super::with_granite_truncation_retry_diagnostics(
+            Some(serde_json::json!({ "decode": { "stop_reason": "stop_token" } })),
+            200,
+            Some(400),
+            Some("stop_token"),
+            true,
+            "retry_selected",
+        )
+        .unwrap();
+
+        let retry = &diagnostics["chunk_truncation_retry"];
+        assert_eq!(retry["decision"], "retry_selected");
+        assert_eq!(retry["selected_retry"], true);
+        assert_eq!(retry["original_max_new_tokens"], 200);
+        assert_eq!(retry["retry_max_new_tokens"], 400);
+        assert_eq!(retry["retry_stop_reason"], "stop_token");
+        assert_eq!(diagnostics["decode"]["stop_reason"], "stop_token");
     }
 
     #[test]

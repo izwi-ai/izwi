@@ -134,10 +134,12 @@ impl OwnedAsrAudioInput {
     }
 }
 
-const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
+/// IBM's plain-ASR decode budget (`ibm-granite/granite-speech`): 200 new
+/// tokens per 30 s window, never less than one window. It covers punctuated
+/// German at about 1.7 tokens per word.
+const GRANITE_ASR_AUTO_TOKENS_PER_WINDOW: f64 = 200.0;
+const GRANITE_ASR_AUTO_WINDOW_SECONDS: f64 = 30.0;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
-const GRANITE_ASR_AUTO_BASE_SECONDS: f32 = 28.0;
-const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
 const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
 const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
@@ -194,9 +196,8 @@ pub(crate) fn solve_invocation_audio_limit(
         return InvocationAudioLimit::Infeasible;
     }
     let fits = |secs: f32| -> bool {
-        let audio_tokens = (secs * audio_token_rate).ceil() as usize;
         text_reserve_tokens
-            .saturating_add(audio_tokens)
+            .saturating_add(invocation_audio_tokens(secs, audio_token_rate))
             .saturating_add(decode_budget_for_duration(secs))
             <= context_tokens
     };
@@ -221,6 +222,23 @@ pub(crate) fn solve_invocation_audio_limit(
         }
     }
     InvocationAudioLimit::Limited(low)
+}
+
+fn invocation_audio_tokens(audio_seconds: f32, audio_token_rate: f32) -> usize {
+    (audio_seconds * audio_token_rate).ceil() as usize
+}
+
+/// Decode tokens `context_tokens` leaves after the prompt of an
+/// `audio_seconds` invocation, under the demand model the chunk planner
+/// solves with (text reserve plus audio tokens at the family's rate).
+pub(crate) fn invocation_decode_room(
+    context_tokens: usize,
+    audio_token_rate: f32,
+    audio_seconds: f32,
+) -> usize {
+    context_tokens.saturating_sub(ASR_TEXT_PROMPT_TOKEN_RESERVE.saturating_add(
+        invocation_audio_tokens(audio_seconds.max(0.0), audio_token_rate),
+    ))
 }
 
 /// Compose the family's audio-seconds hint with the invocation-context budget:
@@ -290,17 +308,31 @@ fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVa
     .then_some(variant)
 }
 
+/// IBM's automatic Granite budget, `ceil(200 * max(1, secs / 30))` tokens.
+/// Callers bound it by the request ceiling and the invocation context.
 pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
-    let duration_budget =
-        if audio_seconds.is_finite() && audio_seconds > GRANITE_ASR_AUTO_BASE_SECONDS {
-            ((audio_seconds - GRANITE_ASR_AUTO_BASE_SECONDS) * GRANITE_ASR_AUTO_TOKENS_PER_SECOND)
-                .ceil() as usize
-        } else {
-            0
-        };
-    GRANITE_ASR_AUTO_MIN_TOKENS
-        .saturating_add(duration_budget)
-        .clamp(GRANITE_ASR_AUTO_MIN_TOKENS, GRANITE_ASR_AUTO_MAX_TOKENS)
+    let windows = if audio_seconds.is_finite() {
+        (f64::from(audio_seconds) / GRANITE_ASR_AUTO_WINDOW_SECONDS).max(1.0)
+    } else {
+        1.0
+    };
+    (GRANITE_ASR_AUTO_TOKENS_PER_WINDOW * windows).ceil() as usize
+}
+
+/// Decode budget Granite plans an invocation of `audio_seconds` with: the
+/// automatic duration budget under the request ceiling, or the caller's own
+/// `max_tokens`. Chunk planning and per-chunk decoding share it, so a planned
+/// chunk always leaves room for the budget it is decoded with.
+pub(crate) fn granite_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        granite_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
+    } else {
+        ceiling
+    }
 }
 
 fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
@@ -5402,14 +5434,55 @@ mod tests {
     }
 
     #[test]
-    fn granite_auto_asr_budget_scales_with_audio_duration() {
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(28.0), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 204);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(600.0), 2048);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(1200.0), 2048);
+    fn granite_auto_asr_budget_follows_the_ibm_reference_formula() {
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(30.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(31.0), 207);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 400);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(540.0), 3_600);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(f32::NAN), 200);
+    }
+
+    #[test]
+    fn granite_planned_asr_budget_honours_the_request_ceiling() {
+        let granite = ModelVariant::GraniteSpeech412BPlus;
+        let mut auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut auto, granite, None);
+        assert_eq!(granite_asr_planned_max_tokens(&auto, 3.0), 200);
+        assert_eq!(granite_asr_planned_max_tokens(&auto, 60.0), 400);
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto, 540.0),
+            GRANITE_ASR_AUTO_MAX_TOKENS
+        );
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut explicit, granite, Some(96));
+        assert_eq!(granite_asr_planned_max_tokens(&explicit, 60.0), 96);
+    }
+
+    #[test]
+    fn invocation_decode_room_matches_the_planner_demand_model() {
+        // 30 s at 10 tokens/s: the 128-token text reserve and 300 audio tokens
+        // leave 3,668 of 4,096 for decoding; a small context leaves none.
+        assert_eq!(invocation_decode_room(4_096, 10.0, 30.0), 3_668);
+        assert_eq!(invocation_decode_room(400, 10.0, 30.0), 0);
+
+        // At the solved single-pass limit Granite's budget still fits the room.
+        let InvocationAudioLimit::Limited(limit) = solve_invocation_audio_limit(
+            4_096,
+            10.0,
+            ASR_TEXT_PROMPT_TOKEN_RESERVE,
+            granite_auto_asr_max_tokens_for_duration,
+        ) else {
+            panic!("a 4096-token context must admit Granite audio");
+        };
+        assert!((237.0..=239.0).contains(&limit), "unexpected limit {limit}");
+        assert!(
+            granite_auto_asr_max_tokens_for_duration(limit)
+                <= invocation_decode_room(4_096, 10.0, limit)
+        );
     }
 
     #[test]

@@ -405,70 +405,37 @@ fn granite_dense_decode_initial_capacity(
     prompt_tokens.saturating_add(max_new_tokens.max(1))
 }
 
-fn granite_deferred_stop_check_enabled(
-    device: &Device,
-    decode_each_step: bool,
-    max_new_tokens: usize,
-) -> bool {
+fn granite_deferred_stop_check_enabled(decode_each_step: bool) -> bool {
     if decode_each_step {
         return false;
     }
     let override_enabled = std::env::var("IZWI_GRANITE_DEFER_STOP_CHECK")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    let default_max_tokens = std::env::var("IZWI_GRANITE_DEFER_STOP_MAX_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    granite_deferred_stop_check_policy(
-        device.is_metal(),
-        override_enabled,
-        max_new_tokens.max(1),
-        default_max_tokens,
-    )
+    granite_deferred_stop_check_policy(override_enabled)
 }
 
-fn granite_deferred_stop_check_policy(
-    is_metal: bool,
-    override_enabled: Option<bool>,
-    max_new_tokens: usize,
-    default_max_tokens: usize,
-) -> bool {
-    override_enabled.unwrap_or(is_metal && max_new_tokens <= default_max_tokens)
+/// Deferring the stop check to the end of the decode runs the whole budget
+/// even when the transcript ends after a few tokens (GRN-3), so it is opt-in.
+fn granite_deferred_stop_check_policy(override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(false)
 }
 
-fn granite_chunked_stop_check_enabled(
-    device: &Device,
-    decode_each_step: bool,
-    max_new_tokens: usize,
-) -> bool {
+fn granite_chunked_stop_check_enabled(device: &Device, decode_each_step: bool) -> bool {
     if decode_each_step {
         return false;
     }
     let override_enabled = std::env::var("IZWI_GRANITE_CHUNKED_STOP_CHECK")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    let default_max_tokens = std::env::var("IZWI_GRANITE_CHUNKED_STOP_MAX_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    granite_chunked_stop_check_policy(
-        device.is_metal(),
-        override_enabled,
-        max_new_tokens.max(1),
-        default_max_tokens,
-    )
+    granite_chunked_stop_check_policy(device.is_metal(), override_enabled)
 }
 
-fn granite_chunked_stop_check_policy(
-    is_metal: bool,
-    override_enabled: Option<bool>,
-    max_new_tokens: usize,
-    default_max_tokens: usize,
-) -> bool {
-    override_enabled.unwrap_or(is_metal && max_new_tokens <= default_max_tokens)
+/// Metal syncs on every token read, so it checks for the stop token once per
+/// interval instead, whatever the budget: a decode runs at most one interval
+/// past its stop token.
+fn granite_chunked_stop_check_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
 }
 
 fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
@@ -1008,10 +975,9 @@ impl GraniteSpeechRuntime {
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
         let decode_each_step = emit_deltas || !stop_sequences.is_empty();
-        let deferred_stop_check =
-            granite_deferred_stop_check_enabled(&self.device, decode_each_step, max_steps);
+        let deferred_stop_check = granite_deferred_stop_check_enabled(decode_each_step);
         let chunked_stop_check = !deferred_stop_check
-            && granite_chunked_stop_check_enabled(&self.device, decode_each_step, max_steps);
+            && granite_chunked_stop_check_enabled(&self.device, decode_each_step);
         let stop_check_interval = if chunked_stop_check {
             granite_chunked_stop_check_interval(max_steps)
         } else {
@@ -5227,42 +5193,18 @@ mod tests {
     }
 
     #[test]
-    fn deferred_stop_check_policy_defaults_to_short_metal_decodes() {
-        assert!(granite_deferred_stop_check_policy(true, None, 76, 128));
-        assert!(!granite_deferred_stop_check_policy(true, None, 129, 128));
-        assert!(!granite_deferred_stop_check_policy(false, None, 76, 128));
-        assert!(granite_deferred_stop_check_policy(
-            false,
-            Some(true),
-            4096,
-            128
-        ));
-        assert!(!granite_deferred_stop_check_policy(
-            true,
-            Some(false),
-            76,
-            128
-        ));
+    fn deferred_stop_check_is_opt_in_only() {
+        assert!(!granite_deferred_stop_check_policy(None));
+        assert!(!granite_deferred_stop_check_policy(Some(false)));
+        assert!(granite_deferred_stop_check_policy(Some(true)));
     }
 
     #[test]
-    fn chunked_stop_check_policy_defaults_to_short_metal_decodes() {
-        assert!(granite_chunked_stop_check_policy(true, None, 76, 128));
-        assert!(granite_chunked_stop_check_policy(true, None, 128, 128));
-        assert!(!granite_chunked_stop_check_policy(true, None, 129, 128));
-        assert!(!granite_chunked_stop_check_policy(false, None, 76, 128));
-        assert!(granite_chunked_stop_check_policy(
-            false,
-            Some(true),
-            4096,
-            128
-        ));
-        assert!(!granite_chunked_stop_check_policy(
-            true,
-            Some(false),
-            76,
-            128
-        ));
+    fn chunked_stop_check_is_the_metal_default_for_every_budget() {
+        assert!(granite_chunked_stop_check_policy(true, None));
+        assert!(!granite_chunked_stop_check_policy(false, None));
+        assert!(granite_chunked_stop_check_policy(false, Some(true)));
+        assert!(!granite_chunked_stop_check_policy(true, Some(false)));
     }
 
     #[test]
