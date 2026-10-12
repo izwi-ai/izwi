@@ -98,8 +98,59 @@ pub struct Qwen3AsrModel {
 pub(crate) struct Qwen3AsrPhysicalStateSpec {
     pub(crate) retained: crate::kv::v2::InferenceStateContract,
     pub(crate) retained_max_tokens: usize,
+    /// Context one sequence or invocation may occupy. It bounds the prepared
+    /// inputs and the invocation KV, so load publishes no larger context.
+    pub(crate) sequence_tokens: usize,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: crate::kv::v2::InferenceStateContract,
+}
+
+/// How load bounds Qwen3-ASR decoder state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen3AsrContextBound {
+    /// The operator configured the context: state keeps the model's native
+    /// bound and the shared fitter applies the configured value.
+    Configured,
+    /// The automatic ASR ceiling, with retained KV for this many concurrent
+    /// sequences.
+    Automatic { retained_rows: usize },
+}
+
+/// Chunk planners cut audio at 95% of the solved invocation limit
+/// (`NativeExecutor::asr_chunk_plan`), so a full chunk needs a limit of
+/// `chunk / 0.95` seconds.
+const QWEN3_ASR_PLANNED_CHUNK_FRACTION: f32 = 0.95;
+
+/// Tokens one Qwen3-ASR invocation is planned with (QASR-1). No request
+/// decodes more than one chunk at a time: input longer than the long-form
+/// chunk is split, and the planners fit each chunk with a text-prompt
+/// reserve, its audio tokens and a decode reserve. This is the smallest
+/// context at which every planner still admits a full chunk.
+fn qwen3_asr_sequence_ceiling(audio_token_rate: f32, max_chunk_secs: f32) -> usize {
+    let planned_secs = max_chunk_secs / QWEN3_ASR_PLANNED_CHUNK_FRACTION;
+    // Preparation plans single-pass input with the default generation budget;
+    // chunk execution decodes at most the transcription cap.
+    let decode_reserve = crate::models::registry::NativeAsrGenerationOptions::default()
+        .max_new_tokens
+        .max(DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS);
+    crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE
+        .saturating_add((planned_secs * audio_token_rate).ceil() as usize)
+        .saturating_add(decode_reserve)
+}
+
+/// `(sequence, retained)` token bounds for the automatic ASR ceiling: one
+/// planned chunk per sequence, and one per concurrent sequence in the shared
+/// retained pool, never above the model's native context.
+fn qwen3_asr_automatic_context(
+    native_tokens: usize,
+    sequence_ceiling: usize,
+    retained_rows: usize,
+) -> (usize, usize) {
+    let sequence = sequence_ceiling.min(native_tokens);
+    let retained = sequence
+        .saturating_mul(retained_rows.max(1))
+        .min(native_tokens);
+    (sequence, retained)
 }
 
 fn qwen3_asr_state_dtype(dtype: DType) -> Result<StateDType> {
@@ -522,6 +573,19 @@ impl Qwen3AsrModel {
     pub(crate) fn managed_inference_state_contract(
         &self,
     ) -> Result<crate::kv::v2::InferenceStateContract> {
+        let max_sequence = self.text_context_tokens.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR text config is missing max_position_embeddings; prepared decoder inputs cannot be bounded"
+                    .to_string(),
+            )
+        })?;
+        self.managed_inference_state_contract_for_sequence(max_sequence)
+    }
+
+    fn managed_inference_state_contract_for_sequence(
+        &self,
+        max_sequence: usize,
+    ) -> Result<crate::kv::v2::InferenceStateContract> {
         let contract = self.text_model.managed_inference_state_contract(
             crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
@@ -529,18 +593,22 @@ impl Qwen3AsrModel {
             // Managed prefix reuse is chat-task-gated; ASR never shares.
             false,
         )?;
-        let max_sequence = self.text_context_tokens.ok_or_else(|| {
-            Error::ModelLoadError(
-                "Qwen3 ASR text config is missing max_position_embeddings; prepared decoder inputs cannot be bounded"
-                    .to_string(),
-            )
-        })?;
         qwen3_asr_retained_state_contract(
             contract,
             max_sequence,
             self.text_model.hidden_size(),
             self.text_dtype,
         )
+    }
+
+    /// Automatic per-sequence context: one planned long-form chunk, which
+    /// also bounds the single-pass route because longer input is chunked.
+    fn automatic_asr_sequence_tokens(&self) -> usize {
+        let long_form_secs = izwi_asr_toolkit::AsrLongFormConfig::default().hard_max_chunk_secs;
+        let max_chunk_secs = self
+            .max_audio_seconds_hint()
+            .map_or(long_form_secs, |hint| hint.min(long_form_secs));
+        qwen3_asr_sequence_ceiling(self.audio_token_rate(), max_chunk_secs)
     }
 
     /// Author the retained streaming state and invocation-only offline state
@@ -550,24 +618,39 @@ impl Qwen3AsrModel {
     /// physical row of an atomic graph. Native streaming continues to use the
     /// scheduler-owned retained cache. Qwen3-ForcedAligner uses its cacheless
     /// NAR head and therefore seals an explicitly stateless descriptor.
+    ///
+    /// The model's native context (65,536 tokens) would size both KV arenas
+    /// and every prepared-input row for requests that need about 1K tokens,
+    /// so the automatic bound is one planned chunk per sequence (QASR-1,
+    /// ADM-6). A configured context keeps the native bound.
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
+        bound: Qwen3AsrContextBound,
     ) -> Result<Qwen3AsrPhysicalStateSpec> {
         if self.is_forced_aligner {
             return Err(Error::ModelLoadError(
                 "Qwen3-ForcedAligner does not own autoregressive ASR state".to_string(),
             ));
         }
-        let max_tokens = self.text_context_tokens.ok_or_else(|| {
+        let native_tokens = self.text_context_tokens.ok_or_else(|| {
             Error::ModelLoadError(
                 "Qwen3 ASR text config is missing max_position_embeddings; an exact invocation KV capacity cannot be sealed"
                     .to_string(),
             )
         })?;
+        let (sequence_tokens, retained_max_tokens) = match bound {
+            Qwen3AsrContextBound::Configured => (native_tokens, native_tokens),
+            Qwen3AsrContextBound::Automatic { retained_rows } => qwen3_asr_automatic_context(
+                native_tokens,
+                self.automatic_asr_sequence_tokens(),
+                retained_rows,
+            ),
+        };
         qwen3_asr_physical_state_spec(
-            &self.managed_inference_state_contract()?,
-            max_tokens,
+            &self.managed_inference_state_contract_for_sequence(sequence_tokens)?,
+            sequence_tokens,
+            retained_max_tokens,
             stage_graphs,
         )
     }
@@ -576,6 +659,7 @@ impl Qwen3AsrModel {
 fn qwen3_asr_physical_state_spec(
     retained: &crate::kv::v2::InferenceStateContract,
     max_tokens: usize,
+    retained_max_tokens: usize,
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<Qwen3AsrPhysicalStateSpec> {
     if stage_graphs.is_empty() {
@@ -697,8 +781,9 @@ fn qwen3_asr_physical_state_spec(
     }
     Ok(Qwen3AsrPhysicalStateSpec {
         retained: retained.clone(),
-        retained_max_tokens: usize::try_from(max_tokens).map_err(|_| {
-            Error::ModelLoadError("Qwen3 ASR retained context exceeds usize".to_string())
+        retained_max_tokens,
+        sequence_tokens: usize::try_from(max_tokens).map_err(|_| {
+            Error::ModelLoadError("Qwen3 ASR sequence context exceeds usize".to_string())
         })?,
         descriptor,
         invocation: invocation_contract,
@@ -4842,8 +4927,8 @@ mod tests {
         let retained =
             qwen3_asr_retained_state_contract(crate::kv::test_contract(), 4096, 256, DType::F32)
                 .expect("retained ASR state");
-        let spec =
-            qwen3_asr_physical_state_spec(&retained, 4096, &graphs).expect("physical ASR spec");
+        let spec = qwen3_asr_physical_state_spec(&retained, 4096, 4096, &graphs)
+            .expect("physical ASR spec");
 
         assert!(matches!(
             spec.descriptor.retained,
@@ -4898,6 +4983,169 @@ mod tests {
                     .count()
             );
         }
+    }
+
+    #[test]
+    fn qwen_asr_automatic_context_is_one_planned_chunk_per_sequence() {
+        // 128-token text reserve, ceil(30 s / 0.95 * 13) audio tokens and the
+        // 768-token planning decode reserve.
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        assert_eq!(ceiling, 128 + 411 + 768);
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 8),
+            (ceiling, 8 * ceiling)
+        );
+        // Many CUDA rows or a small native context never exceed the native bound.
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 96),
+            (ceiling, 65_536)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(1_024, ceiling, 8),
+            (1_024, 1_024)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 0),
+            (ceiling, ceiling)
+        );
+    }
+
+    #[test]
+    fn qwen_asr_ceiling_admits_a_full_chunk_on_every_planner() {
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        let chunk = vec![0.0_f32; 30 * 16_000];
+        // Preparation plans with the default generation budget, execution
+        // with the transcription cap; both must keep a 30 s input whole.
+        for decode_budget in [
+            crate::models::registry::NativeAsrGenerationOptions::default().max_new_tokens,
+            DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS,
+        ] {
+            let limit = crate::runtime::compose_invocation_audio_limit(
+                Some(120.0),
+                Some(13.0),
+                Some(ceiling),
+                |_| decode_budget,
+            )
+            .expect("the ceiling admits a planned chunk");
+            assert!(
+                !crate::engine::qwen3_asr_requires_long_form(&chunk, 16_000, limit),
+                "a 30 s input must stay one chunk with a {decode_budget}-token budget"
+            );
+        }
+
+        // The exact 30 s prompt plus the 512-token decode cap fits a sequence.
+        let frontend = qwen3_asr_frontend_geometry(
+            30 * 16_000,
+            16_000,
+            16_000,
+            400,
+            160,
+            false,
+            false,
+            12_000,
+        )
+        .unwrap();
+        let audio_tokens = audio::get_cnn_output_lengths(&[frontend.mel_frames])[0];
+        assert_eq!(audio_tokens, 391);
+        let prompt = build_qwen_asr_prompt_tokens(
+            &test_specials(Some(7)),
+            audio_tokens,
+            Some("english"),
+            None,
+            encode_prompt_piece_for_test,
+        )
+        .unwrap();
+        assert!(prompt.ids.len() + DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS <= ceiling);
+    }
+
+    #[test]
+    fn qwen_asr_automatic_ceiling_shrinks_state_for_shipped_geometry() {
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        // Qwen3-ASR 0.6B and 1.7B share the decoder KV geometry: 28 layers
+        // of 8 KV heads at head_dim 128, stored as F16 on Metal.
+        let domain = StateDomainSpec::PagedAttention(
+            crate::models::architectures::qwen3::core::qwen3_decoder_cache_domain(
+                crate::models::architectures::qwen3::core::Qwen3DecoderCacheGeometry {
+                    domain: StateDomainId::new(1),
+                    clock: StateClock::DecoderTokens,
+                    num_layers: 28,
+                    num_query_heads: 16,
+                    num_kv_heads: 8,
+                    key_head_dim: 128,
+                    value_head_dim: 128,
+                    sliding_window: None,
+                    storage_dtype: DType::F16,
+                    preferred_page_tokens: 64,
+                    prefix: PrefixPolicy::Disabled,
+                },
+            )
+            .unwrap(),
+        );
+        let token_bytes = 28 * 8 * (128 + 128) * 2;
+        let kv_bytes =
+            |tokens: usize| qwen3_asr_invocation_workspace_bytes(&domain, tokens as u64).unwrap();
+        // 7 GiB at the native context; 1,344 page-rounded tokens at the ceiling.
+        assert_eq!(kv_bytes(65_536), 65_536 * token_bytes);
+        assert_eq!(kv_bytes(ceiling), 1_344 * token_bytes);
+        assert!(kv_bytes(ceiling) * 48 < kv_bytes(65_536));
+        // Eight retained rows still need under a sixth of the native pool.
+        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        assert!(kv_bytes(retained) * 6 < kv_bytes(65_536));
+
+        // Prepared-input rows: F16 embeddings plus I64 MRoPE positions, for
+        // the 0.6B (hidden 1024) and 1.7B (hidden 2048) decoders.
+        for hidden in [1_024_usize, 2_048] {
+            let row_bytes = |max_sequence: usize| {
+                let contract = qwen3_asr_retained_state_contract(
+                    crate::kv::test_contract(),
+                    max_sequence,
+                    hidden,
+                    DType::F16,
+                )
+                .unwrap();
+                negotiate_state_plan(
+                    &contract,
+                    &StateBackendPlanRequest {
+                        backend: BackendKind::Cpu,
+                        device_ordinal: None,
+                        page_tokens_hint: Some(16),
+                        storage_dtype_hint: Some(StateDType::F16),
+                    },
+                )
+                .unwrap()
+                .non_paged[0]
+                    .maximum_bytes()
+            };
+            let expected = |tokens: usize| (tokens * (hidden * 2 + 3 * 8)) as u64;
+            assert_eq!(row_bytes(ceiling), expected(ceiling));
+            assert_eq!(row_bytes(65_536), expected(65_536));
+            assert!(row_bytes(ceiling) * 50 < row_bytes(65_536));
+        }
+    }
+
+    #[test]
+    fn qwen_asr_physical_spec_bounds_invocation_by_the_sequence_context() {
+        let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
+        let graphs = vec![offline.as_slice()];
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let retained = qwen3_asr_retained_state_contract(
+            crate::kv::test_contract(),
+            sequence,
+            256,
+            DType::F32,
+        )
+        .expect("retained ASR state");
+        let spec = qwen3_asr_physical_state_spec(&retained, sequence, retained_max, &graphs)
+            .expect("physical ASR spec");
+
+        assert_eq!(spec.sequence_tokens, ceiling);
+        assert_eq!(spec.retained_max_tokens, 8 * ceiling);
+        assert_eq!(
+            spec.descriptor
+                .capacity_axis_bounds(crate::kv::v2::StateCapacityAxis::DecoderContext),
+            Some((1, ceiling as u64))
+        );
     }
 
     #[test]

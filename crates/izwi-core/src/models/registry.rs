@@ -72,7 +72,8 @@ use crate::models::architectures::parakeet::asr::{
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
-    Qwen3AsrAudioBatchRow, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec, Qwen3AsrPreparedAudio,
+    Qwen3AsrAudioBatchRow, Qwen3AsrContextBound, Qwen3AsrModel, Qwen3AsrPhysicalStateSpec,
+    Qwen3AsrPreparedAudio,
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
@@ -1872,9 +1873,10 @@ impl NativeAsrModel {
     pub(crate) fn qwen3_physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
+        bound: Qwen3AsrContextBound,
     ) -> Result<Qwen3AsrPhysicalStateSpec> {
         match self {
-            Self::Qwen3(model) => model.physical_state_spec(stage_graphs),
+            Self::Qwen3(model) => model.physical_state_spec(stage_graphs, bound),
             _ => Err(Error::ModelLoadError(
                 "non-Qwen ASR model cannot author Qwen3 physical state".to_string(),
             )),

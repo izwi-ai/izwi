@@ -25,6 +25,7 @@ use crate::kv::v2::{
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
+use crate::models::architectures::qwen3::asr::Qwen3AsrContextBound;
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::models::shared::weights::gguf::TensorStorageInventory;
@@ -2159,7 +2160,18 @@ impl ModelLifecycleController {
                             .iter()
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
-                        let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
+                        // A configured context wins; otherwise Qwen3-ASR bounds
+                        // its state by one planned chunk per sequence.
+                        let context_bound =
+                            if self.config.max_sequence_length.explicit_tokens().is_some() {
+                                Qwen3AsrContextBound::Configured
+                            } else {
+                                Qwen3AsrContextBound::Automatic {
+                                    retained_rows: self.core_engine.config().max_retained_sequences,
+                                }
+                            };
+                        let physical_spec =
+                            loaded.qwen3_physical_state_spec(&stage_graphs, context_bound)?;
                         let retained_max_tokens = physical_spec.retained_max_tokens;
                         let physical = self
                             .core_engine
@@ -2170,9 +2182,13 @@ impl ModelLifecycleController {
                                 2,
                             )
                             .await?;
+                        // The retained pool serves several sequences, but one
+                        // sequence or invocation never exceeds its own bound.
                         self.model_registry.publish_effective_context(
                             variant,
-                            physical.logical_token_reach(),
+                            physical
+                                .logical_token_reach()
+                                .min(physical_spec.sequence_tokens as u64),
                         )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
