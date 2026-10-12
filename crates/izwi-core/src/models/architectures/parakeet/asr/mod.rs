@@ -38,20 +38,47 @@ pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GR
 use preprocessor::ParakeetPreprocessor;
 
 const SAMPLE_RATE: u32 = 16_000;
-const ENCODER_LAYERS: usize = 24;
-const ENCODER_DIM: usize = 1024;
-const ENCODER_HEADS: usize = 8;
-const ENCODER_HEAD_DIM: usize = ENCODER_DIM / ENCODER_HEADS;
-const FF_DIM: usize = ENCODER_DIM * 4;
 const PRED_HIDDEN: usize = 640;
-const CONV_SUB_CHANNELS: usize = 256;
-const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
 pub(crate) const PARAKEET_RETAINED_PREFILL_STAGE: &str = "asr.prefill.parakeet.predictor";
 pub(crate) const PARAKEET_RETAINED_DECODE_STAGE: &str = "asr.decode.parakeet.joint";
 pub(crate) const PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
+
+/// FastConformer encoder geometry. `V3` is parakeet-tdt-0.6b-v3; tests build
+/// tiny random encoders from smaller values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderGeometry {
+    mel_bins: usize,
+    subsampling_channels: usize,
+    layers: usize,
+    dim: usize,
+    heads: usize,
+    ff_dim: usize,
+    conv_kernel: usize,
+}
+
+impl EncoderGeometry {
+    const V3: Self = Self {
+        mel_bins: 128,
+        subsampling_channels: 256,
+        layers: 24,
+        dim: 1024,
+        heads: 8,
+        ff_dim: 4096,
+        conv_kernel: 9,
+    };
+
+    const fn head_dim(self) -> usize {
+        self.dim / self.heads
+    }
+
+    /// Mel bins left after the three stride-2 subsampling convolutions.
+    fn subsampled_mel_bins(self) -> usize {
+        subsampled_len_3x(self.mel_bins)
+    }
+}
 
 pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
@@ -275,12 +302,14 @@ impl ParakeetAsrModel {
         } else {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
-        let (features, feature_frames, _) = self
-            .preprocessor
-            .compute_features_with_upload_timing(&mono)?;
+        let log_mel = self.preprocessor.compute_log_mel(&mono)?;
+        let feature_frames = log_mel.valid_frames();
+        let features =
+            log_mel.normalize_and_upload(0..log_mel.frames(), self.preprocessor.device())?;
         let mut timings = ParakeetTimings::default();
         let (encoded, encoded_len) =
             self.network
+                .encoder
                 .encode_with_timings(&features, feature_frames, &mut timings)?;
         if encoded_len == 0 {
             return Err(Error::InferenceError(
@@ -797,15 +826,17 @@ impl ParakeetAsrModel {
         timings.resample_ms = elapsed_ms(resample_started);
 
         let feature_started = Instant::now();
-        let (features, feature_frames, feature_upload_ms) = self
-            .preprocessor
-            .compute_features_with_upload_timing(&mono_16khz)?;
-        let feature_prepare_ms = elapsed_ms(feature_started);
-        timings.feature_upload_ms = feature_upload_ms;
-        timings.feature_extract_ms = (feature_prepare_ms - feature_upload_ms).max(0.0);
+        let log_mel = self.preprocessor.compute_log_mel(&mono_16khz)?;
+        let feature_frames = log_mel.valid_frames();
+        timings.feature_extract_ms = elapsed_ms(feature_started);
+        let upload_started = Instant::now();
+        let features =
+            log_mel.normalize_and_upload(0..log_mel.frames(), self.preprocessor.device())?;
+        timings.feature_upload_ms = elapsed_ms(upload_started);
 
         let (encoded, encoded_len) =
             self.network
+                .encoder
                 .encode_with_timings(&features, feature_frames, &mut timings)?;
 
         let mut token_ids = Vec::<usize>::new();
@@ -855,7 +886,8 @@ impl ParakeetAsrModel {
 
         let diagnostics = parakeet_diagnostics_json(
             &self.variant,
-            &features,
+            self.preprocessor.device(),
+            self.network.encoder.geometry,
             &timings,
             &decode_counters,
             sample_rate,
@@ -902,7 +934,8 @@ fn select_device_for_parakeet(device_profile: &DeviceProfile) -> Device {
 
 fn parakeet_diagnostics_json(
     variant: &ModelVariant,
-    features: &Tensor,
+    device: &Device,
+    geometry: EncoderGeometry,
     timings: &ParakeetTimings,
     decode: &ParakeetDecodeCounters,
     input_sample_rate: u32,
@@ -940,18 +973,18 @@ fn parakeet_diagnostics_json(
             "max_symbols_per_frame": max_symbols,
         },
         "execution": {
-            "device_kind": parakeet_device_kind(features.device()),
-            "encoder_layers": ENCODER_LAYERS,
-            "encoder_dim": ENCODER_DIM,
-            "encoder_heads": ENCODER_HEADS,
-            "encoder_head_dim": ENCODER_HEAD_DIM,
-            "conformer_conv_kernel": CONV_KERNEL_1D,
-            "depthwise_conv1d_groups": ENCODER_DIM,
-            "subsampling_channels": CONV_SUB_CHANNELS,
-            "metal_softmax_last_dim": features.device().is_metal(),
-            "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(features.device()),
-            "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(features.device()),
-            "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(features.device()),
+            "device_kind": parakeet_device_kind(device),
+            "encoder_layers": geometry.layers,
+            "encoder_dim": geometry.dim,
+            "encoder_heads": geometry.heads,
+            "encoder_head_dim": geometry.head_dim(),
+            "conformer_conv_kernel": geometry.conv_kernel,
+            "depthwise_conv1d_groups": geometry.dim,
+            "subsampling_channels": geometry.subsampling_channels,
+            "metal_softmax_last_dim": device.is_metal(),
+            "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(device),
+            "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
+            "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(device),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -985,8 +1018,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 }
 
 struct ParakeetNetwork {
-    pre_encode: ConvSubsamplingDw,
-    layers: Vec<ConformerLayer>,
+    encoder: ParakeetEncoder,
     predictor: Predictor,
     joint: Joint,
     blank_idx: usize,
@@ -995,58 +1027,24 @@ struct ParakeetNetwork {
 
 impl ParakeetNetwork {
     fn load(vb: &VarBuilder) -> Result<Self> {
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"))?;
-
-        let mut layers = Vec::with_capacity(ENCODER_LAYERS);
-        for idx in 0..ENCODER_LAYERS {
-            layers.push(ConformerLayer::load(
-                vb.pp(format!("encoder.layers.{idx}")),
-            )?);
-        }
-
+        let encoder = ParakeetEncoder::load(vb.pp("encoder"), EncoderGeometry::V3)?;
         let predictor = Predictor::load(vb.pp("decoder.prediction"))?;
-        let joint = Joint::load(vb.pp("joint"), ENCODER_DIM, predictor.blank_idx + 1)?;
+        let joint = Joint::load(
+            vb.pp("joint"),
+            encoder.geometry.dim,
+            predictor.blank_idx + 1,
+        )?;
 
         let blank_idx = predictor.blank_idx;
         let num_durations = joint.num_durations;
 
         Ok(Self {
-            pre_encode,
-            layers,
+            encoder,
             predictor,
             joint,
             blank_idx,
             num_durations,
         })
-    }
-
-    fn encode(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
-        let mut timings = ParakeetTimings::default();
-        self.encode_with_timings(features, feature_frames, &mut timings)
-    }
-
-    fn encode_with_timings(
-        &self,
-        features: &Tensor,
-        feature_frames: usize,
-        timings: &mut ParakeetTimings,
-    ) -> Result<(Tensor, usize)> {
-        let pre_encode_started = Instant::now();
-        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
-        timings.pre_encode_ms = elapsed_ms(pre_encode_started);
-
-        let pos_started = Instant::now();
-        let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, ENCODER_DIM, x.device())?;
-        timings.pos_emb_ms = elapsed_ms(pos_started);
-
-        let layers_started = Instant::now();
-        for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb)?;
-        }
-        timings.encoder_layers_ms = elapsed_ms(layers_started);
-
-        Ok((x, encoded_len))
     }
 
     fn decode_tdt_greedy(
@@ -1214,6 +1212,50 @@ impl ParakeetNetwork {
     }
 }
 
+struct ParakeetEncoder {
+    geometry: EncoderGeometry,
+    pre_encode: ConvSubsamplingDw,
+    layers: Vec<ConformerLayer>,
+}
+
+impl ParakeetEncoder {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry)?;
+        let layers = (0..geometry.layers)
+            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            geometry,
+            pre_encode,
+            layers,
+        })
+    }
+
+    fn encode_with_timings(
+        &self,
+        features: &Tensor,
+        feature_frames: usize,
+        timings: &mut ParakeetTimings,
+    ) -> Result<(Tensor, usize)> {
+        let pre_encode_started = Instant::now();
+        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
+        timings.pre_encode_ms = elapsed_ms(pre_encode_started);
+
+        let pos_started = Instant::now();
+        let pos_len = x.dim(1)?;
+        let pos_emb = build_rel_positional_embedding(pos_len, self.geometry.dim, x.device())?;
+        timings.pos_emb_ms = elapsed_ms(pos_started);
+
+        let layers_started = Instant::now();
+        for layer in &self.layers {
+            x = layer.forward(&x, &pos_emb)?;
+        }
+        timings.encoder_layers_ms = elapsed_ms(layers_started);
+
+        Ok((x, encoded_len))
+    }
+}
+
 fn text_delta(previous: &str, current: &str) -> String {
     if let Some(delta) = current.strip_prefix(previous) {
         return delta.to_string();
@@ -1236,7 +1278,8 @@ struct ConvSubsamplingDw {
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let channels = geometry.subsampling_channels;
         let stride_cfg = Conv2dConfig {
             stride: 2,
             padding: 1,
@@ -1248,30 +1291,22 @@ impl ConvSubsamplingDw {
             ..Default::default()
         };
 
-        let conv0 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, stride_cfg, vb.pp("conv.0"))?;
+        let conv0 = mlx::load_conv2d(1, channels, 3, stride_cfg, vb.pp("conv.0"))?;
 
         let mut dw_stride_cfg = stride_cfg;
-        dw_stride_cfg.groups = CONV_SUB_CHANNELS;
+        dw_stride_cfg.groups = channels;
         // Depthwise conv tensors are shaped [out_channels, in_channels/groups, k, k].
         // For groups=channels this second dimension is 1.
-        let conv2 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, dw_stride_cfg, vb.pp("conv.2"))?;
-        let conv3 = mlx::load_conv2d(
-            CONV_SUB_CHANNELS,
-            CONV_SUB_CHANNELS,
-            1,
-            point_cfg,
-            vb.pp("conv.3"),
-        )?;
-        let conv5 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, dw_stride_cfg, vb.pp("conv.5"))?;
-        let conv6 = mlx::load_conv2d(
-            CONV_SUB_CHANNELS,
-            CONV_SUB_CHANNELS,
-            1,
-            point_cfg,
-            vb.pp("conv.6"),
-        )?;
+        let conv2 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.2"))?;
+        let conv3 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.3"))?;
+        let conv5 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.5"))?;
+        let conv6 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.6"))?;
 
-        let out = mlx::load_linear(CONV_SUB_CHANNELS * 16, ENCODER_DIM, vb.pp("out"))?;
+        let out = mlx::load_linear(
+            channels * geometry.subsampled_mel_bins(),
+            geometry.dim,
+            vb.pp("out"),
+        )?;
 
         Ok(Self {
             conv0,
@@ -1350,20 +1385,21 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let norm_ff1 = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward1"))?;
-        let ff1 = FeedForward::load(vb.pp("feed_forward1"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let dim = geometry.dim;
+        let norm_ff1 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward1"))?;
+        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry)?;
 
-        let norm_self_att = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_self_att"))?;
-        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"))?;
+        let norm_self_att = layer_norm(dim, 1e-5, vb.pp("norm_self_att"))?;
+        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry)?;
 
-        let norm_conv = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"))?;
+        let norm_conv = layer_norm(dim, 1e-5, vb.pp("norm_conv"))?;
+        let conv = ConformerConv::load(vb.pp("conv"), geometry)?;
 
-        let norm_ff2 = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward2"))?;
-        let ff2 = FeedForward::load(vb.pp("feed_forward2"))?;
+        let norm_ff2 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward2"))?;
+        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry)?;
 
-        let norm_out = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_out"))?;
+        let norm_out = layer_norm(dim, 1e-5, vb.pp("norm_out"))?;
 
         Ok(Self {
             norm_ff1,
@@ -1407,9 +1443,9 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let linear1 = mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?;
-        let linear2 = mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let linear1 = mlx::load_linear_no_bias(geometry.dim, geometry.ff_dim, vb.pp("linear1"))?;
+        let linear2 = mlx::load_linear_no_bias(geometry.ff_dim, geometry.dim, vb.pp("linear2"))?;
         Ok(Self { linear1, linear2 })
     }
 
@@ -1423,6 +1459,7 @@ impl FeedForward {
 }
 
 struct ConformerConv {
+    dim: usize,
     pointwise_conv1: Conv1d,
     depthwise_conv: Conv1d,
     folded_depthwise_weight: Tensor,
@@ -1432,40 +1469,42 @@ struct ConformerConv {
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let dim = geometry.dim;
         let pointwise_conv1 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM * 2,
+            dim,
+            dim * 2,
             1,
             Conv1dConfig::default(),
             vb.pp("pointwise_conv1"),
         )?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM,
-            CONV_KERNEL_1D,
+            dim,
+            dim,
+            geometry.conv_kernel,
             Conv1dConfig {
-                padding: (CONV_KERNEL_1D - 1) / 2,
-                groups: ENCODER_DIM,
+                padding: (geometry.conv_kernel - 1) / 2,
+                groups: dim,
                 ..Default::default()
             },
             vb.pp("depthwise_conv"),
         )?;
 
-        let batch_norm = batch_norm(ENCODER_DIM, 1e-5, vb.pp("batch_norm"))?;
+        let batch_norm = batch_norm(dim, 1e-5, vb.pp("batch_norm"))?;
         let (folded_depthwise_weight, folded_depthwise_bias) =
             fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
 
         let pointwise_conv2 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM,
+            dim,
+            dim,
             1,
             Conv1dConfig::default(),
             vb.pp("pointwise_conv2"),
         )?;
 
         Ok(Self {
+            dim,
             pointwise_conv1,
             depthwise_conv,
             folded_depthwise_weight,
@@ -1480,8 +1519,8 @@ impl ConformerConv {
         let mut x = x.transpose(1, 2)?;
 
         x = self.pointwise_conv1.forward(&x)?;
-        let x_a = x.i((.., ..ENCODER_DIM, ..))?;
-        let x_b = x.i((.., ENCODER_DIM.., ..))?;
+        let x_a = x.i((.., ..self.dim, ..))?;
+        let x_b = x.i((.., self.dim.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
         if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
@@ -1541,6 +1580,8 @@ fn fold_depthwise_conv1d_batch_norm(
 }
 
 struct RelPosSelfAttention {
+    heads: usize,
+    head_dim: usize,
     linear_q: Linear,
     linear_k: Linear,
     linear_v: Linear,
@@ -1551,18 +1592,22 @@ struct RelPosSelfAttention {
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let linear_q = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_q"))?;
-        let linear_k = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_k"))?;
-        let linear_v = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_v"))?;
-        let linear_out = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_out"))?;
-        let linear_pos = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_pos"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry) -> Result<Self> {
+        let dim = geometry.dim;
+        let (heads, head_dim) = (geometry.heads, geometry.head_dim());
+        let linear_q = mlx::load_linear_no_bias(dim, dim, vb.pp("linear_q"))?;
+        let linear_k = mlx::load_linear_no_bias(dim, dim, vb.pp("linear_k"))?;
+        let linear_v = mlx::load_linear_no_bias(dim, dim, vb.pp("linear_v"))?;
+        let linear_out = mlx::load_linear_no_bias(dim, dim, vb.pp("linear_out"))?;
+        let linear_pos = mlx::load_linear_no_bias(dim, dim, vb.pp("linear_pos"))?;
 
         // In Parakeet checkpoints these are direct tensors under self_attn.*.
-        let pos_bias_u = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?;
-        let pos_bias_v = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?;
+        let pos_bias_u = vb.get((heads, head_dim), "pos_bias_u")?;
+        let pos_bias_v = vb.get((heads, head_dim), "pos_bias_v")?;
 
         Ok(Self {
+            heads,
+            head_dim,
             linear_q,
             linear_k,
             linear_v,
@@ -1574,39 +1619,36 @@ impl RelPosSelfAttention {
     }
 
     fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
-        let (b, t, _d) = x.dims3()?;
+        let (b, t, d) = x.dims3()?;
+        let (heads, head_dim) = (self.heads, self.head_dim);
 
         let q = self
             .linear_q
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?; // [B, H, T, Dh]
         let k = self
             .linear_k
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let v = self
             .linear_v
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
 
         let p = self
             .linear_pos
             .forward(pos_emb)?
-            .reshape((1, 2 * t - 1, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((1, 2 * t - 1, heads, head_dim))?
             .transpose(1, 2)?; // [1, H, 2T-1, Dh]
 
-        let pos_bias_u = self
-            .pos_bias_u
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
-        let pos_bias_v = self
-            .pos_bias_v
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
+        let pos_bias_u = self.pos_bias_u.reshape((1, heads, 1, head_dim))?;
+        let pos_bias_v = self.pos_bias_v.reshape((1, heads, 1, head_dim))?;
 
         let q_u = q.broadcast_add(&pos_bias_u)?;
         let q_v = q.broadcast_add(&pos_bias_v)?;
@@ -1619,7 +1661,7 @@ impl RelPosSelfAttention {
 
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
-            .affine(1.0 / (ENCODER_HEAD_DIM as f64).sqrt(), 0.0)?;
+            .affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
         let scores = if scores.is_contiguous() {
             scores
         } else {
@@ -1628,7 +1670,7 @@ impl RelPosSelfAttention {
         let attn = ops::softmax_last_dim(&scores)?;
 
         let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, t, ENCODER_DIM))?;
+        let out = out.transpose(1, 2)?.reshape((b, t, d))?;
 
         self.linear_out
             .forward(&out)
@@ -2147,16 +2189,143 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         argmax_1d, parakeet_encoded_len_for_samples, parakeet_max_emittable_tokens,
-        ConvSubsamplingDw, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetNetwork,
-        ParakeetPreparedEncoderArtifact, ParakeetPreprocessor, ParakeetRetainedDecodeBatchRow,
-        ParakeetRetainedDecodeStep, Predictor, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+        subsampled_len_3x, EncoderGeometry, Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder,
+        ParakeetEncoder, ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
+        DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
     use crate::error::Error;
     use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
-    use candle_nn::{Conv2d, Conv2dConfig, Linear};
+    use candle_nn::{Linear, VarBuilder};
+
+    /// Small enough to run on CPU in milliseconds; two layers keep conv edge
+    /// effects within 4 × 2 + 1 frames of a window boundary.
+    const TINY: EncoderGeometry = EncoderGeometry {
+        mel_bins: 16,
+        subsampling_channels: 4,
+        layers: 2,
+        dim: 32,
+        heads: 4,
+        ff_dim: 64,
+        conv_kernel: 9,
+    };
+
+    /// xorshift64: unstructured values, so a wrong index cannot cancel out.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next_unit(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+
+        fn values(&mut self, len: usize, scale: f32, offset: f32) -> Vec<f32> {
+            (0..len)
+                .map(|_| offset + scale * self.next_unit())
+                .collect()
+        }
+    }
+
+    struct RandomWeights<'a> {
+        rng: XorShift,
+        device: &'a Device,
+        tensors: HashMap<String, Tensor>,
+    }
+
+    impl RandomWeights<'_> {
+        fn put(&mut self, name: String, shape: &[usize], scale: f32, offset: f32) {
+            let values = self.rng.values(shape.iter().product(), scale, offset);
+            let tensor = Tensor::from_vec(values, shape, self.device).unwrap();
+            self.tensors.insert(name, tensor);
+        }
+
+        fn put_weight(&mut self, name: String, shape: &[usize], fan_in: usize) {
+            self.put(name, shape, 1.0 / (fan_in as f32).sqrt(), 0.0);
+        }
+    }
+
+    /// A NeMo-layout encoder checkpoint with random weights, loaded through
+    /// the production loaders.
+    fn random_encoder(geometry: EncoderGeometry, seed: u64, device: &Device) -> ParakeetEncoder {
+        let (c, d, ff, k) = (
+            geometry.subsampling_channels,
+            geometry.dim,
+            geometry.ff_dim,
+            geometry.conv_kernel,
+        );
+        let mut weights = RandomWeights {
+            rng: XorShift(seed),
+            device,
+            tensors: HashMap::new(),
+        };
+        for (conv, shape) in [
+            ("conv.0", [c, 1, 3, 3]),
+            ("conv.2", [c, 1, 3, 3]),
+            ("conv.3", [c, c, 1, 1]),
+            ("conv.5", [c, 1, 3, 3]),
+            ("conv.6", [c, c, 1, 1]),
+        ] {
+            let fan_in = shape[1] * shape[2] * shape[3];
+            weights.put_weight(format!("pre_encode.{conv}.weight"), &shape, fan_in);
+            weights.put(format!("pre_encode.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        let subsampled = c * geometry.subsampled_mel_bins();
+        weights.put_weight("pre_encode.out.weight".into(), &[d, subsampled], subsampled);
+        weights.put("pre_encode.out.bias".into(), &[d], 0.1, 0.0);
+        for layer in 0..geometry.layers {
+            let prefix = format!("layers.{layer}");
+            for norm in [
+                "norm_feed_forward1",
+                "norm_self_att",
+                "norm_conv",
+                "norm_feed_forward2",
+                "norm_out",
+            ] {
+                weights.put(format!("{prefix}.{norm}.weight"), &[d], 0.1, 1.0);
+                weights.put(format!("{prefix}.{norm}.bias"), &[d], 0.1, 0.0);
+            }
+            for ffn in ["feed_forward1", "feed_forward2"] {
+                weights.put_weight(format!("{prefix}.{ffn}.linear1.weight"), &[ff, d], d);
+                weights.put_weight(format!("{prefix}.{ffn}.linear2.weight"), &[d, ff], ff);
+            }
+            let attention = format!("{prefix}.self_attn");
+            for projection in [
+                "linear_q",
+                "linear_k",
+                "linear_v",
+                "linear_out",
+                "linear_pos",
+            ] {
+                weights.put_weight(format!("{attention}.{projection}.weight"), &[d, d], d);
+            }
+            for bias in ["pos_bias_u", "pos_bias_v"] {
+                let shape = [geometry.heads, geometry.head_dim()];
+                weights.put(format!("{attention}.{bias}"), &shape, 0.1, 0.0);
+            }
+            let conv = format!("{prefix}.conv");
+            weights.put_weight(format!("{conv}.pointwise_conv1.weight"), &[2 * d, d, 1], d);
+            weights.put_weight(format!("{conv}.depthwise_conv.weight"), &[d, 1, k], k);
+            weights.put(format!("{conv}.batch_norm.weight"), &[d], 0.1, 1.0);
+            weights.put(format!("{conv}.batch_norm.bias"), &[d], 0.1, 0.0);
+            weights.put(format!("{conv}.batch_norm.running_mean"), &[d], 0.1, 0.0);
+            weights.put(format!("{conv}.batch_norm.running_var"), &[d], 0.25, 1.0);
+            weights.put_weight(format!("{conv}.pointwise_conv2.weight"), &[d, d, 1], d);
+        }
+        let vb = VarBuilder::from_tensors(weights.tensors, DType::F32, device);
+        ParakeetEncoder::load(vb, geometry).unwrap()
+    }
+
+    fn random_features(mel_bins: usize, frames: usize, seed: u64, device: &Device) -> Tensor {
+        let values = XorShift(seed).values(mel_bins * frames, 1.0, 0.0);
+        Tensor::from_vec(values, (1, mel_bins, frames), device).unwrap()
+    }
 
     fn zero_lstm(device: &Device) -> LstmCell {
         LstmCell {
@@ -2176,19 +2345,10 @@ mod tests {
         }
     }
 
-    const FORCED_ENCODER_DIM: usize = 3;
-
     /// A model whose joint always emits label 0 with duration 0, so every
-    /// encoder frame emits exactly `max_symbols` labels. The encoder is a
-    /// placeholder: the retained decode only reads the prepared artifact.
+    /// encoder frame emits exactly `max_symbols` labels. The retained decode
+    /// only reads the prepared artifact, never the encoder.
     fn forced_label_model(device: &Device) -> ParakeetAsrModel {
-        let placeholder_conv = || {
-            Conv2d::new(
-                Tensor::zeros((1, 1, 1, 1), DType::F32, device).unwrap(),
-                None,
-                Conv2dConfig::default(),
-            )
-        };
         let predictor = zero_predictor(device);
         let joint = Joint {
             pred: Linear::new(
@@ -2196,7 +2356,7 @@ mod tests {
                 None,
             ),
             enc: Linear::new(
-                Tensor::zeros((PRED_HIDDEN, FORCED_ENCODER_DIM), DType::F32, device).unwrap(),
+                Tensor::zeros((PRED_HIDDEN, TINY.dim), DType::F32, device).unwrap(),
                 None,
             ),
             // Labels [0, 1, blank] then durations [0, 1].
@@ -2215,15 +2375,7 @@ mod tests {
             decoder: ParakeetDecoder::Vocab(vec!["\u{2581}a".into(), "\u{2581}b".into()]),
             preprocessor: ParakeetPreprocessor::for_tests(device.clone()),
             network: ParakeetNetwork {
-                pre_encode: ConvSubsamplingDw {
-                    conv0: placeholder_conv(),
-                    conv2: placeholder_conv(),
-                    conv3: placeholder_conv(),
-                    conv5: placeholder_conv(),
-                    conv6: placeholder_conv(),
-                    out: Linear::new(Tensor::zeros((1, 1), DType::F32, device).unwrap(), None),
-                },
-                layers: Vec::new(),
+                encoder: random_encoder(TINY, 1, device),
                 predictor,
                 joint,
                 blank_idx,
@@ -2237,8 +2389,7 @@ mod tests {
 
     fn zero_artifact(device: &Device, encoded_len: usize) -> ParakeetPreparedEncoderArtifact {
         ParakeetPreparedEncoderArtifact {
-            encoded: Tensor::zeros((1, encoded_len, FORCED_ENCODER_DIM), DType::F32, device)
-                .unwrap(),
+            encoded: Tensor::zeros((1, encoded_len, TINY.dim), DType::F32, device).unwrap(),
             encoded_len,
             input_samples: encoded_len * 1280,
             input_sample_rate: 16_000,
@@ -2327,6 +2478,23 @@ mod tests {
         assert_eq!(steps.last().unwrap().tokens_generated, bound);
         assert_eq!(steps.len(), bound);
         assert!(diagnostics.get("stop_reason").is_none());
+    }
+
+    #[test]
+    fn tiny_random_encoder_follows_its_geometry() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 7, &device);
+        let (frames, valid) = (203, 202);
+        let features = random_features(TINY.mel_bins, frames, 9, &device);
+
+        let (encoded, encoded_len) = encoder
+            .encode_with_timings(&features, valid, &mut ParakeetTimings::default())
+            .unwrap();
+
+        assert_eq!(encoded.dims(), &[1, subsampled_len_3x(frames), TINY.dim]);
+        assert_eq!(encoded_len, subsampled_len_3x(valid));
+        let values = encoded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 
     #[test]

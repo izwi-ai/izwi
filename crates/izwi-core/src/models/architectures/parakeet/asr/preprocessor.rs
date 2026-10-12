@@ -1,5 +1,5 @@
+use std::ops::Range;
 use std::path::Path;
-use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -130,16 +130,12 @@ impl ParakeetPreprocessor {
         }
     }
 
-    pub fn compute_features(&self, audio: &[f32]) -> Result<(Tensor, usize)> {
-        let (features, valid_frames, _upload_ms) =
-            self.compute_features_with_upload_timing(audio)?;
-        Ok((features, valid_frames))
+    pub(super) fn device(&self) -> &Device {
+        &self.device
     }
 
-    pub fn compute_features_with_upload_timing(
-        &self,
-        audio: &[f32],
-    ) -> Result<(Tensor, usize, f64)> {
+    /// Host log-mel spectrogram, before per_feature normalization.
+    pub(super) fn compute_log_mel(&self, audio: &[f32]) -> Result<ParakeetLogMel> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
@@ -197,30 +193,86 @@ impl ParakeetPreprocessor {
             }
         }
 
-        let valid_frames = valid_feature_frames(audio.len());
+        Ok(ParakeetLogMel {
+            mel,
+            n_mels: self.n_mels,
+            frames: frame_count,
+            valid_frames: valid_feature_frames(audio.len()).min(frame_count),
+        })
+    }
+}
+
+/// Row-major `[n_mels, frames]` log-mel spectrogram before per_feature
+/// normalization. The STFT emits more frames than `valid_frames`; NeMo masks
+/// those padding frames to zero after normalizing.
+pub(super) struct ParakeetLogMel {
+    mel: Vec<f32>,
+    n_mels: usize,
+    frames: usize,
+    valid_frames: usize,
+}
+
+impl ParakeetLogMel {
+    #[cfg(test)]
+    pub(super) fn from_parts(
+        mel: Vec<f32>,
+        n_mels: usize,
+        frames: usize,
+        valid_frames: usize,
+    ) -> Self {
+        assert_eq!(mel.len(), n_mels * frames);
+        assert!(valid_frames <= frames);
+        Self {
+            mel,
+            n_mels,
+            frames,
+            valid_frames,
+        }
+    }
+
+    pub(super) const fn frames(&self) -> usize {
+        self.frames
+    }
+
+    pub(super) const fn valid_frames(&self) -> usize {
+        self.valid_frames
+    }
+
+    /// Normalizes the `columns` slice per feature over its own valid frames,
+    /// zeroes its padding frames and uploads it as `[1, n_mels, columns]`.
+    /// The full range reproduces NeMo's whole-utterance normalization.
+    pub(super) fn normalize_and_upload(
+        &self,
+        columns: Range<usize>,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let width = columns.len();
+        if width == 0 || columns.end > self.frames {
+            return Err(Error::InvalidInput(format!(
+                "Parakeet feature columns {columns:?} are outside {} frames",
+                self.frames
+            )));
+        }
+        let mut window = Vec::with_capacity(self.n_mels * width);
+        for row in self.mel.chunks_exact(self.frames) {
+            window.extend_from_slice(&row[columns.clone()]);
+        }
+        let valid = self
+            .valid_frames
+            .min(columns.end)
+            .saturating_sub(columns.start);
 
         // normalize per_feature (along time)
-        normalize_per_feature(
-            &mut mel,
-            self.n_mels,
-            frame_count,
-            valid_frames.min(frame_count),
-        );
+        normalize_per_feature(&mut window, self.n_mels, width, valid);
 
         // mask padded frames to zero
-        if valid_frames < frame_count {
-            for m in 0..self.n_mels {
-                for t in valid_frames..frame_count {
-                    mel[m * frame_count + t] = 0.0;
-                }
+        if valid < width {
+            for row in window.chunks_exact_mut(width) {
+                row[valid..].fill(0.0);
             }
         }
 
-        let upload_started = Instant::now();
-        let features = Tensor::from_vec(mel, (1, self.n_mels, frame_count), &self.device)?;
-        let upload_ms = elapsed_ms(upload_started);
-
-        Ok((features, valid_frames.min(frame_count), upload_ms))
+        Tensor::from_vec(window, (1, self.n_mels, width), device).map_err(Error::from)
     }
 }
 
@@ -228,10 +280,6 @@ impl ParakeetPreprocessor {
 /// STFT emits one more (padding) frame, which is masked to zero.
 pub(super) const fn valid_feature_frames(samples: usize) -> usize {
     samples / HOP_LENGTH
-}
-
-fn elapsed_ms(started: Instant) -> f64 {
-    started.elapsed().as_secs_f64() * 1000.0
 }
 
 fn is_missing_tensor_error(err: &candle_core::Error) -> bool {
@@ -372,5 +420,105 @@ fn normalize_per_feature(mel: &mut [f32], n_mels: usize, frames: usize, valid_fr
         for v in row[..valid_frames].iter_mut() {
             *v = (*v - mean) / std;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pseudo_random(len: usize, mut seed: u64) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 40) as f32 / (1u64 << 22) as f32 - 2.0
+            })
+            .collect()
+    }
+
+    /// The pre-split preprocessor: normalize the whole utterance, then mask.
+    fn whole_utterance_normalized(
+        mel: &[f32],
+        n_mels: usize,
+        frames: usize,
+        valid: usize,
+    ) -> Vec<f32> {
+        let mut mel = mel.to_vec();
+        normalize_per_feature(&mut mel, n_mels, frames, valid.min(frames));
+        if valid < frames {
+            for m in 0..n_mels {
+                for t in valid..frames {
+                    mel[m * frames + t] = 0.0;
+                }
+            }
+        }
+        mel
+    }
+
+    fn columns(mel: &[f32], frames: usize, range: Range<usize>) -> Vec<f32> {
+        mel.chunks_exact(frames)
+            .flat_map(|row| row[range.clone()].iter().copied())
+            .collect()
+    }
+
+    fn uploaded(log_mel: &ParakeetLogMel, range: Range<usize>) -> Vec<f32> {
+        log_mel
+            .normalize_and_upload(range, &Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn log_mel_frames_follow_nemo_seq_len() {
+        let preprocessor = ParakeetPreprocessor::for_tests(Device::Cpu);
+        let audio = pseudo_random(16_000 + 77, 5);
+        let log_mel = preprocessor.compute_log_mel(&audio).unwrap();
+
+        assert_eq!(log_mel.valid_frames(), 100);
+        assert_eq!(log_mel.frames(), 101);
+        assert_eq!(log_mel.mel.len(), DEFAULT_N_MELS * 101);
+    }
+
+    #[test]
+    fn full_range_normalization_matches_whole_utterance_normalization() {
+        let (n_mels, frames, valid) = (8, 37, 36);
+        let mel = pseudo_random(n_mels * frames, 3);
+        let log_mel = ParakeetLogMel::from_parts(mel.clone(), n_mels, frames, valid);
+
+        assert_eq!(
+            uploaded(&log_mel, 0..frames),
+            whole_utterance_normalized(&mel, n_mels, frames, valid)
+        );
+    }
+
+    #[test]
+    fn window_normalization_uses_window_statistics_and_zeroes_padding() {
+        let (n_mels, frames, valid) = (4, 40, 33);
+        let mel = pseudo_random(n_mels * frames, 11);
+        let log_mel = ParakeetLogMel::from_parts(mel.clone(), n_mels, frames, valid);
+
+        // A window inside the audio is normalized over its own columns.
+        assert_eq!(
+            uploaded(&log_mel, 8..24),
+            whole_utterance_normalized(&columns(&mel, frames, 8..24), n_mels, 16, 16)
+        );
+        // A window reaching the STFT padding normalizes its valid columns
+        // and keeps the padding at zero.
+        let tail = uploaded(&log_mel, 24..40);
+        assert_eq!(
+            tail,
+            whole_utterance_normalized(&columns(&mel, frames, 24..40), n_mels, 16, 9)
+        );
+        assert!((0..n_mels)
+            .flat_map(|m| &tail[m * 16 + 9..(m + 1) * 16])
+            .all(|value| *value == 0.0));
+
+        assert!(log_mel.normalize_and_upload(30..41, &Device::Cpu).is_err());
+        assert!(log_mel.normalize_and_upload(5..5, &Device::Cpu).is_err());
     }
 }
