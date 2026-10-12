@@ -1,6 +1,7 @@
 # Plan — Qwen3.5 dense (0.8B / 2B / 4B / 9B GGUF) inference performance — 2026-10-12
 
-Branch `perf-qwen35` (worktree `.claude/worktrees/perf-qwen35`, base `main` @ `abf3f26f`).
+Branch `perf-qwen35` (worktree `.claude/worktrees/perf-qwen35`), rebased onto `main` @ `5daa9ae0`
+(which includes the Qwen3.8 work, #222).
 Research and per-phase detail are in `tasks/qwen35-performance-research-2026-10-11.md`; the
 reports are in `tasks/qwen35-performance-evidence-2026-10-11/` (A–F). Both are local, untracked
 files (`/tasks/*` is ignored).
@@ -14,8 +15,8 @@ generic kernels under `kernels/`. Qwen3.6 is a reference, not a dependency.
 - D3: x86-64-v3 CPU build with a baseline fallback.
 - D4: Qwen's per-size sampling profile.
 
-**Overlap with `perf-qwen38`** (36 commits, unmerged). Admission and automatic-rows work (part of
-S5) lives there. Leave it to that branch and rebase after it merges.
+**Qwen3.8 work (#222, now on `main`).** It carries the admission and automatic-rows fixes that S5
+would otherwise duplicate; qwen35 admission follow-ups build on it.
 
 Phase 0 — serving defaults, telemetry, memory
 - [x] 1 S1 `8f3ddf62`: per-size Qwen3.5 sampling profile from the model cards. Qwen3.5's
