@@ -3010,8 +3010,10 @@ impl RuntimeService {
         // resolver can degrade instead of failing startup on a zero budget.
         // Reject unsupported or unsafe cache policy before any model registry,
         // device arena, or readiness state can be created.
-        let cache_policy =
-            config.resolved_kv_cache_policy(EngineCoreConfig::default().max_blocks)?;
+        let cache_policy = config.resolved_kv_cache_policy(startup_policy_capacity_pages(
+            backend_context.backend_kind,
+            &config,
+        ))?;
         if prefix_engaged
             && matches!(
                 cache_policy.effective.prefix,
@@ -7845,6 +7847,73 @@ fn requested_backend_unavailable_message(
     format!(
         "Requested backend `{requested}` is not available on this runtime (selected `{selected}`)"
     )
+}
+
+/// Page capacity the startup cache-policy check assumes. CPU and Metal keep
+/// the portable baseline (`EngineCoreConfig::default().max_blocks`). CUDA
+/// sizes its logical page cap for one maximum-length request plus the prefix
+/// budget (`EngineCoreConfig::apply_backend_context_capacity`) and fits the
+/// arena itself from device memory, so the baseline must not clamp a CUDA
+/// prefix budget: chat history reuse needs a budget as long as the
+/// conversations it serves, and retained prefix pages live inside the fitted
+/// arena, evicted when a request needs them.
+fn startup_policy_capacity_pages(backend: BackendKind, config: &EngineConfig) -> usize {
+    let portable = EngineCoreConfig::default().max_blocks;
+    if backend != BackendKind::Cuda {
+        return portable;
+    }
+    let request_pages = config
+        .portable_context_ceiling()
+        .max(1)
+        .div_ceil(config.kv_page_size.max(1));
+    portable.max(request_pages.saturating_add(config.max_prefix_cache_pages))
+}
+
+#[cfg(test)]
+mod startup_policy_capacity_tests {
+    use super::startup_policy_capacity_pages;
+    use crate::backends::BackendKind;
+    use crate::config::{EngineConfig, PrefixCachePolicy};
+
+    /// A 4,096-page prefix budget (one 262,144-token conversation) survives
+    /// the CUDA startup check unclamped; CPU and Metal still clamp it to the
+    /// portable baseline minus one request.
+    #[test]
+    fn cuda_startup_check_keeps_the_configured_prefix_budget() {
+        let config = EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            max_prefix_cache_pages: 4_096,
+            kv_page_size: 64,
+            ..EngineConfig::default()
+        };
+        let pages = |backend| match config
+            .resolved_kv_cache_policy(startup_policy_capacity_pages(backend, &config))
+            .unwrap()
+            .effective
+            .prefix
+        {
+            PrefixCachePolicy::Namespaced { max_pages, .. } => max_pages,
+            PrefixCachePolicy::Disabled => 0,
+        };
+        assert_eq!(pages(BackendKind::Cuda), 4_096);
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(pages(backend), 1_024 - 4_096 / 64, "{backend:?}");
+        }
+        // The shipped default budget is unchanged everywhere.
+        let default = EngineConfig {
+            enable_prefix_caching: true,
+            managed_prefix_cache_salt: Some("tenant".into()),
+            ..EngineConfig::default()
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert_eq!(
+                startup_policy_capacity_pages(backend, &default),
+                1_024,
+                "{backend:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
