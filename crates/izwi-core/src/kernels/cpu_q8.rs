@@ -58,10 +58,9 @@ pub fn dequant_tile_matmul(x: &Tensor, q: &QTensor, tile_rows: usize) -> Result<
 /// One row of Q8_0 blocks into F32: `d * q` per element, as Candle's
 /// `BlockQ8_0::to_float`.
 fn dequantize_row(row: &[u8], out: &mut [f32]) {
-    for (block, values) in row
-        .chunks_exact(BLOCK_BYTES)
-        .zip(out.chunks_exact_mut(BLOCK_VALUES))
-    {
+    let (blocks, _) = row.as_chunks::<BLOCK_BYTES>();
+    let (outputs, _) = out.as_chunks_mut::<BLOCK_VALUES>();
+    for (block, values) in blocks.iter().zip(outputs.iter_mut()) {
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
         for (value, &q) in values.iter_mut().zip(&block[2..]) {
             *value = f32::from(q as i8) * d;

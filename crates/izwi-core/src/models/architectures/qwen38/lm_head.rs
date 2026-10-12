@@ -178,8 +178,10 @@ pub(crate) fn quantize_bf16_head(
             let block_rows = bytes.len() / cols;
             let source = &data[block * BLOCK * cols * 2..][..block_rows * cols * 2];
             let values: Vec<f32> = source
-                .chunks_exact(2)
-                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| bf16::from_bits(u16::from_le_bytes(b)).to_f32())
                 .collect();
             if let Some(index) = values.iter().position(|v| !v.is_finite()) {
                 return Err(Error::ModelLoadError(format!(
@@ -212,9 +214,11 @@ fn relative_l2(values: &[f32], reference: &[f32]) -> f64 {
 }
 
 fn bf16_dot(row: &[u8], x: &[f32]) -> f32 {
-    row.chunks_exact(2)
+    row.as_chunks::<2>()
+        .0
+        .iter()
         .zip(x)
-        .map(|(b, x)| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32() * x)
+        .map(|(&b, x)| bf16::from_bits(u16::from_le_bytes(b)).to_f32() * x)
         .sum()
 }
 

@@ -376,7 +376,7 @@ impl IndexedSafetensors {
                 .par_chunks_mut(words_per_row * 64)
                 .enumerate()
                 .try_for_each(|(tile, out)| -> Result<()> {
-                    for (index, block) in out.chunks_exact_mut(17).enumerate() {
+                    for (index, block) in out.as_chunks_mut::<17>().0.iter_mut().enumerate() {
                         let first = (tile * 64 * words_per_row / 17 + index) * 32;
                         let mut values = [0f32; 32];
                         let mut amax = 0f32;
