@@ -3,7 +3,8 @@
 use std::cmp;
 
 use izwi_vad::{
-    detect_speech_regions_f32, VadRegionConfig, DEFAULT_EXIT_THRESHOLD, DEFAULT_SPEECH_THRESHOLD,
+    detect_speech_regions_f32, sanitize_score_threshold, VadRegionConfig, VadScorer,
+    DEFAULT_EXIT_THRESHOLD, DEFAULT_SPEECH_THRESHOLD,
 };
 
 /// Tunables for long-form ASR chunking and transcript stitching.
@@ -344,6 +345,58 @@ pub fn plan_speech_audio_chunks(
         skipped_samples: samples.len().saturating_sub(included_samples),
         no_speech: false,
     }
+}
+
+/// Whole-input speech presence, scored by the same VAD as the speech planner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpeechPresenceScan {
+    /// No scored frame reached `threshold`. Input too short to score a single
+    /// VAD frame is never reported as no-speech.
+    pub no_speech: bool,
+    /// The speech start threshold every frame was held to.
+    pub threshold: f32,
+    /// Highest frame score seen before the scan stopped.
+    pub peak_score: f32,
+    /// Frames scored before the scan stopped.
+    pub frames_scored: usize,
+}
+
+/// Decide whether a whole input holds any speech. This is stricter about
+/// declaring no-speech than [`plan_speech_audio_chunks`]: a single VAD frame
+/// at the planner's start threshold counts as speech, with no minimum speech
+/// duration. The scan stops at the first such frame, so speech costs only
+/// the frames before it.
+pub fn scan_speech_presence(
+    samples: &[f32],
+    sample_rate: u32,
+    speech_config: &AsrSpeechChunkConfig,
+) -> SpeechPresenceScan {
+    let threshold = sanitize_score_threshold(speech_config.start_threshold);
+    let mut scan = SpeechPresenceScan {
+        no_speech: false,
+        threshold,
+        peak_score: 0.0,
+        frames_scored: 0,
+    };
+    if sample_rate == 0 {
+        return scan;
+    }
+    let mut scorer = VadScorer::new();
+    // About one second of input per push keeps the early exit cheap.
+    for block in samples.chunks(sample_rate as usize) {
+        let Ok(frames) = scorer.push_f32(block, sample_rate) else {
+            return scan;
+        };
+        for frame in frames {
+            scan.frames_scored += 1;
+            scan.peak_score = scan.peak_score.max(frame.score);
+            if frame.score >= threshold {
+                return scan;
+            }
+        }
+    }
+    scan.no_speech = scan.frames_scored > 0;
+    scan
 }
 
 fn speech_config_to_vad_region_config(speech_config: &AsrSpeechChunkConfig) -> VadRegionConfig {
@@ -1119,6 +1172,40 @@ mod tests {
         assert!(!plan.chunks.is_empty());
         assert!(plan.speech_samples > 0);
         assert!(plan.included_samples <= samples.len());
+    }
+
+    #[test]
+    fn speech_presence_scan_reports_silence_as_no_speech() {
+        let sr = 16_000u32;
+        let samples = vec![0.0f32; (sr as usize) * 3];
+
+        let scan = scan_speech_presence(&samples, sr, &AsrSpeechChunkConfig::default());
+
+        assert!(scan.no_speech);
+        assert_eq!(scan.threshold, DEFAULT_SPEECH_THRESHOLD);
+        assert_eq!(scan.frames_scored, samples.len() / izwi_vad::VAD_FRAME_SAMPLES);
+        assert!(scan.peak_score < scan.threshold);
+    }
+
+    #[test]
+    fn speech_presence_scan_stops_at_the_first_speech_frame() {
+        let (samples, sr) = load_wav_mono_f32("fox.wav");
+
+        let scan = scan_speech_presence(&samples, sr, &AsrSpeechChunkConfig::default());
+
+        assert!(!scan.no_speech);
+        assert!(scan.peak_score >= scan.threshold);
+        let total_frames = samples.len() * 16_000 / sr as usize / izwi_vad::VAD_FRAME_SAMPLES;
+        assert!(scan.frames_scored < total_frames);
+    }
+
+    #[test]
+    fn speech_presence_scan_never_gates_unscorable_input() {
+        let config = AsrSpeechChunkConfig::default();
+
+        assert!(!scan_speech_presence(&[], 16_000, &config).no_speech);
+        assert!(!scan_speech_presence(&[0.0; 100], 16_000, &config).no_speech);
+        assert!(!scan_speech_presence(&[0.0; 16_000], 0, &config).no_speech);
     }
 
     #[test]

@@ -86,6 +86,7 @@ use crate::runtime::adapters::{
     LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
@@ -6802,12 +6803,41 @@ impl RuntimeService {
         Ok((request, job))
     }
 
+    /// Decide from the canonical decoded audio, before the request's route is
+    /// prepared, whether the whole input holds no speech for a model family
+    /// that hallucinates on non-speech (PIPE-18). The decode is transient:
+    /// route preparation decodes its own copy, because families without a
+    /// preparer must not carry prepared audio.
+    async fn asr_no_speech_gate(
+        &self,
+        request: EngineCoreRequest,
+        job: &JobLease,
+    ) -> Result<(EngineCoreRequest, Option<AsrNoSpeechGate>)> {
+        if !asr_no_speech_gate_applies(&request) {
+            return Ok((request, None));
+        }
+        self.coordinator
+            .run_host_blocking_stage(job, move || {
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let gate = AsrNoSpeechGate::evaluate(&samples, sample_rate);
+                Ok((request, gate))
+            })
+            .await
+    }
+
     async fn run_request_after_admission(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        let (request, no_speech) = self.asr_no_speech_gate(request, &job).await?;
+        if let Some(gate) = no_speech {
+            let output = gate.engine_output(&request.id);
+            self.record_engine_output_observation(&request, &output, false);
+            return Ok(output);
+        }
         let (mut request, job) = self
             .prepare_request_for_binding(request, job, residency_lease.as_ref())
             .await?;
@@ -7095,6 +7125,14 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let (request, no_speech) = self.asr_no_speech_gate(request, &job).await?;
+        if let Some(gate) = no_speech {
+            // Close the stream as the engine does: a terminal marker, no text.
+            on_chunk(AsrNoSpeechGate::final_stream_chunk(&request.id)).await?;
+            let output = gate.engine_output(&request.id);
+            self.record_engine_output_observation(&request, &output, true);
+            return Ok(output);
+        }
         let (mut request, job) = self
             .prepare_request_for_binding(request, job, residency_lease.as_ref())
             .await?;
@@ -9970,6 +10008,108 @@ mod tests {
         assert_eq!(request(2048, true), max_emittable);
         assert_eq!(request(5, false), 5);
         assert_eq!(request(50_000, false), max_emittable);
+    }
+
+    async fn admitted_asr_job(runtime: &RuntimeService, request: &EngineCoreRequest) -> JobLease {
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(request)
+            .expect("ASR job");
+        runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("ASR admission")
+    }
+
+    fn ten_second_wav(samples: impl FnOnce(usize) -> Vec<f32>) -> Vec<u8> {
+        use crate::runtime::asr_no_speech::tests::{wav_bytes, SAMPLE_RATE};
+        wav_bytes(&samples(SAMPLE_RATE as usize * 10), SAMPLE_RATE)
+    }
+
+    #[tokio::test]
+    async fn silent_asr_request_is_answered_before_route_preparation() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
+            .with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+        let job = admitted_asr_job(&runtime, &request).await;
+
+        // No model is loaded, so route preparation would fail: the gate must
+        // answer before it.
+        let output = runtime
+            .run_request_after_admission(request, job, None)
+            .await
+            .expect("gated transcript");
+
+        assert_eq!(output.text.as_deref(), Some(""));
+        assert!(output.is_finished);
+        assert_eq!(output.input_audio_duration_secs, Some(10.0));
+        let diagnostics = output.asr_diagnostics.expect("gate diagnostics");
+        assert_eq!(diagnostics["no_speech_gate"]["gated"], true);
+    }
+
+    #[tokio::test]
+    async fn noise_only_streaming_asr_request_emits_a_terminal_empty_final() {
+        use crate::runtime::asr_no_speech::tests::pink_noise;
+
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request =
+            EngineCoreRequest::asr_bytes(ten_second_wav(|len| pink_noise(len, 0.02, 4)))
+                .with_model_variant(ModelVariant::Qwen3Asr17BGguf);
+        request.streaming = true;
+        let job = admitted_asr_job(&runtime, &request).await;
+
+        let mut chunks = Vec::new();
+        let output = runtime
+            .run_streaming_request_after_admission(
+                request,
+                |chunk| {
+                    chunks.push(chunk);
+                    std::future::ready(Ok(()))
+                },
+                job,
+                None,
+                true,
+            )
+            .await
+            .expect("gated stream");
+
+        assert_eq!(chunks.len(), 1, "exactly one terminal marker");
+        assert!(chunks[0].is_final);
+        assert!(chunks[0].text.is_none());
+        assert_eq!(output.text.as_deref(), Some(""));
+        assert_eq!(output.input_audio_duration_secs, Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn no_speech_gate_passes_speech_and_transducer_requests_through() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        let parakeet = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
+            .with_model_variant(ModelVariant::ParakeetTdt06BV3);
+        let job = admitted_asr_job(&runtime, &parakeet).await;
+        let (parakeet, gate) = runtime
+            .asr_no_speech_gate(parakeet, &job)
+            .await
+            .expect("transducer gate decision");
+        assert!(gate.is_none(), "transducers transcribe silence as empty");
+        assert!(parakeet.prepared_asr_audio_for_executor().unwrap().is_none());
+
+        let fox = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav"),
+        )
+        .expect("speech fixture");
+        let whisper =
+            EngineCoreRequest::asr_bytes(fox).with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+        let job = admitted_asr_job(&runtime, &whisper).await;
+        let (whisper, gate) = runtime
+            .asr_no_speech_gate(whisper, &job)
+            .await
+            .expect("speech gate decision");
+        assert!(gate.is_none(), "speech must reach the model");
+        assert!(
+            whisper.prepared_asr_audio_for_executor().unwrap().is_none(),
+            "the gate's decode is transient; route preparation owns prepared audio"
+        );
     }
 
     #[tokio::test]

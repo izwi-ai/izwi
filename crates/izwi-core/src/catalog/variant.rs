@@ -31,6 +31,40 @@ pub enum ModelFamily {
     Tokenizer,
 }
 
+impl ModelFamily {
+    /// Whether this family's ASR decoder can emit text for input that holds
+    /// no speech. Generative decoders continue a language-model prompt, so
+    /// silence or noise can come back as a plausible phrase ("you", "Okay.").
+    /// Transducers emit blanks for frames without speech. Families without an
+    /// offline ASR decoder report `false`.
+    pub fn hallucinates_on_non_speech(self) -> bool {
+        match self {
+            Self::WhisperAsr
+            | Self::Qwen3Asr
+            | Self::VibeVoiceAsr
+            | Self::GraniteSpeechAsr
+            | Self::Lfm25Audio
+            | Self::Voxtral => true,
+            Self::ParakeetAsr | Self::NemotronAsr => false,
+            Self::Qwen3Tts
+            | Self::KokoroTts
+            | Self::VoxtralTts
+            | Self::VibeVoiceTts
+            | Self::FishS2Tts
+            | Self::SortformerDiarization
+            | Self::Qwen3Chat
+            | Self::Qwen3MoeChat
+            | Self::Qwen35Chat
+            | Self::Qwen35MoeChat
+            | Self::Qwen38Chat
+            | Self::Lfm2Chat
+            | Self::Gemma3Chat
+            | Self::Qwen3ForcedAligner
+            | Self::Tokenizer => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTask {
     Tts,
