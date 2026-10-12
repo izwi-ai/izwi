@@ -6010,6 +6010,11 @@ impl ModelRegistry {
         self
     }
 
+    /// The prefix-reuse decision mode this registry's loads apply.
+    pub(crate) fn prefix_reuse_mode(&self) -> PrefixReuseMode {
+        self.prefix_reuse
+    }
+
     pub(crate) fn publish_effective_context(
         &self,
         variant: ModelVariant,

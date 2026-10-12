@@ -134,6 +134,31 @@ workload grouping should be reconsidered. Monotonic retained pages after
 requests drain indicate a lifecycle defect; disable prefix reuse and investigate
 before expanding capacity.
 
+### Hybrid prefix snapshots
+
+Hybrid models (recurrent or convolution state beside attention, such as
+Qwen3.6 and Qwen3.8) can attach a shared prefix only where a committed
+snapshot of that state exists. Each snapshot is one row of the model's
+recurrent state (156,893,184 bytes for Qwen3.8-27B) and outlives the request
+that published it, so snapshots have their own budget:
+
+- `IZWI_MAX_PREFIX_SNAPSHOTS` (engine field `max_prefix_snapshots`, default
+  8) bounds the snapshots one model may hold. `0` keeps hybrid state private,
+  so hybrid prefixes never attach.
+- The budget is fitted and reserved at load beside the state rows: on CUDA it
+  comes out of the automatic rows' state share (`IZWI_CUDA_STATE_BUDGET_FRACTION`),
+  so automatic retained rows shrink by the snapshot count and KV is
+  unchanged; explicit rows keep their count and the KV reach pays instead.
+- A held snapshot is recorded as materialized on the model lease (each
+  allocation once, also when a live session shares it); eviction returns its
+  bytes to the pending claim before they are freed.
+
+Watch `models[].prefix_snapshot_capacity`, `prefix_snapshot_budget_bytes`,
+`prefix_snapshots`, `prefix_snapshot_bytes` and `materialized_tensor_bytes`,
+plus the `tensor_snapshot_publishes`, `tensor_snapshot_attaches`,
+`tensor_snapshot_truncations` and `tensor_snapshot_evictions` counters.
+`prefix_snapshot_bytes` never exceeds the budget.
+
 ## CUDA build and provider controls
 
 The feature names differ slightly by crate:

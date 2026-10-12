@@ -169,6 +169,14 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_max_prefix_cache_pages")]
     pub max_prefix_cache_pages: usize,
 
+    /// Committed prefix snapshots of hybrid recurrent state (one row each) a
+    /// snapshot-sharing model may hold beyond its live rows. They are fitted
+    /// and reserved with the rows at load. Set with IZWI_MAX_PREFIX_SNAPSHOTS
+    /// (0 keeps hybrid state private, so hybrid prefixes never attach);
+    /// default 8.
+    #[serde(default = "default_max_prefix_snapshots")]
+    pub max_prefix_snapshots: u32,
+
     /// Host KV pool budget in bytes for hierarchical offload (DS4). Zero (the
     /// default) keeps the feature fully dormant.
     #[serde(default)]
@@ -335,6 +343,28 @@ fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
 }
 
 pub(crate) const DEFAULT_CUDA_STATE_BUDGET_FRACTION: f64 = 0.25;
+
+fn default_max_prefix_snapshots() -> u32 {
+    max_prefix_snapshots_from_env(std::env::var("IZWI_MAX_PREFIX_SNAPSHOTS").ok().as_deref())
+}
+
+fn max_prefix_snapshots_from_env(value: Option<&str>) -> u32 {
+    let default = crate::engine::cache::managed::DEFAULT_PREFIX_SNAPSHOT_ROWS;
+    let Some(value) = value else {
+        return default;
+    };
+    match value.trim().parse::<u32>() {
+        Ok(rows) if rows <= 1_024 => rows,
+        _ => {
+            tracing::warn!(
+                value,
+                default,
+                "Ignoring IZWI_MAX_PREFIX_SNAPSHOTS that is not a snapshot count in 0..=1024"
+            );
+            default
+        }
+    }
+}
 
 fn default_cuda_state_budget_fraction() -> f64 {
     cuda_state_budget_fraction_from_env(
@@ -547,6 +577,7 @@ impl Default for EngineCoreConfig {
             enable_prefix_caching: default_enable_prefix_caching(),
             managed_prefix_cache_salt: default_managed_prefix_cache_salt(),
             max_prefix_cache_pages: default_max_prefix_cache_pages(),
+            max_prefix_snapshots: default_max_prefix_snapshots(),
             kv_host_pool_budget_bytes: 0,
             kv_offload_high_watermark: default_kv_offload_high_watermark(),
             kv_offload_low_watermark: default_kv_offload_low_watermark(),
@@ -715,6 +746,17 @@ mod managed_kv_default_tests {
         }
         for value in ["0", "false", "off", "", "invalid"] {
             assert!(!super::cuda_incremental_chat_from_env(Some(value)));
+        }
+    }
+
+    #[test]
+    fn prefix_snapshot_budget_parses_a_bounded_count() {
+        use super::max_prefix_snapshots_from_env;
+        assert_eq!(max_prefix_snapshots_from_env(None), 8);
+        assert_eq!(max_prefix_snapshots_from_env(Some(" 16 ")), 16);
+        assert_eq!(max_prefix_snapshots_from_env(Some("0")), 0);
+        for invalid in ["-1", "many", "", "1025", "2.5"] {
+            assert_eq!(max_prefix_snapshots_from_env(Some(invalid)), 8, "{invalid}");
         }
     }
 

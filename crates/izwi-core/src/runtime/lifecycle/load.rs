@@ -277,11 +277,15 @@ fn hybrid_recurrent_state_bytes_per_sequence(geometry: HybridStateGeometry) -> R
 
 /// Recurrent state the CUDA resident fit must hold right after the weights:
 /// its fewest rows (the staged width when retained rows are automatic, the
-/// operator's rows otherwise), each priced at the model's per-row bytes.
+/// operator's rows otherwise) plus the committed prefix snapshots reserved
+/// beside them, each priced at the model's per-row bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CudaStateFloor {
     retained_rows: usize,
     staged_rows: usize,
+    /// Prefix snapshot budget when reuse engages for the model (an upper
+    /// bound: a contract that keeps its state private reserves none).
+    snapshot_rows: usize,
     per_sequence_bytes: u64,
     automatic_rows: bool,
 }
@@ -290,6 +294,7 @@ impl CudaStateFloor {
     fn bytes(self) -> Result<u64> {
         self.retained_rows
             .checked_add(self.staged_rows)
+            .and_then(|rows| rows.checked_add(self.snapshot_rows))
             .and_then(|rows| u64::try_from(rows).ok())
             .and_then(|rows| rows.checked_mul(self.per_sequence_bytes))
             .ok_or_else(|| Error::ModelLoadError("CUDA recurrent state floor overflow".into()))
@@ -329,8 +334,8 @@ fn admit_cuda_state_floor(
                 crate::engine::CUDA_EXPLICIT_ROWS_GUIDANCE
             };
             return Err(Error::ModelLoadError(format!(
-                "CUDA managed context cannot fit the model-authored minimum before loading {variant}: retained_sequences={}, staged_transactions={}, per_sequence_state_bytes={}, minimum_state_bytes={minimum_state_bytes}, weights_bytes={weights_bytes}, safety_reserve={safety_reserve_bytes}, device_capacity={device_bytes}; {guidance}",
-                floor.retained_rows, floor.staged_rows, floor.per_sequence_bytes,
+                "CUDA managed context cannot fit the model-authored minimum before loading {variant}: retained_sequences={}, staged_transactions={}, prefix_snapshots={}, per_sequence_state_bytes={}, minimum_state_bytes={minimum_state_bytes}, weights_bytes={weights_bytes}, safety_reserve={safety_reserve_bytes}, device_capacity={device_bytes}; {guidance}",
+                floor.retained_rows, floor.staged_rows, floor.snapshot_rows, floor.per_sequence_bytes,
             )));
         }
     }
@@ -1472,9 +1477,23 @@ impl ModelLifecycleController {
         } else {
             engine.max_retained_sequences
         };
+        // The fit reserves the prefix snapshot budget beside the rows when
+        // the model shares hybrid prefixes (see `prefix_snapshot_rows_for`).
+        let snapshot_rows = if engine.enable_prefix_caching
+            && engine.max_prefix_cache_pages > 0
+            && crate::catalog::prefix_reuse_engages(
+                variant,
+                BackendKind::Cuda,
+                self.model_registry.prefix_reuse_mode(),
+            ) {
+            usize::try_from(engine.max_prefix_snapshots).unwrap_or(usize::MAX)
+        } else {
+            0
+        };
         Ok(Some(CudaStateFloor {
             retained_rows,
             staged_rows: staged_rows.min(retained_rows),
+            snapshot_rows,
             per_sequence_bytes,
             automatic_rows,
         }))
@@ -3703,6 +3722,7 @@ mod tests {
         let floor = |rows, automatic_rows| CudaStateFloor {
             retained_rows: rows,
             staged_rows: rows.min(8),
+            snapshot_rows: 0,
             per_sequence_bytes: QWEN38_ROW_BYTES,
             automatic_rows,
         };
@@ -3728,6 +3748,7 @@ mod tests {
         let legacy = CudaStateFloor {
             retained_rows: 316,
             staged_rows: 316,
+            snapshot_rows: 0,
             per_sequence_bytes: QWEN38_ROW_BYTES,
             automatic_rows: false,
         };
@@ -3762,6 +3783,17 @@ mod tests {
         assert_eq!(
             authorization.device_bytes,
             ResourceAmount::Known(weights + 16 * QWEN38_ROW_BYTES + GIB)
+        );
+
+        // With prefix reuse engaged, the floor also holds the snapshot budget.
+        let shared = CudaStateFloor {
+            snapshot_rows: 8,
+            ..floor(8, true)
+        };
+        let authorization = admit(shared, H100_BYTES).unwrap();
+        assert_eq!(
+            authorization.device_bytes,
+            ResourceAmount::Known(weights + 24 * QWEN38_ROW_BYTES + GIB)
         );
     }
 

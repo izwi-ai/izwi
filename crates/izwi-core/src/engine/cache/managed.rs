@@ -21,7 +21,7 @@ use super::prefix::{
 };
 use super::telemetry::{ManagedKvTelemetry, ManagedKvTelemetrySnapshot};
 use super::tensor_snapshots::{
-    TensorSnapshotPrefixPolicy, TensorStateSnapshotIndex, tensor_snapshot_byte_size,
+    TensorSnapshotPrefixPolicy, TensorStateSnapshotIndex, tensor_snapshot_backing_bytes,
     tensor_snapshot_prefix_policy,
 };
 use crate::backends::BackendKind;
@@ -54,6 +54,12 @@ use crate::kv::v2::{
     StateRuntimeAllocationPlan, WorkspaceContract, WorkspacePlacement,
 };
 use crate::kv::{InferenceStateCapability, KvArenaId, KvGroupId, KvStorageDType, ResolvedKvPlan};
+
+/// Default snapshot budget of a hybrid model that shares committed prefix
+/// snapshots, in rows of its recurrent state: one continuing conversation per
+/// row of a full decode step (8 rows), each attaching the snapshot its
+/// previous turn published. 8 x 156,893,184 B = 1.26 GB for Qwen3.8-27B.
+pub(crate) const DEFAULT_PREFIX_SNAPSHOT_ROWS: u32 = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ManagedKvOperationSnapshot {
@@ -239,6 +245,16 @@ pub struct ManagedKvModelRuntimeSnapshot {
     pub staged_transaction_capacity: Option<u32>,
     /// Recurrent tensor state of one retained or staged row.
     pub tensor_bytes_per_sequence: Option<u64>,
+    /// Committed prefix snapshots the shared-prefix index may hold (each one
+    /// row of hybrid state), reserved on the model lease beside the rows.
+    /// `None` for plans without tensor state; zero when snapshots do not share.
+    pub prefix_snapshot_capacity: Option<u32>,
+    /// Byte budget of those snapshots (`prefix_snapshot_capacity` rows).
+    pub prefix_snapshot_budget_bytes: u64,
+    /// Snapshots the index holds now, and the backing bytes they keep alive
+    /// (counted in `materialized_tensor_bytes`, once per allocation).
+    pub prefix_snapshots: u64,
+    pub prefix_snapshot_bytes: u64,
     /// Active sessions admitted with bounded next-step claims.
     pub incremental_claim_sessions: u64,
     pub arenas: Vec<ManagedKvArenaRuntimeSnapshot>,
@@ -456,6 +472,9 @@ pub(crate) struct ManagedKvCacheManager {
     telemetry: Arc<ManagedKvTelemetry>,
     prefix_cache_salt: Option<[u8; 32]>,
     max_prefix_cache_pages: usize,
+    /// Committed hybrid-state prefix snapshots a snapshot-sharing model may
+    /// hold beyond its live rows (see [`Self::prefix_snapshot_rows_for`]).
+    prefix_snapshot_rows: u32,
     host_offload_policy: Option<offload::HostOffloadPolicy>,
     worker_backend: BackendKind,
     worker_device_location: DeviceLocation,
@@ -530,6 +549,7 @@ impl ManagedKvCacheManager {
             telemetry: Arc::new(ManagedKvTelemetry::default()),
             prefix_cache_salt: None,
             max_prefix_cache_pages: 0,
+            prefix_snapshot_rows: DEFAULT_PREFIX_SNAPSHOT_ROWS,
             host_offload_policy: None,
             worker_backend: backend,
             worker_device_location: device.location(),
@@ -584,8 +604,9 @@ impl ManagedKvCacheManager {
                 storage_dtype_hint: None,
             },
         )?;
+        let prefix_snapshot_rows = self.prefix_snapshot_rows_for(contract);
         let required_bytes = |tokens: u64| -> Result<u64> {
-            let (allocation, _) = plan_managed_state_capacity(
+            let (allocation, _) = plan_managed_state_capacity_with_policy(
                 &state_plan,
                 model_instance,
                 ManagedStateCapacityRequest {
@@ -594,6 +615,8 @@ impl ManagedKvCacheManager {
                     retained_sequence_rows,
                     staged_transaction_rows,
                 },
+                false,
+                prefix_snapshot_rows,
             )?;
             let resources = managed_state_resources(
                 self.worker_backend,
@@ -655,6 +678,7 @@ impl ManagedKvCacheManager {
             logical_token_reach,
             retained_sequence_rows: rows.retained_sequence_rows,
             staged_transaction_rows: rows.staged_transaction_rows,
+            prefix_snapshot_rows: 0,
             per_sequence_state_bytes: 0,
             resident_state_bytes: 0,
         };
@@ -693,6 +717,7 @@ impl ManagedKvCacheManager {
             safety_reserve_bytes,
             page_tokens_hint,
             rows,
+            self.prefix_snapshot_rows_for(contract),
         )
     }
 
@@ -740,6 +765,31 @@ impl ManagedKvCacheManager {
     /// policy (no host budget) keeps offload fully dormant.
     pub(crate) fn set_host_offload_policy(&mut self, policy: Option<HostOffloadPolicy>) {
         self.host_offload_policy = policy;
+    }
+
+    /// Committed prefix snapshots each snapshot-sharing model may hold (its
+    /// snapshot budget, in rows of hybrid state). Takes effect for models
+    /// loaded afterwards.
+    pub(crate) fn set_prefix_snapshot_rows(&mut self, rows: u32) {
+        self.prefix_snapshot_rows = rows;
+    }
+
+    /// The snapshot rows a model with `contract` is fitted and reserved for:
+    /// the configured budget when its hybrid contract shares committed
+    /// snapshots and prefix caching is engaged (a namespace and a page
+    /// budget), else zero. A snapshot outlives its publisher's committed
+    /// state, so these bytes are authorized on the model lease at load,
+    /// recorded as materialized while the index pins them, and released when
+    /// it evicts them; they never grow memory outside the reservation.
+    pub(crate) fn prefix_snapshot_rows_for(&self, contract: &InferenceStateContract) -> u32 {
+        if self.prefix_cache_salt.is_some()
+            && self.max_prefix_cache_pages > 0
+            && tensor_snapshot_prefix_policy(contract).is_some()
+        {
+            self.prefix_snapshot_rows
+        } else {
+            0
+        }
     }
 
     pub(crate) fn telemetry_snapshot(&self) -> ManagedKvTelemetrySnapshot {
@@ -914,6 +964,18 @@ impl ManagedKvCacheManager {
                         .map(|capacity| capacity.transaction_capacity()),
                     tensor_bytes_per_sequence: tensor_capacity
                         .map(|capacity| capacity.per_sequence_bytes()),
+                    prefix_snapshot_capacity: tensor_capacity
+                        .map(|capacity| capacity.snapshot_capacity()),
+                    prefix_snapshot_budget_bytes: tensor_capacity
+                        .map_or(0, |capacity| capacity.snapshot_capacity_bytes()),
+                    prefix_snapshots: state
+                        .tensor_snapshots
+                        .as_ref()
+                        .map_or(0, |sharing| usize_to_u64(sharing.index.len())),
+                    prefix_snapshot_bytes: state
+                        .tensor_snapshots
+                        .as_ref()
+                        .map_or(0, |sharing| sharing.index.total_bytes()),
                     incremental_claim_sessions: usize_to_u64(
                         state.incremental_claim_sessions.len(),
                     ),
@@ -1130,6 +1192,7 @@ impl ManagedKvCacheManager {
             model_instance,
             capacity,
             materialize_cuda_paged_at_load,
+            self.prefix_snapshot_rows_for(contract),
         )?;
         let plan = ResolvedKvPlan::from_runtime_allocation(
             first_arena_generation,
@@ -1302,8 +1365,8 @@ impl ManagedKvCacheManager {
         };
         // DS1.2b: derive the snapshot-sharing surface from the strict contract
         // gate. The declared snapshot interval must land on the resolved page
-        // grid, and the index inherits the tensor arena's own authorization
-        // envelope as its byte bound.
+        // grid. The index is bounded by the snapshot budget the tensor arena
+        // authorized beside its rows (zero rows without a prefix namespace).
         let tensor_snapshots = tensor_snapshot_prefix_policy(contract).and_then(|policy| {
             let group = plan
                 .groups
@@ -1322,8 +1385,8 @@ impl ManagedKvCacheManager {
                 paged_arena: group.arena,
                 interval_tokens,
                 index: TensorStateSnapshotIndex::with_telemetry(
-                    usize::try_from(capacity.sequence_capacity()).unwrap_or(1),
-                    capacity.committed_capacity_bytes(),
+                    usize::try_from(capacity.snapshot_capacity()).unwrap_or(0),
+                    capacity.snapshot_capacity_bytes(),
                     self.telemetry.clone(),
                 ),
                 policy,
@@ -3156,6 +3219,9 @@ impl ManagedKvCacheManager {
         for arena in state.runtime.arenas.values() {
             arena.drain()?;
         }
+        // Committed prefix snapshots are the last tensor state the model
+        // holds (no session is registered): free them with their claim.
+        clear_tensor_snapshots(state)?;
         if let Some(lease) = state.resource_lease.as_ref() {
             lease.prepare_materialized_release(ResourceVector::zero())?;
         }
@@ -3306,14 +3372,19 @@ pub(crate) fn plan_managed_state_capacity(
     model_instance: ModelInstanceId,
     request: ManagedStateCapacityRequest,
 ) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
-    plan_managed_state_capacity_with_policy(state_plan, model_instance, request, false)
+    plan_managed_state_capacity_with_policy(state_plan, model_instance, request, false, 0)
 }
 
+/// `prefix_snapshot_rows` adds committed prefix snapshots to the lazily
+/// materialized tensor envelope (see
+/// [`ManagedKvCacheManager::prefix_snapshot_rows_for`]), so the allocation
+/// plan, the lease authorization and the CUDA fit all price them.
 fn plan_managed_state_capacity_with_policy(
     state_plan: &ResolvedStatePlan,
     model_instance: ModelInstanceId,
     request: ManagedStateCapacityRequest,
     materialize_cuda_paged_at_load: bool,
+    prefix_snapshot_rows: u32,
 ) -> Result<(StateRuntimeAllocationPlan, Option<TensorStateCapacity>)> {
     if request.total_paged_pages == 0
         || request.retained_sequence_rows == 0
@@ -3401,8 +3472,14 @@ fn plan_managed_state_capacity_with_policy(
     }
     let sequence_capacity = request.retained_sequence_rows.min(paged_sequence_capacity);
     let transaction_capacity = request.staged_transaction_rows.min(sequence_capacity);
+    let snapshot_capacity = if state_plan.non_paged.is_empty() {
+        0
+    } else {
+        prefix_snapshot_rows
+    };
     let lazy_blocks = sequence_capacity
         .checked_add(transaction_capacity)
+        .and_then(|blocks| blocks.checked_add(snapshot_capacity))
         .ok_or_else(|| Error::InvalidInput("managed tensor state capacity overflow".into()))?;
     for domain in &state_plan.non_paged {
         groups.push(GroupCapacityRequest {
@@ -3433,7 +3510,10 @@ fn plan_managed_state_capacity_with_policy(
         &registry,
     )?;
     let tensor_capacity = (!state_plan.non_paged.is_empty())
-        .then(|| TensorStateCapacity::for_plan(state_plan, sequence_capacity, transaction_capacity))
+        .then(|| {
+            TensorStateCapacity::for_plan(state_plan, sequence_capacity, transaction_capacity)?
+                .with_snapshot_capacity(snapshot_capacity)
+        })
         .transpose()?;
     if let Some(capacity) = tensor_capacity {
         let planned_authorization = capacity
@@ -3574,14 +3654,23 @@ pub(crate) struct CudaResidentFit {
     pub(crate) logical_token_reach: u64,
     pub(crate) retained_sequence_rows: u32,
     pub(crate) staged_transaction_rows: u32,
+    /// Committed prefix snapshots reserved beside the rows.
+    pub(crate) prefix_snapshot_rows: u32,
     /// Recurrent tensor state of one row; zero for paged-only plans.
     pub(crate) per_sequence_state_bytes: u64,
-    /// Recurrent tensor state reserved for every retained and staged row.
+    /// Recurrent tensor state reserved for every retained and staged row and
+    /// every prefix snapshot.
     pub(crate) resident_state_bytes: u64,
 }
 
 /// Choose retained rows and the logical reach for one resolved plan. Only
 /// the plan's geometry is read, so CPU tests can drive the CUDA policy.
+///
+/// `prefix_snapshot_rows` committed prefix snapshots are fixed state: they
+/// count against the automatic rows' state share (so automatic retained rows
+/// shrink by about that many, and KV is unchanged), and against the whole
+/// budget beside explicit rows.
+#[allow(clippy::too_many_arguments)]
 fn fit_resident_rows_and_reach(
     state_plan: &ResolvedStatePlan,
     model_instance: ModelInstanceId,
@@ -3590,6 +3679,7 @@ fn fit_resident_rows_and_reach(
     safety_reserve_bytes: u64,
     page_tokens_hint: u32,
     rows: CudaResidentRowRequest,
+    prefix_snapshot_rows: u32,
 ) -> Result<CudaResidentFit> {
     let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
     let geometry = |retained_sequence_rows: u32| {
@@ -3600,6 +3690,7 @@ fn fit_resident_rows_and_reach(
             page_tokens_hint,
             retained_sequence_rows,
             rows.staged_transaction_rows.min(retained_sequence_rows),
+            prefix_snapshot_rows,
         )
     };
     let chosen = match rows.automatic_state_budget_fraction {
@@ -3667,6 +3758,7 @@ fn fit_resident_rows_and_reach(
         )?,
         retained_sequence_rows: chosen.retained_sequence_rows,
         staged_transaction_rows: chosen.staged_transaction_rows,
+        prefix_snapshot_rows: chosen.prefix_snapshot_rows,
         per_sequence_state_bytes: chosen.per_sequence_state_bytes,
         resident_state_bytes: chosen.resident_state_bytes,
     })
@@ -3677,6 +3769,7 @@ fn fit_resident_rows_and_reach(
 struct CudaResidentGeometry {
     retained_sequence_rows: u32,
     staged_transaction_rows: u32,
+    prefix_snapshot_rows: u32,
     maximum_tokens: u64,
     per_sequence_state_bytes: u64,
     resident_state_bytes: u64,
@@ -3687,9 +3780,10 @@ struct CudaResidentGeometry {
 impl CudaResidentGeometry {
     fn describe(&self, headroom_bytes: u64, safety_reserve_bytes: u64) -> String {
         format!(
-            "retained_sequences={}, staged_transactions={}, per_sequence_state_bytes={}, resident_state_bytes={}, minimum_tokens={}, minimum_bytes={}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}",
+            "retained_sequences={}, staged_transactions={}, prefix_snapshots={}, per_sequence_state_bytes={}, resident_state_bytes={}, minimum_tokens={}, minimum_bytes={}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}",
             self.retained_sequence_rows,
             self.staged_transaction_rows,
+            self.prefix_snapshot_rows,
             self.per_sequence_state_bytes,
             self.resident_state_bytes,
             self.minimum_tokens,
@@ -3709,8 +3803,9 @@ fn cuda_resident_geometry(
     page_tokens: u32,
     retained_sequence_rows: u32,
     staged_transaction_rows: u32,
+    prefix_snapshot_rows: u32,
 ) -> Result<CudaResidentGeometry> {
-    let (maximum_allocation, tensor_capacity) = plan_managed_state_capacity(
+    let (maximum_allocation, tensor_capacity) = plan_managed_state_capacity_with_policy(
         state_plan,
         model_instance,
         ManagedStateCapacityRequest {
@@ -3719,6 +3814,8 @@ fn cuda_resident_geometry(
             retained_sequence_rows,
             staged_transaction_rows,
         },
+        false,
+        prefix_snapshot_rows,
     )?;
     let paged = state_plan
         .paged_attention
@@ -3764,6 +3861,7 @@ fn cuda_resident_geometry(
     Ok(CudaResidentGeometry {
         retained_sequence_rows,
         staged_transaction_rows,
+        prefix_snapshot_rows: tensor_capacity.map_or(0, |capacity| capacity.snapshot_capacity()),
         maximum_tokens,
         per_sequence_state_bytes: tensor_capacity
             .map_or(0, |capacity| capacity.per_sequence_bytes()),
@@ -4636,7 +4734,14 @@ fn reconcile_tensor_snapshot_attach(
 }
 
 /// DS1.2b: build and index the committed snapshot for one aligned legacy
-/// commit. `Ok(false)` means the boundary was already published identically.
+/// commit. `Ok(false)` means nothing new is held: the boundary was already
+/// published identically, or the snapshot budget cannot hold it.
+///
+/// Every indexed snapshot is pinned in the tensor arena's committed backing,
+/// so its bytes stay recorded as materialized on the model lease after the
+/// publisher's sequence replaces or releases that state. Evicted snapshots
+/// are unpinned and the lease reconciled (restoring their pending claim)
+/// before their tensors drop.
 fn publish_tensor_snapshot(
     state: &mut ManagedKvModelState,
     reservation: &ManagedCacheReservation,
@@ -4654,11 +4759,10 @@ fn publish_tensor_snapshot(
         return Ok(false);
     };
     let sequence = PhysicalStateSequenceId::new(clocked.sequence())?;
-    let arena = state.runtime.tensor_state().ok_or_else(|| {
+    let arena = state.runtime.tensor_state().cloned().ok_or_else(|| {
         Error::InferenceError("tensor snapshot publication lost its physical arena".into())
     })?;
     let mut entry = Vec::with_capacity(sharing.policy.tensor_domains.len());
-    let mut byte_size = 0_u64;
     for domain in sharing.policy.tensor_domains.iter() {
         let snapshot = arena.read(sequence, *domain)?.ok_or_else(|| {
             Error::InferenceError(
@@ -4670,14 +4774,48 @@ fn publish_tensor_snapshot(
                 "committed tensor snapshot cursor disagrees with its paged boundary".into(),
             ));
         }
-        byte_size = byte_size
-            .checked_add(tensor_snapshot_byte_size(&snapshot.components))
-            .ok_or_else(|| Error::InferenceError("tensor snapshot byte total overflow".into()))?;
         entry.push((*domain, snapshot.components));
     }
-    sharing
+    let domains: Arc<[(StateDomainId, Arc<[StateComponentValue]>)]> = entry.into();
+    let byte_size = tensor_snapshot_backing_bytes(&domains);
+    let publication = sharing
         .index
-        .publish(digest, boundary, entry.into(), byte_size)
+        .publish(digest, boundary, domains.clone(), byte_size)?;
+    if publication.inserted {
+        for (_, components) in domains.iter() {
+            arena.pin_snapshot(components)?;
+        }
+    }
+    for evicted in &publication.evicted {
+        for (_, components) in evicted.domains.iter() {
+            arena.unpin_snapshot(components)?;
+        }
+    }
+    if !publication.evicted.is_empty() {
+        reconcile_tensor_materialization(state);
+    }
+    drop(publication.evicted);
+    Ok(publication.inserted)
+}
+
+/// Drop every indexed snapshot (model unload): unpin them, reconcile the
+/// lease, then free them.
+fn clear_tensor_snapshots(state: &mut ManagedKvModelState) -> Result<()> {
+    let (Some(sharing), Some(arena)) = (
+        state.tensor_snapshots.as_mut(),
+        state.runtime.tensor_state().cloned(),
+    ) else {
+        return Ok(());
+    };
+    let cleared = sharing.index.clear();
+    for entry in &cleared {
+        for (_, components) in entry.domains.iter() {
+            arena.unpin_snapshot(components)?;
+        }
+    }
+    reconcile_tensor_materialization(state);
+    drop(cleared);
+    Ok(())
 }
 
 fn abort_domains(
@@ -5998,6 +6136,24 @@ mod tests {
         safety_reserve_bytes: u64,
         rows: CudaResidentRowRequest,
     ) -> Result<CudaResidentFit> {
+        cuda_admission_fit_with_snapshots(
+            contract,
+            device_bytes,
+            weights_bytes,
+            safety_reserve_bytes,
+            rows,
+            0,
+        )
+    }
+
+    fn cuda_admission_fit_with_snapshots(
+        contract: &InferenceStateContract,
+        device_bytes: u64,
+        weights_bytes: u64,
+        safety_reserve_bytes: u64,
+        rows: CudaResidentRowRequest,
+        prefix_snapshot_rows: u32,
+    ) -> Result<CudaResidentFit> {
         let state_plan = negotiate_state_plan(
             contract,
             &StateBackendPlanRequest {
@@ -6015,6 +6171,7 @@ mod tests {
             safety_reserve_bytes,
             64,
             rows,
+            prefix_snapshot_rows,
         )
     }
 
@@ -9690,6 +9847,234 @@ mod tests {
         assert_eq!(authority.snapshot().reservations, 0);
         assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
         Ok(())
+    }
+
+    /// Committed prefix snapshots outlive their publisher's state, so they
+    /// are an allocation after the load-time fit. Their budget is reserved
+    /// on the model lease at load; an indexed snapshot stays recorded as
+    /// materialized after its publisher advances or releases (each backing
+    /// allocation once, whoever holds it); eviction and unload restore its
+    /// pending claim before the tensors drop. Reserved = materialized +
+    /// pending throughout, and materialized equals what is physically held.
+    #[test]
+    fn prefix_snapshots_are_reserved_at_load_and_stay_materialized_until_evicted() -> Result<()> {
+        use crate::models::shared::memory::accounting::tensor_backing;
+        const ROW: u64 = 16; // four F32 values per hybrid row
+        let provider = Arc::new(DriverFreeProvider {
+            capacity: 1 << 40,
+            available: std::sync::atomic::AtomicU64::new(1 << 40),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let model = ModelInstanceId::new(3_801);
+        let mut manager =
+            ManagedKvCacheManager::with_prefix_cache_salt(Some(authority.clone()), Some([41; 32]));
+        manager.set_prefix_snapshot_rows(1);
+        let contract = hybrid_snapshot_contract();
+        assert_eq!(manager.prefix_snapshot_rows_for(&contract), 1);
+        assert_eq!(manager.prefix_snapshot_rows_for(&test_contract()), 0);
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(contract),
+            )?
+            .expect("managed runtime");
+        let arena = runtime.tensor_state().expect("tensor arena").clone();
+        let capacity = arena.capacity();
+        assert_eq!(capacity.per_sequence_bytes(), ROW);
+        assert_eq!(capacity.snapshot_capacity(), 1);
+        assert_eq!(capacity.snapshot_capacity_bytes(), ROW);
+        assert_eq!(
+            capacity.authorized_bytes(),
+            ROW * u64::from(capacity.sequence_capacity() + capacity.transaction_capacity() + 1)
+        );
+        // The lease authorizes the snapshot budget at load, beside the rows.
+        let reserved_at_load = authority.snapshot().reserved;
+        assert_eq!(
+            reserved_at_load,
+            host_bytes(runtime.resident_paged_bytes() + capacity.authorized_bytes())
+        );
+        let model_snapshot =
+            |manager: &ManagedKvCacheManager| manager.runtime_snapshot().models[0].clone();
+        assert_eq!(model_snapshot(&manager).prefix_snapshot_capacity, Some(1));
+        assert_eq!(model_snapshot(&manager).prefix_snapshot_budget_bytes, ROW);
+        // Reserved = materialized + pending, and materialized tensor bytes
+        // equal the distinct allocations live sessions and the index hold.
+        let check = |manager: &ManagedKvCacheManager, held: &[&Tensor]| -> Result<()> {
+            let ledger = authority.snapshot();
+            assert_eq!(ledger.reserved, reserved_at_load);
+            assert_eq!(
+                ledger.materialized.checked_add(ledger.pending)?,
+                ledger.reserved
+            );
+            let mut keys = HashSet::new();
+            let physically_held = held
+                .iter()
+                .filter(|tensor| keys.insert(tensor_backing(tensor).0))
+                .map(|tensor| tensor_backing(tensor).1.unwrap())
+                .sum::<u64>();
+            let snapshot = model_snapshot(manager);
+            assert_eq!(snapshot.materialized_tensor_bytes, physically_held);
+            assert_eq!(
+                ledger.materialized,
+                host_bytes(runtime.resident_paged_bytes() + physically_held)
+            );
+            Ok(())
+        };
+        let commit = |manager: &mut ManagedKvCacheManager,
+                      plan: u64,
+                      session: &SessionKey,
+                      request: &EngineCoreRequest,
+                      span: (usize, usize),
+                      values: [f32; 4]|
+         -> Result<Tensor> {
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    plan,
+                    session,
+                    &sequence_work(span.0, span.1),
+                    Some(request),
+                )?
+                .expect("managed reservation");
+            let state = hybrid_tensor_values(&values);
+            let tensor = state[0].tensor.clone().unwrap();
+            arena.stage_replace(
+                PhysicalStateTransactionId::new(plan).unwrap(),
+                StateDomainId::new(2),
+                span.0 as u64,
+                span.1 as u64,
+                state,
+            )?;
+            manager.finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )?;
+            Ok(tensor)
+        };
+
+        // A commits an aligned 64-token prompt and publishes its snapshot,
+        // which is A's own committed state: one allocation, counted once.
+        let session_a = SessionKey::new("snapshot-publisher".into(), 1);
+        let mut tokens_a = (0..64_u32).collect::<Vec<u32>>();
+        tokens_a.push(999);
+        let request_a = prefix_request(model, tokens_a);
+        let published = commit(&mut manager, 1, &session_a, &request_a, (0, 64), [7.0; 4])?;
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_publishes, 1);
+        assert_eq!(model_snapshot(&manager).prefix_snapshots, 1);
+        assert_eq!(model_snapshot(&manager).prefix_snapshot_bytes, ROW);
+        check(&manager, &[&published])?;
+
+        // A advances: its new state is a second allocation, and the indexed
+        // snapshot stays materialized (RED without the pin: it would read
+        // as a pending claim while still holding memory).
+        let advanced = commit(&mut manager, 2, &session_a, &request_a, (64, 65), [8.0; 4])?;
+        check(&manager, &[&published, &advanced])?;
+        assert_eq!(model_snapshot(&manager).materialized_tensor_bytes, 2 * ROW);
+
+        // A finishes: only the snapshot remains held.
+        manager.release_session(&session_a)?;
+        drop(advanced);
+        check(&manager, &[&published])?;
+
+        // B publishes a different prefix. The one-row budget evicts A's
+        // snapshot: its claim returns to pending before it is freed.
+        let session_b = SessionKey::new("snapshot-evictor".into(), 1);
+        let mut tokens_b = (1_000..1_064_u32).collect::<Vec<u32>>();
+        tokens_b.push(999);
+        let request_b = prefix_request(model, tokens_b);
+        let replacement = commit(&mut manager, 3, &session_b, &request_b, (0, 64), [9.0; 4])?;
+        assert_eq!(manager.telemetry_snapshot().tensor_snapshot_evictions, 1);
+        assert_eq!(model_snapshot(&manager).prefix_snapshots, 1);
+        drop(published);
+        check(&manager, &[&replacement])?;
+        manager.release_session(&session_b)?;
+        check(&manager, &[&replacement])?;
+
+        // Unload frees the last snapshot with its claim, then the lease.
+        drop(arena);
+        drop(runtime);
+        assert!(manager.unload_model(model)?);
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        Ok(())
+    }
+
+    /// The H100 numbers for Qwen3.8-27B-FP8 (80 GB, field capacity
+    /// 85,064,286,208 B). The resident footprint is anchored to the field
+    /// deploy, which fitted 78 retained rows with the old 1 GiB reserve; the
+    /// next deploy runs the 3% reserve (2,551,928,586 B). The default
+    /// 8-snapshot budget (8 x 156,893,184 B) comes out of the automatic rows'
+    /// state share, so retained rows shrink by 8 and the KV reach is
+    /// unchanged; beside explicit rows the KV reach pays for it instead.
+    #[test]
+    fn cuda_fit_prices_the_prefix_snapshot_budget_inside_the_state_share() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const H100_BYTES: u64 = 85_064_286_208;
+        const DECODE_WIDTH: u32 = 8;
+        const DECODE_RESERVE: u64 = 8 * 401_408;
+        // Everything resident before the fit (weights, graph pools, context)
+        // that puts the field's post-reserve budget mid-window of 86 rows.
+        const RESIDENT: u64 = 29_165_420_544;
+        let contract = qwen38_27b_tensor_contract();
+        let fit = |reserve: u64, snapshots: u32, automatic: bool| {
+            cuda_admission_fit_with_snapshots(
+                &contract,
+                H100_BYTES,
+                RESIDENT,
+                reserve + DECODE_RESERVE,
+                CudaResidentRowRequest {
+                    retained_sequence_rows: if automatic { 316 } else { 64 },
+                    staged_transaction_rows: DECODE_WIDTH,
+                    automatic_state_budget_fraction: automatic.then_some(0.25),
+                },
+                snapshots,
+            )
+            .unwrap()
+        };
+        let field = fit(GIB, 0, true);
+        assert_eq!(field.retained_sequence_rows, 78, "anchored to the field");
+        let reserve = 2_551_928_586;
+        let plain = fit(reserve, 0, true);
+        let shared = fit(reserve, DEFAULT_PREFIX_SNAPSHOT_ROWS, true);
+        assert_eq!(plain.per_sequence_state_bytes, QWEN38_STATE_ROW_BYTES);
+        assert_eq!(plain.retained_sequence_rows, 76);
+        assert_eq!(shared.prefix_snapshot_rows, 8);
+        assert_eq!(shared.retained_sequence_rows, 68);
+        assert_eq!(shared.staged_transaction_rows, DECODE_WIDTH);
+        assert_eq!(shared.resident_state_bytes, plain.resident_state_bytes);
+        assert_eq!(shared.resident_state_bytes, 84 * QWEN38_STATE_ROW_BYTES);
+        assert_eq!(shared.logical_token_reach, plain.logical_token_reach);
+        // Explicit rows keep their count; the snapshots cost KV instead.
+        let explicit_plain = fit(reserve, 0, false);
+        let explicit_shared = fit(reserve, 8, false);
+        assert_eq!(explicit_shared.retained_sequence_rows, 64);
+        assert_eq!(
+            explicit_shared.resident_state_bytes,
+            explicit_plain.resident_state_bytes + 8 * QWEN38_STATE_ROW_BYTES
+        );
+        let lost_kv =
+            (explicit_plain.logical_token_reach - explicit_shared.logical_token_reach) * 65_536;
+        assert!(
+            lost_kv.abs_diff(8 * QWEN38_STATE_ROW_BYTES) <= 2 * 64 * 65_536,
+            "explicit rows gave up {lost_kv} B of KV"
+        );
+        eprintln!(
+            "H100 fit (Qwen3.8-27B-FP8): field 1 GiB reserve {} rows reach {}; 3% reserve {} + {} rows reach {}; with {} snapshots {} + {} rows, state {} B, reach {} tokens",
+            field.retained_sequence_rows,
+            field.logical_token_reach,
+            plain.retained_sequence_rows,
+            plain.staged_transaction_rows,
+            plain.logical_token_reach,
+            shared.prefix_snapshot_rows,
+            shared.retained_sequence_rows,
+            shared.staged_transaction_rows,
+            shared.resident_state_bytes,
+            shared.logical_token_reach,
+        );
     }
 
     #[test]

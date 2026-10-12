@@ -12,6 +12,12 @@
 //! Component tensors are shared by handle once committed. Tensor updates
 //! replace whole component sets and never mutate committed storage, so the
 //! index and any forked sequence can hold the same handles safely.
+//!
+//! A snapshot outlives its publisher's committed state (the publisher keeps
+//! decoding, or finishes), so the index is bounded by an explicit snapshot
+//! budget that the model lease reserves at load. Entries are priced by the
+//! backing allocations they keep alive, and evicted entries are handed back
+//! to the caller, which reconciles the lease before dropping them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +29,7 @@ use crate::kv::v2::{
     CapabilityStateDescriptorV2, InferenceStateContract, PrefixPolicy, RetainedStateCapability,
     StateDomainId, StateDomainSpec, StateGroupId,
 };
+use crate::models::shared::memory::accounting::tensor_backing;
 
 /// The strict contract shape that may share committed tensor snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,16 +131,22 @@ pub(crate) fn declared_snapshot_prefill_interval(
     }
 }
 
-/// Byte size of one committed component set; absent components count as zero.
-pub(crate) fn tensor_snapshot_byte_size(components: &[StateComponentValue]) -> u64 {
-    components
+/// Backing bytes one snapshot keeps alive: every distinct allocation behind
+/// its component tensors, once (a view keeps its whole allocation). An
+/// allocation whose size cannot be read is priced at its view's bytes.
+pub(crate) fn tensor_snapshot_backing_bytes(
+    domains: &[(StateDomainId, Arc<[StateComponentValue]>)],
+) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    domains
         .iter()
-        .map(|value| {
-            value
-                .tensor
-                .as_ref()
-                .map(|tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64)
-                .unwrap_or(0)
+        .flat_map(|(_, components)| components.iter())
+        .filter_map(|value| value.tensor.as_ref())
+        .filter_map(|tensor| {
+            let (key, bytes) = tensor_backing(tensor);
+            seen.insert(key).then(|| {
+                bytes.unwrap_or((tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64)
+            })
         })
         .sum()
 }
@@ -148,11 +161,21 @@ pub(crate) struct TensorSnapshotEntry {
     last_access: u64,
 }
 
+/// Outcome of [`TensorStateSnapshotIndex::publish`].
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotPublication {
+    /// A new entry now holds the snapshot.
+    pub(crate) inserted: bool,
+    /// Entries removed to make room. The caller still owns their tensors and
+    /// must drop them only after reconciling any accounting.
+    pub(crate) evicted: Vec<TensorSnapshotEntry>,
+}
+
 /// Bounded LRU index of committed tensor snapshots for one paged arena.
 ///
-/// Bounds are derived from the tensor arena's own authorization envelope: the
-/// snapshot cache never holds more sequence rows than the arena's sequence
-/// capacity nor more bytes than its authorized committed envelope.
+/// Bounds are the snapshot budget the tensor arena authorizes beside its
+/// rows (`TensorStateCapacity::snapshot_capacity`): never more entries than
+/// snapshot rows, nor more backing bytes than their byte budget.
 #[derive(Debug, Clone)]
 pub(crate) struct TensorStateSnapshotIndex {
     max_entries: usize,
@@ -199,6 +222,20 @@ impl TensorStateSnapshotIndex {
         self.total_bytes
     }
 
+    pub(crate) fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    pub(crate) fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Remove every entry (model unload), handing them to the caller.
+    pub(crate) fn clear(&mut self) -> Vec<TensorSnapshotEntry> {
+        self.total_bytes = 0;
+        self.entries.drain().map(|(_, entry)| entry).collect()
+    }
+
     fn tick(&mut self) -> Result<u64> {
         self.clock = self
             .clock
@@ -210,14 +247,15 @@ impl TensorStateSnapshotIndex {
     /// Publish the committed snapshot at `cursor`, keyed by the page-chain
     /// digest whose page ends exactly there. Republishing an identical
     /// boundary is idempotent; a different cursor under a live chain digest is
-    /// a programming error and is rejected.
+    /// a programming error and is rejected. A snapshot larger than the whole
+    /// byte budget (or any snapshot under a zero budget) is not held.
     pub(crate) fn publish(
         &mut self,
         chain_digest: [u8; 32],
         cursor: u64,
         domains: Arc<[(StateDomainId, Arc<[StateComponentValue]>)]>,
         byte_size: u64,
-    ) -> Result<bool> {
+    ) -> Result<SnapshotPublication> {
         if cursor == 0 {
             return Err(Error::InferenceError(
                 "tensor snapshot cursor must be positive".into(),
@@ -231,9 +269,13 @@ impl TensorStateSnapshotIndex {
                 ));
             }
             existing.last_access = access;
-            return Ok(false);
+            return Ok(SnapshotPublication::default());
         }
-        let evicted_bytes = self.evict_for_insert(byte_size, access)?;
+        if self.max_entries == 0 || byte_size > self.max_bytes {
+            return Ok(SnapshotPublication::default());
+        }
+        let evicted = self.evict_for_insert(byte_size, access);
+        let evicted_bytes = evicted.iter().map(|entry| entry.byte_size).sum::<u64>();
         self.total_bytes = self
             .total_bytes
             .checked_add(byte_size)
@@ -250,7 +292,10 @@ impl TensorStateSnapshotIndex {
                 last_access: access,
             },
         );
-        Ok(true)
+        Ok(SnapshotPublication {
+            inserted: true,
+            evicted,
+        })
     }
 
     /// Return the snapshot published at `expected_cursor` under `chain_digest`,
@@ -274,12 +319,11 @@ impl TensorStateSnapshotIndex {
     }
 
     /// Evict least-recently-used entries until inserting an entry of
-    /// `byte_size` keeps both bounds. Returns the bytes reclaimed. The bounds
-    /// are always satisfiable because each entry is smaller than the whole
-    /// envelope unless the operator sized the arena below one sequence.
-    fn evict_for_insert(&mut self, byte_size: u64, access: u64) -> Result<u64> {
+    /// `byte_size` keeps both bounds, and return them. The bounds are always
+    /// satisfiable: `publish` admits only entries within the byte budget.
+    fn evict_for_insert(&mut self, byte_size: u64, access: u64) -> Vec<TensorSnapshotEntry> {
+        let mut evicted = Vec::new();
         let mut evicted_bytes = 0_u64;
-        let mut evicted_entries = 0_usize;
         while self.entries.len() + 1 > self.max_entries
             || self
                 .total_bytes
@@ -298,12 +342,12 @@ impl TensorStateSnapshotIndex {
             };
             if let Some(removed) = self.entries.remove(&victim) {
                 evicted_bytes += removed.byte_size;
-                evicted_entries += 1;
+                evicted.push(removed);
             }
         }
         self.telemetry
-            .record_tensor_snapshot_eviction(evicted_entries);
-        Ok(evicted_bytes)
+            .record_tensor_snapshot_eviction(evicted.len());
+        evicted
     }
 }
 
@@ -349,7 +393,10 @@ mod tests {
     ) -> bool {
         let domains = snapshot_domains(values);
         let bytes = byte_size_of(&domains);
-        index.publish(digest, cursor, domains, bytes).unwrap()
+        index
+            .publish(digest, cursor, domains, bytes)
+            .unwrap()
+            .inserted
     }
 
     #[test]
@@ -506,5 +553,67 @@ mod tests {
         assert!(publish(&mut index, [3; 32], 96, &[1.0]));
         assert!(index.lookup([1; 32], 32).unwrap().is_some());
         assert!(index.lookup([2; 32], 64).unwrap().is_none());
+    }
+
+    #[test]
+    fn evicted_entries_return_to_the_caller_and_oversized_entries_are_refused() {
+        let mut index = TensorStateSnapshotIndex::new(1, 8);
+        let first = snapshot_domains(&[1.0, 2.0]);
+        let bytes = byte_size_of(&first);
+        assert!(index.publish([1; 32], 32, first, bytes).unwrap().inserted);
+        // The second entry evicts the first and hands it back, tensors intact.
+        let second = snapshot_domains(&[3.0, 4.0]);
+        let outcome = index.publish([2; 32], 64, second, bytes).unwrap();
+        assert!(outcome.inserted);
+        assert_eq!(outcome.evicted.len(), 1);
+        assert_eq!(outcome.evicted[0].cursor, 32);
+        let held = outcome.evicted[0].domains[0].1[0].tensor.as_ref().unwrap();
+        assert_eq!(held.to_vec1::<f32>().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(index.total_bytes(), bytes);
+        // Larger than the whole budget: not held, nothing evicted.
+        let outcome = index
+            .publish([3; 32], 96, snapshot_domains(&[0.0; 3]), 12)
+            .unwrap();
+        assert!(!outcome.inserted && outcome.evicted.is_empty());
+        assert!(index.lookup([2; 32], 64).unwrap().is_some());
+        // A zero budget holds nothing.
+        let mut empty = TensorStateSnapshotIndex::new(0, 0);
+        assert!(!publish(&mut empty, [1; 32], 32, &[1.0]));
+        // Clearing hands back everything.
+        let cleared = index.clear();
+        assert_eq!(cleared.len(), 1);
+        assert!(index.is_empty());
+        assert_eq!(index.total_bytes(), 0);
+    }
+
+    #[test]
+    fn backing_bytes_count_each_allocation_once_and_whole() {
+        let slab = Tensor::from_slice(&[0.0_f32; 16], 16, &Device::Cpu).unwrap();
+        let view = slab.narrow(0, 0, 4).unwrap();
+        let other = Tensor::from_slice(&[0.0_f32; 2], 2, &Device::Cpu).unwrap();
+        let domains: Arc<[(StateDomainId, Arc<[StateComponentValue]>)]> = Arc::from([
+            (
+                StateDomainId::new(2),
+                Arc::from([
+                    StateComponentValue {
+                        component: StateComponentId::new(1),
+                        tensor: Some(view.clone()),
+                    },
+                    StateComponentValue {
+                        component: StateComponentId::new(2),
+                        tensor: Some(other),
+                    },
+                ]) as Arc<[StateComponentValue]>,
+            ),
+            (
+                StateDomainId::new(3),
+                Arc::from([StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(view),
+                }]) as Arc<[StateComponentValue]>,
+            ),
+        ]);
+        // The view keeps all 64 bytes of its slab, counted once; plus 8.
+        assert_eq!(tensor_snapshot_backing_bytes(&domains), 64 + 8);
     }
 }

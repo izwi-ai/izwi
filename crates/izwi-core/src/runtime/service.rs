@@ -9695,6 +9695,10 @@ mod tests {
             retained_sequence_capacity: None,
             staged_transaction_capacity: None,
             tensor_bytes_per_sequence: None,
+            prefix_snapshot_capacity: None,
+            prefix_snapshot_budget_bytes: 0,
+            prefix_snapshots: 0,
+            prefix_snapshot_bytes: 0,
             incremental_claim_sessions: 0,
             arenas: vec![arena(allocated_pages)],
         };

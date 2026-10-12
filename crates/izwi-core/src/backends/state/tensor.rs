@@ -159,7 +159,11 @@ struct CommittedBacking {
 
 impl CommittedBacking {
     fn retain(&mut self, snapshot: &StateDomainSnapshot) {
-        for tensor in snapshot.components.iter().filter_map(|c| c.tensor.as_ref()) {
+        self.retain_components(&snapshot.components);
+    }
+
+    fn retain_components(&mut self, components: &[StateComponentValue]) {
+        for tensor in components.iter().filter_map(|c| c.tensor.as_ref()) {
             let (key, bytes) = tensor_backing(tensor);
             let entry = self.storages.entry(key).or_insert((0, 0));
             if entry.1 == 0 {
@@ -175,7 +179,12 @@ impl CommittedBacking {
     /// Must run while the arena still holds `snapshot`, so its keys cannot
     /// have been reused by another allocation.
     fn forget(&mut self, snapshot: &StateDomainSnapshot) {
-        for tensor in snapshot.components.iter().filter_map(|c| c.tensor.as_ref()) {
+        self.forget_components(&snapshot.components);
+    }
+
+    /// Must run while the caller still holds `components`.
+    fn forget_components(&mut self, components: &[StateComponentValue]) {
+        for tensor in components.iter().filter_map(|c| c.tensor.as_ref()) {
             let (key, _) = tensor_backing(tensor);
             if let Some(entry) = self.storages.get_mut(&key) {
                 entry.1 -= 1;
@@ -214,8 +223,12 @@ pub(crate) struct TensorStateCapacity {
     per_sequence_bytes: u64,
     sequence_capacity: u32,
     transaction_capacity: u32,
+    /// Committed prefix snapshots a shared-prefix index may hold beyond the
+    /// live sequences (each one sequence's state). Zero without sharing.
+    snapshot_capacity: u32,
     committed_capacity_bytes: u64,
     staging_capacity_bytes: u64,
+    snapshot_capacity_bytes: u64,
     authorized_bytes: u64,
 }
 
@@ -249,9 +262,33 @@ impl TensorStateCapacity {
             per_sequence_bytes,
             sequence_capacity,
             transaction_capacity,
+            snapshot_capacity: 0,
             committed_capacity_bytes,
             staging_capacity_bytes,
+            snapshot_capacity_bytes: 0,
             authorized_bytes,
+        })
+    }
+
+    /// The same envelope plus `snapshot_capacity` committed prefix snapshots,
+    /// each priced at one sequence's state. A shared-prefix index holds them
+    /// after their publisher moves on, so they are authorized (and fitted)
+    /// with the rows rather than allocated outside every reservation.
+    pub(crate) fn with_snapshot_capacity(self, snapshot_capacity: u32) -> Result<Self> {
+        let snapshot_capacity_bytes = self
+            .per_sequence_bytes
+            .checked_mul(u64::from(snapshot_capacity))
+            .ok_or_else(|| invalid("tensor state snapshot byte capacity overflow"))?;
+        let authorized_bytes = self
+            .committed_capacity_bytes
+            .checked_add(self.staging_capacity_bytes)
+            .and_then(|bytes| bytes.checked_add(snapshot_capacity_bytes))
+            .ok_or_else(|| invalid("tensor state authorized byte capacity overflow"))?;
+        Ok(Self {
+            snapshot_capacity,
+            snapshot_capacity_bytes,
+            authorized_bytes,
+            ..self
         })
     }
 
@@ -273,6 +310,14 @@ impl TensorStateCapacity {
 
     pub(crate) const fn staging_capacity_bytes(self) -> u64 {
         self.staging_capacity_bytes
+    }
+
+    pub(crate) const fn snapshot_capacity(self) -> u32 {
+        self.snapshot_capacity
+    }
+
+    pub(crate) const fn snapshot_capacity_bytes(self) -> u64 {
+        self.snapshot_capacity_bytes
     }
 
     pub(crate) const fn authorized_bytes(self) -> u64 {
@@ -412,7 +457,8 @@ impl TensorStateArena {
             &plan,
             capacity.sequence_capacity,
             capacity.transaction_capacity,
-        )?;
+        )?
+        .with_snapshot_capacity(capacity.snapshot_capacity)?;
         if capacity != expected_capacity {
             return Err(invalid(
                 "tensor state capacity does not match the resolved state plan",
@@ -464,10 +510,27 @@ impl TensorStateArena {
         })
     }
 
-    /// Backing bytes physically held by committed sequence state, each
-    /// allocation once. Staged replacements are excluded until they commit.
+    /// Backing bytes physically held by committed sequence state and pinned
+    /// prefix snapshots, each allocation once. Staged replacements are
+    /// excluded until they commit.
     pub(crate) fn committed_backing_bytes(&self) -> Result<u64> {
         Ok(self.lock()?.committed.bytes)
+    }
+
+    /// Count committed state that a shared-prefix index now holds in the
+    /// committed backing, so it stays recorded after its publisher's sequence
+    /// replaces or releases it. The index keeps the tensors alive until the
+    /// matching [`Self::unpin_snapshot`].
+    pub(crate) fn pin_snapshot(&self, components: &[StateComponentValue]) -> Result<()> {
+        self.lock()?.committed.retain_components(components);
+        Ok(())
+    }
+
+    /// Undo one [`Self::pin_snapshot`]. The caller must still hold
+    /// `components`, reconcile any lease record, and only then drop them.
+    pub(crate) fn unpin_snapshot(&self, components: &[StateComponentValue]) -> Result<()> {
+        self.lock()?.committed.forget_components(components);
+        Ok(())
     }
 
     pub(crate) fn register(&self, sequence: PhysicalStateSequenceId) -> Result<()> {

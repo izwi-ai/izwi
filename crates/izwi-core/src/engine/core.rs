@@ -3215,6 +3215,7 @@ impl EngineCore {
         managed_kv_cache.set_host_offload_policy(
             crate::engine::cache::offload::HostOffloadPolicy::resolve(&config)?,
         );
+        managed_kv_cache.set_prefix_snapshot_rows(config.max_prefix_snapshots);
 
         Ok(Self {
             config,
@@ -5380,6 +5381,7 @@ impl EngineCore {
                     automatic_rows,
                     retained_sequence_rows = fit.retained_sequence_rows,
                     staged_transaction_rows = fit.staged_transaction_rows,
+                    prefix_snapshot_rows = fit.prefix_snapshot_rows,
                     per_sequence_state_bytes = fit.per_sequence_state_bytes,
                     resident_state_bytes = fit.resident_state_bytes,
                     logical_token_reach = fit.logical_token_reach,
