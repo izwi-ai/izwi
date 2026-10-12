@@ -4904,9 +4904,17 @@ impl RuntimeService {
                     request.asr_language_for_execution(),
                     request.asr_prompt_for_execution(),
                 )?;
+                let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 match decision {
                     VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                        // Admission prices `max_tokens`: narrow an omitted
+                        // budget to this audio's duration first.
+                        request.params.max_tokens =
+                            crate::runtime::asr::vibevoice_asr_planned_max_tokens(
+                                &request,
+                                audio_seconds,
+                            );
                         request.install_prepared_sequence_input_tokens(
                             geometry.prompt_tokens,
                             context_limit,

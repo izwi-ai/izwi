@@ -7799,6 +7799,19 @@ impl NativeExecutor {
                 budget.min(invocation_decode_room(context, rate, chunk_seconds))
             });
         }
+        // VibeVoice's automatic budget is admitted at the reference ceiling;
+        // each chunk decodes with its own duration budget.
+        if request.asr_auto_max_tokens
+            && matches!(family, ModelFamily::VibeVoiceAsr)
+            && sample_rate > 0
+        {
+            let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
+            let budget = crate::runtime::vibevoice_asr_planned_max_tokens(request, chunk_seconds)
+                .min(base.max_new_tokens);
+            options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
+                budget.min(invocation_decode_room(context, rate, chunk_seconds))
+            });
+        }
         options.max_new_tokens = options.max_new_tokens.max(1);
         options
     }
@@ -8044,10 +8057,12 @@ fn asr_planned_decode_tokens(
     family: ModelFamily,
     audio_seconds: f32,
 ) -> usize {
-    if matches!(family, ModelFamily::GraniteSpeechAsr) {
-        granite_asr_planned_max_tokens(request, audio_seconds)
-    } else {
-        MAX_ASR_NEW_TOKENS
+    match family {
+        ModelFamily::GraniteSpeechAsr => granite_asr_planned_max_tokens(request, audio_seconds),
+        ModelFamily::VibeVoiceAsr => {
+            crate::runtime::vibevoice_asr_planned_max_tokens(request, audio_seconds)
+        }
+        _ => MAX_ASR_NEW_TOKENS,
     }
 }
 
@@ -9009,6 +9024,59 @@ mod tests {
         assert_eq!(options(Some((600, 10.0))), 1);
         // 1000 - 128 - 600 leaves 272 decode tokens.
         assert_eq!(options(Some((1_000, 10.0))), 272);
+    }
+
+    #[test]
+    fn vibevoice_auto_options_use_the_duration_budget_under_the_ceiling() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 32_768;
+        let base = NativeExecutor::asr_generation_options(&request);
+        let options = |samples: usize, context: Option<(usize, f32)>| {
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::VibeVoiceAsr,
+                samples,
+                16_000,
+                &base,
+                context,
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(options(16_000 * 60, None), 976);
+        assert_eq!(options(16_000 * 600, None), 7_456);
+        assert_eq!(options(16_000 * 600, Some((131_072, 7.5))), 7_456);
+        // 8192 - 128 text reserve - 4500 audio tokens leaves 3564.
+        assert_eq!(options(16_000 * 600, Some((8_192, 7.5))), 3_564);
+        // The executor solver plans long audio with the same budget.
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::VibeVoiceAsr, 600.0),
+            7_456
+        );
+    }
+
+    #[test]
+    fn vibevoice_explicit_options_preserve_the_caller_budget() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = false;
+        request.params.max_tokens = 200;
+        let base = NativeExecutor::asr_generation_options(&request);
+
+        let options = NativeExecutor::asr_chunk_generation_options(
+            &request,
+            ModelFamily::VibeVoiceAsr,
+            16_000 * 600,
+            16_000,
+            &base,
+            None,
+        );
+
+        assert_eq!(options.max_new_tokens, 200);
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::VibeVoiceAsr, 600.0),
+            200
+        );
     }
 
     #[test]

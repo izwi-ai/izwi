@@ -379,8 +379,33 @@ fn apply_asr_max_tokens(
         return;
     }
     request.asr_auto_max_tokens = true;
-    if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
+    if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant)
+        .or_else(|| vibevoice_auto_asr_token_ceiling(variant))
+    {
         request.params.max_tokens = auto_max_tokens;
+    }
+}
+
+/// VibeVoice-ASR's automatic budget is admitted at the reference ceiling and
+/// narrowed to the decoded audio's duration by preparation and the executor.
+fn vibevoice_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
+    use crate::models::architectures::vibevoice::asr::VIBEVOICE_ASR_AUTO_MAX_TOKENS;
+    (variant.family() == ModelFamily::VibeVoiceAsr).then_some(VIBEVOICE_ASR_AUTO_MAX_TOKENS)
+}
+
+/// Decode budget a VibeVoice-ASR invocation of `audio_seconds` runs with: the
+/// duration budget under the request ceiling when the caller omitted
+/// `max_tokens`, otherwise the caller's own budget.
+pub(crate) fn vibevoice_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    use crate::models::architectures::vibevoice::asr::vibevoice_auto_asr_max_tokens_for_duration;
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        vibevoice_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
+    } else {
+        ceiling
     }
 }
 
@@ -5525,6 +5550,28 @@ mod tests {
         assert_eq!(asr_response_language(None, None), None);
         let undetected = serde_json::json!({ "language": null });
         assert_eq!(asr_response_language(None, Some(&undetected)), None);
+    }
+
+    #[test]
+    fn vibevoice_omitted_budget_is_admitted_at_the_ceiling_and_planned_by_duration() {
+        let vibevoice = ModelVariant::VibeVoiceAsr;
+        let mut auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(vibevoice);
+        apply_asr_max_tokens(&mut auto, vibevoice, None);
+        assert!(auto.asr_auto_max_tokens);
+        assert_eq!(auto.params.max_tokens, 32_768);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 10.0), 512);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 60.0), 976);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 600.0), 7_456);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 3_600.0), 32_768);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(vibevoice);
+        apply_asr_max_tokens(&mut explicit, vibevoice, Some(200));
+        assert!(!explicit.asr_auto_max_tokens);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&explicit, 600.0), 200);
+
+        // The duration budget never exceeds what admission priced.
+        auto.params.max_tokens = 700;
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 60.0), 700);
     }
 
     #[test]

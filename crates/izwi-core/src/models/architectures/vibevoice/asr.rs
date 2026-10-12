@@ -48,8 +48,33 @@ const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
 const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
+/// Automatic decode budget for a request that omits `max_tokens`. The JSON
+/// transcript costs about 5.5–7.8 tokens per second of speech (Qwen2.5
+/// tokenizer); 12 tokens/s plus a fixed reserve covers dense speech.
+const VIBEVOICE_ASR_AUTO_TOKENS_PER_SECOND: f64 = 12.0;
+const VIBEVOICE_ASR_AUTO_TOKEN_RESERVE: f64 = 256.0;
+const VIBEVOICE_ASR_AUTO_MIN_TOKENS: usize = 512;
+/// Reference generation ceiling (`max_new_tokens` 32768 in the VibeVoice demo
+/// and vLLM test). A 60-minute prompt (about 27k tokens) plus this ceiling
+/// stays inside the model card's 64K budget.
+pub(crate) const VIBEVOICE_ASR_AUTO_MAX_TOKENS: usize = 32_768;
 static NEXT_VIBEVOICE_ASR_STATE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_VIBEVOICE_ASR_MODEL_LOAD_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Duration-scaled decode budget, `clamp(ceil(12·s) + 256, 512, 32768)`
+/// (10 s → 512, 60 s → 976, 10 min → 7,456, 60 min → 32,768). A non-finite or
+/// non-positive duration gets the minimum.
+pub(crate) fn vibevoice_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
+    if !audio_seconds.is_finite() || audio_seconds <= 0.0 {
+        return VIBEVOICE_ASR_AUTO_MIN_TOKENS;
+    }
+    let budget = (f64::from(audio_seconds) * VIBEVOICE_ASR_AUTO_TOKENS_PER_SECOND).ceil()
+        + VIBEVOICE_ASR_AUTO_TOKEN_RESERVE;
+    budget.clamp(
+        VIBEVOICE_ASR_AUTO_MIN_TOKENS as f64,
+        VIBEVOICE_ASR_AUTO_MAX_TOKENS as f64,
+    ) as usize
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeVoiceAsrGenerationOptions {
@@ -2555,6 +2580,18 @@ fn truncate_at_stop_sequence(text: &str, stop_sequences: &[String]) -> (String, 
 
 fn parse_vibevoice_asr_output(raw: &str) -> VibeVoiceAsrParsedOutput {
     let raw_text = cleanup_transcript_text(raw);
+    // An unterminated array is a transcript cut off by the decode budget. It
+    // never parses whole; salvage it before the `{…}` candidate can mistake
+    // its first complete segment for the entire output.
+    let salvaged = salvage_truncated_segment_array(&raw_text).filter(|s| !s.is_empty());
+    if let Some(segments) = salvaged {
+        return VibeVoiceAsrParsedOutput {
+            text: join_segment_contents(&segments),
+            raw_text,
+            format: "segments_truncated",
+            segments,
+        };
+    }
     for candidate in json_output_candidates(&raw_text) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
             continue;
@@ -2622,6 +2659,57 @@ fn push_unique_candidate(candidates: &mut Vec<String>, candidate: &str) {
     if !candidates.iter().any(|existing| existing == candidate) {
         candidates.push(candidate.to_string());
     }
+}
+
+/// Complete segment objects of the top-level array opened by the first `[`
+/// when that array is never closed. `None` means there is no array, the array
+/// is closed (the whole-JSON candidates own it) or a stray `}` broke it. The
+/// scan tracks JSON strings and escapes, so a brace inside `Content` neither
+/// opens nor closes an object.
+fn salvage_truncated_segment_array(text: &str) -> Option<Vec<VibeVoiceAsrSegment>> {
+    let body_start = text.find('[')? + 1;
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut object_start = body_start;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[body_start..].char_indices() {
+        let index = body_start + offset;
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = index;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let object = &text[object_start..=index];
+                    if let Some(segment) = serde_json::from_str::<serde_json::Value>(object)
+                        .ok()
+                        .as_ref()
+                        .and_then(vibevoice_segment_from_value)
+                    {
+                        segments.push(segment);
+                    }
+                }
+            }
+            ']' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    Some(segments)
 }
 
 fn vibevoice_segments_from_value(value: &serde_json::Value) -> Vec<VibeVoiceAsrSegment> {
@@ -3645,6 +3733,70 @@ mod tests {
 
         assert_eq!(parsed.format, "text");
         assert_eq!(parsed.text, "plain text");
+        assert!(parsed.segments.is_empty());
+    }
+
+    #[test]
+    fn auto_asr_budget_scales_with_duration_within_reference_bounds() {
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(10.0), 512);
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(60.0), 976);
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(300.0), 3_856);
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(600.0), 7_456);
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(3_600.0), 32_768);
+        assert_eq!(
+            vibevoice_auto_asr_max_tokens_for_duration(3_600.0),
+            VIBEVOICE_ASR_AUTO_MAX_TOKENS
+        );
+        // ceil(12 · 21.5) + 256 = 514: the first value above the minimum.
+        assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(21.5), 514);
+        for degenerate in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -5.0] {
+            assert_eq!(vibevoice_auto_asr_max_tokens_for_duration(degenerate), 512);
+        }
+    }
+
+    #[test]
+    fn truncated_segment_array_salvages_complete_objects_only() {
+        let parsed = parse_vibevoice_asr_output(
+            r#"[{"Start":0.0,"End":1.5,"Speaker":0,"Content":"a } b"},{"Start":1.5,"End":2.0,"Speaker":1,"Content":"wor"#,
+        );
+
+        assert_eq!(parsed.format, "segments_truncated");
+        assert_eq!(parsed.text, "a } b");
+        assert_eq!(parsed.segments.len(), 1);
+        assert_eq!(parsed.segments[0].speaker_id.as_deref(), Some("0"));
+        assert_eq!(parsed.segments[0].end_time, Some(1.5));
+    }
+
+    #[test]
+    fn truncated_segment_array_tracks_escapes_inside_strings() {
+        let parsed = parse_vibevoice_asr_output(
+            r#"[{"Start":0,"End":1,"Speaker":0,"Content":"say \"{\" \\"},{"Start":1,"End":2,"Speaker":1,"Content":"two"},{"Start":2,"End":3,"Speaker":0,"Con"#,
+        );
+
+        assert_eq!(parsed.format, "segments_truncated");
+        assert_eq!(parsed.segments.len(), 2);
+        assert_eq!(parsed.segments[0].content, r#"say "{" \"#);
+        assert_eq!(parsed.text, r#"say "{" \ two"#);
+    }
+
+    #[test]
+    fn complete_segment_array_still_parses_as_segments() {
+        let parsed = parse_vibevoice_asr_output(
+            r#"[{"Start":0.0,"End":1.5,"Speaker":0,"Content":"a } b"},{"Start":1.5,"End":2.0,"Speaker":1,"Content":"world"}]"#,
+        );
+
+        assert_eq!(parsed.format, "segments");
+        assert_eq!(parsed.text, "a } b world");
+        assert_eq!(parsed.segments.len(), 2);
+    }
+
+    #[test]
+    fn truncated_output_without_a_complete_segment_stays_raw_text() {
+        let raw = r#"[{"Start":0.0,"End":1.5,"Speaker":0,"Content":"wor"#;
+        let parsed = parse_vibevoice_asr_output(raw);
+
+        assert_eq!(parsed.format, "text");
+        assert_eq!(parsed.text, raw);
         assert!(parsed.segments.is_empty());
     }
 

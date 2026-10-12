@@ -2165,10 +2165,15 @@ impl Engine {
         input_tokens: Option<usize>,
         artifact: Option<Arc<VibeVoiceAsrPreparedArtifact>>,
     ) -> Result<EngineCoreRequest> {
+        let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, artifact) {
             (None, None) => request.install_prepared_asr_long_form_atomic()?,
             (Some(input_tokens), Some(artifact)) => {
+                // Admission prices `max_tokens`: narrow an omitted budget to
+                // this audio's duration before the context clamp.
+                request.params.max_tokens =
+                    crate::runtime::vibevoice_asr_planned_max_tokens(&request, audio_seconds);
                 request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
                 request.install_prepared_vibevoice_artifact(variant, artifact)?;
             }
@@ -3375,6 +3380,37 @@ mod tests {
                 .unwrap(),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn direct_vibevoice_retained_route_prices_the_duration_budget() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let prepare = |auto: bool, max_tokens: usize, seconds: usize, context: usize| {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            request.asr_auto_max_tokens = auto;
+            request.params.max_tokens = max_tokens;
+            let artifact = VibeVoiceAsrPreparedArtifact::for_test(64, 4..8, 12_800, 2).unwrap();
+            Engine::finalize_direct_vibevoice_asr_preparation(
+                request,
+                variant,
+                vec![0.0; 16_000 * seconds],
+                16_000,
+                context,
+                Some(64),
+                Some(Arc::new(artifact)),
+            )
+            .unwrap()
+            .params
+            .max_tokens
+        };
+
+        // An omitted budget is admitted at the 32768 ceiling, then narrowed to
+        // the clip's duration budget before the context clamp.
+        assert_eq!(prepare(true, 32_768, 60, 131_072), 976);
+        assert_eq!(prepare(true, 32_768, 10, 131_072), 512);
+        assert_eq!(prepare(true, 32_768, 60, 564), 500);
+        assert_eq!(prepare(false, 200, 60, 131_072), 200);
     }
 
     struct EndlessSequenceExecutor;
