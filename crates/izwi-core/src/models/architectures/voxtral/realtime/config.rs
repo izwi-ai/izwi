@@ -75,8 +75,11 @@ impl VoxtralConfig {
             hop_length: whisper.audio_encoding_args.hop_length,
             sampling_rate: whisper.audio_encoding_args.sampling_rate,
             is_causal: whisper.causal,
+            // The causal stem of HF transformers, vLLM and mistral_common:
+            // conv1 keeps the 100 Hz mel rate and conv2 halves it, so with
+            // 4-frame pooling one audio token covers 8 mel frames (80 ms).
             conv1_kernel_size: 3,
-            conv1_stride: 2,
+            conv1_stride: 1,
             conv2_kernel_size: 3,
             conv2_stride: 2,
             global_log_mel_max: whisper.audio_encoding_args.global_log_mel_max,

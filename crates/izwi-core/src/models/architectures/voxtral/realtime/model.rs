@@ -261,6 +261,7 @@ impl VoxtralRealtimeModel {
             &config,
             tokenizer.audio_config(),
             geometry.block_pool_size,
+            geometry.audio_length_per_tok,
         )?;
         let realtime_max_source_samples = realtime_source_sample_ceiling(&config, &layout)?;
 
@@ -691,8 +692,7 @@ impl VoxtralRealtimeModel {
                 "Voxtral realtime prompt requires an empty retained cache".into(),
             ));
         }
-        let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
-        prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
+        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         let prompt_len = prompt_tokens.len();
         if state.prepared_audio_frames < prompt_len {
             return Ok(None);
@@ -729,8 +729,7 @@ impl VoxtralRealtimeModel {
         if state.prompt_initialized || state.finished {
             return Ok(None);
         }
-        let prompt_len =
-            voxtral_generation_prefix_len(self.tokenizer.build_transcription_prompt()?.len());
+        let prompt_len = self.tokenizer.build_transcription_prompt()?.len();
         Ok((state.prepared_audio_frames >= prompt_len).then_some(prompt_len))
     }
 
@@ -1144,8 +1143,7 @@ impl VoxtralRealtimeModel {
         let t_cond = self.time_embedding.forward(&time_tensor)?;
 
         // Generate
-        let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
-        prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
+        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         let prompt_len = prompt_tokens.len();
         let max_frames =
             voxtral_realtime_offline_frame_limit(backend, audio_frames, model_context_limit)?;
@@ -1833,31 +1831,74 @@ fn pool_audio_embeddings_by_block(audio_embeds: &Tensor, pool_size: usize) -> Re
     }
 }
 
+/// One stem convolution. The zero padding is applied explicitly before the
+/// convolution (whose own padding is 0), so it can be one-sided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Conv1dGeometry {
     kernel: usize,
     stride: usize,
-    padding: usize,
+    left_padding: usize,
+    right_padding: usize,
     dilation: usize,
 }
 
+impl Conv1dGeometry {
+    /// Symmetric padding of one frame, as in the classic Whisper stem.
+    fn symmetric(kernel: usize, stride: usize) -> Self {
+        Self {
+            kernel,
+            stride,
+            left_padding: 1,
+            right_padding: 1,
+            dilation: 1,
+        }
+    }
+
+    /// Causal padding as in HF `VoxtralRealtimeCausalConv1d` and vLLM
+    /// `WhisperCausalConv1d`: `(k - 1) * d + 1 - stride` zeros on the left
+    /// only (here `d = 1`), so output `j` reads input frames no later than
+    /// `(j + 1) * stride - 1`, the end of its own stride block.
+    fn causal(kernel: usize, stride: usize) -> Self {
+        Self {
+            kernel,
+            stride,
+            left_padding: kernel.saturating_sub(stride),
+            right_padding: 0,
+            dilation: 1,
+        }
+    }
+}
+
 /// The encoder's two-convolution stem, shared by the loaded encoder and the
-/// weights-free realtime layout.
-fn conv_stem_geometry(cfg: &super::config::AudioEncoderConfig) -> (Conv1dGeometry, Conv1dGeometry) {
+/// weights-free realtime layout. Voxtral Realtime's stem is causal; the
+/// classic Whisper branch keeps symmetric padding.
+fn conv_stem_geometry(
+    cfg: &super::config::AudioEncoderConfig,
+    is_voxtral: bool,
+) -> (Conv1dGeometry, Conv1dGeometry) {
+    let conv = if is_voxtral {
+        Conv1dGeometry::causal
+    } else {
+        Conv1dGeometry::symmetric
+    };
     (
-        Conv1dGeometry {
-            kernel: cfg.conv1_kernel_size,
-            stride: cfg.conv1_stride,
-            padding: 1,
-            dilation: 1,
-        },
-        Conv1dGeometry {
-            kernel: cfg.conv2_kernel_size,
-            stride: cfg.conv2_stride,
-            padding: 1,
-            dilation: 1,
-        },
+        conv(cfg.conv1_kernel_size, cfg.conv1_stride),
+        conv(cfg.conv2_kernel_size, cfg.conv2_stride),
     )
+}
+
+/// Apply one stem convolution with its explicit zero padding.
+fn conv1d_with_geometry(
+    conv: &candle_nn::Conv1d,
+    spec: Conv1dGeometry,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let x = if spec.left_padding == 0 && spec.right_padding == 0 {
+        x.clone()
+    } else {
+        x.pad_with_zeros(D::Minus1, spec.left_padding, spec.right_padding)?
+    };
+    conv.forward(&x).map_err(Error::from)
 }
 
 fn conv_output_length(input: usize, spec: Conv1dGeometry) -> Result<usize> {
@@ -1866,12 +1907,10 @@ fn conv_output_length(input: usize, spec: Conv1dGeometry) -> Result<usize> {
             "Voxtral encoder has invalid convolution geometry".into(),
         ));
     }
-    let padded =
-        input
-            .checked_add(spec.padding.checked_mul(2).ok_or_else(|| {
-                Error::InvalidInput("Voxtral convolution padding overflow".into())
-            })?)
-            .ok_or_else(|| Error::InvalidInput("Voxtral convolution length overflow".into()))?;
+    let padded = input
+        .checked_add(spec.left_padding)
+        .and_then(|length| length.checked_add(spec.right_padding))
+        .ok_or_else(|| Error::InvalidInput("Voxtral convolution length overflow".into()))?;
     let receptive = spec
         .dilation
         .checked_mul(spec.kernel - 1)
@@ -1942,17 +1981,18 @@ impl WhisperEncoder {
         vb: VarBuilder,
         is_voxtral: bool,
     ) -> Result<Self> {
-        let (conv1_spec, conv2_spec) = conv_stem_geometry(cfg);
+        let (conv1_spec, conv2_spec) = conv_stem_geometry(cfg, is_voxtral);
+        // Padding is applied by `conv1d_with_geometry`, never by the conv.
         let conv1_config = candle_nn::Conv1dConfig {
             stride: conv1_spec.stride,
-            padding: conv1_spec.padding,
+            padding: 0,
             groups: 1,
             dilation: conv1_spec.dilation,
             ..Default::default()
         };
         let conv2_config = candle_nn::Conv1dConfig {
             stride: conv2_spec.stride,
-            padding: conv2_spec.padding,
+            padding: 0,
             groups: 1,
             dilation: conv2_spec.dilation,
             ..Default::default()
@@ -2043,10 +2083,8 @@ impl WhisperEncoder {
         let x = input_features.transpose(1, 2)?;
 
         // Conv layers with gelu
-        let x = self.conv1.forward(&x)?;
-        let x = gelu(&x)?;
-        let x = self.conv2.forward(&x)?;
-        let x = gelu(&x)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
 
         // Transpose back: [batch, hidden, frames] -> [batch, frames, hidden]
         let x = x.transpose(1, 2)?;
@@ -2091,7 +2129,7 @@ impl WhisperEncoder {
             .iter()
             .map(|length| conv_output_length(*length, self.conv1_spec))
             .collect::<Result<Vec<_>>>()?;
-        let x = gelu(&self.conv1.forward(&x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
         let conv1_frames = x.dim(2)?;
         let conv1_mask = channel_valid_mask(&conv1_lengths, conv1_frames, &x)?;
         let x = x.broadcast_mul(&conv1_mask)?;
@@ -2100,7 +2138,7 @@ impl WhisperEncoder {
             .iter()
             .map(|length| conv_output_length(*length, self.conv2_spec))
             .collect::<Result<Vec<_>>>()?;
-        let x = gelu(&self.conv2.forward(&x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
         let conv2_frames = x.dim(2)?;
         let conv2_channel_mask = channel_valid_mask(&conv2_lengths, conv2_frames, &x)?;
         let x = x.broadcast_mul(&conv2_channel_mask)?.transpose(1, 2)?;
@@ -2138,10 +2176,8 @@ impl WhisperEncoder {
         for mel in mel_features {
             // mel: [n_mels, seq_len] -> [1, n_mels, seq_len]
             let x = prepare_realtime_conv_input(mel)?;
-            let x = self.conv1.forward(&x)?;
-            let x = gelu(&x)?;
-            let x = self.conv2.forward(&x)?;
-            let x = gelu(&x)?;
+            let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
+            let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
             // [1, hidden, seq_len] -> [hidden, seq_len]
             let x = x.squeeze(0)?;
             outputs.push(x);
@@ -2733,10 +2769,6 @@ fn drop_last_mel_frame_for_voxtral(log_mel: &mut Vec<Vec<f32>>) {
     log_mel.pop();
 }
 
-fn voxtral_generation_prefix_len(standard_prompt_len: usize) -> usize {
-    standard_prompt_len.saturating_sub(1).max(1)
-}
-
 fn append_generated_token(
     tokenizer: &VoxtralTokenizer,
     generated: &mut Vec<u32>,
@@ -2888,20 +2920,25 @@ struct VoxtralRealtimeLayout {
 }
 
 impl VoxtralRealtimeLayout {
-    fn new(config: &VoxtralConfig, audio: &AudioConfig, pool_size: usize) -> Result<Self> {
+    fn new(
+        config: &VoxtralConfig,
+        audio: &AudioConfig,
+        pool_size: usize,
+        audio_length_per_tok: usize,
+    ) -> Result<Self> {
         let encoder = config.audio_config();
         let target_rate = u32::try_from(encoder.sampling_rate)
             .map_err(|_| Error::ModelLoadError("Voxtral sampling rate exceeds u32".into()))?;
-        let (conv1, conv2) = conv_stem_geometry(&encoder);
-        Ok(Self {
+        let (conv1, conv2) = conv_stem_geometry(&encoder, true);
+        let layout = Self {
             target_rate,
             hop_length: encoder.hop_length,
             n_mels: encoder.num_mel_bins,
             raw_audio_length_per_tok: audio.raw_audio_length_per_tok(),
-            left_pad_tokens: offline_left_pad_tokens_for_generation(
-                audio.streaming_left_pad_tokens,
-                audio.n_delay_tokens,
-            ),
+            // Offline audio carries the same left silence as a stream
+            // (mistral_common `_get_streaming_pad`); the 39-token prompt then
+            // covers 32 silent tokens plus the first 7 audio tokens.
+            left_pad_tokens: audio.streaming_left_pad_tokens,
             right_pad_tokens: audio.offline_right_pad_tokens(),
             pool_size,
             text_dim: config.text_dim,
@@ -2912,7 +2949,44 @@ impl VoxtralRealtimeLayout {
             encoder_heads: encoder.encoder_attention_heads,
             encoder_sliding_window: (encoder.is_causal && encoder.sliding_window > 0)
                 .then_some(encoder.sliding_window),
-        })
+        };
+        layout.validate_frame_contract(audio_length_per_tok)?;
+        Ok(layout)
+    }
+
+    /// One audio token must cover exactly the samples and mel frames the
+    /// checkpoint was trained on: `hop * s1 * s2 * pool` samples
+    /// (`raw_audio_length_per_tok`, 160 * 1 * 2 * 4 = 1280) and
+    /// `s1 * s2 * pool` mel frames (`audio_length_per_tok`, 8). A stem that
+    /// disagrees runs the decoder at the wrong audio rate, so it fails the load.
+    fn validate_frame_contract(&self, audio_length_per_tok: usize) -> Result<()> {
+        let mel_frames_per_token = self
+            .conv1
+            .stride
+            .checked_mul(self.conv2.stride)
+            .and_then(|stride| stride.checked_mul(self.pool_size));
+        let samples_per_token =
+            mel_frames_per_token.and_then(|frames| frames.checked_mul(self.hop_length));
+        let (Some(mel_frames_per_token), Some(samples_per_token)) =
+            (mel_frames_per_token, samples_per_token)
+        else {
+            return Err(Error::ModelLoadError(
+                "Voxtral encoder stem geometry overflows".into(),
+            ));
+        };
+        if mel_frames_per_token != audio_length_per_tok
+            || samples_per_token != self.raw_audio_length_per_tok
+        {
+            return Err(Error::ModelLoadError(format!(
+                "Voxtral encoder stem (hop {}, conv strides {} and {}, pooling {}) gives {mel_frames_per_token} mel frames and {samples_per_token} samples per audio token, but the checkpoint expects {audio_length_per_tok} and {}",
+                self.hop_length,
+                self.conv1.stride,
+                self.conv2.stride,
+                self.pool_size,
+                self.raw_audio_length_per_tok
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3273,16 +3347,6 @@ fn offline_streaming_padding_samples(
     (left_pad, right_pad)
 }
 
-fn offline_left_pad_tokens_for_generation(
-    streaming_left_pad_tokens: usize,
-    num_delay_tokens: usize,
-) -> usize {
-    let generation_prefix_tokens = streaming_left_pad_tokens.saturating_add(num_delay_tokens);
-    generation_prefix_tokens
-        .saturating_mul(2)
-        .max(streaming_left_pad_tokens)
-}
-
 fn load_weights<'a>(
     model_dir: &'a Path,
     dtype: DType,
@@ -3435,16 +3499,15 @@ mod tests {
     use super::{
         apply_interleaved_rotary_emb, argmax, attention_scale_tensor,
         checked_realtime_frontend_host_peak_bytes, checked_realtime_stream_peak_bytes,
-        checked_realtime_text_host_bytes, checked_workspace_bytes, conv_output_length,
-        create_valid_attention_mask, drop_last_mel_frame_for_voxtral, load_voxtral_runtime_config,
-        mel_frames_to_tensor, normalize_log_mel_with_max, offline_left_pad_tokens_for_generation,
+        checked_realtime_text_host_bytes, checked_workspace_bytes, conv1d_with_geometry,
+        conv_output_length, create_valid_attention_mask, drop_last_mel_frame_for_voxtral,
+        load_voxtral_runtime_config, mel_frames_to_tensor, normalize_log_mel_with_max,
         offline_streaming_padding_samples, pool_audio_embeddings_by_block,
         prepare_realtime_conv_input, realtime_audio_geometry, realtime_preparation_geometry_for,
         realtime_preparation_stage_seal_for, realtime_source_sample_ceiling, resample_audio,
         select_voxtral_dtype, text_delta, validate_realtime_sample_ceiling,
-        voxtral_generation_prefix_len, voxtral_realtime_cuda_sliding_flash_options,
-        voxtral_realtime_offline_frame_limit, Conv1dGeometry, VoxtralRealtimeLayout,
-        VoxtralRealtimePreparationMode,
+        voxtral_realtime_cuda_sliding_flash_options, voxtral_realtime_offline_frame_limit,
+        Conv1dGeometry, VoxtralRealtimeLayout, VoxtralRealtimePreparationMode,
     };
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, Tensor};
@@ -3468,7 +3531,13 @@ mod tests {
         let geometry = realtime_audio_geometry(&config, &runtime);
         let tekken = std::fs::read_to_string(dir.join("tekken_audio.json")).unwrap();
         let audio = merge_tekken_audio_metadata(geometry.audio, &tekken).unwrap();
-        let layout = VoxtralRealtimeLayout::new(&config, &audio, geometry.block_pool_size).unwrap();
+        let layout = VoxtralRealtimeLayout::new(
+            &config,
+            &audio,
+            geometry.block_pool_size,
+            geometry.audio_length_per_tok,
+        )
+        .unwrap();
         (config, audio, layout)
     }
 
@@ -3497,6 +3566,59 @@ mod tests {
         assert!(seal.max_materialized_tensor_elements_per_row > 0);
         assert!(seal.max_workspace_bytes > 0);
         assert!(seal.max_workspace_bytes < 4 << 30);
+    }
+
+    /// pooled = ceil(N / 1280) + 49: 32 left-pad tokens, 17 right-pad tokens
+    /// (6 delay + 1 + 10 buffer) and the alignment to whole tokens.
+    #[test]
+    fn published_offline_geometry_matches_reference_table() {
+        let (_, _, layout) = published_realtime_layout();
+        // (samples, padded, mel = conv1, conv2, pooled)
+        let table = [
+            (1, 64_000, 400, 200, 50),
+            (16_000, 79_360, 496, 248, 62),
+            (16_001, 79_360, 496, 248, 62),
+            (160_000, 222_720, 1_392, 696, 174),
+            (480_000, 542_720, 3_392, 1_696, 424),
+        ];
+        for (samples, padded, mel, conv2, pooled) in table {
+            let geometry = realtime_preparation_geometry_for(
+                samples,
+                16_000,
+                &layout,
+                VoxtralRealtimePreparationMode::Finish,
+            )
+            .unwrap();
+            assert_eq!(geometry.padded_samples, padded, "{samples} samples");
+            assert_eq!(geometry.mel_frames, mel, "{samples} samples");
+            assert_eq!(geometry.conv1_frames, mel, "{samples} samples");
+            assert_eq!(geometry.conv2_frames, conv2, "{samples} samples");
+            assert_eq!(geometry.pooled_frames, pooled, "{samples} samples");
+            assert_eq!(pooled, samples.div_ceil(1_280) + 49);
+            assert_eq!(geometry.stable_frames, pooled);
+            // HF generates one token per audio token after the 39-token prompt.
+            assert!(pooled > 39);
+        }
+    }
+
+    #[test]
+    fn frame_contract_accepts_published_stem_and_rejects_stride_two() {
+        let (config, audio, layout) = published_realtime_layout();
+        assert_eq!(layout.conv1, Conv1dGeometry::causal(3, 1));
+        assert_eq!(layout.conv2, Conv1dGeometry::causal(3, 2));
+        assert_eq!(layout.raw_audio_length_per_tok, 1_280);
+        assert_eq!(layout.left_pad_tokens, 32);
+        assert_eq!(layout.right_pad_tokens, 17);
+        layout.validate_frame_contract(8).unwrap();
+
+        // The stride-2 stem ran the decoder at 6.25 Hz instead of 12.5 Hz.
+        let mut stride_two = layout;
+        stride_two.conv1 = Conv1dGeometry::symmetric(3, 2);
+        let error = stride_two.validate_frame_contract(8).unwrap_err();
+        assert!(format!("{error}").contains("16 mel frames and 2560 samples"));
+
+        // Load runs the same check against the sidecar's audio_length_per_tok.
+        assert!(VoxtralRealtimeLayout::new(&config, &audio, 4, 16).is_err());
     }
 
     #[test]
@@ -3638,25 +3760,6 @@ mod tests {
     }
 
     #[test]
-    fn voxtral_offline_padding_covers_generation_prefix() {
-        assert_eq!(offline_left_pad_tokens_for_generation(32, 6), 76);
-
-        let (left, _right) = offline_streaming_padding_samples(
-            16_001,
-            1_280,
-            offline_left_pad_tokens_for_generation(32, 6),
-            17,
-        );
-
-        assert_eq!(left, 76 * 1_280);
-    }
-
-    #[test]
-    fn voxtral_generation_uses_reference_prefix_length() {
-        assert_eq!(voxtral_generation_prefix_len(39), 38);
-    }
-
-    #[test]
     fn text_delta_preserves_word_boundary_space() {
         assert_eq!(text_delta("hello", "hello world"), " world");
     }
@@ -3784,16 +3887,65 @@ mod tests {
 
     #[test]
     fn voxtral_two_conv_valid_lengths_are_exact_for_unequal_rows() {
-        let conv = Conv1dGeometry {
-            kernel: 3,
-            stride: 2,
-            padding: 1,
-            dilation: 1,
-        };
-        assert_eq!(conv_output_length(9, conv).unwrap(), 5);
-        assert_eq!(conv_output_length(5, conv).unwrap(), 3);
-        assert_eq!(conv_output_length(8, conv).unwrap(), 4);
-        assert_eq!(conv_output_length(4, conv).unwrap(), 2);
+        let conv1 = Conv1dGeometry::causal(3, 1);
+        let conv2 = Conv1dGeometry::causal(3, 2);
+        assert_eq!((conv1.left_padding, conv1.right_padding), (2, 0));
+        assert_eq!((conv2.left_padding, conv2.right_padding), (1, 0));
+        // conv1 keeps every mel frame; conv2 keeps floor(frames / 2).
+        for (mel, conv2_frames) in [(9, 4), (8, 4), (5, 2), (4, 2), (1, 0)] {
+            let conv1_frames = conv_output_length(mel, conv1).unwrap();
+            assert_eq!(conv1_frames, mel);
+            assert_eq!(
+                conv_output_length(conv1_frames, conv2).unwrap(),
+                conv2_frames
+            );
+        }
+    }
+
+    #[test]
+    fn voxtral_causal_conv_matches_geometry_and_never_looks_ahead() {
+        let device = Device::Cpu;
+        for spec in [Conv1dGeometry::causal(3, 1), Conv1dGeometry::causal(3, 2)] {
+            let conv = candle_nn::Conv1d::new(
+                Tensor::ones((1, 1, spec.kernel), DType::F32, &device).unwrap(),
+                None,
+                candle_nn::Conv1dConfig {
+                    stride: spec.stride,
+                    ..Default::default()
+                },
+            );
+            let frames = 11;
+            let base = (0..frames).map(|v| v as f32 + 1.0).collect::<Vec<_>>();
+            let run = |input: &[f32]| {
+                let x = Tensor::from_vec(input.to_vec(), (1, 1, frames), &device).unwrap();
+                conv1d_with_geometry(&conv, spec, &x)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let output = run(&base);
+            assert_eq!(output.len(), conv_output_length(frames, spec).unwrap());
+            // Output 0 sees only zeros on the left plus the first input frame(s).
+            let first_inputs = &base[..spec.kernel - spec.left_padding];
+            assert_eq!(output[0], first_inputs.iter().sum::<f32>());
+
+            for t in 0..frames {
+                let mut perturbed = base.clone();
+                perturbed[t] += 100.0;
+                let changed = run(&perturbed);
+                for (index, (before, after)) in output.iter().zip(&changed).enumerate() {
+                    // Output `index` ends at input frame (index + 1) * stride - 1.
+                    let last_input = (index + 1) * spec.stride - 1;
+                    if last_input < t {
+                        assert_eq!(before, after, "output {index} saw later frame {t}");
+                    } else if index == t / spec.stride {
+                        assert_ne!(before, after, "output {index} ignored its frame {t}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3814,12 +3966,7 @@ mod tests {
 
     #[test]
     fn voxtral_push_and_finish_geometry_partition_the_tail() {
-        let conv = Conv1dGeometry {
-            kernel: 3,
-            stride: 2,
-            padding: 1,
-            dilation: 1,
-        };
+        let conv = Conv1dGeometry::causal(3, 2);
         let layout = VoxtralRealtimeLayout {
             target_rate: 16_000,
             hop_length: 160,
