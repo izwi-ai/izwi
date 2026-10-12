@@ -58,6 +58,30 @@ fn preferred_prefill_tokens_for(backend: BackendKind) -> usize {
     }
 }
 
+/// Decode tokens per engine step on accelerators, as Qwen3.6 uses. Every
+/// step pays fixed host work (scheduling, state staging and the KV commit)
+/// that a multi-token quantum spreads over its tokens. Streams then deliver
+/// up to this many tokens at a time.
+const ACCELERATOR_DECODE_QUANTUM: usize = 8;
+const MAX_DECODE_QUANTUM: usize = 16;
+
+/// Decode tokens per engine step for a request decoding alone:
+/// `IZWI_QWEN35_DECODE_QUANTUM` (1..=16) when set, else 8 on CUDA and Metal
+/// and 1 on the CPU, where a slow token makes long bursts.
+fn preferred_decode_tokens_for(backend: BackendKind) -> usize {
+    let configured = std::env::var("IZWI_QWEN35_DECODE_QUANTUM")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    configured.map_or(
+        match backend {
+            BackendKind::Cuda | BackendKind::Metal => ACCELERATOR_DECODE_QUANTUM,
+            BackendKind::Cpu => 1,
+        },
+        |value| value.min(MAX_DECODE_QUANTUM),
+    )
+}
+
 fn qwen35_prefill_chunk_size() -> usize {
     std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
         .ok()
@@ -1223,6 +1247,22 @@ impl Qwen35ChatModel {
         preferred_prefill_tokens_for(self.device_kind)
     }
 
+    /// Decode tokens per engine step for a request decoding alone. The
+    /// scheduler grants it only to an isolated row with no waiting work;
+    /// shared batches stay at one token per row.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        preferred_decode_tokens_for(self.device_kind)
+    }
+
+    /// Whether the decode quantum outlives the request's soft scheduling SLA.
+    /// Interactive and streaming chat pass that SLA (about 0.7 s) early in
+    /// almost every stream, after which the scheduler would grant one token
+    /// per step. The quantum still yields to waiting or co-batched work and
+    /// to hard deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.preferred_decode_tokens() > 1
+    }
+
     /// Hybrid retained-state contract shared by loading, scheduling, and the
     /// native model adapter.
     pub(crate) fn managed_composite_cache_contract(
@@ -1303,8 +1343,8 @@ impl Qwen35ChatModel {
             "scheduling": {
                 "preferred_prefill_tokens": self.preferred_prefill_tokens(),
                 "prefill_chunk_tokens": qwen35_prefill_chunk_size(),
-                "preferred_decode_tokens": 1,
-                "sustained_decode_quantum": false,
+                "preferred_decode_tokens": self.preferred_decode_tokens(),
+                "sustained_decode_quantum": self.sustained_decode_quantum(),
             },
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
             "counters": self.exec.text_model.telemetry().snapshot(),
@@ -2495,6 +2535,28 @@ mod tests {
             1,
             "a penalized token 0 falls below token 1"
         );
+    }
+
+    #[test]
+    fn decode_quantum_is_eight_on_accelerators_and_one_on_cpu() {
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("IZWI_QWEN35_DECODE_QUANTUM");
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cuda), 8);
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Metal), 8);
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cpu), 1);
+        for (value, expected) in [("1", 1), ("4", 4), ("99", MAX_DECODE_QUANTUM), ("0", 8)] {
+            std::env::set_var("IZWI_QWEN35_DECODE_QUANTUM", value);
+            assert_eq!(
+                preferred_decode_tokens_for(BackendKind::Cuda),
+                expected,
+                "{value}"
+            );
+        }
+        std::env::set_var("IZWI_QWEN35_DECODE_QUANTUM", "3");
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cpu), 3);
+        std::env::remove_var("IZWI_QWEN35_DECODE_QUANTUM");
     }
 
     #[test]
