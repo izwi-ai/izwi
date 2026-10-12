@@ -187,7 +187,7 @@ Supported request fields:
 | `max_tokens`, `max_completion_tokens` | Optional output budgets. |
 | `stream` | `true` returns SSE chat chunks. |
 | `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
-| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `frequency_penalty`, `stop` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | `tools`, `tool_choice` | Accepted for tool-call prompting. Strict mode only allows `tool_choice` as `auto`, `none`, or `null`. |

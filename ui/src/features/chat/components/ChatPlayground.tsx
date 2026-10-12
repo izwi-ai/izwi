@@ -61,7 +61,10 @@ import {
   parseAssistantContent,
   parseUserMessageDisplayFromContentParts,
   readImageFileAsDataUrl,
+  statsAfterHistoryRefresh,
   stripThinkingArtifacts,
+  summarizeChatStats,
+  type StreamedTurnStats,
   systemPromptForModel,
   supportsImageAttachmentsForModel,
   supportsImplicitOpenThinkTagParsing,
@@ -69,6 +72,7 @@ import {
 } from "@/features/chat/playground/support";
 import {
   api,
+  type ChatGenerationStats,
   type ChatReasoningEffort,
   type ChatThread,
   type ChatThreadMessageRecord,
@@ -133,10 +137,8 @@ export function ChatPlayground({
   const [threadsLoading, setThreadsLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stats, setStats] = useState<{
-    tokens_generated: number;
-    generation_time_ms: number;
-  } | null>(null);
+  const [stats, setStats] = useState<ChatGenerationStats | null>(null);
+  const statsSummary = stats ? summarizeChatStats(stats) : null;
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(
     null,
   );
@@ -937,6 +939,7 @@ export function ChatPlayground({
     setStreamingThreadId(targetThreadId);
 
     let streamFailed = false;
+    let streamedTurn: StreamedTurnStats | null = null;
     try {
       streamAbortRef.current = api.sendChatThreadMessageStream(
         targetThreadId,
@@ -1020,6 +1023,7 @@ export function ChatPlayground({
               return [...updated, assistantMessage];
             });
             setStats(streamStats);
+            streamedTurn = { messageId: assistantMessage.id, stats: streamStats };
 
             if (isFirstTurn) {
               void maybeGenerateThreadTitle({
@@ -1058,7 +1062,7 @@ export function ChatPlayground({
                   return;
                 }
                 setMessages(detail.messages);
-                setStats(extractLatestStats(detail.messages));
+                setStats(statsAfterHistoryRefresh(detail.messages, streamedTurn));
               })
               .catch(() => {
                 // Ignore follow-up sync failures after stream close.
@@ -1814,20 +1818,33 @@ export function ChatPlayground({
               </div>
             </div>
 
-            {stats && !isStreaming && (
+            {statsSummary && !isStreaming && (
               <div className="px-4 pb-2 pt-3 sm:px-6">
                 <div className="mx-auto flex max-w-4xl items-center justify-center gap-3 text-[11px] font-medium text-muted-foreground">
                   <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {stats.tokens_generated} tokens
+                    {statsSummary.tokens} tokens
                   </span>
                   <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {Math.round(stats.generation_time_ms)} ms
+                    {Math.round(statsSummary.totalMs)} ms
                   </span>
-                  <span className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm">
-                    {Math.round(
-                      stats.tokens_generated / (stats.generation_time_ms / 1000),
-                    )}{" "}
-                    t/s
+                  {statsSummary.ttftMs !== null && (
+                    <span
+                      className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
+                      title="Time to first token, including queue wait and prompt processing"
+                    >
+                      {Math.round(statsSummary.ttftMs)} ms TTFT
+                    </span>
+                  )}
+                  <span
+                    className="rounded-md border border-[var(--border-muted)] bg-muted px-2 py-0.5 shadow-sm"
+                    title={
+                      statsSummary.decodeOnly
+                        ? "Decode speed: generated tokens over decode time, excluding queue wait and prompt processing"
+                        : "Generated tokens over total time, including queue wait and prompt processing"
+                    }
+                  >
+                    {Math.round(statsSummary.tokensPerSecond)} t/s
+                    {statsSummary.decodeOnly ? " decode" : ""}
                   </span>
                 </div>
               </div>

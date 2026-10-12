@@ -3707,6 +3707,7 @@ dependencies = [
  "bytes",
  "candle-core",
  "candle-flash-attn",
+ "candle-kernels",
  "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",

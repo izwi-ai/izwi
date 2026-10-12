@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_core::quantized::gguf_file::Value as GgufValue;
@@ -23,12 +24,16 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates_with_history, device_candidates_cover_top_p,
+    sample_device_candidates, PenaltyHistory,
 };
+use crate::models::shared::telemetry::{record_host_read, thread_host_reads};
 use crate::models::shared::weights::gguf::{GgufLoader, GgufModelInfo};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::cache::qwen35_composite_cache_contract;
+use super::fast_path::Qwen35CudaSwitches;
+use super::telemetry::{Qwen35Telemetry, SamplerPath};
 use super::text::{Qwen35TextModel, Qwen35TextRuntimeState};
 use super::vision::{PreparedVisionInputs, Qwen35VisionModel};
 
@@ -36,6 +41,46 @@ const IMAGE_PAD_PLACEHOLDER: &str = "<|image_pad|>";
 const VIDEO_PAD_PLACEHOLDER: &str = "<|video_pad|>";
 const DEFAULT_PREFILL_CHUNK_SIZE: usize = 256;
 const MAX_PREFILL_CHUNK_SIZE: usize = 2048;
+/// Prefill span requested from the scheduler when a request prefills alone
+/// on an accelerator. Each engine step adds fixed host work (state staging,
+/// KV commit, scheduling), and with chunked prefill on (the CUDA default)
+/// the engine's threshold cuts prompts into 192-token steps. The model still
+/// runs the span in `IZWI_QWEN35_PREFILL_CHUNK_SIZE` forward chunks.
+const ACCELERATOR_PREFERRED_PREFILL_TOKENS: usize = 1024;
+
+/// Preferred isolated prefill span for a backend; 0 keeps the engine's
+/// threshold. CPU prefill is compute-bound per token, so a wider step only
+/// delays cancellation and new arrivals.
+fn preferred_prefill_tokens_for(backend: BackendKind) -> usize {
+    match backend {
+        BackendKind::Cuda | BackendKind::Metal => ACCELERATOR_PREFERRED_PREFILL_TOKENS,
+        BackendKind::Cpu => 0,
+    }
+}
+
+/// Decode tokens per engine step on accelerators, as Qwen3.6 uses. Every
+/// step pays fixed host work (scheduling, state staging and the KV commit)
+/// that a multi-token quantum spreads over its tokens. Streams then deliver
+/// up to this many tokens at a time.
+const ACCELERATOR_DECODE_QUANTUM: usize = 8;
+const MAX_DECODE_QUANTUM: usize = 16;
+
+/// Decode tokens per engine step for a request decoding alone:
+/// `IZWI_QWEN35_DECODE_QUANTUM` (1..=16) when set, else 8 on CUDA and Metal
+/// and 1 on the CPU, where a slow token makes long bursts.
+fn preferred_decode_tokens_for(backend: BackendKind) -> usize {
+    let configured = std::env::var("IZWI_QWEN35_DECODE_QUANTUM")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    configured.map_or(
+        match backend {
+            BackendKind::Cuda | BackendKind::Metal => ACCELERATOR_DECODE_QUANTUM,
+            BackendKind::Cpu => 1,
+        },
+        |value| value.min(MAX_DECODE_QUANTUM),
+    )
+}
 
 fn qwen35_prefill_chunk_size() -> usize {
     std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
@@ -97,18 +142,41 @@ where
     }
 }
 
+/// Initial token history for the sampling penalties. The prompt is kept
+/// only when the repetition penalty reads it, because the presence penalty
+/// reads generated tokens alone (vLLM semantics, which Qwen's published
+/// sampling profiles assume).
 fn initial_penalty_history(
     prompt_ids: &[u32],
     max_new_tokens: usize,
     track_history: bool,
+    include_prompt: bool,
 ) -> Vec<u32> {
     if !track_history {
         return Vec::new();
     }
 
-    let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(max_new_tokens.max(1)));
-    history.extend_from_slice(prompt_ids);
+    let prompt = if include_prompt { prompt_ids } else { &[] };
+    let mut history = Vec::with_capacity(prompt.len().saturating_add(max_new_tokens.max(1)));
+    history.extend_from_slice(prompt);
     history
+}
+
+/// Penalty histories for the next sample. `history_ids` starts with
+/// `prompt_len` prompt tokens (zero when the prompt is not tracked) and
+/// continues with the generated tokens.
+fn penalty_history(
+    track_history: bool,
+    history_ids: &[u32],
+    prompt_len: usize,
+) -> PenaltyHistory<'_> {
+    if !track_history {
+        return PenaltyHistory::uniform(&[]);
+    }
+    PenaltyHistory {
+        repetition: history_ids,
+        presence: &history_ids[prompt_len.min(history_ids.len())..],
+    }
 }
 
 fn expected_physical_decode_cursor(prefill_progress: usize, tokens_generated: usize) -> usize {
@@ -124,6 +192,8 @@ pub struct ChatDecodeState {
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
     history_ids: Vec<u32>,
+    /// Number of prompt tokens at the start of `history_ids`.
+    penalty_prompt_len: usize,
     decoder: IncrementalDecoder,
     tokens_generated: usize,
     track_history: bool,
@@ -143,6 +213,8 @@ pub struct ChatDecodeState {
     /// DS9.2: per-request constrained-decoding runtime, present only when
     /// the request asked for `response_format: json_object`.
     grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
+    /// The loaded model's decode counters.
+    telemetry: Arc<Qwen35Telemetry>,
 }
 
 impl ChatDecodeState {
@@ -243,11 +315,13 @@ impl ChatDecodeState {
         transaction: u64,
     ) -> Result<()> {
         let target_cursor = self.physical_kv.context_len() as u64;
-        self.text_state.stage_tensor_domains(
+        let conv_ring_stacks = self.text_state.stage_tensor_domains(
             arena,
             PhysicalStateTransactionId::new(transaction)?,
             target_cursor,
-        )
+        )?;
+        self.telemetry.record_conv_ring_stacks(conv_ring_stacks);
+        Ok(())
     }
 }
 
@@ -328,10 +402,83 @@ pub(crate) struct Qwen35Tokenizer {
     inner: Tokenizer,
     vocab_size: usize,
     specials: SpecialTokenIds,
-    literal_special_tokens: Vec<(String, u32)>,
+    literal_special_tokens: SpecialTokenMatcher,
     chat_template: String,
     default_enable_thinking: bool,
     bos_token: Option<String>,
+}
+
+/// Literal special tokens matched in one pass over a prompt. At each byte
+/// only the tokens starting with that byte are tried, longest first, so a
+/// match is the earliest position and then the longest token there. Prompts
+/// with thousands of `<|image_pad|>` tokens stay linear; a per-match search
+/// of the remaining text for every special token was quadratic.
+#[derive(Debug, Clone)]
+struct SpecialTokenMatcher {
+    tokens: Vec<(String, u32)>,
+    /// Indices into `tokens` by first byte, longest token first.
+    by_first_byte: Vec<Vec<usize>>,
+}
+
+/// A prompt piece: plain text for the BPE tokenizer, or a special token id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSegment<'a> {
+    Text(&'a str),
+    Special(u32),
+}
+
+impl SpecialTokenMatcher {
+    /// Tokens sorted longest first (then lexically) with duplicates removed;
+    /// the first id listed for a duplicated string wins.
+    fn new(mut tokens: Vec<(String, u32)>) -> Self {
+        tokens.retain(|(token, _)| !token.is_empty());
+        tokens.sort_by(|(left, _), (right, _)| {
+            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+        });
+        tokens.dedup_by(|(left, _), (right, _)| left == right);
+        let mut by_first_byte = vec![Vec::new(); 256];
+        for (index, (token, _)) in tokens.iter().enumerate() {
+            by_first_byte[usize::from(token.as_bytes()[0])].push(index);
+        }
+        Self {
+            tokens,
+            by_first_byte,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The first special token at or after byte `start`, as
+    /// `(byte offset, byte length, id)`. Tokens are valid UTF-8 and begin
+    /// with a leading byte, so every match starts on a char boundary.
+    fn next_match(&self, text: &str, start: usize) -> Option<(usize, usize, u32)> {
+        let bytes = text.as_bytes();
+        (start..bytes.len()).find_map(|offset| {
+            self.by_first_byte[usize::from(bytes[offset])]
+                .iter()
+                .map(|index| &self.tokens[*index])
+                .find(|(token, _)| bytes[offset..].starts_with(token.as_bytes()))
+                .map(|(token, id)| (offset, token.len(), *id))
+        })
+    }
+
+    fn segments<'a>(&self, text: &'a str) -> Vec<PromptSegment<'a>> {
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        while let Some((start, len, id)) = self.next_match(text, offset) {
+            if start > offset {
+                segments.push(PromptSegment::Text(&text[offset..start]));
+            }
+            segments.push(PromptSegment::Special(id));
+            offset = start + len;
+        }
+        if offset < text.len() {
+            segments.push(PromptSegment::Text(&text[offset..]));
+        }
+        segments
+    }
 }
 
 #[derive(Debug)]
@@ -419,10 +566,7 @@ impl Qwen35Tokenizer {
                 |(id, entry)| id.parse::<u32>().ok().map(|id| (entry.content.clone(), id)),
             ));
         }
-        literal_special_tokens.sort_by(|(left, _), (right, _)| {
-            right.len().cmp(&left.len()).then_with(|| left.cmp(right))
-        });
-        literal_special_tokens.dedup_by(|(left, _), (right, _)| left == right);
+        let literal_special_tokens = SpecialTokenMatcher::new(literal_special_tokens);
 
         Ok(Self {
             inner,
@@ -448,38 +592,12 @@ impl Qwen35Tokenizer {
         }
 
         let mut ids = Vec::new();
-        let mut offset = 0usize;
-        while offset < text.len() {
-            let tail = &text[offset..];
-            let mut next_match: Option<(usize, &str, u32)> = None;
-            for (token, token_id) in &self.literal_special_tokens {
-                if let Some(rel_idx) = tail.find(token) {
-                    let candidate = (rel_idx, token.as_str(), *token_id);
-                    match next_match {
-                        None => next_match = Some(candidate),
-                        Some((best_idx, best_token, _)) => {
-                            if rel_idx < best_idx
-                                || (rel_idx == best_idx && token.len() > best_token.len())
-                            {
-                                next_match = Some(candidate);
-                            }
-                        }
-                    }
-                }
+        for segment in self.literal_special_tokens.segments(text) {
+            match segment {
+                PromptSegment::Text(text) => ids.extend(self.inner.encode(text)?),
+                PromptSegment::Special(id) => ids.push(id),
             }
-
-            let Some((rel_idx, matched_token, matched_id)) = next_match else {
-                ids.extend(self.inner.encode(tail)?);
-                break;
-            };
-
-            if rel_idx > 0 {
-                ids.extend(self.inner.encode(&tail[..rel_idx])?);
-            }
-            ids.push(matched_id);
-            offset += rel_idx + matched_token.len();
         }
-
         Ok(ids)
     }
 
@@ -648,6 +766,7 @@ impl Qwen35ChatExec {
         }
         let track_history =
             config.repetition_penalty > 1.0 || config.presence_penalty.abs() > f32::EPSILON;
+        let include_prompt = track_history && config.repetition_penalty > 1.0;
         Ok(ChatDecodeState {
             text_state: self.text_model.new_state(),
             physical_kv: cache,
@@ -658,7 +777,13 @@ impl Qwen35ChatExec {
                 &prepared.prompt_ids,
                 max_new_tokens,
                 track_history,
+                include_prompt,
             ),
+            penalty_prompt_len: if include_prompt {
+                prepared.prompt_ids.len()
+            } else {
+                0
+            },
             decoder: IncrementalDecoder::new(true),
             tokens_generated: 0,
             track_history,
@@ -672,6 +797,7 @@ impl Qwen35ChatExec {
             config: config.clone(),
             rng: SimpleRng::new(config.seed),
             grammar: self.grammar_runtime(config),
+            telemetry: self.text_model.telemetry().clone(),
         })
     }
 
@@ -814,13 +940,14 @@ impl Qwen35ChatExec {
             )?);
             state.next_text_position += 1;
             input_tokens_committed = 1;
+            state.telemetry.record_solo_decode_step();
         }
 
-        let history: &[u32] = if state.track_history {
-            &state.history_ids
-        } else {
-            &[]
-        };
+        let history = penalty_history(
+            state.track_history,
+            &state.history_ids,
+            state.penalty_prompt_len,
+        );
         state.pending_logprobs.clear();
         let next = {
             let output = state.unconsumed_output.take().ok_or_else(|| {
@@ -828,14 +955,16 @@ impl Qwen35ChatExec {
                     "Qwen3.5 decode quantum has no unconsumed model output".to_string(),
                 )
             })?;
-            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token(
+            let reads_before = thread_host_reads();
+            let (token, raw_logprobs, path) = if let Some(grammar) = state.grammar.as_mut() {
+                let (token, raw_logprobs) = grammar.sample_token_with_history(
                     &output,
                     self.tokenizer.vocab_size,
                     &state.config,
                     history,
                     &mut state.rng,
-                )?
+                )?;
+                (token, raw_logprobs, SamplerPath::Grammar)
             } else {
                 sample_next_token_with_logprobs(
                     &output,
@@ -845,6 +974,9 @@ impl Qwen35ChatExec {
                     &mut state.rng,
                 )?
             };
+            state
+                .telemetry
+                .record_sample(path, thread_host_reads().wrapping_sub(reads_before));
             if let Some(raw) = raw_logprobs {
                 let entry = crate::models::shared::sampling::resolve_token_logprob(
                     &self.tokenizer.inner,
@@ -938,24 +1070,29 @@ impl Qwen35ChatExec {
         )?;
         drop(text_states);
         drop(caches);
+        if let Some(state) = states.first() {
+            state.telemetry.record_batched_decode_step(states.len());
+        }
 
         let mut sampled = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let history = if state.track_history {
-                state.history_ids.as_slice()
-            } else {
-                &[]
-            };
+            let history = penalty_history(
+                state.track_history,
+                &state.history_ids,
+                state.penalty_prompt_len,
+            );
             state.pending_logprobs.clear();
             let row_logits = logits.i((row, 0))?;
-            let (token, raw_logprobs) = if let Some(grammar) = state.grammar.as_mut() {
-                grammar.sample_token(
+            let reads_before = thread_host_reads();
+            let (token, raw_logprobs, path) = if let Some(grammar) = state.grammar.as_mut() {
+                let (token, raw_logprobs) = grammar.sample_token_with_history(
                     &row_logits,
                     self.tokenizer.vocab_size,
                     &state.config,
                     history,
                     &mut state.rng,
-                )?
+                )?;
+                (token, raw_logprobs, SamplerPath::Grammar)
             } else {
                 sample_next_token_with_logprobs(
                     &row_logits,
@@ -965,6 +1102,9 @@ impl Qwen35ChatExec {
                     &mut state.rng,
                 )?
             };
+            state
+                .telemetry
+                .record_sample(path, thread_host_reads().wrapping_sub(reads_before));
             let entry = raw_logprobs
                 .map(|raw| {
                     crate::models::shared::sampling::resolve_token_logprob(
@@ -1049,6 +1189,23 @@ impl InferenceStateContractProvider for Qwen35ChatModel {
 
 impl Qwen35ChatModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
+        Self::load_with_performance(
+            model_dir,
+            variant,
+            device,
+            &crate::performance::PerformanceConfig::default(),
+        )
+    }
+
+    /// Load and resolve the fused fast paths under the global performance
+    /// switches (`cuda.mode`, `cuda.fused_decode`; CUDA only) and the
+    /// `IZWI_QWEN35_*` switches.
+    pub fn load_with_performance(
+        model_dir: &Path,
+        variant: ModelVariant,
+        device: DeviceProfile,
+        performance: &crate::performance::PerformanceConfig,
+    ) -> Result<Self> {
         let gguf_path = model_dir.join(qwen35_gguf_filename(variant)?);
         let mmproj_path = model_dir.join("mmproj-F16.gguf");
 
@@ -1083,7 +1240,11 @@ impl Qwen35ChatModel {
         let text_config = parse_text_config(&text_loader)?;
         debug!(variant = %variant, ?text_config, "Resolved Qwen3.5 text configuration");
         let tokenizer = Qwen35Tokenizer::load(model_dir, variant, &text_loader)?;
-        let text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
+        let mut text_model = Qwen35TextModel::load(&text_loader, &text_config, &device.device)?;
+        text_model.resolve_fast_paths(
+            Qwen35CudaSwitches::from_performance(backend, &performance.cuda),
+            false,
+        );
 
         let projector_loader = GgufLoader::from_path_with_backend(&mmproj_path, backend)?;
         let projector_checkpoint = projector_loader.get_model_info();
@@ -1122,6 +1283,28 @@ impl Qwen35ChatModel {
 
     pub fn max_context_tokens(&self) -> Result<usize> {
         self.exec.max_context_tokens()
+    }
+
+    /// Prefill span for an isolated request (see
+    /// [`crate::engine::ExecutionProfile::preferred_prefill_tokens`]).
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        preferred_prefill_tokens_for(self.device_kind)
+    }
+
+    /// Decode tokens per engine step for a request decoding alone. The
+    /// scheduler grants it only to an isolated row with no waiting work;
+    /// shared batches stay at one token per row.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        preferred_decode_tokens_for(self.device_kind)
+    }
+
+    /// Whether the decode quantum outlives the request's soft scheduling SLA.
+    /// Interactive and streaming chat pass that SLA (about 0.7 s) early in
+    /// almost every stream, after which the scheduler would grant one token
+    /// per step. The quantum still yields to waiting or co-batched work and
+    /// to hard deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.preferred_decode_tokens() > 1
     }
 
     /// Hybrid retained-state contract shared by loading, scheduling, and the
@@ -1187,6 +1370,31 @@ impl Qwen35ChatModel {
 
     pub fn device_kind(&self) -> BackendKind {
         self.device_kind
+    }
+
+    /// Serving diagnostics for the admin model API: device, storage and
+    /// scheduling preferences, and cumulative decode counters.
+    pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        let kv_dtype = match self.device_kind {
+            BackendKind::Cuda => DType::F16,
+            BackendKind::Cpu | BackendKind::Metal => DType::F32,
+        };
+        serde_json::json!({
+            "family": "qwen35_chat",
+            "device": self.device_kind.as_str(),
+            "compute_dtype": "F32",
+            "kv_dtype": format!("{kv_dtype:?}"),
+            "scheduling": {
+                "preferred_prefill_tokens": self.preferred_prefill_tokens(),
+                "prefill_chunk_tokens": qwen35_prefill_chunk_size(),
+                "preferred_decode_tokens": self.preferred_decode_tokens(),
+                "sustained_decode_quantum": self.sustained_decode_quantum(),
+            },
+            "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "projections": self.exec.text_model.projection_summary(),
+            "decode_graph": self.exec.text_model.decode_graph_summary(),
+            "counters": self.exec.text_model.telemetry().snapshot(),
+        })
     }
 
     pub(crate) fn start_decode_state_physical(
@@ -1789,7 +1997,7 @@ fn take_quantum_sample(
     output: &mut Option<Tensor>,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
     let output = output.take().ok_or_else(|| {
@@ -1799,20 +2007,22 @@ fn take_quantum_sample(
 }
 
 /// DS9.3: sample a token and, when the request asked for logprobs, resolve
-/// the raw-distribution stats on host. Sampling math is unchanged.
+/// the raw-distribution stats on host. Sampling math is unchanged. Also
+/// returns the sampler path that chose the token.
 fn sample_next_token_with_logprobs(
     logits: &Tensor,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<(
     u32,
     Option<crate::models::shared::sampling::RawTokenLogprobs>,
+    SamplerPath,
 )> {
     if !config.logprobs {
-        let token = sample_next_token(logits, vocab_size, config, history, rng)?;
-        return Ok((token, None));
+        let (token, path) = sample_next_token_traced(logits, vocab_size, config, history, rng)?;
+        return Ok((token, None, path));
     }
     let raw_values = logits_to_vec(logits)?;
     let mut values = raw_values.clone();
@@ -1824,7 +2034,7 @@ fn sample_next_token_with_logprobs(
     }
     let (logsumexp, top) =
         crate::models::shared::sampling::raw_logprobs_stats(&values, config.top_logprobs)?;
-    let token = sample_next_token(logits, vocab_size, config, history, rng)?;
+    let (token, path) = sample_next_token_traced(logits, vocab_size, config, history, rng)?;
     let chosen_raw = raw_values
         .get(token as usize)
         .copied()
@@ -1841,6 +2051,7 @@ fn sample_next_token_with_logprobs(
             logprob: chosen_raw - logsumexp,
             top,
         }),
+        path,
     ))
 }
 
@@ -1848,9 +2059,20 @@ fn sample_next_token(
     logits: &Tensor,
     vocab_size: usize,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut SimpleRng,
 ) -> Result<u32> {
+    sample_next_token_traced(logits, vocab_size, config, history, rng).map(|(token, _)| token)
+}
+
+/// [`sample_next_token`] plus the sampler path that chose the token.
+fn sample_next_token_traced(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: PenaltyHistory<'_>,
+    rng: &mut SimpleRng,
+) -> Result<(u32, SamplerPath)> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
             "Qwen3.5 sampler received vocab_size=0".to_string(),
@@ -1865,10 +2087,10 @@ fn sample_next_token(
         && config.top_k == 0
         && config.top_p >= 1.0;
     if deterministic_greedy {
-        return argmax_clamped(logits, vocab_size);
+        return argmax_clamped(logits, vocab_size).map(|token| (token, SamplerPath::Greedy));
     }
 
-    if let Some(candidates) = bounded_device_sampling_candidates(
+    if let Some(candidates) = bounded_device_sampling_candidates_with_history(
         logits,
         vocab_size,
         config.top_k,
@@ -1882,17 +2104,29 @@ fn sample_next_token(
             if let Some(sampled) =
                 sample_device_candidates(&candidates, config.top_p, rng.next_f32())
             {
-                return Ok(sampled);
+                return Ok((sampled, SamplerPath::Device));
             }
         }
     }
 
+    sample_on_host(logits, vocab_size, config, history, rng).map(|token| (token, SamplerPath::Host))
+}
+
+/// Exact host sampling over the full logits row: penalties, temperature,
+/// top-k, top-p, then the draw.
+fn sample_on_host(
+    logits: &Tensor,
+    vocab_size: usize,
+    config: &ChatGenerationConfig,
+    history: PenaltyHistory<'_>,
+    rng: &mut SimpleRng,
+) -> Result<u32> {
     let mut values = logits_to_vec(logits)?;
     truncate_logits_to_vocab(&mut values, vocab_size);
 
-    if config.repetition_penalty > 1.0 && !history.is_empty() {
+    if config.repetition_penalty > 1.0 && !history.repetition.is_empty() {
         let mut seen = vec![false; values.len()];
-        for &token in history {
+        for &token in history.repetition {
             let idx = token as usize;
             if idx < seen.len() {
                 seen[idx] = true;
@@ -1915,9 +2149,9 @@ fn sample_next_token(
         }
     }
 
-    if config.presence_penalty.abs() > f32::EPSILON && !history.is_empty() {
+    if config.presence_penalty.abs() > f32::EPSILON && !history.presence.is_empty() {
         let mut seen = vec![false; values.len()];
-        for &token in history {
+        for &token in history.presence {
             let idx = token as usize;
             if idx < seen.len() {
                 seen[idx] = true;
@@ -2030,10 +2264,9 @@ fn logits_to_vec(logits: &Tensor) -> Result<Vec<f32>> {
         }
     };
 
-    logits
-        .to_dtype(DType::F32)?
-        .to_vec1::<f32>()
-        .map_err(Error::from)
+    let values = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, values.len());
+    Ok(values)
 }
 
 fn truncate_logits_to_vocab(values: &mut Vec<f32>, vocab_size: usize) {
@@ -2078,37 +2311,6 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
         .ok_or_else(|| no_valid_logits_error(values))
 }
 
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
-        2 => {
-            let (rows, _cols) = logits.dims2()?;
-            if rows != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected Qwen3.5 logits shape for argmax: {:?}",
-                    logits.shape().dims()
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3.5 logits rank for argmax: {rank}"
-            )))
-        }
-    };
-
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
-}
-
 fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     if vocab_size == 0 {
         return Err(Error::InvalidInput(
@@ -2141,11 +2343,14 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     } else {
         logits
     };
-    let selected = argmax(&clamped)?;
-    let selected_logit = clamped
-        .i(selected as usize)?
-        .to_dtype(DType::F32)?
-        .to_scalar::<f32>()?;
+    // One readback carries the argmax and the logit it selected. Indices
+    // stay exact in F32 (vocabularies are far below 2^24).
+    let index = clamped.argmax(D::Minus1)?.reshape(1)?;
+    let selected_logit = clamped.to_dtype(DType::F32)?.gather(&index, 0)?;
+    let packed =
+        Tensor::cat(&[&index.to_dtype(DType::F32)?, &selected_logit], 0)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, packed.len());
+    let (selected, selected_logit) = (packed[0] as u32, packed[1]);
     if selected_logit.is_finite() {
         return Ok(selected);
     }
@@ -2155,6 +2360,7 @@ fn argmax_clamped(logits: &Tensor, vocab_size: usize) -> Result<u32> {
     // finite candidate when one exists and otherwise returns useful counts for
     // the exact in-vocabulary row in every sampling mode.
     let values = clamped.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    record_host_read(DType::F32, values.len());
     argmax_values(&values)
 }
 
@@ -2265,7 +2471,7 @@ mod tests {
                 eos: im_end,
                 eos_alt: Some(eos_alt),
             },
-            literal_special_tokens: vec![
+            literal_special_tokens: SpecialTokenMatcher::new(vec![
                 ("<|im_start|>".to_string(), im_start),
                 ("<|endoftext|>".to_string(), eos_alt),
                 ("<|image_pad|>".to_string(), image_pad),
@@ -2273,11 +2479,103 @@ mod tests {
                 ("<|im_end|>".to_string(), im_end),
                 ("</think>".to_string(), think_close),
                 ("<think>".to_string(), think_open),
-            ],
+            ]),
             chat_template: String::new(),
             default_enable_thinking: false,
             bos_token: None,
         }
+    }
+
+    /// The previous quadratic matcher, kept as the reference: the earliest
+    /// occurrence of any token, the longest token on a tie.
+    fn reference_segments<'a>(tokens: &[(String, u32)], text: &'a str) -> Vec<PromptSegment<'a>> {
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let tail = &text[offset..];
+            let best = tokens
+                .iter()
+                .filter_map(|(token, id)| tail.find(token.as_str()).map(|at| (at, token, *id)))
+                .min_by(|left, right| left.0.cmp(&right.0).then(right.1.len().cmp(&left.1.len())));
+            let Some((at, token, id)) = best else {
+                segments.push(PromptSegment::Text(tail));
+                break;
+            };
+            if at > 0 {
+                segments.push(PromptSegment::Text(&tail[..at]));
+            }
+            segments.push(PromptSegment::Special(id));
+            offset += at + token.len();
+        }
+        segments
+    }
+
+    #[test]
+    fn special_token_matcher_agrees_with_the_quadratic_reference() {
+        let tokens = vec![
+            ("<|im_start|>".to_string(), 1),
+            ("<|im_end|>".to_string(), 2),
+            ("<|image_pad|>".to_string(), 3),
+            ("<think>".to_string(), 4),
+            ("</think>".to_string(), 5),
+            ("<|im".to_string(), 6),
+            ("é<|".to_string(), 7),
+        ];
+        let matcher = SpecialTokenMatcher::new(tokens.clone());
+        let pieces = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|image_pad|>",
+            "<think>",
+            "</think>",
+            "<|im",
+            "<|",
+            "<",
+            "|",
+            ">",
+            "im_",
+            "end",
+            "think",
+            "/",
+            "é",
+            "日本",
+            " ",
+            "a",
+            "\n",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for case in 0..2_000 {
+            let mut text = String::new();
+            for _ in 0..(case % 40) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                text.push_str(pieces[(state % pieces.len() as u64) as usize]);
+            }
+            assert_eq!(
+                matcher.segments(&text),
+                reference_segments(&tokens, &text),
+                "{text:?}"
+            );
+        }
+        // The longest token wins where several start at one byte.
+        assert_eq!(
+            matcher.segments("x<|im_end|>"),
+            vec![PromptSegment::Text("x"), PromptSegment::Special(2)]
+        );
+        assert!(matcher.segments("").is_empty());
+    }
+
+    #[test]
+    fn special_token_matcher_stays_linear_on_long_image_prompts() {
+        let matcher = SpecialTokenMatcher::new(vec![
+            ("<|image_pad|>".to_string(), 3),
+            ("<|im_end|>".to_string(), 2),
+        ]);
+        let text = format!("start{}end", "<|image_pad|>".repeat(20_000));
+        let segments = matcher.segments(&text);
+        assert_eq!(segments.len(), 20_002);
+        assert_eq!(segments[1], PromptSegment::Special(3));
     }
 
     fn local_model_dir(name: &str) -> PathBuf {
@@ -2311,11 +2609,103 @@ mod tests {
     #[test]
     fn penalty_history_starts_with_exact_prompt_ids() {
         let prompt_ids = vec![248_000, 17, 23, 248_001];
-        let mut history = initial_penalty_history(&prompt_ids, 8, true);
+        let mut history = initial_penalty_history(&prompt_ids, 8, true, true);
         assert_eq!(history, prompt_ids);
         history.push(99);
         assert_eq!(&history[..prompt_ids.len()], prompt_ids.as_slice());
-        assert!(initial_penalty_history(&prompt_ids, 8, false).is_empty());
+        assert!(initial_penalty_history(&prompt_ids, 8, false, true).is_empty());
+        assert!(initial_penalty_history(&prompt_ids, 8, true, false).is_empty());
+    }
+
+    #[test]
+    fn presence_penalty_reads_generated_tokens_while_repetition_reads_the_prompt() {
+        let prompt_ids = [248_046u32, 13, 7];
+        let mut history = initial_penalty_history(&prompt_ids, 8, true, true);
+        history.extend([5, 13]);
+        let split = penalty_history(true, &history, prompt_ids.len());
+        assert_eq!(split.repetition, &[248_046, 13, 7, 5, 13]);
+        assert_eq!(split.presence, &[5, 13]);
+
+        let generated_only = vec![5u32, 13];
+        let presence_only = penalty_history(true, &generated_only, 0);
+        assert_eq!(presence_only.repetition, &[5, 13]);
+        assert_eq!(presence_only.presence, &[5, 13]);
+
+        let untracked = penalty_history(false, &history, prompt_ids.len());
+        assert!(untracked.repetition.is_empty() && untracked.presence.is_empty());
+    }
+
+    #[test]
+    fn presence_penalty_spares_tokens_that_only_appear_in_the_prompt() {
+        // Token 0 stands for `<|im_end|>`: it ends every prompt turn but has
+        // not been generated. A presence penalty must not push it below
+        // token 1, which appears nowhere. Token 2 was generated.
+        let logits = Tensor::from_vec(vec![10.0f32, 9.0, -50.0], (3,), &candle_core::Device::Cpu)
+            .expect("logits");
+        let config = ChatGenerationConfig {
+            temperature: 1e-3,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 2.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
+        };
+        let history = [0u32, 2];
+        let mut rng = SimpleRng::new(7);
+        let split = PenaltyHistory {
+            repetition: &history,
+            presence: &history[1..],
+        };
+        assert_eq!(
+            sample_next_token(&logits, 3, &config, split, &mut rng).unwrap(),
+            0,
+            "prompt-only token keeps its logit"
+        );
+        let mut rng = SimpleRng::new(7);
+        let legacy = PenaltyHistory::uniform(&history);
+        assert_eq!(
+            sample_next_token(&logits, 3, &config, legacy, &mut rng).unwrap(),
+            1,
+            "a penalized token 0 falls below token 1"
+        );
+    }
+
+    #[test]
+    fn decode_quantum_is_eight_on_accelerators_and_one_on_cpu() {
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::remove_var("IZWI_QWEN35_DECODE_QUANTUM");
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cuda), 8);
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Metal), 8);
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cpu), 1);
+        for (value, expected) in [("1", 1), ("4", 4), ("99", MAX_DECODE_QUANTUM), ("0", 8)] {
+            std::env::set_var("IZWI_QWEN35_DECODE_QUANTUM", value);
+            assert_eq!(
+                preferred_decode_tokens_for(BackendKind::Cuda),
+                expected,
+                "{value}"
+            );
+        }
+        std::env::set_var("IZWI_QWEN35_DECODE_QUANTUM", "3");
+        assert_eq!(preferred_decode_tokens_for(BackendKind::Cpu), 3);
+        std::env::remove_var("IZWI_QWEN35_DECODE_QUANTUM");
+    }
+
+    #[test]
+    fn accelerators_prefer_wide_isolated_prefill_spans() {
+        for backend in [BackendKind::Cuda, BackendKind::Metal] {
+            let span = preferred_prefill_tokens_for(backend);
+            assert_eq!(span, ACCELERATOR_PREFERRED_PREFILL_TOKENS, "{backend:?}");
+            assert_eq!(span % DEFAULT_PREFILL_CHUNK_SIZE, 0, "{backend:?}");
+            assert!(span <= MAX_PREFILL_CHUNK_SIZE, "{backend:?}");
+        }
+        assert_eq!(preferred_prefill_tokens_for(BackendKind::Cpu), 0);
     }
 
     #[test]
@@ -2607,7 +2997,8 @@ mod tests {
             constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
-        let token = sample_next_token(&logits, 3, &config, &[], &mut rng).expect("sample token");
+        let token = sample_next_token(&logits, 3, &config, PenaltyHistory::uniform(&[]), &mut rng)
+            .expect("sample token");
         assert_eq!(token, 2);
     }
 
@@ -2632,19 +3023,62 @@ mod tests {
             top_logprobs: 0,
             constrain_json_object: false,
         };
-        let history = [1u32];
+        let history = PenaltyHistory::uniform(&[1u32]);
         let mut direct_rng = SimpleRng::new(17);
-        let expected = sample_next_token(&output, 4, &config, &history, &mut direct_rng).unwrap();
+        let expected = sample_next_token(&output, 4, &config, history, &mut direct_rng).unwrap();
         let mut quantum_rng = SimpleRng::new(17);
         let mut unconsumed = Some(output);
 
         assert_eq!(
-            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).unwrap(),
+            take_quantum_sample(&mut unconsumed, 4, &config, history, &mut quantum_rng).unwrap(),
             expected
         );
         assert!(unconsumed.is_none());
         assert!(
-            take_quantum_sample(&mut unconsumed, 4, &config, &history, &mut quantum_rng).is_err()
+            take_quantum_sample(&mut unconsumed, 4, &config, history, &mut quantum_rng).is_err()
+        );
+    }
+
+    #[test]
+    fn greedy_sampling_reads_the_index_and_its_logit_back_once() {
+        let config = ChatGenerationConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            stop_token_ids: Vec::new(),
+            seed: 7,
+            request: ChatRequestConfig::default(),
+            logprobs: false,
+            top_logprobs: 0,
+            constrain_json_object: false,
+        };
+        let sample = |values: Vec<f32>, vocab: usize| {
+            let logits = Tensor::from_vec(values.clone(), values.len(), &candle_core::Device::Cpu)
+                .expect("logits");
+            let before = thread_host_reads();
+            let (token, path) = sample_next_token_traced(
+                &logits,
+                vocab,
+                &config,
+                PenaltyHistory::uniform(&[]),
+                &mut SimpleRng::new(7),
+            )
+            .expect("sample");
+            (token, path, thread_host_reads() - before)
+        };
+
+        // Finite winner: one packed readback. The vocabulary limit hides
+        // the larger out-of-vocabulary logit.
+        assert_eq!(
+            sample(vec![0.5, 3.0, -1.0, 9.0], 3),
+            (1, SamplerPath::Greedy, 1)
+        );
+        // A non-finite winner falls back to one full-row read.
+        assert_eq!(
+            sample(vec![0.5, f32::INFINITY, 2.0, -1.0], 4),
+            (2, SamplerPath::Greedy, 2)
         );
     }
 
@@ -2666,7 +3100,7 @@ mod tests {
             constrain_json_object: false,
         };
         let mut rng = SimpleRng::new(7);
-        let result = sample_next_token(&logits, 0, &config, &[], &mut rng);
+        let result = sample_next_token(&logits, 0, &config, PenaltyHistory::uniform(&[]), &mut rng);
         assert!(result.is_err());
     }
 
@@ -2694,8 +3128,9 @@ mod tests {
                 constrain_json_object: false,
             };
             let mut rng = SimpleRng::new(7);
-            let error = sample_next_token(&logits, 3, &config, &[], &mut rng)
-                .expect_err("all in-vocabulary logits are non-finite");
+            let error =
+                sample_next_token(&logits, 3, &config, PenaltyHistory::uniform(&[]), &mut rng)
+                    .expect_err("all in-vocabulary logits are non-finite");
             let message = error.to_string();
             assert!(message.contains("0 finite"));
             assert!(message.contains("1 NaN"));
@@ -2784,3 +3219,7 @@ mod tests {
         assert_eq!(next_text_position, 4);
     }
 }
+
+#[cfg(test)]
+#[path = "chat_trace_tests.rs"]
+mod trace_tests;

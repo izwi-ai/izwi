@@ -150,10 +150,15 @@ export interface ChatThreadSendMessageResponse {
   model_id: string;
   user_message: ChatThreadMessageRecord;
   assistant_message: ChatThreadMessageRecord;
-  stats: {
-    tokens_generated: number;
-    generation_time_ms: number;
-  };
+  stats: ChatGenerationStats;
+}
+
+/** Stats for one generated chat turn. `timing` is the engine's per-phase
+ * breakdown, present when the runtime measured it. */
+export interface ChatGenerationStats {
+  tokens_generated: number;
+  generation_time_ms: number;
+  timing?: ChatTiming;
 }
 
 type ChatThreadStreamEvent =
@@ -169,10 +174,7 @@ type ChatThreadStreamEvent =
       thread_id: string;
       model_id: string;
       assistant_message: ChatThreadMessageRecord;
-      stats: {
-        tokens_generated: number;
-        generation_time_ms: number;
-      };
+      stats: ChatGenerationStats;
     }
   | { event: "error"; error: string };
 
@@ -187,10 +189,7 @@ export interface ChatThreadStreamCallbacks {
     threadId: string;
     modelId: string;
     assistantMessage: ChatThreadMessageRecord;
-    stats: {
-      tokens_generated: number;
-      generation_time_ms: number;
-    };
+    stats: ChatGenerationStats;
   }) => void;
   onError?: (error: string) => void;
   onClose?: () => void;

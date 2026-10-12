@@ -357,12 +357,12 @@ fn load_qwen35_chat_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
-    _performance: &crate::performance::PerformanceConfig,
+    performance: &crate::performance::PerformanceConfig,
     _prefix_reuse: PrefixReuseMode,
 ) -> Result<NativeChatModel> {
-    Ok(NativeChatModel::Qwen35(Qwen35ChatModel::load(
-        model_dir, variant, device,
-    )?))
+    Ok(NativeChatModel::Qwen35(
+        Qwen35ChatModel::load_with_performance(model_dir, variant, device, performance)?,
+    ))
 }
 
 fn load_qwen38_chat_model(
@@ -3733,9 +3733,10 @@ impl NativeChatModel {
     /// the engine's chunk threshold.
     pub fn preferred_prefill_tokens(&self) -> usize {
         match self {
+            Self::Qwen35(model) => model.preferred_prefill_tokens(),
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
             Self::Qwen38(model) => model.preferred_prefill_tokens(),
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
+            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
         }
     }
 
@@ -3763,9 +3764,14 @@ impl NativeChatModel {
                 model.sustained_decode_quantum(),
                 model.speculative_batch_enabled(),
             ),
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => {
-                (1, false, false)
-            }
+            // Isolated multi-token quanta run through the scalar handler's
+            // decode loop; Qwen3.5 has no speculative batch envelope.
+            Self::Qwen35(model) => (
+                model.preferred_decode_tokens(),
+                model.sustained_decode_quantum(),
+                false,
+            ),
+            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => (1, false, false),
         }
     }
 }
@@ -6153,6 +6159,7 @@ impl ModelRegistry {
                     Some(model.supports_incremental_decode()),
                     None,
                     match model.as_ref() {
+                        NativeChatModel::Qwen35(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen38(model) => Some(model.runtime_diagnostics()),
                         NativeChatModel::Qwen36Moe(model) => Some(model.runtime_diagnostics()),
                         _ => None,

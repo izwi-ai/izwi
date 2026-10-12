@@ -24,6 +24,33 @@ pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
 /// CUDA-only entry point.
 pub const CUDA_SAMPLING_CANDIDATE_LIMIT: usize = DEVICE_SAMPLING_CANDIDATE_LIMIT;
 
+/// Token histories read by the two sampling penalties.
+///
+/// The single-history entry points apply both penalties to the same tokens.
+/// Callers that follow vLLM's semantics pass the prompt and output to the
+/// repetition penalty and only the output to the presence penalty, so a
+/// presence penalty does not punish `<|im_end|>` or newlines because the
+/// prompt contains them.
+#[derive(Debug, Clone, Copy)]
+pub struct PenaltyHistory<'a> {
+    pub repetition: &'a [u32],
+    pub presence: &'a [u32],
+}
+
+impl<'a> PenaltyHistory<'a> {
+    /// Both penalties read `history` (the single-history contract).
+    pub fn uniform(history: &'a [u32]) -> Self {
+        Self {
+            repetition: history,
+            presence: history,
+        }
+    }
+
+    fn is_uniform(&self) -> bool {
+        std::ptr::eq(self.repetition, self.presence)
+    }
+}
+
 /// DS9.2: per-request constrained-decoding runtime. The mask cache is shared
 /// across sampler clones; the machine advances per committed token.
 pub struct GrammarRuntime {
@@ -87,6 +114,24 @@ impl GrammarRuntime {
         vocab_size: usize,
         config: &ChatGenerationConfig,
         history: &[u32],
+        rng: &mut R,
+    ) -> Result<(u32, Option<RawTokenLogprobs>)> {
+        self.sample_token_with_history(
+            logits,
+            vocab_size,
+            config,
+            PenaltyHistory::uniform(history),
+            rng,
+        )
+    }
+
+    /// [`Self::sample_token`] with separate penalty histories.
+    pub(crate) fn sample_token_with_history<R: GrammarRng>(
+        &mut self,
+        logits: &Tensor,
+        vocab_size: usize,
+        config: &ChatGenerationConfig,
+        history: PenaltyHistory<'_>,
         rng: &mut R,
     ) -> Result<(u32, Option<RawTokenLogprobs>)> {
         let surfaces = self.surfaces(vocab_size)?;
@@ -364,7 +409,8 @@ fn sample_chat_token_and_logprobs(
             ));
         }
         let (logsumexp, top) = raw_logprobs_stats(&sampled, config.top_logprobs)?;
-        let token = sample_from_host_values(sampled, config, history, rng)?;
+        let token =
+            sample_from_host_values(sampled, config, PenaltyHistory::uniform(history), rng)?;
         let chosen_raw = values
             .get(token as usize)
             .copied()
@@ -419,7 +465,7 @@ fn sample_chat_token_and_logprobs(
             "chat sampler received no in-vocabulary logits".to_string(),
         ));
     }
-    let token = sample_from_host_values(values, config, history, rng)?;
+    let token = sample_from_host_values(values, config, PenaltyHistory::uniform(history), rng)?;
     Ok((token, None))
 }
 
@@ -485,7 +531,7 @@ impl GrammarRng for SimpleRng {
 fn sample_from_host_values<R: GrammarRng>(
     mut values: Vec<f32>,
     config: &ChatGenerationConfig,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     rng: &mut R,
 ) -> Result<u32> {
     apply_chat_history_penalties(
@@ -639,10 +685,15 @@ fn read_f32_values_to_host(values: &Tensor) -> Result<Vec<f32>> {
 
 fn apply_chat_history_penalties(
     values: &mut [f32],
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     repetition_penalty: f32,
     presence_penalty: f32,
 ) {
+    if !history.is_uniform() {
+        apply_split_history_penalties(values, history, repetition_penalty, presence_penalty);
+        return;
+    }
+    let history = history.repetition;
     if history.is_empty()
         || ((repetition_penalty - 1.0).abs() <= f32::EPSILON
             && presence_penalty.abs() <= f32::EPSILON)
@@ -670,6 +721,45 @@ fn apply_chat_history_penalties(
     }
 }
 
+/// Host penalties for separate histories: repetition over
+/// `history.repetition`, presence over `history.presence`.
+fn apply_split_history_penalties(
+    values: &mut [f32],
+    history: PenaltyHistory<'_>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+) {
+    let len = values.len();
+    let seen = |tokens: &[u32]| {
+        let mut seen = vec![false; len];
+        for token in tokens {
+            if let Some(seen) = seen.get_mut(*token as usize) {
+                *seen = true;
+            }
+        }
+        seen
+    };
+    if repetition_penalty > 1.0 && !history.repetition.is_empty() {
+        for (value, was_seen) in values.iter_mut().zip(seen(history.repetition)) {
+            if !was_seen || !value.is_finite() {
+                continue;
+            }
+            if *value > 0.0 {
+                *value /= repetition_penalty;
+            } else {
+                *value *= repetition_penalty;
+            }
+        }
+    }
+    if presence_penalty.abs() > f32::EPSILON && !history.presence.is_empty() {
+        for (value, was_seen) in values.iter_mut().zip(seen(history.presence)) {
+            if was_seen && value.is_finite() {
+                *value -= presence_penalty;
+            }
+        }
+    }
+}
+
 fn finite_argmax(values: &[f32]) -> Result<u32> {
     values
         .iter()
@@ -688,6 +778,9 @@ fn finite_argmax(values: &[f32]) -> Result<u32> {
 enum SamplingTensorCacheInput {
     Mask(Vec<u8>),
     Indices(Vec<u32>),
+    /// `0..len` as U32. Candle builds `arange` on the host, so an uncached
+    /// full-vocabulary range uploads ~1 MB per sampled token.
+    Arange(u32),
 }
 
 struct SamplingTensorCacheEntry {
@@ -716,6 +809,10 @@ fn cached_sampling_tensor(device: &Device, input: SamplingTensorCacheInput) -> R
                         SamplingTensorCacheInput::Indices(left),
                         SamplingTensorCacheInput::Indices(right),
                     ) => left == right,
+                    (
+                        SamplingTensorCacheInput::Arange(left),
+                        SamplingTensorCacheInput::Arange(right),
+                    ) => left == right,
                     _ => false,
                 }
         }) {
@@ -733,6 +830,7 @@ fn cached_sampling_tensor(device: &Device, input: SamplingTensorCacheInput) -> R
             SamplingTensorCacheInput::Indices(values) => {
                 Tensor::from_vec(values.clone(), values.len(), device)?
             }
+            SamplingTensorCacheInput::Arange(len) => Tensor::arange(0u32, *len, device)?,
         };
         if cache.len() == DEVICE_SAMPLING_TENSOR_CACHE_ENTRIES {
             cache.pop_front();
@@ -845,6 +943,30 @@ pub fn bounded_device_sampling_candidates(
     presence_penalty: f32,
     allowed_mask: Option<&[bool]>,
 ) -> Result<Option<DeviceSamplingCandidates>> {
+    bounded_device_sampling_candidates_with_history(
+        logits,
+        vocab_limit,
+        top_k,
+        temperature,
+        PenaltyHistory::uniform(history),
+        repetition_penalty,
+        presence_penalty,
+        allowed_mask,
+    )
+}
+
+/// [`bounded_device_sampling_candidates`] with separate penalty histories.
+#[allow(clippy::too_many_arguments)]
+pub fn bounded_device_sampling_candidates_with_history(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    history: PenaltyHistory<'_>,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    allowed_mask: Option<&[bool]>,
+) -> Result<Option<DeviceSamplingCandidates>> {
     if !(logits.device().is_cuda() || logits.device().is_metal()) || temperature <= 1e-5 {
         return Ok(None);
     }
@@ -882,7 +1004,7 @@ pub fn bounded_cuda_sampling_candidates(
         vocab_limit,
         top_k,
         temperature,
-        history,
+        PenaltyHistory::uniform(history),
         repetition_penalty,
         presence_penalty,
         allowed_mask,
@@ -895,7 +1017,7 @@ fn bounded_sampling_candidates(
     vocab_limit: usize,
     top_k: usize,
     temperature: f32,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     repetition_penalty: f32,
     presence_penalty: f32,
     allowed_mask: Option<&[bool]>,
@@ -1012,10 +1134,31 @@ fn sanitize_finite(values: &Tensor) -> Result<Tensor> {
 
 fn apply_history_penalties(
     values: &Tensor,
-    history: &[u32],
+    history: PenaltyHistory<'_>,
     repetition_penalty: f32,
     presence_penalty: f32,
 ) -> Result<Tensor> {
+    if !history.is_uniform() {
+        let mut values = values.clone();
+        if repetition_penalty > 1.0 {
+            values = apply_history_penalties(
+                &values,
+                PenaltyHistory::uniform(history.repetition),
+                repetition_penalty,
+                0.0,
+            )?;
+        }
+        if presence_penalty.abs() > f32::EPSILON {
+            values = apply_history_penalties(
+                &values,
+                PenaltyHistory::uniform(history.presence),
+                1.0,
+                presence_penalty,
+            )?;
+        }
+        return Ok(values);
+    }
+    let history = history.repetition;
     if history.is_empty()
         || ((repetition_penalty - 1.0).abs() <= f32::EPSILON
             && presence_penalty.abs() <= f32::EPSILON)
@@ -1058,7 +1201,10 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
         )));
     }
     let mut candidate_values = values.contiguous()?;
-    let mut candidate_indices = Tensor::arange(0u32, length as u32, values.device())?;
+    let mut candidate_indices = cached_sampling_tensor(
+        values.device(),
+        SamplingTensorCacheInput::Arange(length as u32),
+    )?;
     loop {
         let length = candidate_values.dim(0)?;
         if length <= DEVICE_SORT_CHUNK {
@@ -1281,7 +1427,7 @@ mod tests {
             width,
             config.top_k,
             config.temperature,
-            &history,
+            PenaltyHistory::uniform(&history),
             config.repetition_penalty,
             config.presence_penalty,
             Some(&allowed),
@@ -1296,7 +1442,7 @@ mod tests {
         }
         apply_chat_history_penalties(
             &mut values,
-            &history,
+            PenaltyHistory::uniform(&history),
             config.repetition_penalty,
             config.presence_penalty,
         );
@@ -1331,7 +1477,7 @@ mod tests {
             width,
             config.top_k,
             config.temperature,
-            &history,
+            PenaltyHistory::uniform(&history),
             config.repetition_penalty,
             config.presence_penalty,
             None,
@@ -1355,9 +1501,18 @@ mod tests {
         let width = DEVICE_SAMPLING_CANDIDATE_LIMIT * 2;
         let logits = Tensor::zeros(width, DType::F32, &device).unwrap();
         let before_candidates = crate::models::shared::telemetry::snapshot();
-        let candidates = bounded_sampling_candidates(&logits, width, 0, 1.0, &[], 1.0, 0.0, None)
-            .unwrap()
-            .unwrap();
+        let candidates = bounded_sampling_candidates(
+            &logits,
+            width,
+            0,
+            1.0,
+            PenaltyHistory::uniform(&[]),
+            1.0,
+            0.0,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         let after_candidates = crate::models::shared::telemetry::snapshot();
         let packed_elements = DEVICE_SAMPLING_CANDIDATE_LIMIT * 2 + 1;
         assert!(after_candidates.host_read_ops_total > before_candidates.host_read_ops_total);
@@ -1427,7 +1582,7 @@ mod tests {
             width,
             0,
             0.8,
-            &history,
+            PenaltyHistory::uniform(&history),
             1.5,
             0.2,
             Some(&allowed),
@@ -1459,10 +1614,63 @@ mod tests {
         let device = Device::Cpu;
         let values = Tensor::from_vec(vec![4.0f32, -2.0, 3.0, f32::NAN], 4, &device).unwrap();
         let values = sanitize_finite(&values).unwrap();
-        let values = apply_history_penalties(&values, &[0, 1, 1], 2.0, 0.5).unwrap();
+        let values =
+            apply_history_penalties(&values, PenaltyHistory::uniform(&[0, 1, 1]), 2.0, 0.5)
+                .unwrap();
         let actual = values.to_vec1::<f32>().unwrap();
         assert_eq!(actual[..3], [1.5, -4.5, 3.0]);
         assert_eq!(actual[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn split_penalty_histories_match_on_device_and_host() {
+        // Repetition reads prompt + output, presence reads output only.
+        let logits = vec![4.0f32, -2.0, 3.0, 1.0, f32::NEG_INFINITY];
+        let history = [0u32, 1, 3, 1, 2];
+        let split = PenaltyHistory {
+            repetition: &history,
+            presence: &history[3..],
+        };
+        // Token 0 and 3: repetition only. Token 1: both. Token 2: both.
+        let expected = [2.0f32, -4.5, 1.0, 0.5, f32::NEG_INFINITY];
+
+        let mut host = logits.clone();
+        apply_chat_history_penalties(&mut host, split, 2.0, 0.5);
+        assert_eq!(host, expected);
+
+        let device = Device::Cpu;
+        let values = Tensor::from_vec(logits.clone(), logits.len(), &device).unwrap();
+        let on_device = apply_history_penalties(&values, split, 2.0, 0.5)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(on_device, expected);
+
+        // A presence-only request touches only the generated tokens.
+        let mut presence_only = logits.clone();
+        apply_chat_history_penalties(&mut presence_only, split, 1.0, 0.5);
+        assert_eq!(presence_only, [4.0, -2.5, 2.5, 1.0, f32::NEG_INFINITY]);
+        let on_device = apply_history_penalties(&values, split, 1.0, 0.5)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(on_device, presence_only);
+    }
+
+    #[test]
+    fn uniform_penalty_history_keeps_the_single_history_contract() {
+        let history = [0u32, 2];
+        assert!(PenaltyHistory::uniform(&history).is_uniform());
+        let split = PenaltyHistory {
+            repetition: &history,
+            presence: &history[1..],
+        };
+        assert!(!split.is_uniform());
+
+        let logits = vec![4.0f32, -2.0, 3.0];
+        let mut uniform = logits.clone();
+        apply_chat_history_penalties(&mut uniform, PenaltyHistory::uniform(&history), 2.0, 0.5);
+        assert_eq!(uniform, [1.5, -2.0, 1.0]);
     }
 
     #[test]

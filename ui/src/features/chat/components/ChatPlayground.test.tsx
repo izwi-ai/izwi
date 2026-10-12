@@ -1142,6 +1142,52 @@ describe("ChatPlayground", () => {
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
   });
 
+  it("shows decode speed and TTFT for a streamed turn after history refreshes", async () => {
+    const model = "Qwen3.5-4B";
+    const thread = { id: "timed-thread", title: "Timed answer", model_id: model,
+      created_at: 1, updated_at: 2, last_message_preview: null, message_count: 0 };
+    const assistantMessage = { id: "assistant-timed", thread_id: thread.id, role: "assistant",
+      content: "Final answer", created_at: 3, tokens_generated: 41, generation_time_ms: 2000 };
+    apiMocks.listChatThreads.mockResolvedValue([thread]);
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [] });
+    apiMocks.sendChatThreadMessageStream.mockReturnValue(new AbortController());
+    render(<MemoryRouter initialEntries={["/chat?threadId=timed-thread"]}>
+      <ChatPlayground selectedModel={model} selectedModelReady={true}
+        supportsThinking={false} modelLabel={model}
+        modelOptions={[{ value: model, label: model, statusLabel: "Ready", isReady: true }]}
+        onSelectModel={vi.fn()} onOpenModelManager={vi.fn()} onModelRequired={vi.fn()} />
+    </MemoryRouter>);
+    await waitFor(() => expect(apiMocks.getChatThread).toHaveBeenCalled());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Hello" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(apiMocks.sendChatThreadMessageStream).toHaveBeenCalledOnce());
+    const callbacks = apiMocks.sendChatThreadMessageStream.mock.calls[0][2];
+    apiMocks.getChatThread.mockResolvedValue({ thread, messages: [
+      { id: "user-timed", thread_id: thread.id, role: "user", content: "Hello", created_at: 2,
+        tokens_generated: null, generation_time_ms: null },
+      assistantMessage,
+    ] });
+    const historyReads = apiMocks.getChatThread.mock.calls.length;
+    act(() => {
+      callbacks.onDone({
+        threadId: thread.id,
+        modelId: model,
+        assistantMessage,
+        stats: {
+          tokens_generated: 41,
+          generation_time_ms: 2000,
+          timing: { queue_wait_ms: 300, prefill_ms: 1200, decode_ms: 380,
+            decode_wall_ms: 400, decode_tokens: 40, ttft_ms: 1550, total_ms: 2000 },
+        },
+      });
+      callbacks.onClose();
+    });
+    await waitFor(() => expect(apiMocks.getChatThread.mock.calls.length).toBeGreaterThan(historyReads));
+    expect(await screen.findByText("100 t/s decode")).toBeInTheDocument();
+    expect(screen.getByText("1550 ms TTFT")).toBeInTheDocument();
+    expect(screen.getByText("41 tokens")).toBeInTheDocument();
+  });
+
   it("keeps failed streamed text visible when history refreshes", async () => {
     const model = "LFM2.5-1.2B-Instruct-GGUF";
     const thread = { id: "failed-thread", title: "Failed answer", model_id: model,
