@@ -107,6 +107,62 @@ Known flakes, unrelated to this branch and filed separately:
 No CUDA path has executed on a GPU. Every CUDA fast path self-checks at load or warmup and falls
 back, with a diagnostics reason, on mismatch.
 
+## Field round 1 — H100 deploy of `b1d51b89` (2026-10-12)
+
+**Readings.**
+- Cold start: 2,135 tokens in 76,689 ms (28 t/s; includes model load inside the first request).
+- Warm run: 3,224 tokens in 53,974 ms (60 t/s).
+- Second chat turn: failed after one token with a BatchWorkspace admission error.
+- Live diagnostics (read through the SSH tunnel):
+  - graph decode active: whole-step `replay`, 5,380 replays, 4,707 pipelined;
+  - every fast path `fused`, 0 self-check failures;
+  - prefill ~100 tok/s (prefill_ms_avg 9,412, TTFT p50 3.0 s / p95 13.9 s).
+
+**Root causes.**
+- **Second-turn failure.** The model's pending claim, 14,030,602,240 B, was 86 lazy state rows
+  (13,492,813,824) plus the graph-decode claim (537,788,416).
+  - Committed state rows were never recorded as materialized, so each live row was charged twice.
+  - About 0.88 GB of lazy CUDA context growth (modules, cuBLAS, graph pools) then ate the 1 GiB
+    margin, and driver-free memory fell 25,370,624 B below pending.
+  - The refusal failed a running stream after 3 retries that all read the same cached capacity
+    sample.
+- **Prefill.**
+  - Prompt chunks ran the software-decode FP8 WMMA `mm` kernel.
+  - Every DeltaNet layer tried the tiled kernel, failed on 16/48 heads, then expanded heads per
+    chunk.
+  - Qwen3.8 never declared a preferred prefill span, so the scheduler cut prompts at 192 tokens.
+
+**Fixes (on `perf-qwen38`).**
+- [x] `6d42ad78` Prefill projections run as dequantized BF16 GEMMs (bounded 128 MiB tiles, cuBLAS),
+      self-checked against `mm` and the checkpoint bytes.
+- [x] `a79bd6c8` Qwen3.8 grouped register-resident DeltaNet prefill kernel; no expansion and no
+      doomed attempt.
+- [x] `48d8d852` 1,024-token CUDA prefill chunks for isolated requests, declared to the scheduler;
+      the activations are charged as a pending claim.
+- [x] `e9f6ac50` Recurrent state rows are recorded as materialized on the model lease.
+- [x] `a1cc21f5` Comment explaining why the graph-decode claim stays pending.
+- [x] `a8e3151e` A refused batch workspace waits up to 5 s for capacity instead of failing the
+      stream (`workspace_waits{retried,recovered,exhausted}`).
+- [x] `a7ca7a93` `/v1/metrics` coordinator gains `materialized_` / `pending_` /
+      `untracked_device_memory_bytes`.
+- [x] `cf03481b` Load-time `kernel_timings`: FP8 GEMV GB/s per kind, GEMM TFLOP/s, and the DeltaNet
+      chunk time.
+- [x] `69092e5d` CUDA context reserve = max(1 GiB, 3% of device), 2.55 GB on the H100.
+      `IZWI_CUDA_CONTEXT_RESERVE_BYTES` overrides it.
+
+**Next deploy should show.**
+- A second and third chat turn succeed.
+- `coordinator.untracked_device_memory_bytes` is ~0.62 GB after load and ~1.49 GB after traffic,
+  then flat. Growth per turn means a leak.
+- `pending_device_memory_bytes` falls by 156,893,184 per live row.
+- `workspace_waits.exhausted = 0`.
+- `fast_paths.fp8_prefill_gemm` and `gdn_prefill` are fused.
+- `chunk_tokens = preferred_span_tokens = 1024`.
+- TTFT and `prefill_ms_avg` fall by an order of magnitude.
+- `kernel_timings.status = measured`. Use its GEMV GB/s to target decode (16.7 ms/token against a
+  ~8 ms floor).
+- Ops: set `IZWI_PRELOAD_MODELS=Qwen3.8-27B-FP8` so the first request does not pay the load.
+
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.

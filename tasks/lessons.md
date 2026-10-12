@@ -218,3 +218,14 @@
   scratchpad has a ~10 GB quota shared with other sessions. Check free disk and scratch usage before
   fanning out, keep large logs under `target/`, and remove a worktree as soon as its commits are
   cherry-picked. Two agents hit ENOSPC mid-verification on 2026-10-11.
+- A documented admission gap is a release blocker once a change spends the margin it relies on.
+  The never-materialized recurrent-state reservation (A4) was recorded as "later". Then graph
+  decode, larger prefill chunks and lazy CUDA context growth consumed the 1 GiB margin, and the
+  H100 failed every second chat turn. Before shipping a change that adds device allocations after
+  the load-time fit, check that every reservation records materialization (pending + materialized
+  == reserved, with nothing counted twice). Size the safety reserve from the measured
+  post-fit growth (the `untracked_device_memory_bytes` gauge), not a fixed 1 GiB.
+- Self-check and parity inputs must be unstructured. Sinusoidal test inputs let a wrong DeltaNet
+  head mapping through at 0.21%; xorshift inputs exposed it at 133%. Likewise, verify a model-side
+  preference's EFFECTIVE value in field diagnostics. Qwen3.8's 256-token prefill chunk never
+  applied, because the model never declared a preferred span and the scheduler cut prompts at 192.
