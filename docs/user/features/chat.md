@@ -193,8 +193,10 @@ conversation they hold at once (about 157 MB per conversation for Qwen3.8 and 66
 Qwen3.6). When `IZWI_MAX_RETAINED_SEQUENCES` is unset, the server sizes this
 automatically at load: recurrent state may use up to a quarter of the memory left after
 the weights, and the rest holds the KV cache. It never keeps fewer conversations than the
-decode width (8 on CUDA). On an 80 GB H100 that is about 67 conversations for Qwen3.8 and
-about 170 for Qwen3.6. Further requests wait for a slot and start as soon as one finishes.
+decode width (8 on CUDA). The chat-history snapshots below come out of the same quarter.
+On an 80 GB H100 that is about 68 conversations plus 8 history snapshots for Qwen3.8,
+and about 160 plus 8 for Qwen3.6. Further requests wait for a slot and start as soon as
+one finishes.
 The load log line `Fitted CUDA resident state rows and context` and the
 `retained_sequence_capacity` field under `kv_cache.models[]` in `/v1/metrics` show the
 chosen size. To give recurrent state a different share, set a value between 0 and 1:
@@ -207,6 +209,47 @@ Setting `IZWI_MAX_RETAINED_SEQUENCES` explicitly turns the automatic sizing off.
 server then reserves exactly that many conversations, plus `IZWI_MAX_STAGED_TRANSACTIONS`
 in-flight copies (by default the decode width), and refuses the load with the byte
 figures if they do not fit.
+
+### Chat history reuse
+
+Each chat turn re-renders the whole conversation, but Qwen3.8 on CUDA and Qwen3.6 on
+CPU and CUDA do not recompute the history they already processed (Qwen3.8 on CPU and
+Metal too, once its MTP draft head is off with `IZWI_QWEN38_MTP=0`). A
+turn's prompt is split before its final assistant header (earlier answers are
+re-rendered, so only the history up to there repeats in the next turn); the server
+keeps the KV pages of that history and a snapshot of the recurrent state at its last
+full 64-token page. The next turn of the conversation attaches there and prefills only
+the previous answer and the new message, which shortens time to first token on long
+conversations. A history shorter than one page has no snapshot, so after a very short
+first prompt the third turn is the first to reuse.
+
+Snapshots are bounded: `IZWI_MAX_PREFIX_SNAPSHOTS` (default 8) snapshots per model,
+about 157 MB each for Qwen3.8, reserved at load. The least recently used snapshot is
+dropped first, so up to 8 conversations continue with their history reused at once;
+others prefill in full. History pages share the KV cache and are released when a
+request needs the room. A conversation's whole history must fit the prefix page
+budget (`IZWI_MAX_PREFIX_CACHE_PAGES`, default 128 pages of 64 tokens, 8,192 tokens);
+longer conversations prefill in full. With thinking on, answers often run to several
+thousand tokens, so on CUDA set a larger budget for long chats, for example:
+
+```bash
+export IZWI_MAX_PREFIX_CACHE_PAGES=4096
+```
+
+To see it working, compare `usage.prompt_tokens_details.cached_tokens` on a second
+turn (the reused tokens) with `prompt_tokens`, or read `prefix_reuse` in the model's
+runtime diagnostics (`attached_prefills`, `reused_prompt_tokens`) and
+`kv_cache.counters.tensor_snapshot_attaches` in `/v1/metrics`. To turn reuse off
+for Qwen3.8 only:
+
+```bash
+export IZWI_QWEN38_PREFIX_REUSE=0
+```
+
+`IZWI_ENABLE_PREFIX_CACHING=0` turns it off for every model. A Qwen3.8 load with its MTP
+draft head (`IZWI_QWEN38_MTP=1` on CUDA; the default on CPU and Metal) keeps its
+history private and prefills every turn in full: the draft head's attention state has
+no snapshot to attach.
 
 Use separate conversations, or independent `/v1/chat/completions` requests, for
 concurrent answers. Sends to the same conversation remain ordered. The playground

@@ -91,7 +91,12 @@ maximum-length request, startup fails.
 
 ## Prefix isolation and capacity
 
-Prefix reuse starts disabled. To enable it, set all three fields:
+The server engages prefix reuse in catalog-auto mode by default: a model
+shares prefixes on the backends where its catalog cell is supported (see the
+[support matrix](/support-matrix)), under a per-process namespace unless you
+set one. `IZWI_ENABLE_PREFIX_CACHING=0` (or `IZWI_PREFIX_REUSE_AUTO=0`) turns it
+off for every model. To enable it explicitly for every model instead, set all
+three fields:
 
 ```json
 {
@@ -107,9 +112,12 @@ config file `[runtime]` keys (`enable_prefix_caching`,
 (`IZWI_ENABLE_PREFIX_CACHING`, `IZWI_MANAGED_PREFIX_CACHE_SALT`,
 `IZWI_MAX_PREFIX_CACHE_PAGES`). Note that a model must also opt in through its
 cache contract: dense families (Qwen3, Gemma3, Voxtral, VibeVoice) participate,
-while hybrid families (Qwen3.5, Qwen3.8) currently declare prefix reuse
-disabled because their recurrent and convolution state has no checkpoint
-boundary for shared spans.
+and so do the hybrid chat families Qwen3.8 and Qwen3.6, which snapshot their
+recurrent and convolution state at each chat turn's history boundary (see
+[Hybrid prefix snapshots](#hybrid-prefix-snapshots)). Qwen3.5 and LFM2 keep
+their hybrid state private. `IZWI_QWEN38_PREFIX_REUSE=0` turns reuse off for
+Qwen3.8 alone, and a Qwen3.8 load with its MTP head (`IZWI_QWEN38_MTP=1` on
+CUDA, the default elsewhere) keeps every domain private.
 
 Use a stable, non-secret namespace that changes whenever tenants or deployments
 must not share cache entries. Never reuse one namespace across mutually
@@ -119,7 +127,15 @@ already change.
 
 Capacity is measured in physical pages. The effective prefix bound is the
 smaller of `max_prefix_cache_pages` and the pages left after reserving one
-`max_sequence_length` request. Watch these runtime fields:
+`max_sequence_length` request. A chat turn can only attach history whose
+whole page chain is still indexed, so a conversation longer than the page
+budget (the default 128 pages of 64 tokens is 8,192 tokens) stops reusing
+its history. On CUDA, retained pages live inside the KV arena fitted and
+reserved at load and are evicted when a request needs them, so a deployment
+serving long chats can raise the budget without reserving more memory, for
+example `IZWI_MAX_PREFIX_CACHE_PAGES=4096` (one 262,144-token conversation).
+CPU and Metal clamp the budget to the 1,024-page baseline minus one
+maximum-length request. Watch these runtime fields:
 
 - `counters.prefix_hits`, `prefix_misses`, `prefix_evictions`,
   `prefix_copy_on_write_pages`, `prefix_rejections`, and
@@ -264,8 +280,10 @@ exact hardware and shape cell.
 
 Rollback is policy-only; ABI v1 and model-owned KV are not available.
 
-1. Disable prefix reuse with `enable_prefix_caching: false`. Restart and confirm
-   health reports `prefix.mode: disabled`.
+1. Disable prefix reuse with `enable_prefix_caching: false` (environment:
+   `IZWI_ENABLE_PREFIX_CACHING=0`; for Qwen3.8 alone,
+   `IZWI_QWEN38_PREFIX_REUSE=0`). Restart and confirm health reports
+   `prefix.mode: disabled`, or the model's `prefix_reuse.engaged: false`.
 2. On CUDA, set `IZWI_KV_DISABLE_OPTIMIZED_PROVIDER=1`. Restart and confirm the
    exact route selects Portable rather than Optimized. On Metal, set
    `IZWI_KV_METAL_EAGER_FENCES=1` to synchronize after every KV mutation again.
