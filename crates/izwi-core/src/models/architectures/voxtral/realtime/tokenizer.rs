@@ -222,7 +222,7 @@ struct TekkenAudioConfig {
     streaming_n_left_pad_tokens: Option<usize>,
 }
 
-fn merge_tekken_audio_metadata(
+pub(super) fn merge_tekken_audio_metadata(
     mut audio_config: AudioConfig,
     tekken_json: &str,
 ) -> Result<AudioConfig> {

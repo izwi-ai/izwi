@@ -1,0 +1,55 @@
+{
+  "dim": 3072,
+  "n_layers": 26,
+  "head_dim": 128,
+  "hidden_dim": 9216,
+  "n_heads": 32,
+  "n_kv_heads": 8,
+  "use_biases": false,
+  "causal": true,
+  "rope_theta": 1000000.0,
+  "norm_eps": 1e-05,
+  "vocab_size": 131072,
+  "model_parallel": 1,
+  "tied_embeddings": true,
+  "sliding_window": 8192,
+  "model_max_length": 131072,
+  "multimodal": {
+    "whisper_model_args": {
+      "encoder_args": {
+        "audio_encoding_args": {
+          "sampling_rate": 16000,
+          "frame_rate": 12.5,
+          "num_mel_bins": 128,
+          "hop_length": 160,
+          "window_size": 400,
+          "chunk_length_s": null,
+          "global_log_mel_max": 1.5,
+          "transcription_format": "streaming"
+        },
+        "dim": 1280,
+        "n_layers": 32,
+        "head_dim": 64,
+        "hidden_dim": 5120,
+        "n_heads": 32,
+        "vocab_size": 131072,
+        "n_kv_heads": 32,
+        "use_biases": true,
+        "use_cache": false,
+        "rope_theta": 1000000.0,
+        "causal": true,
+        "norm_eps": 1e-05,
+        "pos_embed": "rope",
+        "max_source_positions": null,
+        "ffn_type": "swiglu",
+        "norm_type": "rms_norm",
+        "sliding_window": 750
+      },
+      "downsample_args": {
+        "downsample_factor": 4
+      }
+    }
+  },
+  "ada_rms_norm_t_cond": true,
+  "ada_rms_norm_t_cond_dim": 32
+}
