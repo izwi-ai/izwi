@@ -18,32 +18,50 @@ generic kernels under `kernels/`. Qwen3.6 is a reference, not a dependency.
 S5) lives there. Leave it to that branch and rebase after it merges.
 
 Phase 0 — serving defaults, telemetry, memory
-- [x] 1 S1: per-size Qwen3.5 sampling profile from the model cards. Qwen3.5's presence penalty
-      now counts generated tokens only (vLLM semantics); repetition still counts prompt + output.
-      Without that change, the profile's 1.5–2.0 presence penalty would hit `<|im_end|>` from
-      the prompt.
-- [ ] 2 S2: decode-only t/s + TTFT in the UI; qwen35 `runtime_diagnostics`; sync, launch, sampler,
-      prefill-span, quantum and prefix counters.
+- [x] 1 S1 `8f3ddf62`: per-size Qwen3.5 sampling profile from the model cards. Qwen3.5's
+      presence penalty now counts generated tokens only (vLLM semantics); repetition still counts
+      prompt + output. Without that change, the profile's 1.5–2.0 presence penalty would hit
+      `<|im_end|>` from the prompt.
+- [x] 2 S2 `39e4cc4f` + `fcac212a`: decode-only t/s + TTFT in the chat UI (thread stats now carry
+      the engine timing). Qwen3.5 `runtime_diagnostics` reports device, dtypes, scheduling
+      preferences, the `gdn_decode` path and counters: sampler path, sampling host reads, RoPE
+      uploads, conv-ring stacks and decode steps. A prefix-hit counter waits for T1.
 - [ ] 3 S3: revisit. Leaving omitted `max_tokens` uncapped at the API layer was a deliberate
       decision, matching vLLM and pinned by a server test. Fix the arena claim instead
       (incremental claims, T3).
-- [ ] 4 S4: wider qwen35 prefill spans.
+- [x] 4 S4 `8a7d237b`: 1024-token isolated prefill spans on CUDA/Metal (CUDA chunked prefill cut
+      at 192).
 - [ ] 5 S5: quantized embedding gather; lazy/F16 vision tower. Admission goes to `perf-qwen38`.
-- [ ] 6 S6: load warmup; one-pass special-token matcher.
+- [x] 6 S6 `b612432d`: one-pass special-token matcher. Load warmup is still open.
 
 Phase 1 — host work per token
-- [ ] 7 H1: one sync per token (seal after the LM head, packed greedy readback).
-- [ ] 8 H2: RoPE tables built on the host once and uploaded (lesson: Metal's cos/sin is inexact),
-      indexed on device.
-- [ ] 9 H3: packed conv history staged by handle; no per-token checkpoint clones.
-- [ ] 10 H4: sampler cleanup; mine the `cuda-qwen35` branch.
-- [ ] 11 H5: multi-token decode quanta with `sustained_decode_quantum`.
+- [x] 7 H1 `dbf64219`: solo decode seals KV after the LM head; greedy does one packed readback.
+- [x] 8 H2 `fcac212a`: one host-built RoPE table per forward (F32 angle, F64 cos/sin), one upload.
+      Device-indexed tables come with the graph (G1).
+- [ ] 9 H3: packed conv history staged by handle. Deferred: with 8-token quanta, staging runs once
+      per 8 tokens.
+- [x] 10 H4 `dbf64219`: cached `arange` in the shared bounded sampler (was ~1 MB upload/token).
+      Mining the `cuda-qwen35` branch is still open.
+- [x] 11 H5 `a41d4615`: 8-token decode quanta on CUDA/Metal, sustained past the soft SLA on CUDA
+      (the engine honours `sustained` on CUDA only).
 
 Phase 2 — fused decode in q35/
-- [ ] 12 P1: fused DeltaNet decode via `kernels/cuda/gdn.rs` (`grouped: false`), CUDA + Metal.
-- [ ] 13 P2: F32 norm/RoPE/gate kernel variants and their fused wiring.
-- [ ] 14 P3/K1: izwi-owned K-quant MMVQ with model-owned scratch.
-- [ ] 15 G0: parity harness (eager trunk as the oracle, tiny random GGUF, RED-checked).
+- [x] 12 P1 `4a6ae3d2`: fused DeltaNet decode via `kernels/cuda/gdn.rs` (`grouped: false`) on
+      CUDA + Metal. Self-checked at load with xorshift inputs; `IZWI_QWEN35_FUSED_DECODE=legacy`.
+      Metal debug build, 0.8B: 78.5 → 49.6 ms/token vs main.
+- [ ] 13 P2: in-graph attention through the existing F16 kernels (`qk_norm_rope_kv`,
+      `paged_decode_adaptive`) with casts, instead of new F32 kernels; fused add+RMSNorm
+      later.
+- [ ] 14 K1: izwi-owned K-quant MMVQ through candle-kernels' FFI with project-owned scratch; one
+      input quantization per shared input. CUDA only, self-checked bit-exact against `QMatMul`.
+- [ ] 15 G1: whole-step CUDA graph for B = 1 (step buffer, DeltaNet state slabs through
+      `DeviceTable`, `with_graph_writes` attention, verify-before-replay, eager fallback).
+- [ ] 16 G0: parity harness with a tiny random GGUF. Meanwhile the opt-in real-checkpoint trace
+      (`qwen35_local_decode_trace`) covers parity against main on Metal.
+
+Verification so far: the opt-in trace on Metal through production loading. Qwen3.5-0.8B (18/18
+DeltaNet layers fused) and Qwen3.5-4B (24/24) decode 32 greedy tokens identical to main, with top
+logits within 1.7e-5 / 4.4e-5. Base traces are kept locally in `target/traces/`.
 
 Phase 3 and later: as in the research doc (graphs, prefix reuse, batching, Metal, CPU, other GPUs).
 
