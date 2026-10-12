@@ -5133,7 +5133,12 @@ impl RuntimeService {
                 // the expected transcript. Keep retained preparation behind
                 // the model's truthful capability declaration so production
                 // requests use the correctness-proven atomic route.
-                let geometry = (!long_form && model_for_shape.supports_resumable_prefill())
+                // A native-timestamp request needs the atomic route, which
+                // selects the timestamp task; retained preparation is ASR-only.
+                let retained = !long_form
+                    && !request.asr_native_word_timestamps
+                    && model_for_shape.supports_resumable_prefill();
+                let geometry = retained
                     .then(|| {
                         model_for_shape.granite_speech_retained_preparation_geometry(
                             &samples,

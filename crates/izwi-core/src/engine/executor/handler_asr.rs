@@ -1,6 +1,9 @@
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::models::architectures::granite_speech::asr::{
+    granite_speech_chunked_timestamp_transcript, granite_speech_request_plan, GraniteSpeechTask,
+};
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
 };
@@ -7276,14 +7279,24 @@ impl NativeExecutor {
                     request.streaming,
                     matches!(family, ModelFamily::WhisperAsr),
                 );
+            let granite_plan = matches!(family, ModelFamily::GraniteSpeechAsr)
+                .then(|| granite_speech_request_plan(variant, request.asr_native_word_timestamps));
+            let granite_task = granite_plan.map_or(GraniteSpeechTask::Asr, |plan| plan.task);
             let effective_context = self.asr_effective_context(variant);
             let invocation_context = effective_context.zip(model.audio_token_rate());
             let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
-                model.max_audio_seconds_hint(),
+                granite_plan.map_or_else(
+                    || model.max_audio_seconds_hint(),
+                    |plan| Some(plan.max_audio_seconds),
+                ),
                 model.audio_token_rate(),
                 effective_context,
                 |secs| asr_planned_decode_tokens(request, family, secs),
             )?;
+            let audio_limit_secs = match granite_plan.and_then(|plan| plan.max_chunk_seconds) {
+                Some(cap) => Some(audio_limit_secs.map_or(cap, |limit| limit.min(cap))),
+                None => audio_limit_secs,
+            };
             let chunk_plan = Self::asr_chunk_plan(
                 samples,
                 sample_rate,
@@ -7303,8 +7316,9 @@ impl NativeExecutor {
                     &chunk_plan.config,
                     Self::asr_chunk_stream_options(),
                     |chunk_audio, sr, prefix_text, partial| {
-                        let bounded_prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
-                            .then(|| Self::granite_asr_prefix_replay_text(prefix_text));
+                        let bounded_prefix_text = granite_plan
+                            .filter(|plan| plan.prefix_replay)
+                            .map(|_| Self::granite_asr_prefix_replay_text(prefix_text));
                         let prefix_text = bounded_prefix_text
                             .as_deref()
                             .filter(|value| !value.trim().is_empty());
@@ -7367,6 +7381,7 @@ impl NativeExecutor {
                                         chunk_audio,
                                         sr,
                                         language,
+                                        granite_task,
                                         asr_prompt,
                                         prefix_text,
                                         chunk_generation_options.clone(),
@@ -7484,6 +7499,7 @@ impl NativeExecutor {
                                 chunk_audio,
                                 sr,
                                 language,
+                                granite_task,
                                 asr_prompt,
                                 prefix_text,
                                 &chunk_generation_options,
@@ -7499,12 +7515,25 @@ impl NativeExecutor {
                         })
                     },
                 )?;
-                return Ok((
-                    chunked.text,
-                    Some(
-                        chunk_plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics),
-                    ),
-                ));
+                // Timestamp chunks carry their own word timings; the merged
+                // words replace the overlap-deduplicated text.
+                let timestamps = (granite_task == GraniteSpeechTask::WordTimestamps)
+                    .then(|| {
+                        granite_speech_chunked_timestamp_transcript(&chunked.chunk_diagnostics)
+                    })
+                    .flatten();
+                let mut diagnostics =
+                    chunk_plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics);
+                let text = match timestamps {
+                    Some((text, words)) => {
+                        if let Some(root) = diagnostics.as_object_mut() {
+                            root.insert("timestamp_words".to_string(), words);
+                        }
+                        text
+                    }
+                    None => chunked.text,
+                };
+                return Ok((text, Some(diagnostics)));
             }
 
             // Granite's public auto budget is admitted at its conservative
@@ -7662,6 +7691,7 @@ impl NativeExecutor {
                                 samples,
                                 sample_rate,
                                 language,
+                                granite_task,
                                 asr_prompt,
                                 segment_generation_options.clone(),
                                 cache,
@@ -7835,6 +7865,7 @@ impl NativeExecutor {
         chunk_audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         asr_prompt: Option<&str>,
         prefix_text: Option<&str>,
         base_options: &NativeAsrGenerationOptions,
@@ -7851,6 +7882,7 @@ impl NativeExecutor {
                 chunk_audio,
                 sample_rate,
                 language,
+                task,
                 asr_prompt,
                 prefix_text,
                 base_options,
@@ -7891,6 +7923,7 @@ impl NativeExecutor {
                 chunk_audio,
                 sample_rate,
                 language,
+                task,
                 asr_prompt,
                 prefix_text,
                 retry_options,
@@ -7955,6 +7988,7 @@ impl NativeExecutor {
         chunk_audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         asr_prompt: Option<&str>,
         prefix_text: Option<&str>,
         base_options: &NativeAsrGenerationOptions,
@@ -8007,6 +8041,7 @@ impl NativeExecutor {
                 chunk_audio,
                 sample_rate,
                 language,
+                task,
                 asr_prompt,
                 prefix_text,
                 retry_options,
@@ -9024,6 +9059,36 @@ mod tests {
         assert_eq!(options(Some((600, 10.0))), 1);
         // 1000 - 128 - 600 leaves 272 decode tokens.
         assert_eq!(options(Some((1_000, 10.0))), 272);
+    }
+
+    /// Plus's native timestamp task decodes `word [T:N]` for every word, so
+    /// its chunks get the timestamp budget; base keeps the ASR budget.
+    #[test]
+    fn granite_timestamp_requests_budget_tagged_output_on_plus_only() {
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+        let budget = |variant| {
+            let mut request = EngineCoreRequest::asr("UklGRg==")
+                .with_model_variant(variant)
+                .with_asr_native_word_timestamps(true);
+            request.asr_auto_max_tokens = true;
+            request.params.max_tokens = 2048;
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::GraniteSpeechAsr,
+                16_000 * 30,
+                16_000,
+                &base,
+                Some((4_096, 10.0)),
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(budget(ModelVariant::GraniteSpeech412BPlus), 844);
+        assert_eq!(budget(ModelVariant::GraniteSpeech412B), 200);
     }
 
     #[test]

@@ -1119,6 +1119,10 @@ pub struct EngineCoreRequest {
     /// Whether the caller left ASR max_tokens unset, so `params.max_tokens` is
     /// a default or model-specific ceiling that duration-aware families narrow.
     pub asr_auto_max_tokens: bool,
+    /// The caller wants model-native word timestamps. A family that emits
+    /// them (Granite Speech Plus) runs its timestamp task instead of plain
+    /// ASR; the others ignore it and leave timing to the forced aligner.
+    pub asr_native_word_timestamps: bool,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
     pub reference_audio: Option<String>,
@@ -1522,6 +1526,7 @@ impl EngineCoreRequest {
         }
         self.asr_language_for_execution().hash(&mut hasher);
         self.asr_prompt_for_execution().hash(&mut hasher);
+        self.asr_native_word_timestamps.hash(&mut hasher);
         Ok(hasher.finish())
     }
 
@@ -4510,6 +4515,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4572,6 +4578,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4634,6 +4641,7 @@ impl EngineCoreRequest {
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4693,6 +4701,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4753,6 +4762,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4813,6 +4823,7 @@ impl EngineCoreRequest {
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -5417,6 +5428,12 @@ impl EngineCoreRequest {
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
         self.language = Some(language.into());
         self.sync_task_from_fields();
+        self
+    }
+
+    /// Ask for model-native word timestamps where the model emits them.
+    pub fn with_asr_native_word_timestamps(mut self, enabled: bool) -> Self {
+        self.asr_native_word_timestamps = enabled;
         self
     }
 

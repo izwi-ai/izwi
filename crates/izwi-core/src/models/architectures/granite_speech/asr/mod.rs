@@ -77,8 +77,106 @@ const REQUIRED_ARTIFACTS: &[&str] = &[
 
 const UNTIED_LM_HEAD_TENSOR: &str = "language_model.lm_head.weight";
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
-const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 5.0 * 60.0;
+/// Plus's card evaluates timestamps on segments up to 3.5 minutes (trained
+/// on up to 5), so one timestamp invocation covers at most that much audio.
+const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 3.5 * 60.0;
+/// Planned timestamp chunks stay at or under a minute: about 600 audio
+/// tokens plus roughly 24 output tokens per second leave ample room in the
+/// 4096-token decoder context.
+const TIMESTAMP_MAX_CHUNK_SECONDS: f32 = 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How the generic ASR path runs a Granite request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GraniteSpeechRequestPlan {
+    pub(crate) task: GraniteSpeechTask,
+    /// Most audio one invocation of `task` may cover.
+    pub(crate) max_audio_seconds: f32,
+    /// Cap on a planned chunk, below the invocation limit.
+    pub(crate) max_chunk_seconds: Option<f32>,
+    /// Whether chunked ASR may replay earlier text as an assistant prefix
+    /// (plus's incremental decoding; base has no prefix slot).
+    pub(crate) prefix_replay: bool,
+}
+
+/// Native word timestamps are a plus task; every other request, including a
+/// timestamp request for base (which the forced aligner then times), runs
+/// plain ASR.
+pub(crate) fn granite_speech_request_plan(
+    variant: ModelVariant,
+    native_word_timestamps: bool,
+) -> GraniteSpeechRequestPlan {
+    let profile = GraniteSpeechCheckpointKind::for_variant(variant)
+        .map(GraniteSpeechPromptProfile::for_checkpoint);
+    let timestamps = native_word_timestamps
+        && profile.is_some_and(|profile| profile.supports_task(GraniteSpeechTask::WordTimestamps));
+    if timestamps {
+        return GraniteSpeechRequestPlan {
+            task: GraniteSpeechTask::WordTimestamps,
+            max_audio_seconds: TIMESTAMP_MAX_AUDIO_SECONDS,
+            max_chunk_seconds: Some(TIMESTAMP_MAX_CHUNK_SECONDS),
+            prefix_replay: false,
+        };
+    }
+    GraniteSpeechRequestPlan {
+        task: GraniteSpeechTask::Asr,
+        max_audio_seconds: DEFAULT_MAX_AUDIO_SECONDS,
+        max_chunk_seconds: None,
+        prefix_replay: profile.is_some_and(GraniteSpeechPromptProfile::supports_prefix_text),
+    }
+}
+
+/// The transcript and `timestamp_words` of a chunked timestamp request,
+/// merged from the per-chunk diagnostics the chunk driver records
+/// (`start_seconds`, `end_seconds`, `model_diagnostics.timestamp_words`).
+/// `None` when no chunk produced timed words, so the caller keeps its text
+/// and the forced aligner can time it.
+pub(crate) fn granite_speech_chunked_timestamp_transcript(
+    chunk_diagnostics: &[serde_json::Value],
+) -> Option<(String, serde_json::Value)> {
+    let chunks = chunk_diagnostics
+        .iter()
+        .filter_map(|chunk| {
+            Some(GraniteSpeechTimestampChunk {
+                start_seconds: chunk.get("start_seconds")?.as_f64()? as f32,
+                end_seconds: chunk.get("end_seconds")?.as_f64()? as f32,
+                words: granite_speech_timestamp_words_from_json(
+                    chunk.get("model_diagnostics")?.get("timestamp_words")?,
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let words = merge_granite_speech_timestamp_chunks(&chunks);
+    if words.is_empty() {
+        return None;
+    }
+    let text = words
+        .iter()
+        .map(|word| word.word.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some((text, granite_speech_timestamp_words_json(&words)))
+}
+
+fn granite_speech_timestamp_words_from_json(
+    words: &serde_json::Value,
+) -> Vec<GraniteSpeechTimestampWord> {
+    words
+        .as_array()
+        .map(|words| {
+            words
+                .iter()
+                .filter_map(|word| {
+                    Some(GraniteSpeechTimestampWord {
+                        word: word.get("word")?.as_str()?.to_string(),
+                        start_time_seconds: word.get("start_time_seconds")?.as_f64()? as f32,
+                        end_time_seconds: word.get("end_time_seconds")?.as_f64()? as f32,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechAsrTranscriptionOutput {
@@ -1425,11 +1523,13 @@ impl GraniteSpeechAsrModel {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transcribe_with_details_and_prompt_and_options_physical(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
         cache: &mut PhysicalPagedKvCache,
@@ -1439,7 +1539,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
-            GraniteSpeechTask::Asr,
+            task,
             prompt,
             None,
             options,
@@ -1454,6 +1554,7 @@ impl GraniteSpeechAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         prefix_text: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
@@ -1464,7 +1565,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
-            GraniteSpeechTask::Asr,
+            task,
             prompt,
             prefix_text,
             options,
@@ -1557,6 +1658,7 @@ impl GraniteSpeechAsrModel {
         let features = self.prepare_audio_features(audio, sample_rate)?;
         let mel_prepare = prepare_start.elapsed();
         validate_granite_audio_duration(features.audio_seconds)?;
+        validate_granite_task_audio_duration(task, features.audio_seconds)?;
         let encoder_start = Instant::now();
         let (audio_embeds, audio_stats) = self.runtime.audio_embeddings_with_stats(&features)?;
         let encoder_forward = encoder_start.elapsed();
@@ -1969,6 +2071,15 @@ fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
     }
     Err(Error::InvalidInput(format!(
         "Granite Speech ASR supports audio up to {DEFAULT_MAX_AUDIO_SECONDS:.0}s, got {audio_seconds:.1}s"
+    )))
+}
+
+fn validate_granite_task_audio_duration(task: GraniteSpeechTask, audio_seconds: f32) -> Result<()> {
+    if task != GraniteSpeechTask::WordTimestamps || audio_seconds <= TIMESTAMP_MAX_AUDIO_SECONDS {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "Granite Speech word timestamps cover up to {TIMESTAMP_MAX_AUDIO_SECONDS:.0}s per invocation, got {audio_seconds:.1}s"
     )))
 }
 
@@ -3013,6 +3124,94 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("ships language_model.lm_head.weight"));
+    }
+
+    #[test]
+    fn request_plan_runs_native_timestamps_only_on_plus() {
+        let timestamps = granite_speech_request_plan(ModelVariant::GraniteSpeech412BPlus, true);
+        assert_eq!(timestamps.task, GraniteSpeechTask::WordTimestamps);
+        assert_eq!(timestamps.max_audio_seconds, 210.0);
+        assert_eq!(timestamps.max_chunk_seconds, Some(60.0));
+        assert!(!timestamps.prefix_replay);
+
+        let plus_asr = granite_speech_request_plan(ModelVariant::GraniteSpeech412BPlus, false);
+        assert_eq!(plus_asr.task, GraniteSpeechTask::Asr);
+        assert_eq!(plus_asr.max_audio_seconds, DEFAULT_MAX_AUDIO_SECONDS);
+        assert_eq!(plus_asr.max_chunk_seconds, None);
+        assert!(plus_asr.prefix_replay);
+
+        // Base has no timestamp task (the aligner times its punctuated text)
+        // and no assistant-prefix slot.
+        for requested in [false, true] {
+            let base = granite_speech_request_plan(ModelVariant::GraniteSpeech412B, requested);
+            assert_eq!(base.task, GraniteSpeechTask::Asr);
+            assert_eq!(base.max_chunk_seconds, None);
+            assert!(!base.prefix_replay);
+        }
+    }
+
+    #[test]
+    fn timestamp_invocations_are_limited_to_the_evaluated_range() {
+        assert!(
+            validate_granite_task_audio_duration(GraniteSpeechTask::WordTimestamps, 210.0).is_ok()
+        );
+        assert!(
+            validate_granite_task_audio_duration(GraniteSpeechTask::WordTimestamps, 210.5)
+                .unwrap_err()
+                .to_string()
+                .contains("up to 210s")
+        );
+        assert!(validate_granite_task_audio_duration(GraniteSpeechTask::Asr, 500.0).is_ok());
+    }
+
+    /// Words written to chunk diagnostics come back typed and merged on the
+    /// input timeline, and the transcript is rebuilt from them.
+    #[test]
+    fn chunked_timestamp_transcript_merges_chunk_diagnostics() {
+        let chunk = |start: f32, end: f32, raw: &str| {
+            let parsed = parse_granite_speech_output(raw);
+            json!({
+                "start_seconds": start,
+                "end_seconds": end,
+                "model_diagnostics": {
+                    "timestamp_words": granite_speech_timestamp_words_json(&parsed.timestamp_words),
+                },
+            })
+        };
+        // Chunk 0 rolls over twice (silences included) and its "there" ends
+        // at 23.5 s, past the overlap midpoint 22.5 s, so chunk 1's copy
+        // (ending 22.8 s) is kept.
+        let chunks = vec![
+            chunk(0.0, 24.0, "_ [T:950] hello [T:120] _ [T:990] there [T:350]"),
+            chunk(21.0, 45.0, "there [T:180] friend [T:300]"),
+            json!({"index": 2, "skipped": true}),
+        ];
+        let (text, words) = granite_speech_chunked_timestamp_transcript(&chunks).unwrap();
+        assert_eq!(text, "hello there friend");
+        let timed = words
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| {
+                (
+                    word["word"].as_str().unwrap().to_string(),
+                    word["start_time_seconds"].as_f64().unwrap() as f32,
+                    word["end_time_seconds"].as_f64().unwrap() as f32,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            timed,
+            vec![
+                ("hello".to_string(), 9.5, 11.2),
+                ("there".to_string(), 21.0, 22.8),
+                ("friend".to_string(), 22.8, 24.0),
+            ]
+        );
+
+        assert!(
+            granite_speech_chunked_timestamp_transcript(&[chunk(0.0, 10.0, "no tags")]).is_none()
+        );
     }
 
     #[test]

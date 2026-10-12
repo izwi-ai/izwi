@@ -1340,6 +1340,7 @@ impl NativeAsrModel {
                     audio,
                     sample_rate,
                     language,
+                    GraniteSpeechTask::Asr,
                     prompt,
                     options,
                     cache,
@@ -1617,11 +1618,13 @@ impl NativeAsrModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transcribe_granite_speech_with_details_and_prompt_and_options_physical(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         options: NativeAsrGenerationOptions,
         cache: &mut PhysicalPagedKvCache,
@@ -1639,6 +1642,7 @@ impl NativeAsrModel {
             audio,
             sample_rate,
             language,
+            task,
             prompt,
             granite_speech_asr_options(options),
             cache,
@@ -1655,6 +1659,7 @@ impl NativeAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         prefix_text: Option<&str>,
         options: NativeAsrGenerationOptions,
@@ -1673,6 +1678,7 @@ impl NativeAsrModel {
             audio,
             sample_rate,
             language,
+            task,
             prompt,
             prefix_text,
             granite_speech_asr_options(options),

@@ -1877,11 +1877,14 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        let long_form = executor::qwen3_asr_requires_long_form(
-                            &samples,
-                            sample_rate,
-                            model_for_shape.max_audio_seconds_hint(),
-                        );
+                        // Retained preparation renders the plain-ASR prompt; a
+                        // native-timestamp request takes the atomic route.
+                        let long_form = request.asr_native_word_timestamps
+                            || executor::qwen3_asr_requires_long_form(
+                                &samples,
+                                sample_rate,
+                                model_for_shape.max_audio_seconds_hint(),
+                            );
                         if long_form {
                             return Self::finalize_direct_granite_speech_asr_preparation(
                                 request,

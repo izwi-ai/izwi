@@ -17,7 +17,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
-    parse_granite_speech_output, GraniteSpeechTask,
+    granite_speech_request_plan, parse_granite_speech_output, GraniteSpeechTask,
 };
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
@@ -140,6 +140,11 @@ impl OwnedAsrAudioInput {
 const GRANITE_ASR_AUTO_TOKENS_PER_WINDOW: f64 = 200.0;
 const GRANITE_ASR_AUTO_WINDOW_SECONDS: f64 = 30.0;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
+/// Plus's timestamp task writes `word [T:NNN]` (a tag is 5 tokens, plus
+/// silence tags), about 24 tokens per second of speech measured with the
+/// shipped tokenizer; budget 26 per second and a fixed reserve.
+const GRANITE_TIMESTAMP_TOKENS_PER_SECOND: f64 = 26.0;
+const GRANITE_TIMESTAMP_TOKEN_RESERVE: usize = 64;
 const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
 const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
@@ -319,8 +324,20 @@ pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> us
     (GRANITE_ASR_AUTO_TOKENS_PER_WINDOW * windows).ceil() as usize
 }
 
+/// Budget for plus's timestamp task, `ceil(26 * secs) + 64` tokens.
+pub(crate) fn granite_timestamp_max_tokens_for_duration(audio_seconds: f32) -> usize {
+    let seconds = if audio_seconds.is_finite() {
+        f64::from(audio_seconds).max(0.0)
+    } else {
+        0.0
+    };
+    (GRANITE_TIMESTAMP_TOKENS_PER_SECOND * seconds).ceil() as usize
+        + GRANITE_TIMESTAMP_TOKEN_RESERVE
+}
+
 /// Decode budget Granite plans an invocation of `audio_seconds` with: the
-/// automatic duration budget under the request ceiling, or the caller's own
+/// automatic duration budget of the task the request runs (plain ASR or
+/// plus's word timestamps) under the request ceiling, or the caller's own
 /// `max_tokens`. Chunk planning and per-chunk decoding share it, so a planned
 /// chunk always leaves room for the budget it is decoded with.
 pub(crate) fn granite_asr_planned_max_tokens(
@@ -328,11 +345,19 @@ pub(crate) fn granite_asr_planned_max_tokens(
     audio_seconds: f32,
 ) -> usize {
     let ceiling = request.params.max_tokens.max(1);
-    if request.asr_auto_max_tokens {
-        granite_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
-    } else {
-        ceiling
+    if !request.asr_auto_max_tokens {
+        return ceiling;
     }
+    let word_timestamps = request.model_variant.is_some_and(|variant| {
+        granite_speech_request_plan(variant, request.asr_native_word_timestamps).task
+            == GraniteSpeechTask::WordTimestamps
+    });
+    let budget = if word_timestamps {
+        granite_timestamp_max_tokens_for_duration(audio_seconds)
+    } else {
+        granite_auto_asr_max_tokens_for_duration(audio_seconds)
+    };
+    budget.min(ceiling)
 }
 
 fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
@@ -2335,6 +2360,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         streaming: bool,
+        native_word_timestamps: bool,
     ) -> Result<AdmittedEngineRequest> {
         let audio_bytes = match audio_input {
             AsrAudioInput::Base64("") => {
@@ -2411,7 +2437,8 @@ impl RuntimeService {
                         runtime_context,
                     )?,
                 }
-                .with_prompt(prompt);
+                .with_prompt(prompt)
+                .with_native_word_timestamps(native_word_timestamps);
                 let mut request = runtime_request.into_engine_request();
                 apply_asr_max_tokens(&mut request, variant, max_tokens);
                 Ok(request)
@@ -2492,6 +2519,7 @@ impl RuntimeService {
                 max_tokens,
                 correlation_id,
                 RuntimeRequestContext::default(),
+                false,
                 false,
             )
             .await?;
@@ -2594,6 +2622,7 @@ impl RuntimeService {
                 correlation_id,
                 RuntimeRequestContext::default(),
                 true,
+                false,
             )
             .await?;
         let mut streamed_text = String::new();
@@ -2672,6 +2701,7 @@ impl RuntimeService {
             max_tokens,
             correlation_id,
             RuntimeRequestContext::default(),
+            false,
         )
         .await
     }
@@ -2686,6 +2716,7 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
@@ -2714,6 +2745,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 false,
+                native_word_timestamps,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
@@ -2883,6 +2915,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 true,
+                false,
             )
             .await?;
         let mut streamed_text = String::new();
@@ -3082,6 +3115,35 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+            audio_bytes,
+            model_id,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            runtime_context,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`Self::asr_transcribe_bytes_with_runtime_context`], optionally
+    /// asking for model-native word timestamps: a model that emits them
+    /// (Granite Speech Plus) returns them as `timestamp_words` in its
+    /// diagnostics; any other model transcribes as usual.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
+    ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
         self.asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
             variant,
@@ -3091,6 +3153,7 @@ impl RuntimeService {
             max_tokens,
             correlation_id,
             runtime_context,
+            native_word_timestamps,
         )
         .await
     }
@@ -5499,6 +5562,51 @@ mod tests {
         let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
         apply_asr_max_tokens(&mut explicit, granite, Some(96));
         assert_eq!(granite_asr_planned_max_tokens(&explicit, 60.0), 96);
+    }
+
+    #[test]
+    fn granite_timestamp_budget_covers_tagged_words_and_a_reserve() {
+        assert_eq!(granite_timestamp_max_tokens_for_duration(0.0), 64);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(1.0), 90);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(30.0), 844);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(60.0), 1_624);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(f32::NAN), 64);
+    }
+
+    /// Only plus runs the timestamp task, so only plus gets its budget; a
+    /// base request asking for word timestamps keeps the ASR budget and is
+    /// timed by the aligner.
+    #[test]
+    fn granite_planned_budget_follows_the_task_the_request_runs() {
+        let auto = |variant, word_timestamps| {
+            let mut request = EngineCoreRequest::asr_bytes(vec![1])
+                .with_model_variant(variant)
+                .with_asr_native_word_timestamps(word_timestamps);
+            apply_asr_max_tokens(&mut request, variant, None);
+            request
+        };
+        let plus = ModelVariant::GraniteSpeech412BPlus;
+        let base = ModelVariant::GraniteSpeech412B;
+        assert_eq!(granite_asr_planned_max_tokens(&auto(plus, true), 30.0), 844);
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, true), 60.0),
+            1_624
+        );
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, true), 210.0),
+            GRANITE_ASR_AUTO_MAX_TOKENS
+        );
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, false), 30.0),
+            200
+        );
+        assert_eq!(granite_asr_planned_max_tokens(&auto(base, true), 30.0), 200);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(plus)
+            .with_asr_native_word_timestamps(true);
+        apply_asr_max_tokens(&mut explicit, plus, Some(300));
+        assert_eq!(granite_asr_planned_max_tokens(&explicit, 60.0), 300);
     }
 
     #[test]
