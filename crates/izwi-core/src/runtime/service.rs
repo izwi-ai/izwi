@@ -9674,6 +9674,7 @@ mod tests {
             device_ordinal: Some(0),
             resident_paged_bytes: 1_280,
             authorized_tensor_bytes: 0,
+            materialized_tensor_bytes: 0,
             physical_bytes: 1_280,
             registered_sessions: 1,
             single_sequence_token_capacity: 160,

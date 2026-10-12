@@ -220,6 +220,9 @@ pub struct ManagedKvModelRuntimeSnapshot {
     /// Maximum retained tensor-state envelope authorized for committed and
     /// staged rows. Tensor values are materialized on demand.
     pub authorized_tensor_bytes: u64,
+    /// Committed tensor-state backing recorded as materialized on the model
+    /// lease; the rest of `authorized_tensor_bytes` is a pending claim.
+    pub materialized_tensor_bytes: u64,
     /// Compatibility total: resident paged bytes plus authorized tensor bytes.
     pub physical_bytes: u64,
     pub registered_sessions: u64,
@@ -248,6 +251,7 @@ pub struct ManagedKvRuntimeTotalsSnapshot {
     pub registered_sessions: u64,
     pub resident_paged_bytes: u64,
     pub authorized_tensor_bytes: u64,
+    pub materialized_tensor_bytes: u64,
     /// Compatibility total: resident paged bytes plus authorized tensor bytes.
     pub physical_bytes: u64,
     pub coordinator: ManagedKvCoordinatorSnapshot,
@@ -389,7 +393,11 @@ struct ManagedKvModelState {
     /// hierarchical offload is engaged for this engine.
     host_offload: Option<offload::ModelOffload>,
     resource_lease: Option<ResourceLease>,
+    /// Paged backing (and the host tier's budget) recorded on the lease.
     materialized_resources: ResourceVector,
+    /// Tensor-arena committed backing recorded on the lease beside
+    /// `materialized_resources`; the rest of the tensor envelope is pending.
+    tensor_materialized_bytes: u64,
     allocation_ledger: StateAllocationLedger,
 }
 
@@ -750,6 +758,9 @@ impl ManagedKvCacheManager {
                 totals.authorized_tensor_bytes = totals
                     .authorized_tensor_bytes
                     .saturating_add(state.runtime.authorized_tensor_bytes());
+                totals.materialized_tensor_bytes = totals
+                    .materialized_tensor_bytes
+                    .saturating_add(state.tensor_materialized_bytes);
                 let mut arenas = state
                     .runtime
                     .plan
@@ -879,6 +890,7 @@ impl ManagedKvCacheManager {
                     device_ordinal: state.runtime.plan.device_ordinal,
                     resident_paged_bytes: state.runtime.resident_paged_bytes(),
                     authorized_tensor_bytes: state.runtime.authorized_tensor_bytes(),
+                    materialized_tensor_bytes: state.tensor_materialized_bytes,
                     physical_bytes: state.runtime.physical_bytes(),
                     registered_sessions: usize_to_u64(state.registered_sessions.len()),
                     single_sequence_token_capacity: state.runtime.maximum_sequence_tokens(),
@@ -1337,6 +1349,7 @@ impl ManagedKvCacheManager {
                 host_offload,
                 resource_lease,
                 materialized_resources,
+                tensor_materialized_bytes: 0,
                 allocation_ledger,
             },
         );
@@ -2190,7 +2203,12 @@ impl ManagedKvCacheManager {
                         },
                     )?;
                     if let Some(lease) = state.resource_lease.as_ref() {
-                        lease.record_materialized_usage(final_materialized)?;
+                        lease.record_materialized_usage(final_materialized.checked_add(
+                            tensor_state_resources(
+                                state.runtime.plan.backend,
+                                state.tensor_materialized_bytes,
+                            )?,
+                        )?)?;
                     }
                     state.materialized_resources = final_materialized;
                     self.telemetry.record_backing_allocation();
@@ -2433,7 +2451,8 @@ impl ManagedKvCacheManager {
                                 components.iter().cloned().collect(),
                             )?;
                         }
-                        arena.commit(seed, fork_cursor)
+                        // A fresh sequence has no committed state to retire.
+                        arena.commit(seed, fork_cursor).map(drop)
                     })();
                     if staged.is_err() {
                         let _ = arena.abort(seed);
@@ -2445,13 +2464,15 @@ impl ManagedKvCacheManager {
                     state.pending_prefixes.remove(&txn_id);
                     state.pending_promotions.remove(&txn_id);
                     state.tensor_sequences.remove(session);
-                    arena.release(sequence).map_err(|release_error| {
+                    release_tensor_sequence(state, arena, sequence).map_err(|release_error| {
                         Error::InferenceError(format!(
                             "tensor snapshot fork failed ({error}); newly registered sequence rollback also failed: {release_error}"
                         ))
                     })?;
                     return Err(error);
                 }
+                // The fork commits snapshot tensors that already exist.
+                reconcile_tensor_materialization(state);
                 self.telemetry.record_tensor_snapshot_attach();
             }
             let managed_reservation = if let Some(selections) = selected_tensor_state.as_ref() {
@@ -2474,7 +2495,7 @@ impl ManagedKvCacheManager {
                     state.pending_promotions.remove(&txn_id);
                     if newly_registered {
                         state.tensor_sequences.remove(session);
-                        arena.release(sequence)?;
+                        release_tensor_sequence(state, arena, sequence)?;
                     }
                     return Err(error);
                 }
@@ -2490,7 +2511,7 @@ impl ManagedKvCacheManager {
                 state.pending_promotions.remove(&txn_id);
                 if newly_registered {
                     state.tensor_sequences.remove(session);
-                    arena.release(sequence).map_err(|release_error| {
+                    release_tensor_sequence(state, arena, sequence).map_err(|release_error| {
                         Error::InferenceError(format!(
                             "tensor transaction admission failed ({error}); newly registered sequence rollback also failed: {release_error}"
                         ))
@@ -2841,10 +2862,15 @@ impl ManagedKvCacheManager {
                 }
                 arena.commit(transaction, target_cursor)
             };
-            if let Err(error) = committed {
-                abort_reservation(state, reservation);
-                return Err(error);
-            }
+            let retired = match committed {
+                Ok(retired) => retired,
+                Err(error) => {
+                    abort_reservation(state, reservation);
+                    return Err(error);
+                }
+            };
+            reconcile_tensor_materialization(state);
+            drop(retired);
             if clocked_state.selections().is_none() {
                 // DS1.2b: a legacy transaction committed every shared tensor
                 // domain at one cursor; record it for the snapshot publication
@@ -2950,15 +2976,10 @@ impl ManagedKvCacheManager {
                     .map_err(coordinator_error)?;
             }
             if let Some(sequence) = state.tensor_sequences.remove(session) {
-                state
-                    .runtime
-                    .tensor_state()
-                    .ok_or_else(|| {
-                        Error::InferenceError(
-                            "registered tensor-state sequence lost its arena".into(),
-                        )
-                    })?
-                    .release(sequence)?;
+                let arena = state.runtime.tensor_state().cloned().ok_or_else(|| {
+                    Error::InferenceError("registered tensor-state sequence lost its arena".into())
+                })?;
+                release_tensor_sequence(state, &arena, sequence)?;
             }
             state.registered_sessions.remove(session);
             state.session_generations.remove(session);
@@ -3909,6 +3930,75 @@ fn managed_state_resources(
         }
     }
     Ok(resources)
+}
+
+/// Tensor-state bytes in the backend's lease domain (device on CUDA, unified
+/// on Metal, host on CPU), as `managed_state_resources` prices the envelope.
+fn tensor_state_resources(backend: BackendKind, bytes: u64) -> Result<ResourceVector> {
+    managed_state_resources(
+        backend,
+        StateResourceVector {
+            device_bytes: bytes,
+            ..StateResourceVector::default()
+        },
+    )
+}
+
+/// Move the tensor arena's committed backing between the model lease's
+/// pending and materialized claims. The tensor envelope is authorized at load
+/// but allocated lazily: without this, every committed row stays pending
+/// while also shrinking live free memory, so guarded admission charges it
+/// twice. Growth is recorded after the state exists (commits publish tensors
+/// the model already allocated). A shrink restores the pending claim, so the
+/// caller must drop the [`RetiredTensorState`] only after this returns.
+///
+/// Every caller has already applied its arena transition, so a failure here
+/// is logged rather than returned: a stale record keeps the previous claim.
+fn reconcile_tensor_materialization(state: &mut ManagedKvModelState) {
+    let Some(arena) = state.runtime.tensor_state() else {
+        return;
+    };
+    let result = (|| -> Result<Option<u64>> {
+        let bytes = arena
+            .committed_backing_bytes()?
+            .min(arena.capacity().authorized_bytes());
+        if bytes == state.tensor_materialized_bytes {
+            return Ok(None);
+        }
+        if let Some(lease) = state.resource_lease.as_ref() {
+            let materialized = state
+                .materialized_resources
+                .checked_add(tensor_state_resources(state.runtime.plan.backend, bytes)?)?;
+            if bytes > state.tensor_materialized_bytes {
+                lease.record_materialized_usage(materialized)?;
+            } else {
+                lease.prepare_materialized_release(materialized)?;
+            }
+        }
+        Ok(Some(bytes))
+    })();
+    match result {
+        Ok(Some(bytes)) => state.tensor_materialized_bytes = bytes,
+        Ok(None) => {}
+        Err(error) => tracing::error!(
+            error = %error,
+            recorded_bytes = state.tensor_materialized_bytes,
+            "managed tensor-state materialization could not be recorded on the model lease"
+        ),
+    }
+}
+
+/// Release one tensor sequence, restoring its pending claim before its state
+/// can be freed.
+fn release_tensor_sequence(
+    state: &mut ManagedKvModelState,
+    arena: &TensorStateArena,
+    sequence: PhysicalStateSequenceId,
+) -> Result<()> {
+    let retired = arena.release(sequence)?;
+    reconcile_tensor_materialization(state);
+    drop(retired);
+    Ok(())
 }
 
 fn reserve_managed_arena(
@@ -9336,6 +9426,261 @@ mod tests {
                 .lower_slots(&[stale])
                 .is_err()
         );
+    }
+
+    /// Live capacity a driver reports: total fixed, free memory set by the
+    /// test as it simulates allocations and frees.
+    #[derive(Debug)]
+    struct DriverFreeProvider {
+        capacity: u64,
+        available: std::sync::atomic::AtomicU64,
+    }
+
+    impl DriverFreeProvider {
+        fn set_available(&self, bytes: u64) {
+            self.available.store(bytes, Ordering::SeqCst);
+        }
+
+        fn available(&self) -> u64 {
+            self.available.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PhysicalCapacityProvider for DriverFreeProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            let host = |bytes| ResourceVector {
+                host_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            };
+            PhysicalCapacitySnapshot {
+                capacity: host(self.capacity),
+                available: host(self.available()),
+                source: CapacitySource::Test,
+            }
+        }
+    }
+
+    fn host_bytes(bytes: u64) -> ResourceVector {
+        ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        }
+    }
+
+    /// Whether a batch workspace of `bytes` passes guarded admission now.
+    fn workspace_fits(authority: &Arc<ResourceAuthority>, bytes: u64) -> Result<bool> {
+        match authority.reserve_batch_workspace(
+            ExecutionGroupId::new(1),
+            crate::engine::BatchId::new(1),
+            host_bytes(bytes),
+        ) {
+            Ok(_) => Ok(true),
+            Err(Error::Overloaded(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Qwen3.8-27B recurrent state per row: 48 DeltaNet layers x (3 MiB
+    /// recurrent + 120 KiB conv history), F32.
+    const QWEN38_STATE_ROW_BYTES: u64 = 156_893_184;
+
+    /// The composite contract with one tensor component the size of a
+    /// Qwen3.8-27B state row.
+    fn qwen38_sized_tensor_contract() -> InferenceStateContract {
+        let mut contract = composite_tensor_contract();
+        let StateDomainSpec::Tensor(tensor) = &mut contract.domains[1] else {
+            panic!("composite test contract tensor domain changed kind");
+        };
+        tensor.components[0].shape.dimensions[0].extent = ShapeExtent::Fixed {
+            value: QWEN38_STATE_ROW_BYTES / 4,
+        };
+        contract.validate().unwrap();
+        contract
+    }
+
+    fn stage_state_row(
+        arena: &TensorStateArena,
+        reservation: &ManagedCacheReservation,
+        cursor: u64,
+    ) -> Tensor {
+        let row = Tensor::zeros(
+            (QWEN38_STATE_ROW_BYTES / 4) as usize,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        arena
+            .stage_replace(
+                PhysicalStateTransactionId::new(reservation.txn_id).unwrap(),
+                StateDomainId::new(2),
+                cursor,
+                cursor + 1,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(row.clone()),
+                }],
+            )
+            .unwrap();
+        row
+    }
+
+    /// The H100 field failure on build b1d51b89 (Qwen3.8-27B-FP8, 78 retained
+    /// and 8 staged rows): a thread's second turn streamed one token, then
+    /// every decode step's 401,408 B workspace was refused with
+    /// `existing_pending=14,097,711,104` against `physical_available=
+    /// 14,072,741,888`. Model pending was exactly the lazy state envelope (86
+    /// rows x 156,893,184 B) plus the graph-decode claim (537,788,416 B):
+    /// committed rows shrank driver-free memory while staying pending.
+    /// Host bytes stand in for the device domain on this CPU runtime.
+    #[test]
+    fn committed_tensor_state_moves_from_pending_to_materialized_on_the_model_lease() -> Result<()>
+    {
+        const CAPACITY: u64 = 85_064_286_208;
+        const MODEL_RESERVED: u64 = 83_371_414_656;
+        const MODEL_MATERIALIZED: u64 = 69_340_812_416;
+        const GRAPH_DECODE_PENDING: u64 = 537_788_416;
+        const REQUEST_PENDING: u64 = 67_108_864;
+        const FIELD_AVAILABLE: u64 = 14_072_741_888;
+        const WORKSPACE: u64 = 401_408;
+
+        let provider = Arc::new(DriverFreeProvider {
+            capacity: CAPACITY,
+            available: std::sync::atomic::AtomicU64::new(CAPACITY),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let model = ModelInstanceId::new(3_800);
+        let session = SessionKey::new("qwen38-second-turn".into(), 1);
+        let mut manager = ManagedKvCacheManager::new(Some(authority.clone()));
+        let runtime = manager
+            .bind_request_with_capacity(
+                model,
+                BackendKind::Cpu,
+                ManagedStateCapacityRequest {
+                    // A retained row needs a page; pages bound the rows.
+                    total_paged_pages: 128,
+                    logical_token_reach: None,
+                    retained_sequence_rows: 78,
+                    staged_transaction_rows: 8,
+                },
+                16,
+                &CacheCapability::Managed(qwen38_sized_tensor_contract()),
+            )?
+            .expect("managed runtime");
+        let arena = runtime.tensor_state().expect("tensor arena").clone();
+        let envelope = arena.capacity().authorized_bytes();
+        assert_eq!(
+            arena.capacity().per_sequence_bytes(),
+            QWEN38_STATE_ROW_BYTES
+        );
+        assert_eq!(envelope, 13_492_813_824);
+        let paged = runtime.resident_paged_bytes();
+
+        // The weights lease: everything but the graph-decode claim is
+        // resident, so the two Model leases match the field's class totals.
+        let weights_materialized = MODEL_MATERIALIZED - paged;
+        let weights = authority.reserve_with_initial_materialized(
+            ReservationOwner::new(ReservationClass::Model, "qwen38-weights"),
+            host_bytes(weights_materialized + GRAPH_DECODE_PENDING),
+            host_bytes(weights_materialized),
+        )?;
+        assert_eq!(
+            weights_materialized + GRAPH_DECODE_PENDING + paged + envelope,
+            MODEL_RESERVED
+        );
+        let request = authority.reserve(
+            ReservationOwner::new(ReservationClass::Request, "second-turn"),
+            host_bytes(REQUEST_PENDING),
+        )?;
+        let pending_without_state = envelope + GRAPH_DECODE_PENDING + REQUEST_PENDING;
+        assert_eq!(pending_without_state, 14_097_711_104);
+        let initial_reserved = authority.snapshot().reserved;
+
+        // Prefill commits the row's first state. Driver-free memory reflects
+        // the allocation from the moment the model creates it.
+        provider.set_available(FIELD_AVAILABLE + QWEN38_STATE_ROW_BYTES);
+        let prefill = manager
+            .prepare(&runtime, 1, &session, &sequence_work(0, 1), None)?
+            .expect("prefill reservation");
+        let first_row = stage_state_row(&arena, &prefill, 0);
+        provider.set_available(FIELD_AVAILABLE);
+        // Staged state stays pending until it commits: the field arithmetic,
+        // to the byte. 14,097,711,104 + 401,408 > 14,072,741,888.
+        assert!(!workspace_fits(&authority, WORKSPACE)?);
+        manager.finalize(
+            &prefill,
+            Some(&prefill.completed_write_receipt_for_test()),
+            true,
+        )?;
+        assert!(
+            workspace_fits(&authority, WORKSPACE)?,
+            "the committed row must leave the pending claim"
+        );
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            QWEN38_STATE_ROW_BYTES
+        );
+        // Exactly one row moved: live headroom is free minus the rest.
+        let headroom = FIELD_AVAILABLE - (pending_without_state - QWEN38_STATE_ROW_BYTES);
+        assert!(workspace_fits(&authority, headroom)?);
+        assert!(!workspace_fits(&authority, headroom + 1)?);
+
+        // A decode step replaces the row: the new state is allocated beside
+        // the old, the commit retires the old, and the totals do not move.
+        let decode = manager
+            .prepare(&runtime, 2, &session, &sequence_work(1, 2), None)?
+            .expect("decode reservation");
+        stage_state_row(&arena, &decode, 1);
+        provider.set_available(FIELD_AVAILABLE - QWEN38_STATE_ROW_BYTES);
+        manager.finalize(
+            &decode,
+            Some(&decode.completed_write_receipt_for_test()),
+            true,
+        )?;
+        drop(first_row);
+        provider.set_available(FIELD_AVAILABLE);
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            QWEN38_STATE_ROW_BYTES
+        );
+        assert!(workspace_fits(&authority, headroom)?);
+        assert!(!workspace_fits(&authority, headroom + 1)?);
+
+        // An aborted step frees its staged state and changes nothing.
+        let aborted = manager
+            .prepare(&runtime, 3, &session, &sequence_work(2, 3), None)?
+            .expect("aborted reservation");
+        drop(stage_state_row(&arena, &aborted, 2));
+        manager.finalize(&aborted, None, false)?;
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            QWEN38_STATE_ROW_BYTES
+        );
+        assert!(workspace_fits(&authority, headroom)?);
+        assert!(!workspace_fits(&authority, headroom + 1)?);
+
+        // Releasing the session restores the whole envelope as pending
+        // before the row is freed; then the driver reports it free.
+        manager.release_session(&session)?;
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            0
+        );
+        assert!(!workspace_fits(&authority, headroom)?);
+        provider.set_available(FIELD_AVAILABLE + QWEN38_STATE_ROW_BYTES);
+        let released_headroom = FIELD_AVAILABLE + QWEN38_STATE_ROW_BYTES - pending_without_state;
+        assert!(workspace_fits(&authority, released_headroom)?);
+        assert!(!workspace_fits(&authority, released_headroom + 1)?);
+        assert_eq!(authority.snapshot().reserved, initial_reserved);
+
+        // Unload returns the model lease exactly once.
+        drop(arena);
+        drop(runtime);
+        assert!(manager.unload_model(model)?);
+        drop(weights);
+        drop(request);
+        assert_eq!(authority.snapshot().reservations, 0);
+        assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        Ok(())
     }
 
     #[test]

@@ -68,13 +68,12 @@ pub(crate) struct TensorStorageAccounting {
 
 impl TensorStorageAccounting {
     pub(crate) fn add_tensor(&mut self, tensor: &Tensor) -> Option<()> {
-        let (storage, _) = tensor.storage_and_layout();
-        let storage_key = std::ptr::from_ref::<Storage>(&storage) as usize;
+        let (storage_key, bytes) = tensor_backing(tensor);
         if !self.seen.insert(storage_key) {
             return Some(());
         }
 
-        self.add_bytes(storage_bytes(&storage)?)
+        self.add_bytes(bytes?)
     }
 
     pub(crate) fn add_bytes(&mut self, bytes: u64) -> Option<()> {
@@ -85,6 +84,17 @@ impl TensorStorageAccounting {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
+}
+
+/// The backing allocation behind `tensor`: a key shared by every view of the
+/// same Candle storage, and that allocation's size (`None` when it cannot be
+/// read). The key stays unique only while some tensor keeps the storage alive.
+pub(crate) fn tensor_backing(tensor: &Tensor) -> (usize, Option<u64>) {
+    let (storage, _) = tensor.storage_and_layout();
+    (
+        std::ptr::from_ref::<Storage>(&storage) as usize,
+        storage_bytes(&storage),
+    )
 }
 
 fn storage_bytes(storage: &Storage) -> Option<u64> {

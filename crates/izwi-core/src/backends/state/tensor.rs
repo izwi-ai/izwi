@@ -9,6 +9,7 @@ use crate::kv::v2::{
     InferenceStateContract, ResolvedNonPagedDomainPlan, ResolvedStatePlan, ResolvedTensorComponent,
     StateClock, StateComponentId, StateDType, StateDomainId, StateGroupId,
 };
+use crate::models::shared::memory::accounting::tensor_backing;
 
 static NEXT_TENSOR_ARENA_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -142,6 +143,65 @@ struct ArenaState {
     closed: bool,
     sequences: HashMap<PhysicalStateSequenceId, SequenceState>,
     transactions: HashMap<PhysicalStateTransactionId, StagedTransaction>,
+    committed: CommittedBacking,
+}
+
+/// Backing allocations retained by committed sequence state, each counted
+/// once however many views, domains or sequences share it. Staged
+/// replacements are not counted: they stay inside the staging envelope until
+/// their transaction commits.
+#[derive(Default)]
+struct CommittedBacking {
+    /// Storage key -> (allocation bytes, committed references to it).
+    storages: HashMap<usize, (u64, usize)>,
+    bytes: u64,
+}
+
+impl CommittedBacking {
+    fn retain(&mut self, snapshot: &StateDomainSnapshot) {
+        for tensor in snapshot.components.iter().filter_map(|c| c.tensor.as_ref()) {
+            let (key, bytes) = tensor_backing(tensor);
+            let entry = self.storages.entry(key).or_insert((0, 0));
+            if entry.1 == 0 {
+                // An unreadable allocation counts as zero, so committed
+                // backing can only under-report what is physically held.
+                entry.0 = bytes.unwrap_or(0);
+                self.bytes = self.bytes.saturating_add(entry.0);
+            }
+            entry.1 += 1;
+        }
+    }
+
+    /// Must run while the arena still holds `snapshot`, so its keys cannot
+    /// have been reused by another allocation.
+    fn forget(&mut self, snapshot: &StateDomainSnapshot) {
+        for tensor in snapshot.components.iter().filter_map(|c| c.tensor.as_ref()) {
+            let (key, _) = tensor_backing(tensor);
+            if let Some(entry) = self.storages.get_mut(&key) {
+                entry.1 -= 1;
+                if entry.1 == 0 {
+                    self.bytes = self.bytes.saturating_sub(entry.0);
+                    self.storages.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Committed state the arena no longer holds (replaced by a commit, or
+/// released). Dropping it can free device memory, so an owner that records
+/// committed backing on a resource lease reconciles first and drops this
+/// afterwards.
+pub(crate) struct RetiredTensorState {
+    _domains: Vec<StateDomainSnapshot>,
+}
+
+impl RetiredTensorState {
+    fn new(domains: impl IntoIterator<Item = StateDomainSnapshot>) -> Self {
+        Self {
+            _domains: domains.into_iter().collect(),
+        }
+    }
 }
 
 /// Immutable admission and byte-authorization envelope for one tensor arena.
@@ -404,6 +464,12 @@ impl TensorStateArena {
         })
     }
 
+    /// Backing bytes physically held by committed sequence state, each
+    /// allocation once. Staged replacements are excluded until they commit.
+    pub(crate) fn committed_backing_bytes(&self) -> Result<u64> {
+        Ok(self.lock()?.committed.bytes)
+    }
+
     pub(crate) fn register(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
         let mut state = self.lock()?;
         if state.closed {
@@ -611,11 +677,13 @@ impl TensorStateArena {
             .cloned())
     }
 
+    /// Publish a compatibility transaction. Returns the replaced committed
+    /// state (see [`RetiredTensorState`]).
     pub(crate) fn commit(
         &self,
         transaction: PhysicalStateTransactionId,
         expected_cursor: u64,
-    ) -> Result<()> {
+    ) -> Result<RetiredTensorState> {
         let required_domains = self
             .plan
             .non_paged
@@ -648,12 +716,22 @@ impl TensorStateArena {
             .transactions
             .remove(&transaction)
             .expect("validated physical state transaction remains active");
-        let live = state
-            .sequences
+        let ArenaState {
+            sequences,
+            committed,
+            ..
+        } = &mut *state;
+        let live = sequences
             .get_mut(&staged.sequence)
             .ok_or_else(|| invalid("physical state sequence was released during a transaction"))?;
-        *live = staged.state;
-        Ok(())
+        staged
+            .state
+            .domains
+            .values()
+            .for_each(|s| committed.retain(s));
+        live.domains.values().for_each(|s| committed.forget(s));
+        let retired = std::mem::replace(live, staged.state);
+        Ok(RetiredTensorState::new(retired.domains.into_values()))
     }
 
     /// Seal the exact selected-group completion after all selected domains have
@@ -682,11 +760,12 @@ impl TensorStateArena {
     }
 
     /// Validate and publish one arena-sealed selected-group completion.
+    /// Returns the replaced committed domains (see [`RetiredTensorState`]).
     pub(crate) fn commit_selected(
         &self,
         transaction: PhysicalStateTransactionId,
         completion: &TensorStateBatchCompletion,
-    ) -> Result<()> {
+    ) -> Result<RetiredTensorState> {
         let mut state = self.lock()?;
         let staged = state
             .transactions
@@ -711,13 +790,18 @@ impl TensorStateArena {
             .transactions
             .remove(&transaction)
             .expect("validated physical state transaction remains active");
-        let live = state
-            .sequences
+        let ArenaState {
+            sequences,
+            committed,
+            ..
+        } = &mut *state;
+        let live = sequences
             .get_mut(&staged.sequence)
             .ok_or_else(|| invalid("physical state sequence was released during a transaction"))?;
         let TransactionSelection::Selected(selections) = staged.selection else {
             unreachable!("selected transaction changed mode while locked")
         };
+        let mut retired = Vec::new();
         for selected in selections.iter() {
             for domain in selected.domains.iter() {
                 let snapshot = staged
@@ -726,10 +810,14 @@ impl TensorStateArena {
                     .get(domain)
                     .cloned()
                     .expect("validated selected domain has staged state");
-                live.domains.insert(*domain, snapshot);
+                committed.retain(&snapshot);
+                if let Some(replaced) = live.domains.insert(*domain, snapshot) {
+                    committed.forget(&replaced);
+                    retired.push(replaced);
+                }
             }
         }
-        Ok(())
+        Ok(RetiredTensorState::new(retired))
     }
 
     fn resolve_selections(
@@ -780,14 +868,20 @@ impl TensorStateArena {
             .ok_or_else(|| invalid("physical state transaction is not active"))
     }
 
-    pub(crate) fn release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
+    /// Release a sequence. Returns its committed state (see
+    /// [`RetiredTensorState`]).
+    pub(crate) fn release(&self, sequence: PhysicalStateSequenceId) -> Result<RetiredTensorState> {
         let mut state = self.lock()?;
         validate_sequence_release(&state, sequence)?;
-        state
+        let released = state
             .sequences
             .remove(&sequence)
             .expect("validated physical state sequence remains registered");
-        Ok(())
+        released
+            .domains
+            .values()
+            .for_each(|snapshot| state.committed.forget(snapshot));
+        Ok(RetiredTensorState::new(released.domains.into_values()))
     }
 
     pub(crate) fn validate_release(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
@@ -1567,5 +1661,149 @@ mod tests {
                 .map(|tensor| tensor.to_vec1::<f32>().unwrap());
             assert_eq!(a_values, b_values, "forked state must advance identically");
         }
+    }
+
+    fn backing_bytes(tensor: &Tensor) -> u64 {
+        tensor_backing(tensor)
+            .1
+            .expect("CPU storage size is readable")
+    }
+
+    #[test]
+    fn committed_backing_counts_each_allocation_once_and_excludes_staging() {
+        let arena = arena();
+        let domain = StateDomainId::new(1);
+        let a = PhysicalStateSequenceId::new(1).unwrap();
+        let b = PhysicalStateSequenceId::new(2).unwrap();
+        arena.register(a).unwrap();
+        assert_eq!(arena.committed_backing_bytes().unwrap(), 0);
+
+        // A staged replacement is not committed backing until it commits. A
+        // narrow view keeps (and counts) its whole allocation.
+        let slab = Tensor::from_slice(&[1.0_f32; 8], 8, &Device::Cpu).unwrap();
+        let view = slab.narrow(0, 0, 4).unwrap();
+        let slab_bytes = backing_bytes(&slab);
+        assert!(slab_bytes >= 32);
+        let first = PhysicalStateTransactionId::new(1).unwrap();
+        arena.begin(first, a).unwrap();
+        arena
+            .stage_replace(
+                first,
+                domain,
+                0,
+                1,
+                vec![StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(view),
+                }],
+            )
+            .unwrap();
+        assert_eq!(arena.committed_backing_bytes().unwrap(), 0);
+        drop(arena.commit(first, 1).unwrap());
+        assert_eq!(arena.committed_backing_bytes().unwrap(), slab_bytes);
+
+        // B forks A's committed tensors: one shared allocation, counted once.
+        let snapshot = arena.read(a, domain).unwrap().unwrap();
+        arena.register(b).unwrap();
+        let fork = PhysicalStateTransactionId::new(2).unwrap();
+        arena.begin(fork, b).unwrap();
+        arena
+            .stage_replace(fork, domain, 0, 1, snapshot.components.to_vec())
+            .unwrap();
+        drop(arena.commit(fork, 1).unwrap());
+        assert_eq!(arena.committed_backing_bytes().unwrap(), slab_bytes);
+
+        // A advances onto a new allocation; B still holds the old one.
+        let next = value(&[2.0; 8]);
+        let next_bytes = backing_bytes(next.tensor.as_ref().unwrap());
+        let advance = PhysicalStateTransactionId::new(3).unwrap();
+        arena.begin(advance, a).unwrap();
+        arena
+            .stage_replace(advance, domain, 1, 2, vec![next])
+            .unwrap();
+        drop(arena.commit(advance, 2).unwrap());
+        assert_eq!(
+            arena.committed_backing_bytes().unwrap(),
+            slab_bytes + next_bytes
+        );
+
+        // An aborted transaction never touches committed backing.
+        let aborted = PhysicalStateTransactionId::new(4).unwrap();
+        arena.begin(aborted, b).unwrap();
+        arena
+            .stage_replace(aborted, domain, 1, 2, vec![value(&[3.0; 8])])
+            .unwrap();
+        arena.abort(aborted).unwrap();
+        assert_eq!(
+            arena.committed_backing_bytes().unwrap(),
+            slab_bytes + next_bytes
+        );
+
+        // Release forgets the sequence's state but hands it back undropped.
+        let retired = arena.release(b).unwrap();
+        assert_eq!(arena.committed_backing_bytes().unwrap(), next_bytes);
+        drop(retired);
+        drop(arena.release(a).unwrap());
+        assert_eq!(arena.committed_backing_bytes().unwrap(), 0);
+        arena.close_and_validate_drained().unwrap();
+    }
+
+    #[test]
+    fn selected_commit_retires_only_the_replaced_domains() {
+        let arena = independently_clocked_arena();
+        let sequence = PhysicalStateSequenceId::new(1).unwrap();
+        arena.register(sequence).unwrap();
+        let select = |group: u32, clock: StateClock, cursor: u64| TensorStateSelection {
+            group: StateGroupId::new(group),
+            clock,
+            expected_cursor: cursor,
+            target_cursor: cursor + 1,
+        };
+        let component = |component: u32, values: &[f32]| StateComponentValue {
+            component: StateComponentId::new(component),
+            tensor: Some(Tensor::from_slice(values, values.len(), &Device::Cpu).unwrap()),
+        };
+        let commit = |transaction: u64,
+                      selection: TensorStateSelection,
+                      domain: u32,
+                      value: StateComponentValue| {
+            let transaction = PhysicalStateTransactionId::new(transaction).unwrap();
+            let cursor = selection.expected_cursor;
+            arena
+                .begin_selected(transaction, sequence, &[selection])
+                .unwrap();
+            arena
+                .stage_replace(
+                    transaction,
+                    StateDomainId::new(domain),
+                    cursor,
+                    cursor + 1,
+                    vec![value],
+                )
+                .unwrap();
+            let completion = arena.seal_selected_completion(transaction).unwrap();
+            arena.commit_selected(transaction, &completion).unwrap()
+        };
+
+        let text = component(1, &[1.0; 8]);
+        let text_bytes = backing_bytes(text.tensor.as_ref().unwrap());
+        let audio = component(2, &[2.0; 4]);
+        let audio_bytes = backing_bytes(audio.tensor.as_ref().unwrap());
+        drop(commit(1, select(1, StateClock::DecoderTokens, 0), 1, text));
+        drop(commit(2, select(2, StateClock::AudioFrames, 0), 2, audio));
+        assert_eq!(
+            arena.committed_backing_bytes().unwrap(),
+            text_bytes + audio_bytes
+        );
+
+        // Replacing group 1 retires its old domain and leaves group 2 alone.
+        let replacement = component(1, &[3.0; 8]);
+        let replacement_bytes = backing_bytes(replacement.tensor.as_ref().unwrap());
+        let retired = commit(3, select(1, StateClock::DecoderTokens, 1), 1, replacement);
+        assert_eq!(retired._domains.len(), 1);
+        assert_eq!(
+            arena.committed_backing_bytes().unwrap(),
+            replacement_bytes + audio_bytes
+        );
     }
 }
