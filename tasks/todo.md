@@ -163,6 +163,66 @@ back, with a diagnostics reason, on mismatch.
   ~8 ms floor).
 - Ops: set `IZWI_PRELOAD_MODELS=Qwen3.8-27B-FP8` so the first request does not pay the load.
 
+## Field round 2 — H100 deploy of `6f14a0c2` (2026-10-12)
+
+**Readings.**
+- Cold start: 2,598 tokens / 83,444 ms (31 t/s; model load inside the request).
+- Second run: 3,084 tokens / 50,915 ms (61 t/s).
+- `/v1/metrics`:
+  - 0 failures and 0 workspace waits;
+  - TTFT p50 0.78 s / p95 0.95 s (was 3.0 / 13.9 s); prefill ≈ 2,200 tok/s;
+  - pure decode ≈ 14.3 ms/token (~70 t/s);
+  - `untracked_device_memory_bytes` 1.54 GB (predicted ~1.49).
+- `kernel_timings`: FP8 GEMV 2.11–2.44 TB/s per kind, LM head 2.70 TB/s. Layer-weighted, that is
+  ≈ 11.0 ms/token at ~2.33 TB/s; the reported "weighted" 9.96 ms is not layer-weighted.
+
+**Why not Qwen3.6's ~160 t/s.** Same engineering, different physics.
+- Qwen3.6 streams ~3.6 GB/token and is latency-bound at ~6 ms. Qwen3.8 streams 25.6 GB/token,
+  so its roofline is ~131 t/s at 100% bandwidth with zero overhead.
+- vLLM's single-stream H100 figure is 77–79 t/s. 150+ t/s needs MTP on the graph path.
+- Plan: `tasks/qwen38-decode-improvement-plan-2026-10-12.md`.
+  - Phase A: top-k-first sampler, diagnostics, quantum carry, preload → ~76–78 t/s.
+  - Phase B: GEMV v3 at ≥2.9 TB/s (hardware E4M3 cvt; the Modal H100 build already uses compute
+    cap 90) → ~93 t/s.
+  - Phase C: fusions, PDL, state ring → ~100–106 t/s.
+  - Phase D: MTP k=1–3 on graphs → 150–180 t/s.
+  - Batched-decode graphs are a separate track.
+- [ ] Phase A
+- [ ] Phase B
+- [ ] Phase C
+- [ ] Phase D
+- [ ] Batched decode graphs
+
+**Prefix reuse for Qwen3.8 (implemented and enabled by default, including CUDA).**
+- [x] `3c64ed4f` A bounded hybrid prefix-snapshot budget (`IZWI_MAX_PREFIX_SNAPSHOTS`, default 8 ×
+      156,893,184 B) is reserved at load and recorded materialized while held.
+- [x] `af67cf2f` Stable-history boundary at the final `<|im_start|>`; snapshot at the last full
+      64-token page below it.
+- [x] `572ce68d` A resumed prefill with no hybrid state fails closed.
+- [x] `2567b4ef` History-attach tests through production loading on CPU and Metal (exact restore);
+      the CUDA leg is gated and must pass on the H100.
+- [x] `285e4598` Reuse diagnostics plus `IZWI_QWEN38_PREFIX_REUSE` (off-switch).
+- [x] `0d73c214` The CUDA startup check keeps the configured prefix page budget.
+- [x] `f990bbbf` Catalog: Qwen3.8 reuses chat history by default on CUDA.
+- [x] `0216dbab` Unset prefix page budget on CUDA = max(128, KV arena/4): 2,442 pages ≈ 156k tokens
+      on the H100. Index-held pages are reclaimed LRU-first by admission. Explicit
+      `IZWI_MAX_PREFIX_CACHE_PAGES` still wins.
+- MTP-on keeps sharing off. CPU/Metal load MTP by default, so reuse there needs
+  `IZWI_QWEN38_MTP=0`.
+
+**Next deploy checks.**
+- `IZWI_REQUIRE_CUDA_TEST_DEVICE=1 cargo test -p izwi-core --lib --features cuda history_attach`.
+- Load log shows `prefix_reuse=true`, `prefix_snapshot_rows=8`; `kv_cache` `prefix_capacity_pages` ≈ 2,442.
+- On turn 2:
+  - `tensor_snapshot_attaches` / `prefix_hits` +1;
+  - `usage.prompt_tokens_details.cached_tokens` = turn 1's boundary rounded down to 64;
+  - TTFT falls.
+- Idle: pending + materialized == reserved; `untracked_device_memory_bytes` flat.
+- Zero-code A/Bs for the decode plan:
+  - `temperature: 0` vs the default (sampler cost);
+  - `IZWI_QWEN38_DECODE_QUANTUM=32` (quantum boundary);
+  - `IZWI_PRELOAD_MODELS=Qwen3.8-27B-FP8` (cold start).
+
 # Plan — Qwen3.6-35B-A3B inference performance (CUDA / Metal / CPU) — 2026-10-10
 
 Research, evidence and design: `tasks/qwen36moe-inference-performance-research-2026-10-10.md`.
