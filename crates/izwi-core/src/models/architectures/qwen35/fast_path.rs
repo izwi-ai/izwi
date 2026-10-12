@@ -36,6 +36,8 @@ impl Qwen35FastPath {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Qwen35CudaSwitches {
     pub(crate) fused_decode_off: Option<&'static str>,
+    /// The izwi-owned K-quant MMVQ projections (`cuda.packed_projections`).
+    pub(crate) kquant_off: Option<&'static str>,
 }
 
 impl Qwen35CudaSwitches {
@@ -46,12 +48,19 @@ impl Qwen35CudaSwitches {
         if backend != BackendKind::Cuda {
             return Self::default();
         }
-        Self {
-            fused_decode_off: if !performance.enabled() {
+        let off = |mode: crate::performance::OptimizationMode, reason: &'static str| {
+            if !performance.enabled() {
                 Some("cuda.mode=off")
             } else {
-                (!performance.fused_decode.enabled()).then_some("cuda.fused_decode=off")
-            },
+                (!mode.enabled()).then_some(reason)
+            }
+        };
+        Self {
+            fused_decode_off: off(performance.fused_decode, "cuda.fused_decode=off"),
+            kquant_off: off(
+                performance.packed_projections,
+                "cuda.packed_projections=off",
+            ),
         }
     }
 }
@@ -184,14 +193,18 @@ mod tests {
             Qwen35CudaSwitches::from_performance(BackendKind::Metal, &performance),
             Qwen35CudaSwitches::default()
         );
+        performance.fused_decode = OptimizationMode::Auto;
+        performance.packed_projections = OptimizationMode::Off;
+        let switches = Qwen35CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.kquant_off, Some("cuda.packed_projections=off"));
+        assert_eq!(switches.fused_decode_off, None);
         let performance = CudaPerformanceConfig {
             mode: OptimizationMode::Off,
             ..CudaPerformanceConfig::default()
         };
-        assert_eq!(
-            Qwen35CudaSwitches::from_performance(BackendKind::Cuda, &performance).fused_decode_off,
-            Some("cuda.mode=off")
-        );
+        let switches = Qwen35CudaSwitches::from_performance(BackendKind::Cuda, &performance);
+        assert_eq!(switches.fused_decode_off, Some("cuda.mode=off"));
+        assert_eq!(switches.kquant_off, Some("cuda.mode=off"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod fp8;
 pub mod gate;
 pub mod gdn;
 pub mod graphs;
+pub mod kquant;
 pub mod moe;
 pub mod norm;
 pub mod rope;

@@ -35,6 +35,7 @@ use super::fast_path::{
     compare_values, legacy_requested, summarize, xorshift_values, Qwen35CudaSwitches,
     Qwen35FastPath,
 };
+use super::linear::{forward_shared, Qwen35Linear};
 use super::telemetry::Qwen35Telemetry;
 
 /// Environment switch that forces the Candle op chain for DeltaNet decode.
@@ -45,7 +46,7 @@ pub struct Qwen35TextModel {
     token_embeddings: Embedding,
     layers: Vec<Qwen35Layer>,
     output_norm: RmsNorm,
-    output: QMatMul,
+    output: Qwen35Linear,
     finite_diagnostics_enabled: bool,
     telemetry: Arc<Qwen35Telemetry>,
 }
@@ -329,16 +330,16 @@ enum Qwen35Mixer {
 }
 
 struct Qwen35Mlp {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    gate: Qwen35Linear,
+    up: Qwen35Linear,
+    down: Qwen35Linear,
 }
 
 struct Qwen35FullAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: Qwen35Linear,
+    k_proj: Qwen35Linear,
+    v_proj: Qwen35Linear,
+    o_proj: Qwen35Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -352,16 +353,16 @@ struct Qwen35FullAttention {
 }
 
 struct Qwen35LinearAttention {
-    qkv_proj: QMatMul,
-    gate_proj: QMatMul,
-    beta_proj: QMatMul,
-    alpha_proj: QMatMul,
+    qkv_proj: Qwen35Linear,
+    gate_proj: Qwen35Linear,
+    beta_proj: Qwen35Linear,
+    alpha_proj: Qwen35Linear,
     dt_bias: Tensor,
     a: Tensor,
     conv_kernel: Tensor,
     conv_kernel_slices: Vec<Tensor>,
     norm: Qwen35GatedRmsNorm,
-    out_proj: QMatMul,
+    out_proj: Qwen35Linear,
     num_k_heads: usize,
     num_v_heads: usize,
     head_k_dim: usize,
@@ -473,11 +474,11 @@ impl Qwen35TextModel {
 
         let token_embeddings = Embedding::new(embedding_weights, hidden_size);
         let output_norm = source.rms_norm("output_norm.weight", cfg.attention_layer_norm_rms_epsilon, device)?;
-        let output = if source.has("output.weight") {
+        let output = Qwen35Linear::new(if source.has("output.weight") {
             source.qmatmul("output.weight", device)?
         } else {
             source.qmatmul("token_embd.weight", device)?
-        };
+        });
         let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
 
         let mut layers = Vec::with_capacity(cfg.block_count);
@@ -525,6 +526,9 @@ impl Qwen35TextModel {
     /// Resolve every fused fast path after load. `allow_cpu` lets tests run
     /// the portable CPU references; production keeps CPU on the Candle chain.
     pub(crate) fn resolve_fast_paths(&mut self, switches: Qwen35CudaSwitches, allow_cpu: bool) {
+        for linear in self.linears_mut() {
+            linear.resolve_kquant(switches.kquant_off);
+        }
         let hidden = self.hidden_size();
         for layer in &mut self.layers {
             if let Qwen35Mixer::Linear(mixer) = &mut layer.mixer {
@@ -536,6 +540,61 @@ impl Qwen35TextModel {
                 );
             }
         }
+    }
+
+    /// Every projection: the layers' in order, then the LM head.
+    fn linears_mut(&mut self) -> Vec<&mut Qwen35Linear> {
+        let mut linears = Vec::new();
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                Qwen35Mixer::Linear(mixer) => linears.extend([
+                    &mut mixer.qkv_proj,
+                    &mut mixer.gate_proj,
+                    &mut mixer.beta_proj,
+                    &mut mixer.alpha_proj,
+                    &mut mixer.out_proj,
+                ]),
+                Qwen35Mixer::Full(attention) => linears.extend([
+                    &mut attention.q_proj,
+                    &mut attention.k_proj,
+                    &mut attention.v_proj,
+                    &mut attention.o_proj,
+                ]),
+            }
+            linears.extend([&mut layer.ffn.gate, &mut layer.ffn.up, &mut layer.ffn.down]);
+        }
+        linears.push(&mut self.output);
+        linears
+    }
+
+    /// K-quant MMVQ resolution over every projection, for the admin
+    /// diagnostics.
+    pub(crate) fn projection_summary(&self) -> serde_json::Value {
+        let mut paths = Vec::new();
+        for layer in &self.layers {
+            match &layer.mixer {
+                Qwen35Mixer::Linear(mixer) => paths.extend([
+                    mixer.qkv_proj.kquant_path(),
+                    mixer.gate_proj.kquant_path(),
+                    mixer.beta_proj.kquant_path(),
+                    mixer.alpha_proj.kquant_path(),
+                    mixer.out_proj.kquant_path(),
+                ]),
+                Qwen35Mixer::Full(attention) => paths.extend([
+                    attention.q_proj.kquant_path(),
+                    attention.k_proj.kquant_path(),
+                    attention.v_proj.kquant_path(),
+                    attention.o_proj.kquant_path(),
+                ]),
+            }
+            paths.extend([
+                layer.ffn.gate.kquant_path(),
+                layer.ffn.up.kquant_path(),
+                layer.ffn.down.kquant_path(),
+            ]);
+        }
+        paths.push(self.output.kquant_path());
+        summarize(paths)
     }
 
     /// Fused DeltaNet decode resolution, for the admin diagnostics.
@@ -1093,16 +1152,15 @@ impl Qwen35Mlp {
         prefix: &str,
     ) -> Result<Self> {
         Ok(Self {
-            gate: source.qmatmul(&format!("{prefix}.ffn_gate.weight"), device)?,
-            up: source.qmatmul(&format!("{prefix}.ffn_up.weight"), device)?,
-            down: source.qmatmul(&format!("{prefix}.ffn_down.weight"), device)?,
+            gate: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.ffn_gate.weight"), device)?),
+            up: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.ffn_up.weight"), device)?),
+            down: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.ffn_down.weight"), device)?),
         })
     }
 
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // Use fused SiLU-gate-up if available (reduces memory bandwidth)
-        let gate_proj_out = self.gate.forward(hidden_states)?;
-        let up_proj_out = self.up.forward(hidden_states)?;
+        let [gate_proj_out, up_proj_out] = forward_shared(hidden_states, [&self.gate, &self.up])?;
 
         let hidden = if let Some(fused) = try_fused_silu_mul(&gate_proj_out, &up_proj_out) {
             fused
@@ -1111,7 +1169,7 @@ impl Qwen35Mlp {
             (&gate * &up_proj_out)?
         };
 
-        self.down.forward(&hidden).map_err(Error::from)
+        self.down.forward(&hidden)
     }
 }
 
@@ -1123,10 +1181,12 @@ impl Qwen35FullAttention {
         cfg: &Qwen35TextConfig,
     ) -> Result<Self> {
         Ok(Self {
-            q_proj: source.qmatmul(&format!("{prefix}.attn_q.weight"), device)?,
-            k_proj: source.qmatmul(&format!("{prefix}.attn_k.weight"), device)?,
-            v_proj: source.qmatmul(&format!("{prefix}.attn_v.weight"), device)?,
-            o_proj: source.qmatmul(&format!("{prefix}.attn_output.weight"), device)?,
+            q_proj: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.attn_q.weight"), device)?),
+            k_proj: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.attn_k.weight"), device)?),
+            v_proj: Qwen35Linear::new(source.qmatmul(&format!("{prefix}.attn_v.weight"), device)?),
+            o_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.attn_output.weight"), device)?,
+            ),
             q_norm: source.rms_norm(
                 &format!("{prefix}.attn_q_norm.weight"),
                 cfg.attention_layer_norm_rms_epsilon,
@@ -1174,30 +1234,17 @@ impl Qwen35FullAttention {
                 position_ids.len()
             )));
         }
-        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_heads,
-            self.head_dim * 2,
-        ))?;
+        let [q_out, k_out, v_out] =
+            forward_shared(hidden_states, [&self.q_proj, &self.k_proj, &self.v_proj])?;
+        let q_proj = q_out.reshape((1, seq_len, self.num_heads, self.head_dim * 2))?;
         let query_states = q_proj.narrow(3, 0, self.head_dim)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             1,
             seq_len,
             self.num_heads * self.head_dim,
         ))?;
-        let key_states = self.k_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let value_states = self.v_proj.forward(hidden_states)?.reshape((
-            1,
-            seq_len,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let key_states = k_out.reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
+        let value_states = v_out.reshape((1, seq_len, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let (query_states, key_states) = self.apply_rope(
@@ -1232,7 +1279,7 @@ impl Qwen35FullAttention {
                 .to_dtype(output_dtype)?
                 .reshape((1, seq_len, self.num_heads * self.head_dim))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     fn forward_physical_decode_batch(
@@ -1271,30 +1318,17 @@ impl Qwen35FullAttention {
                 "Qwen3.5 decode received an incompatible prepared slot map".into(),
             ));
         }
-        let q_proj = self.q_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_heads,
-            self.head_dim * 2,
-        ))?;
+        let [q_out, k_out, v_out] =
+            forward_shared(hidden_states, [&self.q_proj, &self.k_proj, &self.v_proj])?;
+        let q_proj = q_out.reshape((batch_size, 1, self.num_heads, self.head_dim * 2))?;
         let query_states = q_proj.narrow(3, 0, self.head_dim)?;
         let gate = q_proj.narrow(3, self.head_dim, self.head_dim)?.reshape((
             batch_size,
             1,
             self.num_heads * self.head_dim,
         ))?;
-        let key_states = self.k_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
-        let value_states = self.v_proj.forward(hidden_states)?.reshape((
-            batch_size,
-            1,
-            self.num_kv_heads,
-            self.head_dim,
-        ))?;
+        let key_states = k_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
+        let value_states = v_out.reshape((batch_size, 1, self.num_kv_heads, self.head_dim))?;
         let query_states = self.q_norm.forward(&query_states.contiguous()?)?;
         let key_states = self.k_norm.forward(&key_states.contiguous()?)?;
         let mut queries = Vec::with_capacity(batch_size);
@@ -1362,7 +1396,7 @@ impl Qwen35FullAttention {
             self.num_heads * self.head_dim,
         ))?;
         let output = (&output * &ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&output).map_err(Error::from)
+        self.o_proj.forward(&output)
     }
 
     /// Rotate the leading `rope_dim` channels of `query_states` and
@@ -1529,16 +1563,26 @@ impl Qwen35LinearAttention {
         };
 
         Ok(Self {
-            qkv_proj: source.qmatmul(&format!("{prefix}.attn_qkv.weight"), device)?,
-            gate_proj: source.qmatmul(&format!("{prefix}.attn_gate.weight"), device)?,
-            beta_proj: source.qmatmul(&format!("{prefix}.ssm_beta.weight"), device)?,
-            alpha_proj: source.qmatmul(&format!("{prefix}.ssm_alpha.weight"), device)?,
+            qkv_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.attn_qkv.weight"), device)?,
+            ),
+            gate_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.attn_gate.weight"), device)?,
+            ),
+            beta_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.ssm_beta.weight"), device)?,
+            ),
+            alpha_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.ssm_alpha.weight"), device)?,
+            ),
             dt_bias,
             a,
             conv_kernel,
             conv_kernel_slices,
             norm,
-            out_proj: source.qmatmul(&format!("{prefix}.ssm_out.weight"), device)?,
+            out_proj: Qwen35Linear::new(
+                source.qmatmul(&format!("{prefix}.ssm_out.weight"), device)?,
+            ),
             num_k_heads,
             num_v_heads,
             head_k_dim,
@@ -1761,14 +1805,18 @@ impl Qwen35LinearAttention {
         hidden_states: &Tensor,
         state: &mut Qwen35LayerRuntimeState,
     ) -> Result<Tensor> {
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta_raw = self.beta_proj.forward(hidden_states)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
         let y = self.fused_decode_row(spec, &mixed_qkv, &z, &beta_raw, &alpha, state)?;
         self.out_proj
             .forward(&y.reshape((1, 1, self.num_v_heads * self.head_v_dim))?)
-            .map_err(Error::from)
     }
 
     fn forward(
@@ -1801,10 +1849,16 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
+        let beta = ops::sigmoid(&beta_raw)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_step(&mixed_qkv, conv_state)?;
@@ -1862,7 +1916,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, 1, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_decode_batch(
@@ -1883,10 +1937,16 @@ impl Qwen35LinearAttention {
         }) {
             return self.forward_decode_batch_fused(spec, hidden_states, states);
         }
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
+        let beta = ops::sigmoid(&beta_raw)?;
         if self.num_k_heads == 0 || !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(Error::InferenceError(format!(
                 "Invalid linear-attention head layout: num_v_heads={}, num_k_heads={}",
@@ -1963,7 +2023,7 @@ impl Qwen35LinearAttention {
             1,
             self.num_v_heads * self.head_v_dim,
         ))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     /// Batched decode through the fused kernels: the projections run once
@@ -1976,10 +2036,15 @@ impl Qwen35LinearAttention {
         states: &mut [&mut Qwen35LayerRuntimeState],
     ) -> Result<Tensor> {
         let batch_size = hidden_states.dim(0)?;
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta_raw = self.beta_proj.forward(hidden_states)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
         let mut rows = Vec::with_capacity(batch_size);
         for (row, state) in states.iter_mut().enumerate() {
             rows.push(self.fused_decode_row(
@@ -1997,7 +2062,7 @@ impl Qwen35LinearAttention {
             1,
             self.num_v_heads * self.head_v_dim,
         ))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn forward_sequence(
@@ -2022,10 +2087,16 @@ impl Qwen35LinearAttention {
             }
         };
 
-        let mixed_qkv = self.qkv_proj.forward(hidden_states)?;
-        let z = self.gate_proj.forward(hidden_states)?;
-        let beta = ops::sigmoid(&self.beta_proj.forward(hidden_states)?)?;
-        let alpha = self.alpha_proj.forward(hidden_states)?;
+        let [mixed_qkv, z, beta_raw, alpha] = forward_shared(
+            hidden_states,
+            [
+                &self.qkv_proj,
+                &self.gate_proj,
+                &self.beta_proj,
+                &self.alpha_proj,
+            ],
+        )?;
+        let beta = ops::sigmoid(&beta_raw)?;
         let g = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?;
 
         let mixed_qkv = self.depthwise_conv_sequence(&mixed_qkv, conv_state)?;
@@ -2129,7 +2200,7 @@ impl Qwen35LinearAttention {
         let z = z.reshape((seq_len * self.num_v_heads, self.head_v_dim))?;
         let output = self.norm.forward(&output, &z)?;
         let output = output.reshape((1, seq_len, self.num_v_heads * self.head_v_dim))?;
-        self.out_proj.forward(&output).map_err(Error::from)
+        self.out_proj.forward(&output)
     }
 
     fn depthwise_conv_sequence(
@@ -2779,10 +2850,10 @@ mod tests {
         let tensor =
             |values: Vec<f32>, shape: &[usize]| Tensor::from_vec(values, shape, device).unwrap();
         let dense = |out: usize, input: usize, seed: u64, scale: f32| {
-            QMatMul::Tensor(tensor(
+            super::Qwen35Linear::new(QMatMul::Tensor(tensor(
                 xorshift_values(out * input, seed, scale),
                 &[out, input],
-            ))
+            )))
         };
         let conv_kernel = tensor(xorshift_values(conv_dim * 4, 11, 0.4), &[conv_dim, 4]);
         let conv_kernel_slices = super::pre_slice_conv_kernel(&conv_kernel, 4).unwrap();
@@ -3030,7 +3101,7 @@ mod tests {
             )
             .unwrap();
             let weights = QTensor::quantize(&weights, GgmlDType::F32).unwrap();
-            QMatMul::from_arc(Arc::new(weights)).unwrap()
+            super::Qwen35Linear::new(QMatMul::from_arc(Arc::new(weights)).unwrap())
         };
         let conv_kernel = Tensor::from_vec(
             (0..24)

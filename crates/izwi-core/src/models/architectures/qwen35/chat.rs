@@ -1391,6 +1391,7 @@ impl Qwen35ChatModel {
                 "sustained_decode_quantum": self.sustained_decode_quantum(),
             },
             "gdn_decode": self.exec.text_model.gdn_decode_summary(),
+            "projections": self.exec.text_model.projection_summary(),
             "counters": self.exec.text_model.telemetry().snapshot(),
         })
     }
