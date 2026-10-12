@@ -356,6 +356,12 @@ pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
 pub struct ResourceAuthoritySnapshot {
     pub physical: PhysicalCapacitySnapshot,
     pub reserved: ResourceVector,
+    /// The part of `reserved` its owners report as allocated, so already
+    /// excluded from `physical.available`.
+    pub materialized: ResourceVector,
+    /// The part of `reserved` not yet allocated, which guarded admission
+    /// charges against `physical.available`.
+    pub pending: ResourceVector,
     pub reservations: usize,
 }
 
@@ -580,9 +586,19 @@ impl ResourceAuthority {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let physical = self.normalized_physical_snapshot();
+        // An accounting overflow reads as unknown rather than failing a probe.
+        let materialized = state
+            .materialized
+            .values()
+            .try_fold(ResourceVector::zero(), |total, usage| {
+                total.checked_add(*usage)
+            })
+            .unwrap_or_default();
         ResourceAuthoritySnapshot {
             physical,
             reserved: state.ledger.used(),
+            materialized,
+            pending: state.pending_resources().unwrap_or_default(),
             reservations: state.owners.len(),
         }
     }

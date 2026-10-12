@@ -7673,6 +7673,12 @@ izwi_inference_coordinator_reserved_host_memory_bytes {}\n\
 izwi_inference_coordinator_reserved_device_memory_bytes {}\n\
 # TYPE izwi_inference_coordinator_reserved_unified_memory_bytes gauge\n\
 izwi_inference_coordinator_reserved_unified_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_materialized_device_memory_bytes gauge\n\
+izwi_inference_coordinator_materialized_device_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_pending_device_memory_bytes gauge\n\
+izwi_inference_coordinator_pending_device_memory_bytes {}\n\
+# TYPE izwi_inference_coordinator_untracked_device_memory_bytes gauge\n\
+izwi_inference_coordinator_untracked_device_memory_bytes {}\n\
 # TYPE izwi_inference_coordinator_admitted_total counter\n\
 izwi_inference_coordinator_admitted_total {}\n\
 # TYPE izwi_inference_coordinator_rejected_total counter\n\
@@ -7690,6 +7696,9 @@ izwi_inference_coordinator_poisoned {}\n",
             snapshot.reserved_host_memory_bytes,
             snapshot.reserved_device_memory_bytes,
             snapshot.reserved_unified_memory_bytes,
+            snapshot.materialized_device_memory_bytes,
+            snapshot.pending_device_memory_bytes,
+            snapshot.untracked_device_memory_bytes,
             snapshot.admitted_total,
             snapshot.rejected_total,
             snapshot.expired_total,
@@ -9586,6 +9595,9 @@ mod tests {
         assert!(payload.contains("izwi_inference_coordinator_reserved_host_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_reserved_unified_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_materialized_device_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_pending_device_memory_bytes"));
+        assert!(payload.contains("izwi_inference_coordinator_untracked_device_memory_bytes"));
         assert!(payload.contains("izwi_inference_coordinator_draining 0"));
         assert!(payload.contains("izwi_inference_coordinator_poisoned 0"));
 

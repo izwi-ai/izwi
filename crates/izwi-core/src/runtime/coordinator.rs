@@ -148,6 +148,16 @@ pub struct CoordinatorSnapshot {
     pub reserved_host_memory_bytes: u64,
     pub reserved_device_memory_bytes: u64,
     pub reserved_unified_memory_bytes: u64,
+    /// Reserved device bytes their owners report as allocated.
+    pub materialized_device_memory_bytes: u64,
+    /// Reserved device bytes not allocated yet. Guarded admission charges
+    /// them against live free device memory.
+    pub pending_device_memory_bytes: u64,
+    /// Device memory in use (capacity minus driver-free) that no reservation
+    /// reports as allocated: the backend context, kernel modules and library
+    /// workspaces loaded on first use, graph pools, transients, and other
+    /// processes. Growth after a model load comes out of its safety reserve.
+    pub untracked_device_memory_bytes: u64,
     pub admitted_total: u64,
     pub rejected_total: u64,
     pub expired_total: u64,
@@ -648,7 +658,8 @@ impl InferenceCoordinator {
     }
 
     pub fn snapshot(&self) -> CoordinatorSnapshot {
-        let reserved = self.resources.snapshot().reserved;
+        let authority = self.resources.snapshot();
+        let reserved = authority.reserved;
         let shared_host_unified = known_memory_bytes(reserved.host_bytes)
             .saturating_add(known_memory_bytes(reserved.unified_bytes));
         let reserved_host_memory_bytes = match self.backend {
@@ -665,6 +676,17 @@ impl InferenceCoordinator {
         let reserved_memory_bytes = reserved_host_memory_bytes
             .saturating_add(reserved_device_memory_bytes)
             .saturating_add(reserved_unified_memory_bytes);
+        let materialized_device_memory_bytes =
+            known_memory_bytes(authority.materialized.device_bytes);
+        let untracked_device_memory_bytes = match (
+            authority.physical.capacity.device_bytes,
+            authority.physical.available.device_bytes,
+        ) {
+            (ResourceAmount::Known(capacity), ResourceAmount::Known(available)) => capacity
+                .saturating_sub(available)
+                .saturating_sub(materialized_device_memory_bytes),
+            _ => 0,
+        };
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
@@ -675,6 +697,9 @@ impl InferenceCoordinator {
             reserved_host_memory_bytes,
             reserved_device_memory_bytes,
             reserved_unified_memory_bytes,
+            materialized_device_memory_bytes,
+            pending_device_memory_bytes: known_memory_bytes(authority.pending.device_bytes),
+            untracked_device_memory_bytes,
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
@@ -3490,6 +3515,53 @@ mod tests {
         assert_eq!(snapshot.reserved_host_memory_bytes, 0);
         assert_eq!(snapshot.reserved_device_memory_bytes, 0);
         assert_eq!(snapshot.reserved_memory_bytes, 0);
+    }
+
+    #[test]
+    fn cuda_snapshot_splits_device_reservations_and_reports_untracked_use() {
+        let provider = cuda_provider(100, 1_000);
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let coordinator = InferenceCoordinator::with_resource_authority(
+            BackendKind::Cuda,
+            1,
+            1,
+            authority.clone(),
+        );
+        // Weights resident, a lazily allocated claim still pending.
+        let lease = authority
+            .reserve_with_initial_materialized(
+                crate::engine::ReservationOwner::new(
+                    crate::engine::ReservationClass::Model,
+                    "weights",
+                ),
+                cuda_resources(0, 600),
+                cuda_resources(0, 400),
+            )
+            .unwrap();
+        // The driver reports 450 bytes in use: 400 resident, 50 unreserved.
+        provider.set_available(cuda_resources(100, 550));
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.reserved_device_memory_bytes, 600);
+        assert_eq!(snapshot.materialized_device_memory_bytes, 400);
+        assert_eq!(snapshot.pending_device_memory_bytes, 200);
+        assert_eq!(snapshot.untracked_device_memory_bytes, 50);
+
+        // A model that allocates its claim reports it: pending shrinks and
+        // the allocation does not read as untracked.
+        lease
+            .record_materialized_usage(cuda_resources(0, 500))
+            .unwrap();
+        provider.set_available(cuda_resources(100, 450));
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.pending_device_memory_bytes, 100);
+        assert_eq!(snapshot.untracked_device_memory_bytes, 50);
+
+        drop(lease);
+        provider.set_available(cuda_resources(100, 950));
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.materialized_device_memory_bytes, 0);
+        assert_eq!(snapshot.pending_device_memory_bytes, 0);
+        assert_eq!(snapshot.untracked_device_memory_bytes, 50);
     }
 
     #[test]
