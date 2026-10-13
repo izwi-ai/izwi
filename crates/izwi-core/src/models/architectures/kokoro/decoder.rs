@@ -1643,13 +1643,15 @@ fn sinegen_f02sine(
 
     let down_t = (t / upsample_scale.max(1)).max(1);
     let rad_down = linear_resample_time_time_major(&rad_values, t, down_t, dim);
+    // `torch.cumsum(rad_values, dim=1) * 2 * torch.pi`: Torch's CPU cumsum
+    // accumulates F32 in f64 and stores each prefix as F32.
     let mut phase_down = vec![0.0f32; rad_down.len()];
     for h in 0..dim {
-        let mut acc = 0.0f32;
+        let mut acc = 0.0f64;
         for ti in 0..down_t {
             let idx = ti * dim + h;
-            acc += rad_down[idx];
-            phase_down[idx] = acc * (2.0 * PI);
+            acc += f64::from(rad_down[idx]);
+            phase_down[idx] = (acc as f32) * (2.0 * PI);
         }
     }
     let scale = upsample_scale.max(1) as f32;
@@ -1822,6 +1824,26 @@ mod tests {
             .expect("fused values");
 
         assert_eq!(fused, reference);
+    }
+
+    /// KOK-17: the sine phase is a cumulative sum accumulated in f64 and
+    /// stored as F32 (Torch's CPU cumsum), so it does not drift over a long
+    /// chunk; an F32 accumulator drifts by far more than the tolerance here.
+    #[test]
+    fn sine_phase_accumulates_in_f64_like_torch_cumsum() {
+        let t = 200_000;
+        let f0 = vec![2_962.963f32; t];
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let sines = sinegen_f02sine(&f0, t, 1, 24_000.0, 1, &mut rng);
+        let rad = (2_962.963f32 * (1.0f32 / 24_000.0)).rem_euclid(1.0);
+        let mut acc = 0.0f64;
+        let mut worst = 0.0f32;
+        for (index, sine) in sines.iter().enumerate() {
+            acc += f64::from(rad);
+            let expected = ((acc as f32) * (2.0 * PI)).sin();
+            worst = worst.max((sine - expected).abs());
+            assert!(worst.is_finite() && worst < 1e-3, "sample {index}: {worst}");
+        }
     }
 
     #[test]
