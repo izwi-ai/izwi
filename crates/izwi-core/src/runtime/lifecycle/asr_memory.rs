@@ -1160,7 +1160,7 @@ fn granite_plan(
         dtype,
         representation: granite_load_representation(&device.device, dtype),
         residual_multiplier: config.text_config.residual_multiplier,
-        tied_lm_head: config.text_config.tie_word_embeddings,
+        tied_lm_head: config.tie_word_embeddings(),
         encoder_attention_dists: (
             config.encoder_config.num_layers,
             config.encoder_config.context_size,
