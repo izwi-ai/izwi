@@ -925,12 +925,13 @@ impl VoxtralTtsPipeline {
         let codec_duration = codec_start.elapsed();
         let total_duration = total_start.elapsed();
         info!(
-            "Voxtral TTS timings: frames={}, samples={}, dense_decode_tokens={}, tensor_feedback_frames={}, host_feedback_frames={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
+            "Voxtral TTS timings: frames={}, samples={}, dense_decode_tokens={}, tensor_feedback_frames={}, host_feedback_frames={}, codec_banded_attention_calls_total={}, prompt={:.2}ms, lm_prefill={:.2}ms, acoustic={:.2}ms, lm_decode={:.2}ms, codec={:.2}ms, total={:.2}ms",
             frames_generated,
             samples.len(),
             0,
             tensor_feedback_frames,
             host_feedback_frames,
+            super::codec::voxtral_codec_banded_attention_calls(),
             duration_ms(prompt_duration),
             duration_ms(lm_prefill_duration),
             duration_ms(acoustic_duration),
