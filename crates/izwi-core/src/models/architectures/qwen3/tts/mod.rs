@@ -64,6 +64,35 @@ use crate::models::shared::sampling::{
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::staged::metal_staged_safetensors;
 
+/// Device-to-host readbacks on the Qwen3-TTS decode path (each one blocks on
+/// the device). Every readback in the talker, predictor and semantic sampler
+/// goes through [`record_qwen3_tts_host_readback`].
+static QWEN3_TTS_HOST_READBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static QWEN3_TTS_HOST_READBACKS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn record_qwen3_tts_host_readback() {
+    QWEN3_TTS_HOST_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    QWEN3_TTS_HOST_READBACKS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+/// Process-wide count of Qwen3-TTS device-to-host readbacks.
+pub fn qwen3_tts_host_readbacks() -> u64 {
+    QWEN3_TTS_HOST_READBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This thread's readbacks, for tests that count one frame.
+#[cfg(test)]
+pub(crate) fn thread_qwen3_tts_host_readbacks() -> u64 {
+    QWEN3_TTS_HOST_READBACKS_THREAD.with(std::cell::Cell::get)
+}
+
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
@@ -1384,6 +1413,8 @@ pub struct Qwen3TtsDiagnostics {
     pub cuda_sampling: bool,
     /// Windowed codec decode: window geometry and windows run since load.
     pub codec_decode: SpeechTokenizerDecodeStats,
+    /// Device-to-host readbacks on the decode path since start.
+    pub host_readbacks_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2090,6 +2121,7 @@ impl Qwen3TtsModel {
             device_sampling: qwen_tts_uses_device_sampling(&self.device),
             cuda_sampling: self.device.kind.is_cuda(),
             codec_decode: self.speech_tokenizer.decode_stats(),
+            host_readbacks_total: qwen3_tts_host_readbacks(),
         }
     }
 
@@ -3890,12 +3922,14 @@ fn argmax(logits: &Tensor) -> Result<u32> {
     } else {
         idx.squeeze(0)?
     };
+    record_qwen3_tts_host_readback();
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
 }
 
 fn logit_scalar_f32(logits: &Tensor, idx: u32) -> Result<f32> {
+    record_qwen3_tts_host_readback();
     logits
         .i(idx as usize)?
         .to_dtype(DType::F32)?
@@ -3928,63 +3962,34 @@ fn argmax_semantic(
         }
     };
 
+    // One device argmax over the allowed codes (semantic codes, plus EOS when
+    // allowed), one readback. Ties keep the lower index, so a semantic code
+    // tied with EOS wins as before.
     let vocab_len = logits.dim(0)?;
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
-    let mut best_idx = if semantic_len > 0 {
-        let semantic_logits = logits.narrow(0, 0, semantic_len)?;
-        Some(argmax(&semantic_logits)?)
-    } else {
-        None
-    };
-    let best_val = if let Some(idx) = best_idx {
-        logit_scalar_f32(&logits, idx)?
-    } else {
-        f32::NEG_INFINITY
-    };
-
-    let eos_idx = eos_token_id as usize;
-    if allow_eos && eos_idx < vocab_len && eos_idx >= semantic_len {
-        let eos_val = logit_scalar_f32(&logits, eos_token_id)?;
-        if eos_val > best_val {
-            best_idx = Some(eos_token_id);
-        }
+    let (sampling_vocab, allowed) =
+        semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, allow_eos);
+    if sampling_vocab == 0 {
+        return Ok(if allow_eos { eos_token_id } else { 0 });
     }
-
-    if let Some(idx) = best_idx {
-        Ok(idx)
-    } else if allow_eos {
-        Ok(eos_token_id)
-    } else {
-        Ok(0)
+    let mut row = logits.narrow(0, 0, sampling_vocab)?.to_dtype(DType::F32)?;
+    if allowed.iter().any(|allowed| !allowed) {
+        let mask = allowed.iter().map(|&a| u8::from(a)).collect::<Vec<_>>();
+        let mask = Tensor::from_vec(mask, sampling_vocab, row.device())?;
+        let blocked = Tensor::full(f32::NEG_INFINITY, sampling_vocab, row.device())?;
+        row = mask.where_cond(&row, &blocked)?;
     }
+    argmax(&row)
 }
 
-fn argmax_semantic_reference(
-    logits: &Tensor,
+/// Host argmax over the allowed semantic codes (and EOS when allowed) of
+/// already read-back logits; the first index wins ties.
+fn argmax_semantic_values(
+    values: &[f32],
     semantic_vocab_size: u32,
     eos_token_id: u32,
     allow_eos: bool,
-) -> Result<u32> {
-    let logits = logits.to_dtype(DType::F32)?;
-    let logits = match logits.rank() {
-        1 => logits,
-        2 => {
-            let (rows, _cols) = logits.dims2()?;
-            if rows != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected Qwen3-TTS semantic logits shape: {:?}",
-                    logits.shape().dims()
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3-TTS semantic logits rank: {rank}"
-            )))
-        }
-    };
-    let values = logits.to_vec1::<f32>()?;
+) -> u32 {
     let mut max_idx: Option<usize> = None;
     let mut max_val = f32::NEG_INFINITY;
 
@@ -4001,11 +4006,11 @@ fn argmax_semantic_reference(
     }
 
     if let Some(idx) = max_idx {
-        Ok(idx as u32)
+        idx as u32
     } else if allow_eos {
-        Ok(eos_token_id)
+        eos_token_id
     } else {
-        Ok(0)
+        0
     }
 }
 
@@ -4069,6 +4074,7 @@ fn sample_semantic(
         0.0,
         Some(&allowed_mask),
     )? {
+        record_qwen3_tts_host_readback();
         if device_candidates_cover_top_p(&candidates, params.top_p) {
             if let Some(token) = sample_device_candidates(&candidates, params.top_p, rng.next_f32())
             {
@@ -4225,7 +4231,18 @@ fn sample_semantic_reference(
             )))
         }
     };
+    record_qwen3_tts_host_readback();
     let mut values = logits.to_vec1::<f32>()?;
+    // Greedy decodes the raw logits (no penalty), from this one readback.
+    if params.temperature <= 1e-5 {
+        return Ok(argmax_semantic_values(
+            &values,
+            semantic_vocab_size,
+            eos_token_id,
+            allow_eos,
+        ));
+    }
+    let raw_values = values.clone();
 
     // Token suppression: keep semantic range and optional EOS only.
     for (idx, v) in values.iter_mut().enumerate() {
@@ -4261,11 +4278,6 @@ fn sample_semantic_reference(
         }
     }
 
-    // Greedy fallback when sampling is effectively disabled.
-    if params.temperature <= 1e-5 {
-        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
-    }
-
     let temperature = params.temperature.max(1e-5);
     for v in values.iter_mut() {
         if v.is_finite() {
@@ -4299,7 +4311,12 @@ fn sample_semantic_reference(
 
     let mut sum: f32 = probs.iter().map(|(_, p)| *p).sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+        return Ok(argmax_semantic_values(
+            &raw_values,
+            semantic_vocab_size,
+            eos_token_id,
+            allow_eos,
+        ));
     }
     for (_, p) in probs.iter_mut() {
         *p /= sum;
@@ -4369,6 +4386,8 @@ fn collect_semantic_sampling_values(
         };
         let prefetch = params.top_k.saturating_add(penalty_extra).min(semantic_len);
         let (sorted_values, sorted_indices) = semantic_logits.sort_last_dim(false)?;
+        record_qwen3_tts_host_readback();
+        record_qwen3_tts_host_readback();
         let values = sorted_values.narrow(0, 0, prefetch)?.to_vec1::<f32>()?;
         let indices = sorted_indices
             .narrow(0, 0, prefetch)?
@@ -4377,6 +4396,7 @@ fn collect_semantic_sampling_values(
         return Ok(indices.into_iter().zip(values).collect());
     }
 
+    record_qwen3_tts_host_readback();
     Ok(semantic_logits
         .to_vec1::<f32>()?
         .into_iter()
@@ -5688,6 +5708,34 @@ pub(crate) mod tests {
         config.options.speech.temperature = Some(0.0);
         let greedy = TtsGenerationParams::from_generation_config(&config).subtalker;
         assert!(greedy.is_greedy());
+    }
+
+    /// QTTS-4: the semantic draw reads back once per frame on each sampler
+    /// path (greedy device, host reference), so with the talker (0) and the
+    /// predictor (1) a frame costs two readbacks.
+    #[test]
+    fn semantic_sampling_reads_back_once_per_frame() {
+        let logits = Tensor::new(
+            vec![0.5f32, 2.0, -1.0, 0.25, 3.0, 1.0],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let mut rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+        for (temperature, prefer_device) in [(0.0, true), (0.0, false), (0.9, false)] {
+            let params = TtsGenerationParams {
+                temperature,
+                ..Default::default()
+            };
+            let before = thread_qwen3_tts_host_readbacks();
+            sample_semantic(&logits, 4, 5, true, &params, &[], &mut rng, prefer_device).unwrap();
+            assert_eq!(
+                thread_qwen3_tts_host_readbacks() - before,
+                1,
+                "temperature {temperature}, device {prefer_device}"
+            );
+        }
     }
 
     #[test]

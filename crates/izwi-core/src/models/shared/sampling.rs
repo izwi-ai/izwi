@@ -1207,11 +1207,23 @@ pub fn device_resident_top_k_sample(
     temperature: f32,
     draw: &mut dyn FnMut() -> f32,
 ) -> Result<Option<Tensor>> {
-    if !(logits.device().is_cuda() || logits.device().is_metal())
-        || temperature <= 1e-5
-        || top_k == 0
-        || top_k > DEVICE_SORT_CHUNK
-    {
+    if !(logits.device().is_cuda() || logits.device().is_metal()) {
+        return Ok(None);
+    }
+    resident_top_k_sample(logits, vocab_limit, top_k, temperature, draw)
+}
+
+/// [`device_resident_top_k_sample`] on any device, CPU included: the token
+/// stays a `[1]` U32 tensor where the logits live. `None` for greedy
+/// temperature or a top-k of 0 / above the device sort bound.
+pub fn resident_top_k_sample(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    draw: &mut dyn FnMut() -> f32,
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_SORT_CHUNK {
         return Ok(None);
     }
     let row = logits_row(logits)?;

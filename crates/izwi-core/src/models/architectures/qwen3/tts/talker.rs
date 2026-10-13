@@ -106,67 +106,78 @@ impl Attention {
         }
     }
 
-    fn apply_rope(
+    /// RoPE cos/sin for `seq_len` rows starting at each of `start_positions`
+    /// (one start per batch row), shaped `[rows, seq_len, 1, head_dim]`.
+    ///
+    /// The TTS talker runs interleaved MRoPE with the same position on all
+    /// three axes, which is plain 1-D RoPE: the tables are built on the host
+    /// from the start positions (bit-identical to [`build_mrope_cache`] with
+    /// equal axes) instead of uploading position ids and reading them back
+    /// once per layer for q and once for k. Explicit position ids still take
+    /// the MRoPE path, which reads them back once per forward.
+    fn rope_tables(
         &self,
-        x: Tensor,
-        start_pos: usize,
+        seq_len: usize,
+        start_positions: &[usize],
         position_ids: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let seq_len = x.dim(1)?;
-        let half_dim = self.head_dim / 2;
-
-        let (cos, sin) = if self.use_mrope {
-            if let Some(position_ids) = position_ids {
-                build_mrope_cache(
-                    seq_len,
-                    x.device(),
-                    x.dtype(),
-                    position_ids,
-                    &self.mrope_section,
-                    &self.rope_inv_freq,
-                )?
-            } else {
-                let position_ids = repeated_mrope_position_ids(seq_len, start_pos, x.device())?;
-                build_mrope_cache(
-                    seq_len,
-                    x.device(),
-                    x.dtype(),
-                    &position_ids,
-                    &self.mrope_section,
-                    &self.rope_inv_freq,
-                )?
-            }
-        } else {
-            build_rope_window(
+        device: &Device,
+        dtype: DType,
+    ) -> Result<TalkerRope> {
+        let rows = start_positions.len();
+        let (cos, sin) = match position_ids {
+            Some(position_ids) if self.use_mrope && rows == 1 => build_mrope_cache(
                 seq_len,
-                start_pos,
+                device,
+                dtype,
+                position_ids,
+                &self.mrope_section,
                 &self.rope_inv_freq,
-                x.device(),
-                x.dtype(),
-            )?
+            )?,
+            _ if self.use_mrope && self.mrope_section.len() < 3 => {
+                // MRoPE without three sections counts positions from zero.
+                let (cos, sin) = build_rope_window(seq_len, 0, &self.rope_inv_freq, device, dtype)?;
+                (cos.repeat((rows, 1))?, sin.repeat((rows, 1))?)
+            }
+            _ if self.use_mrope => sequential_rope_host_tables(
+                seq_len,
+                start_positions,
+                &self.rope_inv_freq,
+                device,
+                dtype,
+            )?,
+            _ => {
+                let mut cos_rows = Vec::with_capacity(rows);
+                let mut sin_rows = Vec::with_capacity(rows);
+                for &start in start_positions {
+                    let (cos, sin) =
+                        build_rope_window(seq_len, start, &self.rope_inv_freq, device, dtype)?;
+                    cos_rows.push(cos);
+                    sin_rows.push(sin);
+                }
+                (Tensor::cat(&cos_rows, 0)?, Tensor::cat(&sin_rows, 0)?)
+            }
         };
+        let (cos, sin) = duplicate_rope_window(cos, sin)?;
+        let head_dim = self.head_dim;
+        Ok(TalkerRope {
+            cos: cos.reshape((rows, seq_len, 1, head_dim))?,
+            sin: sin.reshape((rows, seq_len, 1, head_dim))?,
+        })
+    }
 
-        // Qwen RoPE uses rotate_half(x) over [first_half, second_half].
-        let (cos, sin) = if cos.dim(1)? == half_dim {
-            duplicate_rope_window(cos, sin)?
-        } else {
-            (cos, sin)
-        };
-        let cos = cos.unsqueeze(0)?.unsqueeze(2)?;
-        let sin = sin.unsqueeze(0)?.unsqueeze(2)?;
-
-        let rotated = qwen_rotate_half(&x, half_dim)?;
-
-        let out = x.broadcast_mul(&cos)?;
-        out.broadcast_add(&rotated.broadcast_mul(&sin)?)
+    /// Qwen RoPE (rotate_half over [first half, second half]) on
+    /// `[rows, seq, heads, head_dim]`.
+    fn apply_rope(&self, x: Tensor, rope: &TalkerRope) -> Result<Tensor> {
+        let rotated = qwen_rotate_half(&x, self.head_dim / 2)?;
+        x.broadcast_mul(&rope.cos)?
+            .broadcast_add(&rotated.broadcast_mul(&rope.sin)?)
             .map_err(Error::from)
     }
 
     fn forward_physical(
         &self,
         x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
+        rope: &TalkerRope,
         cache: &TalkerPhysicalCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
@@ -194,8 +205,8 @@ impl Attention {
 
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
-        q = self.apply_rope(q, start_pos, position_ids)?;
-        k = self.apply_rope(k, start_pos, position_ids)?;
+        q = self.apply_rope(q, rope)?;
+        k = self.apply_rope(k, rope)?;
 
         let q = q
             .reshape((seq_len, self.num_heads, self.head_dim))?
@@ -233,6 +244,7 @@ impl Attention {
         &self,
         x: &Tensor,
         start_positions: &[usize],
+        rope: &TalkerRope,
         caches: &[&TalkerPhysicalCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -276,22 +288,18 @@ impl Attention {
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, 1)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, 1)?;
 
-        let mut query_rows = Vec::with_capacity(batch_size);
-        let mut key_rows = Vec::with_capacity(batch_size);
-        let mut value_rows = Vec::with_capacity(batch_size);
-        for row in 0..batch_size {
-            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, start_positions[row], None)?;
-            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, start_positions[row], None)?;
-            query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
-            key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
-            value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
-        }
-        let query_refs = query_rows.iter().collect::<Vec<_>>();
-        let key_refs = key_rows.iter().collect::<Vec<_>>();
-        let value_refs = value_rows.iter().collect::<Vec<_>>();
-        let queries = Tensor::stack(&query_refs, 0)?.contiguous()?;
-        let keys = Tensor::stack(&key_refs, 0)?.contiguous()?;
-        let values = Tensor::stack(&value_refs, 0)?.contiguous()?;
+        // One table row per batch row (each at its own position).
+        let queries = self
+            .apply_rope(q, rope)?
+            .reshape((batch_size, self.num_heads, self.head_dim))?
+            .contiguous()?;
+        let keys = self
+            .apply_rope(k, rope)?
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let values = v
+            .reshape((batch_size, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
         if slots.arena_id() != first.arena().id() || slots.len() != batch_size {
             return Err(Error::InvalidInput(
                 "Qwen3-TTS physical talker batch received an incompatible slot map".into(),
@@ -396,21 +404,15 @@ impl Layer {
     fn forward_physical(
         &self,
         x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
+        rope: &TalkerRope,
         cache: &TalkerPhysicalCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward_physical(
-            &normed,
-            start_pos,
-            position_ids,
-            cache,
-            prepared,
-            layer_idx,
-        )?;
+        let attn_out = self
+            .self_attn
+            .forward_physical(&normed, rope, cache, prepared, layer_idx)?;
         let x = x.broadcast_add(&attn_out)?;
 
         let normed = self.post_attention_layernorm.forward(&x)?;
@@ -423,6 +425,7 @@ impl Layer {
         &self,
         x: &Tensor,
         start_positions: &[usize],
+        rope: &TalkerRope,
         caches: &[&TalkerPhysicalCache],
         slots: &dyn KvSlotMap,
         metadata: &KvDecodeBatchMetadata,
@@ -433,6 +436,7 @@ impl Layer {
         let attn_out = self.self_attn.forward_physical_decode_batch(
             &normed,
             start_positions,
+            rope,
             caches,
             slots,
             metadata,
@@ -688,16 +692,10 @@ impl TalkerModel {
         position_ids: Option<&Tensor>,
         prepared: &mut PreparedPhysicalPagedStep,
     ) -> Result<Tensor> {
+        let rope = self.rope_tables(embeds.dim(1)?, &[start_pos], position_ids, embeds)?;
         let mut hidden = embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward_physical(
-                &hidden,
-                start_pos,
-                position_ids,
-                cache,
-                prepared,
-                layer_idx,
-            )?;
+            hidden = layer.forward_physical(&hidden, &rope, cache, prepared, layer_idx)?;
         }
         Ok(hidden)
     }
@@ -798,6 +796,7 @@ impl TalkerModel {
         let mut completions =
             KvWriteCompletionCollector::new(first.arena().config(), lowered.logical_slots())?;
         let execution = (|| -> Result<(Tensor, Tensor)> {
+            let rope = self.rope_tables(1, &start_positions, None, input_embeds)?;
             let mut hidden = input_embeds.clone();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let cache_refs = caches
@@ -807,6 +806,7 @@ impl TalkerModel {
                 hidden = layer.forward_physical_decode_batch(
                     &hidden,
                     &start_positions,
+                    &rope,
                     &cache_refs,
                     lowered.as_ref(),
                     &metadata,
@@ -906,6 +906,65 @@ impl TalkerModel {
     pub fn uses_mrope(&self) -> bool {
         self.use_mrope
     }
+
+    /// One set of RoPE tables per forward, shared by every layer (all layers
+    /// have the same rotary geometry).
+    fn rope_tables(
+        &self,
+        seq_len: usize,
+        start_positions: &[usize],
+        position_ids: Option<&Tensor>,
+        like: &Tensor,
+    ) -> Result<TalkerRope> {
+        let layer = self
+            .layers
+            .first()
+            .ok_or_else(|| Error::InferenceError("Qwen3-TTS talker has no layers".into()))?;
+        layer.self_attn.rope_tables(
+            seq_len,
+            start_positions,
+            position_ids,
+            like.device(),
+            like.dtype(),
+        )
+    }
+}
+
+/// RoPE cos/sin broadcastable over `[rows, seq, heads, head_dim]`.
+struct TalkerRope {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+/// Host cos/sin `[rows * seq_len, half_dim]` for sequential positions from
+/// each row's start: what [`build_mrope_cache`] computes when all three axes
+/// hold the same positions (`pos as f32 * inv`, host `cos`/`sin`).
+fn sequential_rope_host_tables(
+    seq_len: usize,
+    start_positions: &[usize],
+    inv_freq: &[f32],
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor)> {
+    let half_dim = inv_freq.len();
+    let rows = start_positions.len();
+    let mut cos_data = Vec::with_capacity(rows * seq_len * half_dim);
+    let mut sin_data = Vec::with_capacity(rows * seq_len * half_dim);
+    for &start in start_positions {
+        for pos in start..start + seq_len {
+            let pos = pos as f32;
+            for &inv in inv_freq {
+                let angle = pos * inv;
+                cos_data.push(angle.cos());
+                sin_data.push(angle.sin());
+            }
+        }
+    }
+    let shape = (rows * seq_len, half_dim);
+    Ok((
+        Tensor::from_vec(cos_data, shape, device)?.to_dtype(dtype)?,
+        Tensor::from_vec(sin_data, shape, device)?.to_dtype(dtype)?,
+    ))
 }
 
 /// Build MRoPE cache for multi-modal position encoding
@@ -923,6 +982,7 @@ fn build_mrope_cache(
         return build_rope_window(seq_len, 0, inv_freq, device, dtype);
     }
 
+    super::record_qwen3_tts_host_readback();
     let positions = position_ids.to_vec2::<i64>()?;
     if positions.len() != 3 || positions.iter().any(|axis| axis.len() < seq_len) {
         return build_rope_window(seq_len, 0, inv_freq, device, dtype);
@@ -997,6 +1057,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn tiny_talker(device: &Device) -> TalkerModel {
+        tiny_talker_with_mrope(device, false)
+    }
+
+    /// The tiny talker with interleaved MRoPE (three sections over its one
+    /// rotary pair), as the published talkers run.
+    fn tiny_talker_with_mrope(device: &Device, use_mrope: bool) -> TalkerModel {
         let predictor = CodePredictorConfig {
             model_type: "test-predictor".into(),
             hidden_size: 4,
@@ -1058,8 +1124,8 @@ pub(crate) mod tests {
             num_kv_heads: 1,
             head_dim: 2,
             rope_inv_freq: build_rope_inv_freq(2, cfg.rope_theta),
-            use_mrope: false,
-            mrope_section: Vec::new(),
+            use_mrope,
+            mrope_section: if use_mrope { vec![1, 0, 0] } else { Vec::new() },
         };
         let layer = Layer {
             input_layernorm: RmsNorm::new(Tensor::ones(4, DType::F32, device).unwrap(), 1e-5),
@@ -1095,7 +1161,7 @@ pub(crate) mod tests {
             lm_head: test_linear(8, 4, 10, device),
             device: device.clone(),
             cfg,
-            use_mrope: false,
+            use_mrope,
         }
     }
 
@@ -1248,10 +1314,65 @@ pub(crate) mod tests {
         assert_eq!(cache.context_len(), 4);
     }
 
+    /// QTTS-4: host sequential tables equal the MRoPE path with repeated
+    /// position ids bit for bit (the published head_dim 128, theta 1e6,
+    /// sections [24, 20, 20], late positions).
+    #[test]
+    fn sequential_host_tables_match_mrope_with_equal_axes() {
+        let device = Device::Cpu;
+        let inv_freq = build_rope_inv_freq(128, 1_000_000.0);
+        let (seq_len, start) = (5, 4_093);
+        let ids = repeated_mrope_position_ids(seq_len, start, &device).unwrap();
+        let (mrope_cos, mrope_sin) =
+            build_mrope_cache(seq_len, &device, DType::F32, &ids, &[24, 20, 20], &inv_freq)
+                .unwrap();
+        let (host_cos, host_sin) =
+            sequential_rope_host_tables(seq_len, &[start], &inv_freq, &device, DType::F32).unwrap();
+        for (mrope, host) in [(mrope_cos, host_cos), (mrope_sin, host_sin)] {
+            let mrope = mrope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let host = host.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(mrope
+                .iter()
+                .zip(&host)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+    }
+
+    /// QTTS-4: an MRoPE talker step reads nothing back (it read the position
+    /// ids back for q and for k in every layer), and matches the same talker
+    /// with plain RoPE, which equal-axis MRoPE is.
+    #[test]
+    fn mrope_talker_step_reads_nothing_back_and_matches_plain_rope() {
+        let device = Device::Cpu;
+        let mut outputs = Vec::new();
+        for use_mrope in [true, false] {
+            let model = tiny_talker_with_mrope(&device, use_mrope);
+            let (arena, bindings) = test_arena(720 + u64::from(use_mrope));
+            let mut cache = test_cache(arena, &bindings, 0);
+            model
+                .prefill_physical_with_embeds(&embeddings(3, 5, &device), &mut cache, None)
+                .unwrap();
+            let before = super::super::thread_qwen3_tts_host_readbacks();
+            let output = model
+                .generate_physical_step_with_embed(&embeddings(1, 9, &device), &mut cache)
+                .unwrap();
+            assert_eq!(super::super::thread_qwen3_tts_host_readbacks(), before);
+            outputs.push(output);
+        }
+        assert_close(&outputs[0].0, &outputs[1].0);
+        assert_close(&outputs[0].1, &outputs[1].1);
+    }
+
     #[test]
     fn ragged_talker_batch_matches_scalar_rows_and_shares_completion() {
+        for use_mrope in [false, true] {
+            ragged_talker_batch_matches_scalar_rows(use_mrope);
+        }
+    }
+
+    fn ragged_talker_batch_matches_scalar_rows(use_mrope: bool) {
         let device = Device::Cpu;
-        let model = tiny_talker(&device);
+        let model = tiny_talker_with_mrope(&device, use_mrope);
         let (scalar_arena, scalar_bindings) = test_arena(703);
         let (batch_arena, batch_bindings) = test_arena(704);
         let mut scalar_a = test_cache(scalar_arena.clone(), &scalar_bindings, 0);

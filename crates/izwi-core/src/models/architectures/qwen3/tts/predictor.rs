@@ -22,7 +22,8 @@ use crate::models::architectures::qwen3::tts::rope::{
 pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as CodePredictorPhysicalCache;
 use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
 use crate::models::shared::sampling::{
-    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, resident_top_k_sample,
+    sample_device_candidates,
 };
 use crate::models::shared::weights::mlx;
 
@@ -90,13 +91,29 @@ impl CodeSelection<'_> {
         }
     }
 
-    /// Pick one code from a single row of logits.
-    fn select(&mut self, logits: &Tensor) -> Result<u32> {
+    /// Pick one code from a single row of logits as a `[1]` U32 tensor on
+    /// the logits' device. Greedy codes and top-k draws with top-p 1 (the
+    /// sub-talker default) never leave the device; other settings sample on
+    /// the host and upload the code.
+    fn select(&mut self, logits: &Tensor) -> Result<Tensor> {
         match self {
             Self::Sample { params, draw } if !params.is_greedy() => {
-                sample_code(logits, params, &mut **draw)
+                let row = logits_row(logits)?;
+                if params.top_p >= 1.0 {
+                    if let Some(code) = resident_top_k_sample(
+                        &row,
+                        row.dim(0)?,
+                        params.top_k,
+                        params.temperature,
+                        &mut **draw,
+                    )? {
+                        return Ok(code);
+                    }
+                }
+                let code = sample_code(&row, params, &mut **draw)?;
+                Tensor::from_vec(vec![code], 1, row.device()).map_err(Error::from)
             }
-            _ => argmax_token(logits),
+            _ => argmax_device(&logits_row(logits)?),
         }
     }
 }
@@ -333,11 +350,13 @@ impl CodePredictor {
         let mut prev_code = selection.select(&first_logits.i((0, 0))?)?;
         cache.commit_prepared(prefill)?;
 
+        // Codes stay on the device and feed the next embedding directly; the
+        // frame's codes are read back once at the end.
         let mut all_codes = Vec::with_capacity(num_acoustic);
-        all_codes.push(prev_code);
+        all_codes.push(prev_code.clone());
         for group_idx in 1..num_acoustic {
-            let mut step_hidden = self
-                .codec_embedding_row(group_idx - 1, prev_code)?
+            let mut step_hidden = self.codec_embeddings[group_idx - 1]
+                .forward(&prev_code)?
                 .unsqueeze(0)?;
             if let Some(proj) = &self.small_to_mtp_projection {
                 step_hidden = proj.forward(&step_hidden)?;
@@ -350,7 +369,7 @@ impl CodePredictor {
             let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
             prev_code = selection.select(&logits.i((0, 0))?)?;
             cache.commit_prepared(step_prepared)?;
-            all_codes.push(prev_code);
+            all_codes.push(prev_code.clone());
         }
 
         if cache.context_len() != required_tokens {
@@ -359,7 +378,10 @@ impl CodePredictor {
                 cache.context_len()
             )));
         }
-        Ok(all_codes)
+        super::record_qwen3_tts_host_readback();
+        Tensor::cat(&all_codes, 0)?
+            .to_vec1::<u32>()
+            .map_err(Error::from)
     }
 
     /// Generate acoustic codebooks for compatible semantic-frame rows.
@@ -450,10 +472,8 @@ impl CodePredictor {
 
             let first_logits = self.lm_heads[0].forward(&last_hidden)?;
             let mut previous_codes = select_codes(&first_logits, batch_size, selections)?;
-            let mut all_codes = previous_codes
-                .iter()
-                .map(|code| vec![*code])
-                .collect::<Vec<_>>();
+            let mut steps = Vec::with_capacity(num_acoustic);
+            steps.push(previous_codes.clone());
             for group_idx in 1..num_acoustic {
                 if caches
                     .iter()
@@ -463,7 +483,7 @@ impl CodePredictor {
                         "Qwen3-TTS predictor batch rows diverged before codebook {group_idx}"
                     )));
                 }
-                let ids = Tensor::from_vec(previous_codes.clone(), (batch_size, 1), &self.device)?;
+                let ids = previous_codes.reshape((batch_size, 1))?;
                 let mut step_hidden = self.codec_embeddings[group_idx - 1].forward(&ids)?;
                 if let Some(proj) = &self.small_to_mtp_projection {
                     step_hidden = proj.forward(&step_hidden)?;
@@ -475,9 +495,7 @@ impl CodePredictor {
                 )?;
                 let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
                 previous_codes = select_codes(&logits, batch_size, selections)?;
-                for (row, code) in previous_codes.iter().enumerate() {
-                    all_codes[row].push(*code);
-                }
+                steps.push(previous_codes.clone());
             }
             let required_tokens = self.physical_context_tokens_per_frame();
             if caches
@@ -488,7 +506,10 @@ impl CodePredictor {
                     "Qwen3-TTS predictor batch did not finish at cursor {required_tokens}"
                 )));
             }
-            Ok(all_codes)
+            super::record_qwen3_tts_host_readback();
+            Tensor::stack(&steps, 1)?
+                .to_vec2::<u32>()
+                .map_err(Error::from)
         })();
         if let Err(error) = result {
             let mut rollback_error = None;
@@ -1133,64 +1154,13 @@ impl Mlp {
     }
 }
 
-fn argmax_token(logits: &Tensor) -> Result<u32> {
-    if !logits.device().is_cuda() {
-        return argmax_token_reference(logits);
-    }
-
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
-}
-
-fn argmax_token_reference(logits: &Tensor) -> Result<u32> {
-    let logits = logits.to_dtype(DType::F32)?;
-    let logits = match logits.rank() {
-        1 => logits,
-        2 => {
-            let (rows, _cols) = logits.dims2()?;
-            if rows != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected Qwen3-TTS predictor logits shape: {:?}",
-                    logits.shape().dims()
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3-TTS predictor logits rank: {rank}"
-            )))
-        }
-    };
-    let values = logits.to_vec1::<f32>()?;
-    let mut max_idx = 0usize;
-    let mut max_val = f32::NEG_INFINITY;
-    for (idx, &val) in values.iter().enumerate() {
-        if val > max_val {
-            max_val = val;
-            max_idx = idx;
-        }
-    }
-    Ok(max_idx as u32)
-}
-
-/// One code per row: the batched argmax when every row is greedy, otherwise
-/// each row through its own selection.
+/// One code per row as a `[batch]` U32 device tensor: the batched argmax
+/// when every row is greedy, otherwise each row through its own selection.
 fn select_codes(
     logits: &Tensor,
     expected_batch: usize,
     selections: &mut [CodeSelection<'_>],
-) -> Result<Vec<u32>> {
-    if selections.iter().all(CodeSelection::is_greedy) {
-        return argmax_tokens(logits, expected_batch);
-    }
+) -> Result<Tensor> {
     let logits = match logits.rank() {
         3 if logits.dim(1)? == 1 => logits.i((.., 0, ..))?,
         2 => logits.clone(),
@@ -1208,11 +1178,37 @@ fn select_codes(
             selections.len()
         )));
     }
-    selections
+    if selections.iter().all(CodeSelection::is_greedy) {
+        return argmax_device(&logits);
+    }
+    let codes = selections
         .iter_mut()
         .enumerate()
         .map(|(row, selection)| selection.select(&logits.i(row)?))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&codes, 0).map_err(Error::from)
+}
+
+/// Argmax over the last axis as U32 on the logits' device: `[1]` for one row,
+/// `[rows]` for a matrix. Ties take the first index, as `torch.argmax` does.
+fn argmax_device(logits: &Tensor) -> Result<Tensor> {
+    let codes = logits.argmax(D::Minus1)?.to_dtype(DType::U32)?;
+    if codes.rank() == 0 {
+        codes.reshape(1).map_err(Error::from)
+    } else {
+        Ok(codes)
+    }
+}
+
+fn logits_row(logits: &Tensor) -> Result<Tensor> {
+    match logits.rank() {
+        1 => Ok(logits.clone()),
+        2 if logits.dim(0)? == 1 => logits.i(0).map_err(Error::from),
+        _ => Err(Error::InferenceError(format!(
+            "Unexpected Qwen3-TTS predictor logits shape: {:?}",
+            logits.dims()
+        ))),
+    }
 }
 
 /// Draw one code from a logits row with the sub-talker settings. On CUDA and
@@ -1245,6 +1241,7 @@ fn sample_code(
             0.0,
             None,
         )? {
+            super::record_qwen3_tts_host_readback();
             if device_candidates_cover_top_p(&candidates, params.top_p) {
                 if let Some(code) = sample_device_candidates(&candidates, params.top_p, draw()) {
                     return Ok(code);
@@ -1252,6 +1249,7 @@ fn sample_code(
             }
         }
     }
+    super::record_qwen3_tts_host_readback();
     let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
     sample_code_from_values(&values, params, draw())
         .ok_or_else(|| Error::InferenceError("Qwen3-TTS predictor logits are not finite".into()))
@@ -1309,35 +1307,6 @@ fn sample_code_from_values(values: &[f32], params: &SubtalkerSampling, draw: f32
         remaining -= probability;
     }
     Some(candidates[probabilities.len() - 1].0)
-}
-
-fn argmax_tokens(logits: &Tensor, expected_batch: usize) -> Result<Vec<u32>> {
-    let logits = match logits.rank() {
-        3 if logits.dim(1)? == 1 => logits.i((.., 0, ..))?,
-        2 => logits.clone(),
-        _ => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3-TTS predictor batch logits shape: {:?}",
-                logits.dims()
-            )))
-        }
-    };
-    if logits.dim(0)? != expected_batch {
-        return Err(Error::InferenceError(format!(
-            "Qwen3-TTS predictor batch produced {} rows, expected {expected_batch}",
-            logits.dim(0)?
-        )));
-    }
-    if logits.device().is_cuda() {
-        return logits
-            .argmax(D::Minus1)?
-            .to_dtype(DType::U32)?
-            .to_vec1::<u32>()
-            .map_err(Error::from);
-    }
-    (0..expected_batch)
-        .map(|row| argmax_token_reference(&logits.i(row)?))
-        .collect()
 }
 
 #[cfg(test)]
@@ -1496,14 +1465,23 @@ mod tests {
     fn non_cuda_predictor_argmax_uses_reference_ordering() {
         let logits = Tensor::new(vec![0.0f32, 4.0, 4.0, 3.0], &Device::Cpu).unwrap();
 
-        assert_eq!(argmax_token(&logits).unwrap(), 1);
+        assert_eq!(
+            argmax_device(&logits).unwrap().to_vec1::<u32>().unwrap(),
+            [1]
+        );
     }
 
     #[test]
     fn predictor_argmax_reference_accepts_single_row_logits() {
         let logits = Tensor::new(&[[0.0f32, 1.0, 7.0, 3.0]], &Device::Cpu).unwrap();
 
-        assert_eq!(argmax_token(&logits).unwrap(), 2);
+        assert_eq!(
+            argmax_device(&logits_row(&logits).unwrap())
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap(),
+            [2]
+        );
     }
 
     #[test]
@@ -1649,6 +1627,58 @@ mod tests {
         assert_eq!(fallback.context_len(), scalar.context_len());
     }
 
+    /// QTTS-4: one predictor frame reads its codes back once (it read one
+    /// code back per codebook), greedy or sampled with the sub-talker
+    /// defaults, and a two-row batch reads back once for both rows.
+    #[test]
+    fn predictor_frame_reads_its_codes_back_once() {
+        let device = Device::Cpu;
+        let model = tiny_predictor(&device);
+        let talker = frame_input(31, &device);
+        let semantic = frame_input(33, &device);
+        let readbacks = || super::super::thread_qwen3_tts_host_readbacks();
+        let mut draw = {
+            let mut state = 0x2545_F491u64;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 24) as f32
+            }
+        };
+        for (instance, sampled) in [(730u64, false), (731, true)] {
+            let (arena, bindings) = test_arena(instance);
+            let mut cache = test_cache(arena, &bindings, 0, 0);
+            let mut selection = if sampled {
+                CodeSelection::Sample {
+                    params: SubtalkerSampling::default(),
+                    draw: &mut draw,
+                }
+            } else {
+                CodeSelection::Greedy
+            };
+            let before = readbacks();
+            let codes = model
+                .generate_acoustic_codes_physical(&talker, &semantic, &mut cache, &mut selection)
+                .unwrap();
+            assert_eq!(codes.len(), 3);
+            assert_eq!(readbacks() - before, 1, "sampled: {sampled}");
+        }
+        let (arena, bindings) = test_arena(732);
+        let mut row0 = test_cache(arena.clone(), &bindings, 0, 0);
+        let mut row1 = test_cache(arena, &bindings, 6, 0);
+        let before = readbacks();
+        model
+            .generate_acoustic_codes_physical_batch(
+                &Tensor::cat(&[&talker, &talker], 0).unwrap(),
+                &Tensor::cat(&[&semantic, &semantic], 0).unwrap(),
+                &mut [&mut row0, &mut row1],
+                &mut [CodeSelection::Greedy, CodeSelection::Greedy],
+            )
+            .unwrap();
+        assert_eq!(readbacks() - before, 1);
+    }
+
     /// QTTS-6: host sampling follows the warper order (temperature, top-k,
     /// top-p) and draws by inverse CDF.
     #[test]
@@ -1717,12 +1747,22 @@ mod tests {
             top_k: 2,
             ..SubtalkerSampling::default()
         };
-        let mut high = || 0.999_99f32;
+        // Gumbel-max over the top two: a near-zero uniform for the leader and a
+        // near-one uniform for the runner-up makes the runner-up win.
+        let mut flip = false;
+        let mut runner_up = move || {
+            flip = !flip;
+            if flip {
+                1e-4f32
+            } else {
+                0.999_9
+            }
+        };
         let sampled = run(
             722,
             &mut CodeSelection::Sample {
                 params: top2_params,
-                draw: &mut high,
+                draw: &mut runner_up,
             },
         );
         assert_ne!(sampled[0], greedy[0], "the draw must pick the runner-up");
@@ -1733,7 +1773,15 @@ mod tests {
         let mut row1 = test_cache(arena, &bindings, 6, 0);
         let batch_talker = Tensor::cat(&[&talker, &talker], 0).unwrap();
         let batch_semantic = Tensor::cat(&[&semantic, &semantic], 0).unwrap();
-        let mut high = || 0.999_99f32;
+        let mut flip = false;
+        let mut runner_up = move || {
+            flip = !flip;
+            if flip {
+                1e-4f32
+            } else {
+                0.999_9
+            }
+        };
         let codes = model
             .generate_acoustic_codes_physical_batch(
                 &batch_talker,
@@ -1743,7 +1791,7 @@ mod tests {
                     CodeSelection::Greedy,
                     CodeSelection::Sample {
                         params: top2_params,
-                        draw: &mut high,
+                        draw: &mut runner_up,
                     },
                 ],
             )
