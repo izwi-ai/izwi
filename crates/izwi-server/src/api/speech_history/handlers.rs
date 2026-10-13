@@ -1013,6 +1013,7 @@ async fn accept_durable_text_tts_record(
     }
 
     let projection = NewSpeechHistoryRecord {
+        stop_reason: None,
         route_kind,
         processing_status: SpeechHistoryProcessingStatus::Pending,
         processing_error: None,
@@ -1145,6 +1146,7 @@ async fn create_pending_record(
     state
         .speech_history_store
         .create_record(NewSpeechHistoryRecord {
+            stop_reason: None,
             route_kind,
             processing_status: SpeechHistoryProcessingStatus::Pending,
             processing_error: None,
@@ -1933,6 +1935,7 @@ async fn synthesize_record_internal(
 
     if let Some(record_id) = target_record_id {
         let mut completion = CompleteSpeechHistoryRecord {
+            stop_reason: stop_reason.map(|reason| reason.as_str().to_string()),
             model_id: Some(model_id),
             speaker: req.speaker,
             language: req.language,
@@ -2000,6 +2003,7 @@ async fn synthesize_record_internal(
     state
         .speech_history_store
         .create_record(NewSpeechHistoryRecord {
+            stop_reason: stop_reason.map(|reason| reason.as_str().to_string()),
             route_kind,
             processing_status: SpeechHistoryProcessingStatus::Ready,
             processing_error: None,
@@ -2453,6 +2457,7 @@ async fn stream_record_creation(
                             route_kind,
                             placeholder_record_id.clone(),
                             CompleteSpeechHistoryRecord {
+                                stop_reason: stop_reason.map(|reason| reason.as_str().to_string()),
                                 model_id: Some(model_id.clone()),
                                 speaker: req.speaker.clone(),
                                 language: req.language.clone(),

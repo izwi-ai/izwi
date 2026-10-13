@@ -404,6 +404,7 @@ pub(super) async fn synthesize_fish_record(
             None
         };
         let completion = CompleteSpeechHistoryRecord {
+            stop_reason: None,
             model_id: Some(model_id),
             speaker: req.speaker,
             language: req.language,

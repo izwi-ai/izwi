@@ -320,7 +320,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         audio_filename TEXT NULL,
         audio_storage_path TEXT NOT NULL,
         audio_media_asset_id TEXT NULL,
-        audio_artifact_tenant TEXT NULL
+        audio_artifact_tenant TEXT NULL,
+        stop_reason TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_speech_history_route_created_at ON speech_history_records(route_kind, created_at DESC);",
@@ -995,6 +996,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "speech_history_records",
         column: "audio_artifact_tenant",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "stop_reason",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {

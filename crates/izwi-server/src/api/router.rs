@@ -1663,6 +1663,7 @@ mod tests {
         let record = state
             .speech_history_store
             .create_record(NewSpeechHistoryRecord {
+                stop_reason: None,
                 route_kind: SpeechRouteKind::TextToSpeech,
                 processing_status: SpeechHistoryProcessingStatus::Ready,
                 processing_error: None,
