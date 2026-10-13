@@ -8716,8 +8716,12 @@ mod tests {
         assert!(receiver.await.is_err());
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_pending_guard_reclaims_admitted_session_and_job() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         runtime.ensure_step_driver_started().await;
         let mut request = EngineCoreRequest::tts("cancel between admission and waiter binding")
@@ -8804,8 +8808,12 @@ mod tests {
         runtime.core_engine.abort_all_requests().await;
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_pending_guard_retains_ownership_while_exact_abort_waits_for_core_step_lock() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut request = EngineCoreRequest::tts("cancel during an in-flight engine step");
         request.id = "cancel-during-engine-step".to_string();
@@ -8887,8 +8895,12 @@ mod tests {
         runtime.core_engine.abort_all_requests().await;
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nonstreaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let (step_entered_tx, step_entered_rx) = oneshot::channel();
         let (release_step_tx, release_step_rx) = oneshot::channel();
@@ -8949,8 +8961,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let (step_entered_tx, step_entered_rx) = oneshot::channel();
         let (release_step_tx, release_step_rx) = oneshot::channel();
@@ -9042,8 +9058,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fish_streaming_runs_model_preparation_before_engine_admission() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         for model_streaming_required in [true, false] {
             let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
             let mut request = EngineCoreRequest::tts("prepare streaming Fish")
@@ -9096,8 +9116,12 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn shared_preparation_preserves_fish_model_artifact_and_streaming_budget() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         use crate::models::architectures::fish_s2::{FishS2PreparedArtifact, FishS2TtsModel};
         use crate::models::registry::FishS2TtsModelLease;
 
@@ -9164,8 +9188,12 @@ mod tests {
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_streaming_deadline_does_not_invoke_callback() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "expired-streaming-callback";
         let deadline = Instant::now() + Duration::from_millis(50);
@@ -9218,8 +9246,12 @@ mod tests {
         .expect("deadline cleanup did not release request ownership");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hung_streaming_callback_is_bounded_by_absolute_request_deadline() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "hung-streaming-callback-deadline";
         let deadline = Instant::now() + Duration::from_millis(25);
@@ -9264,8 +9296,12 @@ mod tests {
         .expect("deadline cleanup did not release request ownership");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_callback_failure_returns_while_exact_abort_waits_for_core_step_lock() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "streaming-callback-failure-during-step";
         let (observation_request, mut guard, receiver, residency_variant) =
@@ -9333,8 +9369,12 @@ mod tests {
         .expect("exact abort did not release ownership after the core lock became safe");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_detached_cleanup_retains_request_ownership_fail_closed() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut request = EngineCoreRequest::tts("abort detached cancellation cleanup");
         request.id = "abort-detached-cleanup".to_string();
@@ -9637,8 +9677,12 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_pending_guard_cleanup_cannot_abort_reused_session() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut old_request =
             EngineCoreRequest::tts("old exact session").with_model_variant(ModelVariant::Kokoro82M);
@@ -9873,8 +9917,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn runtime_prometheus_includes_engine_metric_values() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
 
         let payload = runtime.telemetry_prometheus().await;
@@ -10171,8 +10219,12 @@ mod tests {
         wav_bytes(&samples(SAMPLE_RATE as usize * 10), SAMPLE_RATE)
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn silent_asr_request_is_answered_before_route_preparation() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
             .with_model_variant(ModelVariant::WhisperLargeV3Turbo);
@@ -10192,8 +10244,12 @@ mod tests {
         assert_eq!(diagnostics["no_speech_gate"]["gated"], true);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn noise_only_streaming_asr_request_emits_a_terminal_empty_final() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         use crate::runtime::asr_no_speech::tests::pink_noise;
 
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
@@ -10225,8 +10281,12 @@ mod tests {
         assert_eq!(output.input_audio_duration_secs, Some(10.0));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn no_speech_gate_passes_speech_and_transducer_requests_through() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
 
         let parakeet = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
@@ -10257,8 +10317,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn whisper_transport_streaming_preserves_normal_and_long_form_routes() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
         let variant = ModelVariant::WhisperLargeV3Turbo;
@@ -10537,8 +10601,12 @@ mod tests {
         assert_eq!(spec.resources, expected);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_copy_yields_between_bounded_quanta() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         use std::sync::atomic::AtomicBool;
 
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
@@ -10576,8 +10644,12 @@ mod tests {
         peer.await.expect("peer task");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_copy_stops_at_absolute_deadline() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let deadline = Instant::now() + Duration::from_millis(50);
         let context = RuntimeRequestContext::default().with_deadline(deadline);

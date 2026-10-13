@@ -2642,9 +2642,12 @@ pub(crate) mod test_support {
     /// variant's full residency estimate (multi-GiB for GGUF families), and
     /// the injected-OOM ladder tests temporarily poison the authority. Two
     /// such tests overlapping can reject an unrelated concurrent admission
-    /// with `Overloaded` on capacity-constrained runners. Tests whose
-    /// admission or load path consults the global authority must hold this
-    /// lock for their whole body.
+    /// with `Overloaded` on capacity-constrained runners. Conversely, any
+    /// `RuntimeService` unload that leaves its own runtime drained clears
+    /// the shared poison, so an unserialized unload test can erase another
+    /// test's poison mid-assertion. Tests whose admission, load, or unload
+    /// path consults the global authority must hold this lock for their
+    /// whole body.
     pub(crate) fn authority_test_lock() -> &'static StdMutex<()> {
         static LOCK: StdMutex<()> = StdMutex::new(());
         &LOCK

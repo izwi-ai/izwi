@@ -6209,6 +6209,9 @@ mod tests {
     // the complete asynchronous load attempt in this test.
     #[allow(clippy::await_holding_lock)]
     async fn parakeet_load_rejects_invalid_nemo_archive() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _guard = env_lock().lock().expect("env lock poisoned");
 
         let root = std::env::temp_dir().join(format!("izwi-parakeet-runtime-{}", Uuid::new_v4()));

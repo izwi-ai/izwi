@@ -603,8 +603,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cancelled_unload_waiter_keeps_lease_until_auxiliary_state_is_removed() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-cancelled-unload-test-{}",
             Uuid::new_v4()
@@ -695,8 +699,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn shutdown_unload_all_cleans_authoritative_loading_slots() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-loading-slot-shutdown-test-{}",
             Uuid::new_v4()
@@ -735,8 +743,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn unload_all_panic_leaves_retryable_cleanup_state_and_retains_lease() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-unload-panic-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();

@@ -6061,8 +6061,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-reap-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -6174,8 +6178,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn residency_budget_evicts_granite_before_loading_another_asr_model() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
