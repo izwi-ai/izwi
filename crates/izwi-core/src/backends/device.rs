@@ -431,6 +431,12 @@ impl DeviceProfile {
         )
     }
 
+    /// The Metal decoder-LM tier for a BF16 checkpoint (report 13): BF16 on
+    /// Apple9+ GPUs, F16 on Apple7/8. See [`metal_bf16_checkpoint_lm_tier`].
+    pub fn metal_bf16_checkpoint_lm_tier(&self) -> DTypeSelection {
+        metal_bf16_checkpoint_lm_tier(self.metal_supports_fast_bf16())
+    }
+
     /// Whether this profile's device is an Apple9+ GPU (M3/M4/M5), the tier
     /// whose BF16 matches F16 throughput. False off Metal and when the family
     /// cannot be read.
@@ -1148,6 +1154,30 @@ fn metal_weight_only_f16_selection(
     }
 }
 
+/// The Metal precision tier for a decoder LM whose checkpoint is BF16
+/// (report 13, plan Phase 6 P6.4):
+/// - Apple9+ (M3/M4/M5, `fast_bf16`): BF16, the checkpoint's own precision,
+///   which llama.cpp measured at about F16 throughput there. This tier is
+///   selected by GPU capability only; it has not been validated numerically
+///   on an Apple9+ GPU yet (plan section 9, open question 1) and needs that
+///   WER-parity run before it is trusted.
+/// - Apple7/8 (M1/M2): F16, because BF16 ran at 0.81x of F16 there
+///   (llama.cpp #29770). F16 narrows BF16's range to 65504, so each family
+///   gates it behind a load-time range probe with an F32 fallback.
+pub fn metal_bf16_checkpoint_lm_tier(fast_bf16: bool) -> DTypeSelection {
+    if fast_bf16 {
+        DTypeSelection {
+            dtype: DType::BF16,
+            reason: "Metal BF16-checkpoint LM tier: BF16 on an Apple9+ GPU (capability-selected; awaiting M3+ validation)".into(),
+        }
+    } else {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "Metal BF16-checkpoint LM tier: F16 on an Apple7/8 GPU, where BF16 runs slower, behind a load-time range probe".into(),
+        }
+    }
+}
+
 /// An Apple GPU family (`MTLGPUFamilyApple<N>`): M1 is Apple7, M2 Apple8,
 /// M3 and M4 Apple9, M5 Apple10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1630,6 +1660,32 @@ mod tests {
             select(true, Some(("X", " ")), MetalDTypeOverride::F32).dtype,
             DType::F32
         );
+    }
+
+    #[test]
+    fn bf16_checkpoint_lm_tier_is_bf16_only_on_apple9_and_newer() {
+        let fast = metal_bf16_checkpoint_lm_tier(true);
+        assert_eq!(fast.dtype, DType::BF16);
+        assert!(fast.reason.contains("Apple9+"), "{}", fast.reason);
+        let slow = metal_bf16_checkpoint_lm_tier(false);
+        assert_eq!(slow.dtype, DType::F16);
+        assert!(slow.reason.contains("range probe"), "{}", slow.reason);
+        // A profile that cannot read an Apple9+ family takes the F16 tier.
+        assert_eq!(
+            metal_test_profile().metal_bf16_checkpoint_lm_tier().dtype,
+            DType::F16
+        );
+        for family in 7..=10 {
+            let family = AppleGpuFamily(family);
+            assert_eq!(
+                metal_bf16_checkpoint_lm_tier(family.supports_fast_bf16()).dtype,
+                if family >= AppleGpuFamily::FAST_BF16 {
+                    DType::BF16
+                } else {
+                    DType::F16
+                }
+            );
+        }
     }
 
     #[test]

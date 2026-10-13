@@ -22,10 +22,11 @@ pub use cuda_runtime::{
     CudaRuntimeDiagnostics,
 };
 pub use device::{
-    metal_apple_gpu_family, metal_device_if_available, metal_runtime_supported,
-    metal_supports_fast_bf16, parse_dtype_name, AppleGpuFamily, DTypeSelection,
-    DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest, DeviceCapabilities,
-    DeviceKind, DeviceProfile, DeviceSelector, MetalDTypeOverride, METAL_DTYPE_ENV,
+    metal_apple_gpu_family, metal_bf16_checkpoint_lm_tier, metal_device_if_available,
+    metal_runtime_supported, metal_supports_fast_bf16, parse_dtype_name, AppleGpuFamily,
+    DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest,
+    DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector, MetalDTypeOverride,
+    METAL_DTYPE_ENV,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,
