@@ -62,7 +62,12 @@ const VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES: usize = 32;
 const WORDS_PER_SECOND: f32 = 2.6;
 const AUTO_PADDING_SECONDS: f32 = 0.8;
 pub const VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF: f64 = 300.0;
-const DEFAULT_CFG_SCALE: f32 = 1.5;
+/// Classifier-free guidance of the reference demos (`--cfg_scale` 1.3 in
+/// `inference_from_file.py`, 1.3 in the Gradio demo).
+pub const VIBEVOICE_TTS_DEFAULT_CFG_SCALE: f32 = 1.3;
+/// Diffusion steps of the reference demo (`set_ddpm_inference_steps(10)`);
+/// with the second-order solver 10 steps track the 20-step trajectory.
+pub const VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS: usize = 10;
 const VIBEVOICE_CFG_BATCHING_ENV: &str = "IZWI_VIBEVOICE_CFG_BATCHING";
 const VIBEVOICE_CUDA_DDPM_STEPS_ENV: &str = "IZWI_VIBEVOICE_CUDA_DDPM_STEPS";
 static NEXT_VIBEVOICE_TTS_STATE_ID: AtomicU64 = AtomicU64::new(1);
@@ -98,7 +103,7 @@ impl VibeVoiceTtsGenerationParams {
                 .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
         };
         Self {
-            cfg_scale: DEFAULT_CFG_SCALE,
+            cfg_scale: VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
             diffusion_steps: default_diffusion_steps.max(1),
             max_frames,
             auto_frame_budget,
@@ -450,11 +455,11 @@ impl VibeVoiceTtsModel {
         vibevoice_physical_state_spec(stage_graphs, contract, max_context_tokens)
     }
 
+    /// The reference demo's 10 steps. The config's `ddpm_num_inference_steps`
+    /// (20) is what bare `generate()` uses; the published inference scripts
+    /// override it to 10.
     pub fn default_diffusion_steps(&self) -> usize {
-        self.prediction_head
-            .config()
-            .ddpm_num_inference_steps
-            .max(1)
+        VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS
     }
 
     pub fn available_speakers(&self) -> Vec<String> {
@@ -2406,7 +2411,9 @@ mod tests {
 
         assert!(params.auto_frame_budget);
         assert_eq!(params.diffusion_steps, 20);
-        assert_eq!(params.cfg_scale, DEFAULT_CFG_SCALE);
+        // VVT-5: the reference demos' guidance scale.
+        assert_eq!(params.cfg_scale, 1.3);
+        assert_eq!(VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS, 10);
     }
 
     #[test]
