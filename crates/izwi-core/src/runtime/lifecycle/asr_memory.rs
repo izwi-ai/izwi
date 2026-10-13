@@ -2192,6 +2192,43 @@ mod tests {
         (2 * 512 * 64 + 32 * 64) * 2
     }
 
+    /// Admission reads the checkpoint the loader reads, and the Metal OOM
+    /// retry judges the same plan.
+    #[test]
+    fn admission_and_the_oom_retry_price_the_same_plan() {
+        let _env = env_lock();
+        let dir = temp_dir("retry");
+        let bf16 = write_vibevoice_checkpoint(&dir);
+        let performance = crate::performance::PerformanceConfig::default();
+        for backend in BACKENDS {
+            let device = profile(backend);
+            let plan = resource_plan(ModelVariant::VibeVoiceAsr, &dir, &device)
+                .unwrap()
+                .expect("VibeVoice has a residency plan");
+            let admitted = super::super::load_domain_bytes(plan.load_authorization, backend);
+            let retry = super::super::retry_load_peak_bytes(
+                ModelVariant::VibeVoiceAsr,
+                backend,
+                &performance,
+                Some((&dir, &device)),
+            );
+            assert_eq!(admitted, ResourceAmount::Known(retry), "{backend:?}");
+            let catalog = super::super::model_memory_estimate(ModelVariant::VibeVoiceAsr);
+            assert!(retry < catalog.load_peak_bytes);
+            if backend == BackendKind::Cuda {
+                assert_eq!(
+                    plan.resident_authorization.device_bytes,
+                    ResourceAmount::Known(bf16)
+                );
+                assert_eq!(
+                    plan.load_authorization.host_bytes,
+                    ResourceAmount::Known(512 * 64 * 2)
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Variants without a plan, and checkpoints whose files are missing (the
     /// loader reports those), keep the generic estimate.
     #[test]
@@ -2217,6 +2254,16 @@ mod tests {
                 "{variant}"
             );
         }
+        let performance = crate::performance::PerformanceConfig::default();
+        assert_eq!(
+            super::super::retry_load_peak_bytes(
+                ModelVariant::Kokoro82M,
+                BackendKind::Metal,
+                &performance,
+                Some((&dir, &device)),
+            ),
+            super::super::model_memory_estimate(ModelVariant::Kokoro82M).load_peak_bytes
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

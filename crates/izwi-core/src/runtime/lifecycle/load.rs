@@ -424,17 +424,38 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
     }
 }
 
+/// The load-domain bytes of a load authorization: host memory on CPU, unified
+/// memory on Metal, device memory on CUDA.
+fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> ResourceAmount {
+    match backend {
+        BackendKind::Cpu => authorization.host_bytes,
+        BackendKind::Metal => authorization.unified_bytes,
+        BackendKind::Cuda => authorization.device_bytes,
+    }
+}
+
 /// Static load peak that decides whether a Metal OOM retry can fit. The
 /// catalog's `memory_required_gb` is one coarse figure for every backend (80
 /// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
 /// these checkpoints use the per-backend representation estimate that load
-/// admission prices instead.
+/// admission prices instead. An ASR checkpoint (`asr_checkpoint`: its path and
+/// the load device) is judged by the residency plan first admission priced.
 fn retry_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,
+    asr_checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
+    if let Some((model_path, device)) = asr_checkpoint {
+        if let Ok(Some(plan)) = asr_memory::resource_plan(variant, model_path, device) {
+            if let ResourceAmount::Known(bytes) =
+                load_domain_bytes(plan.load_authorization, backend)
+            {
+                return bytes;
+            }
+        }
+    }
     match variant {
         ModelVariant::Qwen3827BFp8
             if !crate::models::architectures::qwen38::native::synthetic_geometry_enabled() =>
@@ -444,14 +465,8 @@ fn retry_load_peak_bytes(
         ModelVariant::Qwen36Moe35BA3BFp8
             if !crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() =>
         {
-            let peak = qwen36moe_memory::resource_plan(backend, performance).map(|plan| {
-                let peak = plan.load_authorization;
-                match backend {
-                    BackendKind::Cpu => peak.host_bytes,
-                    BackendKind::Metal => peak.unified_bytes,
-                    BackendKind::Cuda => peak.device_bytes,
-                }
-            });
+            let peak = qwen36moe_memory::resource_plan(backend, performance)
+                .map(|plan| load_domain_bytes(plan.load_authorization, backend));
             match peak {
                 Ok(ResourceAmount::Known(bytes)) => bytes,
                 _ => catalog(),
@@ -1778,8 +1793,15 @@ impl ModelLifecycleController {
         // peak, a second full load is guaranteed to hit the same command-buffer
         // OOM and would burn another GGUF read + F16 materialization + fence
         // (tens of seconds) before poisoning. Skip straight to the poison.
-        let backend = self.backend_router.context().backend_kind;
-        let required_bytes = retry_load_peak_bytes(variant, backend, &self.config.performance);
+        let context = self.backend_router.context();
+        let backend = context.backend_kind;
+        let model_path = self.model_manager.downloaded_model_path(variant);
+        let required_bytes = retry_load_peak_bytes(
+            variant,
+            backend,
+            &self.config.performance,
+            model_path.as_deref().map(|path| (path, &context.device)),
+        );
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
@@ -4035,7 +4057,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let performance = crate::performance::PerformanceConfig::default();
-        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance);
+        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance, None);
 
         // Qwen3.8 on Metal (raw block FP8, about 29.9 GiB at load; 51.9 GiB
         // expanded to F16) sits far below the 80 GiB catalog figure that used
