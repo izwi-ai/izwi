@@ -1126,18 +1126,7 @@ impl WhisperTurboAsrModel {
             &device.device,
         )?;
 
-        let mel = MelSpectrogram::new(MelConfig {
-            sample_rate: whisper::SAMPLE_RATE,
-            n_fft: whisper::N_FFT,
-            win_length: None,
-            hop_length: whisper::HOP_LENGTH,
-            n_mels: config.num_mel_bins,
-            f_min: 0.0,
-            f_max: (whisper::SAMPLE_RATE / 2) as f32,
-            normalize: true,
-            mel_scale: MelScale::Slaney,
-            mel_norm: MelNorm::Slaney,
-        })?;
+        let mel = MelSpectrogram::new(whisper_mel_config(config.num_mel_bins))?;
 
         info!(
             "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={})",
@@ -2407,20 +2396,18 @@ impl WhisperTurboAsrModel {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
 
-        let mut mel_spec = self.mel.compute(&mono_16khz)?;
-        if mel_spec.is_empty() {
+        if mono_16khz.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
         // Whisper encoder downsamples by 2 before positional embeddings.
-        let max_input_frames = self.config.max_source_positions.saturating_mul(2).max(1);
+        let frames = self.config.max_source_positions.saturating_mul(2).max(1);
         let n_mels = self.config.num_mel_bins;
-        pad_or_trim_mel_frames(&mut mel_spec, n_mels, max_input_frames);
-        let frames = mel_spec.len();
+        let features = whisper_log_mel_frames(&self.mel, &mono_16khz, frames)?;
         let mut flat = vec![0f32; frames * n_mels];
-        for (frame_idx, frame) in mel_spec.iter().enumerate() {
-            for mel_idx in 0..n_mels {
-                flat[mel_idx * frames + frame_idx] = frame[mel_idx];
+        for (frame_idx, frame) in features.chunks_exact(n_mels).enumerate() {
+            for (mel_idx, value) in frame.iter().enumerate() {
+                flat[mel_idx * frames + frame_idx] = *value;
             }
         }
 
@@ -2924,12 +2911,49 @@ fn trimmed_audio_bounds(
     (start, end)
 }
 
-fn pad_or_trim_mel_frames(mel_spec: &mut Vec<Vec<f32>>, n_mels: usize, target_frames: usize) {
-    if mel_spec.len() > target_frames {
-        mel_spec.truncate(target_frames);
-    } else if mel_spec.len() < target_frames {
-        mel_spec.resize_with(target_frames, || vec![0.0; n_mels]);
+fn whisper_mel_config(n_mels: usize) -> MelConfig {
+    MelConfig {
+        sample_rate: whisper::SAMPLE_RATE,
+        n_fft: whisper::N_FFT,
+        win_length: None,
+        hop_length: whisper::HOP_LENGTH,
+        n_mels,
+        f_min: 0.0,
+        f_max: (whisper::SAMPLE_RATE / 2) as f32,
+        // Normalized in `whisper_log_mel_frames`, after the extra STFT frame
+        // is dropped.
+        normalize: false,
+        mel_scale: MelScale::Slaney,
+        mel_norm: MelNorm::Slaney,
     }
+}
+
+/// Frame-major normalized log-mel features for one Whisper window, computed
+/// the way OpenAI's `log_mel_spectrogram(padding=N_SAMPLES)` and HF's
+/// `WhisperFeatureExtractor` do: trim or zero-pad the samples to
+/// `target_frames * HOP_LENGTH` (480,000) BEFORE the STFT, drop the STFT's
+/// last frame, then clamp to `max - 8` and scale over the kept frames only.
+/// Padding the normalized mel with 0.0 afterwards instead gives the encoder a
+/// tail far louder than the trained floor of `(max - 8 + 4) / 4`.
+fn whisper_log_mel_frames(
+    mel: &MelSpectrogram,
+    samples: &[f32],
+    target_frames: usize,
+) -> Result<Vec<f32>> {
+    debug_assert!(!mel.config().normalize);
+    let target_samples = target_frames.saturating_mul(mel.config().hop_length);
+    let mut padded = samples[..samples.len().min(target_samples)].to_vec();
+    padded.resize(target_samples, 0.0);
+    let (mut flat, frames) = mel.compute_flat(&padded)?;
+    let n_mels = mel.config().n_mels;
+    if frames < target_frames {
+        return Err(Error::InferenceError(format!(
+            "Whisper STFT produced {frames} frames for a {target_frames}-frame window"
+        )));
+    }
+    flat.truncate(target_frames * n_mels);
+    MelSpectrogram::whisper_normalize_flat(&mut flat);
+    Ok(flat)
 }
 
 impl WhisperTurboAsrModel {
@@ -4232,15 +4256,16 @@ mod tests {
         build_whisper_prompt_prefix, capped_decode_temperatures, contiguous_token_range,
         decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
         greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, pad_or_trim_mel_frames, select_token_from_filtered_logits,
-        should_skip_as_no_speech, tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol,
-        trimmed_audio_bounds, unmasked_token_probability, use_cuda_whisper_dtype_shim,
-        whisper_cross_source_identity, whisper_decode_profile_diagnostics,
-        whisper_device_diagnostics, whisper_impl_name, whisper_sot_row,
+        logits_to_log_probs_in_place, select_token_from_filtered_logits, should_skip_as_no_speech,
+        tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
+        unmasked_token_probability, use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
+        whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
+        whisper_log_mel_frames, whisper_mel_config, whisper_sot_row,
         whisper_terminal_policy_transition, with_whisper_decode_step_transaction,
         WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperPreparedWindow,
         WhisperSpecialTokens, WhisperTerminalTransition,
     };
+    use crate::audio::MelSpectrogram;
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::backends::BackendKind;
@@ -4322,18 +4347,91 @@ mod tests {
         assert_eq!(whisper_impl_name(true), "local_whisper_cuda_dtype_shim");
     }
 
-    #[test]
-    fn whisper_mel_frames_pad_or_trim_to_model_window() {
-        let mut short = vec![vec![1.0, 2.0]];
-        pad_or_trim_mel_frames(&mut short, 2, 3);
-        assert_eq!(short.len(), 3);
-        assert_eq!(short[0], vec![1.0, 2.0]);
-        assert_eq!(short[1], vec![0.0, 0.0]);
-        assert_eq!(short[2], vec![0.0, 0.0]);
+    /// `data/fox.wav`'s int16 PCM scaled by 1/32768, as the golden's
+    /// generator reads it (`tests/fixtures/whisper-hf-features-fox.py`).
+    fn fox_pcm() -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+        let bytes = std::fs::read(path).expect("fox.wav");
+        let mut offset = 12;
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let body = offset + 8;
+            if id == b"data" {
+                let (pairs, _) = bytes[body..body + len as usize].as_chunks::<2>();
+                return pairs
+                    .iter()
+                    .map(|pair| i16::from_le_bytes(*pair) as f32 / 32768.0)
+                    .collect();
+            }
+            offset = body + len as usize + (len as usize & 1);
+        }
+        panic!("fox.wav has no data chunk");
+    }
 
-        let mut long = vec![vec![1.0], vec![2.0], vec![3.0]];
-        pad_or_trim_mel_frames(&mut long, 1, 2);
-        assert_eq!(long, vec![vec![1.0], vec![2.0]]);
+    #[test]
+    fn whisper_log_mel_matches_hf_feature_extractor_golden() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/whisper-hf-features-fox.json");
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("golden")).unwrap();
+        let pcm = fox_pcm();
+        let as_f32 = |value: &serde_json::Value| value.as_f64().unwrap() as f32;
+        let as_usize = |value: &serde_json::Value| value.as_u64().unwrap() as usize;
+        let tolerance = 1e-4f32;
+        for (name, case) in golden["cases"].as_object().unwrap() {
+            let (start, len) = (as_usize(&case["start"]), as_usize(&case["len"]));
+            let mut samples = pcm[start..start + len].repeat(as_usize(&case["tile"]));
+            if case["click"].as_bool().unwrap() {
+                // Exactly 30 s ending in a 2 kHz burst: the dropped 3001st STFT
+                // frame is the loudest, so normalizing before the drop fails.
+                samples.truncate(480_000);
+                let burst = [0.0f32, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5];
+                let tail = samples.len() - 80;
+                for (idx, value) in samples[tail..].iter_mut().enumerate() {
+                    *value = burst[idx % burst.len()];
+                }
+            }
+            let (frames, n_mels) = (as_usize(&case["frames"]), as_usize(&case["mels"]));
+            let mel = MelSpectrogram::new(whisper_mel_config(n_mels)).unwrap();
+            let features = whisper_log_mel_frames(&mel, &samples, frames).unwrap();
+            assert_eq!(features.len(), frames * n_mels, "{name}");
+            let frame = |idx: usize| &features[idx * n_mels..(idx + 1) * n_mels];
+
+            let mut worst = 0f32;
+            let mut check = |got: f32, want: f32, what: &str| {
+                let diff = (got - want).abs();
+                assert!(diff <= tolerance, "{name} {what}: {got} vs HF {want}");
+                worst = worst.max(diff);
+            };
+            let max = features.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let min = features.iter().copied().fold(f32::INFINITY, f32::min);
+            let mean = features.iter().map(|v| *v as f64).sum::<f64>() / features.len() as f64;
+            check(max, as_f32(&case["max"]), "max");
+            check(min, as_f32(&case["min"]), "min");
+            check(mean as f32, as_f32(&case["mean"]), "mean");
+            let frame_means = case["frame_means"].as_array().unwrap();
+            for (idx, want) in frame_means.iter().enumerate() {
+                let got = frame(idx).iter().map(|v| *v as f64).sum::<f64>() / n_mels as f64;
+                check(got as f32, as_f32(want), &format!("frame {idx} mean"));
+            }
+            if let Some(floor) = case["floor"].as_f64() {
+                // Past the audio, every cell is the clamped floor (max - 8 + 4) / 4.
+                for value in &features[frame_means.len() * n_mels..] {
+                    check(*value, floor as f32, "padded floor");
+                }
+            }
+            let sampled = case["sampled"].as_array().unwrap();
+            let sampled_frames = case["sampled_frames"].as_array().unwrap();
+            for (idx, column) in sampled_frames.iter().zip(sampled) {
+                let idx = as_usize(idx);
+                for (mel_idx, want) in column.as_array().unwrap().iter().enumerate() {
+                    let at = format!("[{idx}][{mel_idx}]");
+                    check(frame(idx)[mel_idx], as_f32(want), &at);
+                }
+            }
+            eprintln!("{name}: max abs diff vs HF {worst:.2e}");
+        }
     }
 
     #[test]

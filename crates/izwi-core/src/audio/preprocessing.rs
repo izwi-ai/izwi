@@ -253,7 +253,8 @@ impl MelSpectrogram {
         }
     }
 
-    fn whisper_normalize_flat(log_mel: &mut [f32]) {
+    /// Whisper's log-mel normalization: clamp to `max - 8`, then `(x + 4) / 4`.
+    pub fn whisper_normalize_flat(log_mel: &mut [f32]) {
         let mut max_val = f32::NEG_INFINITY;
         for &value in log_mel.iter() {
             if value > max_val {
