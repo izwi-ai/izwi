@@ -484,7 +484,9 @@ impl DeviceProfile {
     /// The per-family Metal default, before `IZWI_METAL_DTYPE`.
     fn metal_family_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
         DTypeSelection {
-            dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+            dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts)
+                || request.model_family == Some(ModelFamily::WhisperAsr)
+            {
                 DType::F16
             } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                 DType::F32
@@ -497,6 +499,8 @@ impl DeviceProfile {
             },
             reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
                 "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
+            } else if request.model_family == Some(ModelFamily::WhisperAsr) {
+                "Whisper Metal policy runs its F16 checkpoint in F16 on every Apple family, with F32 softmax, LayerNorm statistics and logits (whisper.cpp, mlx-whisper, OpenAI Whisper)".into()
             } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                 "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
             } else if request.model_family == Some(ModelFamily::Voxtral)
@@ -1924,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_and_metal_whisper_model_dtype_defaults_to_f32() {
+    fn whisper_model_dtype_defaults_to_f32_on_cpu_and_f16_on_metal() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1951,8 +1955,30 @@ mod tests {
                 .unwrap(),
             DType::F32
         );
+        // Whisper's F16 checkpoint runs in F16 on every Apple family.
+        let metal_default = metal_profile.metal_default_dtype_selection_with(
+            DTypeSelectionRequest::new(None).with_model_family(ModelFamily::WhisperAsr),
+            MetalDTypeOverride::Auto,
+        );
+        assert_eq!(metal_default.dtype, DType::F16);
+        assert!(
+            metal_default.reason.contains("whisper.cpp"),
+            "{}",
+            metal_default.reason
+        );
         assert_eq!(
-            metal_profile.select_model_dtype(ModelFamily::WhisperAsr, None),
+            metal_profile
+                .metal_default_dtype_selection_with(
+                    DTypeSelectionRequest::new(None).with_model_family(ModelFamily::WhisperAsr),
+                    MetalDTypeOverride::F32,
+                )
+                .dtype,
+            DType::F32
+        );
+        assert_eq!(
+            metal_profile
+                .select_model_dtype_checked(ModelFamily::WhisperAsr, Some("f32"), "Whisper")
+                .unwrap(),
             DType::F32
         );
         assert_eq!(

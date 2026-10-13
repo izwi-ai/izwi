@@ -906,6 +906,9 @@ fn whisper_plan(
     let Some(files) = census_of(&whisper_weight_files(model_path)?)? else {
         return Ok(None);
     };
+    // F16 on Metal by default. A failed load-time self-check reloads in F32
+    // after dropping the F16 model; that rare fallback is not priced here
+    // (as for Parakeet and Nemotron), and live-memory admission sees it.
     price_whisper(&files, backend, whisper_weight_dtype(device)?).map(Some)
 }
 
@@ -1975,7 +1978,7 @@ mod tests {
             (
                 "Whisper-L-v3-Turbo",
                 Box::new(whisper),
-                [3.01, 3.01, 3.48, 1.51],
+                [3.01, 1.51, 1.74, 1.51],
             ),
             (
                 "Qwen3-ASR-0.6B",
@@ -2093,9 +2096,9 @@ mod tests {
                 plan.resident_bytes + NEMOTRON_MODEL_MEMO_MAX_BYTES
             );
         }
-        // Whisper: F16 on CUDA, F32 elsewhere. The computed encoder table
-        // replaces the checkpoint's; each fused self-attention adds a zero K
-        // bias.
+        // Whisper: F16 on CUDA and Metal, F32 on CPU. The computed encoder
+        // table replaces the checkpoint's; each fused self-attention adds a
+        // zero K bias.
         let files = census!("whisper_large_v3_turbo.json");
         let f16 = stored(&files, |_| true);
         let zero_biases = 36 * 1280;
@@ -2105,6 +2108,10 @@ mod tests {
         );
         assert_eq!(
             whisper(BackendKind::Cuda).resident_bytes,
+            f16 + 2 * zero_biases
+        );
+        assert_eq!(
+            whisper(BackendKind::Metal).logical_resident_bytes,
             f16 + 2 * zero_biases
         );
         // VibeVoice and Voxtral keep their BF16 checkpoint as is on CUDA.
@@ -2215,7 +2222,8 @@ mod tests {
     }
 
     /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
-    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 4.13;
+    /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16.
+    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 2.14;
     const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 7.30;
 
     /// A staged Metal loader casts on the host, so its uploads keep their
@@ -2360,6 +2368,17 @@ mod tests {
             vibevoice(BackendKind::Cpu).resident_bytes,
             2 * vibevoice(BackendKind::Metal).logical_resident_bytes
         );
+        // Whisper's Metal F16 default and its F32 escape hatches.
+        let _restore_whisper = Restore("IZWI_WHISPER_DTYPE");
+        let _restore_metal = Restore("IZWI_METAL_DTYPE");
+        let f16 = whisper(BackendKind::Metal).logical_resident_bytes;
+        let f32 = whisper(BackendKind::Cpu).resident_bytes;
+        assert!(f16 < f32);
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        assert_eq!(whisper(BackendKind::Metal).logical_resident_bytes, f32);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        std::env::set_var("IZWI_WHISPER_DTYPE", "f32");
+        assert_eq!(whisper(BackendKind::Metal).logical_resident_bytes, f32);
     }
 
     /// A Granite checkpoint with an untied LM head (the base variant) loads

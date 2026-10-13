@@ -133,6 +133,14 @@ diagnostics under `weight_precision`. Set `IZWI_PARAKEET_ASR_DTYPE=f32` or
 `IZWI_NEMOTRON_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) to keep every weight
 in F32.
 
+Whisper runs its F16 checkpoint in F16 on every Apple GPU, as whisper.cpp,
+mlx-whisper and OpenAI Whisper do. The log-mel input, attention softmax,
+LayerNorm statistics and logits stay in F32. This halves Whisper's weight
+memory (about 3.0 GiB to 1.5 GiB). A numeric self-check runs one encoder
+window and one decoder step at load; if it fails, Whisper loads in F32 and the
+reason appears in its diagnostics under `device.precision`. Set
+`IZWI_WHISPER_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) to run Whisper in F32.
+
 ---
 
 ## Data Locations

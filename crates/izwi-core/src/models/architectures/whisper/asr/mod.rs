@@ -26,17 +26,24 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::state::StaticAttentionLayerValue;
-use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{
+    backend_kind_for_device, BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceKind,
+    DeviceProfile,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::{
     InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::models::shared::weights::staged;
@@ -967,6 +974,12 @@ impl WhisperModel {
             Self::Local(model) => model.decoder.final_linear(x),
         }
     }
+
+    fn numeric_probe(&self, mel: &Tensor, token: u32) -> Result<Vec<(String, Tensor)>> {
+        match self {
+            Self::Local(model) => model.numeric_probe(mel, token),
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -981,14 +994,35 @@ fn whisper_device_diagnostics(
     device_kind: DeviceKind,
     model_dtype: DType,
     cuda_dtype_shim: bool,
+    precision: &PrecisionLoad,
 ) -> serde_json::Value {
     json!({
         "kind": format!("{device_kind:?}"),
         "model_dtype": format!("{model_dtype:?}"),
         "cuda_dtype_shim": cuda_dtype_shim,
         "whisper_impl": whisper_impl_name(cuda_dtype_shim),
+        "precision": whisper_precision_diagnostics(precision),
     })
 }
+
+/// The loaded precision, why, its self-check, and the work that stays F32
+/// whatever the weight dtype.
+fn whisper_precision_diagnostics(precision: &PrecisionLoad) -> serde_json::Value {
+    let mut diagnostics = precision.diagnostics();
+    diagnostics["f32_islands"] = json!(WHISPER_F32_ISLANDS);
+    diagnostics
+}
+
+/// Work Whisper keeps in F32 under F16 weights and activations, as OpenAI
+/// Whisper, whisper.cpp and mlx-whisper do: the log-mel (cast at the encoder
+/// input), attention softmax, LayerNorm statistics (Candle's fused kernel)
+/// and the logits the sampler reads.
+const WHISPER_F32_ISLANDS: &[&str] = &[
+    "log_mel",
+    "attention_softmax",
+    "layer_norm_statistics",
+    "logits",
+];
 
 fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
     if cuda_dtype_shim {
@@ -1038,19 +1072,96 @@ pub struct WhisperTurboAsrModel {
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
     cuda_dtype_shim: bool,
+    precision: PrecisionLoad,
 }
 
-/// The weight dtype the Whisper loader selects on `device`, honouring
-/// `IZWI_WHISPER_DTYPE`. Load admission prices the checkpoint at this dtype
-/// (`runtime/lifecycle/asr_memory.rs`).
-pub(crate) fn whisper_weight_dtype(device: &DeviceProfile) -> Result<DType> {
-    let requested = std::env::var("IZWI_WHISPER_DTYPE").ok();
-    match requested.as_deref().map(str::trim) {
-        Some(raw) if !raw.is_empty() => {
-            device.select_model_dtype_checked(ModelFamily::WhisperAsr, Some(raw), "Whisper")
+const WHISPER_DTYPE_ENV: &str = "IZWI_WHISPER_DTYPE";
+
+/// The weight and activation dtype the Whisper loader selects on `device`,
+/// and why, honouring `IZWI_WHISPER_DTYPE` and then `IZWI_METAL_DTYPE`.
+/// Whisper's checkpoint is F16; Metal runs it in F16 on every Apple family
+/// (the family default in `backends/device.rs`), as whisper.cpp, mlx-whisper
+/// and OpenAI Whisper do. Its Metal decoder state has no BF16 path, so a
+/// BF16 request there runs in F16. A Metal load that is not F32 must still
+/// pass [`whisper_numeric_self_check`] or it reloads in F32.
+pub(crate) fn whisper_weight_precision(device: &DeviceProfile) -> Result<DTypeSelection> {
+    let requested = std::env::var(WHISPER_DTYPE_ENV).ok();
+    let requested = requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    let request = DTypeSelectionRequest::new(requested).with_model_family(ModelFamily::WhisperAsr);
+    let selection = match device.try_resolve_dtype(request) {
+        Ok(selection) => selection,
+        Err(err) if device.kind.is_cuda() => {
+            return Err(Error::InvalidInput(format!(
+                "Invalid CUDA Whisper dtype override: {err}"
+            )));
         }
-        _ => Ok(device.select_model_dtype(ModelFamily::WhisperAsr, None)),
+        Err(err) => {
+            warn!("Ignoring {WHISPER_DTYPE_ENV} on {:?}: {err}", device.kind);
+            device.resolve_dtype(
+                DTypeSelectionRequest::new(None).with_model_family(ModelFamily::WhisperAsr),
+            )
+        }
+    };
+    if device.kind.is_metal() && selection.dtype == DType::BF16 {
+        return Ok(DTypeSelection {
+            dtype: DType::F16,
+            reason: format!(
+                "{}; Whisper's checkpoint is F16 and its Metal decoder state has no BF16 path, so it runs in F16",
+                selection.reason
+            )
+            .into(),
+        });
     }
+    Ok(selection)
+}
+
+/// The dtype of [`whisper_weight_precision`]. Load admission prices the
+/// checkpoint at this dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn whisper_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    whisper_weight_precision(device).map(|selection| selection.dtype)
+}
+
+/// Loads Whisper at `selection`'s dtype from `vb_at(dtype)`. With `check`,
+/// a dtype other than F32 is kept only if [`whisper_numeric_self_check`]
+/// passes; otherwise it reloads in F32 and records why.
+fn load_whisper_with_precision(
+    selection: &DTypeSelection,
+    check: bool,
+    config: &WhisperConfig,
+    probe_token: u32,
+    device: &candle_core::Device,
+    mut vb_at: impl FnMut(DType) -> Result<VarBuilder<'static>>,
+) -> Result<(WhisperModel, PrecisionLoad)> {
+    load_with_precision_fallback(
+        "Whisper",
+        selection,
+        check,
+        DType::F32,
+        |dtype| WhisperModel::load(&vb_at(dtype)?, config.clone()),
+        |model| whisper_numeric_self_check(model, config, selection.dtype, probe_token, device),
+    )
+}
+
+/// A 30 s window of xorshift log-mel (the encoder's real input length; the
+/// normalized log-mel lies in about [-1.5, 1.5]) through the encoder, then
+/// one decoder step for `probe_token`: every block output, the encoder
+/// output and the logits must be finite and below [`F16_SAFE_MAX_ABS`].
+fn whisper_numeric_self_check(
+    model: &WhisperModel,
+    config: &WhisperConfig,
+    dtype: DType,
+    probe_token: u32,
+    device: &candle_core::Device,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check(format!("Whisper {dtype:?}"), F16_SAFE_MAX_ABS, || {
+        let frames = config.max_source_positions.saturating_mul(2).max(1);
+        let mel = xorshift_tensor(&[1, config.num_mel_bins, frames], 0x3157, 1.5, device)?
+            .to_dtype(dtype)?;
+        model.numeric_probe(&mel, probe_token)
+    })
 }
 
 /// The safetensors files the Whisper loader maps: the shards of
@@ -1092,16 +1203,24 @@ impl WhisperTurboAsrModel {
         let generation = read_generation_config(model_dir)?;
         let tokenizer = Tokenizer::from_path(model_dir)?;
 
-        let model_dtype = whisper_weight_dtype(&device)?;
+        let selection = whisper_weight_precision(&device)?;
+        let special = resolve_special_tokens(&tokenizer, &generation)?;
 
         let weight_files = whisper_weight_files(model_dir)?;
-        let vb = unsafe {
-            staged::metal_staged_safetensors(&weight_files, model_dtype, &device.device)?
-        };
+        let (whisper, precision) = load_whisper_with_precision(
+            &selection,
+            device.kind.is_metal(),
+            &config,
+            special.sot,
+            &device.device,
+            |dtype| unsafe {
+                staged::metal_staged_safetensors(&weight_files, dtype, &device.device)
+                    .map_err(Error::from)
+            },
+        )?;
+        let model_dtype = precision.loaded;
 
         let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);
-        let whisper = WhisperModel::load(&vb, config.clone())?;
-        let special = resolve_special_tokens(&tokenizer, &generation)?;
         let (language_token_ids, token_id_to_language_code) =
             build_language_token_maps(&tokenizer, &generation);
         let language_token_range = contiguous_token_range(&language_token_ids);
@@ -1123,15 +1242,16 @@ impl WhisperTurboAsrModel {
             &special,
             runtime_tuning.suppress_blank,
             &numeral_symbol_tokens,
-            model_dtype,
+            // The decoder's logits are F32 whatever the model dtype.
+            DType::F32,
             &device.device,
         )?;
 
         let mel = MelSpectrogram::new(whisper_mel_config(config.num_mel_bins))?;
 
         info!(
-            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={})",
-            device.kind, model_dtype, use_cuda_dtype_shim
+            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={}): {}",
+            device.kind, model_dtype, use_cuda_dtype_shim, precision.reason
         );
 
         Ok(Self {
@@ -1153,6 +1273,7 @@ impl WhisperTurboAsrModel {
             token_id_to_language_code,
             runtime_tuning,
             cuda_dtype_shim: use_cuda_dtype_shim,
+            precision,
         })
     }
 
@@ -1743,6 +1864,7 @@ impl WhisperTurboAsrModel {
                     self.device.kind,
                     self.model_dtype,
                     self.cuda_dtype_shim,
+                    &self.precision,
                 ),
             );
             root.insert(
@@ -2178,6 +2300,7 @@ impl WhisperTurboAsrModel {
                 self.device.kind,
                 self.model_dtype,
                 self.cuda_dtype_shim,
+                &self.precision,
             ),
             "fallback_attempts": attempted_temperatures.len(),
             "attempted_temperatures": attempted_temperatures,
@@ -4309,13 +4432,24 @@ mod tests {
     }
 
     #[test]
-    fn whisper_device_diagnostics_keep_cpu_and_metal_on_local_f32() {
+    fn whisper_device_diagnostics_report_the_local_impl_and_precision() {
         for kind in [
             crate::backends::DeviceKind::Cpu,
             crate::backends::DeviceKind::Metal,
         ] {
-            let diagnostics = whisper_device_diagnostics(kind, candle_core::DType::F32, false);
+            let precision = super::PrecisionLoad::unchecked(&crate::backends::DTypeSelection {
+                dtype: DType::F32,
+                reason: "test".into(),
+            });
+            let diagnostics =
+                whisper_device_diagnostics(kind, candle_core::DType::F32, false, &precision);
             let expected_kind = format!("{kind:?}");
+            assert_eq!(diagnostics["precision"]["loaded_dtype"], "F32");
+            assert_eq!(diagnostics["precision"]["reason"], "test");
+            assert_eq!(
+                diagnostics["precision"]["f32_islands"],
+                serde_json::json!(super::WHISPER_F32_ISLANDS)
+            );
 
             assert_eq!(
                 diagnostics.get("kind").and_then(|value| value.as_str()),
@@ -6209,3 +6343,135 @@ const WHISPER_LANGUAGES: [(&str, &str); 100] = [
     ("su", "sundanese"),
     ("yue", "cantonese"),
 ];
+
+#[cfg(test)]
+mod precision_tests {
+    use candle_core::{DType, Device};
+    use candle_nn::VarBuilder;
+
+    use super::{load_whisper_with_precision, whisper_weight_precision, WHISPER_DTYPE_ENV};
+    use crate::backends::{DTypeSelection, DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::models::architectures::whisper::model::test_fixture::{tiny_config, tiny_tensors};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Restore(&'static [&'static str]);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for name in self.0 {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn metal_profile() -> DeviceProfile {
+        DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn whisper_metal_precision_defaults_to_f16_with_f32_escape_hatches() {
+        let _env = env_lock();
+        let _restore = Restore(&[WHISPER_DTYPE_ENV, "IZWI_METAL_DTYPE"]);
+        std::env::remove_var(WHISPER_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let metal = metal_profile();
+        let default = whisper_weight_precision(&metal).unwrap();
+        assert_eq!(default.dtype, DType::F16);
+        assert!(default.reason.contains("whisper.cpp"), "{}", default.reason);
+        assert_eq!(
+            whisper_weight_precision(&DeviceProfile::cpu())
+                .unwrap()
+                .dtype,
+            DType::F32
+        );
+
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F32);
+        // The family override is more specific than the global one.
+        std::env::set_var(WHISPER_DTYPE_ENV, "f16");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F16);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        std::env::set_var(WHISPER_DTYPE_ENV, "f32");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F32);
+
+        // Metal has no BF16 Whisper state; the F16 checkpoint runs in F16.
+        for (family, global) in [("bf16", ""), ("", "bf16")] {
+            std::env::set_var(WHISPER_DTYPE_ENV, family);
+            std::env::set_var("IZWI_METAL_DTYPE", global);
+            let selection = whisper_weight_precision(&metal).unwrap();
+            assert_eq!(selection.dtype, DType::F16, "{family:?} {global:?}");
+            assert!(selection.reason.contains("no BF16 path"), "{}", selection.reason);
+        }
+    }
+
+    fn load(
+        weight_scale: f32,
+        check: bool,
+    ) -> (super::WhisperModel, crate::kernels::numeric_check::PrecisionLoad, Vec<DType>) {
+        let config = tiny_config();
+        let tensors = tiny_tensors(&config, weight_scale);
+        let mut loads = Vec::new();
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test policy".into(),
+        };
+        let (model, precision) = load_whisper_with_precision(
+            &selection,
+            check,
+            &config,
+            3,
+            &Device::Cpu,
+            |dtype| {
+                loads.push(dtype);
+                Ok(VarBuilder::from_tensors(tensors.clone(), dtype, &Device::Cpu))
+            },
+        )
+        .unwrap();
+        (model, precision, loads)
+    }
+
+    #[test]
+    fn whisper_f16_load_keeps_f16_when_the_self_check_passes() {
+        let (_, precision, loads) = load(0.2, true);
+        assert_eq!(loads, [DType::F16]);
+        assert!(!precision.fell_back(), "{}", precision.reason);
+        let report = precision.self_check.as_ref().unwrap();
+        assert!(report.passed, "{}", report.reason);
+        // Every encoder and decoder block, the encoder output and the logits.
+        assert_eq!(report.tensors.len(), 2 + 1 + 2 + 1);
+        assert_eq!(report.tensors.last().unwrap().name, "logits");
+    }
+
+    /// Weights large enough to overflow F16 activations fail the check and
+    /// reload in F32, with the failure as the reason.
+    #[test]
+    fn whisper_f16_load_falls_back_to_f32_when_the_self_check_fails() {
+        let (_, precision, loads) = load(40.0, true);
+        assert_eq!(loads, [DType::F16, DType::F32]);
+        assert!(precision.fell_back());
+        assert_eq!(precision.loaded, DType::F32);
+        assert!(
+            precision.reason.starts_with("test policy; Whisper F16 self-check")
+                && precision.reason.ends_with("fell back to F32"),
+            "{}",
+            precision.reason
+        );
+        assert!(!precision.self_check.as_ref().unwrap().passed);
+        // Off Metal (no check) the requested dtype loads as is.
+        let (_, precision, loads) = load(40.0, false);
+        assert_eq!(loads, [DType::F16]);
+        assert!(precision.self_check.is_none());
+    }
+}
