@@ -492,15 +492,17 @@ impl DeviceProfile {
 
     /// The per-family Metal default, before `IZWI_METAL_DTYPE`.
     fn metal_family_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
+        if request.model_family == Some(ModelFamily::Voxtral)
+            && request.checkpoint_dtype != Some(DType::F32)
+        {
+            // Voxtral's BF16 checkpoint: BF16 on Apple9+ (once Metal paged
+            // attention takes BF16), F16 on Apple7/8, which also keeps
+            // realtime decoding within Apple GPU memory and latency limits.
+            return self.metal_bf16_checkpoint_lm_tier();
+        }
         DTypeSelection {
             dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts)
                 || request.model_family == Some(ModelFamily::WhisperAsr)
-            {
-                DType::F16
-            } else if request.model_family == Some(ModelFamily::VoxtralTts) {
-                DType::F32
-            } else if request.model_family == Some(ModelFamily::Voxtral)
-                && request.checkpoint_dtype != Some(DType::F32)
             {
                 DType::F16
             } else {
@@ -512,10 +514,6 @@ impl DeviceProfile {
                 "Whisper Metal policy runs its F16 checkpoint in F16 on every Apple family, with F32 softmax, LayerNorm statistics and logits (whisper.cpp, mlx-whisper, OpenAI Whisper)".into()
             } else if request.model_family == Some(ModelFamily::VoxtralTts) {
                 "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
-            } else if request.model_family == Some(ModelFamily::Voxtral)
-                && request.checkpoint_dtype != Some(DType::F32)
-            {
-                "Voxtral Metal policy uses F16 to keep realtime decoding within Apple GPU memory and latency limits".into()
             } else {
                 "Metal default dtype remains F32".into()
             },
@@ -1766,6 +1764,12 @@ mod tests {
                 .select_model_dtype_with_checkpoint(ModelFamily::Voxtral, Some(DType::BF16)),
             DType::F16
         );
+        let voxtral = metal_profile.resolve_dtype(
+            DTypeSelectionRequest::new(None)
+                .with_model_family(ModelFamily::Voxtral)
+                .with_checkpoint_dtype(DType::BF16),
+        );
+        assert!(voxtral.reason.contains("LM tier"), "{}", voxtral.reason);
         assert_eq!(
             metal_profile
                 .select_model_dtype_with_checkpoint(ModelFamily::Voxtral, Some(DType::F32)),

@@ -134,6 +134,23 @@ impl VoxtralLM {
         &self.device
     }
 
+    /// A private scratch cache for a load-time probe of `tokens` positions,
+    /// K/V in `dtype`.
+    pub(crate) fn scratch_probe_cache(
+        &self,
+        dtype: DType,
+        tokens: usize,
+    ) -> Result<PhysicalPagedKvCache> {
+        PhysicalPagedKvCache::scratch_for_probe(
+            &self.device,
+            dtype,
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.attention_geometry()?.key_head_dim(),
+            tokens,
+        )
+    }
+
     /// The dtype of the token embeddings (and so of the decoder activations).
     pub(crate) fn embedding_dtype(&self) -> DType {
         self.embed_tokens.embeddings().dtype()
@@ -1110,7 +1127,7 @@ impl VoxtralMlp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::BackendKind;
@@ -1206,6 +1223,15 @@ mod tests {
 
     /// Two layers with Ada RMSNorm and xorshift weights.
     fn tiny_ada_model(device: &Device, layers: usize) -> VoxtralLM {
+        tiny_ada_model_with_dtype(device, layers, DType::F32)
+    }
+
+    /// The tiny Ada-norm LM with its weights and activations in `dtype`.
+    pub(crate) fn tiny_ada_model_with_dtype(
+        device: &Device,
+        layers: usize,
+        dtype: DType,
+    ) -> VoxtralLM {
         let mut cfg = tiny_cfg();
         cfg.num_hidden_layers = layers;
         cfg.vocab_size = 16;
@@ -1244,12 +1270,7 @@ mod tests {
         for name in norms {
             tensors.insert(name, Tensor::ones(4, DType::F32, device).unwrap());
         }
-        VoxtralLM::load(
-            cfg,
-            VarBuilder::from_tensors(tensors, DType::F32, device),
-            false,
-        )
-        .unwrap()
+        VoxtralLM::load(cfg, VarBuilder::from_tensors(tensors, dtype, device), false).unwrap()
     }
 
     fn bits(tensor: &Tensor) -> Vec<u32> {

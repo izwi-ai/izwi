@@ -12,10 +12,14 @@ use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
-use crate::backends::{BackendKind, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::qwen3::core::build_rope_cache;
 use crate::models::architectures::voxtral::lm::{VoxtralAdaScales, VoxtralLM};
@@ -138,6 +142,57 @@ pub struct VoxtralRealtimeModel {
     layout: VoxtralRealtimeLayout,
     realtime_max_source_samples: usize,
     max_decoded_token_bytes: usize,
+    /// The dtype this model loaded with, why, and its self-check.
+    precision: PrecisionLoad,
+}
+
+/// LM positions the load-time self-check runs.
+const VOXTRAL_PROBE_LM_TOKENS: usize = 16;
+
+/// The components [`voxtral_numeric_probe`] runs.
+struct VoxtralProbeParts<'a> {
+    encoder: &'a WhisperEncoder,
+    adapter: &'a AudioLanguageAdapter,
+    pool_size: usize,
+    language_model: &'a VoxtralLM,
+    ada: &'a VoxtralAdaScales,
+    n_mels: usize,
+}
+
+/// Xorshift log-mel (the normalized log-mel lies in about [-1.5, 1.5]) for
+/// [`VOXTRAL_PROBE_LM_TOKENS`] LM positions through the encoder, the pooling
+/// adapter and every LM layer and the head, on a scratch cache with K/V in
+/// `dtype`. Returns the encoder output, the adapter output and the logits.
+fn voxtral_numeric_probe(
+    parts: VoxtralProbeParts<'_>,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<Vec<(String, Tensor)>> {
+    let frames = VOXTRAL_PROBE_LM_TOKENS
+        .checked_mul(2 * parts.pool_size.max(1))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral probe overflow".into()))?;
+    let mel = xorshift_tensor(&[1, frames, parts.n_mels], 0x7A11, 1.5, device)?.to_dtype(dtype)?;
+    let encoded = parts.encoder.forward(&mel)?;
+    let pooled = pool_audio_embeddings_by_block(&encoded, parts.pool_size)?;
+    let embeds = parts
+        .adapter
+        .forward(&pooled)?
+        .to_dtype(parts.language_model.embedding_dtype())?;
+    let mut cache = parts
+        .language_model
+        .scratch_probe_cache(dtype, embeds.dim(1)?)?;
+    let logits = parts.language_model.forward_managed_with_embeds(
+        &embeds,
+        0,
+        &mut cache,
+        None,
+        Some(parts.ada),
+    )?;
+    Ok(vec![
+        ("encoder".to_string(), encoded),
+        ("adapter".to_string(), embeds),
+        ("logits".to_string(), logits),
+    ])
 }
 
 #[derive(Debug, Clone)]
@@ -237,8 +292,38 @@ fn voxtral_realtime_offline_frame_limit(
 }
 
 impl VoxtralRealtimeModel {
-    /// Load model from directory
+    /// Load model from directory. On Metal a dtype below F32 must pass
+    /// [`Self::numeric_self_check`], or the model reloads in F32.
     pub fn load(model_dir: &Path, device: DeviceProfile, prefix_reuse: bool) -> Result<Self> {
+        let config_str = read_voxtral_config(model_dir)?;
+        let runtime_config = load_voxtral_runtime_config(model_dir)?;
+        let selection = voxtral_precision(
+            &device,
+            voxtral_checkpoint_dtype(&config_str, &runtime_config),
+        );
+        let check = device.kind.is_metal();
+        let (mut model, precision) = load_with_precision_fallback(
+            "Voxtral",
+            &selection,
+            check,
+            DType::F32,
+            |dtype| Self::load_with_dtype(model_dir, device.clone(), prefix_reuse, dtype),
+            Self::numeric_self_check,
+        )?;
+        info!(
+            "Voxtral Realtime precision: {:?} ({})",
+            precision.loaded, precision.reason
+        );
+        model.precision = precision;
+        Ok(model)
+    }
+
+    fn load_with_dtype(
+        model_dir: &Path,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+        dtype: DType,
+    ) -> Result<Self> {
         let config_str = read_voxtral_config(model_dir)?;
         let config: VoxtralConfig = serde_json::from_str(&config_str)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse config: {}", e)))?;
@@ -275,8 +360,6 @@ impl VoxtralRealtimeModel {
             geometry.audio_length_per_tok,
         )?;
         let realtime_max_source_samples = realtime_source_sample_ceiling(&config, &layout)?;
-
-        let dtype = select_voxtral_dtype(&device, checkpoint_dtype);
 
         // Load weights - clone device to a local binding for lifetime
         let device_clone = device.clone();
@@ -332,7 +415,37 @@ impl VoxtralRealtimeModel {
             layout,
             realtime_max_source_samples,
             max_decoded_token_bytes,
+            precision: PrecisionLoad::unchecked(&DTypeSelection {
+                dtype,
+                reason: "set by VoxtralRealtimeModel::load".into(),
+            }),
         })
+    }
+
+    /// The load-time self-check: xorshift log-mel for
+    /// [`VOXTRAL_PROBE_LM_TOKENS`] LM positions through the encoder, the
+    /// pooling adapter and every LM layer and the head (on a scratch cache in
+    /// the model's K/V dtype). Encoder, adapter and logits must be finite
+    /// and below the F16-safe range.
+    fn numeric_self_check(&self) -> NumericSelfCheckReport {
+        run_numeric_self_check(
+            format!("Voxtral {:?}", self.dtype),
+            F16_SAFE_MAX_ABS,
+            || {
+                voxtral_numeric_probe(
+                    VoxtralProbeParts {
+                        encoder: &self.whisper_encoder,
+                        adapter: &self.audio_adapter,
+                        pool_size: self.layout.pool_size,
+                        language_model: &self.language_model,
+                        ada: &self.ada_scales,
+                        n_mels: self.mel.config().n_mels,
+                    },
+                    self.dtype,
+                    &self.device.device,
+                )
+            },
+        )
     }
 
     pub(crate) fn physical_state_spec(
@@ -1732,6 +1845,7 @@ impl VoxtralRealtimeModel {
             "execution": {
                 "device_kind": format!("{:?}", self.device.kind),
                 "dtype": format!("{:?}", self.dtype),
+                "precision": self.precision.diagnostics(),
                 "flash_attention_requested": flash_attention_requested(),
                 "flash_attention_compiled": flash_attention_compiled(),
                 "cache": cache,
@@ -3641,7 +3755,18 @@ fn checked_delay_tokens(audio: &AudioConfig, runtime: &VoxtralRuntimeConfig) -> 
 }
 
 fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
-    device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
+    voxtral_precision(device, checkpoint_dtype).dtype
+}
+
+/// Voxtral's dtype on `device`, and why: a BF16 checkpoint takes the Metal
+/// BF16-checkpoint LM tier (`backends/device.rs`), `IZWI_METAL_DTYPE`
+/// replaces it, CUDA follows the checkpoint and CPU runs F32.
+fn voxtral_precision(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DTypeSelection {
+    let mut request = DTypeSelectionRequest::new(None).with_model_family(ModelFamily::Voxtral);
+    if let Some(dtype) = checkpoint_dtype {
+        request = request.with_checkpoint_dtype(dtype);
+    }
+    device.resolve_dtype(request)
 }
 
 /// Exact (erf) GELU, as HF and vLLM apply after each stem convolution.
@@ -4371,5 +4496,121 @@ mod tests {
         // At 12.5 Hz the 1024-token cap is reached at 78 s of audio.
         assert_eq!(frames(78.0), PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
         assert!(frames(78.1) > PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
+    }
+
+    /// The Voxtral load-time probe on a tiny model: encoder, adapter and
+    /// logits finite, and the F16 run within F16 rounding of F32.
+    fn voxtral_probe_outputs(
+        weights: &std::collections::HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Vec<(String, Vec<f32>)> {
+        use super::super::audio::{AudioLanguageAdapter, TimeEmbedding};
+        use super::{voxtral_numeric_probe, VoxtralProbeParts, WhisperEncoder};
+        use crate::kernels::numeric_check::host_f32;
+        use crate::models::architectures::voxtral::lm::tests::tiny_ada_model_with_dtype;
+
+        let cfg = voxtral_probe_encoder_config();
+        let tensors = weights
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.to_device(device).unwrap()))
+            .collect();
+        let vb = candle_nn::VarBuilder::from_tensors(tensors, dtype, device);
+        let encoder = WhisperEncoder::load_voxtral(&cfg, vb.pp("encoder")).unwrap();
+        let adapter = AudioLanguageAdapter::load(4 * 32, 4, vb.pp("adapter")).unwrap();
+        let lm = tiny_ada_model_with_dtype(device, 2, dtype);
+        let t_cond = TimeEmbedding::new(4, 10_000.0, device)
+            .unwrap()
+            .forward(&Tensor::new(&[6f32], device).unwrap())
+            .unwrap()
+            .to_dtype(lm.embedding_dtype())
+            .unwrap();
+        let ada = lm.ada_scales(&t_cond).unwrap();
+        voxtral_numeric_probe(
+            VoxtralProbeParts {
+                encoder: &encoder,
+                adapter: &adapter,
+                pool_size: 4,
+                language_model: &lm,
+                ada: &ada,
+                n_mels: 8,
+            },
+            dtype,
+            device,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(name, tensor)| (name, host_f32(&tensor).unwrap()))
+        .collect()
+    }
+
+    fn voxtral_probe_encoder_config() -> super::super::config::AudioEncoderConfig {
+        super::super::config::AudioEncoderConfig {
+            d_model: 32,
+            encoder_layers: 2,
+            encoder_attention_heads: 4,
+            encoder_ffn_dim: 64,
+            num_mel_bins: 8,
+            max_source_positions: 512,
+            window_size: 400,
+            hop_length: 160,
+            sampling_rate: 16_000,
+            is_causal: true,
+            conv1_kernel_size: 3,
+            conv1_stride: 1,
+            conv2_kernel_size: 3,
+            conv2_stride: 2,
+            global_log_mel_max: None,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            pos_embed: "rope".into(),
+            sliding_window: 16,
+        }
+    }
+
+    /// Random encoder and adapter weights for [`voxtral_probe_outputs`].
+    fn voxtral_probe_weights() -> std::collections::HashMap<String, Tensor> {
+        use super::super::audio::AudioLanguageAdapter;
+        use super::WhisperEncoder;
+
+        let cfg = voxtral_probe_encoder_config();
+        let vars = candle_nn::VarMap::new();
+        let host = candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        WhisperEncoder::load_voxtral(&cfg, host.pp("encoder")).unwrap();
+        AudioLanguageAdapter::load(4 * 32, 4, host.pp("adapter")).unwrap();
+        let data = vars.data().lock().unwrap();
+        data.iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect()
+    }
+
+    fn assert_voxtral_probe_tracks_f32(device: &Device, dtype: DType) {
+        use crate::kernels::numeric_check::relative_l2;
+        let weights = voxtral_probe_weights();
+        let low = voxtral_probe_outputs(&weights, device, dtype);
+        let reference = voxtral_probe_outputs(&weights, &Device::Cpu, DType::F32);
+        assert_eq!(low.len(), 3);
+        for ((name, low), (_, reference)) in low.iter().zip(&reference) {
+            assert!(low.iter().all(|value| value.is_finite()), "{name}");
+            let rel = relative_l2(low, reference);
+            assert!(rel < 2e-2, "{name}: {dtype:?} vs F32 relative L2 {rel:e}");
+        }
+        // 16 LM positions from the 128-frame window.
+        assert_eq!(low[2].1.len(), 16 * 16);
+    }
+
+    #[test]
+    fn voxtral_numeric_probe_runs_encoder_adapter_and_lm_on_cpu() {
+        assert_voxtral_probe_tracks_f32(&Device::Cpu, DType::F32);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_voxtral_numeric_probe_in_f16_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_voxtral_probe_tracks_f32(&device, DType::F16);
     }
 }

@@ -142,6 +142,13 @@ probe; if the probe fails it loads in F32, and the reason appears under
 `execution.lm_precision`. The same two settings now also keep the language
 model fully in F32.
 
+Voxtral Realtime keeps its F16 default on Metal and now runs a short
+encoder-and-decoder self-check at load; if it fails, Voxtral loads in F32 and
+the reason appears under `execution.precision`. `IZWI_METAL_DTYPE=f32` runs it
+in F32. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
+Voxtral, VibeVoice and Qwen3-ASR, but it stays off until izwi's Metal attention
+kernels support BF16; those GPUs use F16 for now.
+
 Whisper runs its F16 checkpoint in F16 on every Apple GPU, as whisper.cpp,
 mlx-whisper and OpenAI Whisper do. The log-mel input, attention softmax,
 LayerNorm statistics and logits stay in F32. This halves Whisper's weight
