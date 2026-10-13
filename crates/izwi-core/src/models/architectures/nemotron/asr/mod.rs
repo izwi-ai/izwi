@@ -39,9 +39,9 @@ pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILEN
 pub(crate) use nemo::nemotron_checkpoint_paths;
 pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
-    default_realtime_state_shape, resample_linear, NemotronEncodeProfile, NemotronNetwork,
-    NemotronRealtimeStateShape, NemotronRnntStreamState, NemotronStreamingEncoderState,
-    NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    causal_subsampled_len, default_realtime_state_shape, resample_linear, NemotronEncodeProfile,
+    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
+    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
 
@@ -1118,7 +1118,8 @@ fn nemotron_realtime_state_contract(
         ));
     }
     let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
-    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    // Causal subsampling keeps len / 2 + 1 frames per stride-2 stage.
+    let encoded_frames = causal_subsampled_len(feature_frames, shape.subsampling_factor).max(1);
     let feature = fixed_component(
         1,
         TensorRole::AudioHistory,
@@ -1409,7 +1410,8 @@ fn estimate_realtime_resource_reservation(
     }
 
     let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
-    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    // Causal subsampling keeps len / 2 + 1 frames per stride-2 stage.
+    let encoded_frames = causal_subsampled_len(feature_frames, shape.subsampling_factor).max(1);
     let max_output_tokens = encoded_frames
         .checked_mul(shape.max_symbols_per_frame)
         .ok_or_else(realtime_reservation_overflow)?;
@@ -3582,11 +3584,12 @@ mod tests {
         let reservation =
             estimate_realtime_resource_reservation(16_000, 8, &profile, shape, &prompt).unwrap();
 
+        // 100 feature frames -> 14 causal encoder frames (51, 26, 14).
         assert_eq!(reservation.max_samples, 16_000);
-        assert_eq!(reservation.max_output_tokens, 130);
-        assert_eq!(reservation.max_text_bytes, 4_160);
-        assert_eq!(reservation.host_bytes, 357_946);
-        assert_eq!(reservation.tensor_bytes, 6_411_264);
+        assert_eq!(reservation.max_output_tokens, 140);
+        assert_eq!(reservation.max_text_bytes, 4_480);
+        assert_eq!(reservation.host_bytes, 360_746);
+        assert_eq!(reservation.tensor_bytes, 6_415_360);
         let retained_and_worker_audio_bytes =
             16_000_u64 * 2 * std::mem::size_of::<f32>() as u64 * 2;
         assert!(
