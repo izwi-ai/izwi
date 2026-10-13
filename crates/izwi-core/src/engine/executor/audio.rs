@@ -6,8 +6,11 @@ use serde_json::json;
 use std::time::Instant;
 use tracing::debug;
 
+use crate::catalog::ModelFamily;
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
+use crate::models::registry::NativeAsrModel;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes_canonical};
 
 use super::super::output::{AsrProgress, AsrProgressPhase};
@@ -43,6 +46,22 @@ pub(crate) struct PlannedAsrChunks {
     pub(crate) input_samples: usize,
     pub(crate) sample_rate: u32,
     pub(crate) planning_ms: f64,
+}
+
+#[cfg(test)]
+impl PlannedAsrChunks {
+    /// A long-form plan for routing tests that never execute it.
+    pub(crate) fn unexecuted_for_tests() -> Self {
+        Self {
+            config: AsrLongFormConfig::default(),
+            chunks: Vec::new(),
+            planner: AsrChunkPlannerKind::Duration,
+            speech_plan: None,
+            input_samples: 0,
+            sample_rate: 0,
+            planning_ms: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,13 +200,109 @@ impl PlannedAsrChunks {
     }
 }
 
-pub(super) fn qwen3_asr_requires_long_form(
-    samples: &[f32],
-    sample_rate: u32,
-    model_max_chunk_secs: Option<f32>,
-) -> bool {
-    NativeExecutor::asr_chunk_plan(samples, sample_rate, model_max_chunk_secs, false, false)
-        .requires_chunk_path()
+/// What the ASR route planner knows about a loaded model. The route plan is a
+/// function of these, the audio and whether the request streams.
+#[derive(Debug, Clone)]
+pub(crate) struct AsrRouteCapabilities {
+    /// Longest audio one invocation may cover: the model window composed with
+    /// the effective context and decode budget. `None` means unbounded.
+    pub(crate) invocation_limit_secs: Option<f32>,
+    /// One pass covers the whole model window rather than one long-form
+    /// chunk.
+    pub(crate) single_pass_spans_model_window: bool,
+    /// Every chunk costs the encoder's full fixed window.
+    pub(crate) fixed_encoder_window: bool,
+    /// Long audio is chunked on detected speech islands.
+    pub(crate) prefers_vad_planner: bool,
+    /// The chunk route streams this model's tokens while a chunk decodes.
+    pub(crate) streams_within_chunk: bool,
+    /// Chunking for audio that needs more than one pass.
+    pub(crate) chunk_config: AsrLongFormConfig,
+}
+
+impl AsrRouteCapabilities {
+    pub(crate) fn for_family(family: ModelFamily, invocation_limit_secs: Option<f32>) -> Self {
+        let fixed_encoder_window = family.asr_fixed_encoder_window();
+        Self {
+            invocation_limit_secs,
+            single_pass_spans_model_window: family.asr_single_pass_spans_model_window(),
+            fixed_encoder_window,
+            // A fixed-window encoder pads a mostly silent chunk with a full
+            // window of silence, which a decoder that hallucinates on
+            // non-speech turns into text. Speech islands avoid such chunks.
+            prefers_vad_planner: fixed_encoder_window && family.hallucinates_on_non_speech(),
+            streams_within_chunk: family.asr_streams_within_chunk(),
+            chunk_config: NativeExecutor::asr_long_form_config(),
+        }
+    }
+
+    /// Capabilities of a loaded `NativeAsrModel` for one request: its
+    /// invocation window fitted to the effective context with the decode
+    /// budget the model plans for that much audio.
+    pub(crate) fn for_native_model(
+        model: &NativeAsrModel,
+        variant: ModelVariant,
+        request: &EngineCoreRequest,
+        effective_context: Option<usize>,
+    ) -> Result<Self> {
+        let window = model.asr_invocation_window(variant, request.asr_native_word_timestamps);
+        let limit = crate::runtime::compose_invocation_audio_limit(
+            window.max_audio_seconds,
+            model.audio_token_rate(),
+            effective_context,
+            |secs| super::handler_asr::asr_planned_decode_tokens(request, variant.family(), secs),
+        )?;
+        let limit = match window.max_chunk_seconds {
+            Some(cap) => Some(limit.map_or(cap, |limit| limit.min(cap))),
+            None => limit,
+        };
+        Ok(Self::for_family(variant.family(), limit))
+    }
+
+    pub(crate) fn with_chunk_config(mut self, chunk_config: AsrLongFormConfig) -> Self {
+        self.chunk_config = chunk_config;
+        self
+    }
+
+    /// Audio one invocation fits, with a 5% margin.
+    fn fit_limit_secs(&self) -> Option<f32> {
+        self.invocation_limit_secs
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v * 0.95)
+    }
+
+    /// Cap the chunk planner applies on top of `config`'s own chunk length.
+    fn tuned_chunk_limit_secs(&self, config: &AsrLongFormConfig) -> Option<f32> {
+        self.fit_limit_secs()
+            .map(|v| v.max(config.min_chunk_secs.max(1.0)))
+    }
+
+    /// Longest audio this model transcribes in one pass, streaming or not;
+    /// `None` when any length runs in one pass.
+    pub(crate) fn single_pass_limit_secs(&self) -> Option<f32> {
+        if self.single_pass_spans_model_window {
+            return self.fit_limit_secs();
+        }
+        // The chunk planner's own single-chunk bound.
+        let floor = self.chunk_config.min_chunk_secs.max(0.1);
+        let chunk = self.chunk_config.hard_max_chunk_secs.max(floor);
+        Some(match self.tuned_chunk_limit_secs(&self.chunk_config) {
+            Some(limit) => chunk.min(limit.max(floor)),
+            None => chunk,
+        })
+    }
+
+    pub(crate) fn supports_single_pass_up_to(&self, audio_secs: f32) -> bool {
+        self.single_pass_limit_secs()
+            .is_none_or(|limit| audio_secs <= limit)
+    }
+
+    /// Short latency chunks replace the accuracy plan for a streaming request
+    /// only when the model would otherwise emit text a whole chunk at a time,
+    /// and only when a short chunk is actually cheaper to decode.
+    fn latency_chunks_when_streaming(&self) -> bool {
+        !self.streams_within_chunk && !self.fixed_encoder_window
+    }
 }
 
 fn samples_to_seconds(samples: usize, sample_rate: u32) -> f32 {
@@ -338,142 +453,82 @@ impl NativeExecutor {
         .any(|key| std::env::var(key).is_ok())
     }
 
-    pub(super) fn asr_chunk_plan(
+    /// The ASR route plan: how a request's audio is segmented, decided once
+    /// from the model's capabilities, the audio and whether the request
+    /// streams. Preparation stores it on the request and the executor runs it
+    /// as stored.
+    ///
+    /// - Audio that fits one pass runs single pass in both modes. One pass is
+    ///   the whole model window for models built to cover it, otherwise one
+    ///   long-form chunk, and never more than 95% of the invocation limit.
+    /// - Longer audio is chunked the same way whether or not the request
+    ///   streams: the chunk route streams each chunk's tokens as they decode.
+    ///   The one exception is a streaming request for a model that cannot
+    ///   stream within a chunk and has no fixed encoder window; it gets short
+    ///   latency chunks, since its text otherwise arrives a full chunk at a
+    ///   time.
+    /// - A model that prefers the VAD planner chunks long audio on speech
+    ///   islands, in both modes.
+    pub(crate) fn asr_route_plan(
         samples: &[f32],
         sample_rate: u32,
-        model_max_chunk_secs: Option<f32>,
-        streaming_low_latency: bool,
-        allow_speech_planner: bool,
-    ) -> PlannedAsrChunks {
-        Self::asr_chunk_plan_with_options(
-            samples,
-            sample_rate,
-            model_max_chunk_secs,
-            streaming_low_latency,
-            allow_speech_planner,
-        )
-    }
-
-    /// Chunk-planner flags for an ASR request. A streaming request always plans
-    /// for latency; the VAD speech planner is a non-streaming accuracy feature
-    /// and must never override a streaming request's plan, for any family.
-    pub(super) fn asr_chunk_plan_streaming_args(
-        request_streaming: bool,
-        family_accuracy_planner: bool,
-    ) -> (bool, bool) {
-        (
-            request_streaming,
-            !request_streaming && family_accuracy_planner,
-        )
-    }
-
-    fn asr_chunk_plan_with_options(
-        samples: &[f32],
-        sample_rate: u32,
-        model_max_chunk_secs: Option<f32>,
-        mut streaming_low_latency: bool,
-        allow_speech_planner: bool,
+        capabilities: &AsrRouteCapabilities,
+        streaming: bool,
     ) -> PlannedAsrChunks {
         let planning_started = Instant::now();
-        if allow_speech_planner {
-            streaming_low_latency = false;
-        }
-        let audio_secs = if sample_rate > 0 {
-            samples.len() as f32 / sample_rate as f32
-        } else {
-            0.0
+        let audio_secs = samples_to_seconds(samples.len(), sample_rate);
+        let finish = |config: AsrLongFormConfig,
+                      chunks: Vec<AudioChunk>,
+                      planner: AsrChunkPlannerKind,
+                      speech_plan: Option<SpeechChunkPlan>| PlannedAsrChunks {
+            config,
+            chunks,
+            planner,
+            speech_plan,
+            input_samples: samples.len(),
+            sample_rate,
+            planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
         };
-        let model_fit_limit_secs = model_max_chunk_secs
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| v * 0.95);
-        if streaming_low_latency
-            && !Self::stream_chunk_overrides_present()
-            && model_fit_limit_secs
-                .map(|limit| audio_secs <= limit)
-                .unwrap_or(false)
-        {
-            let mut single_chunk_cfg = Self::asr_long_form_config();
-            let single_chunk_secs = audio_secs.max(single_chunk_cfg.min_chunk_secs.max(0.5));
-            single_chunk_cfg.target_chunk_secs = single_chunk_secs;
-            single_chunk_cfg.hard_max_chunk_secs = single_chunk_secs;
-            single_chunk_cfg.overlap_secs =
-                single_chunk_cfg.overlap_secs.min(single_chunk_secs * 0.1);
-            single_chunk_cfg.silence_search_secs = single_chunk_cfg
-                .silence_search_secs
-                .min(single_chunk_secs * 0.25);
+        let cfg = capabilities.chunk_config.clone();
+        if capabilities.supports_single_pass_up_to(audio_secs) {
+            let chunks = if samples.is_empty() || sample_rate == 0 {
+                Vec::new()
+            } else {
+                vec![AudioChunk {
+                    start_sample: 0,
+                    end_sample: samples.len(),
+                }]
+            };
+            return finish(cfg, chunks, AsrChunkPlannerKind::Duration, None);
+        }
+
+        if streaming && capabilities.latency_chunks_when_streaming() {
+            let latency_cfg = Self::asr_streaming_low_latency_config(audio_secs);
             let chunks = plan_audio_chunks(
                 samples,
                 sample_rate,
-                &single_chunk_cfg,
-                model_fit_limit_secs.map(|v| v.max(single_chunk_cfg.min_chunk_secs.max(1.0))),
+                &latency_cfg,
+                capabilities.tuned_chunk_limit_secs(&latency_cfg),
             );
-            return PlannedAsrChunks {
-                config: single_chunk_cfg,
-                chunks,
-                planner: AsrChunkPlannerKind::Duration,
-                speech_plan: None,
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
-        }
-
-        let cfg = if streaming_low_latency {
-            Self::asr_streaming_low_latency_config(audio_secs)
-        } else {
-            Self::asr_long_form_config()
-        };
-        let tuned_limit = model_max_chunk_secs
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| (v * 0.95).max(cfg.min_chunk_secs.max(1.0)));
-
-        if allow_speech_planner {
-            let speech_cfg = AsrSpeechChunkConfig::default();
-            let speech_plan =
-                plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
-            return PlannedAsrChunks {
-                chunks: speech_plan.chunks.clone(),
-                config: cfg,
-                planner: AsrChunkPlannerKind::Speech,
-                speech_plan: Some(speech_plan),
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
-        }
-
-        let mut chunks = plan_audio_chunks(samples, sample_rate, &cfg, tuned_limit);
-
-        if streaming_low_latency && chunks.len() > MAX_STREAMING_LOW_LATENCY_CHUNKS {
+            if chunks.len() <= MAX_STREAMING_LOW_LATENCY_CHUNKS {
+                return finish(latency_cfg, chunks, AsrChunkPlannerKind::Duration, None);
+            }
             debug!(
                 "ASR streaming chunk plan too fragmented ({} chunks), relaxing to long-form defaults",
                 chunks.len()
             );
-            let fallback_cfg = Self::asr_long_form_config();
-            let fallback_limit = model_max_chunk_secs
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .map(|v| (v * 0.95).max(fallback_cfg.min_chunk_secs.max(1.0)));
-            chunks = plan_audio_chunks(samples, sample_rate, &fallback_cfg, fallback_limit);
-            return PlannedAsrChunks {
-                config: fallback_cfg,
-                chunks,
-                planner: AsrChunkPlannerKind::Duration,
-                speech_plan: None,
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
         }
 
-        PlannedAsrChunks {
-            config: cfg,
-            chunks,
-            planner: AsrChunkPlannerKind::Duration,
-            speech_plan: None,
-            input_samples: samples.len(),
-            sample_rate,
-            planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
+        let tuned_limit = capabilities.tuned_chunk_limit_secs(&cfg);
+        if capabilities.prefers_vad_planner {
+            let speech_cfg = AsrSpeechChunkConfig::default();
+            let speech_plan =
+                plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
+            let chunks = speech_plan.chunks.clone();
+            return finish(cfg, chunks, AsrChunkPlannerKind::Speech, Some(speech_plan));
         }
+        let chunks = plan_audio_chunks(samples, sample_rate, &cfg, tuned_limit);
+        finish(cfg, chunks, AsrChunkPlannerKind::Duration, None)
     }
 
     pub(super) fn transcribe_with_chunk_plan<F>(
@@ -1113,9 +1168,10 @@ mod tests {
     use crate::engine::EngineStreamPolicy;
 
     use super::{
-        AsrChunkPlannerKind, AsrChunkStreamOptions, AsrChunkTranscription, NativeExecutor,
-        TranscriptStreamCursor,
+        AsrChunkPlannerKind, AsrChunkStreamOptions, AsrChunkTranscription, AsrRouteCapabilities,
+        NativeExecutor, PlannedAsrChunks, TranscriptStreamCursor,
     };
+    use crate::catalog::ModelFamily;
 
     #[test]
     fn next_audio_delta_emits_only_new_tail_samples() {
@@ -1199,233 +1255,192 @@ mod tests {
         );
     }
 
-    #[test]
-    fn asr_chunk_plan_streaming_args_request_drives_the_plan() {
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(true, true);
-        assert!(low_latency, "streaming requests always plan for latency");
-        assert!(
-            !speech_planner,
-            "the VAD speech planner is a non-streaming accuracy feature"
-        );
-
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(false, true);
-        assert!(!low_latency);
-        assert!(speech_planner, "non-streaming keeps family accuracy policy");
-
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(true, false);
-        assert!(low_latency);
-        assert!(!speech_planner);
-
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(false, false);
-        assert!(!low_latency);
-        assert!(!speech_planner);
+    fn caps(family: ModelFamily, limit: Option<f32>) -> AsrRouteCapabilities {
+        AsrRouteCapabilities::for_family(family, limit)
     }
 
+    fn plan(
+        family: ModelFamily,
+        limit: Option<f32>,
+        samples: &[f32],
+        sr: u32,
+        streaming: bool,
+    ) -> PlannedAsrChunks {
+        NativeExecutor::asr_route_plan(samples, sr, &caps(family, limit), streaming)
+    }
+
+    /// Representative invocation limits: Qwen3 off CUDA (1500 encoder
+    /// positions), Whisper's and Nemotron's 30 s window, Granite's 9 min ASR
+    /// task, VibeVoice's hour; Parakeet, Voxtral and LFM2.5 set none.
+    const ROUTE_FAMILIES: [(ModelFamily, Option<f32>); 8] = [
+        (ModelFamily::Qwen3Asr, Some(120.0)),
+        (ModelFamily::WhisperAsr, Some(30.0)),
+        (ModelFamily::GraniteSpeechAsr, Some(540.0)),
+        (ModelFamily::VibeVoiceAsr, Some(3600.0)),
+        (ModelFamily::NemotronAsr, Some(30.0)),
+        (ModelFamily::ParakeetAsr, None),
+        (ModelFamily::Voxtral, None),
+        (ModelFamily::Lfm25Audio, None),
+    ];
+
+    #[derive(Debug, PartialEq)]
+    enum Route {
+        SinglePass,
+        /// Long-form chunks on the given planner, identical in both modes.
+        Chunked(AsrChunkPlannerKind),
+        /// Streaming only: short chunks for latency.
+        LatencyChunks,
+    }
+
+    fn route_of(plan: &PlannedAsrChunks, accuracy: &PlannedAsrChunks) -> Route {
+        if !plan.requires_chunk_path() {
+            return Route::SinglePass;
+        }
+        if plan.chunks == accuracy.chunks
+            && plan.config.target_chunk_secs == accuracy.config.target_chunk_secs
+            && plan.planner == accuracy.planner
+        {
+            return Route::Chunked(plan.planner);
+        }
+        assert!(plan.config.target_chunk_secs <= super::DEFAULT_STREAM_LONG_TARGET_CHUNK_SECS);
+        Route::LatencyChunks
+    }
+
+    /// The route decision table: family x duration x mode.
     #[test]
-    fn speech_planner_still_overrides_streaming_if_both_requested() {
-        // Internal invariant of the planner: the speech planner wins if a caller
-        // ever requests both. Call-site policy (asr_chunk_plan_streaming_args)
-        // keeps the two mutually exclusive.
+    fn route_plan_decision_table() {
+        use AsrChunkPlannerKind::{Duration, Speech};
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 30];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
+        let expected = |family: ModelFamily, secs: usize, streaming: bool| -> Route {
+            if secs <= 20 {
+                return Route::SinglePass;
+            }
+            match family {
+                ModelFamily::VibeVoiceAsr | ModelFamily::ParakeetAsr => Route::SinglePass,
+                ModelFamily::WhisperAsr => Route::Chunked(Speech),
+                // Granite cannot stream within a chunk; 600 s of latency
+                // chunks is too fragmented and relaxes to the accuracy plan.
+                ModelFamily::GraniteSpeechAsr if streaming && secs < 600 => Route::LatencyChunks,
+                _ => Route::Chunked(Duration),
+            }
+        };
+        for secs in [20usize, 60, 116, 600] {
+            let samples = vec![0.0f32; sr as usize * secs];
+            for (family, limit) in ROUTE_FAMILIES {
+                let accuracy = plan(family, limit, &samples, sr, false);
+                for streaming in [false, true] {
+                    let planned = plan(family, limit, &samples, sr, streaming);
+                    assert_eq!(
+                        route_of(&planned, &accuracy),
+                        expected(family, secs, streaming),
+                        "{family:?} {secs}s streaming={streaming}"
+                    );
+                    if planned.requires_chunk_path() {
+                        let fit = limit.map_or(f32::INFINITY, |limit| limit * 0.95);
+                        for chunk in &planned.chunks {
+                            let chunk_secs = chunk.len_samples() as f32 / sr as f32;
+                            assert!(chunk_secs <= fit.min(30.0) + 1e-3, "{family:?} {secs}s");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn streaming_plan_sizes_long_audio_for_latency_not_accuracy() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 60];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.config.target_chunk_secs <= super::DEFAULT_STREAM_LONG_TARGET_CHUNK_SECS,
-            "expected latency-sized streaming chunks, got target {}s",
-            plan.config.target_chunk_secs
-        );
-        assert!(
-            plan.chunks.len() > 1,
-            "expected 60s audio to split into streaming chunks, got {}",
-            plan.chunks.len()
-        );
+    fn single_pass_limit_agrees_with_the_chunk_planner() {
+        let sr = 1_000u32;
+        for (family, limit) in ROUTE_FAMILIES {
+            let capabilities = caps(family, limit);
+            let Some(limit_secs) = capabilities.single_pass_limit_secs() else {
+                assert!(capabilities.supports_single_pass_up_to(1e6));
+                continue;
+            };
+            let at_limit = vec![0.0f32; (limit_secs * sr as f32).floor() as usize];
+            let past_limit = vec![0.0f32; at_limit.len() + 2];
+            assert!(
+                !NativeExecutor::asr_route_plan(&at_limit, sr, &capabilities, false)
+                    .requires_chunk_path(),
+                "{family:?}"
+            );
+            assert!(
+                NativeExecutor::asr_route_plan(&past_limit, sr, &capabilities, false)
+                    .requires_chunk_path(),
+                "{family:?}"
+            );
+            if !capabilities.single_pass_spans_model_window {
+                let chunks = izwi_asr_toolkit::plan_audio_chunks(
+                    &at_limit,
+                    sr,
+                    &capabilities.chunk_config,
+                    capabilities.tuned_chunk_limit_secs(&capabilities.chunk_config),
+                );
+                assert_eq!(chunks.len(), 1, "{family:?}");
+            }
+        }
     }
 
     #[test]
-    fn streaming_low_latency_chunk_plan_keeps_very_short_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected a single chunk, got {}",
-            plan.chunks.len()
-        );
+    fn capability_flags_come_from_the_family() {
+        let whisper = caps(ModelFamily::WhisperAsr, Some(30.0));
+        assert!(whisper.fixed_encoder_window && whisper.prefers_vad_planner);
+        let qwen = caps(ModelFamily::Qwen3Asr, Some(120.0));
+        assert!(!qwen.fixed_encoder_window && !qwen.prefers_vad_planner);
+        assert!(qwen.streams_within_chunk);
+        assert!(!caps(ModelFamily::GraniteSpeechAsr, None).streams_within_chunk);
+        assert!(caps(ModelFamily::VibeVoiceAsr, None).single_pass_spans_model_window);
     }
 
     #[test]
-    fn streaming_low_latency_chunk_plan_splits_medium_audio() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 8];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, None, true, false);
-        assert!(
-            plan.chunks.len() > 1,
-            "expected multiple chunks, got {}",
-            plan.chunks.len()
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_keeps_model_fit_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 20];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected a single chunk for model-fit audio, got {}",
-            plan.chunks.len()
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_splits_audio_when_model_hint_is_exceeded() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 40];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.chunks.len() > 1,
-            "expected chunking beyond model hint, got {}",
-            plan.chunks.len()
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_keeps_long_audio_single_chunk_when_model_hint_fits() {
+    fn whole_window_model_chunks_past_its_window() {
         let sr = 10u32;
-        let audio_secs = 50 * 60;
-        let samples = vec![0.0f32; sr as usize * audio_secs];
-
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(60.0 * 60.0), true, false);
-
-        assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected model-fit 50-minute audio to stay single chunk"
-        );
-        assert!(
-            !plan.requires_chunk_path(),
-            "model-fit single chunk should bypass chunked transcription"
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_forces_long_audio_chunk_path_before_model_prefill() {
-        let sr = 10u32;
-        let audio_secs = 50 * 60;
-        let model_hint_secs = 120.0f32;
-        let model_fit_limit_secs = model_hint_secs * 0.95;
-        let samples = vec![0.0f32; sr as usize * audio_secs];
-
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(model_hint_secs), true, false);
-
-        assert!(
-            plan.requires_chunk_path(),
-            "expected 50-minute model-limited audio to use chunked transcription"
-        );
-        assert!(
-            plan.chunks.len() > 1,
-            "expected multiple chunks, got {}",
-            plan.chunks.len()
-        );
-        let max_chunk_secs = plan
+        let samples = vec![0.0f32; sr as usize * 50 * 60];
+        let fits = plan(ModelFamily::VibeVoiceAsr, Some(3600.0), &samples, sr, false);
+        assert!(!fits.requires_chunk_path());
+        let limited = plan(ModelFamily::VibeVoiceAsr, Some(120.0), &samples, sr, true);
+        assert!(limited.requires_chunk_path());
+        let max_chunk_secs = limited
             .chunks
             .iter()
             .map(|chunk| chunk.len_samples() as f32 / sr as f32)
             .fold(0.0f32, f32::max);
-        assert!(
-            max_chunk_secs <= model_fit_limit_secs + 1.0 / sr as f32,
-            "expected chunk duration <= {model_fit_limit_secs}s, got {max_chunk_secs}s"
-        );
+        assert!(max_chunk_secs <= 30.0 + 1.0 / sr as f32);
     }
 
     #[test]
-    fn speech_planner_plan_is_identical_for_streaming_and_standard_requests() {
-        // Documents planner dominance inside asr_chunk_plan: when the speech
-        // planner runs it produces the same plan regardless of the streaming
-        // flag. Call-site policy keeps the planner out of streaming requests
-        // entirely (asr_chunk_plan_streaming_args).
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 40];
-        let streaming = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
-        let standard = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
-
-        assert_eq!(
-            streaming.config.target_chunk_secs,
-            standard.config.target_chunk_secs
-        );
-        assert_eq!(
-            streaming.config.hard_max_chunk_secs,
-            standard.config.hard_max_chunk_secs
-        );
-        assert_eq!(streaming.config.overlap_secs, standard.config.overlap_secs);
-        assert_eq!(streaming.chunks, standard.chunks);
-    }
-
-    #[test]
-    fn standard_chunk_plan_keeps_short_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, false);
-        assert_eq!(plan.chunks.len(), 1);
-    }
-
-    #[test]
-    fn streaming_chunk_plan_relaxes_when_chunk_count_is_too_high() {
+    fn latency_plan_relaxes_when_chunk_count_is_too_high() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 180];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.chunks.len() <= 24,
-            "expected guarded chunk count, got {}",
-            plan.chunks.len()
+        let planned = plan(
+            ModelFamily::GraniteSpeechAsr,
+            Some(540.0),
+            &samples,
+            sr,
+            true,
         );
+        assert!(planned.chunks.len() <= 24, "got {}", planned.chunks.len());
     }
 
     #[test]
-    fn speech_chunk_plan_is_default_for_allowed_models() {
+    fn vad_route_plan_can_return_no_speech() {
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
-        assert!(plan.requires_chunk_path());
-        assert!(plan.chunks.is_empty());
-        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
-    }
-
-    #[test]
-    fn vad_chunk_plan_can_return_no_speech() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan =
-            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
-        assert!(plan.requires_chunk_path());
-        assert!(plan.chunks.is_empty());
-        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
+        let samples = vec![0.0f32; (sr as usize) * 60];
+        for streaming in [false, true] {
+            let planned = plan(ModelFamily::WhisperAsr, Some(30.0), &samples, sr, streaming);
+            assert_eq!(planned.planner, AsrChunkPlannerKind::Speech);
+            assert!(planned.requires_chunk_path());
+            assert!(planned.chunks.is_empty());
+            assert!(planned.speech_plan.as_ref().expect("speech plan").no_speech);
+        }
     }
 
     #[test]
     fn chunk_plan_diagnostics_include_timing_and_seconds() {
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan =
-            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
+        let samples = vec![0.0f32; (sr as usize) * 60];
+        let planned = plan(ModelFamily::WhisperAsr, Some(30.0), &samples, sr, false);
 
-        let diagnostics = plan.diagnostics();
+        let diagnostics = planned.diagnostics();
         let chunking = diagnostics
             .get("chunking")
             .and_then(|value| value.as_object())
@@ -1451,7 +1466,7 @@ mod tests {
             .expect("speech diagnostics");
         assert_eq!(
             speech.get("skipped_seconds").and_then(|v| v.as_f64()),
-            Some(4.0)
+            Some(60.0)
         );
     }
 
@@ -2241,7 +2256,12 @@ mod tests {
     fn chunk_plan_diagnostics_can_embed_transcription_details() {
         let sr = 10u32;
         let samples = vec![0.0f32; sr as usize * 2];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(1.0), false, false);
+        let plan = NativeExecutor::asr_route_plan(
+            &samples,
+            sr,
+            &caps(ModelFamily::Qwen3Asr, Some(1.0)),
+            false,
+        );
 
         let diagnostics = plan.diagnostics_with_chunk_transcriptions(vec![
             serde_json::json!({ "index": 0, "text_chars": 5 }),

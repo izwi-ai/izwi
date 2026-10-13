@@ -4529,20 +4529,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 let geometry = (!long_form)
                     .then(|| {
                         model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
@@ -4560,7 +4559,7 @@ impl RuntimeService {
                     .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                 } else {
                     request.install_prepared_sequence_input_tokens(
                         input_tokens.expect("normal Qwen3 ASR shape"),
@@ -4761,20 +4760,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 let geometry = (!long_form)
                     .then(|| {
                         model_for_shape.whisper_window_preparation_geometry(&samples, sample_rate)
@@ -4782,7 +4780,7 @@ impl RuntimeService {
                     .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                 }
                 Ok((request, geometry))
             })
@@ -5030,7 +5028,25 @@ impl RuntimeService {
                         Ok((request, Some(geometry)))
                     }
                     VibeVoiceAsrPreparationDecision::LegacyInvocation => {
-                        request.install_prepared_asr_long_form_atomic()?;
+                        let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let (samples, sample_rate) =
+                            request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                                Error::InferenceError(
+                                    "VibeVoice ASR preparation lost its decoded audio".into(),
+                                )
+                            })?;
+                        let plan = crate::engine::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &capabilities,
+                            request.streaming,
+                        );
+                        request.install_prepared_asr_long_form_atomic(plan)?;
                         Ok((request, None))
                     }
                 }
@@ -5224,17 +5240,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |secs| crate::runtime::asr::granite_asr_planned_max_tokens(&request, secs),
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 // Granite's retained decoder is not quality-certified: the
                 // real model can collapse to tokenizer id 0 for every output
                 // step while its invocation-scoped physical route produces
@@ -5264,7 +5282,7 @@ impl RuntimeService {
                     )?;
                     Ok((request, Some(geometry)))
                 } else {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
                 }
             })
@@ -5449,7 +5467,13 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let long_form = model_for_shape.asr_requires_long_form(&samples, sample_rate);
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &model_for_shape.asr_route_capabilities(),
+                    request.streaming,
+                );
+                let long_form = plan.requires_chunk_path();
                 let envelope = (!long_form)
                     .then(|| {
                         model_for_shape.lfm25_audio_asr_preparation_resource_envelope(
@@ -5466,7 +5490,7 @@ impl RuntimeService {
                     )?;
                     Ok((request, Some(envelope)))
                 } else {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
                 }
             })
@@ -10284,7 +10308,11 @@ mod tests {
         long_form
             .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
             .unwrap();
-        long_form.install_prepared_asr_long_form_atomic().unwrap();
+        long_form
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         let (long_spec, long_observation) = runtime
             .coordinator_job_for_request(&long_form)
             .expect("long-form streaming job");
@@ -10860,7 +10888,11 @@ mod tests {
         offline_asr
             .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 16_000], 16_000)
             .unwrap();
-        offline_asr.install_prepared_asr_long_form_atomic().unwrap();
+        offline_asr
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
             CoordinatorLane::Atomic
@@ -10886,7 +10918,9 @@ mod tests {
         );
         let mut whisper_long = EngineCoreRequest::asr("audio").with_model_variant(whisper_variant);
         whisper_long
-            .install_prepared_asr_long_form_atomic()
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
             .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&whisper_long),
@@ -10903,7 +10937,11 @@ mod tests {
             CoordinatorLane::Resumable
         );
         let mut vibe_long = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
-        vibe_long.install_prepared_asr_long_form_atomic().unwrap();
+        vibe_long
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&vibe_long),
             CoordinatorLane::Atomic
@@ -10919,7 +10957,11 @@ mod tests {
             CoordinatorLane::Resumable
         );
         let mut lfm_long = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
-        lfm_long.install_prepared_asr_long_form_atomic().unwrap();
+        lfm_long
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&lfm_long),
             CoordinatorLane::Atomic

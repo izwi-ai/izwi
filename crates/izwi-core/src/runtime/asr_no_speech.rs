@@ -279,7 +279,9 @@ pub(crate) mod tests {
             .install_prepared_asr_audio(variant, vec![0.0; 160], SAMPLE_RATE)
             .expect("prepared audio");
         routed
-            .install_prepared_asr_long_form_atomic()
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
             .expect("prepared route");
         assert!(routed.uses_asr_long_form_atomic());
         assert!(!asr_no_speech_gate_applies(&routed));

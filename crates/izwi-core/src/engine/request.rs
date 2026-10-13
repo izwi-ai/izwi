@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
+use super::executor::PlannedAsrChunks;
 use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
@@ -1145,6 +1146,8 @@ pub struct EngineCoreRequest {
     /// instead of manufacturing placeholder token IDs.
     pub(super) prepared_sequence_input_tokens: Option<usize>,
     pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
+    /// Segmentation a long-form row executes, planned once at preparation.
+    pub(super) prepared_asr_route_plan: Option<Arc<PlannedAsrChunks>>,
     pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
     /// Digest of the encoded upload, keyed by the buffer it was computed
     /// from. Preparation hashes the upload once; the per-step accessors reuse
@@ -3582,7 +3585,12 @@ impl EngineCoreRequest {
         Ok(())
     }
 
-    pub(crate) fn install_prepared_asr_long_form_atomic(&mut self) -> Result<()> {
+    /// Route the request to the long-form atomic executor, which runs `plan`
+    /// as planned here.
+    pub(crate) fn install_prepared_asr_long_form_atomic(
+        &mut self,
+        plan: PlannedAsrChunks,
+    ) -> Result<()> {
         if self.task_type != TaskType::ASR {
             return Err(Error::InvalidInput(format!(
                 "Request {} cannot install an ASR long-form route for {:?}",
@@ -3601,7 +3609,13 @@ impl EngineCoreRequest {
             )));
         }
         self.prepared_asr_execution_shape = Some(PreparedAsrExecutionShape::LongFormAtomic);
+        self.prepared_asr_route_plan = Some(Arc::new(plan));
         Ok(())
+    }
+
+    /// The segmentation preparation planned for a long-form row.
+    pub(crate) fn prepared_asr_route_plan(&self) -> Option<Arc<PlannedAsrChunks>> {
+        self.prepared_asr_route_plan.clone()
     }
 
     pub(crate) fn prepared_asr_execution_shape(&self) -> Option<PreparedAsrExecutionShape> {
@@ -4618,6 +4632,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -4682,6 +4697,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -4746,6 +4762,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -4807,6 +4824,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -4869,6 +4887,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -4931,6 +4950,7 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
             asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
@@ -6102,12 +6122,19 @@ mod tests {
             .install_prepared_sequence_input_tokens(32, 4096)
             .unwrap();
         assert!(normal.uses_asr_retained_sequence());
-        assert!(normal.install_prepared_asr_long_form_atomic().is_err());
+        assert!(normal
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests()
+            )
+            .is_err());
 
         let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
         long.install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
             .unwrap();
-        long.install_prepared_asr_long_form_atomic().unwrap();
+        long.install_prepared_asr_long_form_atomic(
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+        )
+        .unwrap();
         assert!(long.uses_asr_long_form_atomic());
         assert!(long
             .install_prepared_sequence_input_tokens(32, 4096)

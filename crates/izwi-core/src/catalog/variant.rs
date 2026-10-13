@@ -63,6 +63,38 @@ impl ModelFamily {
             | Self::Tokenizer => false,
         }
     }
+
+    /// Whether this family's ASR encoder pads every input to one fixed window
+    /// (Whisper's 30 s mel window). A shorter chunk then costs a full window,
+    /// so the route planner never cuts such a model's audio below its window
+    /// for latency.
+    pub fn asr_fixed_encoder_window(self) -> bool {
+        matches!(self, Self::WhisperAsr)
+    }
+
+    /// Whether one ASR invocation is meant to cover the model's whole audio
+    /// window (VibeVoice's hour-long context, Parakeet's windowed encoder),
+    /// rather than the shared ~30 s long-form chunk.
+    pub fn asr_single_pass_spans_model_window(self) -> bool {
+        matches!(self, Self::VibeVoiceAsr | Self::ParakeetAsr)
+    }
+
+    /// Whether the chunked ASR route can stream this family's text token by
+    /// token while a chunk decodes. Granite's chunk decode replays earlier
+    /// text as a prefix and may re-decode a looping chunk, so its chunk text is
+    /// known only when the chunk finishes.
+    pub fn asr_streams_within_chunk(self) -> bool {
+        matches!(
+            self,
+            Self::WhisperAsr
+                | Self::Qwen3Asr
+                | Self::VibeVoiceAsr
+                | Self::ParakeetAsr
+                | Self::NemotronAsr
+                | Self::Lfm25Audio
+                | Self::Voxtral
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

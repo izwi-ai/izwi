@@ -27,6 +27,7 @@ use crate::models::architectures::gemma3::chat::{
     ChatDecodeCheckpoint as Gemma3ChatDecodeCheckpoint, ChatDecodeState as Gemma3ChatDecodeState,
     Gemma3ChatModel,
 };
+use crate::models::architectures::granite_speech::asr::granite_speech_request_plan;
 use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechAsrGenerationOptions, GraniteSpeechAsrModel, GraniteSpeechAsrTranscriptionOutput,
     GraniteSpeechDecodeCheckpoint, GraniteSpeechDecodeState, GraniteSpeechDecodeStep,
@@ -799,20 +800,6 @@ impl NativeAsrDecodeState {
         }
     }
 
-    pub(crate) fn install_qwen3_managed_reservation(
-        &mut self,
-        cache: PhysicalPagedKvCache,
-    ) -> Result<()> {
-        match self {
-            Self::Qwen3(state) => state.install_managed_reservation(cache),
-            Self::Whisper(_) | Self::VibeVoice(_) | Self::GraniteSpeech(_) | Self::Nemotron(_) => {
-                Err(Error::InvalidInput(
-                    "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR state".to_string(),
-                ))
-            }
-        }
-    }
-
     pub(crate) fn begin_managed_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -1042,6 +1029,15 @@ pub struct NativeAsrRealtimeEvent {
     pub text: String,
     pub is_final: bool,
     pub chunk_index: usize,
+}
+
+/// Audio one ASR invocation may cover for a request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AsrInvocationWindow {
+    /// The model's window; `None` when the model sets none.
+    pub(crate) max_audio_seconds: Option<f32>,
+    /// Cap on a planned chunk, below the window.
+    pub(crate) max_chunk_seconds: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2606,6 +2602,33 @@ impl NativeAsrModel {
         }
     }
 
+    /// Audio one invocation may cover for a request, and a cap on each
+    /// planned chunk below it. Granite's window depends on the task the
+    /// request selects (native word timestamps run a shorter task).
+    pub(crate) fn asr_invocation_window(
+        &self,
+        variant: ModelVariant,
+        native_word_timestamps: bool,
+    ) -> AsrInvocationWindow {
+        match self {
+            Self::GraniteSpeech(_) => {
+                let plan = granite_speech_request_plan(variant, native_word_timestamps);
+                AsrInvocationWindow {
+                    max_audio_seconds: Some(plan.max_audio_seconds),
+                    max_chunk_seconds: plan.max_chunk_seconds,
+                }
+            }
+            Self::Qwen3(_)
+            | Self::Parakeet(_)
+            | Self::Nemotron(_)
+            | Self::WhisperTurbo(_)
+            | Self::VibeVoice(_) => AsrInvocationWindow {
+                max_audio_seconds: self.max_audio_seconds_hint(),
+                max_chunk_seconds: None,
+            },
+        }
+    }
+
     /// Decoder-prompt tokens added per second of audio for families whose
     /// audio is embedded into the autoregressive prompt. `None` means audio
     /// never reaches decoder self-attention (encoder-only, cross-attention,
@@ -2682,35 +2705,6 @@ impl NativeAsrModel {
             )),
             Self::GraniteSpeech(_) => Err(Error::InvalidInput(
                 "Incremental decode state is not available for this ASR model".to_string(),
-            )),
-        }
-    }
-
-    /// Start Qwen3 ASR with an exact scheduler-owned cache reservation.
-    /// Other ASR architectures fail closed until they provide their own
-    /// managed-cache adapter instead of being selected by family inference.
-    pub(crate) fn start_decode_state_with_prompt_managed(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        prompt: Option<&str>,
-        max_new_tokens: usize,
-        cache: PhysicalPagedKvCache,
-    ) -> Result<NativeAsrDecodeState> {
-        match self {
-            Self::Qwen3(model) => Ok(NativeAsrDecodeState::Qwen3(
-                model.start_decode_with_prompt_managed(
-                    audio,
-                    sample_rate,
-                    language,
-                    prompt,
-                    max_new_tokens,
-                    cache,
-                )?,
-            )),
-            _ => Err(Error::InvalidInput(
-                "managed Qwen3 KV cache was supplied to a non-Qwen3 ASR model".to_string(),
             )),
         }
     }
@@ -3064,17 +3058,6 @@ fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
     cfg
 }
 
-fn lfm25_audio_asr_requires_long_form(audio: &[f32], sample_rate: u32) -> bool {
-    plan_audio_chunks(
-        audio,
-        sample_rate,
-        &lfm25_audio_asr_long_form_config(),
-        None,
-    )
-    .len()
-        > 1
-}
-
 fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
     max_tokens
         .or_else(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"))
@@ -3291,8 +3274,21 @@ impl NativeAudioChatModel {
         }
     }
 
-    pub(crate) fn asr_requires_long_form(&self, audio: &[f32], sample_rate: u32) -> bool {
-        lfm25_audio_asr_requires_long_form(audio, sample_rate)
+    /// ASR route capabilities: LFM2.5 Audio sets no invocation window and
+    /// chunks long audio with its own long-form config.
+    pub(crate) fn asr_route_capabilities(&self) -> crate::engine::AsrRouteCapabilities {
+        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
+            .with_chunk_config(lfm25_audio_asr_long_form_config())
+    }
+
+    /// Decode budget for one long-form chunk of `duration_secs` audio, or the
+    /// caller's limit.
+    pub(crate) fn lfm25_audio_asr_chunk_max_new_tokens(
+        &self,
+        duration_secs: f32,
+        max_tokens: Option<usize>,
+    ) -> usize {
+        lfm25_audio_asr_chunk_max_new_tokens(duration_secs, max_tokens)
     }
 
     pub(crate) fn prepare_lfm25_audio_asr_artifact(
@@ -4023,6 +4019,12 @@ pub struct VoxtralModelLease {
 impl VoxtralModelLease {
     pub(crate) fn model_arc(&self) -> Arc<VoxtralRealtimeModel> {
         self.inner.model.clone()
+    }
+
+    /// Offline ASR route capabilities: Voxtral sets no invocation window and
+    /// chunks long audio with the shared long-form config.
+    pub(crate) fn asr_route_capabilities(&self) -> crate::engine::AsrRouteCapabilities {
+        crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Voxtral, None)
     }
 
     pub(crate) fn start_realtime_state(&self, language: Option<&str>) -> VoxtralRealtimeState {
@@ -7787,16 +7789,20 @@ mod tests {
             .and_then(|value| value.checked_add(1))
             .expect("test audio length");
 
+        let capabilities =
+            crate::engine::AsrRouteCapabilities::for_family(ModelFamily::Lfm25Audio, None)
+                .with_chunk_config(cfg.clone());
+        let requires_long_form = |audio: &[f32]| {
+            crate::engine::asr_route_plan(audio, sample_rate, &capabilities, false)
+                .requires_chunk_path()
+        };
         let one_chunk = vec![0.0; one_chunk_samples];
         assert_eq!(
-            lfm25_audio_asr_requires_long_form(&one_chunk, sample_rate),
+            requires_long_form(&one_chunk),
             plan_audio_chunks(&one_chunk, sample_rate, &cfg, None).len() > 1
         );
         let multi_chunk = vec![0.0; multi_chunk_samples];
-        assert!(lfm25_audio_asr_requires_long_form(
-            &multi_chunk,
-            sample_rate
-        ));
+        assert!(requires_long_form(&multi_chunk));
     }
 
     #[test]
