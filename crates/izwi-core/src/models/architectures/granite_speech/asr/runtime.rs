@@ -576,6 +576,43 @@ impl GraniteTextExecutionPlan {
     }
 }
 
+/// The load-time representation switches `GraniteSpeechRuntime::load`
+/// resolves for weights of `dtype` on `device`. Load admission prices the
+/// checkpoint in this form (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraniteLoadRepresentation {
+    /// A tied LM head gets its own F16 copy of the embedding.
+    pub(crate) f16_lm_head: bool,
+    /// Q/K/V projections load as F16.
+    pub(crate) f16_qkv: bool,
+    /// Gate/up and down projections load as F16.
+    pub(crate) f16_mlp: bool,
+    /// The attention output projection loads as F16.
+    pub(crate) f16_attention_output: bool,
+    /// Q/K/V are concatenated into one projection.
+    pub(crate) qkv_fusion: bool,
+    /// Gate and up are concatenated into one projection.
+    pub(crate) gate_up_fusion: bool,
+    /// o_proj and down_proj are pre-scaled by the residual multiplier.
+    pub(crate) residual_prescale: bool,
+}
+
+pub(crate) fn granite_load_representation(
+    device: &Device,
+    dtype: DType,
+) -> GraniteLoadRepresentation {
+    let plan = GraniteTextExecutionPlan::for_device(device, dtype);
+    GraniteLoadRepresentation {
+        f16_lm_head: plan.selective_f16_lm_head,
+        f16_qkv: plan.selective_f16_qkv,
+        f16_mlp: plan.selective_f16_mlp,
+        f16_attention_output: plan.selective_f16_attention_output,
+        qkv_fusion: granite_projection_fusion_enabled(device),
+        gate_up_fusion: granite_gate_up_projection_fusion_enabled(device),
+        residual_prescale: granite_residual_prescale_enabled(device),
+    }
+}
+
 fn granite_text_attention_geometry(config: &GraniteTextConfig) -> Result<AttentionGeometry> {
     for (name, value) in [
         ("rope_theta", config.rope_theta),

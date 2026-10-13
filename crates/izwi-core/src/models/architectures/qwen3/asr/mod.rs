@@ -54,6 +54,7 @@ use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 
+pub(crate) use audio::QWEN3_ASR_AUDIO_POSITIONS;
 use audio::AudioTower;
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};

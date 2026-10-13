@@ -1,0 +1,2308 @@
+//! Load admission for the ASR families on every backend: the residency plan of
+//! the ASR admission framework (`AsrResidencyPlan`). Each family prices the
+//! header census of the files its loader reads (tensor name, stored dtype and
+//! shape from the safetensors, GGUF or PyTorch headers, never the payloads) in
+//! the form that loader leaves resident on the selected backend. The dtypes come
+//! from the loader's own resolvers, so a dtype policy change reprices admission
+//! without a table to update here. One plan answers first admission and the
+//! Metal OOM retry on CPU, Metal and CUDA alike; the catalog's
+//! `memory_required_gb` stays a display figure for these variants.
+//!
+//! A plan prices, on the load backend's domain (host memory on CPU, unified
+//! memory on Metal, device memory on CUDA):
+//! - Resident weights: every tensor the loader reads, in its resident form (kept
+//!   quantized, dequantized or cast), plus the copies it makes (Granite's F16 LM
+//!   head, LFM's second Q6_K token-embedding read, Qwen3-ASR's separate Q8_0
+//!   `lm_head` beside its dense embedding) and the tables it computes. Tensors it
+//!   never reads are left out. On Metal, a buffer a device kernel writes (a cast,
+//!   a concatenation, any op output) is sized the way Candle 0.11's pool
+//!   allocates it, rounded up to the next power of two (`candle-core`
+//!   `metal_backend/device.rs`, `buf_size`). Host uploads keep their exact size.
+//! - The load peak: resident plus everything alive while loading. Candle keeps a
+//!   Metal shared buffer it released, such as the stored-dtype upload of a cast
+//!   tensor, until the next device synchronization. The safetensors and PyTorch
+//!   loaders never synchronize before the load fence, so all their uploads stay
+//!   until then; every GGUF dequantization synchronizes. Freed private-pool
+//!   intermediates, such as the parts of a fused projection, are reused by later
+//!   allocations, so only their high-water mark counts. CPU and CUDA release a
+//!   buffer when it drops.
+//! - CUDA host staging, which is the whole CUDA host authorization: the largest
+//!   per-tensor host copy, or the NeMo extraction buffer of a first load.
+//! - The Nemotron model memo bound, resident on the load device.
+//!
+//! Approximations, each conservative unless noted:
+//! - On CUDA every tensor is priced as staged through one host copy. Candle
+//!   copies a memory-mapped safetensors payload only when it is misaligned.
+//! - Candle's pool can serve a later, smaller allocation from a larger freed
+//!   buffer, so a Metal resident can occupy more than priced (not
+//!   conservative). The peak is unaffected because that buffer was already
+//!   counted.
+//! - Derived tensors under about 1 MiB per family (concatenated norm gains,
+//!   scalars, decode masks, the LFM conformer BatchNorm folds) are not priced.
+//! - A first NeMo load has no checkpoint header to read yet; its weights are
+//!   priced from the archive's payload size (`price_nemo_first_load`).
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use candle_core::quantized::GgmlDType;
+use candle_core::DType;
+
+use super::{
+    census_checkpoint_file, CensusFile, CensusTensor, ModelMemoryEstimate, ModelResourcePlan,
+    StoredDType,
+};
+use crate::backends::{BackendKind, DeviceProfile};
+use crate::catalog::ModelFamily;
+use crate::engine::ResourceAmount;
+use crate::error::{Error, Result};
+use crate::model::ModelVariant;
+use crate::models::architectures::granite_speech::asr::{
+    ensure_granite_speech_artifacts, granite_load_representation, select_granite_speech_dtype,
+    GraniteLoadRepresentation, GraniteSpeechConfig,
+};
+use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
+use crate::models::architectures::nemotron::asr::{
+    nemotron_checkpoint_paths, resolve_nemotron_asr_dtype, NEMOTRON_MODEL_MEMO_MAX_BYTES,
+};
+use crate::models::architectures::parakeet::asr::{
+    parakeet_checkpoint_paths, PARAKEET_WEIGHT_DTYPE,
+};
+use crate::models::architectures::qwen3::asr::{
+    qwen3_asr_use_gguf_qmatmul_text, qwen3_asr_weight_dtypes, resolve_qwen_asr_gguf_path,
+    QWEN3_ASR_AUDIO_POSITIONS, QWEN3_ASR_GGUF_CHECKPOINT_DTYPE,
+};
+use crate::models::architectures::qwen3::core::{
+    qwen3_dense_projection_fusion_enabled, qwen3_quantized_projection_grouping_for_hidden_size,
+};
+use crate::models::architectures::vibevoice::asr::vibevoice_asr_weight_dtype;
+use crate::models::architectures::voxtral::realtime::model::{
+    voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
+};
+use crate::models::architectures::whisper::asr::{whisper_weight_dtype, whisper_weight_files};
+use crate::models::shared::weights::gguf::safetensors_weight_files;
+
+/// Candle 0.11's CUDA `QTensor` allocation pads every quantized buffer by this
+/// many rows of blocks (`quantized/cuda.rs`, `MATRIX_ROW_PADDING`).
+const CUDA_QTENSOR_ROW_PADDING: u64 = 512;
+
+/// One tensor's load-time copies when a first NeMo load has no tensor list to
+/// read: four times the largest tensor of either published NeMo ASR checkpoint
+/// (Nemotron's 33.5 MB prediction embedding; Parakeet's largest is 21 MB).
+const NEMO_UNLISTED_TENSOR_BYTES: u64 = 128 * 1024 * 1024;
+
+fn overflow() -> Error {
+    Error::ModelLoadError("ASR residency plan overflow".into())
+}
+
+fn sum(values: &[u64]) -> Result<u64> {
+    values
+        .iter()
+        .try_fold(0u64, |total, value| total.checked_add(*value))
+        .ok_or_else(overflow)
+}
+
+fn dense_bytes(elements: u64, dtype: DType) -> Result<u64> {
+    elements
+        .checked_mul(dtype.size_in_bytes() as u64)
+        .ok_or_else(overflow)
+}
+
+/// Admission for a load of the ASR `variant` checkpoint at `model_path` on
+/// `device`, or `None` for a variant without a residency plan (or with weight
+/// files missing, which the loader reports): such loads keep the generic
+/// estimate.
+pub(super) fn resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    let Some(plan) = residency_plan(variant, model_path, device)? else {
+        return Ok(None);
+    };
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        memo_bytes = plan.memo_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        host_staging_bytes = plan.host_staging_bytes,
+        "Priced ASR load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+pub(super) fn residency_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<AsrResidencyPlan>> {
+    let backend = BackendKind::from(device.kind);
+    match variant {
+        ModelVariant::WhisperLargeV3Turbo => whisper_plan(model_path, device, backend),
+        ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
+            qwen3_asr_plan(variant, model_path, device, backend)
+        }
+        ModelVariant::ParakeetTdt06BV3 => parakeet_plan(variant, model_path, backend),
+        ModelVariant::Nemotron35AsrStreaming06B => {
+            nemotron_plan(variant, model_path, device, backend)
+        }
+        // Plus and base share the loader; the census carries their differences
+        // (base: no layer-3 concatenation in the projector, an untied LM head).
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => {
+            granite_plan(model_path, device, backend)
+        }
+        ModelVariant::VibeVoiceAsr => vibevoice_plan(model_path, device, backend),
+        ModelVariant::VoxtralMini4BRealtime2602 => voxtral_plan(model_path, device, backend),
+        ModelVariant::Lfm25Audio15BGguf => lfm25_audio_plan(model_path, backend),
+        _ => Ok(None),
+    }
+}
+
+/// What a load of one ASR checkpoint allocates on its backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AsrResidencyPlan {
+    backend: BackendKind,
+    /// Resident weights at their exact sizes.
+    logical_resident_bytes: u64,
+    /// Resident weights as the backend allocates them.
+    resident_bytes: u64,
+    /// Bounded model memo, resident on the load device and filled lazily.
+    memo_bytes: u64,
+    /// High-water mark of the load domain while the weights load, resident
+    /// weights included and the memo excluded.
+    load_peak_bytes: u64,
+    /// CUDA only: high-water mark of host staging.
+    host_staging_bytes: u64,
+}
+
+impl AsrResidencyPlan {
+    fn from_ledger(ledger: Ledger, memo_bytes: u64) -> Result<Self> {
+        let ledger = ledger.finish()?;
+        Ok(Self {
+            backend: ledger.backend,
+            logical_resident_bytes: ledger.logical,
+            resident_bytes: ledger.resident,
+            memo_bytes,
+            load_peak_bytes: ledger.peak,
+            host_staging_bytes: ledger.host_peak,
+        })
+    }
+
+    pub(super) fn estimate(&self) -> Result<ModelMemoryEstimate> {
+        Ok(ModelMemoryEstimate {
+            resident_bytes: sum(&[self.resident_bytes, self.memo_bytes])?,
+            load_peak_bytes: sum(&[self.load_peak_bytes, self.memo_bytes])?,
+        })
+    }
+
+    pub(super) fn resource_plan(&self) -> Result<ModelResourcePlan> {
+        let mut plan = super::model_resource_plan(self.backend, self.estimate()?);
+        if self.backend == BackendKind::Cuda {
+            // The device holds the weights; the host only stages them.
+            plan.load_authorization.host_bytes = ResourceAmount::Known(self.host_staging_bytes);
+        }
+        Ok(plan)
+    }
+}
+
+/// How a loader reads a tensor's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// From a memory-mapped safetensors file.
+    Mapped,
+    /// Through a host buffer (a PyTorch zip entry).
+    Copied,
+}
+
+/// What one load step allocates beyond what the ledger already holds.
+#[derive(Debug, Default)]
+struct Step {
+    logical: u64,
+    /// Allocated bytes the step leaves resident.
+    resident: u64,
+    /// Load-domain bytes the step has alive at its high point, its new
+    /// resident bytes included. Host buffers count on CPU and Metal (one
+    /// memory); Metal's reusable private-pool intermediates do not.
+    high: u64,
+    /// Metal: buffers the step releases that Candle keeps until the next
+    /// device synchronization (released shared buffers).
+    held_until_sync: u64,
+    /// Metal: private-pool intermediates, reusable by later steps.
+    intermediates: u64,
+    /// CUDA: host bytes alive at the step's high point.
+    host: u64,
+    /// Metal: load-domain bytes the step has alive when it synchronizes the
+    /// device, which drops every released buffer still held.
+    before_sync: Option<u64>,
+}
+
+/// Accumulates a load's steps into an upper bound of its peak that holds for
+/// any order of the steps (the loaders' order is theirs to change): every step
+/// may run last, beside every resident byte and whatever earlier steps left
+/// for Candle to release at the next synchronization.
+#[derive(Debug)]
+struct Ledger {
+    backend: BackendKind,
+    logical: u64,
+    resident: u64,
+    /// Buffers kept alive across steps ([`Self::hold`]), and their maximum.
+    live: u64,
+    max_live: u64,
+    /// Metal: high-water mark of reusable private-pool intermediates.
+    scratch: u64,
+    /// Metal: bytes held until a synchronization by steps that do not
+    /// synchronize first: they accumulate until the load fence.
+    held_unsynced: u64,
+    /// Metal: the most any one synchronizing step (or a release) leaves held;
+    /// the next synchronizing step drops it.
+    held_max: u64,
+    /// Metal: per synchronizing step, what it leaves held and what it has
+    /// alive at its synchronization (beside what an earlier step left held).
+    synced: Vec<(u64, u64)>,
+    /// Largest step high point beyond the step's own resident bytes, over
+    /// steps that do not synchronize, and over steps that do.
+    extra_max: u64,
+    extra_max_synced: u64,
+    /// Largest step high point beyond the step's own resident and held bytes.
+    extra_beyond_held_max: u64,
+    /// Metal: the most a synchronizing step has alive at its synchronization.
+    before_sync_max: u64,
+    /// Metal: the most held by a synchronizing step's predecessor (another
+    /// step, or a release) beside its own synchronization.
+    at_sync_max: u64,
+    /// Load-domain buffers freed before any weight loads.
+    prelude: u64,
+    host_peak: u64,
+    peak: u64,
+}
+
+impl Ledger {
+    fn new(backend: BackendKind) -> Self {
+        Self {
+            backend,
+            logical: 0,
+            resident: 0,
+            live: 0,
+            max_live: 0,
+            scratch: 0,
+            held_unsynced: 0,
+            held_max: 0,
+            synced: Vec::new(),
+            extra_max: 0,
+            extra_max_synced: 0,
+            extra_beyond_held_max: 0,
+            before_sync_max: 0,
+            at_sync_max: 0,
+            prelude: 0,
+            host_peak: 0,
+            peak: 0,
+        }
+    }
+
+    fn metal(&self) -> bool {
+        self.backend == BackendKind::Metal
+    }
+
+    /// The size Candle allocates for `bytes` written by a device kernel.
+    fn kernel(&self, bytes: u64) -> Result<u64> {
+        if self.metal() {
+            bytes.checked_next_power_of_two().ok_or_else(overflow)
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn apply(&mut self, step: Step) -> Result<()> {
+        self.logical = sum(&[self.logical, step.logical])?;
+        self.resident = sum(&[self.resident, step.resident])?;
+        let extra = step.high.checked_sub(step.resident).ok_or_else(overflow)?;
+        self.extra_beyond_held_max = self
+            .extra_beyond_held_max
+            .max(extra.saturating_sub(step.held_until_sync));
+        self.scratch = self.scratch.max(step.intermediates);
+        self.host_peak = self.host_peak.max(step.host);
+        match step.before_sync.filter(|_| self.metal()) {
+            Some(before_sync) => {
+                self.extra_max_synced = self.extra_max_synced.max(extra);
+                self.before_sync_max = self.before_sync_max.max(before_sync);
+                self.held_max = self.held_max.max(step.held_until_sync);
+                self.synced.push((step.held_until_sync, before_sync));
+            }
+            None => {
+                self.extra_max = self.extra_max.max(extra);
+                self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep `bytes` alive, not resident, until [`Self::release`].
+    fn hold(&mut self, bytes: u64) -> Result<()> {
+        self.live = sum(&[self.live, bytes])?;
+        self.max_live = self.max_live.max(self.live);
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) -> Result<()> {
+        self.live = self.live.checked_sub(bytes).ok_or_else(overflow)?;
+        if self.metal() {
+            // Held like a synchronizing step's buffers: the next
+            // synchronization drops it.
+            self.held_max = self.held_max.max(bytes);
+            self.at_sync_max = self.at_sync_max.max(sum(&[bytes, self.before_sync_max])?);
+        }
+        Ok(())
+    }
+
+    /// A host buffer filled and freed before any weight loads (NeMo
+    /// extraction).
+    fn host_buffer(&mut self, bytes: u64) {
+        if self.backend == BackendKind::Cuda {
+            self.host_peak = self.host_peak.max(bytes);
+        } else {
+            self.prelude = self.prelude.max(bytes);
+        }
+    }
+
+    /// A tensor read through a Candle `VarBuilder` at `chain[0]` (uploaded at
+    /// its stored dtype, then cast on the device when they differ) and
+    /// rewritten by device ops into each later dtype of `chain`, the last of
+    /// which stays resident. Every form stays alive until the step ends.
+    fn var(&mut self, tensor: &CensusTensor, source: Source, chain: &[DType]) -> Result<()> {
+        let (&first, rest) = chain.split_first().ok_or_else(overflow)?;
+        let stored = tensor.stored_bytes;
+        let elements = tensor.elements();
+        let cast = tensor.dtype != StoredDType::Dense(first);
+        // Allocated bytes of each form; the first is the upload itself (exact
+        // size) unless a cast wrote it.
+        let first_exact = dense_bytes(elements, first)?;
+        let mut forms = vec![if cast {
+            self.kernel(first_exact)?
+        } else {
+            first_exact
+        }];
+        let mut logical = first_exact;
+        for &dtype in rest {
+            logical = dense_bytes(elements, dtype)?;
+            forms.push(self.kernel(logical)?);
+        }
+        let resident = forms.pop().ok_or_else(overflow)?;
+        let earlier = sum(&forms)?;
+        let source_copy = if cast { stored } else { 0 };
+        let step = match self.backend {
+            BackendKind::Cpu => Step {
+                logical,
+                resident,
+                high: sum(&[resident, source_copy, earlier])?,
+                ..Step::default()
+            },
+            BackendKind::Cuda => Step {
+                logical,
+                resident,
+                high: sum(&[resident, source_copy, earlier])?,
+                host: stored,
+                ..Step::default()
+            },
+            BackendKind::Metal => {
+                // The shared upload is released when a cast or a later form
+                // replaces it; cast-written earlier forms are private.
+                let upload_released = if cast || !rest.is_empty() { stored } else { 0 };
+                let private_earlier = if cast {
+                    earlier
+                } else {
+                    earlier.saturating_sub(stored)
+                };
+                let host = if source == Source::Copied { stored } else { 0 };
+                Step {
+                    logical,
+                    resident,
+                    high: sum(&[resident, upload_released, host])?,
+                    held_until_sync: upload_released,
+                    intermediates: private_earlier,
+                    ..Step::default()
+                }
+            }
+        };
+        self.apply(step)
+    }
+
+    /// `VarBuilder` tensors read at `dtype` and joined by `Tensor::cat` into
+    /// one resident tensor, with `zeros` extra elements the loader synthesizes
+    /// (a zero bias part); the parts are dropped.
+    fn fused(
+        &mut self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+        zeros: u64,
+    ) -> Result<()> {
+        let zero_bytes = dense_bytes(zeros, dtype)?;
+        let mut exact = vec![zero_bytes];
+        let mut private = vec![self.kernel(zero_bytes)?];
+        let mut uploads = Vec::with_capacity(parts.len());
+        let mut cast_sources = vec![0];
+        for part in parts {
+            let bytes = dense_bytes(part.elements(), dtype)?;
+            exact.push(bytes);
+            uploads.push(part.stored_bytes);
+            if part.dtype != StoredDType::Dense(dtype) {
+                private.push(self.kernel(bytes)?);
+                cast_sources.push(part.stored_bytes);
+            }
+        }
+        let logical = sum(&exact)?;
+        let largest_upload = uploads.iter().copied().max().unwrap_or(0);
+        let largest_cast_source = cast_sources.iter().copied().max().unwrap_or(0);
+        let step = match self.backend {
+            // Each part's source while it is cast, then every part beside the
+            // concatenation.
+            BackendKind::Cpu | BackendKind::Cuda => Step {
+                logical,
+                resident: logical,
+                high: sum(&[logical, logical.max(largest_cast_source)])?,
+                host: if self.backend == BackendKind::Cuda {
+                    largest_upload
+                } else {
+                    0
+                },
+                ..Step::default()
+            },
+            BackendKind::Metal => {
+                let resident = self.kernel(logical)?;
+                let uploads = sum(&uploads)?;
+                let host = if source == Source::Copied {
+                    largest_upload
+                } else {
+                    0
+                };
+                Step {
+                    logical,
+                    resident,
+                    high: sum(&[resident, uploads, host])?,
+                    held_until_sync: uploads,
+                    intermediates: sum(&private)?,
+                    ..Step::default()
+                }
+            }
+        };
+        self.apply(step)
+    }
+
+    /// A GGUF tensor kept quantized (`QTensor` / `QMatMul`), read through a
+    /// host buffer.
+    fn gguf_stored(&mut self, tensor: &CensusTensor) -> Result<()> {
+        let stored = tensor.stored_bytes;
+        self.apply(if self.backend == BackendKind::Cuda {
+            let resident = sum(&[stored, cuda_qtensor_padding(tensor)?])?;
+            Step {
+                logical: stored,
+                resident,
+                high: resident,
+                host: stored,
+                ..Step::default()
+            }
+        } else {
+            // The read buffer beside the `QTensor`'s own copy (CPU) or upload.
+            Step {
+                logical: stored,
+                resident: stored,
+                high: sum(&[stored, stored])?,
+                ..Step::default()
+            }
+        })
+    }
+
+    /// A GGUF tensor dequantized (`QTensor::dequantize`, which yields F32) and
+    /// cast to `dtype`. The `QTensor` lives until the cast is done.
+    fn gguf_dense(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+        let stored = tensor.stored_bytes;
+        let f32_bytes = dense_bytes(tensor.elements(), DType::F32)?;
+        let logical = dense_bytes(tensor.elements(), dtype)?;
+        let cast = dtype != DType::F32;
+        let step = match self.backend {
+            // The read buffer beside the `QTensor`'s copy; then the `QTensor`,
+            // its F32 dequantization and the cast.
+            BackendKind::Cpu => {
+                let cast_copy = if cast { logical } else { 0 };
+                Step {
+                    logical,
+                    resident: if cast { logical } else { f32_bytes },
+                    high: sum(&[stored, stored])?.max(sum(&[stored, f32_bytes, cast_copy])?),
+                    ..Step::default()
+                }
+            }
+            // Candle dequantizes on the host (`quantized/metal.rs`): the
+            // upload and a pooled blit copy of it, a device synchronization,
+            // the host F32 result and its upload (the resident tensor unless a
+            // cast replaces it), then the cast.
+            BackendKind::Metal => {
+                let blit = self.kernel(stored)?;
+                let resident = if cast {
+                    self.kernel(logical)?
+                } else {
+                    f32_bytes
+                };
+                let held = sum(&[stored, blit])?;
+                Step {
+                    logical,
+                    resident,
+                    // The host F32 buffer is freed before the cast allocates.
+                    high: sum(&[
+                        held,
+                        f32_bytes,
+                        f32_bytes.max(if cast { resident } else { 0 }),
+                    ])?,
+                    held_until_sync: sum(&[held, if cast { f32_bytes } else { 0 }])?,
+                    before_sync: Some(held),
+                    ..Step::default()
+                }
+            }
+            // Quantized types dequantize on the device; F32, F16 and BF16
+            // sources round-trip through the host (`quantized/cuda.rs`).
+            BackendKind::Cuda => {
+                let host_dequantized = matches!(
+                    tensor.dtype,
+                    StoredDType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+                );
+                let cast_copy = if cast { logical } else { 0 };
+                Step {
+                    logical,
+                    resident: if cast { logical } else { f32_bytes },
+                    high: sum(&[stored, cuda_qtensor_padding(tensor)?, f32_bytes, cast_copy])?,
+                    host: if host_dequantized {
+                        sum(&[stored, f32_bytes])?
+                    } else {
+                        stored
+                    },
+                    ..Step::default()
+                }
+            }
+        };
+        self.apply(step)
+    }
+
+    /// Metal: quantized projections packed into one `QTensor`. Each part is
+    /// uploaded and read back through a pooled blit copy (each read-back
+    /// synchronizes), concatenated on the host, and uploaded again.
+    fn gguf_packed(&mut self, parts: &[&CensusTensor]) -> Result<()> {
+        let stored = sum(&parts
+            .iter()
+            .map(|part| part.stored_bytes)
+            .collect::<Vec<_>>())?;
+        let mut blit = 0;
+        for part in parts {
+            blit = blit.max(self.kernel(part.stored_bytes)?);
+        }
+        let parts_and_blit = sum(&[stored, blit])?;
+        self.apply(Step {
+            logical: stored,
+            resident: stored,
+            // The parts, the last blit copy, the host concatenation and the
+            // packed upload.
+            high: sum(&[parts_and_blit, stored, stored])?,
+            held_until_sync: parts_and_blit,
+            before_sync: Some(parts_and_blit),
+            ..Step::default()
+        })
+    }
+
+    /// A tensor the loader computes on the device: its kernel-written result
+    /// stays resident, and the kernel-written `intermediates` (exact bytes) are
+    /// freed once it is built.
+    fn derived(&mut self, elements: u64, dtype: DType, intermediates: &[u64]) -> Result<()> {
+        let logical = dense_bytes(elements, dtype)?;
+        let resident = self.kernel(logical)?;
+        let mut allocated = Vec::with_capacity(intermediates.len());
+        for bytes in intermediates {
+            allocated.push(self.kernel(*bytes)?);
+        }
+        let intermediates = sum(&allocated)?;
+        self.apply(if self.metal() {
+            Step {
+                logical,
+                resident,
+                high: resident,
+                intermediates,
+                ..Step::default()
+            }
+        } else {
+            Step {
+                logical,
+                resident,
+                high: sum(&[resident, intermediates])?,
+                ..Step::default()
+            }
+        })
+    }
+
+    /// A table the loader builds on the host and uploads at its exact size.
+    fn uploaded(&mut self, elements: u64, dtype: DType) -> Result<()> {
+        let bytes = dense_bytes(elements, dtype)?;
+        self.apply(match self.backend {
+            BackendKind::Cpu => Step {
+                logical: bytes,
+                resident: bytes,
+                high: bytes,
+                ..Step::default()
+            },
+            BackendKind::Metal => Step {
+                logical: bytes,
+                resident: bytes,
+                high: sum(&[bytes, bytes])?,
+                ..Step::default()
+            },
+            BackendKind::Cuda => Step {
+                logical: bytes,
+                resident: bytes,
+                high: bytes,
+                host: bytes,
+                ..Step::default()
+            },
+        })
+    }
+
+    /// The most alive at a synchronization: the step's own buffers beside
+    /// what another step, or a release, left held.
+    fn at_sync_max(&self) -> Result<u64> {
+        let mut top = [(0u64, usize::MAX); 2];
+        for (index, (held, _)) in self.synced.iter().enumerate() {
+            if *held > top[0].0 {
+                top = [(*held, index), top[0]];
+            } else if *held > top[1].0 {
+                top[1] = (*held, index);
+            }
+        }
+        let mut most = self.at_sync_max;
+        for (index, (_, before_sync)) in self.synced.iter().enumerate() {
+            let other = if top[0].1 == index {
+                top[1].0
+            } else {
+                top[0].0
+            };
+            most = most.max(sum(&[other, *before_sync])?);
+        }
+        Ok(most)
+    }
+
+    fn finish(mut self) -> Result<Self> {
+        let base = sum(&[self.resident, self.max_live])?;
+        self.peak = if self.metal() {
+            let base = sum(&[base, self.scratch])?;
+            if self.held_unsynced > 0 {
+                // Nothing synchronizes before the load fence: every released
+                // upload is still held when the last step runs.
+                let held = sum(&[self.held_unsynced, self.held_max])?;
+                let extra = self.extra_beyond_held_max.max(self.before_sync_max);
+                sum(&[base, held, extra])?
+            } else {
+                // A synchronizing step drops what the previous one left held;
+                // the others run beside it.
+                let unsynced = sum(&[self.held_max, self.extra_max])?;
+                let extra = self.extra_max_synced.max(unsynced).max(self.at_sync_max()?);
+                sum(&[base, extra])?
+            }
+        } else {
+            sum(&[base, self.extra_max.max(self.extra_max_synced)])?
+        }
+        .max(self.prelude);
+        Ok(self)
+    }
+}
+
+fn cuda_qtensor_padding(tensor: &CensusTensor) -> Result<u64> {
+    let StoredDType::Ggml(dtype) = tensor.dtype else {
+        return Ok(0);
+    };
+    CUDA_QTENSOR_ROW_PADDING
+        .checked_mul(dtype.type_size() as u64)
+        .map(|bytes| bytes / dtype.block_size() as u64)
+        .ok_or_else(overflow)
+}
+
+/// The census of `paths`, or `None` when one is missing (the loader reports
+/// that). A file that is not a readable checkpoint is an error.
+fn census_of(paths: &[PathBuf]) -> Result<Option<Vec<CensusFile>>> {
+    if paths.iter().any(|path| !path.is_file()) {
+        return Ok(None);
+    }
+    paths
+        .iter()
+        .map(|path| {
+            census_checkpoint_file(path)?.ok_or_else(|| {
+                Error::ModelLoadError(format!("Cannot read the tensor list of {}", path.display()))
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn by_name(files: &[CensusFile]) -> BTreeMap<&str, &CensusTensor> {
+    files
+        .iter()
+        .flat_map(|file| file.tensors.iter())
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect()
+}
+
+fn tensor<'a>(tensors: &BTreeMap<&str, &'a CensusTensor>, name: &str) -> Result<&'a CensusTensor> {
+    tensors
+        .get(name)
+        .copied()
+        .ok_or_else(|| Error::ModelLoadError(format!("Checkpoint is missing tensor `{name}`")))
+}
+
+fn dim(tensor: &CensusTensor, index: usize) -> Result<u64> {
+    tensor
+        .shape
+        .get(index)
+        .map(|dim| *dim as u64)
+        .ok_or_else(|| {
+            Error::ModelLoadError(format!("Tensor `{}` has no dimension {index}", tensor.name))
+        })
+}
+
+fn whisper_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Some(files) = census_of(&whisper_weight_files(model_path)?)? else {
+        return Ok(None);
+    };
+    price_whisper(&files, backend, whisper_weight_dtype(device)?).map(Some)
+}
+
+/// Whisper (`whisper/model.rs`): every tensor through a `VarBuilder` at
+/// `dtype`, except the encoder positional table, which the loader computes on
+/// the device (F32 sin/cos, cast to `dtype`; the checkpoint's copy gives its
+/// shape), and each self-attention's Q/K/V weights and Q/V biases, which it
+/// concatenates into one projection with a zero K bias.
+fn price_whisper(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+) -> Result<AsrResidencyPlan> {
+    const ENCODER_POSITIONS: &str = "model.encoder.embed_positions.weight";
+    let tensors = by_name(files);
+    let mut ledger = Ledger::new(backend);
+    let mut fused = BTreeSet::new();
+    for name in tensors.keys() {
+        let Some(attention) = name.strip_suffix(".q_proj.weight") else {
+            continue;
+        };
+        if !attention.ends_with(".self_attn") {
+            continue;
+        }
+        let part = |suffix: &str| tensor(&tensors, &format!("{attention}.{suffix}"));
+        let weights = [
+            part("q_proj.weight")?,
+            part("k_proj.weight")?,
+            part("v_proj.weight")?,
+        ];
+        ledger.fused(&weights, Source::Mapped, dtype, 0)?;
+        let biases = [part("q_proj.bias")?, part("v_proj.bias")?];
+        ledger.fused(&biases, Source::Mapped, dtype, biases[0].elements())?;
+        fused.extend(weights.iter().chain(&biases).map(|t| t.name.as_str()));
+    }
+    for (name, tensor) in &tensors {
+        if *name != ENCODER_POSITIONS && !fused.contains(name) {
+            ledger.var(tensor, Source::Mapped, &[dtype])?;
+        }
+    }
+    let positions = tensor(&tensors, ENCODER_POSITIONS)?;
+    let elements = positions.elements();
+    // scaled_time, sin and cos are [rows, channels / 2] F32; a cast replaces
+    // their F32 concatenation.
+    let half = dense_bytes(elements / 2, DType::F32)?;
+    let mut intermediates = vec![half, half, half];
+    if dtype != DType::F32 {
+        intermediates.push(dense_bytes(elements, DType::F32)?);
+    }
+    ledger.derived(elements, dtype, &intermediates)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// The switches the Qwen3-ASR GGUF loader resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen3AsrLoad {
+    text_dtype: DType,
+    audio_dtype: DType,
+    /// Text projections and `lm_head` stay quantized `QMatMul`s.
+    qmatmul_text: bool,
+    /// Q/K/V and gate/up are packed into one quantized projection each.
+    packed_projections: bool,
+}
+
+fn qwen3_asr_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Some(path) = resolve_qwen_asr_gguf_path(model_path, variant) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(&[path])? else {
+        return Ok(None);
+    };
+    let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+        device,
+        ModelFamily::Qwen3Asr,
+        true,
+        true,
+        Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE),
+    )?;
+    let tensors = by_name(&files);
+    let prefix = qwen3_asr_prefix(&tensors);
+    let hidden_size = dim(
+        tensor(&tensors, &format!("{prefix}model.embed_tokens.weight"))?,
+        1,
+    )?;
+    let load = Qwen3AsrLoad {
+        text_dtype,
+        audio_dtype,
+        qmatmul_text: qwen3_asr_use_gguf_qmatmul_text(&device.device),
+        packed_projections: qwen3_quantized_projection_grouping_for_hidden_size(
+            &device.device,
+            hidden_size as usize,
+        ),
+    };
+    price_qwen3_asr(&files, backend, load).map(Some)
+}
+
+fn qwen3_asr_prefix(tensors: &BTreeMap<&str, &CensusTensor>) -> &'static str {
+    if tensors.keys().any(|name| name.starts_with("thinker.")) {
+        "thinker."
+    } else {
+        ""
+    }
+}
+
+/// Qwen3-ASR GGUF (`qwen3/asr/mod.rs`): the audio tower dequantized to the
+/// audio dtype; the text embedding and norms dequantized to the text dtype; the
+/// text projections and the separate `lm_head` kept quantized (unless the
+/// `QMatMul` text path is off); plus the F32 audio position table built on the
+/// host.
+fn price_qwen3_asr(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: Qwen3AsrLoad,
+) -> Result<AsrResidencyPlan> {
+    const PROJECTIONS: [&str; 7] = [
+        ".self_attn.q_proj.weight",
+        ".self_attn.k_proj.weight",
+        ".self_attn.v_proj.weight",
+        ".self_attn.o_proj.weight",
+        ".mlp.gate_proj.weight",
+        ".mlp.up_proj.weight",
+        ".mlp.down_proj.weight",
+    ];
+    let tensors = by_name(files);
+    let prefix = qwen3_asr_prefix(&tensors);
+    let audio = format!("{prefix}audio_tower.");
+    let text = format!("{prefix}model.");
+    let lm_head = format!("{prefix}lm_head.weight");
+    let mut ledger = Ledger::new(backend);
+    let mut packed = BTreeSet::new();
+    if load.qmatmul_text && load.packed_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
+                continue;
+            };
+            if !layer.starts_with(&text) {
+                continue;
+            }
+            for group in [
+                ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"].as_slice(),
+                ["mlp.gate_proj", "mlp.up_proj"].as_slice(),
+            ] {
+                let parts = group
+                    .iter()
+                    .map(|part| tensor(&tensors, &format!("{layer}.{part}.weight")))
+                    .collect::<Result<Vec<_>>>()?;
+                ledger.gguf_packed(&parts)?;
+                packed.extend(parts.iter().map(|part| part.name.as_str()));
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        if packed.contains(name) {
+            continue;
+        }
+        if name.starts_with(&audio) {
+            ledger.gguf_dense(tensor, load.audio_dtype)?;
+        } else if name.starts_with(&text) || *name == lm_head {
+            let projection = *name == lm_head || PROJECTIONS.iter().any(|p| name.ends_with(p));
+            if load.qmatmul_text && projection {
+                ledger.gguf_stored(tensor)?;
+            } else {
+                ledger.gguf_dense(tensor, load.text_dtype)?;
+            }
+        }
+    }
+    let d_model = dim(tensor(&tensors, &format!("{audio}ln_post.weight"))?, 0)?;
+    let positions = (QWEN3_ASR_AUDIO_POSITIONS as u64)
+        .checked_mul(d_model)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(positions, DType::F32)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// The NeMo ASR families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NemoFamily {
+    Parakeet,
+    Nemotron,
+}
+
+impl NemoFamily {
+    fn memo_bytes(self) -> u64 {
+        match self {
+            Self::Parakeet => 0,
+            Self::Nemotron => NEMOTRON_MODEL_MEMO_MAX_BYTES,
+        }
+    }
+}
+
+fn parakeet_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let paths = parakeet_checkpoint_paths(model_path, variant)?;
+    // The loader reads the extracted checkpoint, or its zip-repacked copy when
+    // Candle cannot parse the original.
+    for checkpoint in [&paths.checkpoint_path, &paths.repacked_checkpoint_path] {
+        if checkpoint.is_file() {
+            if let Some(file) = census_checkpoint_file(checkpoint)? {
+                return price_nemo(
+                    &[file],
+                    backend,
+                    PARAKEET_WEIGHT_DTYPE,
+                    NemoFamily::Parakeet,
+                )
+                .map(Some);
+            }
+        }
+    }
+    if paths.checkpoint_path.is_file() {
+        // An unreadable checkpoint is repacked on disk before it loads.
+        let payload = std::fs::metadata(&paths.checkpoint_path)?.len();
+        return price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some);
+    }
+    if !paths.nemo_path.is_file() {
+        return Ok(None);
+    }
+    // First load: `tar -xOf` reads each archive member into one growing host
+    // buffer, the checkpoint (most of the archive) included.
+    let payload = nemo_payload_bytes(&paths.nemo_path)?;
+    let extraction = payload.checked_next_power_of_two().ok_or_else(overflow)?;
+    price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, extraction, 0).map(Some)
+}
+
+fn nemotron_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let paths = nemotron_checkpoint_paths(model_path, variant)?;
+    let dtype = resolve_nemotron_asr_dtype(device)?.dtype;
+    if paths.checkpoint_path.is_file() {
+        if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
+            return price_nemo(&[file], backend, dtype, NemoFamily::Nemotron).map(Some);
+        }
+    }
+    if !paths.nemo_path.is_file() {
+        return Ok(None);
+    }
+    // First load: the archive is streamed to disk through small buffers.
+    let payload = nemo_payload_bytes(&paths.nemo_path)?;
+    let memo = NemoFamily::Nemotron.memo_bytes();
+    price_nemo_first_load(backend, payload, dtype, 0, memo).map(Some)
+}
+
+/// Parakeet and Nemotron (`VarBuilder::from_pth`): each tensor is read into a
+/// host buffer, uploaded, and cast to `dtype` on the device. BatchNorm step
+/// counters are never read, and the featurizer tensors go back to the host.
+/// Parakeet adds each depthwise convolution with its BatchNorm folded in;
+/// Nemotron on CUDA adds transposed copies of its LSTM weights.
+fn price_nemo(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+    family: NemoFamily,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    for tensor in files.iter().flat_map(|file| file.tensors.iter()) {
+        let name = tensor.name.as_str();
+        if name.ends_with(".num_batches_tracked") || name.starts_with("preprocessor.") {
+            continue;
+        }
+        ledger.var(tensor, Source::Copied, &[dtype])?;
+        match family {
+            NemoFamily::Parakeet if name.ends_with(".conv.depthwise_conv.weight") => {
+                let channels = dim(tensor, 0)?;
+                ledger.derived(sum(&[tensor.elements(), channels])?, dtype, &[])?;
+            }
+            NemoFamily::Nemotron
+                if backend == BackendKind::Cuda
+                    && (name.contains(".lstm.weight_ih_l")
+                        || name.contains(".lstm.weight_hh_l")) =>
+            {
+                ledger.derived(tensor.elements(), dtype, &[])?;
+            }
+            _ => {}
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, family.memo_bytes())
+}
+
+/// A NeMo load before its checkpoint has been extracted, so there is no tensor
+/// list to read: the F32 checkpoint is priced from the archive's `payload`
+/// (which also holds the small config and tokenizer members) cast to `dtype`,
+/// with one tensor's copies bounded by [`NEMO_UNLISTED_TENSOR_BYTES`], after
+/// an `extraction` host buffer that is freed before any weight loads.
+fn price_nemo_first_load(
+    backend: BackendKind,
+    payload: u64,
+    dtype: DType,
+    extraction: u64,
+    memo_bytes: u64,
+) -> Result<AsrResidencyPlan> {
+    let weights = payload
+        .checked_div(DType::F32.size_in_bytes() as u64)
+        .and_then(|elements| elements.checked_mul(dtype.size_in_bytes() as u64))
+        .ok_or_else(overflow)?;
+    let mut ledger = Ledger::new(backend);
+    ledger.host_buffer(extraction);
+    // One tensor's host copy (which on the CPU is the weight itself) and the
+    // stored-dtype upload a cast replaces.
+    let cast_source = if dtype != DType::F32 {
+        NEMO_UNLISTED_TENSOR_BYTES
+    } else {
+        0
+    };
+    ledger.apply(match backend {
+        BackendKind::Cpu => Step {
+            logical: weights,
+            resident: weights,
+            high: sum(&[weights, cast_source])?,
+            ..Step::default()
+        },
+        BackendKind::Metal => Step {
+            logical: weights,
+            resident: weights,
+            high: sum(&[weights, NEMO_UNLISTED_TENSOR_BYTES, cast_source])?,
+            ..Step::default()
+        },
+        BackendKind::Cuda => Step {
+            logical: weights,
+            resident: weights,
+            high: sum(&[weights, cast_source])?,
+            host: NEMO_UNLISTED_TENSOR_BYTES,
+            ..Step::default()
+        },
+    })?;
+    AsrResidencyPlan::from_ledger(ledger, memo_bytes)
+}
+
+/// The uncompressed payload of a `.nemo` archive, a tar that some checkpoints
+/// gzip, read without decompressing it. A gzip trailer stores the payload size
+/// modulo 2^32 (ISIZE). The payload is the smallest value with that residue
+/// that is no smaller than the archive less deflate's bounded expansion (about
+/// 5 bytes per 64 KiB stored block). A weights tarball barely compresses.
+fn nemo_payload_bytes(path: &Path) -> Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let archive = file.metadata()?.len();
+    let mut magic = [0u8; 2];
+    if archive < 18 || file.read_exact(&mut magic).is_err() || magic != [0x1f, 0x8b] {
+        return Ok(archive);
+    }
+    file.seek(SeekFrom::End(-4))?;
+    let mut residue = [0u8; 4];
+    file.read_exact(&mut residue)?;
+    let floor = archive - archive / 512;
+    let mut payload = u64::from(u32::from_le_bytes(residue));
+    while payload < floor {
+        payload = payload.checked_add(1 << 32).ok_or_else(overflow)?;
+    }
+    Ok(payload)
+}
+
+/// The switches the Granite Speech loader resolves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GraniteLoad {
+    dtype: DType,
+    representation: GraniteLoadRepresentation,
+    residual_multiplier: f32,
+    tied_lm_head: bool,
+    /// (encoder layers, attention context) of the per-layer U32 distance table.
+    encoder_attention_dists: (usize, usize),
+}
+
+fn granite_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(shards) = ensure_granite_speech_artifacts(model_path) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(&shards)? else {
+        return Ok(None);
+    };
+    let config = GraniteSpeechConfig::load(model_path)?;
+    let dtype = select_granite_speech_dtype(device, config.target_dtype_hint())?;
+    let load = GraniteLoad {
+        dtype,
+        representation: granite_load_representation(&device.device, dtype),
+        residual_multiplier: config.text_config.residual_multiplier,
+        tied_lm_head: config.text_config.tie_word_embeddings,
+        encoder_attention_dists: (
+            config.encoder_config.num_layers,
+            config.encoder_config.context_size,
+        ),
+    };
+    price_granite(&files, backend, &load).map(Some)
+}
+
+/// Granite Speech (`granite_speech/asr/runtime.rs`): every tensor through a
+/// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
+/// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
+/// and down_proj pre-scaled by the residual multiplier and then made F16, and
+/// an F16 copy of a tied embedding as the LM head. Each encoder layer adds a
+/// host-built U32 attention distance table.
+fn price_granite(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: &GraniteLoad,
+) -> Result<AsrResidencyPlan> {
+    const EMBEDDING: &str = "language_model.model.embed_tokens.weight";
+    const LM_HEAD: &str = "language_model.lm_head.weight";
+    let representation = load.representation;
+    let dtype = load.dtype;
+    let half_if = |enabled: bool| if enabled { DType::F16 } else { dtype };
+    let prescaled = representation.residual_prescale && load.residual_multiplier != 1.0;
+    let residual_chain = |f16: bool| {
+        let mut chain = vec![dtype];
+        if prescaled {
+            chain.push(dtype);
+        }
+        if f16 {
+            chain.push(DType::F16);
+        }
+        chain
+    };
+    let tensors = by_name(files);
+    let mut ledger = Ledger::new(backend);
+    let mut grouped = BTreeSet::new();
+    for name in tensors.keys() {
+        if !name.starts_with("language_model.") {
+            continue;
+        }
+        let groups = if let Some(attention) = name.strip_suffix(".q_proj.weight") {
+            (
+                attention,
+                ["q_proj", "k_proj", "v_proj"].as_slice(),
+                half_if(representation.f16_qkv),
+                representation.qkv_fusion,
+            )
+        } else if let Some(mlp) = name.strip_suffix(".gate_proj.weight") {
+            (
+                mlp,
+                ["gate_proj", "up_proj"].as_slice(),
+                half_if(representation.f16_mlp),
+                representation.gate_up_fusion,
+            )
+        } else {
+            continue;
+        };
+        let (stem, parts, part_dtype, fuse) = groups;
+        let parts = parts
+            .iter()
+            .map(|part| tensor(&tensors, &format!("{stem}.{part}.weight")))
+            .collect::<Result<Vec<_>>>()?;
+        if fuse {
+            ledger.fused(&parts, Source::Mapped, part_dtype, 0)?;
+        } else {
+            for part in &parts {
+                ledger.var(part, Source::Mapped, &[part_dtype])?;
+            }
+        }
+        grouped.extend(parts.iter().map(|part| part.name.as_str()));
+    }
+    for (name, tensor) in &tensors {
+        if grouped.contains(name) || name.ends_with(".num_batches_tracked") {
+            continue;
+        }
+        if !name.starts_with("language_model.") {
+            ledger.var(tensor, Source::Mapped, &[dtype])?;
+        } else if name.ends_with(".o_proj.weight") {
+            let chain = residual_chain(representation.f16_attention_output);
+            ledger.var(tensor, Source::Mapped, &chain)?;
+        } else if name.ends_with(".down_proj.weight") {
+            ledger.var(
+                tensor,
+                Source::Mapped,
+                &residual_chain(representation.f16_mlp),
+            )?;
+        } else if *name == LM_HEAD {
+            ledger.var(
+                tensor,
+                Source::Mapped,
+                &[half_if(representation.f16_lm_head)],
+            )?;
+        } else {
+            ledger.var(tensor, Source::Mapped, &[dtype])?;
+            if *name == EMBEDDING && load.tied_lm_head && representation.f16_lm_head {
+                ledger.derived(tensor.elements(), DType::F16, &[])?;
+            }
+        }
+    }
+    let (layers, context) = load.encoder_attention_dists;
+    let dists = (layers as u64)
+        .checked_mul(context as u64)
+        .and_then(|n| n.checked_mul(context as u64))
+        .ok_or_else(overflow)?;
+    ledger.uploaded(dists, DType::U32)?;
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+fn vibevoice_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(paths) = safetensors_weight_files(model_path) else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    let dtype = vibevoice_asr_weight_dtype(device)?;
+    let fused = qwen3_dense_projection_fusion_enabled(&device.device);
+    price_vibevoice(&files, backend, dtype, fused).map(Some)
+}
+
+/// VibeVoice-ASR (`vibevoice/asr.rs`): every tensor through a `VarBuilder` at
+/// `dtype`, the TTS-only acoustic decoder included, except the TTS prediction
+/// head and speech scaling factors of a TTS checkpoint. With dense projection
+/// fusion (`qwen3/core.rs`), each LM layer's Q/K/V weights and biases and its
+/// gate/up weights are concatenated.
+fn price_vibevoice(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+    fused_projections: bool,
+) -> Result<AsrResidencyPlan> {
+    let tensors = by_name(files);
+    let mut ledger = Ledger::new(backend);
+    let mut grouped = BTreeSet::new();
+    if fused_projections {
+        for name in tensors.keys() {
+            let Some(layer) = name.strip_suffix(".self_attn.q_proj.weight") else {
+                continue;
+            };
+            if !layer.starts_with("model.language_model.layers.") {
+                continue;
+            }
+            for group in [
+                [
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                ]
+                .as_slice(),
+                [
+                    "self_attn.q_proj.bias",
+                    "self_attn.k_proj.bias",
+                    "self_attn.v_proj.bias",
+                ]
+                .as_slice(),
+                ["mlp.gate_proj.weight", "mlp.up_proj.weight"].as_slice(),
+            ] {
+                let parts = group
+                    .iter()
+                    .map(|part| tensor(&tensors, &format!("{layer}.{part}")))
+                    .collect::<Result<Vec<_>>>()?;
+                ledger.fused(&parts, Source::Mapped, dtype, 0)?;
+                grouped.extend(parts.iter().map(|part| part.name.as_str()));
+            }
+        }
+    }
+    for (name, tensor) in &tensors {
+        let tts_only = name.starts_with("model.prediction_head.")
+            || matches!(
+                *name,
+                "model.speech_scaling_factor" | "model.speech_bias_factor"
+            );
+        if !tts_only && !grouped.contains(name) {
+            ledger.var(tensor, Source::Mapped, &[dtype])?;
+        }
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+fn voxtral_plan(
+    model_path: &Path,
+    device: &DeviceProfile,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let Some(files) = census_of(&voxtral_realtime_weight_files(model_path)?)? else {
+        return Ok(None);
+    };
+    let dtype = voxtral_realtime_weight_dtype(model_path, device)?;
+    price_voxtral(&files, backend, dtype).map(Some)
+}
+
+/// Voxtral realtime (`voxtral/realtime/model.rs`): every tensor through a
+/// `VarBuilder` at `dtype`, the LM head tied to the embedding without a copy.
+fn price_voxtral(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtype: DType,
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    for tensor in by_name(files).values() {
+        ledger.var(tensor, Source::Mapped, &[dtype])?;
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+/// The four LFM2.5-Audio GGUFs' censuses.
+#[derive(Debug)]
+struct Lfm25AudioCensus {
+    main: CensusFile,
+    mmproj: CensusFile,
+    tokenizer: CensusFile,
+    vocoder: CensusFile,
+}
+
+fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<AsrResidencyPlan>> {
+    let Ok(layout) = lfm25_audio_load_layout(model_path) else {
+        return Ok(None);
+    };
+    let paths = [
+        layout.main.clone(),
+        layout.mmproj.clone(),
+        layout.tokenizer.clone(),
+        layout.vocoder.clone(),
+    ];
+    let Some(files) = census_of(&paths)? else {
+        return Ok(None);
+    };
+    let [main, mmproj, tokenizer, vocoder]: [CensusFile; 4] =
+        files.try_into().map_err(|_| overflow())?;
+    let census = Lfm25AudioCensus {
+        main,
+        mmproj,
+        tokenizer,
+        vocoder,
+    };
+    price_lfm25_audio(&census, backend, layout.rope_tables).map(Some)
+}
+
+/// LFM2.5-Audio (`lfm25_audio/`, `lfm2/backbone.rs`): all four GGUFs load on
+/// every backend. Quantized projections stay quantized; F32 tensors and the
+/// embedding tables (each backbone's `token_embd`, every loaded mmproj tensor,
+/// the vocoder's audio and depth embeddings) are dequantized to F32, the dtype
+/// the loader hard-codes (there is no dtype resolver to call). The main
+/// backbone has no `output.weight`, so its head reads `token_embd` a second
+/// time as a quantized projection, and each backbone keeps its first
+/// `token_embd` read alive until it finishes loading. Each backbone also
+/// precomputes F32 RoPE tables over its full context (`rope_tables`).
+fn price_lfm25_audio(
+    census: &Lfm25AudioCensus,
+    backend: BackendKind,
+    rope_tables: [(usize, usize); 2],
+) -> Result<AsrResidencyPlan> {
+    const MMPROJ_UNREAD: [&str; 3] = [
+        "a.position_embd.weight",
+        "a.embd_to_logits.weight",
+        "a.position_embd_norm.weight",
+    ];
+    const VOCODER_UNREAD: [&str; 2] = [
+        "audio_embedding.to_logits.weight",
+        "audio_embedding.embedding_norm.weight",
+    ];
+    let quantized = |tensor: &CensusTensor| {
+        !matches!(
+            tensor.dtype,
+            StoredDType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+        )
+    };
+    let mut ledger = Ledger::new(backend);
+    for backbone in [&census.main, &census.tokenizer] {
+        let tensors = by_name(std::slice::from_ref(backbone));
+        let embedding = tensor(&tensors, "token_embd.weight")?;
+        ledger.gguf_dense(embedding, DType::F32)?;
+        ledger.hold(embedding.stored_bytes)?;
+        for (name, tensor) in &tensors {
+            if *name == "token_embd.weight" {
+                continue;
+            }
+            if quantized(tensor) {
+                ledger.gguf_stored(tensor)?;
+            } else {
+                ledger.gguf_dense(tensor, DType::F32)?;
+            }
+        }
+        if !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight") {
+            ledger.gguf_stored(embedding)?;
+        }
+        ledger.release(embedding.stored_bytes)?;
+    }
+    for tensor in &census.mmproj.tensors {
+        if !MMPROJ_UNREAD.contains(&tensor.name.as_str()) {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    for tensor in &census.vocoder.tensors {
+        let name = tensor.name.as_str();
+        if VOCODER_UNREAD.contains(&name) {
+            continue;
+        }
+        let embedding = name.ends_with(".embedding.weight") || name == "emb.emb.weight";
+        if quantized(tensor) && !embedding {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    for (positions, head_dim) in rope_tables {
+        let positions = positions as u64;
+        let half = positions
+            .checked_mul(head_dim as u64 / 2)
+            .ok_or_else(overflow)?;
+        // arange (U32), its F32 cast, and the angle matrix.
+        let angles = [
+            dense_bytes(positions, DType::U32)?,
+            dense_bytes(positions, DType::F32)?,
+            dense_bytes(half, DType::F32)?,
+        ];
+        ledger.derived(half, DType::F32, &angles)?;
+        ledger.derived(half, DType::F32, &[])?;
+        ledger.derived(sum(&[half, half])?, DType::F32, &[])?;
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{DeviceCapabilities, DeviceKind};
+    use crate::models::architectures::qwen3::core::{
+        qwen3_dense_projection_fusion_policy, qwen3_quantized_projection_grouping_policy,
+    };
+
+    const GIB: f64 = (1u64 << 30) as f64;
+    const BACKENDS: [BackendKind; 3] = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+    /// A committed header census: `[name, dtype, shape]`, or
+    /// `[pattern, dtype, shape, first, count]` for a run of tensors whose names
+    /// differ in one index (`{i}`), with each file's exact payload total.
+    fn fixture(json: &str) -> Vec<CensusFile> {
+        let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+        let files = doc["files"].as_array().unwrap();
+        files
+            .iter()
+            .map(|file| {
+                let gguf = file["format"] == "gguf";
+                let mut tensors = Vec::new();
+                for entry in file["tensors"].as_array().unwrap() {
+                    let entry = entry.as_array().unwrap();
+                    let name = entry[0].as_str().unwrap();
+                    let dtype = stored_dtype(entry[1].as_str().unwrap(), gguf);
+                    let shape = entry[2]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|dim| dim.as_u64().unwrap() as usize)
+                        .collect::<Vec<_>>();
+                    let (first, count) = match entry.len() {
+                        5 => (entry[3].as_u64().unwrap(), entry[4].as_u64().unwrap()),
+                        _ => (0, 1),
+                    };
+                    for index in first..first + count {
+                        let name = name.replace("{i}", &index.to_string());
+                        tensors.push(census_tensor(name, dtype, shape.clone()));
+                    }
+                }
+                assert_eq!(tensors.len() as u64, file["tensor_count"].as_u64().unwrap());
+                assert_eq!(
+                    tensors.iter().map(|t| t.stored_bytes).sum::<u64>(),
+                    file["total_bytes"].as_u64().unwrap(),
+                    "{}",
+                    file["path"]
+                );
+                CensusFile {
+                    path: PathBuf::from(file["path"].as_str().unwrap()),
+                    tensors,
+                }
+            })
+            .collect()
+    }
+
+    fn stored_dtype(name: &str, gguf: bool) -> StoredDType {
+        if gguf {
+            StoredDType::Ggml(match name {
+                "F32" => GgmlDType::F32,
+                "F16" => GgmlDType::F16,
+                "BF16" => GgmlDType::BF16,
+                "Q8_0" => GgmlDType::Q8_0,
+                "Q4_0" => GgmlDType::Q4_0,
+                "Q6_K" => GgmlDType::Q6K,
+                other => panic!("unexpected GGUF dtype {other}"),
+            })
+        } else {
+            StoredDType::Dense(match name {
+                "F32" => DType::F32,
+                "F16" => DType::F16,
+                "BF16" => DType::BF16,
+                "I64" => DType::I64,
+                other => panic!("unexpected dtype {other}"),
+            })
+        }
+    }
+
+    fn census_tensor(name: String, dtype: StoredDType, shape: Vec<usize>) -> CensusTensor {
+        let elements = shape.iter().product::<usize>() as u64;
+        let stored_bytes = match dtype {
+            StoredDType::Dense(dtype) => elements * dtype.size_in_bytes() as u64,
+            StoredDType::Ggml(dtype) => {
+                elements / dtype.block_size() as u64 * dtype.type_size() as u64
+            }
+            StoredDType::Unsupported => unreachable!(),
+        };
+        CensusTensor {
+            name,
+            dtype,
+            shape,
+            stored_bytes,
+        }
+    }
+
+    macro_rules! census {
+        ($file:literal) => {
+            fixture(include_str!(concat!(
+                "../../../tests/fixtures/asr_residency/",
+                $file
+            )))
+        };
+    }
+
+    /// A device profile standing in for `backend`'s (dtype resolvers read only
+    /// the kind and capabilities): CUDA reports BF16 and F16, Metal F16.
+    fn profile(backend: BackendKind) -> DeviceProfile {
+        let kind = match backend {
+            BackendKind::Cpu => DeviceKind::Cpu,
+            BackendKind::Metal => DeviceKind::Metal,
+            BackendKind::Cuda => DeviceKind::Cuda,
+        };
+        DeviceProfile {
+            device: candle_core::Device::Cpu,
+            kind,
+            capabilities: DeviceCapabilities {
+                supports_bf16: kind == DeviceKind::Cuda,
+                supports_f16: kind != DeviceKind::Cpu,
+                has_unified_memory: kind == DeviceKind::Metal,
+                ..DeviceCapabilities::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn whisper(backend: BackendKind) -> AsrResidencyPlan {
+        let dtype = whisper_weight_dtype(&profile(backend)).unwrap();
+        price_whisper(&census!("whisper_large_v3_turbo.json"), backend, dtype).unwrap()
+    }
+
+    fn qwen3_asr(files: &[CensusFile], backend: BackendKind) -> AsrResidencyPlan {
+        let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+            &profile(backend),
+            ModelFamily::Qwen3Asr,
+            true,
+            true,
+            Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE),
+        )
+        .unwrap();
+        let tensors = by_name(files);
+        let hidden = dim(tensors["thinker.model.embed_tokens.weight"], 1).unwrap();
+        let load = Qwen3AsrLoad {
+            text_dtype,
+            audio_dtype,
+            qmatmul_text: qwen3_asr_use_gguf_qmatmul_text(&candle_core::Device::Cpu),
+            packed_projections: qwen3_quantized_projection_grouping_policy(
+                backend == BackendKind::Metal,
+                hidden as usize,
+                None,
+            ),
+        };
+        price_qwen3_asr(files, backend, load).unwrap()
+    }
+
+    fn parakeet(backend: BackendKind) -> AsrResidencyPlan {
+        price_nemo(
+            &census!("parakeet_tdt_0_6b_v3.json"),
+            backend,
+            PARAKEET_WEIGHT_DTYPE,
+            NemoFamily::Parakeet,
+        )
+        .unwrap()
+    }
+
+    fn nemotron(backend: BackendKind) -> AsrResidencyPlan {
+        let dtype = resolve_nemotron_asr_dtype(&profile(backend)).unwrap().dtype;
+        price_nemo(
+            &census!("nemotron_3_5_asr_streaming_0_6b.json"),
+            backend,
+            dtype,
+            NemoFamily::Nemotron,
+        )
+        .unwrap()
+    }
+
+    /// The Granite representation each backend resolves by default: Metal
+    /// takes the F16 LM projections and head copy and the residual
+    /// pre-scaling for F32 weights (`granite_speech/asr/runtime.rs` policies);
+    /// every backend fuses Q/K/V and gate/up.
+    fn granite_representation(backend: BackendKind) -> GraniteLoadRepresentation {
+        let metal = backend == BackendKind::Metal;
+        GraniteLoadRepresentation {
+            f16_lm_head: metal,
+            f16_qkv: metal,
+            f16_mlp: metal,
+            f16_attention_output: metal,
+            qkv_fusion: true,
+            gate_up_fusion: true,
+            residual_prescale: metal,
+        }
+    }
+
+    fn granite(backend: BackendKind) -> AsrResidencyPlan {
+        let dtype = select_granite_speech_dtype(&profile(backend), Some("bfloat16")).unwrap();
+        let load = GraniteLoad {
+            dtype,
+            representation: granite_representation(backend),
+            // The published granite-speech-4.1-2b-plus config.json.
+            residual_multiplier: 0.22,
+            tied_lm_head: true,
+            encoder_attention_dists: (16, 200),
+        };
+        price_granite(&census!("granite_speech_4_1_2b_plus.json"), backend, &load).unwrap()
+    }
+
+    fn vibevoice(backend: BackendKind) -> AsrResidencyPlan {
+        let dtype = vibevoice_asr_weight_dtype(&profile(backend)).unwrap();
+        let fused = qwen3_dense_projection_fusion_policy(backend == BackendKind::Metal, None);
+        price_vibevoice(&census!("vibevoice_asr.json"), backend, dtype, fused).unwrap()
+    }
+
+    fn voxtral(backend: BackendKind) -> AsrResidencyPlan {
+        let config_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voxtral_realtime_2602");
+        let dtype = voxtral_realtime_weight_dtype(&config_dir, &profile(backend)).unwrap();
+        price_voxtral(
+            &census!("voxtral_mini_4b_realtime_2602.json"),
+            backend,
+            dtype,
+        )
+        .unwrap()
+    }
+
+    /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
+    /// over 128,000 positions; head dims 2048 / 32 and 512 / 16.
+    const LFM_ROPE_TABLES: [(usize, usize); 2] = [(128_000, 64), (128_000, 32)];
+
+    fn lfm25_audio(backend: BackendKind) -> AsrResidencyPlan {
+        let files = census!("lfm2_5_audio_1_5b_q4_0.json");
+        let [main, mmproj, tokenizer, vocoder]: [CensusFile; 4] = files.try_into().unwrap();
+        let census = Lfm25AudioCensus {
+            main,
+            mmproj,
+            tokenizer,
+            vocoder,
+        };
+        price_lfm25_audio(&census, backend, LFM_ROPE_TABLES).unwrap()
+    }
+
+    fn gib(bytes: u64) -> f64 {
+        bytes as f64 / GIB
+    }
+
+    fn stored(files: &[CensusFile], keep: impl Fn(&CensusTensor) -> bool) -> u64 {
+        files
+            .iter()
+            .flat_map(|file| file.tensors.iter())
+            .filter(|tensor| keep(tensor))
+            .map(|tensor| tensor.stored_bytes)
+            .sum()
+    }
+
+    fn largest(files: &[CensusFile]) -> u64 {
+        files
+            .iter()
+            .flat_map(|file| file.tensors.iter())
+            .map(|tensor| tensor.stored_bytes)
+            .max()
+            .unwrap()
+    }
+
+    fn assert_gib(label: &str, bytes: u64, expected: f64) {
+        let actual = gib(bytes);
+        assert!(
+            (actual - expected).abs() <= 0.015,
+            "{label}: {actual:.3} GiB, expected {expected:.2} GiB"
+        );
+    }
+
+    /// Per variant and backend (CPU, Metal, CUDA): resident weights at their
+    /// exact size, and as allocated on Metal. The exact figures are the
+    /// admission report's table B (per-variant dtype sources); Metal's
+    /// allocator sizes are computed from the census here (the report gave
+    /// only rough figures, and its Whisper 3.80 GiB left out the fused Q/K/V,
+    /// which the Whisper audit's 4.38 GB included).
+    #[test]
+    fn plans_match_the_per_backend_residency_table() {
+        let _env = env_lock();
+        let qwen06 = census!("qwen3_asr_0_6b_q8_0.json");
+        let qwen17 = census!("qwen3_asr_1_7b_q8_0.json");
+        type Row<'a> = (
+            &'a str,
+            Box<dyn Fn(BackendKind) -> AsrResidencyPlan + 'a>,
+            [f64; 4],
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "Parakeet-TDT-0.6B-v3",
+                Box::new(parakeet),
+                [2.34, 2.34, 2.34, 2.34],
+            ),
+            (
+                "Nemotron-3.5-ASR-0.6B",
+                Box::new(nemotron),
+                [2.38, 2.38, 2.38, 1.20],
+            ),
+            (
+                "Whisper-L-v3-Turbo",
+                Box::new(whisper),
+                [3.01, 3.01, 4.08, 1.51],
+            ),
+            (
+                "Qwen3-ASR-0.6B",
+                Box::new(|b| qwen3_asr(&qwen06, b)),
+                [1.86, 1.23, 1.55, 1.57],
+            ),
+            (
+                "Qwen3-ASR-1.7B",
+                Box::new(|b| qwen3_asr(&qwen17, b)),
+                [4.05, 2.87, 3.30, 3.47],
+            ),
+            (
+                "Granite-Speech-Plus",
+                Box::new(granite),
+                [7.87, 5.60, 6.11, 3.93],
+            ),
+            (
+                "VibeVoice-ASR",
+                Box::new(vibevoice),
+                [32.31, 32.31, 57.52, 16.16],
+            ),
+            (
+                "Voxtral-Mini-4B-RT",
+                Box::new(voxtral),
+                [16.50, 8.25, 10.50, 8.25],
+            ),
+            (
+                "LFM2.5-Audio-1.5B",
+                Box::new(lfm25_audio),
+                [2.08, 2.08, 2.08, 2.08],
+            ),
+        ];
+        for (label, plan, [cpu, metal_exact, metal_allocated, cuda]) in rows {
+            let [on_cpu, on_metal, on_cuda] = BACKENDS.map(&plan);
+            eprintln!(
+                "{label:22} resident (load peak) GiB: CPU {:.2} ({:.2}), Metal {:.2} exact / {:.2} allocated ({:.2}), CUDA {:.2} ({:.2}, host {:.2})",
+                gib(on_cpu.resident_bytes),
+                gib(on_cpu.load_peak_bytes),
+                gib(on_metal.logical_resident_bytes),
+                gib(on_metal.resident_bytes),
+                gib(on_metal.load_peak_bytes),
+                gib(on_cuda.resident_bytes),
+                gib(on_cuda.load_peak_bytes),
+                gib(on_cuda.host_staging_bytes),
+            );
+            assert_gib(&format!("{label} CPU"), on_cpu.resident_bytes, cpu);
+            assert_eq!(on_cpu.resident_bytes, on_cpu.logical_resident_bytes);
+            assert_gib(
+                &format!("{label} Metal"),
+                on_metal.logical_resident_bytes,
+                metal_exact,
+            );
+            assert_gib(
+                &format!("{label} Metal allocated"),
+                on_metal.resident_bytes,
+                metal_allocated,
+            );
+            assert_gib(&format!("{label} CUDA"), on_cuda.resident_bytes, cuda);
+            for plan in [on_cpu, on_metal, on_cuda] {
+                assert!(plan.load_peak_bytes >= plan.resident_bytes, "{label}");
+                assert!(
+                    plan.resident_bytes >= plan.logical_resident_bytes,
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// The census totals pin the exact figures independently of the plan.
+    #[test]
+    fn exact_residency_follows_the_loaders_dtype_and_skips() {
+        let _env = env_lock();
+        // Parakeet: every F32 tensor but the featurizer, on every backend,
+        // plus each depthwise convolution with its BatchNorm folded in.
+        let files = census!("parakeet_tdt_0_6b_v3.json");
+        let weights = stored(&files, |t| {
+            t.dtype == StoredDType::Dense(DType::F32) && !t.name.starts_with("preprocessor.")
+        });
+        let folds = 24 * (1024 * 9 + 1024) * 4;
+        for backend in BACKENDS {
+            assert_eq!(parakeet(backend).logical_resident_bytes, weights + folds);
+        }
+        // Nemotron: F32 on CPU and Metal; BF16 on CUDA plus transposed copies
+        // of the two LSTM layers' input and hidden weights.
+        let files = census!("nemotron_3_5_asr_streaming_0_6b.json");
+        let weights = stored(&files, |t| !t.name.starts_with("preprocessor."));
+        assert_eq!(nemotron(BackendKind::Cpu).resident_bytes, weights);
+        assert_eq!(
+            nemotron(BackendKind::Cuda).resident_bytes,
+            weights / 2 + 4 * 2560 * 640 * 2
+        );
+        for backend in BACKENDS {
+            let plan = nemotron(backend);
+            assert_eq!(plan.memo_bytes, NEMOTRON_MODEL_MEMO_MAX_BYTES);
+            assert_eq!(
+                plan.estimate().unwrap().resident_bytes,
+                plan.resident_bytes + NEMOTRON_MODEL_MEMO_MAX_BYTES
+            );
+        }
+        // Whisper: F16 on CUDA, F32 elsewhere. The computed encoder table
+        // replaces the checkpoint's; each fused self-attention adds a zero K
+        // bias.
+        let files = census!("whisper_large_v3_turbo.json");
+        let f16 = stored(&files, |_| true);
+        let zero_biases = 36 * 1280;
+        assert_eq!(
+            whisper(BackendKind::Cpu).resident_bytes,
+            2 * f16 + 4 * zero_biases
+        );
+        assert_eq!(
+            whisper(BackendKind::Cuda).resident_bytes,
+            f16 + 2 * zero_biases
+        );
+        // VibeVoice and Voxtral keep their BF16 checkpoint as is on CUDA.
+        let files = census!("vibevoice_asr.json");
+        assert_eq!(
+            vibevoice(BackendKind::Cuda).resident_bytes,
+            stored(&files, |_| true)
+        );
+        assert_eq!(
+            vibevoice(BackendKind::Cpu).resident_bytes,
+            2 * stored(&files, |_| true)
+        );
+        let files = census!("voxtral_mini_4b_realtime_2602.json");
+        assert_eq!(
+            voxtral(BackendKind::Cuda).resident_bytes,
+            stored(&files, |_| true)
+        );
+        assert_eq!(
+            voxtral(BackendKind::Metal).logical_resident_bytes,
+            stored(&files, |_| true)
+        );
+        // Granite on CUDA: BF16 without BatchNorm step counters, plus the
+        // encoder's U32 attention distance tables.
+        let files = census!("granite_speech_4_1_2b_plus.json");
+        let bf16 = stored(&files, |t| t.dtype == StoredDType::Dense(DType::BF16));
+        assert_eq!(
+            granite(BackendKind::Cuda).resident_bytes,
+            bf16 + 16 * 200 * 200 * 4
+        );
+    }
+
+    /// On Metal Candle rounds every kernel-written buffer up to a power of
+    /// two and keeps a cast tensor's stored-dtype upload until the load fence;
+    /// host uploads keep their size.
+    #[test]
+    fn metal_prices_allocator_rounding_and_uploads_held_until_the_fence() {
+        let _env = env_lock();
+        let tensor = |name: &str, dtype, shape: Vec<usize>| {
+            census_tensor(name.into(), StoredDType::Dense(dtype), shape)
+        };
+        // An F16 tensor cast to 6.6 MB of F32 takes an 8 MiB buffer; an F32
+        // upload of the same tensor keeps its size.
+        let f16 = tensor("w", DType::F16, vec![1280, 1280]);
+        let f32 = tensor("w", DType::F32, vec![1280, 1280]);
+        for (source, expected) in [(&f16, 8 << 20), (&f32, 1280 * 1280 * 4)] {
+            let mut ledger = Ledger::new(BackendKind::Metal);
+            ledger.var(source, Source::Mapped, &[DType::F32]).unwrap();
+            let plan = AsrResidencyPlan::from_ledger(ledger, 0).unwrap();
+            assert_eq!(plan.logical_resident_bytes, 1280 * 1280 * 4);
+            assert_eq!(plan.resident_bytes, expected);
+        }
+        let mut ledger = Ledger::new(BackendKind::Cpu);
+        ledger.var(&f16, Source::Mapped, &[DType::F32]).unwrap();
+        assert_eq!(
+            AsrResidencyPlan::from_ledger(ledger, 0)
+                .unwrap()
+                .resident_bytes,
+            1280 * 1280 * 4
+        );
+        // The safetensors loaders never synchronize before the fence: the
+        // load peak holds every cast tensor's upload beside the residents.
+        for (label, plan, uploads) in [
+            (
+                "Whisper",
+                whisper(BackendKind::Metal),
+                census!("whisper_large_v3_turbo.json"),
+            ),
+            (
+                "Granite",
+                granite(BackendKind::Metal),
+                census!("granite_speech_4_1_2b_plus.json"),
+            ),
+            (
+                "Voxtral",
+                voxtral(BackendKind::Metal),
+                census!("voxtral_mini_4b_realtime_2602.json"),
+            ),
+        ] {
+            let uploads = stored(&uploads, |t| !t.name.ends_with("num_batches_tracked"));
+            let staging = plan.load_peak_bytes - plan.resident_bytes;
+            assert!(
+                staging >= uploads && staging - uploads < 128 << 20,
+                "{label}: staging {staging}, uploads {uploads}"
+            );
+        }
+        // Whisper's live Metal load reached about 6.3 GB with the process.
+        assert_gib(
+            "Whisper Metal load peak",
+            whisper(BackendKind::Metal).load_peak_bytes,
+            5.61,
+        );
+        assert_gib(
+            "Granite Metal load peak",
+            granite(BackendKind::Metal).load_peak_bytes,
+            10.11,
+        );
+    }
+
+    /// CUDA prices the device from the plan and authorizes only host staging
+    /// on the host, never the catalog's figure.
+    #[test]
+    fn cuda_plans_price_the_device_and_stage_only_on_the_host() {
+        let _env = env_lock();
+        let qwen06 = census!("qwen3_asr_0_6b_q8_0.json");
+        let plans = [
+            (ModelVariant::ParakeetTdt06BV3, parakeet(BackendKind::Cuda)),
+            (
+                ModelVariant::Nemotron35AsrStreaming06B,
+                nemotron(BackendKind::Cuda),
+            ),
+            (
+                ModelVariant::WhisperLargeV3Turbo,
+                whisper(BackendKind::Cuda),
+            ),
+            (
+                ModelVariant::Qwen3Asr06BGguf,
+                qwen3_asr(&qwen06, BackendKind::Cuda),
+            ),
+            (
+                ModelVariant::GraniteSpeech412BPlus,
+                granite(BackendKind::Cuda),
+            ),
+            (ModelVariant::VibeVoiceAsr, vibevoice(BackendKind::Cuda)),
+            (
+                ModelVariant::VoxtralMini4BRealtime2602,
+                voxtral(BackendKind::Cuda),
+            ),
+            (
+                ModelVariant::Lfm25Audio15BGguf,
+                lfm25_audio(BackendKind::Cuda),
+            ),
+        ];
+        for (variant, plan) in plans {
+            let catalog = super::super::model_memory_estimate(variant);
+            let resource = plan.resource_plan().unwrap();
+            let device = plan.estimate().unwrap();
+            assert_eq!(
+                resource.load_authorization.device_bytes,
+                ResourceAmount::Known(device.load_peak_bytes)
+            );
+            assert_eq!(
+                resource.resident_authorization.device_bytes,
+                ResourceAmount::Known(device.resident_bytes)
+            );
+            assert_eq!(
+                resource.load_authorization.host_bytes,
+                ResourceAmount::Known(plan.host_staging_bytes)
+            );
+            assert!(
+                device.load_peak_bytes < catalog.load_peak_bytes,
+                "{variant}"
+            );
+            assert!(plan.host_staging_bytes < 1100 << 20, "{variant}");
+            assert!(
+                plan.host_staging_bytes < device.load_peak_bytes,
+                "{variant}"
+            );
+        }
+        // The largest tensor's host copy: VibeVoice's untied LM head.
+        let files = census!("vibevoice_asr.json");
+        assert_eq!(
+            vibevoice(BackendKind::Cuda).host_staging_bytes,
+            largest(&files)
+        );
+        // Parakeet's 12 GiB catalog figure (device and host) was 5x its weights.
+        assert_gib(
+            "Parakeet CUDA",
+            parakeet(BackendKind::Cuda).load_peak_bytes,
+            2.34,
+        );
+    }
+
+    /// A dtype policy change reprices admission: the plans take the loaders'
+    /// resolvers, overrides included.
+    #[test]
+    fn plans_follow_the_loader_dtype_overrides() {
+        let _env = env_lock();
+        struct Restore(&'static str);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+        let default = vibevoice(BackendKind::Cuda).resident_bytes;
+        std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "f32");
+        let _restore = Restore("IZWI_VIBEVOICE_ASR_DTYPE");
+        assert_eq!(vibevoice(BackendKind::Cuda).resident_bytes, 2 * default);
+        // CPU and Metal resolve F32 whatever is requested.
+        std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "bf16");
+        assert_eq!(
+            vibevoice(BackendKind::Cpu).resident_bytes,
+            vibevoice(BackendKind::Metal).logical_resident_bytes
+        );
+    }
+
+    /// A Granite checkpoint with an untied LM head (the base variant) loads
+    /// it from the checkpoint, in F16 on Metal, and makes no embedding copy.
+    #[test]
+    fn granite_prices_a_tied_head_copy_or_an_untied_head() {
+        let tensor = |name: &str, shape: Vec<usize>| {
+            census_tensor(name.into(), StoredDType::Dense(DType::BF16), shape)
+        };
+        let embedding = tensor("language_model.model.embed_tokens.weight", vec![1000, 64]);
+        let head = tensor("language_model.lm_head.weight", vec![1000, 64]);
+        let price = |tensors: Vec<CensusTensor>, tied| {
+            let files = [CensusFile {
+                path: PathBuf::from("model.safetensors"),
+                tensors,
+            }];
+            let load = GraniteLoad {
+                dtype: DType::F32,
+                representation: granite_representation(BackendKind::Metal),
+                residual_multiplier: 0.22,
+                tied_lm_head: tied,
+                encoder_attention_dists: (0, 0),
+            };
+            price_granite(&files, BackendKind::Metal, &load)
+                .unwrap()
+                .logical_resident_bytes
+        };
+        let embedding_f32 = 1000 * 64 * 4;
+        let head_f16 = 1000 * 64 * 2;
+        assert_eq!(
+            price(vec![embedding.clone()], true),
+            embedding_f32 + head_f16
+        );
+        assert_eq!(
+            price(vec![embedding, head], false),
+            embedding_f32 + head_f16
+        );
+    }
+
+    /// The CPU resolves the Granite switches the plan prices for the CPU.
+    #[test]
+    fn granite_cpu_representation_matches_the_loader() {
+        let _env = env_lock();
+        assert_eq!(
+            granite_load_representation(&candle_core::Device::Cpu, DType::F32),
+            granite_representation(BackendKind::Cpu)
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn granite_metal_representation_matches_the_loader() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        let _env = env_lock();
+        assert_eq!(
+            granite_load_representation(&device, DType::F32),
+            granite_representation(BackendKind::Metal)
+        );
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "izwi-asr-residency-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes a small BF16 VibeVoice-shaped `model.safetensors`.
+    fn write_vibevoice_checkpoint(dir: &Path) -> u64 {
+        let device = candle_core::Device::Cpu;
+        let tensors = std::collections::HashMap::from([
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                candle_core::Tensor::zeros((512, 64), DType::BF16, &device).unwrap(),
+            ),
+            (
+                "lm_head.weight".to_string(),
+                candle_core::Tensor::zeros((512, 64), DType::BF16, &device).unwrap(),
+            ),
+            (
+                "model.acoustic_tokenizer.encoder.head.weight".to_string(),
+                candle_core::Tensor::zeros((32, 64), DType::BF16, &device).unwrap(),
+            ),
+        ]);
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+        (2 * 512 * 64 + 32 * 64) * 2
+    }
+
+    /// Variants without a plan, and checkpoints whose files are missing (the
+    /// loader reports those), keep the generic estimate.
+    #[test]
+    fn variants_without_a_plan_keep_the_generic_estimate() {
+        let _env = env_lock();
+        let dir = temp_dir("fallback");
+        let device = profile(BackendKind::Cuda);
+        for variant in [ModelVariant::Kokoro82M, ModelVariant::Qwen306B] {
+            assert!(residency_plan(variant, &dir, &device).unwrap().is_none());
+        }
+        for variant in [
+            ModelVariant::VibeVoiceAsr,
+            ModelVariant::WhisperLargeV3Turbo,
+            ModelVariant::Qwen3Asr06BGguf,
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Nemotron35AsrStreaming06B,
+            ModelVariant::GraniteSpeech412BPlus,
+            ModelVariant::VoxtralMini4BRealtime2602,
+            ModelVariant::Lfm25Audio15BGguf,
+        ] {
+            assert!(
+                residency_plan(variant, &dir, &device).unwrap().is_none(),
+                "{variant}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The loaded runtime's admission takes the ASR plan on its backend.
+    #[test]
+    fn runtime_admission_prices_asr_loads_by_their_plan() {
+        let _authority = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = env_lock();
+        let models_dir = temp_dir("runtime");
+        let checkpoint = models_dir.join("VibeVoice-ASR");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        write_vibevoice_checkpoint(&checkpoint);
+        let runtime = crate::runtime::service::RuntimeService::new(crate::config::EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: crate::backends::BackendPreference::Cpu,
+            ..crate::config::EngineConfig::default()
+        })
+        .unwrap();
+        let admitted = runtime
+            .model_lifecycle
+            .model_resource_plan(ModelVariant::VibeVoiceAsr, &checkpoint)
+            .unwrap();
+        let device = runtime
+            .model_lifecycle
+            .backend_router
+            .context()
+            .device
+            .clone();
+        let plan = resource_plan(ModelVariant::VibeVoiceAsr, &checkpoint, &device)
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted, plan);
+        // F32 on the CPU: twice the BF16 checkpoint, not its stored bytes.
+        let inventory = super::super::portable_model_memory_estimate(
+            BackendKind::Cpu,
+            ModelVariant::VibeVoiceAsr,
+            &checkpoint,
+        )
+        .unwrap();
+        assert_eq!(
+            admitted.resident_authorization.host_bytes,
+            ResourceAmount::Known(2 * inventory.resident_bytes)
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// A gzip `.nemo` reports its payload through the ISIZE trailer; a plain
+    /// tar is its own payload.
+    #[test]
+    fn nemo_payload_reads_the_gzip_trailer() {
+        use std::io::Write;
+        let dir = temp_dir("nemo");
+        let payload = vec![7u8; 3 << 20];
+        let gzip = dir.join("model.nemo");
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gzip).unwrap(),
+            flate2::Compression::fast(),
+        );
+        encoder.write_all(&payload).unwrap();
+        encoder.finish().unwrap();
+        // Highly compressible: far smaller than its payload.
+        assert!(std::fs::metadata(&gzip).unwrap().len() < 1 << 20);
+        assert_eq!(nemo_payload_bytes(&gzip).unwrap(), 3 << 20);
+        let tar = dir.join("plain.nemo");
+        std::fs::write(&tar, &payload).unwrap();
+        assert_eq!(nemo_payload_bytes(&tar).unwrap(), 3 << 20);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Before extraction a NeMo load is priced from the archive payload, after
+    /// Parakeet's in-memory extraction buffer is freed.
+    #[test]
+    fn first_nemo_loads_price_the_payload_and_the_extraction_buffer() {
+        let payload: u64 = 2_509_332_480;
+        let extraction = payload.next_power_of_two();
+        let cpu =
+            price_nemo_first_load(BackendKind::Cpu, payload, DType::F32, extraction, 0).unwrap();
+        assert_eq!(cpu.resident_bytes, payload);
+        // Extraction precedes the weights: the peak is the larger of the two.
+        assert_eq!(cpu.load_peak_bytes, extraction);
+        let cuda = price_nemo_first_load(BackendKind::Cuda, payload, DType::BF16, 0, 7).unwrap();
+        assert_eq!(cuda.resident_bytes, payload / 2);
+        assert_eq!(cuda.memo_bytes, 7);
+        assert_eq!(cuda.host_staging_bytes, NEMO_UNLISTED_TENSOR_BYTES);
+    }
+}

@@ -36,6 +36,7 @@ use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
+pub(crate) use nemo::nemotron_checkpoint_paths;
 pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
     default_realtime_state_shape, resample_linear, NemotronEncodeProfile, NemotronNetwork,

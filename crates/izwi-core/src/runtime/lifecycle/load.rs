@@ -37,6 +37,8 @@ use crate::runtime::lifecycle::controller::{
 };
 use crate::runtime::service::RuntimeService;
 
+#[path = "asr_memory.rs"]
+mod asr_memory;
 #[path = "qwen36moe_memory.rs"]
 mod qwen36moe_memory;
 #[path = "qwen38_memory.rs"]
@@ -479,87 +481,171 @@ fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>)
     Ok(())
 }
 
-fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
+/// How a checkpoint stores one tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredDType {
+    /// A safetensors or PyTorch tensor, which Candle loads as a dense tensor.
+    Dense(candle_core::DType),
+    /// A GGUF tensor. Candle loads every GGUF tensor, F32 ones included, as a
+    /// `QTensor`.
+    Ggml(candle_core::quantized::GgmlDType),
+    /// A safetensors dtype Candle cannot load: only its stored bytes are known.
+    Unsupported,
+}
+
+/// One tensor as its checkpoint header records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusTensor {
+    name: String,
+    dtype: StoredDType,
+    shape: Vec<usize>,
+    /// Payload bytes in the file.
+    stored_bytes: u64,
+}
+
+impl CensusTensor {
+    fn elements(&self) -> u64 {
+        u64::try_from(
+            self.shape
+                .iter()
+                .try_fold(1_usize, |acc, &dim| acc.checked_mul(dim))
+                .unwrap_or(usize::MAX),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+/// The header census of one checkpoint file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusFile {
+    path: PathBuf,
+    tensors: Vec<CensusTensor>,
+}
+
+/// Header census of the checkpoint files under a model path: the tensor list
+/// of every readable checkpoint, without materializing any payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CheckpointCensus {
+    files: Vec<CensusFile>,
+    /// Size of the largest container whose tensors cannot be listed (a `.nemo`
+    /// archive, or a PTH file Candle cannot parse).
+    container_fallback_bytes: u64,
+}
+
+impl CheckpointCensus {
+    fn tensors(&self) -> impl Iterator<Item = &CensusTensor> {
+        self.files.iter().flat_map(|file| file.tensors.iter())
+    }
+
+    fn inventory(&self) -> Option<TensorStorageInventory> {
+        if self.files.is_empty() {
+            // The compressed artifact size is a conservative lower bound until
+            // the extracted checkpoint header exists.
+            let bytes = self.container_fallback_bytes;
+            return (bytes > 0).then_some(TensorStorageInventory {
+                total_bytes: bytes,
+                largest_tensor_bytes: bytes,
+                largest_tensor_elements: 0,
+                tensor_count: 1,
+            });
+        }
+        Some(
+            self.tensors()
+                .fold(TensorStorageInventory::default(), |inv, tensor| {
+                    inv.push(tensor.stored_bytes, tensor.elements())
+                }),
+        )
+    }
+}
+
+/// The header census of one checkpoint file, or `None` for a file that is not
+/// a checkpoint or a PTH file Candle cannot parse.
+fn census_checkpoint_file(file: &Path) -> Result<Option<CensusFile>> {
+    let tensors = match file.extension().and_then(|value| value.to_str()) {
+        Some("gguf") => crate::models::shared::weights::gguf::GgufLoader::from_path(file)?
+            .tensor_census()?
+            .into_iter()
+            .map(|tensor| CensusTensor {
+                name: tensor.name,
+                dtype: StoredDType::Ggml(tensor.dtype),
+                shape: tensor.shape,
+                stored_bytes: tensor.bytes,
+            })
+            .collect(),
+        Some("safetensors") => {
+            // SAFETY: Candle owns the read-only mapping for the lifetime of
+            // the parsed tensor views read below.
+            let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(file) }?;
+            tensors
+                .tensors()
+                .into_iter()
+                .map(|(name, view)| {
+                    let stored_bytes = u64::try_from(view.data().len()).map_err(|_| {
+                        Error::ModelLoadError("safetensors tensor size exceeds u64".into())
+                    })?;
+                    Ok(CensusTensor {
+                        name,
+                        dtype: candle_core::DType::try_from(view.dtype())
+                            .map_or(StoredDType::Unsupported, StoredDType::Dense),
+                        shape: view.shape().to_vec(),
+                        stored_bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        Some("pth" | "ckpt") => {
+            let Ok(infos) = candle_core::pickle::read_pth_tensor_info(file, false, None) else {
+                return Ok(None);
+            };
+            infos
+                .into_iter()
+                .map(|info| {
+                    let elements =
+                        u64::try_from(info.layout.shape().elem_count()).unwrap_or(u64::MAX);
+                    CensusTensor {
+                        name: info.name,
+                        dtype: StoredDType::Dense(info.dtype),
+                        shape: info.layout.shape().dims().to_vec(),
+                        stored_bytes: elements.saturating_mul(info.dtype.size_in_bytes() as u64),
+                    }
+                })
+                .collect()
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(CensusFile {
+        path: file.to_path_buf(),
+        tensors,
+    }))
+}
+
+fn checkpoint_census(path: &Path) -> Result<CheckpointCensus> {
     let mut files = Vec::new();
     collect_checkpoint_files(path, 3, &mut files)?;
-    let mut found = false;
-    let mut container_fallback = 0_u64;
-    let mut aggregate = TensorStorageInventory::default();
+    let mut census = CheckpointCensus::default();
     for file in files {
         let extension = file.extension().and_then(|value| value.to_str());
-        let inventory = match extension {
-            Some("gguf") => {
-                let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&file)?;
-                Some(loader.tensor_storage_inventory()?)
-            }
-            Some("safetensors") => {
-                // SAFETY: Candle owns the read-only mapping for the lifetime of
-                // the parsed tensor views returned below.
-                let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(&file) }?;
-                Some(tensors.tensors().into_iter().try_fold(
-                    TensorStorageInventory::default(),
-                    |inv, (_, tensor)| {
-                        let bytes = u64::try_from(tensor.data().len()).map_err(|_| {
-                            Error::ModelLoadError("safetensors tensor size exceeds u64".into())
-                        })?;
-                        let elements = u64::try_from(
-                            tensor
-                                .shape()
-                                .iter()
-                                .try_fold(1_usize, |acc: usize, &dim| acc.checked_mul(dim))
-                                .unwrap_or(usize::MAX),
-                        )
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "safetensors tensor element count exceeds u64".into(),
-                            )
-                        })?;
-                        Ok::<_, Error>(inv.push(bytes, elements))
-                    },
-                )?)
-            }
-            Some("pth" | "ckpt") => {
-                let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
-                    .ok()
-                    .map(|infos| {
-                        infos
-                            .into_iter()
-                            .fold(TensorStorageInventory::default(), |inv, info| {
-                                let elements = u64::try_from(info.layout.shape().elem_count())
-                                    .unwrap_or(u64::MAX);
-                                let bytes =
-                                    elements.saturating_mul(info.dtype.size_in_bytes() as u64);
-                                inv.push(bytes, elements)
-                            })
-                    });
-                if parsed.is_none() {
-                    container_fallback = container_fallback.max(file.metadata()?.len());
+        let container = match extension {
+            // NeMo is a tar container (gzip-compressed for some checkpoints).
+            Some("nemo") => true,
+            _ => match census_checkpoint_file(&file)? {
+                Some(parsed) => {
+                    census.files.push(parsed);
+                    false
                 }
-                parsed
-            }
-            // NeMo is a zip container. Its compressed artifact size is a
-            // conservative lower bound until the repacked PTH header exists.
-            Some("nemo") => {
-                let bytes = file.metadata()?.len();
-                container_fallback = container_fallback.max(bytes);
-                None
-            }
-            _ => None,
+                None => matches!(extension, Some("pth" | "ckpt")),
+            },
         };
-        if let Some(file_inventory) = inventory {
-            found = true;
-            aggregate = aggregate.merge(file_inventory);
+        if container {
+            census.container_fallback_bytes =
+                census.container_fallback_bytes.max(file.metadata()?.len());
         }
     }
-    if !found && container_fallback > 0 {
-        return Ok(Some(TensorStorageInventory {
-            total_bytes: container_fallback,
-            largest_tensor_bytes: container_fallback,
-            largest_tensor_elements: 0,
-            tensor_count: 1,
-        }));
-    }
-    Ok(found.then_some(aggregate))
+    Ok(census)
+}
+
+fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
+    Ok(checkpoint_census(path)?.inventory())
 }
 
 /// Per-tensor instantiation slack: device buffer page rounding, storage
@@ -1432,6 +1518,13 @@ impl ModelLifecycleController {
                 &self.backend_router.context().device,
             )?;
             return fish_s2_resource_plan(backend, memory);
+        }
+        // ASR families price what their loader allocates on every backend;
+        // the catalog figure stays a display value for them.
+        if let Some(plan) =
+            asr_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
+        {
+            return Ok(plan);
         }
         let estimate = if backend == BackendKind::Cuda {
             model_memory_estimate(variant)
@@ -3433,6 +3526,64 @@ mod tests {
                 .unwrap(),
             catalog
         );
+    }
+
+    /// The header census lists every tensor with its stored dtype, shape and
+    /// payload bytes, and the inventory folds the same records.
+    #[test]
+    fn checkpoint_census_records_every_tensor_header() {
+        use super::{checkpoint_census, checkpoint_tensor_inventory, StoredDType};
+        let dir = std::env::temp_dir().join(format!("izwi-census-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("shards")).unwrap();
+        let device = candle_core::Device::Cpu;
+        let zeros = |shape: &[usize], dtype| candle_core::Tensor::zeros(shape, dtype, &device).unwrap();
+        candle_core::safetensors::save(
+            &HashMap::from([
+                ("embed".to_string(), zeros(&[300, 16], candle_core::DType::BF16)),
+                ("norm".to_string(), zeros(&[16], candle_core::DType::F32)),
+            ]),
+            dir.join("shards/model.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.nemo"), vec![0u8; 4096]).unwrap();
+
+        let census = checkpoint_census(&dir).unwrap();
+        assert_eq!(census.files.len(), 1);
+        assert_eq!(census.container_fallback_bytes, 4096);
+        let mut tensors = census.files[0]
+            .tensors
+            .iter()
+            .map(|t| (t.name.as_str(), t.dtype, t.shape.clone(), t.stored_bytes))
+            .collect::<Vec<_>>();
+        tensors.sort_by_key(|tensor| tensor.0);
+        assert_eq!(
+            tensors,
+            [
+                ("embed", StoredDType::Dense(candle_core::DType::BF16), vec![300, 16], 9600),
+                ("norm", StoredDType::Dense(candle_core::DType::F32), vec![16], 64),
+            ]
+        );
+        assert_eq!(
+            checkpoint_tensor_inventory(&dir).unwrap(),
+            Some(TensorStorageInventory {
+                total_bytes: 9664,
+                largest_tensor_bytes: 9600,
+                largest_tensor_elements: 4800,
+                tensor_count: 2,
+            })
+        );
+        // Without a readable checkpoint the container size stands in.
+        std::fs::remove_dir_all(dir.join("shards")).unwrap();
+        assert_eq!(
+            checkpoint_tensor_inventory(&dir).unwrap(),
+            Some(TensorStorageInventory {
+                total_bytes: 4096,
+                largest_tensor_bytes: 4096,
+                largest_tensor_elements: 0,
+                tensor_count: 1,
+            })
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

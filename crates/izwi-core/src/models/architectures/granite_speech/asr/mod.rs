@@ -58,6 +58,7 @@ pub use runtime::{
     GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
+pub(crate) use runtime::{granite_load_representation, GraniteLoadRepresentation};
 pub use transcript::{
     merge_granite_speech_timestamp_chunks, parse_granite_speech_output,
     GraniteSpeechParsedTranscript, GraniteSpeechSegment, GraniteSpeechTimestampChunk,
@@ -2099,7 +2100,14 @@ fn validate_granite_task_audio_duration(task: GraniteSpeechTask, audio_seconds: 
     )))
 }
 
-fn select_granite_speech_dtype(device: &DeviceProfile, config_hint: Option<&str>) -> Result<DType> {
+/// The base weight dtype the Granite Speech loader selects on `device`,
+/// honouring `IZWI_GRANITE_SPEECH_DTYPE`; `config_hint` is the checkpoint
+/// config's dtype. Load admission prices the checkpoint at this dtype
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn select_granite_speech_dtype(
+    device: &DeviceProfile,
+    config_hint: Option<&str>,
+) -> Result<DType> {
     let explicit = std::env::var("IZWI_GRANITE_SPEECH_DTYPE")
         .ok()
         .map(|raw| raw.trim().to_string())

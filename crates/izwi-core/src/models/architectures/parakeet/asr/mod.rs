@@ -35,6 +35,7 @@ use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
+pub(crate) use nemo::parakeet_checkpoint_paths;
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 
