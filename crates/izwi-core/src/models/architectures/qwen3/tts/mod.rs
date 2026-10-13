@@ -13,7 +13,7 @@ mod tokenizer;
 pub use config::Qwen3TtsConfig;
 pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
-    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
+    CodeSelection, SubtalkerSampling, CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
 pub use speech_tokenizer::{SpeechTokenizerDecodeStats, SpeechTokenizerDecoder};
 pub use talker::{TalkerModel, TalkerPhysicalCache};
@@ -171,6 +171,8 @@ pub struct TtsGenerationParams {
     pub repetition_penalty: f32,
     /// Maximum generated codec frames. `0` means auto (model maximum).
     pub max_frames: usize,
+    /// Residual-codebook sampling (the reference's `subtalker_*` settings).
+    pub subtalker: SubtalkerSampling,
 }
 
 impl Default for TtsGenerationParams {
@@ -182,6 +184,20 @@ impl Default for TtsGenerationParams {
             top_k: 50,
             repetition_penalty: 1.05,
             max_frames: crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES,
+            subtalker: SubtalkerSampling::default(),
+        }
+    }
+}
+
+impl TtsGenerationParams {
+    /// Sub-talker settings for a request whose semantic temperature is
+    /// `temperature`: the reference defaults, except that a greedy request
+    /// (temperature 0) stays greedy for every codebook, so it is deterministic.
+    pub fn subtalker_for_request_temperature(temperature: f32) -> SubtalkerSampling {
+        if temperature <= 1e-5 {
+            SubtalkerSampling::greedy()
+        } else {
+            SubtalkerSampling::default()
         }
     }
 }
@@ -854,6 +870,7 @@ pub struct PreparedTtsPredictorStage {
     expected_tensor_sequence: Option<PhysicalStateSequenceId>,
     next_rng: SimpleRng,
     next_semantic_history: Vec<u32>,
+    subtalker: SubtalkerSampling,
     sampling_ms: f64,
 }
 
@@ -948,6 +965,7 @@ impl TtsGenerationParams {
                 opts.max_tokens
                     .clamp(16, crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
             },
+            subtalker: Self::subtalker_for_request_temperature(opts.temperature),
         }
     }
 }
@@ -2323,6 +2341,7 @@ impl Qwen3TtsModel {
                 expected_tensor_sequence: state.tensor_sequence,
                 next_rng,
                 next_semantic_history,
+                subtalker: state.params.subtalker,
                 sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
             },
         ))
@@ -2335,7 +2354,7 @@ impl Qwen3TtsModel {
     /// acoustic embedding or step-input construction fails.
     pub fn tts_predictor_stage_batch_physical(
         &self,
-        rows: Vec<PreparedTtsPredictorStage>,
+        mut rows: Vec<PreparedTtsPredictorStage>,
         caches: &mut [&mut CodePredictorPhysicalCache],
     ) -> Result<Vec<PreparedTtsTalkerStage>> {
         if rows.is_empty() || rows.len() != caches.len() {
@@ -2363,11 +2382,32 @@ impl Qwen3TtsModel {
             .map(|cache| cache.context_len())
             .collect::<Vec<_>>();
         let predictor_started = Instant::now();
-        let acoustic = self.code_predictor.generate_acoustic_codes_physical_batch(
-            &talker_hidden,
-            &semantic_embeds,
-            caches,
-        )?;
+        // Each row keeps drawing from its own post-semantic RNG; the advanced
+        // state commits with the talker step, like the semantic draw.
+        let mut rngs = rows.iter().map(|row| row.next_rng).collect::<Vec<_>>();
+        let acoustic = {
+            let mut draws = rngs
+                .iter_mut()
+                .map(|rng| move || rng.next_f32())
+                .collect::<Vec<_>>();
+            let mut selections = rows
+                .iter()
+                .zip(draws.iter_mut())
+                .map(|(row, draw)| CodeSelection::Sample {
+                    params: row.subtalker,
+                    draw,
+                })
+                .collect::<Vec<_>>();
+            self.code_predictor.generate_acoustic_codes_physical_batch(
+                &talker_hidden,
+                &semantic_embeds,
+                caches,
+                &mut selections,
+            )?
+        };
+        for (row, rng) in rows.iter_mut().zip(rngs) {
+            row.next_rng = rng;
+        }
         let predictor_ms = predictor_started.elapsed().as_secs_f64() * 1000.0;
         let result = rows
             .into_iter()
@@ -2822,11 +2862,18 @@ impl Qwen3TtsModel {
         let last_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
         })?;
-        let acoustic_codes = self.code_predictor.generate_acoustic_codes_physical(
-            last_hidden,
-            &semantic_embed,
-            predictor_cache,
-        )?;
+        let acoustic_codes = {
+            let mut draw = || next_rng.next_f32();
+            self.code_predictor.generate_acoustic_codes_physical(
+                last_hidden,
+                &semantic_embed,
+                predictor_cache,
+                &mut CodeSelection::Sample {
+                    params: state.params.subtalker,
+                    draw: &mut draw,
+                },
+            )?
+        };
         let acoustic_embed_sum = self
             .code_predictor
             .get_acoustic_embeddings_sum(&acoustic_codes)?;
@@ -4783,6 +4830,7 @@ mod tests {
                     state: state.rng.state.wrapping_add(1),
                 },
                 next_semantic_history: next_history,
+                subtalker: SubtalkerSampling::default(),
                 sampling_ms: 1.0,
             },
             acoustic_codes: vec![1, 2, 3],
@@ -5292,6 +5340,28 @@ mod tests {
         let (vocab, mask) = semantic_sampling_vocab_and_mask(5, 4, 9, true);
         assert_eq!(vocab, 4);
         assert_eq!(mask, vec![true; 4]);
+    }
+
+    /// QTTS-6: residual codebooks sample with the reference sub-talker
+    /// defaults unless the request is greedy.
+    #[test]
+    fn subtalker_sampling_defaults_follow_the_reference_and_greedy_requests() {
+        assert_eq!(
+            TtsGenerationParams::default().subtalker,
+            SubtalkerSampling {
+                do_sample: true,
+                temperature: 0.9,
+                top_k: 50,
+                top_p: 1.0,
+            }
+        );
+        let mut config = crate::runtime::GenerationConfig::default();
+        config.options.temperature = 0.7;
+        let sampled = TtsGenerationParams::from_generation_config(&config).subtalker;
+        assert_eq!(sampled, SubtalkerSampling::default());
+        config.options.temperature = 0.0;
+        let greedy = TtsGenerationParams::from_generation_config(&config).subtalker;
+        assert!(greedy.is_greedy());
     }
 
     #[test]

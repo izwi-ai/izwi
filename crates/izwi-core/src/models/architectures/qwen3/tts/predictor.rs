@@ -21,6 +21,9 @@ use crate::models::architectures::qwen3::tts::rope::{
 };
 pub use crate::models::shared::attention::physical::PhysicalPagedKvCache as CodePredictorPhysicalCache;
 use crate::models::shared::attention::physical::PreparedPhysicalPagedStep;
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
+};
 use crate::models::shared::weights::mlx;
 
 /// The predictor starts each semantic frame from talker hidden state followed
@@ -30,6 +33,72 @@ pub const CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS: usize = 2;
 /// Exact physical context occupied by one predictor frame.
 pub const fn code_predictor_physical_context_tokens(acoustic_groups: usize) -> usize {
     CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS.saturating_add(acoustic_groups.saturating_sub(1))
+}
+
+/// Sampling for the residual codebooks: the reference's `subtalker_*`
+/// generation settings (`generation_config.json`: do_sample true,
+/// temperature 0.9, top_k 50, top_p 1.0), passed to
+/// `code_predictor.generate`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubtalkerSampling {
+    pub do_sample: bool,
+    pub temperature: f32,
+    /// 0 disables top-k.
+    pub top_k: usize,
+    pub top_p: f32,
+}
+
+impl Default for SubtalkerSampling {
+    fn default() -> Self {
+        Self {
+            do_sample: true,
+            temperature: 0.9,
+            top_k: 50,
+            top_p: 1.0,
+        }
+    }
+}
+
+impl SubtalkerSampling {
+    pub fn greedy() -> Self {
+        Self {
+            do_sample: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_greedy(&self) -> bool {
+        !self.do_sample || self.temperature <= 1e-5
+    }
+}
+
+/// How one row picks each residual code: argmax, or a draw from the
+/// sub-talker distribution using the row's own uniform source.
+pub enum CodeSelection<'a> {
+    Greedy,
+    Sample {
+        params: SubtalkerSampling,
+        draw: &'a mut dyn FnMut() -> f32,
+    },
+}
+
+impl CodeSelection<'_> {
+    fn is_greedy(&self) -> bool {
+        match self {
+            Self::Greedy => true,
+            Self::Sample { params, .. } => params.is_greedy(),
+        }
+    }
+
+    /// Pick one code from a single row of logits.
+    fn select(&mut self, logits: &Tensor) -> Result<u32> {
+        match self {
+            Self::Sample { params, draw } if !params.is_greedy() => {
+                sample_code(logits, params, &mut **draw)
+            }
+            _ => argmax_token(logits),
+        }
+    }
 }
 
 /// Code Predictor model
@@ -197,12 +266,17 @@ impl CodePredictor {
         talker_hidden: &Tensor,
         semantic_embed: &Tensor,
         cache: &mut CodePredictorPhysicalCache,
+        selection: &mut CodeSelection<'_>,
     ) -> Result<Vec<u32>> {
         self.validate_physical_workspace(cache)?;
         let initial_cursor = cache.context_len();
         let checkpoint = cache.logical_checkpoint();
-        let result =
-            self.generate_acoustic_codes_physical_inner(talker_hidden, semantic_embed, cache);
+        let result = self.generate_acoustic_codes_physical_inner(
+            talker_hidden,
+            semantic_embed,
+            cache,
+            selection,
+        );
         if result.is_err() && cache.context_len() != initial_cursor {
             cache.restore_logical_checkpoint(checkpoint)?;
         }
@@ -214,6 +288,7 @@ impl CodePredictor {
         talker_hidden: &Tensor,
         semantic_embed: &Tensor,
         cache: &mut CodePredictorPhysicalCache,
+        selection: &mut CodeSelection<'_>,
     ) -> Result<Vec<u32>> {
         let required_tokens = self.physical_context_tokens_per_frame();
 
@@ -255,7 +330,7 @@ impl CodePredictor {
         }
 
         let first_logits = self.lm_heads[0].forward(&last_hidden)?;
-        let mut prev_code = argmax_token(&first_logits.i((0, 0))?)?;
+        let mut prev_code = selection.select(&first_logits.i((0, 0))?)?;
         cache.commit_prepared(prefill)?;
 
         let mut all_codes = Vec::with_capacity(num_acoustic);
@@ -273,7 +348,7 @@ impl CodePredictor {
                 self.forward_physical_hidden_uncommitted(&step_hidden, step_start, cache)?;
             step_hidden = next_hidden;
             let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
-            prev_code = argmax_token(&logits.i((0, 0))?)?;
+            prev_code = selection.select(&logits.i((0, 0))?)?;
             cache.commit_prepared(step_prepared)?;
             all_codes.push(prev_code);
         }
@@ -299,6 +374,7 @@ impl CodePredictor {
         talker_hidden: &Tensor,
         semantic_embeds: &Tensor,
         caches: &mut [&mut CodePredictorPhysicalCache],
+        selections: &mut [CodeSelection<'_>],
     ) -> Result<Vec<Vec<u32>>> {
         let (batch_size, talker_tokens, talker_dim) = talker_hidden.dims3()?;
         let (semantic_batch, semantic_tokens, semantic_dim) = semantic_embeds.dims3()?;
@@ -309,6 +385,7 @@ impl CodePredictor {
             || talker_dim != semantic_dim
             || talker_dim != self.cfg.hidden_size
             || caches.len() != batch_size
+            || selections.len() != batch_size
         {
             return Err(Error::InvalidInput(format!(
                 "Qwen3-TTS predictor batch expects matching [batch,1,{}] inputs and caches, got {:?}, {:?}, and {} caches",
@@ -320,7 +397,12 @@ impl CodePredictor {
         }
         if batch_size == 1 {
             return self
-                .generate_acoustic_codes_physical(talker_hidden, semantic_embeds, caches[0])
+                .generate_acoustic_codes_physical(
+                    talker_hidden,
+                    semantic_embeds,
+                    caches[0],
+                    &mut selections[0],
+                )
                 .map(|codes| vec![codes]);
         }
         for cache in caches.iter() {
@@ -367,7 +449,7 @@ impl CodePredictor {
             }
 
             let first_logits = self.lm_heads[0].forward(&last_hidden)?;
-            let mut previous_codes = argmax_tokens(&first_logits, batch_size)?;
+            let mut previous_codes = select_codes(&first_logits, batch_size, selections)?;
             let mut all_codes = previous_codes
                 .iter()
                 .map(|code| vec![*code])
@@ -392,7 +474,7 @@ impl CodePredictor {
                     caches,
                 )?;
                 let logits = self.lm_heads[group_idx].forward(&step_hidden)?;
-                previous_codes = argmax_tokens(&logits, batch_size)?;
+                previous_codes = select_codes(&logits, batch_size, selections)?;
                 for (row, code) in previous_codes.iter().enumerate() {
                     all_codes[row].push(*code);
                 }
@@ -1099,6 +1181,136 @@ fn argmax_token_reference(logits: &Tensor) -> Result<u32> {
     Ok(max_idx as u32)
 }
 
+/// One code per row: the batched argmax when every row is greedy, otherwise
+/// each row through its own selection.
+fn select_codes(
+    logits: &Tensor,
+    expected_batch: usize,
+    selections: &mut [CodeSelection<'_>],
+) -> Result<Vec<u32>> {
+    if selections.iter().all(CodeSelection::is_greedy) {
+        return argmax_tokens(logits, expected_batch);
+    }
+    let logits = match logits.rank() {
+        3 if logits.dim(1)? == 1 => logits.i((.., 0, ..))?,
+        2 => logits.clone(),
+        _ => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3-TTS predictor batch logits shape: {:?}",
+                logits.dims()
+            )))
+        }
+    };
+    if logits.dim(0)? != expected_batch || selections.len() != expected_batch {
+        return Err(Error::InferenceError(format!(
+            "Qwen3-TTS predictor batch produced {} rows for {} selections, expected {expected_batch}",
+            logits.dim(0)?,
+            selections.len()
+        )));
+    }
+    selections
+        .iter_mut()
+        .enumerate()
+        .map(|(row, selection)| selection.select(&logits.i(row)?))
+        .collect()
+}
+
+/// Draw one code from a logits row with the sub-talker settings. On CUDA and
+/// Metal the top-k candidates are selected on device and only k values are
+/// read back; otherwise the row is read back and sampled on the host.
+fn sample_code(
+    logits: &Tensor,
+    params: &SubtalkerSampling,
+    draw: &mut dyn FnMut() -> f32,
+) -> Result<u32> {
+    let row = match logits.rank() {
+        1 => logits.clone(),
+        2 if logits.dim(0)? == 1 => logits.i(0)?,
+        _ => {
+            return Err(Error::InferenceError(format!(
+                "Unexpected Qwen3-TTS predictor logits shape: {:?}",
+                logits.dims()
+            )))
+        }
+    };
+    let vocab = row.dim(0)?;
+    if params.top_k > 0 {
+        if let Some(candidates) = bounded_device_sampling_candidates(
+            &row,
+            vocab,
+            params.top_k,
+            params.temperature,
+            &[],
+            1.0,
+            0.0,
+            None,
+        )? {
+            if device_candidates_cover_top_p(&candidates, params.top_p) {
+                if let Some(code) = sample_device_candidates(&candidates, params.top_p, draw()) {
+                    return Ok(code);
+                }
+            }
+        }
+    }
+    let values = row.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    sample_code_from_values(&values, params, draw())
+        .ok_or_else(|| Error::InferenceError("Qwen3-TTS predictor logits are not finite".into()))
+}
+
+/// Host sampling in Hugging Face's warper order: temperature, top-k, then
+/// top-p over the renormalized distribution, then one inverse-CDF draw
+/// (`draw` in [0, 1)). Ties keep the lower index first.
+fn sample_code_from_values(values: &[f32], params: &SubtalkerSampling, draw: f32) -> Option<u32> {
+    let temperature = params.temperature.max(1e-5);
+    let mut candidates: Vec<(u32, f32)> = values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .map(|(index, value)| (index as u32, value / temperature))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    if params.top_k > 0 {
+        candidates.truncate(params.top_k);
+    }
+    let max = candidates[0].1;
+    let mut probabilities: Vec<f32> = candidates
+        .iter()
+        .map(|(_, value)| (value - max).exp())
+        .collect();
+    let total: f32 = probabilities.iter().sum();
+    for probability in &mut probabilities {
+        *probability /= total;
+    }
+    if params.top_p < 1.0 {
+        let cutoff = params.top_p.max(1e-6);
+        let mut cumulative = 0.0f32;
+        let mut keep = 0usize;
+        for probability in &probabilities {
+            cumulative += probability;
+            keep += 1;
+            if cumulative >= cutoff {
+                break;
+            }
+        }
+        probabilities.truncate(keep.max(1));
+        let kept: f32 = probabilities.iter().sum();
+        for probability in &mut probabilities {
+            *probability /= kept;
+        }
+    }
+    let mut remaining = draw.clamp(0.0, 1.0 - f32::EPSILON);
+    for (index, probability) in probabilities.iter().enumerate() {
+        if remaining < *probability {
+            return Some(candidates[index].0);
+        }
+        remaining -= probability;
+    }
+    Some(candidates[probabilities.len() - 1].0)
+}
+
 fn argmax_tokens(logits: &Tensor, expected_batch: usize) -> Result<Vec<u32>> {
     let logits = match logits.rank() {
         3 if logits.dim(1)? == 1 => logits.i((.., 0, ..))?,
@@ -1313,6 +1525,7 @@ mod tests {
                 &frame_input(3, &device),
                 &frame_input(7, &device),
                 &mut cache,
+                &mut CodeSelection::Greedy,
             )
             .unwrap();
 
@@ -1335,16 +1548,31 @@ mod tests {
         let semantic_a = frame_input(7, &device);
         let semantic_b = frame_input(9, &device);
         let scalar_codes_a = model
-            .generate_acoustic_codes_physical(&talker_a, &semantic_a, &mut scalar_a)
+            .generate_acoustic_codes_physical(
+                &talker_a,
+                &semantic_a,
+                &mut scalar_a,
+                &mut CodeSelection::Greedy,
+            )
             .unwrap();
         let scalar_codes_b = model
-            .generate_acoustic_codes_physical(&talker_b, &semantic_b, &mut scalar_b)
+            .generate_acoustic_codes_physical(
+                &talker_b,
+                &semantic_b,
+                &mut scalar_b,
+                &mut CodeSelection::Greedy,
+            )
             .unwrap();
         let talker = Tensor::cat(&[&talker_a, &talker_b], 0).unwrap();
         let semantic = Tensor::cat(&[&semantic_a, &semantic_b], 0).unwrap();
         let mut caches = [&mut batch_a, &mut batch_b];
         let batch_codes = model
-            .generate_acoustic_codes_physical_batch(&talker, &semantic, &mut caches)
+            .generate_acoustic_codes_physical_batch(
+                &talker,
+                &semantic,
+                &mut caches,
+                &mut [CodeSelection::Greedy, CodeSelection::Greedy],
+            )
             .unwrap();
 
         assert_eq!(batch_codes, vec![scalar_codes_a, scalar_codes_b]);
@@ -1377,7 +1605,12 @@ mod tests {
         let mut caches = [&mut fresh, &mut incompatible];
 
         assert!(model
-            .generate_acoustic_codes_physical_batch(&talker, &semantic, &mut caches)
+            .generate_acoustic_codes_physical_batch(
+                &talker,
+                &semantic,
+                &mut caches,
+                &mut [CodeSelection::Greedy, CodeSelection::Greedy],
+            )
             .is_err());
         assert_eq!((fresh.context_len(), incompatible.context_len()), (0, 1));
         assert!(fresh.take_completed_writes().is_empty());
@@ -1395,14 +1628,126 @@ mod tests {
         let talker = frame_input(19, &device);
         let semantic = frame_input(21, &device);
         let expected = model
-            .generate_acoustic_codes_physical(&talker, &semantic, &mut scalar)
+            .generate_acoustic_codes_physical(
+                &talker,
+                &semantic,
+                &mut scalar,
+                &mut CodeSelection::Greedy,
+            )
             .unwrap();
         let mut caches = [&mut fallback];
         let actual = model
-            .generate_acoustic_codes_physical_batch(&talker, &semantic, &mut caches)
+            .generate_acoustic_codes_physical_batch(
+                &talker,
+                &semantic,
+                &mut caches,
+                &mut [CodeSelection::Greedy],
+            )
             .unwrap();
 
         assert_eq!(actual, vec![expected]);
         assert_eq!(fallback.context_len(), scalar.context_len());
+    }
+
+    /// QTTS-6: host sampling follows the warper order (temperature, top-k,
+    /// top-p) and draws by inverse CDF.
+    #[test]
+    fn subtalker_host_sampling_honours_top_k_top_p_and_temperature() {
+        let values = [2.0f32, 1.0, 0.0, -1.0, f32::NAN];
+        let top2 = SubtalkerSampling {
+            do_sample: true,
+            temperature: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+        };
+        // p(0) = e^2 / (e^2 + e^1) = 0.7311 within the top two.
+        assert_eq!(sample_code_from_values(&values, &top2, 0.0), Some(0));
+        assert_eq!(sample_code_from_values(&values, &top2, 0.730), Some(0));
+        assert_eq!(sample_code_from_values(&values, &top2, 0.732), Some(1));
+        assert_eq!(sample_code_from_values(&values, &top2, 0.999_99), Some(1));
+        // Top-k = 0 keeps every finite logit: the last bucket is index 3.
+        let all = SubtalkerSampling { top_k: 0, ..top2 };
+        assert_eq!(sample_code_from_values(&values, &all, 0.999_99), Some(3));
+        // Top-p 0.5 keeps only the head (0.731 >= 0.5).
+        let nucleus = SubtalkerSampling { top_p: 0.5, ..all };
+        assert_eq!(
+            sample_code_from_values(&values, &nucleus, 0.999_99),
+            Some(0)
+        );
+        // Temperature 0.5 sharpens: p(0) = e^4 / (e^4 + e^2) = 0.8808.
+        let sharp = SubtalkerSampling {
+            temperature: 0.5,
+            ..top2
+        };
+        assert_eq!(sample_code_from_values(&values, &sharp, 0.880), Some(0));
+        assert_eq!(sample_code_from_values(&values, &sharp, 0.882), Some(1));
+        assert_eq!(sample_code_from_values(&[f32::NAN], &top2, 0.5), None);
+    }
+
+    /// QTTS-6: the predictor samples every residual codebook through the
+    /// row's selection: top-1 sampling equals greedy, a high draw under
+    /// top-2 picks the runner-up, and a batch row keeps its own selection.
+    #[test]
+    fn predictor_samples_residual_codebooks_per_row() {
+        let device = Device::Cpu;
+        let model = tiny_predictor(&device);
+        let talker = frame_input(23, &device);
+        let semantic = frame_input(25, &device);
+        let run = |instance: u64, selection: &mut CodeSelection<'_>| {
+            let (arena, bindings) = test_arena(instance);
+            let mut cache = test_cache(arena, &bindings, 0, 0);
+            model
+                .generate_acoustic_codes_physical(&talker, &semantic, &mut cache, selection)
+                .unwrap()
+        };
+        let greedy = run(720, &mut CodeSelection::Greedy);
+        let mut high = || 0.999_99f32;
+        let top1 = run(
+            721,
+            &mut CodeSelection::Sample {
+                params: SubtalkerSampling {
+                    top_k: 1,
+                    ..SubtalkerSampling::default()
+                },
+                draw: &mut high,
+            },
+        );
+        assert_eq!(top1, greedy);
+        let top2_params = SubtalkerSampling {
+            top_k: 2,
+            ..SubtalkerSampling::default()
+        };
+        let mut high = || 0.999_99f32;
+        let sampled = run(
+            722,
+            &mut CodeSelection::Sample {
+                params: top2_params,
+                draw: &mut high,
+            },
+        );
+        assert_ne!(sampled[0], greedy[0], "the draw must pick the runner-up");
+
+        // Batch: row 0 greedy, row 1 sampled, each equal to its scalar run.
+        let (arena, bindings) = test_arena(723);
+        let mut row0 = test_cache(arena.clone(), &bindings, 0, 0);
+        let mut row1 = test_cache(arena, &bindings, 6, 0);
+        let batch_talker = Tensor::cat(&[&talker, &talker], 0).unwrap();
+        let batch_semantic = Tensor::cat(&[&semantic, &semantic], 0).unwrap();
+        let mut high = || 0.999_99f32;
+        let codes = model
+            .generate_acoustic_codes_physical_batch(
+                &batch_talker,
+                &batch_semantic,
+                &mut [&mut row0, &mut row1],
+                &mut [
+                    CodeSelection::Greedy,
+                    CodeSelection::Sample {
+                        params: top2_params,
+                        draw: &mut high,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(codes, vec![greedy, sampled]);
     }
 }

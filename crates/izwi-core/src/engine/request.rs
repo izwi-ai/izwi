@@ -4052,6 +4052,9 @@ impl EngineCoreRequest {
             } else {
                 self.params.max_tokens.clamp(16, model_max_frames.max(16))
             },
+            subtalker: TtsGenerationParams::subtalker_for_request_temperature(
+                self.params.temperature,
+            ),
         }
     }
 
