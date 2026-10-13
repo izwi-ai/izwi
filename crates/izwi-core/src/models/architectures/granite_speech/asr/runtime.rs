@@ -1721,28 +1721,34 @@ impl GraniteConformerAttention {
     }
 
     fn relative_position_bias(&self, q: &Tensor) -> Result<Tensor> {
-        let out_dtype = q.dtype();
         let rel = self
             .rel_pos_emb
             .forward(&self.attention_dists)?
-            .to_dtype(out_dtype)?;
-        let (batch, blocks, heads, context, dim) = q.dims5()?;
-        let q = q
-            .reshape((batch * blocks * heads, context, dim))?
-            .to_dtype(DType::F32)?;
-        let rel = rel.to_dtype(DType::F32)?;
-        let mut rows = Vec::with_capacity(context);
-        for query_idx in 0..context {
-            let q_row = q.narrow(1, query_idx, 1)?;
-            let rel_row = rel.narrow(0, query_idx, 1)?.squeeze(0)?;
-            rows.push(relative_position_score_row(&q_row, &rel_row)?);
-        }
-        let refs = rows.iter().collect::<Vec<_>>();
-        let out = Tensor::cat(&refs, 1)?.reshape((batch, blocks, heads, context, context))?;
-        (out / (dim as f64).sqrt())?
-            .to_dtype(out_dtype)
-            .map_err(Error::from)
+            .to_dtype(q.dtype())?;
+        relative_position_bias(q, &rel)
     }
+}
+
+/// Shaw-style relative-position scores for every block-local query/key pair,
+/// `bias[.., i, j] = q[.., i, :] · rel[i, j, :] / sqrt(dim)`, as one batched
+/// matmul over the query position (previously one matmul per query row: 200
+/// per layer at Granite's context). `q` is `(batch, blocks, heads, context,
+/// dim)`; `rel` is the gathered `(context, context, dim)` embedding table.
+fn relative_position_bias(q: &Tensor, rel: &Tensor) -> Result<Tensor> {
+    let out_dtype = q.dtype();
+    let (batch, blocks, heads, context, dim) = q.dims5()?;
+    let rows = batch * blocks * heads;
+    // (context, rows, dim) @ (context, dim, context) -> (context, rows, context).
+    let q = q
+        .reshape((rows, context, dim))?
+        .to_dtype(DType::F32)?
+        .transpose(0, 1)?
+        .contiguous()?;
+    let rel = rel.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+    let scores = q.matmul(&rel)?.transpose(0, 1)?.contiguous()?;
+    (scores.reshape((batch, blocks, heads, context, context))? / (dim as f64).sqrt())?
+        .to_dtype(out_dtype)
+        .map_err(Error::from)
 }
 
 fn validate_frame_lengths(batch: usize, sequence: usize, valid_lengths: &[usize]) -> Result<()> {
@@ -1846,12 +1852,6 @@ fn encoder_attention_context(attn: &Tensor, v: &Tensor) -> Result<Tensor> {
             .map_err(Error::from);
     }
     attn.matmul(v).map_err(Error::from)
-}
-
-fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
-    let q_row = q_row.squeeze(1)?.contiguous()?;
-    let rel_row = rel_row.t()?.contiguous()?;
-    q_row.matmul(&rel_row)?.unsqueeze(1).map_err(Error::from)
 }
 
 fn encoder_attention_dists(context: usize, max_pos_emb: usize, device: &Device) -> Result<Tensor> {
@@ -5033,17 +5033,48 @@ mod tests {
         assert!(format!("{err}").contains("exactly one audio placeholder"));
     }
 
+    /// The batched relative-position bias matches the per-query-row matmul
+    /// loop it replaced, on unstructured inputs at Granite's head geometry.
     #[test]
-    fn relative_position_score_row_handles_head_batched_query_rows() {
+    fn batched_relative_position_bias_matches_per_row_matmuls() {
         let device = Device::Cpu;
-        let q = Tensor::zeros((8, 200, 128), DType::F32, &device).unwrap();
-        let q_row = q.narrow(1, 17, 1).unwrap();
-        let rel_row = Tensor::zeros((200, 128), DType::F32, &device).unwrap();
+        let mut state = 0x1F83_D9AB_FB41_BD6Bu64;
+        let mut tensor = |shape: &[usize]| {
+            let n = shape.iter().product::<usize>();
+            let values = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let (batch, blocks, heads, context, dim) = (2, 3, 8, 37, 128);
+        let q = tensor(&[batch, blocks, heads, context, dim]);
+        let rel = tensor(&[context, context, dim]);
 
-        assert!(!q_row.squeeze(1).unwrap().is_contiguous());
-        let scores = relative_position_score_row(&q_row, &rel_row).unwrap();
+        // Pre-change formulation: one (rows, dim) x (dim, context) matmul per
+        // query row, concatenated.
+        let rows = batch * blocks * heads;
+        let q_flat = q.reshape((rows, context, dim)).unwrap();
+        let per_row = (0..context)
+            .map(|i| {
+                let q_row = q_flat.narrow(1, i, 1).unwrap().squeeze(1).unwrap();
+                let rel_row = rel.get(i).unwrap().t().unwrap();
+                q_row.matmul(&rel_row).unwrap().unsqueeze(1).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected = (Tensor::cat(&per_row, 1)
+            .unwrap()
+            .reshape((batch, blocks, heads, context, context))
+            .unwrap()
+            / (dim as f64).sqrt())
+        .unwrap();
 
-        assert_eq!(scores.dims(), &[8, 1, 200]);
+        let actual = relative_position_bias(&q, &rel).unwrap();
+        assert_close_1e5(&expected, &actual);
     }
 
     #[test]
