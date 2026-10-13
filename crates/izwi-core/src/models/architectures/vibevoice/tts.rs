@@ -1265,18 +1265,11 @@ impl VibeVoiceTtsModel {
     }
 
     fn encode_reference(&self, reference: &VibeVoiceSpeakerReference) -> Result<EncodedReference> {
-        let cleaned = preprocess_reference_audio(
-            reference.audio_samples.clone(),
+        let resampled = reference_audio_for_encoder(
+            &reference.audio_samples,
             reference.sample_rate,
             &self.preprocessor,
-        );
-        if cleaned.is_empty() {
-            return Err(Error::InvalidInput(
-                "VibeVoice TTS reference_audio contains no usable speech".to_string(),
-            ));
-        }
-        let target_sample_rate = self.preprocessor.target_sample_rate();
-        let resampled = resample_linear(&cleaned, reference.sample_rate, target_sample_rate)?;
+        )?;
         let speech = Tensor::from_vec(
             resampled.clone(),
             (1, 1, resampled.len()),
@@ -2247,130 +2240,109 @@ fn elapsed_ms(started: Instant) -> f32 {
     started.elapsed().as_secs_f32() * 1000.0
 }
 
-fn preprocess_reference_audio(
-    mut samples: Vec<f32>,
+/// Longest voice prompt encoded, in seconds. The reference processor has no
+/// limit, but the preparation stage is priced at a flat 512 MiB, and the
+/// acoustic encoder's first stage holds about 1 KB of F32 activations per
+/// input sample (12 s = 0.3 GB); a longer prompt needs that price raised.
+const MAX_REFERENCE_SECONDS: usize = 12;
+/// A cut is placed at the quietest window of this length ...
+const REFERENCE_CUT_WINDOW_SECONDS: f32 = 0.05;
+/// ... within this much audio before the limit.
+const REFERENCE_CUT_SEARCH_SECONDS: usize = 4;
+
+/// The voice-prompt audio the reference encodes: resampled to the
+/// tokenizer rate with a band-limited resampler (`librosa.load(sr=24000)`),
+/// then the whole sample brought to the target dBFS and scaled down only if
+/// it would clip (`AudioNormalizer`). No DC removal, silence trimming or
+/// energy-window cropping: the reference does none of them. Past
+/// [`MAX_REFERENCE_SECONDS`] the audio is cut at the quietest point of the
+/// last few seconds before the limit, so the cut does not land mid-word.
+fn reference_audio_for_encoder(
+    samples: &[f32],
     sample_rate: u32,
     config: &VibeVoicePreprocessorConfig,
-) -> Vec<f32> {
-    if samples.is_empty() || sample_rate == 0 {
-        return Vec::new();
+) -> Result<Vec<f32>> {
+    if sample_rate == 0 {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_audio sample rate must be positive".into(),
+        ));
     }
-
-    for sample in &mut samples {
-        if !sample.is_finite() {
-            *sample = 0.0;
-        }
+    let finite = samples
+        .iter()
+        .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
+        .collect::<Vec<_>>();
+    let target_rate = config.target_sample_rate();
+    let mut audio = crate::audio::resample_mono_high_quality(&finite, sample_rate, target_rate)?;
+    let limit = target_rate as usize * MAX_REFERENCE_SECONDS;
+    if audio.len() > limit {
+        let end = quietest_cut_before(
+            &audio,
+            limit,
+            target_rate as usize * REFERENCE_CUT_SEARCH_SECONDS,
+            ((target_rate as f32) * REFERENCE_CUT_WINDOW_SECONDS) as usize,
+        );
+        audio.truncate(end);
     }
-
-    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
-    for sample in &mut samples {
-        *sample -= mean;
+    let peak = audio.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+    if audio.is_empty() || peak <= config.eps.max(1e-8) {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_audio contains no usable speech".to_string(),
+        ));
     }
-
-    let initial_peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
-    if initial_peak <= config.eps.max(1e-8) {
-        return Vec::new();
-    }
-
-    let silence_threshold = (initial_peak * 0.04).max(0.0025);
-    let first_idx = samples.iter().position(|s| s.abs() >= silence_threshold);
-    let last_idx = samples.iter().rposition(|s| s.abs() >= silence_threshold);
-    if let (Some(first), Some(last)) = (first_idx, last_idx) {
-        let margin = ((sample_rate as f32) * 0.12) as usize;
-        let start = first.saturating_sub(margin);
-        let end = (last + margin + 1).min(samples.len());
-        samples = samples[start..end].to_vec();
-    }
-
-    let max_len = sample_rate as usize * 12;
-    if max_len > 0 && samples.len() > max_len {
-        let start = highest_energy_window_start(&samples, max_len);
-        samples = samples[start..start + max_len].to_vec();
-    }
-
     if config.normalize_audio {
-        normalize_reference_loudness(&mut samples, config.target_db_fs, config.eps);
+        normalize_reference_loudness(&mut audio, config.target_db_fs, config.eps);
     }
-
-    samples
+    Ok(audio)
 }
 
+/// The reference `AudioNormalizer`: scale to `target_db_fs` by
+/// `10^(dB/20) / (rms + eps)`, then, if any sample exceeds 1, divide by
+/// `max + eps`.
 fn normalize_reference_loudness(samples: &mut [f32], target_db_fs: f32, eps: f32) {
     if samples.is_empty() {
         return;
     }
     let rms = (samples
         .iter()
-        .map(|&sample| (sample as f64) * (sample as f64))
+        .map(|&sample| f64::from(sample) * f64::from(sample))
         .sum::<f64>()
         / samples.len() as f64)
-        .sqrt() as f32;
-    if rms <= eps.max(1e-8) {
-        return;
-    }
-    let target_rms = 10f32.powf(target_db_fs / 20.0);
-    let gain = target_rms / rms;
+        .sqrt();
+    let gain = 10f64.powf(f64::from(target_db_fs) / 20.0) / (rms + f64::from(eps));
     for sample in samples.iter_mut() {
-        *sample *= gain;
+        *sample = (f64::from(*sample) * gain) as f32;
     }
-
     let peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
-    if peak > 0.99 {
-        let limit = 0.99 / peak;
+    if peak > 1.0 {
+        let divisor = peak + eps;
         for sample in samples.iter_mut() {
-            *sample *= limit;
+            *sample /= divisor;
         }
     }
 }
 
-fn highest_energy_window_start(samples: &[f32], window: usize) -> usize {
-    if samples.is_empty() || window == 0 || samples.len() <= window {
-        return 0;
+/// End of the quietest `window`-sample stretch (lowest energy) that ends
+/// within `search` samples before `limit`; `limit` itself when the audio is
+/// not longer than that.
+fn quietest_cut_before(samples: &[f32], limit: usize, search: usize, window: usize) -> usize {
+    let limit = limit.min(samples.len());
+    let window = window.max(1);
+    let first_end = limit.saturating_sub(search).max(window);
+    if first_end >= limit {
+        return limit;
     }
-
-    let mut prefix = Vec::with_capacity(samples.len() + 1);
+    let mut prefix = Vec::with_capacity(limit + 1);
     prefix.push(0.0f64);
-    for &sample in samples {
-        let energy = (sample as f64) * (sample as f64);
-        let next = prefix.last().copied().unwrap_or(0.0) + energy;
+    for &sample in &samples[..limit] {
+        let next = prefix.last().copied().unwrap_or(0.0) + f64::from(sample) * f64::from(sample);
         prefix.push(next);
     }
-
-    let mut best_start = 0usize;
-    let mut best_energy = f64::NEG_INFINITY;
-    for start in 0..=(samples.len() - window) {
-        let energy = prefix[start + window] - prefix[start];
-        if energy > best_energy {
-            best_energy = energy;
-            best_start = start;
-        }
-    }
-    best_start
-}
-
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if src_rate == 0 || dst_rate == 0 {
-        return Err(Error::InvalidInput(
-            "Sample rates must be positive for VibeVoice TTS resampling".to_string(),
-        ));
-    }
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for idx in 0..out_len {
-        let src_pos = idx as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let right = (left + 1).min(audio.len() - 1);
-        let frac = (src_pos - left as f64) as f32;
-        out.push(audio[left] * (1.0 - frac) + audio[right] * frac);
-    }
-    Ok(out)
+    (first_end..=limit)
+        .min_by(|&a, &b| {
+            let energy = |end: usize| prefix[end] - prefix[end - window];
+            energy(a).total_cmp(&energy(b))
+        })
+        .unwrap_or(limit)
 }
 
 #[cfg(test)]
@@ -2702,33 +2674,97 @@ mod tests {
         assert!(validate_latent_scale_factor("speech_scaling_factor", &negative, 64).is_err());
     }
 
+    /// VVT-13: loudness follows the reference `AudioNormalizer`: RMS to the
+    /// target dBFS over the whole sample, then a divide by `max + eps` only
+    /// if a sample exceeds 1.
     #[test]
-    fn reference_preprocessing_normalizes_to_configured_loudness() {
+    fn reference_preprocessing_matches_the_reference_normalizer() {
         let config = VibeVoicePreprocessorConfig {
             target_db_fs: -20.0,
             ..VibeVoicePreprocessorConfig::default()
         };
-        let processed = preprocess_reference_audio(
-            (0..24_000)
-                .map(|idx| if idx % 2 == 0 { 0.2 } else { -0.2 })
-                .collect(),
-            24_000,
-            &config,
-        );
-        let rms = (processed
-            .iter()
-            .map(|&sample| (sample as f64) * (sample as f64))
-            .sum::<f64>()
-            / processed.len() as f64)
-            .sqrt() as f32;
-
-        assert!((rms - 0.1).abs() < 1e-4);
+        let input = crate::kernels::numeric_check::xorshift_values(24_000, 3, 0.2);
+        let processed = reference_audio_for_encoder(&input, 24_000, &config).unwrap();
+        let rms = |values: &[f32]| {
+            (values.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / values.len() as f64).sqrt()
+        };
+        let gain = 10f64.powf(-1.0) / (rms(&input) + f64::from(config.eps));
+        assert_eq!(processed.len(), input.len());
+        for (actual, source) in processed.iter().zip(&input) {
+            assert!((f64::from(*actual) - f64::from(*source) * gain).abs() < 1e-6);
+        }
+        // A loud target would clip: scaled down by max + eps, not to 0.99.
+        let loud = VibeVoicePreprocessorConfig {
+            target_db_fs: 6.0,
+            ..config
+        };
+        let processed = reference_audio_for_encoder(&input, 24_000, &loud).unwrap();
+        let peak = processed.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= 1.0 && peak > 0.999_99, "peak {peak}");
     }
 
+    /// VVT-13: a 48 kHz reference is band-limited before decimation: a
+    /// 15 kHz tone (above the 12 kHz output Nyquist) must not alias to 9 kHz
+    /// next to a 1 kHz tone. Linear interpolation folded it back.
     #[test]
-    fn resample_linear_preserves_identity_rate() {
-        let audio = vec![0.0, 0.5, -0.25];
-        assert_eq!(resample_linear(&audio, 24_000, 24_000).unwrap(), audio);
+    fn reference_resampling_does_not_alias() {
+        let config = VibeVoicePreprocessorConfig {
+            normalize_audio: false,
+            ..VibeVoicePreprocessorConfig::default()
+        };
+        let input = (0..48_000)
+            .map(|n| {
+                let t = n as f32 / 48_000.0;
+                0.3 * (std::f32::consts::TAU * 1_000.0 * t).sin()
+                    + 0.3 * (std::f32::consts::TAU * 15_000.0 * t).sin()
+            })
+            .collect::<Vec<_>>();
+        let output = reference_audio_for_encoder(&input, 48_000, &config).unwrap();
+        let tone = |hz: f64| {
+            let (mut re, mut im) = (0f64, 0f64);
+            for (n, &v) in output.iter().enumerate().skip(2_400).take(19_200) {
+                let phase = std::f64::consts::TAU * hz * n as f64 / 24_000.0;
+                re += f64::from(v) * phase.cos();
+                im += f64::from(v) * phase.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        let (wanted, alias) = (tone(1_000.0), tone(9_000.0));
+        assert!(
+            alias < wanted * 1e-2,
+            "9 kHz alias {alias} vs 1 kHz {wanted}"
+        );
+    }
+
+    /// VVT-13: references up to the limit are kept whole (no energy-window
+    /// crop, no silence trim); longer ones are cut at the quietest point
+    /// before the limit, here a silent gap 2 s before it.
+    #[test]
+    fn long_references_are_cut_in_silence_before_the_limit() {
+        let config = VibeVoicePreprocessorConfig {
+            normalize_audio: false,
+            ..VibeVoicePreprocessorConfig::default()
+        };
+        let rate = 24_000usize;
+        let speech =
+            |len: usize, seed: u64| crate::kernels::numeric_check::xorshift_values(len, seed, 0.3);
+        let mut short = vec![0.0f32; rate];
+        short.extend(speech(rate * 9, 5));
+        short.extend(vec![0.0f32; rate]);
+        let kept = reference_audio_for_encoder(&short, 24_000, &config).unwrap();
+        assert_eq!(kept.len(), short.len());
+
+        let gap_end = rate * (MAX_REFERENCE_SECONDS - 2);
+        let mut long = speech(gap_end - rate / 10, 7);
+        long.extend(vec![0.0f32; rate / 10]);
+        long.extend(speech(rate * 10, 9));
+        let cut = reference_audio_for_encoder(&long, 24_000, &config).unwrap();
+        assert!(cut.len() <= rate * MAX_REFERENCE_SECONDS);
+        assert!(
+            cut.len() > gap_end - rate / 10 && cut.len() <= gap_end,
+            "cut at {} outside the silent gap ending at {gap_end}",
+            cut.len()
+        );
     }
 
     #[test]
