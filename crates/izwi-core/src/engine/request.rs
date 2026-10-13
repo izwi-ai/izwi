@@ -2464,6 +2464,19 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        // The service path installs the encoder artifact before the model
+        // lease, when the stage costs cannot be priced yet; price them here
+        // from the artifact's prompt so the stages are never admitted as free
+        // (LFA-2).
+        let prepared_costs = match self.prepared_lfm25_audio_asr_artifact_for_executor()? {
+            Some(artifact) => Self::lfm25_audio_asr_stage_costs(
+                self.execution_adapter_binding.as_ref(),
+                &model,
+                artifact.prompt_tokens,
+                self.params.max_tokens,
+            )?,
+            None => Vec::new(),
+        };
         self.prepared_stage_costs.clear();
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
@@ -2478,6 +2491,9 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             kokoro_tts: None,
         });
+        for (stage_id, cost) in prepared_costs {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
