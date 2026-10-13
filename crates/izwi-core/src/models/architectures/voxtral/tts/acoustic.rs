@@ -1,5 +1,8 @@
 //! Flow-matching acoustic-token shape helpers.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
 use candle_core::{DType, IndexOp, Tensor, D};
 use candle_nn::{ops, Linear, Module, RmsNorm, VarBuilder};
 
@@ -84,6 +87,43 @@ pub struct FlowMatchingAudioTransformer {
     time_embedding: TimeEmbedding,
     args: VoxtralTtsAcousticTransformerArgs,
     generation: AcousticGenerationConfig,
+    /// `time_projection(time_embedding(step / n_steps))` for every step of
+    /// an `n_steps` schedule, per (n_steps, dtype, device).
+    time_tables: Mutex<Vec<AcousticTimeTable>>,
+}
+
+struct AcousticTimeTable {
+    n_steps: usize,
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    /// `[n_steps, dim]`.
+    projected: Tensor,
+}
+
+static VOXTRAL_ACOUSTIC_STEP_UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_ACOUSTIC_STEP_UPLOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of host uploads of flow-matching step times. The
+/// projected time table is built once per decoding schedule; before, every
+/// step of every frame uploaded its `t` and re-ran the time embedding and
+/// projection.
+pub fn voxtral_acoustic_step_uploads() -> u64 {
+    VOXTRAL_ACOUSTIC_STEP_UPLOADS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_acoustic_step_uploads() -> u64 {
+    THREAD_ACOUSTIC_STEP_UPLOADS.with(|uploads| uploads.get())
+}
+
+fn record_acoustic_step_upload() {
+    VOXTRAL_ACOUSTIC_STEP_UPLOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_ACOUSTIC_STEP_UPLOADS.with(|uploads| uploads.set(uploads.get() + 1));
 }
 
 struct AcousticTransformerBlock {
@@ -205,6 +245,7 @@ impl FlowMatchingAudioTransformer {
             time_embedding,
             args,
             generation,
+            time_tables: Mutex::new(Vec::new()),
         })
     }
 
@@ -329,7 +370,7 @@ impl FlowMatchingAudioTransformer {
         let dtype = llm_hidden.dtype();
         let device = llm_hidden.device();
         let shape = (batch, self.generation.n_acoustic_codebooks);
-        let mut sampled = match initial_noise {
+        let sampled = match initial_noise {
             Some(noise) if noise.dims() == [shape.0, shape.1] => {
                 noise.to_device(device)?.to_dtype(dtype)?
             }
@@ -342,23 +383,47 @@ impl FlowMatchingAudioTransformer {
             }
             None => Tensor::randn(0.0f32, 1.0f32, shape, device)?.to_dtype(dtype)?,
         };
-        let llm_hidden_zero = Tensor::zeros(llm_hidden.shape(), dtype, device)?;
+        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        shifted_acoustic_codes_from_sampled_tensor(
+            &sampled,
+            semantic_codes,
+            self.generation.acoustic_codebook_size,
+        )
+    }
+
+    /// Euler-integrates the classifier-free-guided flow from `sampled` over
+    /// `n_decoding_steps` steps and returns the continuous acoustic state.
+    fn integrate_flow(
+        &self,
+        mut sampled: Tensor,
+        llm_hidden: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+    ) -> Result<Tensor> {
+        let batch = llm_hidden.dim(0)?;
+        let dtype = llm_hidden.dtype();
+        let device = llm_hidden.device();
         let n_steps = n_decoding_steps.max(1);
+        // The conditional and unconditional (zero) LLM rows and the step
+        // times are the same for every step: project them once.
+        let projected_llm = {
+            let llm_hidden_zero = Tensor::zeros(llm_hidden.shape(), dtype, device)?;
+            let llm_batched = Tensor::cat(&[llm_hidden.clone(), llm_hidden_zero], 0)?;
+            linear_forward_last_dim(&self.llm_projection, &llm_batched)?.unsqueeze(1)?
+        };
+        let time_table = self
+            .projected_time_table(n_steps, dtype, device)
+            .map_err(|err| Error::InferenceError(format!("time embedding failed: {err}")))?;
+        let dt = 1.0f64 / n_steps as f64;
         for step in 0..n_steps {
-            let t = step as f32 / n_steps as f32;
-            let dt = 1.0f64 / n_steps as f64;
-            let t_values = Tensor::from_vec(vec![t; batch], (batch, 1), device)?.to_dtype(dtype)?;
-            let t_emb = (|| -> Result<Tensor> {
-                Ok(self.time_embedding.forward(&t_values)?.to_dtype(dtype)?)
-            })()
-            .map_err(|err| {
-                Error::InferenceError(format!("time embedding step {step} failed: {err}"))
-            })?;
+            let projected_t = time_table.narrow(0, step, 1)?.unsqueeze(1)?.broadcast_as((
+                2 * batch,
+                1,
+                self.args.dim,
+            ))?;
             let x_batched = Tensor::cat(&[sampled.clone(), sampled.clone()], 0)?;
-            let llm_batched = Tensor::cat(&[llm_hidden.clone(), llm_hidden_zero.clone()], 0)?;
-            let t_emb_batched = Tensor::cat(&[t_emb.clone(), t_emb], 0)?;
             let velocity = self
-                .predict_velocity(&x_batched, &llm_batched, &t_emb_batched)
+                .predict_velocity(&x_batched, &projected_t, &projected_llm)
                 .map_err(|err| {
                     Error::InferenceError(format!("velocity prediction step {step} failed: {err}"))
                 })?;
@@ -368,25 +433,55 @@ impl FlowMatchingAudioTransformer {
             sampled = sampled.broadcast_add(&(blended * dt)?)?;
         }
 
-        shifted_acoustic_codes_from_sampled_tensor(
-            &sampled,
-            semantic_codes,
-            self.generation.acoustic_codebook_size,
-        )
+        Ok(sampled)
     }
 
+    /// `time_projection(time_embedding(t))` for `t = step / n_steps`, one row
+    /// per step, built on first use and cached for the model's lifetime.
+    fn projected_time_table(
+        &self,
+        n_steps: usize,
+        dtype: DType,
+        device: &candle_core::Device,
+    ) -> Result<Tensor> {
+        let mut tables = self
+            .time_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(table) = tables.iter().find(|table| {
+            table.n_steps == n_steps && table.dtype == dtype && table.device == device.location()
+        }) {
+            return Ok(table.projected.clone());
+        }
+        let times = (0..n_steps)
+            .map(|step| step as f32 / n_steps as f32)
+            .collect::<Vec<_>>();
+        record_acoustic_step_upload();
+        // `t` rounds through the activation dtype exactly as a per-step
+        // `[batch, 1]` upload did.
+        let t_values = Tensor::from_vec(times, (n_steps, 1), device)?.to_dtype(dtype)?;
+        let t_emb = self.time_embedding.forward(&t_values)?.to_dtype(dtype)?;
+        let projected = linear_forward_last_dim(&self.time_projection, &t_emb)?;
+        tables.push(AcousticTimeTable {
+            n_steps,
+            dtype,
+            device: device.location(),
+            projected: projected.clone(),
+        });
+        Ok(projected)
+    }
+
+    /// One flow-matching velocity for `x_t` given the already projected time
+    /// (`[rows, 1, dim]`) and LLM (`[rows, 1, dim]`) inputs.
     fn predict_velocity(
         &self,
         x_t: &Tensor,
-        llm_output: &Tensor,
-        t_emb: &Tensor,
+        projected_t: &Tensor,
+        projected_llm: &Tensor,
     ) -> Result<Tensor> {
-        let x_t = x_t.to_dtype(llm_output.dtype())?;
+        let x_t = x_t.to_dtype(projected_llm.dtype())?;
         let projected_x = linear_forward_last_dim(&self.input_projection, &x_t.unsqueeze(1)?)?;
-        let projected_t = linear_forward_last_dim(&self.time_projection, t_emb)?.unsqueeze(1)?;
-        let projected_llm =
-            linear_forward_last_dim(&self.llm_projection, llm_output)?.unsqueeze(1)?;
-        let mut hidden = Tensor::cat(&[projected_x, projected_t, projected_llm], 1)?;
+        let mut hidden = Tensor::cat(&[&projected_x, projected_t, projected_llm], 1)?;
         for (idx, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden).map_err(|err| {
                 Error::InferenceError(format!(
@@ -1166,6 +1261,103 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(frames.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    /// The pre-VXT-10 flow-matching loop: every step re-uploads `t`, re-runs
+    /// the time embedding and projection, and re-projects the conditional
+    /// and zero LLM rows.
+    fn decode_reference(
+        transformer: &FlowMatchingAudioTransformer,
+        llm_hidden: &Tensor,
+        noise: &Tensor,
+        cfg_alpha: f32,
+        n_steps: usize,
+    ) -> Tensor {
+        let batch = llm_hidden.dim(0).unwrap();
+        let dtype = llm_hidden.dtype();
+        let device = llm_hidden.device();
+        let mut sampled = noise.clone();
+        let llm_hidden_zero = Tensor::zeros(llm_hidden.shape(), dtype, device).unwrap();
+        for step in 0..n_steps {
+            let t = step as f32 / n_steps as f32;
+            let dt = 1.0f64 / n_steps as f64;
+            let t_values = Tensor::from_vec(vec![t; batch], (batch, 1), device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let t_emb = transformer
+                .time_embedding
+                .forward(&t_values)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let x_batched = Tensor::cat(&[sampled.clone(), sampled.clone()], 0).unwrap();
+            let llm_batched =
+                Tensor::cat(&[llm_hidden.clone(), llm_hidden_zero.clone()], 0).unwrap();
+            let t_emb_batched = Tensor::cat(&[t_emb.clone(), t_emb], 0).unwrap();
+            let projected_t = linear_forward_last_dim(&transformer.time_projection, &t_emb_batched)
+                .unwrap()
+                .unsqueeze(1)
+                .unwrap();
+            let projected_llm = linear_forward_last_dim(&transformer.llm_projection, &llm_batched)
+                .unwrap()
+                .unsqueeze(1)
+                .unwrap();
+            let velocity = transformer
+                .predict_velocity(&x_batched, &projected_t, &projected_llm)
+                .unwrap();
+            let cond = velocity.narrow(0, 0, batch).unwrap();
+            let uncond = velocity.narrow(0, batch, batch).unwrap();
+            let blended = blend_cfg_tensors(&cond, &uncond, cfg_alpha).unwrap();
+            sampled = sampled.broadcast_add(&(blended * dt).unwrap()).unwrap();
+        }
+        sampled
+    }
+
+    /// VXT-10: the hoisted loop (LLM rows projected once per frame, the
+    /// projected step times cached per schedule) matches the per-step loop
+    /// on a random tiny transformer, and uploads step times once per
+    /// schedule instead of once per step.
+    #[test]
+    fn hoisted_flow_matching_matches_the_per_step_loop() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let device = Device::Cpu;
+        let config = tiny_acoustic_config();
+        let tensors = tiny_acoustic_tensors(&device)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, tensor))| {
+                let random = if name.contains("norm") {
+                    tensor
+                } else {
+                    xorshift_tensor(tensor.dims(), 0x7A11 + index as u64, 0.5, &device).unwrap()
+                };
+                (name, random)
+            })
+            .collect::<HashMap<_, _>>();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let transformer = FlowMatchingAudioTransformer::load(&config, vb).unwrap();
+        let llm_hidden = xorshift_tensor(&[3, 4], 0xBEEF, 1.0, &device).unwrap();
+        let noise = xorshift_tensor(&[3, 2], 0xF00D, 1.0, &device).unwrap();
+        let n_steps = 7;
+        let before = thread_acoustic_step_uploads();
+        for _frame in 0..3 {
+            let codes = transformer
+                .decode_one_frame(&[5, 6, 7], &llm_hidden, 1.2, n_steps, Some(&noise))
+                .unwrap();
+            assert_eq!(codes.shifted_codes.len(), 3);
+        }
+        // Three frames of seven steps: one upload (it was 21).
+        assert_eq!(thread_acoustic_step_uploads() - before, 1);
+
+        // Compare the continuous ODE state, before quantization.
+        let expected = decode_reference(&transformer, &llm_hidden, &noise, 1.2, n_steps);
+        let actual = transformer
+            .integrate_flow(noise.clone(), &llm_hidden, 1.2, n_steps)
+            .unwrap();
+        let diff = max_abs_diff(&host_f32(&actual).unwrap(), &host_f32(&expected).unwrap());
+        assert!(diff == 0.0, "bit-exact on CPU; max |diff| {diff}");
     }
 
     /// VXT-12: the time embedding uses the reference's fixed theta 10000,
