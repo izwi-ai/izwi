@@ -130,12 +130,24 @@ fn stream_event_queue_capacity() -> usize {
         .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
 }
 
+/// Send one SSE event, failing a reader that has stalled past the stall
+/// deadline (`IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS`, 30 s) as the
+/// first-party stream does, so a connected but stuck client cannot pin the
+/// generation and its permit forever (TPIPE-13).
 async fn send_stream_event(
     event_tx: &mpsc::Sender<String>,
     event: SpeechStreamEvent,
 ) -> Result<(), ()> {
     let payload = serde_json::to_string(&event).unwrap_or_default();
-    event_tx.send(payload).await.map_err(|_| ())
+    let stall_secs = std::env::var("IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30);
+    tokio::time::timeout(Duration::from_secs(stall_secs), event_tx.send(payload))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 pub async fn speech(
