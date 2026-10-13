@@ -26,7 +26,8 @@ use crate::models::architectures::vibevoice::config::{
 };
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::diffusion::{
-    VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler, VibeVoiceDiffusionStepTensors,
+    DpmSolverState, VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
+    VibeVoiceDiffusionStepTensors,
 };
 use crate::models::architectures::vibevoice::prompt::{
     VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
@@ -1420,6 +1421,7 @@ impl VibeVoiceTtsModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
+        let mut solver = DpmSolverState::default();
         for step in &plan.steps {
             let model_output = if let (Some(negative_condition), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
@@ -1464,11 +1466,9 @@ impl VibeVoiceTtsModel {
                     &condition,
                 )?
             };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
+            speech = plan
+                .scheduler
+                .step(&model_output, &speech, &step.tensors, &mut solver)?;
         }
         Ok(speech)
     }
@@ -1489,6 +1489,7 @@ impl VibeVoiceTtsModel {
             None
         };
         let mut speech = noise.clone();
+        let mut solver = DpmSolverState::default();
         for step in &plan.steps {
             let model_output = if let (Some(negative), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
@@ -1517,11 +1518,9 @@ impl VibeVoiceTtsModel {
                     &condition,
                 )?
             };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
+            speech = plan
+                .scheduler
+                .step(&model_output, &speech, &step.tensors, &mut solver)?;
         }
         Ok(speech)
     }
@@ -1556,6 +1555,7 @@ impl VibeVoiceTtsModel {
             .map(|state| &state.frame_noises[state.scaled_latents.len()])
             .collect::<Vec<_>>();
         let mut speech = Tensor::cat(&noises, 0)?;
+        let mut solver = DpmSolverState::default();
         for step in &plan.steps {
             let model_output = if let (Some(negative), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
@@ -1580,11 +1580,9 @@ impl VibeVoiceTtsModel {
                 self.prediction_head
                     .forward_with_precomputed(&speech, &timestep, &condition)?
             };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
+            speech = plan
+                .scheduler
+                .step(&model_output, &speech, &step.tensors, &mut solver)?;
         }
         (0..batch)
             .map(|row| speech.narrow(0, row, 1).map_err(Error::from))
