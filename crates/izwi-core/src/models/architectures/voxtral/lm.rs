@@ -1279,7 +1279,7 @@ pub(crate) mod tests {
     use candle_core::DType;
     use std::collections::HashMap;
 
-    fn tiny_cfg() -> Qwen3Config {
+    pub(crate) fn tiny_cfg() -> Qwen3Config {
         Qwen3Config {
             hidden_size: 4,
             intermediate_size: 8,

@@ -391,6 +391,28 @@ impl FlowMatchingAudioTransformer {
         )
     }
 
+    /// The load-time precision probe for one frame: the semantic logits and
+    /// the integrated acoustic state from `llm_hidden` (`[rows, input_dim]`)
+    /// and `noise` (`[rows, n_acoustic_codebooks]`), at the model's default
+    /// guidance and step count.
+    pub(crate) fn numeric_probe(
+        &self,
+        llm_hidden: &Tensor,
+        noise: &Tensor,
+    ) -> Result<Vec<(String, Tensor)>> {
+        let semantic = linear_forward_last_dim(&self.semantic_codebook_output, llm_hidden)?;
+        let state = self.integrate_flow(
+            noise.to_dtype(llm_hidden.dtype())?,
+            llm_hidden,
+            self.generation.cfg_alpha,
+            self.generation.n_decoding_steps,
+        )?;
+        Ok(vec![
+            ("acoustic_semantic_logits".to_string(), semantic),
+            ("acoustic_state".to_string(), state),
+        ])
+    }
+
     /// Euler-integrates the classifier-free-guided flow from `sampled` over
     /// `n_decoding_steps` steps and returns the continuous acoustic state.
     fn integrate_flow(
@@ -998,7 +1020,7 @@ fn blend_cfg_tensors(cond: &Tensor, uncond: &Tensor, alpha: f32) -> Result<Tenso
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::models::architectures::voxtral::tts::config::{fixture_json, VoxtralTtsConfig};
     use candle_core::{Device, Shape};
@@ -1382,7 +1404,7 @@ mod tests {
         assert!((inv_freq[1] - 0.01).abs() < 1e-7, "{inv_freq:?}");
     }
 
-    fn tiny_acoustic_config() -> VoxtralTtsConfig {
+    pub(crate) fn tiny_acoustic_config() -> VoxtralTtsConfig {
         let mut value: serde_json::Value = serde_json::from_str(fixture_json()).unwrap();
         value["dim"] = json!(4);
         value["hidden_dim"] = json!(8);
@@ -1409,7 +1431,7 @@ mod tests {
         VoxtralTtsConfig::from_json_str(&value.to_string()).unwrap()
     }
 
-    fn tiny_acoustic_tensors(device: &Device) -> HashMap<String, Tensor> {
+    pub(crate) fn tiny_acoustic_tensors(device: &Device) -> HashMap<String, Tensor> {
         fn zeros(shape: impl Into<Shape>, device: &Device) -> Tensor {
             Tensor::zeros(shape, DType::F32, device).unwrap()
         }

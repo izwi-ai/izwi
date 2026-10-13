@@ -8,10 +8,17 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 use tracing::{info, warn};
 
-use crate::backends::{BackendKind, DeviceProfile};
+use crate::backends::{
+    BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile,
+    METAL_PAGED_ATTENTION_SUPPORTS_BF16,
+};
 use crate::catalog::{ModelFamily, ModelVariant};
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::architectures::voxtral::{
@@ -21,7 +28,8 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 use super::acoustic::{
-    seeded_flow_noise, AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT,
+    seeded_flow_noise, AcousticGenerationConfig, AudioSpecialToken, FlowMatchingAudioTransformer,
+    AUDIO_SPECIAL_TOKEN_COUNT,
 };
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
 use super::config::VoxtralTtsConfig;
@@ -84,6 +92,8 @@ pub struct VoxtralTtsModel {
     pub codec_config: VoxtralCodecConfig,
     pub dtype_plan: VoxtralTtsDTypePlan,
     pipeline: Option<VoxtralTtsPipeline>,
+    /// The LM and acoustic transformer's dtype after the load-time check.
+    precision: Option<PrecisionLoad>,
 }
 
 struct VoxtralTtsPipeline {
@@ -150,45 +160,55 @@ impl VoxtralTtsAssets {
 }
 
 impl VoxtralTtsModel {
+    /// Load the generation pipeline. On Metal a transformer dtype below F32
+    /// must pass [`VoxtralTtsPipeline::numeric_self_check`], or the LM and
+    /// acoustic transformer reload in F32. The codec's dtype is not lowered
+    /// on Metal.
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let mut model = Self::load_metadata(model_dir, device.clone())?;
         info!(
             "Loading Voxtral TTS generation pipeline from {:?}",
             model_dir
         );
+        let (_, selection) =
+            voxtral_tts_precision(&device, voxtral_tts_dtype_override().as_deref())?;
+        let codec_dtype = model.dtype_plan.codec;
+        let config = &model.config;
+        let (pipeline, precision) = load_with_precision_fallback(
+            "Voxtral TTS",
+            &selection,
+            device.kind.is_metal(),
+            DType::F32,
+            |dtype| VoxtralTtsPipeline::load(model_dir, config, dtype, codec_dtype, &device),
+            |pipeline| pipeline.numeric_self_check(config),
+        )?;
+        if precision.loaded != model.dtype_plan.language_model {
+            model.dtype_plan.language_model = precision.loaded;
+            model.dtype_plan.acoustic_transformer = precision.loaded;
+            model.voice_embeddings = VoxtralVoiceEmbeddingLibrary::new(
+                model.voices.clone(),
+                device.device.clone(),
+                precision.loaded,
+                model.config.text_dim,
+            );
+        }
         info!(
-            "Voxtral TTS dtype plan on {:?}: language_model={:?}, acoustic_transformer={:?}, codec={:?}",
+            "Voxtral TTS dtype plan on {:?}: language_model={:?}, acoustic_transformer={:?}, codec={:?} ({})",
             device.kind,
             model.dtype_plan.language_model,
             model.dtype_plan.acoustic_transformer,
-            model.dtype_plan.codec
+            model.dtype_plan.codec,
+            precision.reason
         );
-        let language_vb =
-            load_voxtral_tts_weights(model_dir, model.dtype_plan.language_model, &device)?;
-        let acoustic_vb =
-            load_voxtral_tts_weights(model_dir, model.dtype_plan.acoustic_transformer, &device)?;
-        let codec_vb = load_voxtral_tts_weights(model_dir, model.dtype_plan.codec, &device)?;
-        let tokenizer = VoxtralTtsTokenizer::load(model_dir, &model.config)?;
-        // Managed prefix reuse is chat-task-gated; the TTS route never shares.
-        let language_model =
-            VoxtralLM::load(model.config.text_config(), language_vb.clone(), false)?;
-        let acoustic_transformer = FlowMatchingAudioTransformer::load(
-            &model.config,
-            acoustic_vb.pp("acoustic_transformer"),
-        )?;
-        let codec_decoder =
-            VoxtralCodecDecoder::load(&model.config, codec_vb.pp("audio_tokenizer"))?;
-        let audio_embeddings =
-            VoxtralAudioTokenEmbeddings::load(&model.config, model.config.text_dim, language_vb)?;
-        model.pipeline = Some(VoxtralTtsPipeline {
-            tokenizer,
-            language_model,
-            acoustic_transformer,
-            codec_decoder,
-            audio_embeddings,
-            device: device.device.clone(),
-        });
+        model.pipeline = Some(pipeline);
+        model.precision = Some(precision);
         Ok(model)
+    }
+
+    /// The transformer precision this model loaded with and why, including
+    /// the load-time self-check; `None` before the pipeline loads.
+    pub fn precision(&self) -> Option<&PrecisionLoad> {
+        self.precision.as_ref()
     }
 
     pub fn load_metadata(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
@@ -215,6 +235,7 @@ impl VoxtralTtsModel {
             codec_config,
             dtype_plan,
             pipeline: None,
+            precision: None,
         })
     }
 
@@ -1176,6 +1197,89 @@ fn codebook_offsets(sizes: &[u32]) -> Result<Vec<u32>> {
     Ok(offsets)
 }
 
+/// LM positions the load-time self-check runs.
+const VOXTRAL_TTS_PROBE_LM_TOKENS: usize = 16;
+
+impl VoxtralTtsPipeline {
+    /// The LM and acoustic transformer in `dtype`, the codec in `codec_dtype`.
+    fn load(
+        model_dir: &Path,
+        config: &VoxtralTtsConfig,
+        dtype: DType,
+        codec_dtype: DType,
+        device: &DeviceProfile,
+    ) -> Result<Self> {
+        let language_vb = load_voxtral_tts_weights(model_dir, dtype, device)?;
+        let codec_vb = load_voxtral_tts_weights(model_dir, codec_dtype, device)?;
+        let tokenizer = VoxtralTtsTokenizer::load(model_dir, config)?;
+        // Managed prefix reuse is chat-task-gated; the TTS route never shares.
+        let language_model = VoxtralLM::load(config.text_config(), language_vb.clone(), false)?;
+        let acoustic_transformer =
+            FlowMatchingAudioTransformer::load(config, language_vb.pp("acoustic_transformer"))?;
+        let codec_decoder = VoxtralCodecDecoder::load(config, codec_vb.pp("audio_tokenizer"))?;
+        let audio_embeddings =
+            VoxtralAudioTokenEmbeddings::load(config, config.text_dim, language_vb)?;
+        Ok(Self {
+            tokenizer,
+            language_model,
+            acoustic_transformer,
+            codec_decoder,
+            audio_embeddings,
+            device: device.device.clone(),
+        })
+    }
+
+    /// The load-time self-check (report 13): see [`voxtral_tts_numeric_probe`].
+    /// Every probed tensor must be finite and below the F16-safe range.
+    fn numeric_self_check(&self, config: &VoxtralTtsConfig) -> NumericSelfCheckReport {
+        let dtype = self.language_model.embedding_dtype();
+        run_numeric_self_check(format!("Voxtral TTS {dtype:?}"), F16_SAFE_MAX_ABS, || {
+            voxtral_tts_numeric_probe(
+                &self.language_model,
+                &self.acoustic_transformer,
+                config.text_config().vocab_size,
+                AcousticGenerationConfig::from_config(config).n_acoustic_codebooks,
+                &self.device,
+            )
+        })
+    }
+}
+
+/// Xorshift token ids (unstructured) for [`VOXTRAL_TTS_PROBE_LM_TOKENS`]
+/// positions, embedded and run through every LM layer and the head on a
+/// scratch cache in the LM's dtype, then one flow-matching frame of the
+/// acoustic transformer from the last hidden state with xorshift noise.
+/// Returns the LM hidden states and logits, and the acoustic transformer's
+/// semantic logits and integrated state.
+fn voxtral_tts_numeric_probe(
+    language_model: &VoxtralLM,
+    acoustic: &FlowMatchingAudioTransformer,
+    vocab_size: usize,
+    n_acoustic_codebooks: usize,
+    device: &Device,
+) -> Result<Vec<(String, Tensor)>> {
+    let tokens = VOXTRAL_TTS_PROBE_LM_TOKENS;
+    let ids = xorshift_tensor(&[tokens], 0x7751, 1.0, device)?
+        .abs()?
+        .affine(vocab_size.saturating_sub(1) as f64, 0.0)?
+        .floor()?
+        .to_dtype(DType::U32)?
+        .unsqueeze(0)?;
+    let embeds = language_model.embeddings(&ids)?;
+    let mut cache = language_model.scratch_probe_cache(embeds.dtype(), tokens)?;
+    let hidden =
+        language_model.forward_managed_hidden_with_embeds(&embeds, 0, &mut cache, None, None)?;
+    let logits = language_model.logits_from_hidden(&hidden)?;
+    let last = hidden.i((.., tokens - 1, ..))?;
+    let noise = xorshift_tensor(&[1, n_acoustic_codebooks], 0x7752, 1.0, device)?;
+    let mut outputs = vec![
+        ("lm_hidden".to_string(), hidden),
+        ("lm_logits".to_string(), logits),
+    ];
+    outputs.extend(acoustic.numeric_probe(&last, &noise)?);
+    Ok(outputs)
+}
+
 fn load_voxtral_tts_weights<'a>(
     model_dir: &'a Path,
     dtype: DType,
@@ -1193,27 +1297,65 @@ pub fn select_voxtral_tts_dtypes(
     device: &DeviceProfile,
     dtype_override: Option<&str>,
 ) -> Result<VoxtralTtsDTypePlan> {
-    if let Some(raw) = dtype_override.map(str::trim).filter(|raw| !raw.is_empty()) {
-        let dtype =
-            device.select_model_dtype_checked(ModelFamily::VoxtralTts, Some(raw), "Voxtral TTS")?;
-        return Ok(VoxtralTtsDTypePlan {
-            language_model: dtype,
-            acoustic_transformer: dtype,
-            codec: dtype,
-        });
-    }
+    voxtral_tts_precision(device, dtype_override).map(|(plan, _)| plan)
+}
 
-    let transformer_dtype = device.select_model_dtype(ModelFamily::VoxtralTts, None);
-    let codec_dtype = if device.kind.is_cuda() {
-        transformer_dtype
-    } else {
-        DType::F32
+/// Voxtral TTS's dtypes on `device` and why its transformers (LM and
+/// acoustic) take theirs. On Metal the transformers follow the
+/// BF16-checkpoint LM tier (F16 today, behind the load-time self-check) and
+/// a BF16 request runs in F16 until Metal paged attention takes BF16; the
+/// codec stays F32 off CUDA, override or not. CUDA keeps its family policy
+/// (BF16 when supported) for every stage, and CPU runs F32 unless
+/// overridden.
+fn voxtral_tts_precision(
+    device: &DeviceProfile,
+    dtype_override: Option<&str>,
+) -> Result<(VoxtralTtsDTypePlan, DTypeSelection)> {
+    let mut selection = match dtype_override.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => DTypeSelection {
+            dtype: device.select_model_dtype_checked(
+                ModelFamily::VoxtralTts,
+                Some(raw),
+                "Voxtral TTS",
+            )?,
+            reason: format!("IZWI_VOXTRAL_TTS_DTYPE={raw} selects the Voxtral TTS dtype").into(),
+        },
+        None => device.resolve_dtype(
+            DTypeSelectionRequest::new(None).with_model_family(ModelFamily::VoxtralTts),
+        ),
     };
-    Ok(VoxtralTtsDTypePlan {
-        language_model: transformer_dtype,
-        acoustic_transformer: transformer_dtype,
-        codec: codec_dtype,
-    })
+    if device.kind.is_metal()
+        && selection.dtype == DType::BF16
+        && !METAL_PAGED_ATTENTION_SUPPORTS_BF16
+    {
+        selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: format!(
+                "{}; BF16 is held on Metal until paged attention takes it, so F16",
+                selection.reason
+            )
+            .into(),
+        };
+    }
+    let codec = if device.kind.is_cuda() {
+        selection.dtype
+    } else if device.kind.is_metal() {
+        DType::F32
+    } else {
+        // CPU: the explicit override applies to every stage, as before.
+        dtype_override
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map_or(DType::F32, |_| selection.dtype)
+    };
+    Ok((
+        VoxtralTtsDTypePlan {
+            language_model: selection.dtype,
+            acoustic_transformer: selection.dtype,
+            codec,
+        },
+        selection,
+    ))
 }
 
 fn voxtral_tts_dtype_override() -> Option<String> {
@@ -1268,8 +1410,18 @@ mod tests {
         );
     }
 
+    /// VXT-3/VXT-6: CPU stays F32; Metal's LM and acoustic transformer take
+    /// the BF16-checkpoint LM tier (F16 today, behind the self-check) while
+    /// the codec stays F32 even under an override, and a BF16 override runs
+    /// in F16 until Metal paged attention takes BF16; CUDA keeps BF16.
     #[test]
-    fn dtype_plan_keeps_cpu_and_metal_in_f32_and_allows_cuda_bf16() {
+    fn dtype_plan_puts_metal_transformers_on_the_lm_tier_and_keeps_the_codec_f32() {
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = std::env::var_os("IZWI_METAL_DTYPE");
+        std::env::remove_var("IZWI_METAL_DTYPE");
+
         let cpu = profile(DeviceKind::Cpu, false, false);
         let cpu_plan = select_voxtral_tts_dtypes(&cpu, None).unwrap();
         assert_eq!(cpu_plan.language_model, DType::F32);
@@ -1277,16 +1429,200 @@ mod tests {
         assert_eq!(cpu_plan.codec, DType::F32);
 
         let metal = profile(DeviceKind::Metal, false, true);
-        let metal_plan = select_voxtral_tts_dtypes(&metal, None).unwrap();
-        assert_eq!(metal_plan.language_model, DType::F32);
-        assert_eq!(metal_plan.acoustic_transformer, DType::F32);
+        let (metal_plan, selection) = voxtral_tts_precision(&metal, None).unwrap();
+        assert_eq!(metal_plan.language_model, DType::F16);
+        assert_eq!(metal_plan.acoustic_transformer, DType::F16);
         assert_eq!(metal_plan.codec, DType::F32);
+        assert!(selection.reason.contains("LM tier"), "{}", selection.reason);
+
+        let (bf16, selection) = voxtral_tts_precision(&metal, Some("bf16")).unwrap();
+        assert_eq!(bf16.language_model, DType::F16);
+        assert_eq!(bf16.codec, DType::F32);
+        assert!(
+            selection.reason.contains("BF16 is held"),
+            "{}",
+            selection.reason
+        );
+        let f32_plan = select_voxtral_tts_dtypes(&metal, Some("f32")).unwrap();
+        assert_eq!(f32_plan.language_model, DType::F32);
+        assert_eq!(f32_plan.codec, DType::F32);
 
         let cuda = profile(DeviceKind::Cuda, true, true);
         let cuda_plan = select_voxtral_tts_dtypes(&cuda, None).unwrap();
         assert_eq!(cuda_plan.language_model, DType::BF16);
         assert_eq!(cuda_plan.acoustic_transformer, DType::BF16);
         assert_eq!(cuda_plan.codec, DType::BF16);
+
+        if let Some(value) = saved {
+            std::env::set_var("IZWI_METAL_DTYPE", value);
+        }
+    }
+
+    /// A tiny Voxtral TTS LM and acoustic transformer with xorshift weights
+    /// (embeddings scaled by `embedding_scale`), loaded in `dtype`.
+    fn tiny_probe_parts(
+        device: &Device,
+        dtype: DType,
+        embedding_scale: f32,
+    ) -> (VoxtralLM, FlowMatchingAudioTransformer) {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::architectures::voxtral::lm::tests::tiny_cfg;
+
+        let mut cfg = tiny_cfg();
+        cfg.num_hidden_layers = 2;
+        cfg.vocab_size = 16;
+        cfg.max_position_embeddings = Some(64);
+        let mut tensors = HashMap::new();
+        let mut seed = 0x51EE_D000u64;
+        let mut random = |shape: &[usize], scale: f32| {
+            seed += 1;
+            xorshift_tensor(shape, seed, scale, device).unwrap()
+        };
+        tensors.insert(
+            "tok_embeddings.weight".to_string(),
+            random(&[16, 4], embedding_scale),
+        );
+        tensors.insert("output.weight".to_string(), random(&[16, 4], 0.5));
+        tensors.insert(
+            "norm.weight".to_string(),
+            Tensor::ones(4, DType::F32, device).unwrap(),
+        );
+        for layer in 0..2 {
+            for (name, shape) in [
+                ("attention.wq.weight", [4, 4]),
+                ("attention.wk.weight", [2, 4]),
+                ("attention.wv.weight", [2, 4]),
+                ("attention.wo.weight", [4, 4]),
+                ("feed_forward.w1.weight", [8, 4]),
+                ("feed_forward.w3.weight", [8, 4]),
+                ("feed_forward.w2.weight", [4, 8]),
+            ] {
+                tensors.insert(format!("layers.{layer}.{name}"), random(&shape, 0.5));
+            }
+            for name in ["attention_norm.weight", "ffn_norm.weight"] {
+                tensors.insert(
+                    format!("layers.{layer}.{name}"),
+                    Tensor::ones(4, DType::F32, device).unwrap(),
+                );
+            }
+        }
+        let lm =
+            VoxtralLM::load(cfg, VarBuilder::from_tensors(tensors, dtype, device), false).unwrap();
+        // Sorted, so every load draws the same weights for the same names.
+        let acoustic_tensors = super::super::acoustic::tests::tiny_acoustic_tensors(device)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(name, tensor)| {
+                let value = if name.contains("norm") {
+                    tensor
+                } else {
+                    random(tensor.dims(), 0.5)
+                };
+                (name, value)
+            })
+            .collect::<HashMap<_, _>>();
+        let acoustic = FlowMatchingAudioTransformer::load(
+            &super::super::acoustic::tests::tiny_acoustic_config(),
+            VarBuilder::from_tensors(acoustic_tensors, dtype, device),
+        )
+        .unwrap();
+        (lm, acoustic)
+    }
+
+    fn probe_report(device: &Device, dtype: DType, embedding_scale: f32) -> NumericSelfCheckReport {
+        let (lm, acoustic) = tiny_probe_parts(device, dtype, embedding_scale);
+        run_numeric_self_check("tiny Voxtral TTS", F16_SAFE_MAX_ABS, || {
+            voxtral_tts_numeric_probe(&lm, &acoustic, 16, 2, device)
+        })
+    }
+
+    /// VXT-3: the load-time probe runs the LM (every layer and the head) and
+    /// one acoustic frame; on a healthy tiny model it passes in F16, with
+    /// the F16 outputs tracking F32.
+    #[test]
+    fn voxtral_tts_probe_passes_in_f16_and_tracks_f32() {
+        let device = Device::Cpu;
+        let f32_report = probe_report(&device, DType::F32, 0.5);
+        let f16_report = probe_report(&device, DType::F16, 0.5);
+        assert!(f32_report.passed, "{}", f32_report.reason);
+        assert!(f16_report.passed, "{}", f16_report.reason);
+        let names = f16_report
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "lm_hidden",
+                "lm_logits",
+                "acoustic_semantic_logits",
+                "acoustic_state"
+            ]
+        );
+        for (half, full) in f16_report.tensors.iter().zip(&f32_report.tensors) {
+            let tolerance = 0.05 * full.max_abs.max(1.0);
+            assert!(
+                (half.max_abs - full.max_abs).abs() <= tolerance,
+                "{}: F16 max |x| {} vs F32 {}",
+                half.name,
+                half.max_abs,
+                full.max_abs
+            );
+        }
+    }
+
+    /// VXT-3: the probe runs on Metal in F16 (Metal paged attention, F16
+    /// K/V) and passes on the healthy tiny model.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_voxtral_tts_probe_passes_in_f16() {
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let report = probe_report(&metal, DType::F16, 0.5);
+        assert!(report.passed, "{}", report.reason);
+        let cpu = probe_report(&Device::Cpu, DType::F32, 0.5);
+        for (metal, cpu) in report.tensors.iter().zip(&cpu.tensors) {
+            assert!(
+                (metal.max_abs - cpu.max_abs).abs() <= 0.05 * cpu.max_abs.max(1.0),
+                "{}: Metal F16 {} vs CPU F32 {}",
+                metal.name,
+                metal.max_abs,
+                cpu.max_abs
+            );
+        }
+    }
+
+    /// VXT-3: an F16 load whose activations leave F16's range fails the
+    /// self-check and reloads in F32, recording why; a healthy one keeps F16.
+    #[test]
+    fn voxtral_tts_self_check_falls_back_to_f32_when_f16_overflows() {
+        let device = Device::Cpu;
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test tier".into(),
+        };
+        for (embedding_scale, expected) in [(0.5f32, DType::F16), (1e5, DType::F32)] {
+            let (_, precision) = load_with_precision_fallback(
+                "tiny Voxtral TTS",
+                &selection,
+                true,
+                DType::F32,
+                |dtype| Ok::<_, Error>((dtype, tiny_probe_parts(&device, dtype, embedding_scale))),
+                |(_, (lm, acoustic))| {
+                    run_numeric_self_check("tiny Voxtral TTS", F16_SAFE_MAX_ABS, || {
+                        voxtral_tts_numeric_probe(lm, acoustic, 16, 2, &device)
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(precision.loaded, expected, "{}", precision.reason);
+            assert_eq!(precision.fell_back(), expected == DType::F32);
+            assert!(precision.self_check.is_some());
+        }
     }
 
     #[test]
