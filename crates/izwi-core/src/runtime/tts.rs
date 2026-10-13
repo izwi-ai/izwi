@@ -9,20 +9,17 @@ use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::engine::{
     tts_explicit_output_limit, GenerationParams as CoreGenParams, ResourceAmount, ResourceVector,
-    WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
-use crate::models::architectures::voxtral::tts::{
-    voxtral_tts_auto_max_frames_for_text, VoxtralTtsGenerationParams,
-};
+use crate::models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::TtsRuntimeRequest;
-use crate::runtime::service::{CapabilityLoadOptions, RuntimeService};
+use crate::runtime::service::RuntimeService;
 use crate::runtime::telemetry::{
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming,
@@ -278,12 +275,21 @@ impl DirectTtsObservationContext {
     }
 }
 
-fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
-    matches!(variant.family(), ModelFamily::VoxtralTts)
+/// Kokoro streams its planned chunks natively on the direct route; every
+/// other TTS request, streaming or not, runs on the engine.
+fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
+    matches!(variant.family(), ModelFamily::KokoroTts)
 }
 
-fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
-    uses_direct_tts_runtime(variant) || matches!(variant.family(), ModelFamily::KokoroTts)
+/// The execution target the public TTS route actually uses for `variant`.
+/// The adapter registry must advertise the same target, or no loaded
+/// contract can serve the request (VXT-1).
+pub(crate) fn tts_route_target(variant: ModelVariant, streaming: bool) -> ExecutionTargetKind {
+    if streaming && uses_direct_streaming_tts_runtime(variant) {
+        ExecutionTargetKind::DirectModel
+    } else {
+        ExecutionTargetKind::TokenEngine
+    }
 }
 
 pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Result<usize> {
@@ -455,134 +461,6 @@ impl RuntimeService {
                     .map(|_| variant)
             })
     }
-    async fn voxtral_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_voxtral_tts(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .unwrap_or_else(|| self.config.portable_context_ceiling());
-        let explicit_max_frames = tts_explicit_output_limit(
-            self.backend_router.context().backend_kind,
-            variant,
-            context_limit,
-        );
-        let request_id = request.id;
-        let config = request.config;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_paged(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let voice = config
-                        .options
-                        .speaker
-                        .clone()
-                        .or_else(|| config.options.voice.clone())
-                        .or_else(|| model.available_speakers().into_iter().next())
-                        .ok_or_else(|| {
-                            Error::InferenceError(
-                                "Voxtral TTS model exposes no preset voices".to_string(),
-                            )
-                        })?;
-                    let params =
-                        VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
-                            &config,
-                            &text,
-                            explicit_max_frames,
-                        );
-                    let started = Instant::now();
-                    let domains = leases.domains().collect::<Vec<_>>();
-                    let [domain] = domains.as_slice() else {
-                        return Err(Error::InferenceError(format!(
-                            "Voxtral TTS requires one invocation KV domain, found {}",
-                            domains.len()
-                        )));
-                    };
-                    let output = model.generate_with_voice_physical(
-                        &text,
-                        &voice,
-                        params,
-                        leases.cache_mut(*domain)?,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-                    let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
-                        Error::InferenceError(format!(
-                            "Voxtral TTS sample rate {} exceeds u32",
-                            output.sample_rate
-                        ))
-                    })?;
-
-                    Ok(GenerationResult {
-                        request_id,
-                        samples: output.samples,
-                        sample_rate,
-                        total_tokens: output.frames_generated,
-                        total_time_ms,
-                        diagnostics: None,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn voxtral_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .voxtral_tts_generate(job, request, variant, true)
-            .await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
     async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
@@ -627,38 +505,6 @@ impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if uses_direct_tts_runtime(resolved_variant) {
-            let observation = DirectTtsObservationContext::new(&request, resolved_variant, false);
-            let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
-            let observed_input_bytes = u64::try_from(retained_input_bytes).map_err(|_| {
-                Error::InvalidInput("TTS retained input size exceeds u64".to_string())
-            })?;
-            let mut spec = self.coordinator_job_for_input(
-                request.id.clone(),
-                CoordinatorLane::Atomic,
-                request.runtime_context,
-                retained_input_bytes,
-            );
-            spec.resources = spec.resources.checked_add(direct_tts_additional_resources(
-                self.backend_router.context().backend_kind,
-                &request,
-                resolved_variant,
-                self.config.portable_context_ceiling(),
-            )?)?;
-            let job = self
-                .coordinator
-                .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-                .await?;
-            let result = match resolved_variant.family() {
-                ModelFamily::VoxtralTts => {
-                    self.voxtral_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                _ => unreachable!("direct TTS family checked above"),
-            };
-            self.record_direct_tts_observation(observation, result.as_ref().map(Some));
-            return result;
-        }
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -730,10 +576,6 @@ impl RuntimeService {
             let result = match resolved_variant.family() {
                 ModelFamily::KokoroTts => {
                     self.kokoro_tts_generate_streaming(&job, request, chunk_tx)
-                        .await
-                }
-                ModelFamily::VoxtralTts => {
-                    self.voxtral_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),
@@ -813,7 +655,10 @@ mod tests {
 
     #[test]
     fn fish_s2_public_tts_routes_always_use_retained_execution() {
-        assert!(!uses_direct_tts_runtime(ModelVariant::FishAudioS2Pro));
+        assert_eq!(
+            tts_route_target(ModelVariant::FishAudioS2Pro, false),
+            ExecutionTargetKind::TokenEngine
+        );
         assert!(!uses_direct_streaming_tts_runtime(
             ModelVariant::FishAudioS2Pro
         ));
@@ -821,7 +666,10 @@ mod tests {
 
     #[test]
     fn kokoro_uses_engine_for_atomic_generation_and_direct_native_streaming() {
-        assert!(!uses_direct_tts_runtime(ModelVariant::Kokoro82M));
+        assert_eq!(
+            tts_route_target(ModelVariant::Kokoro82M, false),
+            ExecutionTargetKind::TokenEngine
+        );
         assert!(uses_direct_streaming_tts_runtime(ModelVariant::Kokoro82M));
     }
     use crate::backends::BackendKind;

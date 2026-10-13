@@ -12,6 +12,7 @@ enum CertifiedTopology {
     RetainedPaged,
     RetainedPagedRing,
     RetainedPagedRotatingAndInvocationScratch,
+    RetainedPagedAndInvocationScratch,
     RetainedPagedTensorAndInvocationPaged,
     RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
     RetainedTensorAndInvocationTensor,
@@ -43,6 +44,7 @@ impl CertifiedTopology {
             | Self::RetainedPagedAndInvocationPagedTensor
             | Self::RetainedPagedStaticAndInvocationPagedStatic
             | Self::RetainedPagedRotatingAndInvocationScratch
+            | Self::RetainedPagedAndInvocationScratch
             | Self::RetainedAppendRingTensor => InferenceStateRequirement::RetainedAndInvocation,
             Self::RetainedPagedPagedTensorAndInvocationPagedPagedTensor => {
                 InferenceStateRequirement::RetainedAndInvocation
@@ -93,7 +95,9 @@ fn certified_topology(
         // leases a separate predictor page domain per invocation.
         (Qwen3Tts, Tts | StreamingTts) => RetainedPagedTensorAndInvocationPaged,
         (KokoroTts, Tts | StreamingTts) => Stateless,
-        (VoxtralTts, Tts) => InvocationPaged,
+        // Voxtral TTS retains its LM pages for one request on the engine
+        // route; its stages lease scratch only.
+        (VoxtralTts, Tts) => RetainedPagedAndInvocationScratch,
         (VibeVoiceTts, Tts) => RetainedPagedPagedTensorAndInvocationPagedPagedTensor,
         (FishS2Tts, Tts | StreamingTts) => RetainedPagedAndInvocationPaged,
 

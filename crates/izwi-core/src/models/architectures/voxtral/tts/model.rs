@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::voxtral::lm::VoxtralLM;
 use crate::models::architectures::voxtral::{
-    voxtral_invocation_contract, voxtral_physical_state_spec, VoxtralPhysicalStateSpec,
+    voxtral_invocation_contract, voxtral_tts_physical_state_spec, VoxtralTtsPhysicalStateSpec,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
@@ -34,6 +34,25 @@ use super::retained::{
 use super::sampling::VoxtralTtsGenerationParams;
 use super::tokenizer::VoxtralTtsTokenizer;
 use super::voice::{voice_embedding_path, VoxtralVoiceCatalog, VoxtralVoiceEmbeddingLibrary};
+
+/// Retained LM context of one Voxtral-TTS request: the prompt (a preset
+/// voice of at most a few hundred audio tokens, the text and its control
+/// tokens) plus at most 2,048 frames on CUDA (1,500 elsewhere). 4,096
+/// matches the reference runtime's `max_model_len` (vllm-omni); the
+/// model's 128,000-token maximum sized gigabytes of state per stage that no
+/// request could use (VXT-2). Load guarantees it or refuses the load.
+pub(crate) const VOXTRAL_TTS_STATE_CONTEXT_TOKENS: usize = 4_096;
+
+/// The retained context fitted for a model whose LM allows
+/// `physical_context_limit` positions.
+pub(crate) fn voxtral_tts_retained_max_tokens(physical_context_limit: usize) -> usize {
+    physical_context_limit.min(VOXTRAL_TTS_STATE_CONTEXT_TOKENS)
+}
+
+const _: () = assert!(
+    VOXTRAL_TTS_STATE_CONTEXT_TOKENS
+        >= crate::catalog::ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES + 1_024
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoxtralTtsDTypePlan {
@@ -206,7 +225,7 @@ impl VoxtralTtsModel {
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
-    ) -> Result<VoxtralPhysicalStateSpec> {
+    ) -> Result<VoxtralTtsPhysicalStateSpec> {
         let pipeline = self.pipeline.as_ref().ok_or_else(|| {
             Error::ModelLoadError(
                 "Voxtral TTS physical state requires the full model loader".into(),
@@ -222,7 +241,11 @@ impl VoxtralTtsModel {
             .language_model
             .physical_context_limit()
             .ok_or_else(|| Error::ModelLoadError("Voxtral TTS has no context limit".into()))?;
-        voxtral_physical_state_spec(stage_graphs, invocation, max_context_tokens)
+        voxtral_tts_physical_state_spec(
+            stage_graphs,
+            invocation,
+            voxtral_tts_retained_max_tokens(max_context_tokens),
+        )
     }
 
     pub fn generate_with_voice(

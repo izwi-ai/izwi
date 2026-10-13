@@ -157,7 +157,7 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
             ..FamilyInferenceStatePolicy::STATELESS
         },
         VoxtralTts => FamilyInferenceStatePolicy {
-            tts: Invocation,
+            tts: RetainedAndInvocation,
             ..FamilyInferenceStatePolicy::STATELESS
         },
         FishS2Tts => FamilyInferenceStatePolicy {
@@ -383,15 +383,11 @@ pub(crate) fn scalar_execution_profile(
     profile
 }
 
-fn tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if matches!(
-        model_variant.family(),
-        crate::catalog::ModelFamily::VoxtralTts
-    ) {
-        ExecutionTargetKind::DirectModel
-    } else {
-        ExecutionTargetKind::TokenEngine
-    }
+/// Every non-streaming TTS family runs on the engine. Voxtral-TTS was
+/// marked DirectModel while its loaded adapter publishes only the engine's
+/// sequence stages, so no route could run a request (VXT-1).
+fn tts_execution_target(_model_variant: ModelVariant) -> ExecutionTargetKind {
+    ExecutionTargetKind::TokenEngine
 }
 
 fn streaming_tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
@@ -1094,18 +1090,18 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_marks_voxtral_tts_as_direct_tts_with_final_only_streaming() {
+    fn built_in_registry_routes_voxtral_tts_through_the_engine_with_final_only_streaming() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Voxtral4BTts2603;
 
         let adapter = registry
             .require(CapabilityKind::Tts, variant)
             .expect("voxtral tts adapter");
-        assert_eq!(adapter.execution_target, ExecutionTargetKind::DirectModel);
+        assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
         assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
         assert_eq!(
             adapter.state_requirement,
-            InferenceStateRequirement::Invocation
+            InferenceStateRequirement::RetainedAndInvocation
         );
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)

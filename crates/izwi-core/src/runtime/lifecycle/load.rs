@@ -201,6 +201,9 @@ fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
         crate::catalog::ModelFamily::VibeVoiceTts => {
             crate::models::architectures::vibevoice::tts::vibevoice_tts_state_floor_tokens()
         }
+        crate::catalog::ModelFamily::VoxtralTts => {
+            crate::models::architectures::voxtral::tts::VOXTRAL_TTS_STATE_CONTEXT_TOKENS
+        }
         _ => 0,
     };
     tokens as u64
@@ -3460,16 +3463,43 @@ impl ModelLifecycleController {
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
-                let publication = self
-                    .load_invocation_workspace_publication(
+                // The engine route runs the LM on retained paged K/V (one
+                // context per request, shared by prefill and decode).
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state(
                         model_instance_id,
-                        &contracts,
-                        physical_spec.descriptor,
-                        &physical_spec.invocation,
-                        None,
-                        HashMap::new(),
+                        &physical_spec.retained,
+                        Some(physical_spec.retained_max_tokens),
+                        tts_state_minimum_tokens(variant),
+                        state_fit_reserve,
                     )
                     .await?;
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained.logical_token_reach(),
+                )?;
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Tts,
+                    retained.state_plan_v2(),
+                )?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        Ok((
+                            stage_graph_fingerprint(&contract.stages)?,
+                            RetainedStateUseV2::ExternalPaged,
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                // Stages keep only scratch; no stage owns K/V of its own.
+                let publication = self.load_scratch_only_workspace_publication(
+                    &contracts,
+                    physical_spec.descriptor,
+                    Some(retained.into()),
+                    retained_uses,
+                )?;
                 state_publications.insert(CapabilityKind::Tts, publication);
             }
             if variant.family() == crate::catalog::ModelFamily::KokoroTts {
