@@ -63,8 +63,9 @@ use crate::engine::ResourceAmount;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::granite_speech::asr::{
-    ensure_granite_speech_artifacts, granite_load_representation, select_granite_speech_dtype,
-    GraniteLoadRepresentation, GraniteSpeechConfig,
+    ensure_granite_speech_artifacts, granite_load_representation,
+    granite_tensor_is_f16_encoder_projection, resolve_granite_encoder_projection_precision,
+    select_granite_speech_dtype, GraniteLoadRepresentation, GraniteSpeechConfig,
 };
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
@@ -1301,6 +1302,10 @@ fn nemo_payload_bytes(path: &Path) -> Result<u64> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraniteLoad {
     dtype: DType,
+    /// The encoder and projector's dtype (F32 under weight-only F16).
+    audio_dtype: DType,
+    /// Encoder projections load as weight-only F16.
+    f16_encoder_projections: bool,
     representation: GraniteLoadRepresentation,
     residual_multiplier: f32,
     tied_lm_head: bool,
@@ -1321,8 +1326,16 @@ fn granite_plan(
     };
     let config = GraniteSpeechConfig::load(model_path)?;
     let dtype = select_granite_speech_dtype(device, config.target_dtype_hint())?;
+    let f16_encoder_projections =
+        resolve_granite_encoder_projection_precision(device).dtype == DType::F16;
     let load = GraniteLoad {
         dtype,
+        audio_dtype: if f16_encoder_projections {
+            DType::F32
+        } else {
+            dtype
+        },
+        f16_encoder_projections,
         representation: granite_load_representation(&device.device, dtype),
         residual_multiplier: config.text_config.residual_multiplier,
         tied_lm_head: config.tie_word_embeddings(),
@@ -1339,8 +1352,10 @@ fn granite_plan(
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
 /// and down_proj read at F16 (when selective) and then pre-scaled by the
 /// residual multiplier, and
-/// an F16 copy of a tied embedding as the LM head. Each encoder layer adds a
-/// host-built U32 attention distance table.
+/// an F16 copy of a tied embedding as the LM head. The encoder and projector
+/// read at the audio dtype, with the encoder projections converted to F16 on
+/// the host under weight-only F16. Each encoder layer adds a host-built U32
+/// attention distance table.
 fn price_granite(
     files: &[CensusFile],
     backend: BackendKind,
@@ -1404,7 +1419,11 @@ fn price_granite(
             continue;
         }
         if !name.starts_with("language_model.") {
-            ledger.var(tensor, Source::Mapped, &[dtype])?;
+            if load.f16_encoder_projections && granite_tensor_is_f16_encoder_projection(name) {
+                ledger.host_converted(tensor, DType::F16)?;
+            } else {
+                ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
+            }
         } else if name.ends_with(".o_proj.weight") {
             let chain = residual_chain(representation.f16_attention_output);
             ledger.var(tensor, Source::Mapped, &chain)?;
@@ -1870,16 +1889,32 @@ mod tests {
     }
 
     fn granite(backend: BackendKind) -> AsrResidencyPlan {
+        price_granite(
+            &census!("granite_speech_4_1_2b_plus.json"),
+            backend,
+            &granite_load(backend),
+        )
+        .unwrap()
+    }
+
+    fn granite_load(backend: BackendKind) -> GraniteLoad {
         let dtype = select_granite_speech_dtype(&profile(backend), Some("bfloat16")).unwrap();
-        let load = GraniteLoad {
+        // Metal loads the encoder projections as weight-only F16.
+        let f16_encoder_projections = backend == BackendKind::Metal;
+        GraniteLoad {
             dtype,
+            audio_dtype: if f16_encoder_projections {
+                DType::F32
+            } else {
+                dtype
+            },
+            f16_encoder_projections,
             representation: granite_representation(backend),
             // The published granite-speech-4.1-2b-plus config.json.
             residual_multiplier: 0.22,
             tied_lm_head: true,
             encoder_attention_dists: (16, 200),
-        };
-        price_granite(&census!("granite_speech_4_1_2b_plus.json"), backend, &load).unwrap()
+        }
     }
 
     fn vibevoice(backend: BackendKind) -> AsrResidencyPlan {
@@ -1993,7 +2028,7 @@ mod tests {
             (
                 "Granite-Speech-Plus",
                 Box::new(granite),
-                [7.87, 5.60, 5.87, 3.93],
+                [7.87, 4.78, 5.06, 3.93],
             ),
             (
                 "VibeVoice-ASR",
@@ -2137,6 +2172,31 @@ mod tests {
             voxtral(BackendKind::Metal).logical_resident_bytes,
             stored(&files, |_| true)
         );
+        // Granite on Metal: the encoder's linear and pointwise-conv weights
+        // are weight-only F16, 437M parameters (16 layers of FFN, attention
+        // and pointwise convs, plus the input and CTC projections).
+        let files = census!("granite_speech_4_1_2b_plus.json");
+        let encoder_projections = stored(&files, |t| {
+            granite_tensor_is_f16_encoder_projection(&t.name)
+        }) / 2;
+        assert_eq!(
+            encoder_projections,
+            16 * (2 * 2048 * 1024 + 2 * 1024 * 1024 + 4096 * 1024 + 4 * 4096 * 1024)
+                + 1024 * 160
+                + 2 * 348 * 1024
+        );
+        let dense_encoder = {
+            let mut load = granite_load(BackendKind::Metal);
+            load.audio_dtype = DType::F32;
+            load.f16_encoder_projections = false;
+            price_granite(&files, BackendKind::Metal, &load)
+                .unwrap()
+                .logical_resident_bytes
+        };
+        assert_eq!(
+            dense_encoder - granite(BackendKind::Metal).logical_resident_bytes,
+            encoder_projections * 2
+        );
         // Granite on CUDA: BF16 without BatchNorm step counters, plus the
         // encoder's U32 attention distance tables.
         let files = census!("granite_speech_4_1_2b_plus.json");
@@ -2224,7 +2284,8 @@ mod tests {
     /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
     /// Whisper's was 4.13 GiB staged in F32, before it loaded in F16.
     const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 2.14;
-    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 7.30;
+    /// Granite's was 7.30 GiB before its encoder loaded weight-only F16.
+    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 6.49;
 
     /// A staged Metal loader casts on the host, so its uploads keep their
     /// exact sizes, and it synchronizes every interval of uploads, so the
@@ -2397,6 +2458,8 @@ mod tests {
             }];
             let load = GraniteLoad {
                 dtype: DType::F32,
+                audio_dtype: DType::F32,
+                f16_encoder_projections: true,
                 representation: granite_representation(BackendKind::Metal),
                 residual_multiplier: 0.22,
                 tied_lm_head: tied,

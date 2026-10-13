@@ -11,7 +11,7 @@ use candle_core::{DType, Tensor, D};
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::{parse_dtype_name, BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{parse_dtype_name, BackendKind, DTypeSelection, DeviceKind, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -591,14 +591,17 @@ impl GraniteSpeechAsrModel {
             GraniteSpeechPromptTokenizer::load(model_dir, &config, &processor, &tokenizer_config)?;
         let preprocessor = GraniteSpeechPreprocessor::new(processor.clone())?;
         let dtype = select_granite_speech_dtype(&device, config.target_dtype_hint())?;
-        let runtime = GraniteSpeechRuntime::load(&shards, &config, &device, dtype)?;
+        let encoder_precision = resolve_granite_encoder_projection_precision(&device);
+        let runtime =
+            GraniteSpeechRuntime::load(&shards, &config, &device, dtype, &encoder_precision)?;
 
         info!(
-            "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files)",
+            "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files); encoder: {}",
             model_dir,
             device.kind,
             dtype,
-            shards.len()
+            shards.len(),
+            runtime.encoder_weight_precision().reason
         );
 
         Ok(Self {
@@ -1669,7 +1672,7 @@ impl GraniteSpeechAsrModel {
         Ok(GraniteSpeechAsrTranscriptionOutput {
             text,
             language: language.map(str::to_string),
-            diagnostics: Some(granite_diagnostics(
+            diagnostics: Some(self.with_precision_diagnostics(granite_diagnostics(
                 &features,
                 &granite_prompt,
                 &generation,
@@ -1678,8 +1681,16 @@ impl GraniteSpeechAsrModel {
                 &self.device,
                 timings,
                 audio_stats,
-            )),
+            ))),
         })
+    }
+
+    /// Adds the precision each component loaded with, and why, under
+    /// `execution`.
+    fn with_precision_diagnostics(&self, mut diagnostics: serde_json::Value) -> serde_json::Value {
+        diagnostics["execution"]["encoder_weight_precision"] =
+            self.runtime.encoder_weight_precision().diagnostics();
+        diagnostics
     }
 }
 
@@ -2065,6 +2076,58 @@ fn validate_granite_task_audio_duration(task: GraniteSpeechTask, audio_seconds: 
     )))
 }
 
+const GRANITE_SPEECH_DTYPE_ENV: &str = "IZWI_GRANITE_SPEECH_DTYPE";
+
+/// Whether the conformer encoder's linear and pointwise-convolution weights
+/// load as weight-only F16 (F32 activations): on by default on Metal, as
+/// whisper.cpp stores conformer encoders; `IZWI_GRANITE_SPEECH_DTYPE=f32`
+/// or `IZWI_METAL_DTYPE=f32` keeps them F32. Admission prices the encoder
+/// accordingly (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn resolve_granite_encoder_projection_precision(
+    device: &DeviceProfile,
+) -> DTypeSelection {
+    let family = std::env::var(GRANITE_SPEECH_DTYPE_ENV).ok();
+    device.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (GRANITE_SPEECH_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is one of the encoder weights that load
+/// as weight-only F16 under [`resolve_granite_encoder_projection_precision`]
+/// (their biases stay in the encoder dtype).
+pub(crate) fn granite_tensor_is_f16_encoder_projection(name: &str) -> bool {
+    let Some(encoder) = name.strip_prefix("encoder.") else {
+        return false;
+    };
+    if matches!(
+        encoder,
+        "input_linear.weight" | "out.weight" | "out_mid.weight"
+    ) {
+        return true;
+    }
+    let Some((index, tail)) = encoder
+        .strip_prefix("layers.")
+        .and_then(|layer| layer.split_once('.'))
+    else {
+        return false;
+    };
+    index.parse::<usize>().is_ok()
+        && matches!(
+            tail,
+            "ff1.up_proj.weight"
+                | "ff1.down_proj.weight"
+                | "ff2.up_proj.weight"
+                | "ff2.down_proj.weight"
+                | "attn.to_q.weight"
+                | "attn.to_kv.weight"
+                | "attn.to_out.weight"
+                | "conv.up_conv.weight"
+                | "conv.down_conv.weight"
+        )
+}
+
 /// The base weight dtype the Granite Speech loader selects on `device`,
 /// honouring `IZWI_GRANITE_SPEECH_DTYPE`; `config_hint` is the checkpoint
 /// config's dtype. Load admission prices the checkpoint at this dtype
@@ -2073,7 +2136,7 @@ pub(crate) fn select_granite_speech_dtype(
     device: &DeviceProfile,
     config_hint: Option<&str>,
 ) -> Result<DType> {
-    let explicit = std::env::var("IZWI_GRANITE_SPEECH_DTYPE")
+    let explicit = std::env::var(GRANITE_SPEECH_DTYPE_ENV)
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty());
@@ -3016,6 +3079,53 @@ mod tests {
         let err = select_granite_speech_dtype(&metal, None).unwrap_err();
         assert!(err.to_string().contains("BF16 is not supported on Metal"));
         std::env::remove_var("IZWI_GRANITE_SPEECH_DTYPE");
+    }
+
+    #[test]
+    fn granite_encoder_projections_are_weight_only_f16_on_metal_with_f32_escapes() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let metal = test_profile(DeviceKind::Metal, true);
+        let resolve = || resolve_granite_encoder_projection_precision(&metal).dtype;
+        assert_eq!(resolve(), DType::F16);
+        assert_eq!(
+            resolve_granite_encoder_projection_precision(&DeviceProfile::cpu()).dtype,
+            DType::F32
+        );
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        assert_eq!(resolve(), DType::F32);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        std::env::set_var(GRANITE_SPEECH_DTYPE_ENV, "f32");
+        assert_eq!(resolve(), DType::F32);
+        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
+
+        for name in [
+            "encoder.input_linear.weight",
+            "encoder.out.weight",
+            "encoder.out_mid.weight",
+            "encoder.layers.0.ff1.up_proj.weight",
+            "encoder.layers.15.ff2.down_proj.weight",
+            "encoder.layers.3.attn.to_kv.weight",
+            "encoder.layers.3.conv.up_conv.weight",
+        ] {
+            assert!(granite_tensor_is_f16_encoder_projection(name), "{name}");
+        }
+        for name in [
+            "encoder.input_linear.bias",
+            "encoder.layers.0.ff1.up_proj.bias",
+            "encoder.layers.0.attn.rel_pos_emb.weight",
+            "encoder.layers.0.conv.depth_conv.conv.weight",
+            "encoder.layers.0.post_norm.weight",
+            "encoder.layers.x.ff1.up_proj.weight",
+            "projector.linear.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+        ] {
+            assert!(!granite_tensor_is_f16_encoder_projection(name), "{name}");
+        }
     }
 
     #[test]

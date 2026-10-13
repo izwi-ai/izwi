@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Conv1d, Linear};
+use candle_nn::{Conv1d, Linear, VarBuilder};
 
 use super::numeric_check::{host_f32, relative_l2, xorshift_tensor, NumericSelfCheckReport};
 use crate::backends::DTypeSelection;
@@ -290,6 +290,16 @@ pub fn load_weight_only_f16<T, E>(
             self_check: Some(report),
         },
     ))
+}
+
+/// The builder a projection that may load as weight-only F16 reads from:
+/// with `f16` set, the host, so the weight is read and converted there and
+/// its F32 form never reaches the GPU; otherwise `vb` itself.
+pub fn projection_var_builder<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
+    match f16 {
+        Some(_) => vb.clone().set_device(Device::Cpu),
+        None => vb.clone(),
+    }
 }
 
 /// A projection held dense (Candle's `Linear`, any dtype) or weight-only F16.
