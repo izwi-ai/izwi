@@ -414,6 +414,23 @@ impl DeviceProfile {
         }
     }
 
+    /// Weight-only F16 for an F32 checkpoint: projection (linear and
+    /// pointwise) weights stored in F16 and applied to F32 activations with
+    /// F32 accumulation, the whisper.cpp recipe for NeMo models. Returns F16
+    /// when the projections should load in F16 and F32 when every weight stays
+    /// F32. `family_override` is the family's `(variable, value)` dtype
+    /// override, if set.
+    pub fn resolve_metal_weight_only_f16(
+        &self,
+        family_override: Option<(&str, &str)>,
+    ) -> DTypeSelection {
+        metal_weight_only_f16_selection(
+            self.kind.is_metal(),
+            family_override,
+            MetalDTypeOverride::from_env(),
+        )
+    }
+
     /// Whether this profile's device is an Apple9+ GPU (M3/M4/M5), the tier
     /// whose BF16 matches F16 throughput. False off Metal and when the family
     /// cannot be read.
@@ -1074,6 +1091,59 @@ impl MetalDTypeOverride {
     }
 }
 
+/// [`DeviceProfile::resolve_metal_weight_only_f16`] with the global override
+/// passed in. The family override wins, then `IZWI_METAL_DTYPE`; the Metal
+/// default is on.
+fn metal_weight_only_f16_selection(
+    is_metal: bool,
+    family_override: Option<(&str, &str)>,
+    global: MetalDTypeOverride,
+) -> DTypeSelection {
+    let off = |reason: Cow<'static, str>| DTypeSelection {
+        dtype: DType::F32,
+        reason,
+    };
+    let on = |reason: Cow<'static, str>| DTypeSelection {
+        dtype: DType::F16,
+        reason,
+    };
+    if !is_metal {
+        return off("weight-only F16 is a Metal policy; weights stay F32".into());
+    }
+    let family_override = family_override
+        .map(|(name, raw)| (name, raw.trim()))
+        .filter(|(_, raw)| !raw.is_empty());
+    let family_note = match family_override {
+        Some((name, raw)) => match parse_dtype_name(raw) {
+            Some(DType::F32) => {
+                return off(format!("{name}={raw} keeps every weight in F32").into());
+            }
+            Some(DType::F16) => {
+                return on(
+                    format!("{name}={raw}: F16 projection weights with F32 activations").into(),
+                );
+            }
+            _ => format!("; {name}={raw} is not a Metal weight precision and is ignored"),
+        },
+        None => String::new(),
+    };
+    match global {
+        MetalDTypeOverride::F32 => off(format!(
+            "IZWI_METAL_DTYPE=f32 keeps every weight in F32{family_note}"
+        )
+        .into()),
+        MetalDTypeOverride::Auto => on(format!(
+            "Metal default: F16 projection weights with F32 activations and accumulation{family_note}"
+        )
+        .into()),
+        MetalDTypeOverride::F16 | MetalDTypeOverride::Bf16 => on(format!(
+            "IZWI_METAL_DTYPE={}: F16 projection weights with F32 activations{family_note}",
+            if global == MetalDTypeOverride::F16 { "f16" } else { "bf16" }
+        )
+        .into()),
+    }
+}
+
 /// An Apple GPU family (`MTLGPUFamilyApple<N>`): M1 is Apple7, M2 Apple8,
 /// M3 and M4 Apple9, M5 Apple10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1508,6 +1578,54 @@ mod tests {
         assert_eq!(MetalDTypeOverride::parse("int8"), None);
         assert_eq!(MetalDTypeOverride::Auto.dtype(), None);
         assert_eq!(MetalDTypeOverride::F16.dtype(), Some(DType::F16));
+    }
+
+    #[test]
+    fn metal_weight_only_f16_defaults_on_and_honours_f32_escape_hatches() {
+        let select = metal_weight_only_f16_selection;
+        let env = Some(("IZWI_PARAKEET_ASR_DTYPE", "f32"));
+
+        assert_eq!(
+            select(false, None, MetalDTypeOverride::Auto).dtype,
+            DType::F32
+        );
+        assert_eq!(
+            select(false, Some(("X", "f16")), MetalDTypeOverride::F16).dtype,
+            DType::F32
+        );
+
+        assert_eq!(
+            select(true, None, MetalDTypeOverride::Auto).dtype,
+            DType::F16
+        );
+        assert_eq!(
+            select(true, None, MetalDTypeOverride::F16).dtype,
+            DType::F16
+        );
+        assert_eq!(
+            select(true, None, MetalDTypeOverride::Bf16).dtype,
+            DType::F16
+        );
+        let global_f32 = select(true, None, MetalDTypeOverride::F32);
+        assert_eq!(global_f32.dtype, DType::F32);
+        assert!(global_f32.reason.contains("IZWI_METAL_DTYPE=f32"));
+
+        // The family override is more specific than the global one.
+        let family_f32 = select(true, env, MetalDTypeOverride::Auto);
+        assert_eq!(family_f32.dtype, DType::F32);
+        assert!(family_f32.reason.contains("IZWI_PARAKEET_ASR_DTYPE=f32"));
+        assert_eq!(
+            select(true, Some(("X", "fp16")), MetalDTypeOverride::F32).dtype,
+            DType::F16
+        );
+        // A value that is not a Metal weight precision is ignored, visibly.
+        let ignored = select(true, Some(("X", "bf16")), MetalDTypeOverride::Auto);
+        assert_eq!(ignored.dtype, DType::F16);
+        assert!(ignored.reason.contains("ignored"), "{}", ignored.reason);
+        assert_eq!(
+            select(true, Some(("X", " ")), MetalDTypeOverride::F32).dtype,
+            DType::F32
+        );
     }
 
     #[test]

@@ -157,20 +157,24 @@ impl NumericSelfCheckReport {
 /// normally from [`xorshift_tensor`]. An error from `probe` fails the check
 /// with that error as the reason; it is never propagated, so the caller can
 /// fall back to its reference representation.
-pub fn run_numeric_self_check<F>(
+pub fn run_numeric_self_check<F, E>(
     label: impl Into<Cow<'static, str>>,
     max_abs_limit: f32,
     probe: F,
 ) -> NumericSelfCheckReport
 where
-    F: FnOnce() -> Result<Vec<(String, Tensor)>>,
+    F: FnOnce() -> std::result::Result<Vec<(String, Tensor)>, E>,
+    E: std::fmt::Display,
 {
     let label = label.into();
-    let probed = probe().and_then(|outputs| {
+    let probed = probe().map_err(|err| err.to_string()).and_then(|outputs| {
         outputs
             .into_iter()
-            .map(|(name, tensor)| Ok(ProbedTensor::from_values(name, &host_f32(&tensor)?)))
-            .collect::<Result<Vec<_>>>()
+            .map(|(name, tensor)| {
+                let values = host_f32(&tensor).map_err(|err| err.to_string())?;
+                Ok(ProbedTensor::from_values(name, &values))
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()
     });
     let tensors = match probed {
         Ok(tensors) => tensors,
@@ -263,7 +267,7 @@ mod tests {
     fn self_check_passes_finite_in_range_outputs() {
         let report = run_numeric_self_check("probe", F16_SAFE_MAX_ABS, || {
             let x = xorshift_tensor(&[4, 8], 1, 2.0, &Device::Cpu)?;
-            Ok(vec![("x".into(), x.clone()), ("y".into(), (x * 100.0)?)])
+            Ok::<_, candle_core::Error>(vec![("x".into(), x.clone()), ("y".into(), (x * 100.0)?)])
         });
         assert!(report.passed, "{}", report.reason);
         assert_eq!(report.tensors.len(), 2);
@@ -277,19 +281,19 @@ mod tests {
         let tensor = |values: Vec<f32>| Tensor::new(values, &Device::Cpu);
 
         let nan = run_numeric_self_check("nan", F16_SAFE_MAX_ABS, || {
-            Ok(vec![("h".into(), tensor(vec![1.0, f32::NAN])?)])
+            Ok::<_, candle_core::Error>(vec![("h".into(), tensor(vec![1.0, f32::NAN])?)])
         });
         assert!(!nan.passed);
         assert!(nan.reason.contains("non-finite"), "{}", nan.reason);
         assert_eq!(nan.tensors[0].non_finite, 1);
 
         let inf = run_numeric_self_check("inf", F16_SAFE_MAX_ABS, || {
-            Ok(vec![("h".into(), tensor(vec![f32::INFINITY])?)])
+            Ok::<_, candle_core::Error>(vec![("h".into(), tensor(vec![f32::INFINITY])?)])
         });
         assert!(!inf.passed);
 
         let large = run_numeric_self_check("large", F16_SAFE_MAX_ABS, || {
-            Ok(vec![
+            Ok::<_, candle_core::Error>(vec![
                 ("ok".into(), tensor(vec![1.0])?),
                 ("big".into(), tensor(vec![-4.0e4])?),
             ])
@@ -303,7 +307,9 @@ mod tests {
         assert!(!error.passed);
         assert!(error.reason.contains("kernel refused"), "{}", error.reason);
 
-        let empty = run_numeric_self_check("empty", F16_SAFE_MAX_ABS, || Ok(Vec::new()));
+        let empty = run_numeric_self_check("empty", F16_SAFE_MAX_ABS, || {
+            Ok::<_, candle_core::Error>(Vec::new())
+        });
         assert!(!empty.passed);
     }
 }

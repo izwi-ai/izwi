@@ -17,10 +17,14 @@
 //! numbers. Candle's CPU `QTensor` op would quantize the activations to F16,
 //! so it is not used.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::{Conv1d, Linear};
+
+use super::numeric_check::{host_f32, relative_l2, xorshift_tensor};
 
 /// ggml's `mul_mm` reads the reduction dimension in blocks of 32 with no tail.
 const GGML_MUL_MM_K_BLOCK: usize = 32;
@@ -60,18 +64,26 @@ pub struct F16WeightLinear {
 
 impl F16WeightLinear {
     /// Converts a `[out, in]` weight (any float dtype, any device) to F16 on
-    /// the host and places it on `device`. `bias` stays F32 on `device`.
+    /// the host and uploads it to `device` once, at its exact size. `bias`
+    /// stays F32 on `device`.
     pub fn new(weight: &Tensor, bias: Option<&Tensor>, device: &Device) -> Result<Self> {
         let (out_features, in_features) = weight.dims2()?;
-        let host = weight.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let host = weight.to_device(&Device::Cpu)?.to_dtype(DType::F16)?;
         let weight = if device.is_metal() && in_features % GGML_MUL_MM_K_BLOCK == 0 {
-            F16Weight::Ggml(Arc::new(QTensor::quantize_onto(
-                &host,
-                GgmlDType::F16,
-                device,
+            // One exact-size upload of the host F16 bytes (`quantize_onto`
+            // would first allocate and clear a pooled device buffer).
+            let values = host.flatten_all()?.to_vec1::<half::f16>()?;
+            let mut bytes = Vec::with_capacity(values.len() * DType::F16.size_in_bytes());
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let storage = QStorage::from_data(Cow::Owned(bytes), device, GgmlDType::F16)?;
+            F16Weight::Ggml(Arc::new(QTensor::new(
+                storage,
+                (out_features, in_features),
             )?))
         } else {
-            F16Weight::Dense(host.to_dtype(DType::F16)?.to_device(device)?)
+            F16Weight::Dense(host.to_device(device)?)
         };
         let bias = bias
             .map(|bias| bias.to_dtype(DType::F32)?.to_device(device))
@@ -171,11 +183,140 @@ impl Module for F16WeightLinear {
     }
 }
 
+/// The largest relative L2 an F16 projection may differ from its F32
+/// original by in [`F16WeightLinear::check_against`]. F16 rounding gives
+/// about 3e-4 on unstructured input; a wrong transform gives order 1.
+pub const F16_PROJECTION_MAX_RELATIVE_L2: f64 = 1e-2;
+
+impl F16WeightLinear {
+    /// Compares this layer with the F32 `[out, in]` weight it was built from
+    /// on `rows` xorshift rows, on this layer's device, and returns the
+    /// relative L2 error. A self-check that compares only the converted
+    /// weights with themselves cannot see a bad conversion.
+    pub fn check_against(
+        &self,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        rows: usize,
+    ) -> Result<f64> {
+        let device = match &self.weight {
+            F16Weight::Ggml(weight) => weight.device(),
+            F16Weight::Dense(weight) => weight.device().clone(),
+        };
+        let x = xorshift_tensor(&[rows, self.in_features], 0x5EED, 1.0, &device)?;
+        let reference = Linear::new(
+            weight.to_device(&Device::Cpu)?.to_dtype(DType::F32)?,
+            bias.map(|bias| bias.to_device(&Device::Cpu)?.to_dtype(DType::F32))
+                .transpose()?,
+        )
+        .forward(&x.to_device(&Device::Cpu)?)?;
+        Ok(relative_l2(
+            &host_f32(&self.forward(&x)?)?,
+            &host_f32(&reference)?,
+        ))
+    }
+}
+
+/// A projection held dense (Candle's `Linear`, any dtype) or weight-only F16.
+#[derive(Debug, Clone)]
+pub enum ProjectionLinear {
+    Dense(Linear),
+    F16(F16WeightLinear),
+}
+
+impl ProjectionLinear {
+    /// Keeps `linear` dense, or converts it to weight-only F16 on `f16_device`.
+    pub fn new(linear: Linear, f16_device: Option<&Device>) -> Result<Self> {
+        match f16_device {
+            None => Ok(Self::Dense(linear)),
+            Some(device) => Ok(Self::F16(F16WeightLinear::new(
+                linear.weight(),
+                linear.bias(),
+                device,
+            )?)),
+        }
+    }
+
+    pub fn as_f16(&self) -> Option<&F16WeightLinear> {
+        match self {
+            Self::Dense(_) => None,
+            Self::F16(linear) => Some(linear),
+        }
+    }
+}
+
+impl From<Linear> for ProjectionLinear {
+    fn from(linear: Linear) -> Self {
+        Self::Dense(linear)
+    }
+}
+
+impl Module for ProjectionLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(linear) => linear.forward(x),
+            Self::F16(linear) => linear.forward(x),
+        }
+    }
+}
+
+/// A pointwise (kernel-size 1) `Conv1d` over `[B, C, T]`, held dense or as a
+/// weight-only F16 projection over the channels.
+#[derive(Debug, Clone)]
+pub enum PointwiseConv1d {
+    Dense(Conv1d),
+    F16(F16WeightLinear),
+}
+
+impl PointwiseConv1d {
+    /// Keeps `conv` dense, or converts it to weight-only F16 on `f16_device`.
+    /// Only a plain pointwise convolution (kernel 1, stride 1, no padding,
+    /// dilation or groups) converts.
+    pub fn new(conv: Conv1d, f16_device: Option<&Device>) -> Result<Self> {
+        let Some(device) = f16_device else {
+            return Ok(Self::Dense(conv));
+        };
+        let config = conv.config();
+        if config.padding != 0 || config.stride != 1 || config.dilation != 1 || config.groups != 1 {
+            candle_core::bail!("only a plain pointwise conv1d can load as an F16 projection");
+        }
+        Ok(Self::F16(F16WeightLinear::from_pointwise_conv1d(
+            conv.weight(),
+            conv.bias(),
+            device,
+        )?))
+    }
+
+    pub fn as_f16(&self) -> Option<&F16WeightLinear> {
+        match self {
+            Self::Dense(_) => None,
+            Self::F16(linear) => Some(linear),
+        }
+    }
+}
+
+impl From<Conv1d> for PointwiseConv1d {
+    fn from(conv: Conv1d) -> Self {
+        Self::Dense(conv)
+    }
+}
+
+impl Module for PointwiseConv1d {
+    /// `x` is `[B, C_in, T]`; the output is `[B, C_out, T]` (a transposed
+    /// view on the F16 path).
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(conv) => conv.forward(x),
+            Self::F16(linear) => linear.forward(&x.transpose(1, 2)?)?.transpose(1, 2),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::numeric_check::{host_f32, max_abs_diff, relative_l2, xorshift_tensor};
-    use candle_nn::Linear;
+    use crate::kernels::numeric_check::max_abs_diff;
+    use candle_nn::Conv1dConfig;
 
     /// A dense F32 reference and the F16 layer built from the same weights.
     fn layers(
@@ -264,6 +405,53 @@ mod tests {
         let (_, f16) = layers(8, 32, false, &Device::Cpu);
         let x = xorshift_tensor(&[2, 16], 1, 1.0, &Device::Cpu).unwrap();
         assert!(f16.forward(&x).is_err());
+    }
+
+    #[test]
+    fn check_against_measures_the_conversion_against_the_original() {
+        let (dense, f16) = layers(48, 64, true, &Device::Cpu);
+        let rel = f16.check_against(dense.weight(), dense.bias(), 8).unwrap();
+        assert!(rel > 0.0 && rel < 1e-3, "{rel:e}");
+        // A transform that lost the weights is far outside the bound.
+        let wrong = (dense.weight() * -1.0).unwrap();
+        let rel = f16.check_against(&wrong, dense.bias(), 8).unwrap();
+        assert!(rel > F16_PROJECTION_MAX_RELATIVE_L2, "{rel:e}");
+    }
+
+    #[test]
+    fn projection_wrappers_match_their_dense_forms() {
+        let device = Device::Cpu;
+        let (dense, _) = layers(16, 32, true, &device);
+        let x = xorshift_tensor(&[2, 5, 32], 4, 1.0, &device).unwrap();
+        let reference = host_f32(&dense.forward(&x).unwrap()).unwrap();
+        let kept = ProjectionLinear::new(dense.clone(), None).unwrap();
+        assert!(kept.as_f16().is_none());
+        assert_eq!(host_f32(&kept.forward(&x).unwrap()).unwrap(), reference);
+        let f16 = ProjectionLinear::new(dense.clone(), Some(&device)).unwrap();
+        assert!(f16.as_f16().is_some());
+        let rel = relative_l2(&host_f32(&f16.forward(&x).unwrap()).unwrap(), &reference);
+        assert!(rel > 0.0 && rel < 1e-3, "{rel:e}");
+
+        let weight = xorshift_tensor(&[24, 32, 1], 6, 0.2, &device).unwrap();
+        let conv = Conv1d::new(weight, None, Conv1dConfig::default());
+        let x = xorshift_tensor(&[2, 32, 7], 7, 1.0, &device).unwrap();
+        let reference = conv.forward(&x).unwrap();
+        let pointwise = PointwiseConv1d::new(conv.clone(), Some(&device)).unwrap();
+        let y = pointwise.forward(&x).unwrap();
+        assert_eq!(y.dims(), reference.dims());
+        let rel = relative_l2(&host_f32(&y).unwrap(), &host_f32(&reference).unwrap());
+        assert!(rel > 0.0 && rel < 1e-3, "{rel:e}");
+        assert!(PointwiseConv1d::new(conv, None).unwrap().as_f16().is_none());
+
+        let grouped = Conv1d::new(
+            xorshift_tensor(&[8, 4, 1], 8, 0.2, &device).unwrap(),
+            None,
+            Conv1dConfig {
+                groups: 2,
+                ..Default::default()
+            },
+        );
+        assert!(PointwiseConv1d::new(grouped, Some(&device)).is_err());
     }
 
     /// The Metal layer must run ggml's f16 x f32 kernel (not a dense
