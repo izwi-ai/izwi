@@ -66,9 +66,14 @@ impl ResolvedFishServingCapacity {
         let fast_head = fast
             .head_dim
             .unwrap_or(fast.hidden_size / fast.num_attention_heads.max(1));
-        // Price packed dense buffers plus a conservative full-context attention
-        // score/mask envelope. Provider kernels may use less, never more than
-        // the published bound. Bound aggregate prefill tokens, not just rows.
+        // Price packed dense buffers, the logits row and the paged-prefill
+        // attention working set. The slow stack prefills through the paged
+        // kernels (`paged_prefill` on every backend), which keep online-softmax
+        // state per query and head, never a query-by-context score matrix, so
+        // a token costs its query, output and partial vectors whatever the
+        // context (FSH-6: pricing full-context scores per token resolved the
+        // prefill chunk to 29 tokens). Bound aggregate prefill tokens, not just
+        // rows.
         let hidden_buffers = slow
             .hidden_size
             .checked_mul(16)
@@ -80,7 +85,7 @@ impl ResolvedFishServingCapacity {
                 )
             })
             .ok_or_else(|| Error::ModelLoadError("Fish prefill geometry overflow".into()))?;
-        let attention = checked_product(&[4, slow.num_attention_heads, effective_context, 4])?;
+        let attention = checked_product(&[4, slow.num_attention_heads, slow_head + 2, 4])?;
         let dense = checked_product(&[4, hidden_buffers])?;
         profile.prefill_workspace_per_token = attention
             .checked_add(dense)
@@ -90,8 +95,15 @@ impl ResolvedFishServingCapacity {
         profile.ar_workspace_per_row = profile
             .ar_workspace_per_row
             .max(profile.prefill_workspace_per_token);
-        profile.prefill_tokens =
-            (profile.ar_workspace_per_row / profile.prefill_workspace_per_token).clamp(1, 512);
+        // Metal splits long contexts across partitions only for tiny query
+        // batches (at most 64 query-head workgroups); their partials are a
+        // fixed charge per prefill pass.
+        let split_partials =
+            checked_product(&[64, effective_context.div_ceil(512), slow_head + 2, 4])?;
+        let chunk_budget = profile.ar_workspace_per_row.saturating_sub(split_partials);
+        profile.prefill_tokens = (chunk_budget / profile.prefill_workspace_per_token)
+            .clamp(1, 512)
+            .min(effective_context as u64);
         // Scalar tensor execution can still interleave multiple independently
         // retained requests. Unknown memory leaves final fitting to the existing
         // state authority, without promoting native tensor width.
@@ -200,8 +212,14 @@ mod tests {
         let shorter =
             ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
                 .unwrap();
-        assert!(shorter.prefill_workspace_per_token < native.prefill_workspace_per_token);
+        // Paged prefill works per query, so a token costs the same at any
+        // context; the shorter context still frees KV for more rows.
+        assert_eq!(
+            shorter.prefill_workspace_per_token,
+            native.prefill_workspace_per_token
+        );
         assert!(shorter.ar_rows >= native.ar_rows);
+        assert!(shorter.prefill_tokens <= 32);
     }
 
     #[test]
@@ -240,6 +258,32 @@ mod tests {
                 <= capacity.ar_workspace_per_row
         );
         assert!(capacity.prefill_tokens < model.config().max_seq_len as u64);
+    }
+
+    /// FSH-6: pricing a full-context score matrix per prompt token resolved
+    /// the slow-stack prefill chunk to 29 tokens, so a prompt took about 25
+    /// full passes. Priced as the paged kernels run, a typical prompt
+    /// prefills in a pass or two, and the chunk still fits the row's
+    /// workspace.
+    #[test]
+    fn prefill_chunk_follows_the_paged_kernel_working_set() {
+        let model = FishS2TtsModel::for_test();
+        let capacity = ResolvedFishServingCapacity::resolve(
+            model.config(),
+            &EngineConfig::default(),
+            Some(64 << 30),
+            false,
+        )
+        .unwrap();
+        assert!(
+            capacity.prefill_tokens >= 256,
+            "{}",
+            capacity.prefill_tokens
+        );
+        assert!(
+            capacity.prefill_tokens * capacity.prefill_workspace_per_token
+                <= capacity.ar_workspace_per_row
+        );
     }
 
     #[test]
