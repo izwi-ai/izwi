@@ -29,7 +29,6 @@ pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::VarBuilder;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -63,6 +62,7 @@ use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::state::exact_stage_scratch_domain;
+use crate::models::shared::weights::staged::metal_staged_safetensors;
 
 const NEWLINE_TOKEN_ID: u32 = 198;
 const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
@@ -1583,11 +1583,7 @@ fn load_speaker_encoder(
         return Ok(None);
     };
     let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(
-            std::slice::from_ref(&weights_path),
-            DType::F32,
-            device,
-        )?
+        metal_staged_safetensors(std::slice::from_ref(&weights_path), DType::F32, device)?
     };
     if !vb.contains_tensor("speaker_encoder.fc.weight") {
         return Ok(None);
@@ -1753,8 +1749,12 @@ impl Qwen3TtsModel {
 
         // Load model weights
         let weights_path = model_dir.join("model.safetensors");
+        // On Metal each tensor is cast on the host and uploaded at its exact
+        // size, with a device synchronization every 256 MiB of uploads, so
+        // the F32 talker neither rounds up to powers of two nor keeps every
+        // BF16 upload alive until the load fence.
         let talker_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
+            metal_staged_safetensors(
                 std::slice::from_ref(&weights_path),
                 dtype_plan.talker,
                 &device.device,
@@ -1764,7 +1764,7 @@ impl Qwen3TtsModel {
             talker_vb.clone()
         } else {
             unsafe {
-                VarBuilder::from_mmaped_safetensors(
+                metal_staged_safetensors(
                     std::slice::from_ref(&weights_path),
                     dtype_plan.code_predictor,
                     &device.device,

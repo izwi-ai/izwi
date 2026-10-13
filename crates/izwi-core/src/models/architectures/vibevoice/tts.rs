@@ -48,7 +48,8 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::telemetry::{
     snapshot as kernel_telemetry_snapshot, KernelPathTelemetrySnapshot,
 };
-use crate::models::shared::weights::gguf::load_model_weights;
+use crate::models::shared::weights::gguf::safetensors_weight_files;
+use crate::models::shared::weights::staged::metal_staged_safetensors;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
 const SPEECH_TOKEN_COMPRESS_RATIO: usize = 3_200;
@@ -363,7 +364,14 @@ impl VibeVoiceTtsModel {
             Error::ModelLoadError("VibeVoice TTS config missing diffusion head".to_string())
         })?;
         let dtype = vibevoice_tts_weight_dtype(&device)?;
-        let vb = load_model_weights(model_dir, dtype, &device.device)?;
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`); Candle's mapped backend elsewhere.
+        let vb = unsafe {
+            metal_staged_safetensors(&safetensors_weight_files(model_dir)?, dtype, &device.device)
+        }
+        .map_err(|error| {
+            Error::ModelLoadError(format!("Failed to load VibeVoice TTS weights: {error}"))
+        })?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;
         let acoustic_tokenizer = VibeVoiceAcousticTokenizer::load(

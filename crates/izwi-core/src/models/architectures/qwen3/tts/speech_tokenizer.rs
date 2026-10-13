@@ -1649,8 +1649,15 @@ impl SpeechTokenizerDecoder {
             speech_cfg.encoder_config = None;
         }
         let weights_path = model_dir.join("model.safetensors");
-        let root_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`).
+        let root_vb = unsafe {
+            crate::models::shared::weights::staged::metal_staged_safetensors(
+                &[weights_path],
+                dtype,
+                &device,
+            )?
+        };
         Self::from_config(speech_cfg, root_vb, device)
     }
 

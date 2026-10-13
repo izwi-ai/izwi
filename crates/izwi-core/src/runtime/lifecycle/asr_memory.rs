@@ -343,7 +343,7 @@ impl Ledger {
     /// A ledger for a loader that reads through
     /// `staged::metal_staged_safetensors`, which is Candle's own backend
     /// except on Metal.
-    fn staged(backend: BackendKind) -> Self {
+    pub(super) fn staged(backend: BackendKind) -> Self {
         let mut ledger = Self::new(backend);
         if ledger.metal() {
             ledger.sync_interval = Some(METAL_LOAD_SYNC_INTERVAL_BYTES);
@@ -1483,6 +1483,7 @@ fn vibevoice_plan(
             == DType::F16,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
         tts: false,
+        staged: false,
     };
     price_vibevoice(&files, backend, &load).map(Some)
 }
@@ -1505,6 +1506,8 @@ pub(super) struct VibeVoiceLoad {
     /// The TTS model, which loads the acoustic decoder and the prediction
     /// head the ASR model skips.
     tts: bool,
+    /// The loader reads through `staged::metal_staged_safetensors`.
+    staged: bool,
 }
 
 impl VibeVoiceLoad {
@@ -1516,6 +1519,7 @@ impl VibeVoiceLoad {
             f16_tokenizer_projections: false,
             fused_projections,
             tts: true,
+            staged: true,
         }
     }
 }
@@ -1536,7 +1540,11 @@ pub(super) fn price_vibevoice(
     let dtype = load.lm_dtype;
     let fused_projections = load.fused_projections;
     let tensors = by_name(files);
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = if load.staged {
+        Ledger::staged(backend)
+    } else {
+        Ledger::new(backend)
+    };
     let mut grouped = BTreeSet::new();
     if fused_projections {
         for name in tensors.keys() {
@@ -2000,6 +2008,7 @@ pub(super) mod tests {
                 None,
             ),
             tts: false,
+            staged: false,
         }
     }
 

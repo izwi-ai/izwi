@@ -102,12 +102,12 @@ fn qwen3_tts_plan(
     price_qwen3_tts(&files, backend, &layout).map(Some)
 }
 
-/// Qwen3-TTS (`qwen3/tts/mod.rs`): every tensor through a `VarBuilder` over
-/// the mapped checkpoint, the talker and code predictor at their dtypes, the
-/// ECAPA speaker encoder at F32 (voice clone only) and the speech tokenizer
-/// at its dtype, its reference encoder for voice clone only. CustomVoice and
-/// Base load F32 everywhere, so a BF16 checkpoint is cast on the device
-/// (power-of-two buffers on Metal).
+/// Qwen3-TTS (`qwen3/tts/mod.rs`): every tensor through
+/// `staged::metal_staged_safetensors`, the talker and code predictor at
+/// their dtypes, the ECAPA speaker encoder at F32 (voice clone only) and the
+/// speech tokenizer at its dtype, its reference encoder for voice clone
+/// only. On Metal the BF16 checkpoint is cast to F32 on the host and
+/// uploaded at its exact size.
 fn price_qwen3_tts(
     files: &[CensusFile],
     backend: BackendKind,
@@ -118,7 +118,7 @@ fn price_qwen3_tts(
             "Qwen3-TTS residency plan needs the model and speech-tokenizer censuses".into(),
         ));
     };
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = Ledger::staged(backend);
     for tensor in &model.tensors {
         let name = tensor.name.as_str();
         let dtype = if name.starts_with("talker.code_predictor.") {
@@ -306,17 +306,18 @@ mod tests {
 
     /// Report 08 table B, resident weights per backend (CPU, Metal as
     /// allocated, CUDA), with the load peak each must stay under:
-    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU and Metal; Metal casts
-    ///   each BF16 tensor on the device into a power-of-two buffer (the
-    ///   1.19 GiB text embedding takes 2 GiB), so 0.6B Base is 4.04 GiB
-    ///   exact and 5.29 GiB allocated, as the report measured. CUDA keeps
-    ///   the talker and predictor BF16 beside an F32 speech tokenizer.
-    ///   CustomVoice skips the speech-tokenizer encoder (0.24 GiB) it never
-    ///   runs.
+    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU and Metal: 0.6B Base is
+    ///   4.04 GiB, as the report measured. The staged loader casts on the
+    ///   host on Metal, so the 5.29 GiB the report saw from device casts
+    ///   into power-of-two buffers (the 1.19 GiB text embedding took 2 GiB)
+    ///   is gone. CUDA keeps the talker and predictor BF16 beside an F32
+    ///   speech tokenizer. CustomVoice skips the speech-tokenizer encoder
+    ///   (0.24 GiB) it never runs.
     /// - Kokoro is its 0.305 GiB F32 checkpoint read from the nested
     ///   `.pth`, not the 2 GiB catalog figure.
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
-    ///   CUDA (5.04 GiB exact).
+    ///   CUDA (5.04 GiB exact); on Metal only its fused LM projections are
+    ///   device-written (5.41 GiB allocated, from 5.86).
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
@@ -332,20 +333,20 @@ mod tests {
             (
                 "Qwen3-TTS-0.6B-CustomVoice",
                 Box::new(|b| qwen(&qwen06_cv, false, b)),
-                [3.80, 5.04, 2.11],
+                [3.80, 3.80, 2.11],
             ),
             (
                 "Qwen3-TTS-0.6B-Base",
                 Box::new(|b| qwen(&qwen06_base, true, b)),
-                [4.04, 5.29, 2.36],
+                [4.04, 4.04, 2.36],
             ),
             (
                 "Qwen3-TTS-1.7B-CustomVoice",
                 Box::new(|b| qwen(&qwen17_cv, false, b)),
-                [7.57, 9.79, 4.00],
+                [7.57, 7.57, 4.00],
             ),
             ("Kokoro-82M", Box::new(kokoro), [0.30, 0.30, 0.30]),
-            ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.81, 5.04]),
+            ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.41, 5.04]),
         ];
         for (label, plan, [cpu, metal, cuda]) in rows {
             let plans = BACKENDS.map(&plan);
