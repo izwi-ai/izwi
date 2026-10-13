@@ -988,6 +988,39 @@ impl ResourceAuthority {
                     self.provider.configured_budget(),
                     self.domain_policy,
                 ));
+                if owner.class == ReservationClass::Request {
+                    // A request's working set must exist when it runs, so it
+                    // is also checked against the operating system's live
+                    // sample (Metal working set, CPU MemAvailable or cgroup),
+                    // less every unallocated claim, not only the ledger:
+                    // otherwise memory used elsewhere surfaces as a Metal OOM
+                    // or swap in the middle of the request (ADM-4).
+                    let physical = self.normalized_physical_snapshot();
+                    if matches!(
+                        physical.source,
+                        CapacitySource::OperatingSystem | CapacitySource::MetalWorkingSet
+                    ) {
+                        let pending = resources.positive_growth_over(materialized)?;
+                        let existing_pending = state.pending_resources()?;
+                        let live_claim = existing_pending.checked_add(pending)?;
+                        let live = physical.available;
+                        let exceeds = |claim: ResourceAmount, available: ResourceAmount| {
+                            matches!(
+                                (claim, available),
+                                (ResourceAmount::Known(claim), ResourceAmount::Known(available))
+                                    if claim > available
+                            )
+                        };
+                        if exceeds(live_claim.host_bytes, live.host_bytes)
+                            || exceeds(live_claim.unified_bytes, live.unified_bytes)
+                        {
+                            return Err(Error::Overloaded(format!(
+                                "insufficient live memory for a request: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={live:?}, live_by_class={:?}",
+                                state.pending_by_class(None)?
+                            )));
+                        }
+                    }
+                }
                 state.ledger.reserve(resources)?
             }
         };
@@ -1951,6 +1984,59 @@ mod tests {
         );
         authority.poison("simulated backend failure");
         assert!(authority.state_fit_headroom_bytes(BackendKind::Cpu).is_err());
+    }
+
+    /// Advisory authorities still check a request against the operating
+    /// system's live sample (less every unallocated claim); model and state
+    /// reservations, and test-source samples, keep the ledger-only contract.
+    #[test]
+    fn advisory_request_reservations_check_live_memory() {
+        let live = |source| {
+            Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                Arc::new(UnifiedProvider {
+                    capacity: 1_000,
+                    available: 100,
+                    source,
+                }),
+            ))
+        };
+        for source in [
+            CapacitySource::OperatingSystem,
+            CapacitySource::MetalWorkingSet,
+        ] {
+            let authority = live(source);
+            let request = |bytes| {
+                authority.reserve(
+                    ReservationOwner::new(ReservationClass::Request, "request"),
+                    unified_bytes(bytes),
+                )
+            };
+            assert!(matches!(request(150), Err(Error::Overloaded(_))));
+            let first = request(60).unwrap();
+            // 60 pending + 50 > 100 live.
+            assert!(matches!(request(50), Err(Error::Overloaded(_))));
+            // Bytes already allocated (the decoded input) are not pending.
+            let observed = authority
+                .reserve_with_initial_materialized(
+                    ReservationOwner::new(ReservationClass::Request, "observed"),
+                    unified_bytes(90),
+                    unified_bytes(60),
+                )
+                .unwrap();
+            drop((first, observed));
+            let model = authority.reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(500),
+            );
+            assert!(model.is_ok(), "{source:?}");
+        }
+        let test_source = live(CapacitySource::Test);
+        assert!(test_source
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                unified_bytes(150),
+            )
+            .is_ok());
     }
 
     #[derive(Debug)]

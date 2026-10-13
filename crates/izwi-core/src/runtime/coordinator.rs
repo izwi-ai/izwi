@@ -2516,6 +2516,19 @@ struct DeviceCapacityProbe {
 }
 
 impl DeviceCapacityProbe {
+    /// Without an explicit budget the CPU advisory ledger admitted against
+    /// u64::MAX, so no reservation could ever fail and an oversized load or
+    /// request surfaced as swap or the OOM killer. Bound it by physical memory
+    /// (MemTotal or the cgroup limit on Linux, hw.memsize on macOS) with the
+    /// Metal default's fraction; an operator budget wins unchanged.
+    fn derive_default_cpu_budget(&mut self) {
+        if self.backend == BackendKind::Cpu && self.configured_cap.is_none() {
+            self.configured_cap = self
+                .observed_capacity()
+                .map(|(total, _, _)| metal_default_budget_from_working_set(total));
+        }
+    }
+
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
         Self::apply_optional_cap(self.configured_cap, total, available)
     }
@@ -2657,13 +2670,14 @@ impl DeviceCapacityProvider {
         } else {
             None
         };
-        let probe = DeviceCapacityProbe {
+        let mut probe = DeviceCapacityProbe {
             backend,
             device: Some(device),
             configured_cap,
             configured_host_cap,
             test_capacity: cfg!(test).then_some(1024 * 1024 * 1024 * 1024),
         };
+        probe.derive_default_cpu_budget();
         Self::from_probe(probe)
     }
 
@@ -2917,9 +2931,10 @@ fn metal_allocated_bytes(_device: &DeviceProfile) -> Option<u64> {
 }
 
 /// Default Metal advisory-ledger budget as a fraction of the probed working
-/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset. The remaining fraction
-/// absorbs command buffers, staging copies, and allocator metadata that no
-/// per-model static estimate tracks.
+/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset, and the CPU budget as
+/// the same fraction of physical memory when `IZWI_CPU_MEMORY_BUDGET_BYTES` is
+/// unset. The remaining fraction absorbs command buffers, staging copies, and
+/// allocator metadata that no per-model static estimate tracks.
 const METAL_DEFAULT_BUDGET_NUMERATOR: u64 = 9;
 const METAL_DEFAULT_BUDGET_DENOMINATOR: u64 = 10;
 
@@ -3839,6 +3854,31 @@ Pages free: 10.\n";
             metal_default_budget_from_working_set(u64::MAX),
             u64::MAX / 10 * 9
         );
+    }
+
+    /// CPU's advisory ledger is bounded by physical memory (the probe's total,
+    /// here a fixed test capacity) unless the operator sets a budget.
+    #[test]
+    fn cpu_ledger_budget_is_finite_and_respects_the_operator_budget() {
+        let probe = |configured_cap| DeviceCapacityProbe {
+            backend: BackendKind::Cpu,
+            device: None,
+            configured_cap,
+            configured_host_cap: None,
+            test_capacity: Some(1000),
+        };
+        let mut derived = probe(None);
+        derived.derive_default_cpu_budget();
+        assert_eq!(derived.configured_cap, Some(900));
+        let mut configured = probe(Some(4096));
+        configured.derive_default_cpu_budget();
+        assert_eq!(configured.configured_cap, Some(4096));
+        let mut metal = DeviceCapacityProbe {
+            backend: BackendKind::Metal,
+            ..probe(None)
+        };
+        metal.derive_default_cpu_budget();
+        assert_eq!(metal.configured_cap, None);
     }
 
     #[test]
