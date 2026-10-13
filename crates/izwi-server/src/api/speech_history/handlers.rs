@@ -1622,6 +1622,12 @@ async fn execute_batch_tts_stage(
                         .await;
                 }
             }
+            // An invalid request fails the same way on every attempt.
+            if err.status.is_client_error() {
+                return Err(
+                    crate::batch_runtime::worker::DeterministicStageFailure(err.message).into(),
+                );
+            }
             anyhow::bail!("{}", err.message);
         }
     };
