@@ -1788,7 +1788,9 @@ fn encoder_valid_key_mask(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let mut data = Vec::with_capacity(valid_lengths.len() * nblocks * context * context);
+    // F32 on the host: an unannotated float literal is F64, which Candle's
+    // Metal backend cannot cast.
+    let mut data = Vec::<f32>::with_capacity(valid_lengths.len() * nblocks * context * context);
     for valid in valid_lengths {
         for block in 0..nblocks {
             for _query in 0..context {
@@ -5536,5 +5538,23 @@ mod tests {
             &["<stop>".to_string()]
         ));
         assert_eq!(text, "hello");
+    }
+
+    /// The batched encoder's key mask is built in F32: an F64 host buffer
+    /// cannot be cast on Metal, which failed every multi-row Metal batch.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_encoder_valid_key_mask_builds_on_the_gpu() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let mask = encoder_valid_key_mask(&[1, 3], 2, 2, &device, DType::F32).unwrap();
+        assert_eq!(mask.dims(), &[2, 2, 1, 2, 2]);
+        let values = mask.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Row 0 keeps key 0 of block 0; row 1 keeps keys 0..3.
+        assert_eq!(&values[..4], &[0.0, -1e4, 0.0, -1e4]);
+        assert_eq!(&values[8..12], &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[12..], &[0.0, -1e4, 0.0, -1e4]);
     }
 }
