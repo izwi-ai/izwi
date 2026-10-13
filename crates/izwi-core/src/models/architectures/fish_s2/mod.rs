@@ -299,6 +299,13 @@ impl FishS2TtsModel {
         ))
     }
 
+    /// Bytes of one retained state element at the precision the model runs.
+    pub(crate) fn state_element_bytes(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map_or(4, |runtime| runtime.dtype.size_in_bytes())
+    }
+
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],

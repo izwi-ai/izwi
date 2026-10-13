@@ -3527,6 +3527,7 @@ impl ModelLifecycleController {
                 };
                 let capacity = crate::runtime::fish_capacity::ResolvedFishServingCapacity::resolve(
                     model.config(), &fish_limits, headroom, native_batching,
+                    model.state_element_bytes(),
                 )?;
                 tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
                 bundle_draft.seal_fish_capacity(capacity.clone())?;

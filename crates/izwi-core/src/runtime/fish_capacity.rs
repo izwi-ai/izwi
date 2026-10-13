@@ -17,6 +17,22 @@ pub(crate) struct ResolvedFishServingCapacity {
     pub native_batching: bool,
 }
 
+/// Tokens one Fish request holds in the slow stack's retained state: a full
+/// reference (the 30 s reference limit at 21.5 frames per second), a
+/// rendered text segment, and the explicit output-frame cap. Rows are
+/// priced at this envelope, not at the native 32,768-token context, which
+/// stays a per-request admission bound (FSH-2).
+fn fish_request_tokens() -> usize {
+    let reference_frames = (crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS
+        as f32
+        * crate::model::ModelVariant::FISH_S2_PRO_FRAME_RATE_HZ)
+        .ceil() as usize;
+    const TEXT_SEGMENT_TOKENS: usize = 1_024;
+    reference_frames
+        + TEXT_SEGMENT_TOKENS
+        + crate::model::ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES
+}
+
 impl ResolvedFishServingCapacity {
     pub(crate) fn scalar() -> Result<Self> {
         Ok(Self {
@@ -36,11 +52,14 @@ impl ResolvedFishServingCapacity {
         })
     }
 
+    /// `kv_element_bytes`: one retained KV element at the loaded precision
+    /// (2 for F16/BF16, 4 for F32, including a load-time F32 fallback).
     pub(crate) fn resolve(
         model: &FishS2Config,
         config: &EngineConfig,
         headroom: Option<u64>,
         native_batching: bool,
+        kv_element_bytes: usize,
     ) -> Result<Self> {
         let mut profile = Self::scalar()?;
         profile.planning_headroom_bytes = headroom;
@@ -124,34 +143,56 @@ impl ResolvedFishServingCapacity {
                     .streaming_history_bound_bytes()?,
             )
             .ok_or_else(|| Error::ModelLoadError("Fish codec packing workspace overflow".into()))?;
+        // One request's retained slow KV at the loaded precision (FSH-2).
         let slow_bytes = checked_product(&[
             2,
-            4,
+            kv_element_bytes.max(1),
             slow.num_hidden_layers,
             slow.num_key_value_heads,
             slow_head,
-            effective_context,
+            effective_context.min(fish_request_tokens()),
         ])?;
         let fast_bytes = checked_product(&[
             2,
-            4,
+            kv_element_bytes.max(1),
             fast.num_hidden_layers,
             fast.num_key_value_heads,
             fast_head,
             model.num_codebooks,
         ])?;
-        // Both public capabilities have independent invocation banks. Price
-        // prefill+decode scratch and fast state for each, plus codec candidates.
+        // The slow state is retained once and shared by both public
+        // capabilities; each has its own invocation bank, so price its
+        // prefill+decode scratch and fast state twice, plus codec candidates.
         let row_bytes = slow_bytes
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(fast_bytes.checked_mul(2)?))
+            .checked_add(
+                fast_bytes.checked_mul(2).ok_or_else(|| {
+                    Error::ModelLoadError("Fish serving row budget overflow".into())
+                })?,
+            )
             .and_then(|bytes| bytes.checked_add(profile.ar_workspace_per_row.checked_mul(4)?))
             .and_then(|bytes| bytes.checked_add(profile.codec_workspace_per_row.checked_mul(4)?))
             .ok_or_else(|| Error::ModelLoadError("Fish serving row budget overflow".into()))?;
-        let fixed_preparation =
-            crate::models::architectures::fish_s2::codec::maximum_preparation_workspace_bytes()?
-                .checked_mul(2)
+        // Reference preparation for the longest reference a request may
+        // carry (the 30 s reference limit, at the highest accepted rate), not
+        // the codec's 4,096-frame ceiling (FSH-2: 2 x 39 GB).
+        let reference_rate =
+            crate::models::architectures::fish_s2::FishS2DacConfig::MAX_REFERENCE_SAMPLE_RATE;
+        let reference_samples =
+            usize::try_from(crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS)
+                .ok()
+                .and_then(|secs| secs.checked_mul(reference_rate as usize))
                 .ok_or_else(|| Error::ModelLoadError("Fish preparation budget overflow".into()))?;
+        let fixed_preparation =
+            crate::models::architectures::fish_s2::codec::preparation_workspace_bytes(
+                reference_samples,
+                reference_rate,
+            )?
+            .min(
+                crate::models::architectures::fish_s2::codec::maximum_preparation_workspace_bytes(
+                )?,
+            )
+            .checked_mul(2)
+            .ok_or_else(|| Error::ModelLoadError("Fish preparation budget overflow".into()))?;
         let available = headroom.unwrap_or(0);
         // Keep 20% untouched for allocator/transient uncertainty. The resource
         // authority still performs exact retained/invocation allocation and admission.
@@ -194,7 +235,7 @@ mod tests {
         let config = EngineConfig::default();
         for (memory, enabled) in [(None, true), (Some(u64::MAX / 2), false)] {
             let profile =
-                ResolvedFishServingCapacity::resolve(model.config(), &config, memory, enabled)
+                ResolvedFishServingCapacity::resolve(model.config(), &config, memory, enabled, 4)
                     .unwrap();
             assert_eq!(profile.ar_rows, 1);
             assert!(!profile.native_batching);
@@ -206,11 +247,11 @@ mod tests {
         let model = FishS2TtsModel::for_test();
         let mut config = EngineConfig::default();
         let native =
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         config.max_sequence_length = crate::config::ContextLengthPreference::explicit(32).unwrap();
         let shorter =
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         // Paged prefill works per query, so a token costs the same at any
         // context; the shorter context still frees KV for more rows.
@@ -232,7 +273,7 @@ mod tests {
         };
         for memory in [None, Some(256 << 30)] {
             let profile =
-                ResolvedFishServingCapacity::resolve(model.config(), &config, memory, false)
+                ResolvedFishServingCapacity::resolve(model.config(), &config, memory, false, 4)
                     .unwrap();
             assert_eq!(profile.ar_rows, 1);
             assert!(profile.active_rows > 1);
@@ -249,6 +290,7 @@ mod tests {
             &EngineConfig::default(),
             None,
             false,
+            4,
         )
         .unwrap();
         assert!(capacity.prefill_tokens > 0);
@@ -273,6 +315,7 @@ mod tests {
             &EngineConfig::default(),
             Some(64 << 30),
             false,
+            4,
         )
         .unwrap();
         assert!(
@@ -286,6 +329,42 @@ mod tests {
         );
     }
 
+    /// FSH-2: rows were priced at F32 over the native 32,768-token context,
+    /// twice (19.3 GB of slow KV a row), beside 78 GB of preparation for a
+    /// 4,096-frame reference, so even an H100 sealed one Fish row. Priced at
+    /// the loaded BF16 over one request's tokens (counted once) and the
+    /// 30 s reference limit, an H100's headroom seals several rows. The
+    /// per-row codec and AR workspaces (four of each) now dominate a row.
+    #[test]
+    fn rows_are_priced_from_one_request_at_the_loaded_precision() {
+        let model = FishS2TtsModel::for_test();
+        let config = EngineConfig {
+            max_scheduler_batch_size: 0,
+            max_retained_sequences: 0,
+            max_staged_transactions: 0,
+            ..Default::default()
+        };
+        let rows = |headroom_gib: u64, kv_bytes: usize| {
+            ResolvedFishServingCapacity::resolve(
+                model.config(),
+                &config,
+                Some(headroom_gib << 30),
+                true,
+                kv_bytes,
+            )
+            .unwrap()
+            .active_rows
+        };
+        // H100 headroom after about 10 GB of BF16 weights.
+        let h100 = rows(68, 2);
+        assert!(h100 >= 4, "H100: {h100} rows");
+        // An F32 fallback prices twice the KV, never more rows.
+        assert!(rows(68, 4) <= h100);
+        assert!(
+            fish_request_tokens() < crate::model::ModelVariant::FISH_S2_PRO_NATIVE_CONTEXT_TOKENS
+        );
+    }
+
     #[test]
     fn capacity_scales_with_memory_and_preserves_operator_ceilings() {
         let model = FishS2TtsModel::for_test();
@@ -296,21 +375,21 @@ mod tests {
             ..Default::default()
         };
         let small =
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(8 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(8 << 30), true, 4)
                 .unwrap();
         let large =
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         assert!(large.ar_rows > small.ar_rows);
         assert!(large.ar_rows > 5);
         config.max_batch_size = crate::config::BatchSizePreference::fixed(3).unwrap();
         let capped =
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap();
         assert_eq!(capped.ar_rows, 3);
         config.max_staged_transactions = 2;
         assert_eq!(
-            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true)
+            ResolvedFishServingCapacity::resolve(model.config(), &config, Some(256 << 30), true, 4)
                 .unwrap()
                 .ar_rows,
             2
