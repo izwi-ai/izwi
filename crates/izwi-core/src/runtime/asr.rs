@@ -50,7 +50,7 @@ use crate::runtime::types::{
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
 use crate::runtime::CoordinatorLane;
-use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
+use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
@@ -387,6 +387,13 @@ fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
     output
         .input_audio_duration_secs
         .unwrap_or(output.audio.duration_secs)
+}
+
+/// The final transcript, cleaned exactly as the long-form assembler cleans
+/// each chunk, so a file decoded in one window and a file merged from chunks
+/// come back alike. Cleaning is idempotent, so merged text is unchanged.
+fn asr_transcript_text(text: &str) -> String {
+    clean_transcript_text(text, AsrLongFormConfig::default().max_repeated_chars)
 }
 
 /// Transcript language: the caller's hint when given, otherwise the language
@@ -2353,7 +2360,7 @@ impl RuntimeService {
                         )?;
 
                     Ok(AsrTranscription {
-                        text: output.text,
+                        text: asr_transcript_text(&output.text),
                         language: output.language,
                         duration_secs,
                         asr_diagnostics: output.diagnostics,
@@ -2539,7 +2546,7 @@ impl RuntimeService {
             .await?;
         let output = self.run_admitted_request(admitted).await?;
         let duration_secs = asr_transcription_duration_secs(&output);
-        let text = output.text.unwrap_or_default();
+        let text = asr_transcript_text(&output.text.unwrap_or_default());
 
         Ok(AsrTranscription {
             text,
@@ -2652,7 +2659,7 @@ impl RuntimeService {
             })
             .await?;
         let duration_secs = asr_transcription_duration_secs(&output);
-        let text = output.text.unwrap_or(streamed_text);
+        let text = asr_transcript_text(&output.text.unwrap_or(streamed_text));
 
         Ok(AsrTranscription {
             text,
@@ -2764,7 +2771,7 @@ impl RuntimeService {
             .await?;
         let output = self.run_admitted_request(admitted).await?;
         let duration_secs = asr_transcription_duration_secs(&output);
-        let text = output.text.unwrap_or_default();
+        let text = asr_transcript_text(&output.text.unwrap_or_default());
 
         Ok(AsrTranscription {
             text,
@@ -2953,7 +2960,7 @@ impl RuntimeService {
                 .await?
         };
         let duration_secs = asr_transcription_duration_secs(&output);
-        let text = output.text.unwrap_or(streamed_text);
+        let text = asr_transcript_text(&output.text.unwrap_or(streamed_text));
 
         Ok(AsrTranscription {
             text,
@@ -5657,6 +5664,22 @@ mod tests {
             granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn single_window_and_chunked_transcripts_get_the_same_cleanup() {
+        let raw = "  Total:   1000000000 units.............\n\nNext  line  ";
+        let mut assembler =
+            izwi_asr_toolkit::TranscriptAssembler::new(AsrLongFormConfig::default());
+        assembler.push_chunk_text(raw);
+        let chunked = assembler.finish();
+
+        assert_eq!(
+            asr_transcript_text(raw),
+            "Total: 1000000000 units........\nNext line"
+        );
+        assert_eq!(asr_transcript_text(raw), chunked);
+        assert_eq!(asr_transcript_text(&chunked), chunked);
     }
 
     #[test]

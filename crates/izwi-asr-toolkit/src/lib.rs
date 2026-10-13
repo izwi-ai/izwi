@@ -807,15 +807,30 @@ fn percentile(values: &mut [f32], q: f32) -> f32 {
     values[idx]
 }
 
-fn clean_chunk_text(text: &str, max_repeated_chars: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    remove_repeated_chars(trimmed, max_repeated_chars.max(1))
+/// The cleanup every ASR transcript gets, whether it was decoded in one
+/// window or merged from long-form chunks: whitespace collapsed within each
+/// line, blank lines dropped, and runs of a repeated symbol cut to
+/// `max_repeated_chars`. Letters and digits are never cut, so "1000000000"
+/// and drawn-out words survive.
+pub fn clean_transcript_text(text: &str, max_repeated_chars: usize) -> String {
+    clean_chunk_text(text, max_repeated_chars)
 }
 
+fn clean_chunk_text(text: &str, max_repeated_chars: usize) -> String {
+    let normalized = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.is_empty() {
+        return String::new();
+    }
+    remove_repeated_chars(&normalized, max_repeated_chars.max(1))
+}
+
+/// Cut runs of a repeated non-alphanumeric character (a decoder stuck on
+/// "........") to `max_run`.
 fn remove_repeated_chars(text: &str, max_run: usize) -> String {
     let mut out = String::with_capacity(text.len());
     let mut last: Option<char> = None;
@@ -829,7 +844,7 @@ fn remove_repeated_chars(text: &str, max_run: usize) -> String {
             run = 1;
         }
 
-        if run <= max_run {
+        if run <= max_run || ch.is_alphanumeric() {
             out.push(ch);
         }
     }
@@ -850,6 +865,8 @@ fn spacing_between(prev: &str, delta: &str) -> &'static str {
                 && !b.is_whitespace()
                 && !is_closing_punctuation(b)
                 && !is_opening_punctuation(a)
+                && !written_without_spaces(a)
+                && !written_without_spaces(b)
         }
         _ => false,
     };
@@ -858,6 +875,26 @@ fn spacing_between(prev: &str, delta: &str) -> &'static str {
     } else {
         ""
     }
+}
+
+/// Characters of scripts written without spaces between words (Chinese,
+/// Japanese, Thai, Lao, Khmer, Myanmar), including CJK and full-width
+/// punctuation. Chunks meeting at such a character join directly. Hangul is
+/// excluded because Korean separates words with spaces.
+fn written_without_spaces(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0E00..=0x0EFF // Thai, Lao
+            | 0x1000..=0x109F // Myanmar
+            | 0x1780..=0x17FF // Khmer
+            | 0x3000..=0x30FF // CJK symbols and punctuation, Hiragana, Katakana
+            | 0x31F0..=0x31FF // Katakana phonetic extensions
+            | 0x3400..=0x4DBF // CJK extension A
+            | 0x4E00..=0x9FFF // CJK unified ideographs
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0xFF00..=0xFFEF // half-width and full-width forms
+            | 0x20000..=0x3134F // CJK extensions B and later
+    )
 }
 
 fn is_opening_punctuation(ch: char) -> bool {
@@ -1471,13 +1508,57 @@ mod tests {
     }
 
     #[test]
-    fn assembler_trims_excessive_char_repetition() {
+    fn assembler_trims_excessive_symbol_repetition() {
         let cfg = AsrLongFormConfig {
             max_repeated_chars: 3,
             ..Default::default()
         };
         let mut assembler = TranscriptAssembler::new(cfg);
-        let delta = assembler.push_chunk_text("heyyyyyyyy there");
-        assert_eq!(delta, "heyyy there");
+        let delta = assembler.push_chunk_text("wait.......... heyyyyyyyy there");
+        assert_eq!(delta, "wait... heyyyyyyyy there");
+    }
+
+    #[test]
+    fn cleanup_keeps_digit_and_letter_runs() {
+        assert_eq!(
+            clean_transcript_text("it cost 1000000000 dollars, sooooooooo much", 8),
+            "it cost 1000000000 dollars, sooooooooo much"
+        );
+        assert_eq!(
+            clean_transcript_text("and then!!!!!!!!!!!! ------------", 8),
+            "and then!!!!!!!! --------"
+        );
+    }
+
+    #[test]
+    fn cleanup_collapses_spaces_but_keeps_line_breaks() {
+        assert_eq!(
+            clean_transcript_text("  Speaker 1:   hello \n\n\t Speaker 2:  hi  ", 8),
+            "Speaker 1: hello\nSpeaker 2: hi"
+        );
+        assert_eq!(clean_transcript_text(" \n \t ", 8), "");
+    }
+
+    #[test]
+    fn chunks_in_unspaced_scripts_join_without_a_space() {
+        assert_eq!(
+            merged(&[("今天天气很好。", 0.0), ("我们去公园吧。", 0.0)]),
+            "今天天气很好。我们去公园吧。"
+        );
+        assert_eq!(
+            merged(&[("我喜欢", 0.0), ("Python", 0.0), ("和", 0.0)]),
+            "我喜欢Python和"
+        );
+        assert_eq!(
+            merged(&[("東京に行きました", 0.0), ("「楽しかった」", 0.0)]),
+            "東京に行きました「楽しかった」"
+        );
+        assert_eq!(merged(&[("สวัสดี", 0.0), ("ครับ", 0.0)]), "สวัสดีครับ");
+        // Korean and Latin-script languages keep word spaces.
+        assert_eq!(
+            merged(&[("안녕하세요", 0.0), ("반갑습니다", 0.0)]),
+            "안녕하세요 반갑습니다"
+        );
+        assert_eq!(merged(&[("hello", 0.0), ("world", 0.0)]), "hello world");
     }
 }

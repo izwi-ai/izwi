@@ -67,12 +67,49 @@ pub fn decode_tokens(ids: &[usize], vocab: &[String]) -> String {
     normalize_text(out)
 }
 
+/// Collapse whitespace and drop the space a `▁.` or `▁,` piece adds. A space
+/// before `! ? : ;` is kept: the model writes French with it ("Ça va ?").
 fn normalize_text(mut s: String) -> String {
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    for punct in [".", ",", "!", "?", ":", ";"] {
+    for punct in [".", ","] {
         s = s.replace(&format!(" {punct}"), punct);
     }
 
     s.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_tokens;
+
+    #[test]
+    fn detokenizer_keeps_french_spacing_before_high_punctuation() {
+        let vocab: Vec<String> = [
+            "▁Bonjour",
+            "▁!",
+            "▁Ça",
+            "▁va",
+            "▁?",
+            "▁Oui",
+            "▁,",
+            "▁merci",
+            "▁.",
+            "▁Note",
+            "▁:",
+            "▁fin",
+            "▁;",
+            "▁ok",
+            "?",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let ids: Vec<usize> = (0..vocab.len()).collect();
+
+        assert_eq!(
+            decode_tokens(&ids, &vocab),
+            "Bonjour ! Ça va ? Oui, merci. Note : fin ; ok?"
+        );
+    }
 }

@@ -3268,9 +3268,11 @@ fn should_skip_token(token: &str) -> bool {
     )
 }
 
+/// Collapse whitespace and drop the space a `▁.` or `▁,` piece adds. A space
+/// before `! ? : ;` is kept: the model writes French with it ("Ça va ?").
 fn normalize_decoded_text(mut text: String) -> String {
     text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    for punct in [".", ",", "!", "?", ":", ";"] {
+    for punct in [".", ","] {
         text = text.replace(&format!(" {punct}"), punct);
     }
     text.trim().to_string()
@@ -3292,6 +3294,31 @@ mod tests {
 
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector};
     use uuid::Uuid;
+
+    #[test]
+    fn detokenizer_keeps_french_spacing_before_high_punctuation() {
+        let vocab: Vec<String> = [
+            "▁Bonjour",
+            "▁!",
+            "▁Ça",
+            "▁va",
+            "▁?",
+            "▁Oui",
+            "▁,",
+            "▁merci",
+            "▁.",
+            "?",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let ids: Vec<usize> = (0..vocab.len()).collect();
+
+        assert_eq!(
+            decode_vocab_tokens(&ids, &vocab),
+            "Bonjour ! Ça va ? Oui, merci.?"
+        );
+    }
 
     #[test]
     fn prompt_condition_defaults_to_auto_language() {
