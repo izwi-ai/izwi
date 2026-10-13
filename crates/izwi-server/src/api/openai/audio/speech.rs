@@ -122,6 +122,33 @@ struct SpeechStreamEvent {
     stop_reason: Option<&'static str>,
 }
 
+/// One SSE event as JSON, carrying OpenAI's speech-stream shape beside
+/// izwi's (TPIPE-11): an `audio.chunk` is also a `speech.audio.delta` with
+/// the base64 PCM in `audio`, and `audio.done` is also a `speech.audio.done`
+/// with `usage`. Existing clients keep reading `event` and `audio_base64`.
+fn openai_stream_payload(event: &SpeechStreamEvent) -> String {
+    let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        match event.event {
+            "audio.chunk" => {
+                object.insert("type".into(), "speech.audio.delta".into());
+                if let Some(audio) = &event.audio_base64 {
+                    object.insert("audio".into(), audio.clone().into());
+                }
+            }
+            "audio.done" => {
+                object.insert("type".into(), "speech.audio.done".into());
+                object.insert(
+                    "usage".into(),
+                    serde_json::json!({ "output_tokens": event.tokens_generated }),
+                );
+            }
+            _ => {}
+        }
+    }
+    value.to_string()
+}
+
 fn stream_event_queue_capacity() -> usize {
     std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
         .ok()
@@ -138,7 +165,7 @@ async fn send_stream_event(
     event_tx: &mpsc::Sender<String>,
     event: SpeechStreamEvent,
 ) -> Result<(), ()> {
-    let payload = serde_json::to_string(&event).unwrap_or_default();
+    let payload = openai_stream_payload(&event);
     let stall_secs = std::env::var("IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1386,6 +1413,39 @@ mod tests {
             ModelVariant::Kokoro82M
         )
         .is_ok());
+    }
+
+    /// TPIPE-11: the SSE events also carry OpenAI's `speech.audio.delta` and
+    /// `speech.audio.done` shape.
+    #[test]
+    fn sse_events_carry_the_openai_speech_stream_shape() {
+        let event = |name: &'static str| SpeechStreamEvent {
+            event: name,
+            timing: None,
+            request_id: None,
+            sequence: Some(0),
+            audio_base64: Some("AAEC".into()),
+            sample_count: None,
+            is_final: None,
+            sample_rate: None,
+            audio_format: None,
+            tokens_generated: Some(12),
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            error: None,
+            stop_reason: None,
+        };
+        let delta: serde_json::Value =
+            serde_json::from_str(&openai_stream_payload(&event("audio.chunk"))).unwrap();
+        assert_eq!(delta["type"], "speech.audio.delta");
+        assert_eq!(delta["audio"], "AAEC");
+        assert_eq!(delta["event"], "audio.chunk");
+        assert_eq!(delta["audio_base64"], "AAEC");
+        let done: serde_json::Value =
+            serde_json::from_str(&openai_stream_payload(&event("audio.done"))).unwrap();
+        assert_eq!(done["type"], "speech.audio.done");
+        assert_eq!(done["usage"]["output_tokens"], 12);
     }
 
     #[test]
