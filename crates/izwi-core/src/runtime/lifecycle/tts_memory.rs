@@ -508,6 +508,23 @@ mod tests {
         .is_err());
     }
 
+    /// Fish keeps its own plan, and the Metal OOM retry now reads it too
+    /// (it used the catalog figure): the shared lookup takes the Fish branch,
+    /// which reads the checkpoint, rather than reporting "no plan".
+    #[test]
+    fn the_oom_retry_reads_fish_from_its_own_plan() {
+        let _env = env_lock();
+        let missing = temp_dir("fish-missing");
+        let device = profile(BackendKind::Cpu);
+        assert!(super::super::checkpoint_resource_plan(
+            ModelVariant::FishAudioS2Pro,
+            &missing,
+            &device
+        )
+        .is_err());
+        std::fs::remove_dir_all(missing).unwrap();
+    }
+
     /// The runtime's load admission takes the TTS plan.
     #[test]
     fn runtime_admission_prices_tts_loads_by_their_plan() {

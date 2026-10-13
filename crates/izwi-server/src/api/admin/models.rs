@@ -981,6 +981,7 @@ mod tests {
             default_compute_dtype: "bf16".to_string(),
             default_dtype_reason: "CUDA policy prefers BF16".to_string(),
             effective_context_tokens: None,
+            weight_residency: None,
             supports_incremental_decode: Some(true),
             supports_realtime_stream_decode: None,
             family_diagnostics: Some(serde_json::json!({

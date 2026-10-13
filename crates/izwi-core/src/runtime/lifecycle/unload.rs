@@ -107,6 +107,7 @@ impl ModelLifecycleController {
             }
         }
         self.model_registry.clear_effective_context(variant);
+        self.model_registry.clear_weight_residency(variant);
     }
 
     async fn purge_executor_model_cache(&self, variant: ModelVariant) -> Result<()> {

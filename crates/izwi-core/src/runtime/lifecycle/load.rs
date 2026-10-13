@@ -591,25 +591,44 @@ fn reconcile_observed_growth(
     Ok(observed_growth)
 }
 
+/// The residency plan first admission prices for a checkpoint-planned
+/// family (Fish, ASR, TTS), or `None` for one without a plan. The Metal OOM
+/// retry judges futility by the same plan.
+fn checkpoint_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &crate::backends::DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    if variant == ModelVariant::FishAudioS2Pro {
+        let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
+            model_path, device,
+        )?;
+        return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
+    }
+    // ASR and TTS families price what their loader allocates on every
+    // backend; the catalog figure stays a display value for them.
+    if let Some(plan) = asr_memory::resource_plan(variant, model_path, device)? {
+        return Ok(Some(plan));
+    }
+    tts_memory::resource_plan(variant, model_path, device)
+}
+
 /// Static load peak that decides whether a Metal OOM retry can fit. The
 /// catalog's `memory_required_gb` is one coarse figure for every backend (80
 /// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
 /// these checkpoints use the per-backend representation estimate that load
-/// admission prices instead. An ASR checkpoint (`asr_checkpoint`: its path and
-/// the load device) is judged by the residency plan first admission priced.
+/// admission prices instead. A planned checkpoint (`checkpoint`: its path and
+/// the load device; Fish, ASR and TTS) is judged by the plan first admission
+/// priced ([`checkpoint_resource_plan`]).
 fn retry_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,
-    asr_checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
+    checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
-    if let Some((model_path, device)) = asr_checkpoint {
-        let plan = match asr_memory::resource_plan(variant, model_path, device) {
-            Ok(None) => tts_memory::resource_plan(variant, model_path, device),
-            plan => plan,
-        };
-        if let Ok(Some(plan)) = plan {
+    if let Some((model_path, device)) = checkpoint {
+        if let Ok(Some(plan)) = checkpoint_resource_plan(variant, model_path, device) {
             if let ResourceAmount::Known(bytes) =
                 load_domain_bytes(plan.load_authorization, backend)
             {
@@ -1736,23 +1755,8 @@ impl ModelLifecycleController {
             }
             return qwen36moe_memory::resource_plan(backend, &self.config.performance);
         }
-        if variant == ModelVariant::FishAudioS2Pro {
-            let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
-                model_path,
-                &self.backend_router.context().device,
-            )?;
-            return fish_s2_resource_plan(backend, memory);
-        }
-        // ASR families price what their loader allocates on every backend;
-        // the catalog figure stays a display value for them.
         if let Some(plan) =
-            asr_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
-        {
-            return Ok(plan);
-        }
-        // So do the TTS families (Fish has its own plan above).
-        if let Some(plan) =
-            tts_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
+            checkpoint_resource_plan(variant, model_path, &self.backend_router.context().device)?
         {
             return Ok(plan);
         }
@@ -2388,6 +2392,13 @@ impl ModelLifecycleController {
                             observed_bytes = observed,
                             authorized_bytes = own_bytes,
                             "Observed device growth of the weight load"
+                        );
+                        self.model_registry.publish_weight_residency(
+                            variant,
+                            crate::models::registry::WeightResidency {
+                                priced_bytes: own_bytes,
+                                observed_bytes: observed,
+                            },
                         );
                         Some((backend, observed))
                     }

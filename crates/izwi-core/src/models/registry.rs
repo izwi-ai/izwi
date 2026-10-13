@@ -5831,6 +5831,9 @@ pub struct ModelRegistry {
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
+    /// Per loaded model: what admission priced for its weights and what the
+    /// device observer saw them occupy (TADM-13).
+    weight_residency: Arc<std::sync::RwLock<HashMap<ModelVariant, WeightResidency>>>,
 }
 
 /// Explicit name for the in-memory registry of loaded native model handles.
@@ -5856,12 +5859,26 @@ pub struct LoadedModelDiagnostics {
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_context_tokens: Option<usize>,
+    /// Priced vs actual weights (TADM-13): what load admission authorized
+    /// for the weights and what the device observer (Metal
+    /// `currentAllocatedSize`, CUDA `mem_get_info`) saw them take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_residency: Option<WeightResidency>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_incremental_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_realtime_stream_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family_diagnostics: Option<Value>,
+}
+
+/// A loaded model's weights, priced and observed, in the load domain's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WeightResidency {
+    /// The load peak admission authorized.
+    pub priced_bytes: u64,
+    /// The device growth observed over the weight load (after the fence).
+    pub observed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5919,6 +5936,7 @@ fn loaded_model_diagnostics_entry(
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
         effective_context_tokens: None,
+        weight_residency: None,
         supports_incremental_decode,
         supports_realtime_stream_decode,
         family_diagnostics,
@@ -6050,6 +6068,7 @@ impl ModelRegistry {
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            weight_residency: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -6098,6 +6117,26 @@ impl ModelRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&variant)
             .copied()
+    }
+
+    /// Record what admission priced for `variant`'s weights and what the
+    /// device observer saw the load allocate.
+    pub(crate) fn publish_weight_residency(
+        &self,
+        variant: ModelVariant,
+        residency: WeightResidency,
+    ) {
+        self.weight_residency
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(variant, residency);
+    }
+
+    pub(crate) fn clear_weight_residency(&self, variant: ModelVariant) {
+        self.weight_residency
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
     }
 
     pub(crate) fn clear_effective_context(&self, variant: ModelVariant) {
@@ -6339,6 +6378,14 @@ impl ModelRegistry {
         }
 
         for entry in &mut diagnostics {
+            entry.weight_residency = self
+                .weight_residency
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, residency)| {
+                    (variant.dir_name() == entry.variant_id).then_some(*residency)
+                });
             entry.effective_context_tokens = self
                 .effective_contexts
                 .read()
@@ -7524,6 +7571,32 @@ mod tests {
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn weight_residency_is_published_per_model_and_cleared_on_unload() {
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let residency = WeightResidency {
+            priced_bytes: 5_950_000_000,
+            observed_bytes: 4_080_000_000,
+        };
+        registry.publish_weight_residency(variant, residency);
+        assert_eq!(
+            registry
+                .weight_residency
+                .read()
+                .unwrap()
+                .get(&variant)
+                .copied(),
+            Some(residency)
+        );
+        assert_eq!(
+            serde_json::to_value(residency).unwrap(),
+            serde_json::json!({"priced_bytes": 5_950_000_000u64, "observed_bytes": 4_080_000_000u64})
+        );
+        registry.clear_weight_residency(variant);
+        assert!(registry.weight_residency.read().unwrap().is_empty());
     }
 
     #[test]
