@@ -1214,11 +1214,14 @@ impl ModelLifecycleController {
             return Ok(());
         }
         let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
-        let ResourceAmount::Known(headroom_bytes) = self
-            .coordinator
-            .resource_authority()
-            .planning_headroom_bytes(backend)?
-        else {
+        // ASR state leaves live room for the requests it serves (ADM-7).
+        let authority = self.coordinator.resource_authority();
+        let headroom = if asr_memory::is_asr_variant(variant) {
+            authority.state_fit_headroom_bytes(backend)?
+        } else {
+            authority.planning_headroom_bytes(backend)?
+        };
+        let ResourceAmount::Known(headroom_bytes) = headroom else {
             let Some((_, maximum)) = axis_bounds else {
                 return Ok(());
             };

@@ -515,6 +515,17 @@ impl Default for ManagedKvCacheManager {
     }
 }
 
+/// What a portable managed-state fit may spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortableFitHeadroom {
+    /// Stable planning headroom (chat and TTS state).
+    Planning,
+    /// Planning headroom clamped to live memory
+    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR state, which
+    /// must leave room for the requests it serves.
+    Live,
+}
+
 impl ManagedKvCacheManager {
     pub(crate) fn contains_model(&self, model_instance: ModelInstanceId) -> bool {
         self.models.contains_key(&model_instance)
@@ -573,6 +584,7 @@ impl ManagedKvCacheManager {
     /// Resolve the largest portable logical reach whose exact managed-state
     /// plan fits the stable shared-memory envelope. CUDA deliberately bypasses
     /// this path and keeps admission-growable arenas.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fit_portable_logical_token_reach(
         &self,
         model_instance: ModelInstanceId,
@@ -583,6 +595,7 @@ impl ManagedKvCacheManager {
         retained_sequence_rows: u32,
         staged_transaction_rows: u32,
         portable_state_copies: u32,
+        headroom: PortableFitHeadroom,
     ) -> Result<u64> {
         if self.worker_backend == BackendKind::Cuda || maximum_tokens == 0 {
             return Ok(maximum_tokens);
@@ -595,9 +608,13 @@ impl ManagedKvCacheManager {
         let Some(authority) = self.resource_authority.as_ref() else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let ResourceAmount::Known(headroom_bytes) =
-            authority.planning_headroom_bytes(self.worker_backend)?
-        else {
+        let headroom_bytes = match headroom {
+            PortableFitHeadroom::Planning => {
+                authority.planning_headroom_bytes(self.worker_backend)?
+            }
+            PortableFitHeadroom::Live => authority.state_fit_headroom_bytes(self.worker_backend)?,
+        };
+        let ResourceAmount::Known(headroom_bytes) = headroom_bytes else {
             return Ok(maximum_tokens.min(4_096));
         };
         let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
@@ -5831,6 +5848,7 @@ mod tests {
                     8,
                     8,
                     1,
+                    PortableFitHeadroom::Planning,
                 )
                 .unwrap(),
             4_096
@@ -5851,10 +5869,95 @@ mod tests {
                 8,
                 8,
                 2,
+                PortableFitHeadroom::Planning,
             )
             .unwrap();
         assert!(selected < 4_096);
         assert!(selected >= 64);
+    }
+
+    /// ASR state fits spend live memory, not only ledger headroom: with the
+    /// ledger empty but most of the machine in use elsewhere, the live fit
+    /// shrinks while the planning fit still takes the whole ceiling.
+    #[test]
+    fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
+        const RESERVE: u64 = 64 * 1024 * 1024;
+        let contract = test_contract();
+        let bytes = |tokens: u64| {
+            let state_plan = negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(64),
+                    storage_dtype_hint: None,
+                },
+            )
+            .unwrap();
+            let (allocation, _) = plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(902),
+                ManagedStateCapacityRequest {
+                    total_paged_pages: u32::MAX,
+                    logical_token_reach: Some(tokens),
+                    retained_sequence_rows: 8,
+                    staged_transaction_rows: 8,
+                },
+            )
+            .unwrap();
+            let resources = managed_state_resources(
+                BackendKind::Cpu,
+                allocation.maximum_resources(&state_plan).unwrap(),
+            )
+            .unwrap();
+            let ResourceAmount::Known(bytes) = resources.host_bytes else {
+                panic!("test plan must have known host bytes");
+            };
+            bytes
+        };
+        // The ledger admits 4,096 tokens; live memory only 1,024.
+        let capacity = host_bytes_vector(RESERVE + bytes(4_096));
+        let available = host_bytes_vector(RESERVE + bytes(1_024));
+        let manager = ManagedKvCacheManager::for_worker(
+            Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
+                TestCapacityProvider {
+                    snapshot: PhysicalCapacitySnapshot {
+                        capacity,
+                        available,
+                        source: CapacitySource::Test,
+                    },
+                },
+            )))),
+            BackendKind::Cpu,
+            Device::Cpu,
+        );
+        let fit = |headroom| {
+            manager
+                .fit_portable_logical_token_reach(
+                    ModelInstanceId::new(902),
+                    &contract,
+                    4_096,
+                    RESERVE,
+                    64,
+                    8,
+                    8,
+                    1,
+                    headroom,
+                )
+                .unwrap()
+        };
+        assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
+        let live = fit(PortableFitHeadroom::Live);
+        assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
+    }
+
+    fn host_bytes_vector(bytes: u64) -> ResourceVector {
+        ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            device_bytes: ResourceAmount::Known(bytes),
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        }
     }
 
     #[test]

@@ -138,6 +138,23 @@ pub(super) fn resource_plan(
     plan.resource_plan().map(Some)
 }
 
+/// Whether `variant` is an ASR family this module prices. Its state fits
+/// spend live headroom, not only the ledger's, so the requests the state
+/// serves can still run beside it.
+pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
+    matches!(
+        variant,
+        ModelVariant::WhisperLargeV3Turbo
+            | ModelVariant::Qwen3Asr06BGguf
+            | ModelVariant::Qwen3Asr17BGguf
+            | ModelVariant::ParakeetTdt06BV3
+            | ModelVariant::Nemotron35AsrStreaming06B
+            | ModelVariant::VibeVoiceAsr
+            | ModelVariant::VoxtralMini4BRealtime2602
+            | ModelVariant::Lfm25Audio15BGguf
+    ) || variant.family() == ModelFamily::GraniteSpeechAsr
+}
+
 pub(super) fn residency_plan(
     variant: ModelVariant,
     model_path: &Path,

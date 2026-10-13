@@ -17,7 +17,9 @@ use super::cache::composite::{
     allocate_composite_retained_state, project_composite_paged_contract,
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
-use super::cache::managed::{ManagedKvCacheManager, ManagedStateCapacityRequest};
+use super::cache::managed::{
+    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+};
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
 #[cfg(test)]
@@ -5480,6 +5482,7 @@ impl EngineCore {
                         contract,
                         logical_context_tokens,
                         1,
+                        PortableFitHeadroom::Planning,
                     )?,
                     retained_sequence_rows,
                     staged_transaction_rows,
@@ -5537,12 +5540,15 @@ impl EngineCore {
         portable_state_copies: u32,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let backend = self.managed_kv_cache.worker_backend();
+        // Only ASR retained state loads through here; it fits within live
+        // memory so the requests it serves can run beside it.
         let logical_token_reach = self.resolve_managed_token_reach_for_contract(
             backend,
             model_instance,
             retained_state,
             logical_context_tokens,
             portable_state_copies,
+            PortableFitHeadroom::Live,
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5602,6 +5608,7 @@ impl EngineCore {
             logical_context_tokens,
             1,
             (retained_rows, staged_rows),
+            PortableFitHeadroom::Planning,
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5644,6 +5651,8 @@ impl EngineCore {
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
+            // Whisper's decoder state: ASR, fitted within live memory.
+            PortableFitHeadroom::Live,
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
@@ -5682,6 +5691,7 @@ impl EngineCore {
         contract: &crate::kv::v2::InferenceStateContract,
         loaded_context: Option<usize>,
         portable_state_copies: u32,
+        headroom: PortableFitHeadroom,
     ) -> Result<Option<u64>> {
         self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
@@ -5693,6 +5703,7 @@ impl EngineCore {
                 self.config.max_retained_sequences,
                 self.config.max_staged_transactions,
             ),
+            headroom,
         )
     }
 
@@ -5704,6 +5715,7 @@ impl EngineCore {
         loaded_context: Option<usize>,
         portable_state_copies: u32,
         row_limits: (usize, usize),
+        headroom: PortableFitHeadroom,
     ) -> Result<Option<u64>> {
         if !self.config.portable_context_auto
             && backend != BackendKind::Cuda
@@ -5734,6 +5746,7 @@ impl EngineCore {
                         Error::InvalidInput("managed state transaction limit exceeds u32".into())
                     })?,
                     portable_state_copies,
+                    headroom,
                 )
                 .map(Some);
         }

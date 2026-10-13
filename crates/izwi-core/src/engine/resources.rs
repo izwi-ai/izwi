@@ -725,19 +725,31 @@ impl ResourceAuthority {
         })
     }
 
-    /// Probed live headroom for one Metal pre-load admission decision. Unlike
-    /// planning headroom this deliberately reads the volatile live-available
-    /// sample: a Metal model load allocates its full physical working set at
-    /// the load fence, so starting one while the device has less free memory
-    /// than the new model's static estimate turns an admission question into
-    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
-    /// exists (probe unavailable); callers must treat that as "fall back to
-    /// planning headroom", never as unlimited. CPU keeps planning headroom
-    /// only: host availability is compressed/swapped and must not gate loads.
-    pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
-        if backend != BackendKind::Metal {
-            return Ok(None);
+    /// Headroom a load-time ASR state fit may spend, in the backend's domain:
+    /// planning headroom, clamped on CPU and Metal to the live sample (less
+    /// pending claims) when the provider has one (ADM-7). Planning headroom
+    /// alone is a ledger figure: on a machine whose memory is already in use
+    /// it lets a fit allocate state that the next request then cannot run
+    /// beside. Everything reserved before the fit, such as the model's own
+    /// lease and a deferred request envelope, is charged to both figures, so
+    /// a fit can never spend it. CUDA's planning headroom already takes the
+    /// live minimum.
+    pub(crate) fn state_fit_headroom_bytes(&self, backend: BackendKind) -> Result<ResourceAmount> {
+        let planning = self.planning_headroom_bytes(backend)?;
+        if backend == BackendKind::Cuda {
+            return Ok(planning);
         }
+        Ok(match (planning, self.live_headroom_in_domain(backend)?) {
+            (ResourceAmount::Known(planning), Some(live)) => {
+                ResourceAmount::Known(planning.min(live))
+            }
+            (planning, _) => planning,
+        })
+    }
+
+    /// The live sample less pending claims, in `backend`'s canonical domain,
+    /// or `None` when the provider has no trustworthy sample.
+    fn live_headroom_in_domain(&self, backend: BackendKind) -> Result<Option<u64>> {
         let state = self
             .state
             .lock()
@@ -754,10 +766,34 @@ impl ResourceAuthority {
         let live = physical
             .available
             .positive_growth_over(state.pending_resources()?)?;
-        Ok(match live.unified_bytes {
+        let amount = match (self.domain_policy, backend) {
+            (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
+                live.unified_bytes
+            }
+            (_, BackendKind::Cpu) => live.host_bytes,
+            (_, BackendKind::Metal) => live.unified_bytes,
+            (_, BackendKind::Cuda) => live.device_bytes,
+        };
+        Ok(match amount {
             ResourceAmount::Known(bytes) => Some(bytes),
             ResourceAmount::Unknown => None,
         })
+    }
+
+    /// Probed live headroom for one Metal pre-load admission decision. Unlike
+    /// planning headroom this deliberately reads the volatile live-available
+    /// sample: a Metal model load allocates its full physical working set at
+    /// the load fence, so starting one while the device has less free memory
+    /// than the new model's static estimate turns an admission question into
+    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
+    /// exists (probe unavailable); callers must treat that as "fall back to
+    /// planning headroom", never as unlimited. CPU keeps planning headroom
+    /// only: host availability is compressed/swapped and must not gate loads.
+    pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
+        if backend != BackendKind::Metal {
+            return Ok(None);
+        }
+        self.live_headroom_in_domain(backend)
     }
 
     /// Publish a post-release physical observation before another guarded
@@ -1806,6 +1842,49 @@ mod tests {
             Some(80)
         );
         drop(lease);
+    }
+
+    #[test]
+    fn asr_state_fit_headroom_takes_live_memory_below_the_ledger() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 40,
+                source: CapacitySource::Test,
+            }),
+        ));
+        let _model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(30),
+            )
+            .unwrap();
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            // Planning: 100 - 30 reserved. Live: 40 available - 30 pending.
+            assert_eq!(
+                authority.planning_headroom_bytes(backend).unwrap(),
+                ResourceAmount::Known(70)
+            );
+            assert_eq!(
+                authority.state_fit_headroom_bytes(backend).unwrap(),
+                ResourceAmount::Known(10)
+            );
+        }
+
+        // Without a trustworthy live sample the ledger figure stands.
+        let unprobed = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 0,
+                source: CapacitySource::Unavailable,
+            }),
+        ));
+        assert_eq!(
+            unprobed.state_fit_headroom_bytes(BackendKind::Metal).unwrap(),
+            ResourceAmount::Known(100)
+        );
+        authority.poison("simulated backend failure");
+        assert!(authority.state_fit_headroom_bytes(BackendKind::Cpu).is_err());
     }
 
     #[test]
