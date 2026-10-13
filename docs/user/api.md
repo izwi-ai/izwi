@@ -65,13 +65,13 @@ Common status codes:
 
 | Status | Meaning |
 |--------|---------|
-| `400` | Invalid request shape, model id, unsupported field, or invalid option. |
+| `400` | Invalid request shape, model id, unsupported field, or invalid option, including input the runtime rejects (for example audio over the duration limit). |
 | `403` | Authenticated request or local voice reuse is not permitted by policy metadata. |
 | `404` | Resource, model, media object, or process-local record was not found. |
 | `413` | Body exceeded an upload limit before the handler could parse it. |
 | `415` | Endpoint expected JSON or multipart content but received another content type. |
 | `500` | Runtime, model, storage, or server failure. |
-| `503` | Readiness endpoint reports the server is alive but not ready. |
+| `503` | Temporarily out of capacity: the requested model cannot be loaded while other resident models are busy, or the runtime is overloaded. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
 
 Enterprise builds can inject authentication and policy hooks. Community builds use local anonymous defaults. If an enterprise hook rejects a request, the response can be `401`, `403`, or `500` before the route handler runs.
 

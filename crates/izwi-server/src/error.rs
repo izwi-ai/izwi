@@ -1,11 +1,24 @@
 //! API error handling
 
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+
+/// Seconds a client should wait before retrying a `503`. Capacity refusals
+/// clear when another request finishes or a model goes idle, which is
+/// usually within seconds.
+const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
+
+/// A model load the runtime refused because device memory or the residency
+/// budget is held by models that are busy right now. The load can succeed
+/// once one of them goes idle, so it is a temporary capacity condition, not
+/// a server fault. Every such refusal ends with this advice.
+fn is_transient_capacity_refusal(message: &str) -> bool {
+    message.contains("unload a model to make room")
+}
 
 /// API error type
 #[derive(Debug)]
@@ -91,15 +104,26 @@ impl IntoResponse for ApiError {
                 "code": self.status.as_str()
             }
         }));
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(SERVICE_UNAVAILABLE_RETRY_AFTER_SECS),
+            );
+        }
+        response
     }
 }
 
 impl From<izwi_core::Error> for ApiError {
     fn from(err: izwi_core::Error) -> Self {
         match &err {
+            izwi_core::Error::InvalidInput(_) => ApiError::bad_request(err.to_string()),
             izwi_core::Error::ModelNotFound(_) => ApiError::not_found(err.to_string()),
             izwi_core::Error::ConfigError(_) => ApiError::bad_request(err.to_string()),
+            izwi_core::Error::ModelLoadError(message) if is_transient_capacity_refusal(message) => {
+                ApiError::service_unavailable(err.to_string())
+            }
             izwi_core::Error::MissingDependency(_) => {
                 ApiError::service_unavailable(err.to_string())
             }
@@ -136,10 +160,66 @@ mod tests {
         assert!(api_error.message.contains("espeak-ng not found"));
     }
 
+    #[test]
+    fn runtime_errors_map_to_client_and_capacity_statuses() {
+        for (error, status) in [
+            (
+                izwi_core::Error::InvalidInput("audio exceeds 60 minutes".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                izwi_core::Error::ModelNotFound("Unknown-ASR".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                izwi_core::Error::ModelLoadError(
+                    "Cannot fit Parakeet-TDT-0.6B-v3 model tensors before state allocation: \
+                     load_peak_bytes=1; no idle resident model is available for eviction; \
+                     unload a model to make room"
+                        .into(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                izwi_core::Error::ModelLoadError(
+                    "Cannot load Whisper-Large-v3-Turbo: the 2-model residency budget is full \
+                     and no resident model is idle and available for eviction; unload a model \
+                     to make room"
+                        .into(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                izwi_core::Error::Overloaded("all ASR slots are busy".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                izwi_core::Error::ModelLoadError("safetensors header is corrupt".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                izwi_core::Error::InferenceError("device lost".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let message = error.to_string();
+            let api_error = ApiError::from(error);
+            assert_eq!(api_error.status, status, "{message}");
+            assert_eq!(api_error.message, message);
+        }
+    }
+
     #[tokio::test]
     async fn service_unavailable_uses_openai_style_error_type() {
         let response = ApiError::service_unavailable("missing espeak-ng").into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "5"
+        );
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
