@@ -70,7 +70,8 @@ use crate::models::architectures::nemotron::asr::{
     nemotron_checkpoint_paths, resolve_nemotron_asr_dtype, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
-    parakeet_checkpoint_paths, PARAKEET_WEIGHT_DTYPE,
+    parakeet_checkpoint_paths, parakeet_tensor_is_f16_projection,
+    resolve_parakeet_projection_precision, PARAKEET_WEIGHT_DTYPE,
 };
 use crate::models::architectures::qwen3::asr::{
     qwen3_asr_use_gguf_qmatmul_text, qwen3_asr_weight_dtypes, resolve_qwen_asr_gguf_path,
@@ -166,7 +167,7 @@ pub(super) fn residency_plan(
         ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
             qwen3_asr_plan(variant, model_path, device, backend)
         }
-        ModelVariant::ParakeetTdt06BV3 => parakeet_plan(variant, model_path, backend),
+        ModelVariant::ParakeetTdt06BV3 => parakeet_plan(variant, model_path, device, backend),
         ModelVariant::Nemotron35AsrStreaming06B => {
             nemotron_plan(variant, model_path, device, backend)
         }
@@ -760,6 +761,29 @@ impl Ledger {
         })
     }
 
+    /// A weight read on the host at its stored dtype, converted there to
+    /// `dtype` and uploaded once at its exact size (`F16WeightLinear`): the
+    /// host read and its converted copy are alive beside the upload.
+    fn host_converted(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+        let bytes = dense_bytes(tensor.elements(), dtype)?;
+        let host = sum(&[tensor.stored_bytes, bytes])?;
+        self.apply(match self.backend {
+            BackendKind::Cpu | BackendKind::Metal => Step {
+                logical: bytes,
+                resident: bytes,
+                high: sum(&[host, bytes])?,
+                ..Step::default()
+            },
+            BackendKind::Cuda => Step {
+                logical: bytes,
+                resident: bytes,
+                high: bytes,
+                host,
+                ..Step::default()
+            },
+        })
+    }
+
     /// The most alive at a synchronization: the step's own buffers beside
     /// what another step, or a release, left held.
     fn at_sync_max(&self) -> Result<u64> {
@@ -1067,6 +1091,13 @@ enum NemoFamily {
 }
 
 impl NemoFamily {
+    fn is_f16_projection(self, name: &str) -> bool {
+        match self {
+            Self::Parakeet => parakeet_tensor_is_f16_projection(name),
+            Self::Nemotron => false,
+        }
+    }
+
     fn memo_bytes(self) -> u64 {
         match self {
             Self::Parakeet => 0,
@@ -1078,9 +1109,11 @@ impl NemoFamily {
 fn parakeet_plan(
     variant: ModelVariant,
     model_path: &Path,
+    device: &DeviceProfile,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = parakeet_checkpoint_paths(model_path, variant)?;
+    let f16_projections = resolve_parakeet_projection_precision(device).dtype == DType::F16;
     // The loader reads the extracted checkpoint, or its zip-repacked copy when
     // Candle cannot parse the original.
     for checkpoint in [&paths.checkpoint_path, &paths.repacked_checkpoint_path] {
@@ -1091,11 +1124,14 @@ fn parakeet_plan(
                     backend,
                     PARAKEET_WEIGHT_DTYPE,
                     NemoFamily::Parakeet,
+                    f16_projections,
                 )
                 .map(Some);
             }
         }
     }
+    // Without a tensor list the first load is priced at F32 throughout, an
+    // over-estimate when the projections load in F16.
     if paths.checkpoint_path.is_file() {
         // An unreadable checkpoint is repacked on disk before it loads.
         let payload = std::fs::metadata(&paths.checkpoint_path)?.len();
@@ -1121,7 +1157,7 @@ fn nemotron_plan(
     let dtype = resolve_nemotron_asr_dtype(device)?.dtype;
     if paths.checkpoint_path.is_file() {
         if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
-            return price_nemo(&[file], backend, dtype, NemoFamily::Nemotron).map(Some);
+            return price_nemo(&[file], backend, dtype, NemoFamily::Nemotron, false).map(Some);
         }
     }
     if !paths.nemo_path.is_file() {
@@ -1137,12 +1173,15 @@ fn nemotron_plan(
 /// host buffer, uploaded, and cast to `dtype` on the device. BatchNorm step
 /// counters are never read, and the featurizer tensors go back to the host.
 /// Parakeet adds each depthwise convolution with its BatchNorm folded in;
-/// Nemotron on CUDA adds transposed copies of its LSTM weights.
+/// Nemotron on CUDA adds transposed copies of its LSTM weights. With
+/// `f16_projections` the family's encoder projections are read and converted
+/// to F16 on the host and uploaded once (weight-only F16 on Metal).
 fn price_nemo(
     files: &[CensusFile],
     backend: BackendKind,
     dtype: DType,
     family: NemoFamily,
+    f16_projections: bool,
 ) -> Result<AsrResidencyPlan> {
     let mut ledger = Ledger::new(backend);
     for tensor in files.iter().flat_map(|file| file.tensors.iter()) {
@@ -1150,7 +1189,11 @@ fn price_nemo(
         if name.ends_with(".num_batches_tracked") || name.starts_with("preprocessor.") {
             continue;
         }
-        ledger.var(tensor, Source::Copied, &[dtype])?;
+        if f16_projections && family.is_f16_projection(name) {
+            ledger.host_converted(tensor, DType::F16)?;
+        } else {
+            ledger.var(tensor, Source::Copied, &[dtype])?;
+        }
         match family {
             NemoFamily::Parakeet if name.ends_with(".conv.depthwise_conv.weight") => {
                 let channels = dim(tensor, 0)?;
@@ -1760,11 +1803,14 @@ mod tests {
     }
 
     fn parakeet(backend: BackendKind) -> AsrResidencyPlan {
+        let f16_projections =
+            resolve_parakeet_projection_precision(&profile(backend)).dtype == DType::F16;
         price_nemo(
             &census!("parakeet_tdt_0_6b_v3.json"),
             backend,
             PARAKEET_WEIGHT_DTYPE,
             NemoFamily::Parakeet,
+            f16_projections,
         )
         .unwrap()
     }
@@ -1776,6 +1822,7 @@ mod tests {
             backend,
             dtype,
             NemoFamily::Nemotron,
+            false,
         )
         .unwrap()
     }
@@ -1896,7 +1943,7 @@ mod tests {
             (
                 "Parakeet-TDT-0.6B-v3",
                 Box::new(parakeet),
-                [2.34, 2.34, 2.34, 2.34],
+                [2.34, 1.20, 1.20, 2.34],
             ),
             (
                 "Nemotron-3.5-ASR-0.6B",
@@ -1980,15 +2027,26 @@ mod tests {
     fn exact_residency_follows_the_loaders_dtype_and_skips() {
         let _env = env_lock();
         // Parakeet: every F32 tensor but the featurizer, on every backend,
-        // plus each depthwise convolution with its BatchNorm folded in.
+        // plus each depthwise convolution with its BatchNorm folded in. Metal
+        // stores the encoder projections in F16: the subsampling output
+        // projection and, per layer, four FFN, five attention and two
+        // pointwise-conv weights.
         let files = census!("parakeet_tdt_0_6b_v3.json");
         let weights = stored(&files, |t| {
             t.dtype == StoredDType::Dense(DType::F32) && !t.name.starts_with("preprocessor.")
         });
         let folds = 24 * (1024 * 9 + 1024) * 4;
-        for backend in BACKENDS {
+        for backend in [BackendKind::Cpu, BackendKind::Cuda] {
             assert_eq!(parakeet(backend).logical_resident_bytes, weights + folds);
         }
+        let projections = 1024 * 4096 + 24 * (4 * 4096 * 1024 + 5 * 1024 * 1024 + 3 * 1024 * 1024);
+        assert_eq!(
+            parakeet(BackendKind::Metal).logical_resident_bytes,
+            weights + folds - projections * 2
+        );
+        // About 2.5 GB of weights become about 1.3 GB.
+        assert_eq!(weights, 2_508_229_144);
+        assert_eq!(weights - projections * 2, 1_291_880_984);
         // Nemotron: F32 on CPU and Metal; BF16 on CUDA plus transposed copies
         // of the two LSTM layers' input and hidden weights.
         let files = census!("nemotron_3_5_asr_streaming_0_6b.json");
