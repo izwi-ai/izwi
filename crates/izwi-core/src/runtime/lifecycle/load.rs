@@ -2164,7 +2164,11 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec =
                         model.granite_speech_physical_state_spec(&stage_graphs)?;
-                    let (retained, retained_uses) = if capability == CapabilityKind::Asr {
+                    // Without resumable prefill the model authors no retained
+                    // route, and its state is not allocated (GRN-8).
+                    let retained_route = capability == CapabilityKind::Asr
+                        && physical_spec.retained.is_some();
+                    let (retained, retained_uses) = if retained_route {
                         let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
                             Error::ModelLoadError(
                                 "Granite Speech ASR graph did not author retained decoder state"

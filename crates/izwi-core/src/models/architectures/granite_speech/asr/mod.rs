@@ -697,12 +697,17 @@ impl GraniteSpeechAsrModel {
             default_kv_page_size(),
         )?;
         let retained = granite_speech_retained_contract(invocation.clone())?;
-        granite_speech_physical_state_spec(
+        let spec = granite_speech_physical_state_spec(
             stage_graphs,
             retained,
             invocation,
             self.config.text_config.max_position_embeddings,
-        )
+        )?;
+        Ok(if self.supports_resumable_prefill() {
+            spec
+        } else {
+            granite_speech_without_retained_route(spec)
+        })
     }
 
     pub fn processor(&self) -> &GraniteSpeechProcessorConfig {
@@ -2030,6 +2035,19 @@ fn granite_speech_physical_state_spec(
     })
 }
 
+/// Request preparation routes ASR to the retained sequence graph only for a
+/// model with resumable prefill (`runtime/service.rs`), so without it that
+/// graph never runs: its retained decoder state would be fitted, allocated
+/// and held for nothing (GRN-8). The graph keeps its scratch-only profile.
+fn granite_speech_without_retained_route(
+    mut spec: GraniteSpeechPhysicalStateSpec,
+) -> GraniteSpeechPhysicalStateSpec {
+    spec.retained = None;
+    spec.retained_max_tokens = None;
+    spec.descriptor.retained = RetainedStateCapability::Stateless;
+    spec
+}
+
 fn granite_speech_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
@@ -2700,6 +2718,37 @@ mod tests {
             .stages
             .iter()
             .all(|stage| !stage.groups.is_empty()));
+    }
+
+    #[test]
+    fn disabled_retained_route_allocates_no_retained_state() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            granite_test_stage(0, StageWorkSelector::PreSequencePreparation),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+            granite_test_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+        let spec = granite_speech_without_retained_route(
+            granite_speech_physical_state_spec(
+                &[normal.as_slice(), atomic.as_slice()],
+                retained,
+                invocation,
+                128,
+            )
+            .unwrap(),
+        );
+
+        assert!(spec.retained.is_none());
+        assert_eq!(spec.retained_max_tokens, None);
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Stateless
+        ));
+        for stages in [normal.as_slice(), atomic.as_slice()] {
+            spec.descriptor.validate_against_stages(stages).unwrap();
+        }
     }
 
     #[test]

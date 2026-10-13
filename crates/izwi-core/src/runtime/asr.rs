@@ -163,7 +163,11 @@ const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 const ASR_REALTIME_MAX_SESSIONS_ENV: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
 const ASR_REALTIME_MAX_LIFETIME_SECS_ENV: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
 const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
-const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 16;
+/// Concurrent realtime sessions, which is also the row count of the realtime
+/// state arena a load allocates up front: Nemotron's is about 37 MB of F32 per
+/// row (twice per session), so 16 sessions held 1.18 GB that a desktop rarely
+/// uses (NEM-4). Servers raise it with `IZWI_ASR_REALTIME_MAX_SESSIONS`.
+const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 4;
 const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 10 * 60;
 const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
 
