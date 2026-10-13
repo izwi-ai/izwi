@@ -40,10 +40,16 @@ use tracing::{debug, info};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
-use crate::backends::DeviceProfile;
+use crate::backends::{DTypeSelection, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{
+    load_weight_only_f16, WeightOnlyF16Load, F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, xorshift_values, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     minimum_physical_bytes_for_capacity, stage_graph_fingerprint, BoundedShape,
     CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract, InvocationLeaseScope,
@@ -63,6 +69,7 @@ use crate::models::shared::sampling::{
 };
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::staged::metal_staged_safetensors;
+use candle_nn::VarBuilder;
 
 /// Device-to-host readbacks on the Qwen3-TTS decode path (each one blocks on
 /// the device). Every readback in the talker, predictor and semantic sampler
@@ -1075,6 +1082,9 @@ pub struct Qwen3TtsModel {
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+    /// Whether the talker and predictor projections loaded as weight-only
+    /// F16, why, and the self-check that decided.
+    weight_precision: WeightOnlyF16Load,
 }
 
 impl Qwen3TtsModel {
@@ -1407,6 +1417,8 @@ pub struct Qwen3TtsDiagnostics {
     pub vocab_size: usize,
     pub text_vocab_size: usize,
     pub num_code_groups: usize,
+    /// Talker/predictor projection storage (weight-only F16 tier).
+    pub weight_precision: serde_json::Value,
     /// Whether bounded candidate selection can execute on the selected device.
     pub device_sampling: bool,
     /// Backward-compatible CUDA-specific capability flag.
@@ -1436,6 +1448,10 @@ pub(crate) struct Qwen3TtsLoadLayout {
     /// The speech-tokenizer encoder (`encoder.*`): only voice cloning encodes
     /// reference audio, so the other variants never load it.
     pub(crate) tokenizer_encoder: bool,
+    /// The talker and predictor projections and the text embedding are
+    /// requested as weight-only F16 (F16 storage, F32 compute; Metal only).
+    /// The load-time self-check can still fall back to dense F32.
+    pub(crate) weight_only_f16: bool,
 }
 
 impl Qwen3TtsLoadLayout {
@@ -1451,6 +1467,7 @@ impl Qwen3TtsLoadLayout {
             dtypes,
             speaker_encoder: is_voice_clone_model && config.speaker_encoder_config.is_some(),
             tokenizer_encoder: is_voice_clone_model,
+            weight_only_f16: qwen3_tts_weight_only_f16(device, dtypes).dtype == DType::F16,
         })
     }
 }
@@ -1490,6 +1507,134 @@ fn qwen3_tts_dtype_override() -> Option<String> {
 
 const QWEN3_TTS_DTYPE_ENV: &str = "IZWI_QWEN_TTS_DTYPE";
 
+/// The talker and code predictor, their projections and the text embedding
+/// stored in F16 on `f16` when given (weight-only F16), else dense.
+fn load_qwen3_tts_transformers(
+    talker_config: &config::TalkerConfig,
+    code_predictor_config: &config::CodePredictorConfig,
+    talker_vb: &VarBuilder,
+    code_predictor_vb: &VarBuilder,
+    f16: Option<&Device>,
+) -> Result<(TalkerModel, CodePredictor)> {
+    let talker = TalkerModel::load(talker_config.clone(), talker_vb.pp("talker"), f16)?;
+    let code_predictor = CodePredictor::load(
+        code_predictor_config.clone(),
+        code_predictor_vb.pp("talker.code_predictor"),
+        talker_config.num_code_groups,
+        f16,
+    )?;
+    Ok((talker, code_predictor))
+}
+
+/// Talker positions the weight-only F16 self-check runs.
+const QWEN3_TTS_PROBE_TOKENS: usize = 16;
+
+/// The weight-only F16 load-time self-check (report 13): the conversions are
+/// checked against the original F32 weights (relative L2 at most
+/// [`F16_PROJECTION_MAX_RELATIVE_L2`]), then xorshift text tokens run
+/// through the text projection, every talker layer, the norm and the codec
+/// head on a scratch cache, and one greedy predictor frame from the last
+/// hidden state. Every probed tensor must be finite and inside the F16-safe
+/// range.
+fn qwen3_tts_weight_only_self_check(
+    talker: &TalkerModel,
+    code_predictor: &CodePredictor,
+    talker_vb: &VarBuilder,
+    code_predictor_vb: &VarBuilder,
+    talker_state_dtype: DType,
+    predictor_state_dtype: DType,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check("Qwen3-TTS weight-only F16", F16_SAFE_MAX_ABS, || {
+        let relative = talker.check_f16_conversion(&talker_vb.pp("talker"))?.max(
+            code_predictor.check_f16_conversion(&code_predictor_vb.pp("talker.code_predictor"))?,
+        );
+        if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3-TTS F16 weights differ from their F32 originals by relative L2 {relative:.3e}"
+            )));
+        }
+        qwen3_tts_numeric_probe(
+            talker,
+            code_predictor,
+            talker_state_dtype,
+            predictor_state_dtype,
+        )
+    })
+}
+
+/// The probe of [`qwen3_tts_weight_only_self_check`]: talker hidden states and
+/// logits, and the predictor frame's acoustic embedding sum.
+fn qwen3_tts_numeric_probe(
+    talker: &TalkerModel,
+    code_predictor: &CodePredictor,
+    talker_state_dtype: DType,
+    predictor_state_dtype: DType,
+) -> Result<Vec<(String, Tensor)>> {
+    let device = talker.device().clone();
+    let cfg = talker.config();
+    let draws = xorshift_values(QWEN3_TTS_PROBE_TOKENS + 1, 0x7151, 1.0);
+    let pick = |draw: f32, limit: usize| ((draw.abs() * limit as f32) as u32).min(limit as u32 - 1);
+    let ids = draws[..QWEN3_TTS_PROBE_TOKENS]
+        .iter()
+        .map(|draw| pick(*draw, cfg.text_vocab_size))
+        .collect::<Vec<_>>();
+    let embeds = talker.get_projected_text_embeddings(&ids)?;
+    let mut talker_cache = TalkerPhysicalCache::scratch_for_probe(
+        &device,
+        talker_state_dtype,
+        cfg.num_hidden_layers,
+        cfg.num_key_value_heads,
+        cfg.head_dim(),
+        QWEN3_TTS_PROBE_TOKENS,
+    )?;
+    let (hidden, logits) = talker.prefill_physical_with_embeds(&embeds, &mut talker_cache, None)?;
+    let predictor_cfg = code_predictor.config();
+    let mut predictor_cache = CodePredictorPhysicalCache::scratch_for_probe(
+        &device,
+        predictor_state_dtype,
+        predictor_cfg.num_hidden_layers,
+        predictor_cfg.num_key_value_heads,
+        predictor_cfg.head_dim(),
+        code_predictor.physical_context_tokens_per_frame(),
+    )?;
+    let semantic = talker.get_codec_embedding(pick(
+        draws[QWEN3_TTS_PROBE_TOKENS],
+        2048.min(cfg.vocab_size),
+    ))?;
+    let codes = code_predictor.generate_acoustic_codes_physical(
+        &hidden,
+        &semantic,
+        &mut predictor_cache,
+        &mut CodeSelection::Greedy,
+    )?;
+    let acoustic = code_predictor.get_acoustic_embeddings_sum(&codes)?;
+    Ok(vec![
+        ("talker_hidden".to_string(), hidden),
+        ("talker_logits".to_string(), logits),
+        ("predictor_embedding_sum".to_string(), acoustic),
+    ])
+}
+
+/// Weight-only F16 for the talker and code predictor (QTTS-10/11): on Metal,
+/// when both compute in F32, their projections and the text embedding are
+/// stored in F16 while activations, norms, softmax, RoPE and logits stay
+/// F32, behind a load-time self-check with F32 fallback.
+/// `IZWI_QWEN_TTS_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) keeps every weight
+/// F32; an explicit lower-precision compute dtype keeps its dense plan.
+pub(crate) fn qwen3_tts_weight_only_f16(
+    device: &DeviceProfile,
+    plan: Qwen3TtsDTypePlan,
+) -> DTypeSelection {
+    if !device.kind.is_metal() || plan.talker != DType::F32 || plan.code_predictor != DType::F32 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: "weight-only F16 applies to F32 talker/predictor compute on Metal".into(),
+        };
+    }
+    let raw = qwen3_tts_dtype_override();
+    device.resolve_metal_weight_only_f16(raw.as_deref().map(|raw| (QWEN3_TTS_DTYPE_ENV, raw)))
+}
+
 fn select_qwen3_tts_dtypes(
     device: &DeviceProfile,
     dtype_override: Option<&str>,
@@ -1523,8 +1668,9 @@ fn select_qwen3_tts_dtypes(
         // component produces structurally valid but corrupted speech.
         DType::F32
     } else if device.kind.is_metal() {
-        // VoiceDesign remains safe at F16 and benefits from lower residency.
-        DType::F16
+        // VoiceDesign computes in F32 too; its residency comes from the
+        // weight-only F16 tier (QTTS-10), not from all-F16 compute.
+        DType::F32
     } else {
         device.select_model_dtype(ModelFamily::Qwen3Tts, None)
     };
@@ -1816,13 +1962,7 @@ impl Qwen3TtsModel {
             }
         };
 
-        // Load talker model
-        info!("Loading talker model...");
-        let talker = TalkerModel::load(config.talker_config.clone(), talker_vb.pp("talker"))?;
-
-        // Load code predictor
-        info!("Loading code predictor...");
-        let num_code_groups = config.talker_config.num_code_groups;
+        info!("Loading talker and code predictor...");
         // For 1.7B model, codec embeddings use talker.text_hidden_size (2048)
         // For 0.6B model, codec embeddings use code_predictor.hidden_size (1024)
         // Detect 1.7B by checking if talker.hidden_size differs from code_predictor.hidden_size
@@ -1831,11 +1971,40 @@ impl Qwen3TtsModel {
             // 1.7B case: codec embeddings use text_hidden_size dimension
             code_predictor_config.text_hidden_size = Some(config.talker_config.text_hidden_size);
         }
-        let code_predictor = CodePredictor::load(
-            code_predictor_config,
-            code_predictor_vb.pp("talker.code_predictor"),
-            num_code_groups,
+        let weight_only = qwen3_tts_weight_only_f16(&device, dtype_plan);
+        let ((talker, code_predictor), weight_precision) = load_weight_only_f16(
+            "Qwen3-TTS",
+            &weight_only,
+            &device.device,
+            |f16| {
+                load_qwen3_tts_transformers(
+                    &config.talker_config,
+                    &code_predictor_config,
+                    &talker_vb,
+                    &code_predictor_vb,
+                    f16,
+                )
+            },
+            |(talker, code_predictor)| {
+                qwen3_tts_weight_only_self_check(
+                    talker,
+                    code_predictor,
+                    &talker_vb,
+                    &code_predictor_vb,
+                    talker_state_dtype,
+                    predictor_state_dtype,
+                )
+            },
         )?;
+        info!(
+            "Qwen3-TTS projection weights: {} ({})",
+            if weight_precision.projections_f16 {
+                "F16"
+            } else {
+                "dense"
+            },
+            weight_precision.reason
+        );
 
         // Load speech tokenizer decoder
         info!("Loading speech tokenizer decoder...");
@@ -1877,6 +2046,7 @@ impl Qwen3TtsModel {
             speech_tokenizer,
             speaker_encoder,
             config,
+            weight_precision,
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
         })
@@ -2131,6 +2301,7 @@ impl Qwen3TtsModel {
             vocab_size: self.config.talker_config.vocab_size,
             text_vocab_size: self.config.talker_config.text_vocab_size,
             num_code_groups: self.config.talker_config.num_code_groups,
+            weight_precision: self.weight_precision.diagnostics(),
             device_sampling: qwen_tts_uses_device_sampling(&self.device),
             cuda_sampling: self.device.kind.is_cuda(),
             codec_decode: self.speech_tokenizer.decode_stats(),
@@ -5461,15 +5632,10 @@ pub(crate) mod tests {
         let metal_base = select_qwen3_tts_dtypes(&metal, None, false, true).unwrap();
         assert_eq!(metal_base, metal_custom);
 
+        // VoiceDesign computes in F32 like the others; its residency comes
+        // from the weight-only F16 tier (QTTS-10).
         let metal_voice_design = select_qwen3_tts_dtypes(&metal, None, false, false).unwrap();
-        assert_eq!(
-            metal_voice_design,
-            Qwen3TtsDTypePlan {
-                talker: DType::F16,
-                code_predictor: DType::F16,
-                speech_tokenizer: DType::F16,
-            }
-        );
+        assert_eq!(metal_voice_design, metal_custom);
     }
 
     #[test]
@@ -5542,6 +5708,266 @@ pub(crate) mod tests {
                 .talker,
             DType::F16
         );
+    }
+
+    /// QTTS-10/11: on Metal every Qwen3-TTS variant takes weight-only F16
+    /// for its talker and predictor (F32 compute), `IZWI_QWEN_TTS_DTYPE=f32`
+    /// keeps every weight F32, an explicit lower compute dtype keeps its dense
+    /// plan, and CPU/CUDA never take the tier. The load layout reports it.
+    #[test]
+    fn metal_qwen_tts_takes_weight_only_f16_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = (
+            std::env::var(QWEN3_TTS_DTYPE_ENV).ok(),
+            std::env::var("IZWI_METAL_DTYPE").ok(),
+        );
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        for (custom_voice, clone) in [(true, false), (false, true), (false, false)] {
+            let plan = select_qwen3_tts_dtypes(&metal, None, custom_voice, clone).unwrap();
+            assert_eq!(plan.talker, DType::F32);
+            let tier = qwen3_tts_weight_only_f16(&metal, plan);
+            assert_eq!(tier.dtype, DType::F16, "{}", tier.reason);
+        }
+        std::env::set_var(QWEN3_TTS_DTYPE_ENV, "f32");
+        let plan = select_qwen3_tts_dtypes(&metal, Some("f32"), true, false).unwrap();
+        assert_eq!(qwen3_tts_weight_only_f16(&metal, plan).dtype, DType::F32);
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        let voice_design_f16 = select_qwen3_tts_dtypes(&metal, Some("f16"), false, false).unwrap();
+        assert_eq!(voice_design_f16.talker, DType::F16);
+        assert_eq!(
+            qwen3_tts_weight_only_f16(&metal, voice_design_f16).dtype,
+            DType::F32
+        );
+        for kind in [DeviceKind::Cpu, DeviceKind::Cuda] {
+            let profile = dtype_test_profile(kind, true, true);
+            let plan = select_qwen3_tts_dtypes(&profile, None, true, false).unwrap();
+            assert_eq!(qwen3_tts_weight_only_f16(&profile, plan).dtype, DType::F32);
+        }
+
+        for (name, value) in [
+            (QWEN3_TTS_DTYPE_ENV, previous.0),
+            ("IZWI_METAL_DTYPE", previous.1),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// The tiny talker + predictor checkpoint for weight-only F16 tests:
+    /// xorshift weights (the MLP gate projections scaled by `gate_scale`)
+    /// under the names `load_qwen3_tts_transformers` reads.
+    fn tiny_transformer_tensors(
+        talker_cfg: &config::TalkerConfig,
+        gate_scale: f32,
+    ) -> std::collections::HashMap<String, Tensor> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = candle_core::Device::Cpu;
+        let h = talker_cfg.hidden_size;
+        let p = &talker_cfg.code_predictor_config;
+        let mut shapes: Vec<(String, Vec<usize>)> = vec![
+            (
+                "talker.model.text_embedding.weight".into(),
+                vec![talker_cfg.text_vocab_size, talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc1.weight".into(),
+                vec![talker_cfg.text_hidden_size, talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc1.bias".into(),
+                vec![talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc2.weight".into(),
+                vec![h, talker_cfg.text_hidden_size],
+            ),
+            ("talker.text_projection.linear_fc2.bias".into(), vec![h]),
+            (
+                "talker.model.codec_embedding.weight".into(),
+                vec![talker_cfg.vocab_size, h],
+            ),
+            (
+                "talker.codec_head.weight".into(),
+                vec![talker_cfg.vocab_size, h],
+            ),
+        ];
+        let layer =
+            |prefix: &str, hidden: usize, inter: usize, heads: usize, kv: usize, hd: usize| {
+                vec![
+                    (
+                        format!("{prefix}.self_attn.q_proj.weight"),
+                        vec![heads * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.k_proj.weight"),
+                        vec![kv * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.v_proj.weight"),
+                        vec![kv * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.o_proj.weight"),
+                        vec![hidden, heads * hd],
+                    ),
+                    (
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        vec![inter, hidden],
+                    ),
+                    (format!("{prefix}.mlp.up_proj.weight"), vec![inter, hidden]),
+                    (
+                        format!("{prefix}.mlp.down_proj.weight"),
+                        vec![hidden, inter],
+                    ),
+                ]
+            };
+        shapes.extend(layer(
+            "talker.model.layers.0",
+            h,
+            talker_cfg.intermediate_size,
+            talker_cfg.num_attention_heads,
+            talker_cfg.num_key_value_heads,
+            talker_cfg.head_dim(),
+        ));
+        shapes.extend(layer(
+            "talker.code_predictor.model.layers.0",
+            p.hidden_size,
+            p.intermediate_size,
+            p.num_attention_heads,
+            p.num_key_value_heads,
+            p.head_dim(),
+        ));
+        for group in 0..talker_cfg.num_code_groups.min(15) {
+            shapes.push((
+                format!("talker.code_predictor.model.codec_embedding.{group}.weight"),
+                vec![p.vocab_size, p.hidden_size],
+            ));
+            shapes.push((
+                format!("talker.code_predictor.lm_head.{group}.weight"),
+                vec![p.vocab_size, p.hidden_size],
+            ));
+        }
+        let mut tensors = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, shape))| {
+                let scale = if name.ends_with("mlp.gate_proj.weight") {
+                    gate_scale
+                } else {
+                    0.4
+                };
+                let tensor =
+                    xorshift_tensor(&shape, 0x9E37 + index as u64, scale, &device).unwrap();
+                (name, tensor)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for (prefix, hidden, hd) in [
+            ("talker.model", h, talker_cfg.head_dim()),
+            ("talker.code_predictor.model", p.hidden_size, p.head_dim()),
+        ] {
+            let ones = |n: usize| Tensor::ones(n, DType::F32, &device).unwrap();
+            tensors.insert(format!("{prefix}.norm.weight"), ones(hidden));
+            for name in ["input_layernorm", "post_attention_layernorm"] {
+                tensors.insert(format!("{prefix}.layers.0.{name}.weight"), ones(hidden));
+            }
+            for name in ["q_norm", "k_norm"] {
+                tensors.insert(
+                    format!("{prefix}.layers.0.self_attn.{name}.weight"),
+                    ones(hd),
+                );
+            }
+        }
+        tensors
+    }
+
+    /// QTTS-10/11: on the tiny checkpoint, weight-only F16 transformers
+    /// (the CPU's dense-F16 path) pass the self-check and track the dense
+    /// F32 probe; F16 weights that overflow fail it, and the load falls
+    /// back to dense F32 with the reason recorded.
+    #[test]
+    fn weight_only_f16_transformers_pass_the_self_check_or_fall_back() {
+        let device = candle_core::Device::Cpu;
+        let talker_cfg = talker::tests::tiny_talker(&device).config().clone();
+        let predictor_cfg = talker_cfg.code_predictor_config.clone();
+        let vb_for = |gate_scale| {
+            candle_nn::VarBuilder::from_tensors(
+                tiny_transformer_tensors(&talker_cfg, gate_scale),
+                DType::F32,
+                &device,
+            )
+        };
+        let load = |vb: &candle_nn::VarBuilder, f16| {
+            load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, vb, vb, f16).unwrap()
+        };
+        let vb = vb_for(0.4);
+        let (dense_talker, dense_predictor) = load(&vb, None);
+        let (half_talker, half_predictor) = load(&vb, Some(&device));
+        let dense =
+            qwen3_tts_numeric_probe(&dense_talker, &dense_predictor, DType::F32, DType::F32)
+                .unwrap();
+        let report = qwen3_tts_weight_only_self_check(
+            &half_talker,
+            &half_predictor,
+            &vb,
+            &vb,
+            DType::F32,
+            DType::F32,
+        );
+        assert!(report.passed, "{}", report.reason);
+        // The F16 weights are really F16 (rounded), the dense ones untouched.
+        assert!(half_talker.projections_f16() && half_predictor.projections_f16());
+        assert!(!dense_talker.projections_f16() && !dense_predictor.projections_f16());
+        let rounding = half_talker.check_f16_conversion(&vb.pp("talker")).unwrap();
+        assert!(rounding > 0.0 && rounding < 1e-2, "{rounding}");
+        assert_eq!(
+            dense_talker.check_f16_conversion(&vb.pp("talker")).unwrap(),
+            0.0
+        );
+        let half =
+            qwen3_tts_numeric_probe(&half_talker, &half_predictor, DType::F32, DType::F32).unwrap();
+        for ((name, d), (_, h)) in dense.iter().zip(&half).take(2) {
+            let d = crate::kernels::numeric_check::host_f32(d).unwrap();
+            let h = crate::kernels::numeric_check::host_f32(h).unwrap();
+            let relative = crate::kernels::numeric_check::relative_l2(&h, &d);
+            assert!(relative < 1e-2, "{name}: relative L2 {relative}");
+        }
+
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test tier".into(),
+        };
+        for (gate_scale, expect_f16) in [(0.4f32, true), (1e6, false)] {
+            let vb = vb_for(gate_scale);
+            let (_, precision) = load_weight_only_f16(
+                "tiny Qwen3-TTS",
+                &selection,
+                &device,
+                |f16| load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, &vb, &vb, f16),
+                |(talker, predictor)| {
+                    qwen3_tts_weight_only_self_check(
+                        talker,
+                        predictor,
+                        &vb,
+                        &vb,
+                        DType::F32,
+                        DType::F32,
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                precision.projections_f16, expect_f16,
+                "{}",
+                precision.reason
+            );
+        }
     }
 
     #[test]

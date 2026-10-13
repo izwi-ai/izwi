@@ -14,6 +14,7 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{projection_var_builder, ProjectionLinear};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::tts::config::TalkerConfig;
 use crate::models::architectures::qwen3::tts::rope::{
@@ -25,10 +26,10 @@ use crate::models::shared::weights::mlx;
 
 /// Multi-head attention with optional Q/K normalization
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: ProjectionLinear,
+    k_proj: ProjectionLinear,
+    v_proj: ProjectionLinear,
+    o_proj: ProjectionLinear,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     num_heads: usize,
@@ -40,28 +41,41 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(cfg: &TalkerConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &TalkerConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let pvb = projection_var_builder(&vb, f16);
         let head_dim = cfg.head_dim();
 
-        let q_proj = mlx::load_linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_attention_heads * head_dim,
-            vb.pp("q_proj"),
+        let q_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(
+                cfg.hidden_size,
+                cfg.num_attention_heads * head_dim,
+                pvb.pp("q_proj"),
+            )?,
+            f16,
         )?;
-        let k_proj = mlx::load_linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("k_proj"),
+        let k_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(
+                cfg.hidden_size,
+                cfg.num_key_value_heads * head_dim,
+                pvb.pp("k_proj"),
+            )?,
+            f16,
         )?;
-        let v_proj = mlx::load_linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_key_value_heads * head_dim,
-            vb.pp("v_proj"),
+        let v_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(
+                cfg.hidden_size,
+                cfg.num_key_value_heads * head_dim,
+                pvb.pp("v_proj"),
+            )?,
+            f16,
         )?;
-        let o_proj = mlx::load_linear_no_bias(
-            cfg.num_attention_heads * head_dim,
-            cfg.hidden_size,
-            vb.pp("o_proj"),
+        let o_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(
+                cfg.num_attention_heads * head_dim,
+                cfg.hidden_size,
+                pvb.pp("o_proj"),
+            )?,
+            f16,
         )?;
 
         // Q/K normalization (optional, for Qwen3)
@@ -343,19 +357,26 @@ impl Attention {
 
 /// SwiGLU MLP
 struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: ProjectionLinear,
+    up_proj: ProjectionLinear,
+    down_proj: ProjectionLinear,
 }
 
 impl Mlp {
-    fn load(cfg: &TalkerConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj =
-            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj =
-            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj =
-            mlx::load_linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+    fn load(cfg: &TalkerConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let pvb = projection_var_builder(&vb, f16);
+        let gate_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, pvb.pp("gate_proj"))?,
+            f16,
+        )?;
+        let up_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(cfg.hidden_size, cfg.intermediate_size, pvb.pp("up_proj"))?,
+            f16,
+        )?;
+        let down_proj = ProjectionLinear::new(
+            mlx::load_linear_no_bias(cfg.intermediate_size, cfg.hidden_size, pvb.pp("down_proj"))?,
+            f16,
+        )?;
 
         Ok(Self {
             gate_proj,
@@ -382,16 +403,16 @@ struct Layer {
 }
 
 impl Layer {
-    fn load(cfg: &TalkerConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &TalkerConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
         let input_layernorm =
             candle_nn::rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let self_attn = Attention::load(cfg, vb.pp("self_attn"))?;
+        let self_attn = Attention::load(cfg, vb.pp("self_attn"), f16)?;
         let post_attention_layernorm = candle_nn::rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Mlp::load(cfg, vb.pp("mlp"))?;
+        let mlp = Mlp::load(cfg, vb.pp("mlp"), f16)?;
 
         Ok(Self {
             input_layernorm,
@@ -452,14 +473,26 @@ impl Layer {
 
 /// Text projection MLP to project text embeddings to model hidden size
 struct TextProjection {
-    linear_fc1: Linear,
-    linear_fc2: Linear,
+    linear_fc1: ProjectionLinear,
+    linear_fc2: ProjectionLinear,
 }
 
 impl TextProjection {
-    fn load(text_hidden_size: usize, hidden_size: usize, vb: VarBuilder) -> Result<Self> {
-        let linear_fc1 = mlx::load_linear(text_hidden_size, text_hidden_size, vb.pp("linear_fc1"))?;
-        let linear_fc2 = mlx::load_linear(text_hidden_size, hidden_size, vb.pp("linear_fc2"))?;
+    fn load(
+        text_hidden_size: usize,
+        hidden_size: usize,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
+        let pvb = projection_var_builder(&vb, f16);
+        let linear_fc1 = ProjectionLinear::new(
+            mlx::load_linear(text_hidden_size, text_hidden_size, pvb.pp("linear_fc1"))?,
+            f16,
+        )?;
+        let linear_fc2 = ProjectionLinear::new(
+            mlx::load_linear(text_hidden_size, hidden_size, pvb.pp("linear_fc2"))?,
+            f16,
+        )?;
         Ok(Self {
             linear_fc1,
             linear_fc2,
@@ -473,9 +506,62 @@ impl TextProjection {
     }
 }
 
+/// The text embedding table (`text_vocab x text_hidden`, the talker's
+/// largest tensor): dense, or stored in F16 with gathered rows widened to
+/// F32 (weight-only F16, like the projections).
+enum TextEmbeddingTable {
+    Dense(Embedding),
+    /// The F16 table and the relative L2 of the conversion on sampled rows.
+    F16(Tensor, f64),
+}
+
+impl TextEmbeddingTable {
+    fn load(vocab: usize, hidden: usize, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let Some(device) = f16 else {
+            return Ok(Self::Dense(mlx::load_embedding(vocab, hidden, vb)?));
+        };
+        let host = mlx::load_embedding(vocab, hidden, projection_var_builder(&vb, f16))?;
+        let table = host.embeddings().to_dtype(DType::F32)?;
+        let f16_table = table.to_dtype(DType::F16)?;
+        // Check the conversion against the original F32 rows before they are
+        // dropped (every 257th row: unstructured, cheap).
+        let rows = (0..vocab as u32).step_by(257).collect::<Vec<_>>();
+        let rows = Tensor::from_vec(rows.clone(), rows.len(), &Device::Cpu)?;
+        let original = table
+            .index_select(&rows, 0)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let converted = f16_table
+            .index_select(&rows, 0)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let relative = crate::kernels::numeric_check::relative_l2(&converted, &original);
+        Ok(Self::F16(f16_table.to_device(device)?, relative))
+    }
+
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(embedding) => embedding.forward(ids).map_err(Error::from),
+            Self::F16(table, _) => table
+                .index_select(ids, 0)?
+                .to_dtype(DType::F32)
+                .map_err(Error::from),
+        }
+    }
+
+    /// The F16 conversion's relative L2 on sampled rows; `None` when dense.
+    fn f16_relative_l2(&self) -> Option<f64> {
+        match self {
+            Self::Dense(_) => None,
+            Self::F16(_, relative) => Some(*relative),
+        }
+    }
+}
+
 /// Qwen3-TTS Talker model
 pub struct TalkerModel {
-    text_embedding: Embedding,
+    text_embedding: TextEmbeddingTable,
     text_projection: TextProjection,
     codec_embedding: Embedding,
     layers: Vec<Layer>,
@@ -495,16 +581,20 @@ pub struct TalkerPhysicalBatchOutput {
 
 impl TalkerModel {
     /// Load the talker model from VarBuilder
-    pub fn load(cfg: TalkerConfig, vb: VarBuilder) -> Result<Self> {
-        let text_embedding = mlx::load_embedding(
+    /// Load the talker. With `f16`, its projections and text embedding are
+    /// stored in F16 on that device (activations stay F32).
+    pub fn load(cfg: TalkerConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let text_embedding = TextEmbeddingTable::load(
             cfg.text_vocab_size,
             cfg.text_hidden_size,
             vb.pp("model.text_embedding"),
+            f16,
         )?;
         let text_projection = TextProjection::load(
             cfg.text_hidden_size,
             cfg.hidden_size,
             vb.pp("text_projection"),
+            f16,
         )?;
         let codec_embedding = mlx::load_embedding(
             cfg.vocab_size,
@@ -516,7 +606,7 @@ impl TalkerModel {
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for idx in 0..cfg.num_hidden_layers {
-            let layer = Layer::load(&cfg, vb.pp(format!("model.layers.{idx}")))?;
+            let layer = Layer::load(&cfg, vb.pp(format!("model.layers.{idx}")), f16)?;
             layers.push(layer);
         }
 
@@ -534,6 +624,55 @@ impl TalkerModel {
             cfg,
             use_mrope,
         })
+    }
+
+    /// Whether every layer's attention and MLP projections are stored as
+    /// weight-only F16.
+    pub fn projections_f16(&self) -> bool {
+        !self.layers.is_empty()
+            && self.layers.iter().all(|layer| {
+                [
+                    &layer.self_attn.q_proj,
+                    &layer.self_attn.k_proj,
+                    &layer.self_attn.v_proj,
+                    &layer.self_attn.o_proj,
+                    &layer.mlp.gate_proj,
+                    &layer.mlp.up_proj,
+                    &layer.mlp.down_proj,
+                ]
+                .iter()
+                .all(|projection| projection.as_f16().is_some())
+            })
+    }
+
+    pub fn config(&self) -> &TalkerConfig {
+        &self.cfg
+    }
+
+    /// Checks the weight-only F16 conversions against the original F32
+    /// weights: the first layer's MLP gate projection (re-read from `vb`, the
+    /// talker's builder) and the text embedding (sampled at load). A check
+    /// that compares converted weights with themselves cannot see a bad
+    /// conversion. Returns the worst relative L2; dense weights check nothing.
+    pub(crate) fn check_f16_conversion(&self, vb: &VarBuilder) -> Result<f64> {
+        let mut worst = 0f64;
+        if let Some(gate) = self.layers.first().and_then(|l| l.mlp.gate_proj.as_f16()) {
+            let host = projection_var_builder(vb, Some(&Device::Cpu));
+            let original = mlx::load_linear_no_bias(
+                self.cfg.hidden_size,
+                self.cfg.intermediate_size,
+                host.pp("model.layers.0.mlp.gate_proj"),
+            )?;
+            worst = worst.max(gate.check_against(original.weight(), None, 8)?);
+        }
+        if let Some(relative) = self.text_embedding.f16_relative_l2() {
+            worst = worst.max(if relative.is_finite() {
+                relative
+            } else {
+                f64::INFINITY
+            });
+        }
+        Ok(worst)
     }
 
     /// Get the device
@@ -1114,10 +1253,10 @@ pub(crate) mod tests {
             codec_language_id: HashMap::new(),
         };
         let attention = Attention {
-            q_proj: test_linear(4, 4, 1, device),
-            k_proj: test_linear(2, 4, 2, device),
-            v_proj: test_linear(2, 4, 3, device),
-            o_proj: test_linear(4, 4, 4, device),
+            q_proj: test_linear(4, 4, 1, device).into(),
+            k_proj: test_linear(2, 4, 2, device).into(),
+            v_proj: test_linear(2, 4, 3, device).into(),
+            o_proj: test_linear(4, 4, 4, device).into(),
             q_norm: None,
             k_norm: None,
             num_heads: 2,
@@ -1135,22 +1274,22 @@ pub(crate) mod tests {
                 1e-5,
             ),
             mlp: Mlp {
-                gate_proj: test_linear(8, 4, 5, device),
-                up_proj: test_linear(8, 4, 6, device),
-                down_proj: test_linear(4, 8, 7, device),
+                gate_proj: test_linear(8, 4, 5, device).into(),
+                up_proj: test_linear(8, 4, 6, device).into(),
+                down_proj: test_linear(4, 8, 7, device).into(),
             },
         };
         let embedding_values = (0..32)
             .map(|index| ((index * 5 % 17) as f32 - 8.0) / 16.0)
             .collect::<Vec<_>>();
         TalkerModel {
-            text_embedding: Embedding::new(
+            text_embedding: TextEmbeddingTable::Dense(Embedding::new(
                 Tensor::from_vec(embedding_values.clone(), (8, 4), device).unwrap(),
                 4,
-            ),
+            )),
             text_projection: TextProjection {
-                linear_fc1: test_linear(4, 4, 8, device),
-                linear_fc2: test_linear(4, 4, 9, device),
+                linear_fc1: test_linear(4, 4, 8, device).into(),
+                linear_fc2: test_linear(4, 4, 9, device).into(),
             },
             codec_embedding: Embedding::new(
                 Tensor::from_vec(embedding_values, (8, 4), device).unwrap(),
