@@ -15,7 +15,7 @@ pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
     CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
-pub use speech_tokenizer::SpeechTokenizerDecoder;
+pub use speech_tokenizer::{SpeechTokenizerDecodeStats, SpeechTokenizerDecoder};
 pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
@@ -1305,6 +1305,8 @@ pub struct Qwen3TtsDiagnostics {
     pub device_sampling: bool,
     /// Backward-compatible CUDA-specific capability flag.
     pub cuda_sampling: bool,
+    /// Windowed codec decode: window geometry and windows run since load.
+    pub codec_decode: SpeechTokenizerDecodeStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1894,6 +1896,7 @@ impl Qwen3TtsModel {
             num_code_groups: self.config.talker_config.num_code_groups,
             device_sampling: qwen_tts_uses_device_sampling(&self.device),
             cuda_sampling: self.device.kind.is_cuda(),
+            codec_decode: self.speech_tokenizer.decode_stats(),
         }
     }
 
