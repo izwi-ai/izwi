@@ -25,7 +25,8 @@ pub(crate) const CANONICAL_SPEECH_SAMPLE_RATE: u32 = 16_000;
 const CANONICAL_RESAMPLE_WINDOW_FRAMES: usize = 65_536;
 pub(crate) const MAX_REFERENCE_SOURCE_BYTES: usize = 32 * MIB;
 const MAX_REFERENCE_DECODED_BYTES: usize = 32 * MIB;
-const MAX_REFERENCE_DURATION_SECONDS: u64 = 30;
+const MAX_REFERENCE_DURATION_SECONDS: u64 =
+    crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS;
 const MAX_BASE64_AUDIO_METADATA_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,6 +6,7 @@
 mod budget;
 mod config;
 mod predictor;
+mod reference_cache;
 mod rope;
 mod speaker_encoder;
 mod speech_tokenizer;
@@ -1093,6 +1094,8 @@ pub struct Qwen3TtsModel {
     /// Whether the talker and predictor projections loaded as weight-only
     /// F16, why, and the self-check that decided.
     weight_precision: WeightOnlyF16Load,
+    /// Prepared voice-clone references, by reference audio.
+    reference_cache: reference_cache::ReferenceCache,
 }
 
 impl Qwen3TtsModel {
@@ -1435,6 +1438,8 @@ pub struct Qwen3TtsDiagnostics {
     pub codec_decode: SpeechTokenizerDecodeStats,
     /// Device-to-host readbacks on the decode path since start.
     pub host_readbacks_total: u64,
+    /// Voice-clone references prepared from the cache vs encoded.
+    pub reference_cache: reference_cache::ReferenceCacheStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2071,6 +2076,7 @@ impl Qwen3TtsModel {
             weight_precision,
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
+            reference_cache: reference_cache::ReferenceCache::default(),
         })
     }
 
@@ -2328,6 +2334,7 @@ impl Qwen3TtsModel {
             cuda_sampling: self.device.kind.is_cuda(),
             codec_decode: self.speech_tokenizer.decode_stats(),
             host_readbacks_total: qwen3_tts_host_readbacks(),
+            reference_cache: self.reference_cache.stats(),
         }
     }
 
@@ -2480,7 +2487,18 @@ impl Qwen3TtsModel {
         language: Option<&str>,
         params: &TtsGenerationParams,
     ) -> Result<PreparedTtsDecodePrefill> {
-        let ref_codec_tokens = self.encode_reference_audio(reference)?;
+        // The same reference (a saved voice, each long-form segment) is
+        // encoded once and then served from the cache (TPIPE-23).
+        let prepared = self.reference_cache.get_or_prepare(
+            reference_cache::ReferenceCache::key(&reference.audio_samples, reference.sample_rate),
+            || {
+                Ok(reference_cache::PreparedReference {
+                    codes: self.encode_reference_audio(reference)?,
+                    speaker_embedding: self.reference_speaker_embedding(reference)?,
+                })
+            },
+        )?;
+        let ref_codec_tokens = prepared.codes;
         if ref_codec_tokens.is_empty() || ref_codec_tokens[0].is_empty() {
             return Err(Error::ModelError(
                 "Voice cloning reference encoder produced no conditioning tokens".to_string(),
@@ -2506,7 +2524,7 @@ impl Qwen3TtsModel {
         }
 
         let language_id = self.resolve_language_id(language);
-        let speaker_embedding = self.reference_speaker_embedding(reference)?;
+        let speaker_embedding = prepared.speaker_embedding;
         let base_prefill = self.build_conditioned_prefill_embeddings(
             &[],
             speaker_embedding.as_ref().map(SpeakerPrefix::Embedding),

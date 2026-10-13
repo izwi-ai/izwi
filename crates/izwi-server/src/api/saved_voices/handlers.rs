@@ -107,6 +107,19 @@ pub async fn get_saved_voice_audio(
     Ok(audio_response(audio, query.download))
 }
 
+/// A saved voice is a voice-clone reference, so it is held to the reference
+/// limit at upload: a longer clip was accepted and then failed every use
+/// (TPIPE-23).
+fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
+    let limit = izwi_core::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS;
+    if duration_secs > limit as f32 {
+        return Err(ApiError::bad_request(format!(
+            "Reference audio is {duration_secs:.1} s; voice references are limited to {limit} s. Trim it to the clearest {limit} s or less."
+        )));
+    }
+    Ok(())
+}
+
 pub async fn create_saved_voice(
     State(state): State<AppState>,
     Json(req): Json<CreateSavedVoiceRequest>,
@@ -119,7 +132,8 @@ pub async fn create_saved_voice(
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("Missing required `audio_base64` field."))?;
     let audio_payload = decode_base64_audio_payload(audio_payload)?;
-    inspect_audio_payload_with_diagnostics("saved_voices.create", &audio_payload)?;
+    let inspection = inspect_audio_payload_with_diagnostics("saved_voices.create", &audio_payload)?;
+    validate_saved_voice_reference(inspection.duration_secs)?;
     let audio_mime_type = req
         .audio_mime_type
         .or_else(|| audio_payload.content_type_hint().map(str::to_string))
@@ -217,4 +231,19 @@ fn is_duplicate_name_error(err: &anyhow::Error) -> bool {
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
     ApiError::internal(format!("Saved voice storage error: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TPIPE-23: saved voices and synthesis share the 30 s reference limit.
+    #[test]
+    fn saved_voices_are_held_to_the_reference_limit_at_upload() {
+        assert!(validate_saved_voice_reference(12.0).is_ok());
+        assert!(validate_saved_voice_reference(30.0).is_ok());
+        let error = validate_saved_voice_reference(45.2).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("45.2 s") && error.message.contains("30 s"));
+    }
 }

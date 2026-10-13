@@ -1117,6 +1117,11 @@ impl SpeechModelCapabilities {
     /// is refused rather than silently clamped or dropped (TPIPE-10).
     pub const SPEED_RANGE: (f32, f32) = (0.5, 2.0);
 
+    /// The longest reference audio a voice-clone request or saved voice
+    /// carries, in seconds; longer audio is refused with 400 at upload and at
+    /// synthesis alike (TPIPE-23).
+    pub const MAX_REFERENCE_AUDIO_SECS: u64 = 30;
+
     /// Whether this model honours `speed`.
     pub fn honours_speed(&self, speed: f32) -> bool {
         speed == 1.0
