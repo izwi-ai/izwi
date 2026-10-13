@@ -3,6 +3,7 @@ use candle_nn::ops;
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
 
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::models::architectures::parakeet::asr::metal_kernels as parakeet_metal_kernels;
 use crate::models::shared::weights::gguf::GgufLoader;
 
@@ -505,30 +506,45 @@ impl ConformerConv {
         let x_b = x.i((.., hidden.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = if use_cuda_depthwise_candidate(&self.depthwise_conv, &x) {
+        x = self.depthwise_affine_swish(&x)?;
+        x = self.pointwise_conv2.forward(&x)?;
+
+        x.transpose(1, 2).map_err(Error::from)
+    }
+
+    fn depthwise_affine_swish(&self, x: &Tensor) -> Result<Tensor> {
+        if use_cuda_depthwise_candidate(&self.depthwise_conv, x) {
             // Fold the inference affine transform before the activation, as on Metal.
-            candle_depthwise_conv1d(
-                &x,
+            return candle_depthwise_conv1d(
+                x,
                 &self.folded_depthwise_weight,
                 &self.folded_depthwise_bias,
                 CUDA_DEPTHWISE_PRODUCT_ELEMENTS,
             )?
-            .silu()?
-        } else if let Some(fused) = try_forward_depthwise_conv1d_affine_swish(
+            .silu()
+            .map_err(Error::from);
+        }
+        if let Some(fused) = try_forward_depthwise_conv1d_affine_swish(
             &self.depthwise_conv,
             &self.folded_depthwise_weight,
             &self.folded_depthwise_bias,
-            &x,
+            x,
         ) {
-            fused
-        } else {
-            let x = forward_depthwise_conv1d(&self.depthwise_conv, &x)?;
-            let x = self.affine_norm.forward(&x)?;
-            swish(&x)?
-        };
-        x = self.pointwise_conv2.forward(&x)?;
-
-        x.transpose(1, 2).map_err(Error::from)
+            return Ok(fused);
+        }
+        if let Some(y) = try_metal_depthwise_conv1d(&self.depthwise_conv, x)? {
+            return swish(&self.affine_norm.forward(&y)?);
+        }
+        // CPU (and CUDA without the opt-in): the shared shift-and-accumulate op
+        // with the folded affine, instead of Candle's per-channel grouped conv.
+        let cfg = self.depthwise_conv.config();
+        let y = depthwise_conv1d(
+            x,
+            &self.folded_depthwise_weight,
+            Some(&self.folded_depthwise_bias),
+            DepthwiseConv1dSpec::symmetric(cfg.padding).with_dilation(cfg.dilation),
+        )?;
+        swish(&y)
     }
 }
 
@@ -621,7 +637,7 @@ fn candle_depthwise_conv1d(
     Tensor::cat(&chunks, 2).map_err(Error::from)
 }
 
-fn forward_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Tensor> {
+fn try_metal_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Option<Tensor>> {
     let cfg = conv.config();
     let Some(mut y) = parakeet_metal_kernels::try_depthwise_conv1d(
         x,
@@ -630,7 +646,7 @@ fn forward_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Tensor> {
         cfg.stride,
         cfg.dilation,
     ) else {
-        return conv.forward(x).map_err(Error::from);
+        return Ok(None);
     };
 
     if let Some(bias) = conv.bias() {
@@ -638,7 +654,7 @@ fn forward_depthwise_conv1d(conv: &Conv1d, x: &Tensor) -> Result<Tensor> {
         y = y.broadcast_add(&bias.reshape((1, channels, 1))?)?;
     }
 
-    Ok(y)
+    Ok(Some(y))
 }
 
 fn forward_depthwise_conv2d(conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
@@ -1472,6 +1488,67 @@ mod tests {
                 assert!(!super::use_cuda_depthwise_candidate(&conv, &input));
             }
         }
+    }
+
+    /// The CPU conformer conv path (shared shift-and-accumulate op with the
+    /// folded affine) matches Candle's grouped conv, the affine and swish.
+    #[test]
+    fn conformer_depthwise_shared_op_matches_candle_grouped_conv_and_affine() {
+        let device = Device::Cpu;
+        let mut state = 0xBB67_AE85_84CA_A73Bu64;
+        let mut tensor = |shape: &[usize], scale: f32, offset: f32| {
+            let n = shape.iter().product::<usize>();
+            let values = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    offset + scale * ((state >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                })
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let channels = 48;
+        let depthwise_conv = Conv1d::new(
+            tensor(&[channels, 1, 9], 0.4, 0.0),
+            Some(tensor(&[channels], 0.1, 0.0)),
+            Conv1dConfig {
+                padding: 4,
+                groups: channels,
+                ..Default::default()
+            },
+        );
+        let affine_norm = AffineNorm1d {
+            weight: tensor(&[channels], 0.5, 1.0),
+            bias: tensor(&[channels], 0.2, 0.0),
+        };
+        let (folded_depthwise_weight, folded_depthwise_bias) =
+            fold_depthwise_conv_affine(&depthwise_conv, &affine_norm).unwrap();
+        let pointwise = Conv1d::new(
+            tensor(&[channels, channels, 1], 0.1, 0.0),
+            None,
+            Conv1dConfig::default(),
+        );
+        let conv = super::ConformerConv {
+            pointwise_conv1: pointwise.clone(),
+            depthwise_conv,
+            affine_norm,
+            folded_depthwise_weight,
+            folded_depthwise_bias,
+            pointwise_conv2: pointwise,
+        };
+        let x = tensor(&[2, channels, 37], 1.0, 0.0);
+        let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        let actual = conv.depthwise_affine_swish(&x).unwrap();
+        assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+        let expected = super::swish(
+            &conv
+                .affine_norm
+                .forward(&conv.depthwise_conv.forward(&x).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_close(&actual, &expected, 1e-5);
     }
 
     #[test]
