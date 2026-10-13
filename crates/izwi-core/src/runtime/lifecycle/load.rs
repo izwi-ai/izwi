@@ -434,6 +434,58 @@ fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> Res
     }
 }
 
+/// One observed-usage checkpoint of a load (ADM-8): the device observer's
+/// reading and the ledger's reserved bytes, both in the load domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceUsageSample {
+    observed: u64,
+    reserved: u64,
+}
+
+/// Fixed part of the observed-materialization tolerance. Candle's Metal pool
+/// keeps a buffer per size class it has served even after a synchronization
+/// drops released ones, and the plan leaves out derived tensors under about
+/// 1 MiB per family; a CUDA context lazily allocates module and stream
+/// memory on its first kernels. A few hundred MiB covers these.
+const MATERIALIZATION_TOLERANCE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How far observed growth may exceed what the ledger authorized before the
+/// load fails: an eighth of the authorization (the plans' own conservative
+/// approximations, such as the Metal pool serving a smaller tensor from a
+/// larger freed buffer, are well inside that), and never less than
+/// [`MATERIALIZATION_TOLERANCE_FLOOR_BYTES`]. An excess beyond it means the
+/// plan prices a different representation than the loader allocates, which
+/// is the defect class the reconciliation exists to catch.
+fn materialization_tolerance_bytes(authorized_bytes: u64) -> u64 {
+    (authorized_bytes / 8).max(MATERIALIZATION_TOLERANCE_FLOOR_BYTES)
+}
+
+/// The device growth observed between two checkpoints of a load, failing the
+/// load when it exceeds what the ledger authorized over the same interval
+/// plus [`materialization_tolerance_bytes`]. `own_authorized_bytes` is what
+/// this load held before `before` was sampled (its weight peak); every lease
+/// reserved in between, the load's own state leases and any concurrent
+/// request workspace alike, is authorized through the ledger growth, so a
+/// concurrent allocation counts on both sides.
+fn reconcile_observed_growth(
+    variant: ModelVariant,
+    stage: &str,
+    before: DeviceUsageSample,
+    after: DeviceUsageSample,
+    own_authorized_bytes: u64,
+) -> Result<u64> {
+    let observed_growth = after.observed.saturating_sub(before.observed);
+    let authorized_bytes =
+        own_authorized_bytes.saturating_add(after.reserved.saturating_sub(before.reserved));
+    let tolerance_bytes = materialization_tolerance_bytes(authorized_bytes);
+    if observed_growth > authorized_bytes.saturating_add(tolerance_bytes) {
+        return Err(Error::ModelLoadError(format!(
+            "{variant} {stage} allocated more device memory than its admission authorized: observed_bytes={observed_growth}, authorized_bytes={authorized_bytes}, tolerance_bytes={tolerance_bytes}; the residency plan under-prices this load"
+        )));
+    }
+    Ok(observed_growth)
+}
+
 /// Static load peak that decides whether a Metal OOM retry can fit. The
 /// catalog's `memory_required_gb` is one coarse figure for every backend (80
 /// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
@@ -1207,19 +1259,29 @@ impl ModelLifecycleController {
         executions: &[LoadedExecutionContract],
         remaining_automatic_state_groups: u64,
     ) -> Result<()> {
-        let safety_reserve_bytes =
-            portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes);
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
         }
         let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
-        // ASR state leaves live room for the requests it serves (ADM-7).
+        // ASR state leaves live room for the requests it serves (ADM-7), and
+        // keeps the one reserve the retained fit keeps too (ADM-11): the
+        // configured floor or the measured untracked growth, not a catalog
+        // difference.
         let authority = self.coordinator.resource_authority();
-        let headroom = if asr_memory::is_asr_variant(variant) {
-            authority.state_fit_headroom_bytes(backend)?
+        let (headroom, safety_reserve_bytes) = if asr_memory::is_asr_variant(variant) {
+            (
+                authority.state_fit_headroom_bytes(backend)?,
+                authority.state_safety_reserve_bytes(
+                    backend,
+                    self.config.portable_context_reserve_bytes,
+                ),
+            )
         } else {
-            authority.planning_headroom_bytes(backend)?
+            (
+                authority.planning_headroom_bytes(backend)?,
+                portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes),
+            )
         };
         let ResourceAmount::Known(headroom_bytes) = headroom else {
             let Some((_, maximum)) = axis_bounds else {
@@ -1696,6 +1758,21 @@ impl ModelLifecycleController {
         }
     }
 
+    /// One reconciliation checkpoint for an ASR load, or `None` for other
+    /// families and backends without a device observer (CPU).
+    fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
+        if !asr_memory::is_asr_variant(variant) {
+            return None;
+        }
+        let authority = self.coordinator.resource_authority();
+        let observed = authority.observed_device_usage_bytes()?;
+        Some(DeviceUsageSample {
+            observed,
+            reserved: authority
+                .reserved_bytes_in_domain(self.backend_router.context().backend_kind),
+        })
+    }
+
     async fn reserve_model_resources(
         &self,
         requested_variant: ModelVariant,
@@ -1956,6 +2033,7 @@ impl ModelLifecycleController {
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
             let weights_started = Instant::now();
+            let usage_before_weights = self.sample_device_usage(variant);
             let instantiated = self.instantiate_model(acquired).await?;
             let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
             let preparation_started = Instant::now();
@@ -2062,6 +2140,36 @@ impl ModelLifecycleController {
             self.core_engine.synchronize_worker_device().await?;
             let upload_fence_ms = fence_started.elapsed().as_secs_f64() * 1000.0;
             self.publish_loaded_model(instantiated).await?;
+            let backend = self.backend_router.context().backend_kind;
+            // Truth reconciliation (ADM-8): the fence has executed every
+            // upload and dropped the staging Candle held, so the observed
+            // growth is what the weights occupy. A load that outgrew its
+            // authorized peak fails here, before any state is fitted beside
+            // a model the ledger under-counts.
+            let observed_weights = match usage_before_weights {
+                Some(before) => match self.sample_device_usage(variant) {
+                    Some(after) => {
+                        let own_bytes = match load_domain_bytes(
+                            resource_plan.load_authorization,
+                            backend,
+                        ) {
+                            ResourceAmount::Known(bytes) => bytes,
+                            ResourceAmount::Unknown => u64::MAX,
+                        };
+                        let observed =
+                            reconcile_observed_growth(variant, "weight load", before, after, own_bytes)?;
+                        info!(
+                            model = %variant,
+                            observed_bytes = observed,
+                            authorized_bytes = own_bytes,
+                            "Observed device growth of the weight load"
+                        );
+                        Some((backend, observed))
+                    }
+                    None => None,
+                },
+                None => None,
+            };
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
             // invocation state so live headroom does not charge the model once
@@ -2070,8 +2178,9 @@ impl ModelLifecycleController {
                 variant,
                 resource_plan.resident_authorization,
                 resource_plan.deferred_resident_authorization,
+                observed_weights,
             )?;
-            let backend = self.backend_router.context().backend_kind;
+            let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
             let state_started = Instant::now();
@@ -3144,6 +3253,21 @@ impl ModelLifecycleController {
                 self.model_registry
                     .publish_effective_context(variant, effective_context)?;
             }
+            if let Some(before) = usage_before_state {
+                // State arenas are zero-filled by queued blits; synchronize so
+                // the observation covers what they really occupy.
+                self.core_engine.synchronize_worker_device().await?;
+                if let Some(after) = self.sample_device_usage(variant) {
+                    let observed =
+                        reconcile_observed_growth(variant, "state allocation", before, after, 0)?;
+                    info!(
+                        model = %variant,
+                        observed_bytes = observed,
+                        authorized_bytes = after.reserved.saturating_sub(before.reserved),
+                        "Observed device growth of the state allocation"
+                    );
+                }
+            }
             let state_allocation_ms = state_started.elapsed().as_secs_f64() * 1000.0;
             let binding_started = Instant::now();
             self.bind_loaded_model_bundle_draft(
@@ -3350,8 +3474,9 @@ mod tests {
         is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
         loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
         model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
-        portable_invocation_context_intent,
-        qwen38_representation_memory_estimate, residency_budget_has_capacity,
+        materialization_tolerance_bytes, portable_invocation_context_intent,
+        qwen38_representation_memory_estimate, reconcile_observed_growth,
+        residency_budget_has_capacity, DeviceUsageSample,
         select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
         QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
@@ -4811,6 +4936,106 @@ mod tests {
         );
     }
 
+    /// Truth reconciliation (ADM-8): growth beyond the authorization plus the
+    /// tolerance fails the load; growth inside it, or matched by leases
+    /// reserved over the same interval (the load's own state, a concurrent
+    /// request), passes and reports the observed bytes.
+    #[test]
+    fn observed_growth_beyond_the_authorization_fails_the_load() {
+        const MIB: u64 = 1024 * 1024;
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let sample = |observed, reserved| DeviceUsageSample { observed, reserved };
+        let authorized = 4 * 1024 * MIB;
+        let tolerance = materialization_tolerance_bytes(authorized);
+        assert_eq!(tolerance, 512 * MIB);
+        assert_eq!(materialization_tolerance_bytes(MIB), 256 * MIB);
+
+        let before = sample(100 * MIB, authorized);
+        let within = sample(100 * MIB + authorized + tolerance, authorized);
+        assert_eq!(
+            reconcile_observed_growth(variant, "weight load", before, within, authorized).unwrap(),
+            authorized + tolerance
+        );
+        let over = sample(within.observed + 1, authorized);
+        let error = reconcile_observed_growth(variant, "weight load", before, over, authorized)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("under-prices"), "{error}");
+
+        // State leases reserved between the samples authorize their growth.
+        let state_before = sample(0, 1_000 * MIB);
+        let state_after = sample(1_200 * MIB, 2_000 * MIB);
+        assert!(reconcile_observed_growth(
+            variant,
+            "state allocation",
+            state_before,
+            state_after,
+            0
+        )
+        .is_ok());
+        let state_unauthorized = sample(1_200 * MIB, 1_000 * MIB);
+        assert!(reconcile_observed_growth(
+            variant,
+            "state allocation",
+            state_before,
+            state_unauthorized,
+            0
+        )
+        .is_err());
+        // A release elsewhere (observed shrinking) never fails a load.
+        assert_eq!(
+            reconcile_observed_growth(variant, "weight load", sample(MIB, 0), sample(0, 0), 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The weight lease records the smaller of the estimate and the observed
+    /// growth: priced bytes the loader never allocated stay pending.
+    #[tokio::test]
+    async fn observed_weight_growth_is_recorded_as_materialized() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-observed-weights-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let authority = vector_authority(all_memory_capacity(1024));
+        let bytes = |n| ResourceVector {
+            unified_bytes: ResourceAmount::Known(n),
+            ..ResourceVector::zero()
+        };
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "observed-weights"),
+                bytes(256),
+            )
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, lease)
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .finalize_slot_materialization_with_pending(
+                variant,
+                bytes(200),
+                ResourceVector::zero(),
+                Some((BackendKind::Metal, 150)),
+            )
+            .unwrap();
+        let snapshot = authority.snapshot();
+        assert_eq!(snapshot.reserved, bytes(200));
+        assert_eq!(snapshot.materialized, bytes(150));
+        assert_eq!(snapshot.pending, bytes(50));
+        assert!(runtime.model_lifecycle.remove_resident_slot(variant));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
     #[test]
     fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         let explicit = ContextLengthPreference::explicit(32_768).unwrap();
@@ -4967,7 +5192,7 @@ mod tests {
             .unwrap();
         runtime
             .model_lifecycle
-            .finalize_slot_materialization_with_pending(variant, bytes(64), bytes(16))
+            .finalize_slot_materialization_with_pending(variant, bytes(64), bytes(16), None)
             .unwrap();
         assert!(matches!(
             authority.reserve(

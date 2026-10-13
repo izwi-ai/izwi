@@ -350,6 +350,15 @@ pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         self.snapshot()
     }
+
+    /// Bytes this process has allocated on the inference device right now,
+    /// sampled fresh: Metal's `currentAllocatedSize`, or CUDA's used device
+    /// memory (total less free, read from the driver without touching
+    /// cudarc's shared error state). `None` when the backend has no device
+    /// observer (CPU), which skips observed reconciliation.
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,6 +756,56 @@ impl ResourceAuthority {
         })
     }
 
+    /// Fresh device usage from the provider's observer; see
+    /// [`PhysicalCapacityProvider::observed_device_usage_bytes`].
+    pub(crate) fn observed_device_usage_bytes(&self) -> Option<u64> {
+        self.provider.observed_device_usage_bytes()
+    }
+
+    /// Reserved bytes in `backend`'s canonical domain (every lease).
+    pub(crate) fn reserved_bytes_in_domain(&self, backend: BackendKind) -> u64 {
+        let reserved = self.snapshot().reserved;
+        known_bytes(self.domain_amount(reserved, backend))
+    }
+
+    /// Device memory the process holds outside every lease's materialized
+    /// usage, in `backend`'s domain: observed device usage less what the
+    /// ledger records as allocated (Candle pool slack, power-of-two rounding
+    /// of activations, command buffers, lazily grown backend contexts).
+    /// `None` without a device observer.
+    pub(crate) fn untracked_device_bytes(&self, backend: BackendKind) -> Option<u64> {
+        let observed = self.observed_device_usage_bytes()?;
+        let materialized = self.snapshot().materialized;
+        Some(observed.saturating_sub(known_bytes(self.domain_amount(materialized, backend))))
+    }
+
+    /// The one safety reserve ASR state fits leave free: the operator's
+    /// configured floor, or the measured untracked device memory when that is
+    /// larger. Untracked memory is what this process allocated outside any
+    /// lease so far; leaving at least as much beside the fitted state lets the
+    /// same growth recur without crowding the requests the state serves.
+    pub(crate) fn state_safety_reserve_bytes(
+        &self,
+        backend: BackendKind,
+        configured_floor_bytes: u64,
+    ) -> u64 {
+        self.untracked_device_bytes(backend)
+            .map_or(configured_floor_bytes, |untracked| {
+                untracked.max(configured_floor_bytes)
+            })
+    }
+
+    fn domain_amount(&self, resources: ResourceVector, backend: BackendKind) -> ResourceAmount {
+        match (self.domain_policy, backend) {
+            (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
+                resources.unified_bytes
+            }
+            (_, BackendKind::Cpu) => resources.host_bytes,
+            (_, BackendKind::Metal) => resources.unified_bytes,
+            (_, BackendKind::Cuda) => resources.device_bytes,
+        }
+    }
+
     /// The live sample less pending claims, in `backend`'s canonical domain,
     /// or `None` when the provider has no trustworthy sample.
     fn live_headroom_in_domain(&self, backend: BackendKind) -> Result<Option<u64>> {
@@ -1106,6 +1165,13 @@ impl ResourceAuthority {
             available: normalize_physical_resource_domains(physical.available, self.domain_policy),
             source: physical.source,
         }
+    }
+}
+
+fn known_bytes(amount: ResourceAmount) -> u64 {
+    match amount {
+        ResourceAmount::Known(bytes) => bytes,
+        ResourceAmount::Unknown => 0,
     }
 }
 
@@ -1885,6 +1951,71 @@ mod tests {
         );
         authority.poison("simulated backend failure");
         assert!(authority.state_fit_headroom_bytes(BackendKind::Cpu).is_err());
+    }
+
+    #[derive(Debug)]
+    struct ObservedProvider {
+        observed: Option<u64>,
+    }
+
+    impl PhysicalCapacityProvider for ObservedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: unified_bytes(10_000),
+                available: unified_bytes(10_000),
+                source: CapacitySource::Test,
+            }
+        }
+
+        fn observed_device_usage_bytes(&self) -> Option<u64> {
+            self.observed
+        }
+    }
+
+    /// The untracked gauge is the observed device usage less the ledger's
+    /// materialized bytes, and the one ASR safety reserve is the larger of it
+    /// and the configured floor; without an observer the floor stands.
+    #[test]
+    fn untracked_device_memory_sizes_the_state_safety_reserve() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedProvider {
+                observed: Some(900),
+            }),
+        ));
+        let model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(600),
+            )
+            .unwrap();
+        // Reserved but not yet allocated: everything observed is untracked.
+        assert_eq!(
+            authority.untracked_device_bytes(BackendKind::Metal),
+            Some(900)
+        );
+        model.reconcile_materialized(unified_bytes(500)).unwrap();
+        assert_eq!(
+            authority.untracked_device_bytes(BackendKind::Metal),
+            Some(400)
+        );
+        assert_eq!(authority.reserved_bytes_in_domain(BackendKind::Metal), 600);
+        assert_eq!(
+            authority.state_safety_reserve_bytes(BackendKind::Metal, 100),
+            400
+        );
+        assert_eq!(
+            authority.state_safety_reserve_bytes(BackendKind::Metal, 1_000),
+            1_000
+        );
+
+        let unobserved = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedProvider { observed: None }),
+        ));
+        assert_eq!(unobserved.untracked_device_bytes(BackendKind::Cpu), None);
+        assert_eq!(
+            unobserved.state_safety_reserve_bytes(BackendKind::Cpu, 1_000),
+            1_000
+        );
     }
 
     #[test]

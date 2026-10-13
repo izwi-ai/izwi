@@ -608,11 +608,17 @@ impl ManagedKvCacheManager {
         let Some(authority) = self.resource_authority.as_ref() else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let headroom_bytes = match headroom {
-            PortableFitHeadroom::Planning => {
-                authority.planning_headroom_bytes(self.worker_backend)?
-            }
-            PortableFitHeadroom::Live => authority.state_fit_headroom_bytes(self.worker_backend)?,
+        let (headroom_bytes, safety_reserve_bytes) = match headroom {
+            PortableFitHeadroom::Planning => (
+                authority.planning_headroom_bytes(self.worker_backend)?,
+                safety_reserve_bytes,
+            ),
+            // ASR state keeps the one reserve its invocation fit keeps too:
+            // the configured floor or the measured untracked growth (ADM-11).
+            PortableFitHeadroom::Live => (
+                authority.state_fit_headroom_bytes(self.worker_backend)?,
+                authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+            ),
         };
         let ResourceAmount::Known(headroom_bytes) = headroom_bytes else {
             return Ok(maximum_tokens.min(4_096));

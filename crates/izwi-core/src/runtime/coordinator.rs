@@ -678,15 +678,24 @@ impl InferenceCoordinator {
             .saturating_add(reserved_unified_memory_bytes);
         let materialized_device_memory_bytes =
             known_memory_bytes(authority.materialized.device_bytes);
-        let untracked_device_memory_bytes = match (
-            authority.physical.capacity.device_bytes,
-            authority.physical.available.device_bytes,
-        ) {
-            (ResourceAmount::Known(capacity), ResourceAmount::Known(available)) => capacity
-                .saturating_sub(available)
-                .saturating_sub(materialized_device_memory_bytes),
-            _ => 0,
-        };
+        // With a device observer (Metal's allocated size, CUDA's used device
+        // memory) this is what the process holds beyond every lease's
+        // materialized usage, in the backend's own domain; Metal has no
+        // device-domain capacity, so the capacity difference read zero there.
+        let untracked_device_memory_bytes = self
+            .resources
+            .untracked_device_bytes(self.backend)
+            .unwrap_or_else(|| {
+                match (
+                    authority.physical.capacity.device_bytes,
+                    authority.physical.available.device_bytes,
+                ) {
+                    (ResourceAmount::Known(capacity), ResourceAmount::Known(available)) => capacity
+                        .saturating_sub(available)
+                        .saturating_sub(materialized_device_memory_bytes),
+                    _ => 0,
+                }
+            });
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
@@ -1937,6 +1946,17 @@ impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         self.combined_snapshot(true)
     }
+
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        providers
+            .values()
+            .filter_map(|provider| provider.observed_device_usage_bytes())
+            .reduce(u64::saturating_add)
+    }
 }
 
 impl SharedHostUnifiedCapacityProvider {
@@ -2738,6 +2758,21 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
         self.cache.publish_sample(snapshot, sampled_at);
         snapshot
     }
+
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        if self.probe.test_capacity.is_some() {
+            return None;
+        }
+        let device = self.probe.device.as_ref()?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self.probe.backend {
+            BackendKind::Cpu => None,
+            BackendKind::Metal => metal_allocated_bytes(device),
+            BackendKind::Cuda => cuda_memory_snapshot(device)
+                .map(|(total, available, _)| total.saturating_sub(available)),
+        }))
+        .ok()
+        .flatten()
+    }
 }
 
 fn host_memory_snapshot() -> Option<(u64, u64)> {
@@ -2865,6 +2900,19 @@ fn metal_memory_snapshot(device: &DeviceProfile) -> Option<(u64, u64, CapacitySo
 
 #[cfg(not(feature = "metal"))]
 fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacitySource)> {
+    None
+}
+
+/// Metal buffers this process holds (`currentAllocatedSize`), Candle's pooled
+/// released buffers included until the device next synchronizes.
+#[cfg(feature = "metal")]
+fn metal_allocated_bytes(device: &DeviceProfile) -> Option<u64> {
+    let metal = device.device.as_metal_device().ok()?.metal_device();
+    u64::try_from(metal.current_allocated_size()).ok()
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_allocated_bytes(_device: &DeviceProfile) -> Option<u64> {
     None
 }
 

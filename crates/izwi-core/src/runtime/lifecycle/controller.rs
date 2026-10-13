@@ -437,16 +437,37 @@ impl ModelLifecycleController {
             variant,
             resident_resources,
             ResourceVector::zero(),
+            None,
         )
     }
 
+    /// Shrink the slot's lease from its load peak to `resident_resources`,
+    /// recording what is allocated. Without an observation that is the
+    /// estimate (resident less `deferred_resources`); with `observed` (the
+    /// backend and the device growth the weight load was observed to make,
+    /// ADM-8) the load domain records the smaller of the two: bytes the plan
+    /// priced but the loader never allocated stay a pending claim, and bytes
+    /// it allocated beyond the plan surface as untracked device memory.
     pub(super) fn finalize_slot_materialization_with_pending(
         &self,
         variant: ModelVariant,
         resident_resources: ResourceVector,
         deferred_resources: ResourceVector,
+        observed: Option<(crate::backends::BackendKind, u64)>,
     ) -> Result<()> {
-        let materialized = resident_resources.checked_sub(deferred_resources)?;
+        let mut materialized = resident_resources.checked_sub(deferred_resources)?;
+        if let Some((backend, observed_bytes)) = observed {
+            use crate::backends::BackendKind;
+            use crate::engine::ResourceAmount;
+            let domain = match backend {
+                BackendKind::Cpu => &mut materialized.host_bytes,
+                BackendKind::Metal => &mut materialized.unified_bytes,
+                BackendKind::Cuda => &mut materialized.device_bytes,
+            };
+            if let ResourceAmount::Known(estimate) = *domain {
+                *domain = ResourceAmount::Known(estimate.min(observed_bytes));
+            }
+        }
         let mut state = self.state();
         let slot = state.residents.get_mut(&variant).ok_or_else(|| {
             Error::ModelLoadError(format!(
