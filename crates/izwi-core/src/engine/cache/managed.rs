@@ -727,9 +727,16 @@ impl ManagedKvCacheManager {
             .min(maximum_tokens);
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
-            let message = format!(
+            tracing::warn!(
                 "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
                 minimum_bytes - floor_budget_bytes
+            );
+            let message = crate::engine::resources::capacity_shortfall_reason(
+                format_args!(
+                    "not enough memory for this model's minimum {minimum_tokens}-token state"
+                ),
+                minimum_bytes,
+                floor_budget_bytes,
             );
             // An ASR or TTS floor that planning headroom cannot hold is a
             // capacity refusal (503), not a load defect.
@@ -3880,9 +3887,17 @@ fn fit_resident_rows_and_reach(
         None => {
             let explicit = geometry(rows.retained_sequence_rows)?;
             if explicit.minimum_bytes > budget_bytes {
-                return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum: {}; {CUDA_EXPLICIT_ROWS_GUIDANCE}",
+                tracing::warn!(
+                    "CUDA managed context cannot fit the model-authored minimum: {}",
                     explicit.describe(headroom_bytes, safety_reserve_bytes)
+                );
+                return Err(Error::ModelLoadError(format!(
+                    "{}; {CUDA_EXPLICIT_ROWS_GUIDANCE}",
+                    crate::engine::resources::capacity_shortfall_reason(
+                        "CUDA managed context cannot fit the model-authored minimum",
+                        explicit.minimum_bytes,
+                        budget_bytes,
+                    )
                 )));
             }
             explicit
@@ -3893,9 +3908,17 @@ fn fit_resident_rows_and_reach(
                     .min(rows.retained_sequence_rows),
             )?;
             if floor.minimum_bytes > budget_bytes {
-                return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}; {CUDA_AUTOMATIC_ROWS_GUIDANCE}",
+                tracing::warn!(
+                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}",
                     floor.describe(headroom_bytes, safety_reserve_bytes)
+                );
+                return Err(Error::ModelLoadError(format!(
+                    "{}; {CUDA_AUTOMATIC_ROWS_GUIDANCE}",
+                    crate::engine::resources::capacity_shortfall_reason(
+                        "CUDA managed context cannot fit the model-authored minimum at the decode width",
+                        floor.minimum_bytes,
+                        budget_bytes,
+                    )
                 )));
             }
             let state_cap = (budget_bytes as f64 * fraction) as u64;
@@ -6739,8 +6762,10 @@ mod tests {
                         message.contains("IZWI_MAX_STAGED_TRANSACTIONS"),
                         "{message}"
                     );
+                    // The client sees the short shortfall; the geometry
+                    // (per-sequence bytes, rows) is logged.
                     assert!(
-                        message.contains(&format!("per_sequence_state_bytes={per_sequence}")),
+                        message.contains(" GB, ") && !message.contains("per_sequence_state_bytes="),
                         "{message}"
                     );
                     continue;

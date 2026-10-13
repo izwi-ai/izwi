@@ -1223,6 +1223,21 @@ fn known_bytes(amount: ResourceAmount) -> u64 {
     }
 }
 
+/// The short reason a client sees when `subject` needs more memory than is
+/// available: "{subject}: needs X GB, Y GB available". Callers log the
+/// detail (headroom, reserve, geometry) beside it.
+pub(crate) fn capacity_shortfall_reason(
+    subject: impl std::fmt::Display,
+    need_bytes: u64,
+    available_bytes: u64,
+) -> String {
+    format!(
+        "{subject}: needs {:.2} GB, {:.2} GB available",
+        need_bytes as f64 / 1e9,
+        available_bytes as f64 / 1e9
+    )
+}
+
 /// The short reason a client sees when live memory refuses a claim: the
 /// first domain where `need` plus what is already held for admitted work
 /// exceeds `available`, in GB. The full vectors are logged by the caller.

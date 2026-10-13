@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::config::ContextLengthPreference;
+use crate::engine::resources::capacity_shortfall_reason;
 use crate::engine::{
     AdapterInstanceId, CacheMode, ModelInstanceId, ReservationClass, ReservationOwner,
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
@@ -1447,8 +1448,13 @@ impl ModelLifecycleController {
         let Some((minimum, maximum)) = axis_bounds else {
             let bytes = required(None)?;
             if bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!("not enough memory for {variant}'s working state"),
+                    bytes,
+                    budget,
                 )));
             }
             return Ok(());
@@ -1463,8 +1469,13 @@ impl ModelLifecycleController {
         let selected = if let PortableInvocationContextIntent::Explicit { selected } = intent {
             let bytes = required(Some(selected))?;
             if bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!("not enough memory for {variant} at a {selected}-token context"),
+                    bytes,
+                    budget,
                 )));
             }
             selected
@@ -1486,8 +1497,15 @@ impl ModelLifecycleController {
             }
             let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!(
+                        "not enough memory for {variant}'s minimum {minimum}-token context"
+                    ),
+                    minimum_bytes,
+                    budget,
                 )));
             }
             let (mut low, mut high) = (minimum, ceiling);
@@ -1875,8 +1893,16 @@ impl ModelLifecycleController {
                         .refresh_physical_capacity_after_release();
                     continue;
                 }
+                tracing::warn!(
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}"
+                );
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
+                    "{}; no idle resident model is available for eviction; unload a model to make room",
+                    capacity_shortfall_reason(
+                        format_args!("Cannot load {requested_variant}"),
+                        required_bytes,
+                        headroom,
+                    )
                 )));
             };
             info!(
@@ -6615,7 +6641,12 @@ mod tests {
         let tight = TTS_CHARGED_WEIGHT_BYTES + GIB + 64 * 1024 * 1024;
         match load_tts_retained_state(variant, &contract, maximum, tight, tight, observed) {
             Err(Error::Overloaded(message)) => {
-                assert!(message.contains("shortfall_bytes="), "{message}")
+                assert!(
+                    message.starts_with("not enough memory for this model's minimum")
+                        && message.contains(" GB, ")
+                        && !message.contains("planning_headroom="),
+                    "{message}"
+                )
             }
             other => panic!("expected a capacity refusal, got {other:?}"),
         }
