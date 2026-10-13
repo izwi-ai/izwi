@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, Module,
     RmsNorm, VarBuilder,
@@ -15,6 +15,7 @@ use crate::backends::state::{
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{depthwise_conv1d, is_depthwise_conv1d, DepthwiseConv1dSpec};
+use crate::kernels::f16_weight_linear::{projection_var_builder, ProjectionLinear};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateDomainId, StateUpdateKind,
@@ -79,19 +80,25 @@ pub struct VibeVoiceAcousticTokenizer {
 
 impl VibeVoiceAcousticTokenizer {
     pub fn load(config: &VibeVoiceTokenizerConfig, vb: VarBuilder) -> Result<Self> {
-        Self::load_parts(config, vb, true)
+        Self::load_parts(config, vb, true, None)
     }
 
-    /// The encoder half only. ASR never decodes latents back to audio, so it
-    /// skips the decoder's weights (about 0.69 GB in BF16).
-    pub fn load_encoder_only(config: &VibeVoiceTokenizerConfig, vb: VarBuilder) -> Result<Self> {
-        Self::load_parts(config, vb, false)
+    /// The encoder half only, its FFN linears weight-only F16 on `f16` (the
+    /// ASR recipe). ASR never decodes latents back to audio, so it skips the
+    /// decoder's weights (about 0.69 GB in BF16).
+    pub fn load_encoder_only(
+        config: &VibeVoiceTokenizerConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
+        Self::load_parts(config, vb, false, f16)
     }
 
     fn load_parts(
         config: &VibeVoiceTokenizerConfig,
         vb: VarBuilder,
         with_decoder: bool,
+        f16: Option<&Device>,
     ) -> Result<Self> {
         let encoder_depths = config.encoder_depths_vec()?;
         let encoder = TokenizerEncoder::load(
@@ -114,6 +121,7 @@ impl VibeVoiceAcousticTokenizer {
                 trim_right_ratio: config.trim_right_ratio,
             },
             vb.pp("encoder"),
+            f16,
         )?;
         if !with_decoder {
             return Ok(Self {
@@ -419,6 +427,15 @@ pub struct VibeVoiceSemanticTokenizer {
 
 impl VibeVoiceSemanticTokenizer {
     pub fn load(config: &VibeVoiceTokenizerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load_with_encoder_projections(config, vb, None)
+    }
+
+    /// [`Self::load`] with the encoder's FFN linears weight-only F16 on `f16`.
+    pub(crate) fn load_with_encoder_projections(
+        config: &VibeVoiceTokenizerConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         let encoder = TokenizerEncoder::load(
             TokenizerStackConfig {
                 dimension: config.vae_dim,
@@ -439,6 +456,7 @@ impl VibeVoiceSemanticTokenizer {
                 trim_right_ratio: config.trim_right_ratio,
             },
             vb.pp("encoder"),
+            f16,
         )?;
         Ok(Self { encoder })
     }
@@ -609,7 +627,7 @@ struct TokenizerEncoder {
 }
 
 impl TokenizerEncoder {
-    fn load(config: TokenizerStackConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: TokenizerStackConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
         config.validate_topology("encoder")?;
         validate_constant_padding(&config.pad_mode)?;
         let mut ratios = config.ratios.clone();
@@ -651,6 +669,7 @@ impl TokenizerEncoder {
                     dim,
                     &config,
                     vb.pp(format!("stages.{stage_idx}.{block_idx}")),
+                    f16,
                 )?);
             }
             stages.push(blocks);
@@ -898,6 +917,7 @@ impl TokenizerDecoder {
                     dim,
                     &config,
                     vb.pp(format!("stages.{stage_idx}.{block_idx}")),
+                    None,
                 )?);
             }
             stages.push(blocks);
@@ -1138,14 +1158,21 @@ struct Block1D {
     norm: ConvNorm,
     mixer: SConv1d,
     ffn_norm: ConvNorm,
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ProjectionLinear,
+    linear2: ProjectionLinear,
     gamma: Option<Tensor>,
     ffn_gamma: Option<Tensor>,
 }
 
 impl Block1D {
-    fn load(dim: usize, config: &TokenizerStackConfig, vb: VarBuilder) -> Result<Self> {
+    /// With `f16` set, the FFN linears load as weight-only F16 on that
+    /// device (F32 activations); the mixer, norms and gains stay dense.
+    fn load(
+        dim: usize,
+        config: &TokenizerStackConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         let norm = ConvNorm::load(dim, &config.layernorm, config.layernorm_eps, vb.pp("norm"))?;
         let ffn_norm = ConvNorm::load(
             dim,
@@ -1170,8 +1197,17 @@ impl Block1D {
             vb.pp("mixer.conv"),
         )?;
         let ffn_dim = 4 * dim;
-        let linear1 = load_ffn_linear(dim, ffn_dim, config.conv_bias, vb.pp("ffn.linear1"))?;
-        let linear2 = load_ffn_linear(ffn_dim, dim, config.conv_bias, vb.pp("ffn.linear2"))?;
+        let ffn_linear = |in_dim, out_dim, name: &str| -> Result<ProjectionLinear> {
+            let linear = load_ffn_linear(
+                in_dim,
+                out_dim,
+                config.conv_bias,
+                projection_var_builder(&vb.pp(name), f16),
+            )?;
+            Ok(ProjectionLinear::new(linear, f16)?)
+        };
+        let linear1 = ffn_linear(dim, ffn_dim, "ffn.linear1")?;
+        let linear2 = ffn_linear(ffn_dim, dim, "ffn.linear2")?;
         let gamma = (config.layer_scale_init_value > 0.0)
             .then(|| vb.get((dim,), "gamma"))
             .transpose()?;
@@ -2695,6 +2731,7 @@ mod tests {
             4,
             &config,
             VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+            None,
         )
     }
 
@@ -2782,8 +2819,8 @@ mod tests {
             norm: ConvNorm::Identity,
             mixer: test_sconv1d(&[0.0, 0.0, 0.0], 0.0),
             ffn_norm: ConvNorm::Identity,
-            linear1: linear(vec![1.0, 0.0, 0.0, 0.0], (4, 1)),
-            linear2: linear(vec![1.0, 0.0, 0.0, 0.0], (1, 4)),
+            linear1: linear(vec![1.0, 0.0, 0.0, 0.0], (4, 1)).into(),
+            linear2: linear(vec![1.0, 0.0, 0.0, 0.0], (1, 4)).into(),
             gamma: None,
             ffn_gamma: None,
         };
@@ -2931,7 +2968,7 @@ mod tests {
                 Device::Cpu,
             );
             let tokenizer = if encoder_only {
-                VibeVoiceAcousticTokenizer::load_encoder_only(&config, vb)
+                VibeVoiceAcousticTokenizer::load_encoder_only(&config, vb, None)
             } else {
                 VibeVoiceAcousticTokenizer::load(&config, vb)
             }
@@ -3760,5 +3797,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Deterministic xorshift weights keyed by tensor name: norm gains near
+    /// one, everything else small, so a stack of blocks stays O(1).
+    struct XorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for XorshiftWeights {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            _: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let seed = name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+            });
+            let gain = name.ends_with("norm.weight");
+            let scale = if gain { 0.1 } else { 0.3 };
+            let values = crate::kernels::numeric_check::xorshift_tensor(
+                shape.dims(),
+                seed,
+                scale,
+                &Device::Cpu,
+            )?;
+            let values = if gain { (values + 1.0)? } else { values };
+            values.to_dtype(dtype)?.to_device(device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// A two-stage encoder (32 and 64 channels) whose FFN linears take
+    /// ggml's F16 kernel on Metal.
+    fn weight_only_f16_encoder(device: &Device, f16: bool) -> TokenizerEncoder {
+        let config = TokenizerStackConfig {
+            dimension: 8,
+            n_filters: 32,
+            ..test_stack_config(vec![2], vec![1, 1])
+        };
+        let vb = VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, device.clone());
+        TokenizerEncoder::load(config, vb, f16.then_some(device)).unwrap()
+    }
+
+    /// Weight-only F16 FFN linears against the dense encoder on the same
+    /// weights: F32 output within F16 weight rounding.
+    fn assert_weight_only_f16_encoder_tracks_f32(device: &Device) {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+
+        let dense = weight_only_f16_encoder(&Device::Cpu, false);
+        let f16 = weight_only_f16_encoder(device, true);
+        assert!(f16
+            .stages
+            .iter()
+            .flatten()
+            .all(|block| { block.linear1.as_f16().is_some() && block.linear2.as_f16().is_some() }));
+        assert!(dense
+            .stages
+            .iter()
+            .flatten()
+            .all(|block| block.linear1.as_f16().is_none()));
+        let audio = xorshift_tensor(&[1, 1, 256], 3, 0.5, &Device::Cpu).unwrap();
+        let reference = host_f32(&dense.forward(&audio).unwrap()).unwrap();
+        let output = f16.forward(&audio.to_device(device).unwrap()).unwrap();
+        assert_eq!(output.dtype(), DType::F32);
+        let output = host_f32(&output).unwrap();
+        assert!(output.iter().all(|value| value.is_finite()));
+        let rel = relative_l2(&output, &reference);
+        assert!(rel > 0.0 && rel < 1e-2, "F16 vs F32 relative L2 {rel:e}");
+    }
+
+    #[test]
+    fn weight_only_f16_tokenizer_encoder_tracks_f32_on_cpu() {
+        assert_weight_only_f16_encoder_tracks_f32(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_weight_only_f16_tokenizer_encoder_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_weight_only_f16_encoder_tracks_f32(&device);
     }
 }

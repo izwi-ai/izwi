@@ -83,7 +83,11 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::core::{
     qwen3_dense_projection_fusion_enabled, qwen3_quantized_projection_grouping_for_hidden_size,
 };
-use crate::models::architectures::vibevoice::asr::vibevoice_asr_weight_dtype;
+use crate::models::architectures::vibevoice::asr::{
+    resolve_vibevoice_tokenizer_projection_precision, vibevoice_asr_audio_dtype,
+    vibevoice_asr_weight_dtype, vibevoice_tensor_is_f16_tokenizer_projection,
+    vibevoice_tensor_is_language_model,
+};
 use crate::models::architectures::voxtral::realtime::model::{
     voxtral_realtime_weight_dtype, voxtral_realtime_weight_files,
 };
@@ -1466,25 +1470,48 @@ fn vibevoice_plan(
     let Some(files) = census_of(&paths)? else {
         return Ok(None);
     };
-    let dtype = vibevoice_asr_weight_dtype(device)?;
-    let fused = qwen3_dense_projection_fusion_enabled(&device.device);
-    price_vibevoice(&files, backend, dtype, fused).map(Some)
+    let lm_dtype = vibevoice_asr_weight_dtype(device)?;
+    let load = VibeVoiceLoad {
+        lm_dtype,
+        audio_dtype: vibevoice_asr_audio_dtype(device, lm_dtype),
+        f16_tokenizer_projections: resolve_vibevoice_tokenizer_projection_precision(device).dtype
+            == DType::F16,
+        fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+    };
+    price_vibevoice(&files, backend, &load).map(Some)
 }
 
 /// The TTS-only acoustic decoder, which VibeVoice-ASR does not load.
 const VIBEVOICE_ASR_UNLOADED_DECODER: &str = "model.acoustic_tokenizer.decoder.";
 
-/// VibeVoice-ASR (`vibevoice/asr.rs`): every tensor through a `VarBuilder` at
-/// `dtype`, except the acoustic decoder (ASR loads the acoustic tokenizer
-/// encoder-only) and a TTS checkpoint's prediction head and speech scaling
-/// factors. With dense projection fusion (`qwen3/core.rs`), each LM layer's
+/// How `VibeVoiceAsrModel::load` represents the checkpoint.
+#[derive(Debug, Clone, Copy)]
+struct VibeVoiceLoad {
+    /// The decoder LM's dtype.
+    lm_dtype: DType,
+    /// The tokenizers' and connectors' dtype.
+    audio_dtype: DType,
+    /// The tokenizer encoders' FFN linears load as weight-only F16.
+    f16_tokenizer_projections: bool,
+    /// Dense projection fusion (`qwen3/core.rs`).
+    fused_projections: bool,
+}
+
+/// VibeVoice-ASR (`vibevoice/asr.rs`): every tensor through a `VarBuilder`,
+/// the decoder LM at its dtype and the audio path (tokenizer encoders and
+/// connectors) at the audio dtype, with the tokenizer encoders' FFN weights
+/// converted to F16 on the host under weight-only F16. The acoustic decoder
+/// (ASR loads the acoustic tokenizer encoder-only) and a TTS checkpoint's
+/// prediction head and speech scaling factors are skipped. With dense
+/// projection fusion (`qwen3/core.rs`), each LM layer's
 /// Q/K/V weights and biases and its gate/up weights are concatenated.
 fn price_vibevoice(
     files: &[CensusFile],
     backend: BackendKind,
-    dtype: DType,
-    fused_projections: bool,
+    load: &VibeVoiceLoad,
 ) -> Result<AsrResidencyPlan> {
+    let dtype = load.lm_dtype;
+    let fused_projections = load.fused_projections;
     let tensors = by_name(files);
     let mut ledger = Ledger::new(backend);
     let mut grouped = BTreeSet::new();
@@ -1527,8 +1554,17 @@ fn price_vibevoice(
                 *name,
                 "model.speech_scaling_factor" | "model.speech_bias_factor"
             );
-        if !tts_only && !grouped.contains(name) {
+        if tts_only || grouped.contains(name) {
+            continue;
+        }
+        if vibevoice_tensor_is_language_model(name) {
             ledger.var(tensor, Source::Mapped, &[dtype])?;
+        } else if load.f16_tokenizer_projections
+            && vibevoice_tensor_is_f16_tokenizer_projection(name)
+        {
+            ledger.host_converted(tensor, DType::F16)?;
+        } else {
+            ledger.var(tensor, Source::Mapped, &[load.audio_dtype])?;
         }
     }
     AsrResidencyPlan::from_ledger(ledger, 0)
@@ -1918,9 +1954,28 @@ mod tests {
     }
 
     fn vibevoice(backend: BackendKind) -> AsrResidencyPlan {
-        let dtype = vibevoice_asr_weight_dtype(&profile(backend)).unwrap();
-        let fused = qwen3_dense_projection_fusion_policy(backend == BackendKind::Metal, None);
-        price_vibevoice(&census!("vibevoice_asr.json"), backend, dtype, fused).unwrap()
+        price_vibevoice(
+            &census!("vibevoice_asr.json"),
+            backend,
+            &vibevoice_load(backend),
+        )
+        .unwrap()
+    }
+
+    fn vibevoice_load(backend: BackendKind) -> VibeVoiceLoad {
+        let profile = profile(backend);
+        let lm_dtype = vibevoice_asr_weight_dtype(&profile).unwrap();
+        VibeVoiceLoad {
+            lm_dtype,
+            audio_dtype: vibevoice_asr_audio_dtype(&profile, lm_dtype),
+            f16_tokenizer_projections: resolve_vibevoice_tokenizer_projection_precision(&profile)
+                .dtype
+                == DType::F16,
+            fused_projections: qwen3_dense_projection_fusion_policy(
+                backend == BackendKind::Metal,
+                None,
+            ),
+        }
     }
 
     fn voxtral(backend: BackendKind) -> AsrResidencyPlan {
@@ -2033,7 +2088,7 @@ mod tests {
             (
                 "VibeVoice-ASR",
                 Box::new(vibevoice),
-                [31.03, 31.03, 56.22, 15.52],
+                [31.03, 15.72, 28.35, 15.52],
             ),
             (
                 "Voxtral-Mini-4B-RT",
@@ -2423,11 +2478,29 @@ mod tests {
         std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "f32");
         let _restore = Restore("IZWI_VIBEVOICE_ASR_DTYPE");
         assert_eq!(vibevoice(BackendKind::Cuda).resident_bytes, 2 * default);
-        // CPU resolves F32 whatever is requested; Metal honours the override.
+        // CPU resolves F32 whatever is requested; Metal honours the override
+        // for the LM and keeps the audio path F32 with weight-only F16
+        // tokenizer FFN weights (BF16 and F16 store the same bytes); the
+        // TTS-only acoustic decoder is not loaded at all.
         std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "bf16");
+        let files = census!("vibevoice_asr.json");
+        let all = stored(&files, |t| {
+            !t.name.starts_with(VIBEVOICE_ASR_UNLOADED_DECODER)
+        });
+        let lm = stored(&files, |t| vibevoice_tensor_is_language_model(&t.name));
+        let projections = stored(&files, |t| {
+            vibevoice_tensor_is_f16_tokenizer_projection(&t.name)
+        });
+        assert_eq!(vibevoice(BackendKind::Cpu).resident_bytes, 2 * all);
         assert_eq!(
-            vibevoice(BackendKind::Cpu).resident_bytes,
-            2 * vibevoice(BackendKind::Metal).logical_resident_bytes
+            vibevoice(BackendKind::Metal).logical_resident_bytes,
+            lm + 2 * (all - lm) - projections
+        );
+        // IZWI_VIBEVOICE_ASR_DTYPE=f32 keeps every Metal weight F32.
+        std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "f32");
+        assert_eq!(
+            vibevoice(BackendKind::Metal).logical_resident_bytes,
+            2 * all
         );
         // Whisper's Metal F16 default and its F32 escape hatches.
         let _restore_whisper = Restore("IZWI_WHISPER_DTYPE");

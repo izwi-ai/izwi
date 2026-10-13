@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use serde::Serialize;
 use serde_json::json;
@@ -14,13 +14,21 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::backends::state::{PhysicalStateTransactionId, TensorStateArena};
-use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{
+    backend_kind_for_device, BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceKind,
+    DeviceProfile, MetalDTypeOverride,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::{
     ClockedStateProjection, ClockedStateSelection, ClockedStateSpan, InputRange,
     InvocationTensorLease, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{load_weight_only_f16, WeightOnlyF16Load};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, PrecisionLoad,
+    F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2, StateClock, StateGroupId,
 };
@@ -142,7 +150,14 @@ pub struct VibeVoiceAsrTranscriptionOutput {
 pub struct VibeVoiceAsrModel {
     model_dir: PathBuf,
     device: DeviceProfile,
+    /// The audio path's dtype: tokenizer encoders, connectors, the uploaded
+    /// audio, sampling noise and tokenizer streaming state. F32 on Metal and
+    /// CPU, the LM dtype on CUDA.
     dtype: DType,
+    /// The Qwen2.5 decoder's weights, activations and K/V.
+    lm_dtype: DType,
+    lm_precision: PrecisionLoad,
+    tokenizer_weight_precision: WeightOnlyF16Load,
     config: VibeVoiceConfig,
     preprocessor: VibeVoicePreprocessorConfig,
     tokenizer: VibeVoicePromptTokenizer,
@@ -415,27 +430,107 @@ struct VibeVoiceAsrDecodeCheckpointPayload {
 }
 
 /// ASR encodes speech and never decodes latents, so it loads the acoustic
-/// tokenizer without its decoder; admission prices it the same way
-/// (`runtime/lifecycle/asr_memory.rs`).
+/// tokenizer without its decoder (its encoder FFN linears weight-only F16 on
+/// `f16`); admission prices it the same way (`runtime/lifecycle/asr_memory.rs`).
 fn load_asr_acoustic_tokenizer(
     config: &VibeVoiceTokenizerConfig,
     vb: VarBuilder,
+    f16: Option<&Device>,
 ) -> Result<VibeVoiceAcousticTokenizer> {
-    VibeVoiceAcousticTokenizer::load_encoder_only(config, vb)
+    VibeVoiceAcousticTokenizer::load_encoder_only(config, vb, f16)
 }
 
-/// The weight dtype the VibeVoice-ASR loader selects on `device`, honouring
-/// `IZWI_VIBEVOICE_ASR_DTYPE`. Load admission prices the checkpoint at this
-/// dtype (`runtime/lifecycle/asr_memory.rs`).
+const VIBEVOICE_ASR_DTYPE_ENV: &str = "IZWI_VIBEVOICE_ASR_DTYPE";
+
+/// The decoder LM dtype the VibeVoice-ASR loader selects on `device`,
+/// honouring `IZWI_VIBEVOICE_ASR_DTYPE` and then `IZWI_METAL_DTYPE`. Load
+/// admission prices the LM at this dtype (`runtime/lifecycle/asr_memory.rs`).
 pub(crate) fn vibevoice_asr_weight_dtype(device: &DeviceProfile) -> Result<DType> {
-    let requested = std::env::var("IZWI_VIBEVOICE_ASR_DTYPE").ok();
+    vibevoice_asr_lm_precision(device).map(|selection| selection.dtype)
+}
+
+/// [`vibevoice_asr_weight_dtype`] and why. On Metal with no override the
+/// BF16 Qwen2.5 checkpoint takes the BF16-checkpoint LM tier (report 13):
+/// F16 behind a load-time range probe, BF16 on Apple9+ once Metal paged
+/// attention takes BF16.
+fn vibevoice_asr_lm_precision(device: &DeviceProfile) -> Result<DTypeSelection> {
+    let requested = std::env::var(VIBEVOICE_ASR_DTYPE_ENV).ok();
     match requested.as_deref().map(str::trim) {
-        Some(raw) if !raw.is_empty() => {
-            device.select_model_dtype_checked(ModelFamily::VibeVoiceAsr, Some(raw), "VibeVoice ASR")
+        Some(raw) if !raw.is_empty() => Ok(DTypeSelection {
+            dtype: device.select_model_dtype_checked(
+                ModelFamily::VibeVoiceAsr,
+                Some(raw),
+                "VibeVoice ASR",
+            )?,
+            reason: format!("{VIBEVOICE_ASR_DTYPE_ENV}={raw}").into(),
+        }),
+        _ if device.kind.is_metal()
+            && MetalDTypeOverride::from_env() == MetalDTypeOverride::Auto =>
+        {
+            Ok(device.metal_bf16_checkpoint_lm_tier())
         }
-        _ => Ok(device.select_model_dtype(ModelFamily::VibeVoiceAsr, None)),
+        _ => Ok(device.resolve_dtype(
+            DTypeSelectionRequest::new(None).with_model_family(ModelFamily::VibeVoiceAsr),
+        )),
     }
 }
+
+/// The audio path's dtype for an LM in `lm_dtype`: CUDA keeps one dtype; CPU
+/// and Metal run the tokenizer encoders and connectors with F32 activations
+/// (their FFN linears weight-only F16 on Metal), as report 13 recommends, and
+/// cast the speech features to the LM dtype at the connector boundary, as
+/// mlx-audio does.
+pub(crate) fn vibevoice_asr_audio_dtype(device: &DeviceProfile, lm_dtype: DType) -> DType {
+    if device.kind.is_cuda() {
+        lm_dtype
+    } else {
+        DType::F32
+    }
+}
+
+/// Whether the tokenizer encoders' FFN linears load as weight-only F16: on
+/// by default on Metal; `IZWI_VIBEVOICE_ASR_DTYPE=f32` or
+/// `IZWI_METAL_DTYPE=f32` keeps them F32.
+pub(crate) fn resolve_vibevoice_tokenizer_projection_precision(
+    device: &DeviceProfile,
+) -> DTypeSelection {
+    let family = std::env::var(VIBEVOICE_ASR_DTYPE_ENV).ok();
+    device.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (VIBEVOICE_ASR_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is a tokenizer-encoder FFN weight that
+/// loads as weight-only F16 under
+/// [`resolve_vibevoice_tokenizer_projection_precision`].
+pub(crate) fn vibevoice_tensor_is_f16_tokenizer_projection(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("model.acoustic_tokenizer.encoder.stages.")
+        .or_else(|| name.strip_prefix("model.semantic_tokenizer.encoder.stages."))
+    else {
+        return false;
+    };
+    let mut parts = rest.splitn(3, '.');
+    let (Some(stage), Some(block), Some(tail)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    stage.parse::<usize>().is_ok()
+        && block.parse::<usize>().is_ok()
+        && matches!(tail, "ffn.linear1.weight" | "ffn.linear2.weight")
+}
+
+/// Whether checkpoint tensor `name` belongs to the decoder LM (loaded at the
+/// LM dtype); everything else is the audio path.
+pub(crate) fn vibevoice_tensor_is_language_model(name: &str) -> bool {
+    name.starts_with("model.language_model.") || name.starts_with("lm_head.")
+}
+
+/// Audio samples the tokenizer encoders' load-time probe runs.
+const VIBEVOICE_TOKENIZER_PROBE_SAMPLES: usize = 4 * 3200;
+/// Token positions the LM's load-time probe runs.
+const VIBEVOICE_LM_PROBE_TOKENS: usize = 16;
 
 impl VibeVoiceAsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
@@ -451,18 +546,55 @@ impl VibeVoiceAsrModel {
             ));
         }
         let preprocessor = VibeVoicePreprocessorConfig::load(model_dir)?;
-        let dtype = vibevoice_asr_weight_dtype(&device)?;
+        let lm_selection = vibevoice_asr_lm_precision(&device)?;
+        let dtype = vibevoice_asr_audio_dtype(&device, lm_selection.dtype);
+        let projection_precision = resolve_vibevoice_tokenizer_projection_precision(&device);
         let vb = load_model_weights(model_dir, dtype, &device.device)?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;
-        let acoustic_tokenizer = load_asr_acoustic_tokenizer(
-            &config.acoustic_tokenizer_config,
-            vb.pp("model.acoustic_tokenizer"),
-        )?;
-        let semantic_tokenizer = VibeVoiceSemanticTokenizer::load(
-            &config.semantic_tokenizer_config,
-            vb.pp("model.semantic_tokenizer"),
-        )?;
+        let ((acoustic_tokenizer, semantic_tokenizer), tokenizer_weight_precision) =
+            load_weight_only_f16(
+                "VibeVoice tokenizer encoders",
+                &projection_precision,
+                &device.device,
+                |f16| {
+                    Ok::<_, Error>((
+                        load_asr_acoustic_tokenizer(
+                            &config.acoustic_tokenizer_config,
+                            vb.pp("model.acoustic_tokenizer"),
+                            f16,
+                        )?,
+                        VibeVoiceSemanticTokenizer::load_with_encoder_projections(
+                            &config.semantic_tokenizer_config,
+                            vb.pp("model.semantic_tokenizer"),
+                            f16,
+                        )?,
+                    ))
+                },
+                |(acoustic, semantic)| {
+                    run_numeric_self_check(
+                        "VibeVoice tokenizer encoders weight-only F16",
+                        F16_SAFE_MAX_ABS,
+                        || {
+                            let audio = xorshift_tensor(
+                                &[
+                                    1,
+                                    config.acoustic_tokenizer_config.channels,
+                                    VIBEVOICE_TOKENIZER_PROBE_SAMPLES,
+                                ],
+                                0xB1BE,
+                                0.5,
+                                &device.device,
+                            )?
+                            .to_dtype(dtype)?;
+                            Ok::<_, Error>(vec![
+                                ("acoustic".to_string(), acoustic.encode(&audio)?.mean),
+                                ("semantic".to_string(), semantic.encode(&audio)?.mean),
+                            ])
+                        },
+                    )
+                },
+            )?;
         let acoustic_connector = SpeechConnector::load(
             config.acoustic_vae_dim(),
             config.decoder_config.hidden_size,
@@ -473,25 +605,55 @@ impl VibeVoiceAsrModel {
             config.decoder_config.hidden_size,
             vb.pp("model.semantic_connector"),
         )?;
-        let language_model = Qwen3Model::load_with_layout(
-            config.decoder_config.clone(),
-            vb,
-            Qwen3WeightLayout::VIBEVOICE,
+        let (language_model, lm_precision) = load_with_precision_fallback(
+            "VibeVoice-ASR LM",
+            &lm_selection,
+            device.kind.is_metal(),
+            DType::F32,
+            |lm_dtype| {
+                let lm_vb = if lm_dtype == dtype {
+                    vb.clone()
+                } else {
+                    load_model_weights(model_dir, lm_dtype, &device.device)?
+                };
+                Qwen3Model::load_with_layout(
+                    config.decoder_config.clone(),
+                    lm_vb,
+                    Qwen3WeightLayout::VIBEVOICE,
+                )
+            },
+            |lm| {
+                run_numeric_self_check(
+                    format!("VibeVoice-ASR LM {:?}", lm_selection.dtype),
+                    F16_SAFE_MAX_ABS,
+                    || lm.stateless_numeric_probe(VIBEVOICE_LM_PROBE_TOKENS, 0xB1B0),
+                )
+            },
         )?;
+        drop(vb);
+        let lm_dtype = lm_precision.loaded;
         let model_identity = vibevoice_asr_model_identity(
             model_dir,
-            dtype,
+            lm_dtype,
             &config,
             next_vibevoice_asr_model_load_nonce()?,
         );
         info!(
-            "Loaded VibeVoice-ASR from {:?} on {:?} with dtype {:?}",
-            model_dir, device.kind, dtype
+            "Loaded VibeVoice-ASR from {:?} on {:?}: LM {:?} ({}), audio path {:?}, tokenizer FFN {}",
+            model_dir,
+            device.kind,
+            lm_dtype,
+            lm_precision.reason,
+            dtype,
+            tokenizer_weight_precision.reason
         );
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
             device,
             dtype,
+            lm_dtype,
+            lm_precision,
+            tokenizer_weight_precision,
             config,
             preprocessor,
             tokenizer,
@@ -524,6 +686,7 @@ impl VibeVoiceAsrModel {
         ];
         let contract = vibevoice_invocation_contract(
             &self.language_model,
+            self.lm_dtype,
             self.dtype,
             default_kv_page_size(),
             &[CacheDomainId::new(1)],
@@ -615,9 +778,15 @@ impl VibeVoiceAsrModel {
                 tokens.checked_mul(u64::try_from(self.language_model.hidden_size()).ok()?)
             })
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR embedding elements overflow".into()))?;
-        let element_bytes = u64::try_from(self.dtype.size_in_bytes()).map_err(|_| {
-            Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
-        })?;
+        let dtype_bytes = |dtype: DType| {
+            u64::try_from(dtype.size_in_bytes()).map_err(|_| {
+                Error::Overloaded("VibeVoice ASR embedding dtype size exceeds u64".into())
+            })
+        };
+        // Prompt embeddings are in the LM dtype; the audio and its noise in
+        // the audio path's dtype.
+        let (embedding_bytes, audio_bytes) =
+            (dtype_bytes(self.lm_dtype)?, dtype_bytes(self.dtype)?);
         let audio_elements = u64::try_from(encoder_samples)
             .map_err(|_| Error::Overloaded("VibeVoice ASR audio elements exceed u64".into()))?;
         let noise_elements = if !self.acoustic_tokenizer.requires_sampling_noise() {
@@ -634,10 +803,10 @@ impl VibeVoiceAsrModel {
                     Error::Overloaded("VibeVoice ASR acoustic noise elements overflow".into())
                 })?
         };
-        let retained_device_bytes = embedding_elements
-            .checked_add(audio_elements)
-            .and_then(|elements| elements.checked_add(noise_elements))
-            .and_then(|elements| elements.checked_mul(element_bytes))
+        let retained_device_bytes = audio_elements
+            .checked_add(noise_elements)
+            .and_then(|elements| elements.checked_mul(audio_bytes))
+            .and_then(|bytes| bytes.checked_add(embedding_elements.checked_mul(embedding_bytes)?))
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR artifact bytes overflow".into()))?;
         let retained_host_bytes = u64::try_from(prompt_tokens)
             .ok()
@@ -1848,7 +2017,10 @@ impl VibeVoiceAsrModel {
                     "segments": parsed.segments,
                 },
                 "execution": {
-                    "dtype": format!("{:?}", self.dtype),
+                    "dtype": format!("{:?}", self.lm_dtype),
+                    "audio_dtype": format!("{:?}", self.dtype),
+                    "lm_precision": self.lm_precision.diagnostics(),
+                    "tokenizer_weight_precision": self.tokenizer_weight_precision.diagnostics(),
                     "device_kind": format!("{:?}", self.device.kind),
                     "decoder_layers": self.config.decoder_config.num_hidden_layers,
                     "cuda_dense_decode_cache": decode_cache_dense_max_tokens > 0,
@@ -2380,11 +2552,10 @@ fn validate_vibevoice_artifact_storage(artifact: &VibeVoiceAsrPreparedArtifact) 
         || *audio_batch != 1
         || *audio_channels != 1
         || *audio_samples != artifact.geometry.encoder_samples
-        || artifact.encoder_audio.dtype() != artifact.prompt_embeddings.dtype()
         || artifact
             .acoustic_noise
             .as_ref()
-            .is_some_and(|noise| noise.dtype() != artifact.prompt_embeddings.dtype())
+            .is_some_and(|noise| noise.dtype() != artifact.encoder_audio.dtype())
         || !noise_valid
         || elements != artifact.geometry.embedding_elements
         || bytes != artifact.geometry.retained_device_bytes
@@ -3913,7 +4084,7 @@ mod tests {
             }
         }
         let vb = VarBuilder::from_backend(Box::new(ShapedZeros), DType::F32, Device::Cpu);
-        let tokenizer = load_asr_acoustic_tokenizer(&config, vb).unwrap();
+        let tokenizer = load_asr_acoustic_tokenizer(&config, vb, None).unwrap();
         let latents = Tensor::zeros((1, 4, 1), DType::F32, &Device::Cpu).unwrap();
         let error = tokenizer.decode(&latents).unwrap_err();
         assert!(error.to_string().contains("encoder-only"), "{error}");
@@ -4163,5 +4334,103 @@ mod tests {
             padded.i(1).unwrap().to_vec2::<f32>().unwrap(),
             vec![vec![3.0, 4.0], vec![5.0, 6.0], vec![7.0, 8.0]]
         );
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use candle_core::{DType, Device};
+
+    use super::{
+        resolve_vibevoice_tokenizer_projection_precision, vibevoice_asr_audio_dtype,
+        vibevoice_asr_lm_precision, vibevoice_tensor_is_f16_tokenizer_projection,
+        vibevoice_tensor_is_language_model, VIBEVOICE_ASR_DTYPE_ENV,
+    };
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+
+    fn profile(kind: DeviceKind) -> DeviceProfile {
+        DeviceProfile {
+            device: Device::Cpu,
+            kind,
+            capabilities: DeviceCapabilities {
+                supports_f16: kind != DeviceKind::Cpu,
+                supports_bf16: kind == DeviceKind::Cuda,
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn metal_lm_takes_the_tier_and_the_audio_path_stays_f32() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(VIBEVOICE_ASR_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let metal = profile(DeviceKind::Metal);
+        let lm = vibevoice_asr_lm_precision(&metal).unwrap();
+        assert_eq!(lm.dtype, DType::F16);
+        assert!(lm.reason.contains("LM tier"), "{}", lm.reason);
+        assert_eq!(vibevoice_asr_audio_dtype(&metal, lm.dtype), DType::F32);
+        assert_eq!(
+            resolve_vibevoice_tokenizer_projection_precision(&metal).dtype,
+            DType::F16
+        );
+        // CPU is F32 throughout; CUDA keeps one dtype for both paths.
+        let cpu = profile(DeviceKind::Cpu);
+        assert_eq!(vibevoice_asr_lm_precision(&cpu).unwrap().dtype, DType::F32);
+        assert_eq!(vibevoice_asr_audio_dtype(&cpu, DType::F32), DType::F32);
+        let cuda = profile(DeviceKind::Cuda);
+        let cuda_lm = vibevoice_asr_lm_precision(&cuda).unwrap().dtype;
+        assert_eq!(cuda_lm, DType::BF16);
+        assert_eq!(vibevoice_asr_audio_dtype(&cuda, cuda_lm), DType::BF16);
+
+        // The F32 escape hatches.
+        for (family, global) in [("f32", ""), ("", "f32")] {
+            std::env::set_var(VIBEVOICE_ASR_DTYPE_ENV, family);
+            std::env::set_var("IZWI_METAL_DTYPE", global);
+            assert_eq!(
+                vibevoice_asr_lm_precision(&metal).unwrap().dtype,
+                DType::F32,
+                "{family:?} {global:?}"
+            );
+            assert_eq!(
+                resolve_vibevoice_tokenizer_projection_precision(&metal).dtype,
+                DType::F32,
+                "{family:?} {global:?}"
+            );
+        }
+        std::env::remove_var(VIBEVOICE_ASR_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+    }
+
+    #[test]
+    fn tensor_predicates_split_the_lm_from_the_tokenizer_ffn() {
+        for name in [
+            "model.acoustic_tokenizer.encoder.stages.0.2.ffn.linear1.weight",
+            "model.semantic_tokenizer.encoder.stages.6.7.ffn.linear2.weight",
+        ] {
+            assert!(vibevoice_tensor_is_f16_tokenizer_projection(name), "{name}");
+            assert!(!vibevoice_tensor_is_language_model(name), "{name}");
+        }
+        for name in [
+            "model.acoustic_tokenizer.encoder.stages.0.2.ffn.linear1.bias",
+            "model.acoustic_tokenizer.decoder.stages.0.2.ffn.linear1.weight",
+            "model.acoustic_tokenizer.encoder.stages.0.2.mixer.conv.conv.conv.weight",
+            "model.acoustic_connector.fc1.weight",
+        ] {
+            assert!(
+                !vibevoice_tensor_is_f16_tokenizer_projection(name),
+                "{name}"
+            );
+        }
+        assert!(vibevoice_tensor_is_language_model(
+            "model.language_model.layers.0.mlp.up_proj.weight"
+        ));
+        assert!(vibevoice_tensor_is_language_model("lm_head.weight"));
+        assert!(!vibevoice_tensor_is_language_model(
+            "model.semantic_connector.fc2.weight"
+        ));
     }
 }

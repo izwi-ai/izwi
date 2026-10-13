@@ -426,6 +426,7 @@ impl VibeVoiceTtsModel {
         let contract = vibevoice_invocation_contract(
             &self.language_model,
             self.dtype,
+            self.dtype,
             default_kv_page_size(),
             &[CacheDomainId::new(1), CacheDomainId::new(2)],
             &tokenizer_domains,

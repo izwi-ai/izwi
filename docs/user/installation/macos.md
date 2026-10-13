@@ -147,7 +147,12 @@ encoder-and-decoder self-check at load; if it fails, Voxtral loads in F32 and
 the reason appears under `execution.precision`. `IZWI_METAL_DTYPE=f32` runs it
 in F32. Qwen3-ASR (GGUF) checks its audio encoder and its text model the same
 way, each falling back to F32 on its own (`execution.audio_precision` and
-`execution.text_precision`); `IZWI_METAL_DTYPE=f32` now also applies to it. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
+`execution.text_precision`); `IZWI_METAL_DTYPE=f32` now also applies to it. VibeVoice-ASR
+now runs its language model in F16 on Metal (it was F32) behind the same kind
+of check, and keeps its audio tokenizers and connectors in F32 with F16
+feed-forward weights, about 16 GiB of weights instead of 31 GiB. The results
+appear under `execution.lm_precision` and `execution.tokenizer_weight_precision`,
+and `IZWI_VIBEVOICE_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) keeps it in F32. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
 Voxtral, VibeVoice and Qwen3-ASR, but it stays off until izwi's Metal attention
 kernels support BF16; those GPUs use F16 for now.
 
