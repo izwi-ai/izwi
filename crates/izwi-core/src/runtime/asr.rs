@@ -445,6 +445,16 @@ pub(super) fn asr_streams_natively(
         .is_ok_and(|adapter| adapter.streaming_mode != StreamingMode::None)
 }
 
+/// The part of the final transcript a stream has not delivered, so the
+/// deltas concatenate to it: all of it when nothing was streamed, the rest
+/// after the streamed prefix (allowing for leading whitespace the cleanup
+/// trimmed), and nothing when the cleanup rewrote text already sent.
+fn unstreamed_transcript_tail<'a>(streamed: &str, text: &'a str) -> Option<&'a str> {
+    text.strip_prefix(streamed)
+        .or_else(|| text.strip_prefix(streamed.trim_start()))
+        .filter(|tail| !tail.is_empty())
+}
+
 /// Transcript language: the caller's hint when given, otherwise the language
 /// the model detected and reported as `language` in its ASR diagnostics.
 fn asr_response_language(
@@ -2986,7 +2996,8 @@ impl RuntimeService {
     /// contract. A model whose ASR adapter declares no streaming mode is
     /// offline-only, so its stream runs on the offline route instead: the
     /// transport still carries the deltas its decode emits (retained per-step
-    /// text, chunk partials).
+    /// text, chunk partials). Either way the deltas end with whatever part of
+    /// the final transcript they did not cover, so they concatenate to it.
     async fn stream_admitted_asr_request<F, P>(
         &self,
         admitted: AdmittedEngineRequest,
@@ -3023,6 +3034,9 @@ impl RuntimeService {
             };
         let duration_secs = asr_transcription_duration_secs(&output);
         let text = asr_transcript_text(output.text.as_deref().unwrap_or(&streamed_text));
+        if let Some(tail) = unstreamed_transcript_tail(&streamed_text, &text) {
+            on_delta(tail.to_string());
+        }
 
         Ok(AsrTranscription {
             text,
@@ -4953,6 +4967,27 @@ mod tests {
         }
         let qwen = ModelVariant::Qwen3Asr06BGguf;
         assert!(asr_streams_natively(&adapters, qwen));
+    }
+
+    #[test]
+    fn stream_deltas_end_with_the_unstreamed_transcript_tail() {
+        // Final-only: nothing streamed, the whole transcript is one delta.
+        assert_eq!(
+            unstreamed_transcript_tail("", "hello world"),
+            Some("hello world")
+        );
+        assert_eq!(
+            unstreamed_transcript_tail("hello ", "hello world"),
+            Some("world")
+        );
+        assert_eq!(unstreamed_transcript_tail("hello", "hello"), None);
+        assert_eq!(
+            unstreamed_transcript_tail(" hello", "hello world"),
+            Some(" world")
+        );
+        assert_eq!(unstreamed_transcript_tail("", ""), None);
+        // Cleanup rewrote text already sent: appending cannot repair it.
+        assert_eq!(unstreamed_transcript_tail("aaaaaaaa", "aaa b"), None);
     }
 
     fn env_lock() -> &'static Mutex<()> {
