@@ -1904,6 +1904,10 @@ impl Lfm25AudioModel {
                 "detokenizer": {
                     "banded_attention_calls_total":
                         crate::models::architectures::lfm2::backbone::lfm2_banded_stateless_attention_calls()
+                },
+                "audio_head": {
+                    "device_sampled_codes_total":
+                        super::audio_output::lfm25_device_sampled_audio_codes()
                 }
             })),
         })

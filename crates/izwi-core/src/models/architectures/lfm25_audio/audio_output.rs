@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::kernels::{try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::sampling::device_resident_top_k_sample;
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
 
@@ -394,12 +396,12 @@ impl Lfm25AudioHead {
         if let Some(samples) = device_tokens {
             if samples
                 .iter()
-                .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+                .all(|sample| matches!(sample, CodebookSample::Device(_)))
             {
                 let tensors = samples
                     .iter()
                     .filter_map(|sample| match sample {
-                        CodebookSample::DeviceGreedy(token) => Some(token),
+                        CodebookSample::Device(token) => Some(token),
                         CodebookSample::Host(_) => None,
                     })
                     .collect::<Vec<_>>();
@@ -456,13 +458,13 @@ impl Lfm25AudioHead {
         if frames
             .iter()
             .flat_map(|frame| frame.samples.iter())
-            .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+            .all(|sample| matches!(sample, CodebookSample::Device(_)))
         {
             let tensors = frames
                 .iter()
                 .flat_map(|frame| frame.samples.iter())
                 .filter_map(|sample| match sample {
-                    CodebookSample::DeviceGreedy(token) => Some(token),
+                    CodebookSample::Device(token) => Some(token),
                     CodebookSample::Host(_) => None,
                 })
                 .collect::<Vec<_>>();
@@ -533,7 +535,7 @@ impl Lfm25AudioHead {
                 CodebookSample::Host(token) => {
                     Tensor::from_vec(vec![*token], (1,), device).map_err(Error::from)
                 }
-                CodebookSample::DeviceGreedy(token) => Ok(token.clone()),
+                CodebookSample::Device(token) => Ok(token.clone()),
             })
             .collect::<Result<Vec<_>>>()?;
         let tokens = end_of_audio_frame_device(&Tensor::cat(&tokens, 0)?, self.audio_end_token_id)?;
@@ -547,11 +549,7 @@ impl Lfm25AudioHead {
             .sum(1)?
             .unsqueeze(1)?;
         let samples = (0..self.codebooks)
-            .map(|codebook| {
-                tokens
-                    .narrow(0, codebook, 1)
-                    .map(CodebookSample::DeviceGreedy)
-            })
+            .map(|codebook| tokens.narrow(0, codebook, 1).map(CodebookSample::Device))
             .collect::<candle_core::Result<Vec<_>>>()?;
         Ok(Lfm25SampledAudioFrame { samples, embedding })
     }
@@ -1183,16 +1181,25 @@ struct CodebookEmbeddingHead {
     code_limit: Option<usize>,
 }
 
+/// One sampled code: read back already, or still a `[1]` U32 tensor on the
+/// accelerator (argmax, or a device-resident Gumbel-max draw).
 enum CodebookSample {
     Host(u32),
-    DeviceGreedy(Tensor),
+    Device(Tensor),
+}
+
+/// Audio codes drawn on device without a readback (diagnostics).
+static DEVICE_SAMPLED_AUDIO_CODES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn lfm25_device_sampled_audio_codes() -> u64 {
+    DEVICE_SAMPLED_AUDIO_CODES.load(Ordering::Relaxed)
 }
 
 impl CodebookSample {
     fn to_token(&self) -> Result<u32> {
         match self {
             CodebookSample::Host(token) => Ok(*token),
-            CodebookSample::DeviceGreedy(token) => {
+            CodebookSample::Device(token) => {
                 token.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
             }
         }
@@ -1238,7 +1245,7 @@ impl CodebookEmbeddingHead {
     fn embed_sample(&self, sample: &CodebookSample, device: &Device) -> Result<Tensor> {
         match sample {
             CodebookSample::Host(token) => self.embed(*token, device),
-            CodebookSample::DeviceGreedy(token) => self.embed_token_tensor(token),
+            CodebookSample::Device(token) => self.embed_token_tensor(token),
         }
     }
 
@@ -1265,7 +1272,20 @@ impl CodebookEmbeddingHead {
         let vocab_limit = self.code_limit.map_or(vocab, |limit| limit.min(vocab));
         if config.temperature <= 1e-5 {
             if let Some(token) = greedy_token_tensor_from_logits(&logits, vocab_limit)? {
-                return Ok(CodebookSample::DeviceGreedy(token));
+                return Ok(CodebookSample::Device(token));
+            }
+        } else if config.top_p >= 1.0 {
+            // Keep the draw on device so the frame needs one readback, not
+            // one per codebook (LFT-9).
+            if let Some(token) = device_resident_top_k_sample(
+                &logits,
+                vocab_limit,
+                config.top_k,
+                config.temperature,
+                &mut || rng.next_f32(),
+            )? {
+                DEVICE_SAMPLED_AUDIO_CODES.fetch_add(1, Ordering::Relaxed);
+                return Ok(CodebookSample::Device(token));
             }
         }
         sample_from_logits(&logits, vocab_limit, config, rng).map(CodebookSample::Host)
@@ -1283,12 +1303,12 @@ fn materialize_codebook_samples_with_profile<'a>(
 ) -> Result<MaterializedCodebookSamples> {
     if samples
         .clone()
-        .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+        .all(|sample| matches!(sample, CodebookSample::Device(_)))
     {
         let tensors = samples
             .clone()
             .filter_map(|sample| match sample {
-                CodebookSample::DeviceGreedy(token) => Some(token),
+                CodebookSample::Device(token) => Some(token),
                 CodebookSample::Host(_) => None,
             })
             .collect::<Vec<_>>();
@@ -1312,7 +1332,7 @@ fn materialize_codebook_samples_with_profile<'a>(
         .clone()
         .map(|sample| match sample {
             CodebookSample::Host(token) => Ok(*token),
-            CodebookSample::DeviceGreedy(token) => {
+            CodebookSample::Device(token) => {
                 token.squeeze(0)?.to_scalar::<u32>().map_err(Error::from)
             }
         })
@@ -1510,13 +1530,16 @@ mod tests {
 
     /// A codebook head over 3 codes (EOA = 2) whose logits always favour EOA.
     fn eoa_favouring_head(idx: usize) -> super::CodebookEmbeddingHead {
+        eoa_favouring_head_on(idx, &Device::Cpu)
+    }
+
+    fn eoa_favouring_head_on(idx: usize, device: &Device) -> super::CodebookEmbeddingHead {
         use candle_core::quantized::{GgmlDType, QTensor};
         use candle_transformers::models::with_tracing::QMatMul;
 
-        let device = Device::Cpu;
         let quantize = |values: Vec<f32>, shape: &[usize]| {
             QTensor::quantize(
-                &Tensor::from_vec(values, shape, &device).unwrap(),
+                &Tensor::from_vec(values, shape, device).unwrap(),
                 GgmlDType::F32,
             )
             .unwrap()
@@ -1528,7 +1551,7 @@ mod tests {
         );
         super::CodebookEmbeddingHead {
             embedding: candle_nn::Embedding::new(
-                Tensor::zeros((3, 4), DType::F32, &device).unwrap(),
+                Tensor::zeros((3, 4), DType::F32, device).unwrap(),
                 4,
             ),
             norm: super::DepthRmsNorm::from_qtensor(quantize(vec![1.0; 4], &[4]), 1e-5).unwrap(),
@@ -1580,6 +1603,34 @@ mod tests {
                 .unwrap();
             assert!(code < 2, "codebook 3 emitted end-of-audio");
         }
+    }
+
+    /// LFT-9: on Metal a sampled audio code stays on device (no per-codebook
+    /// readback) and still respects the codebook's code limit.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_sampled_audio_codes_stay_on_device() {
+        use super::super::sampling::{Lfm25SamplingConfig, SimpleRng};
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let head = eoa_favouring_head_on(3, &device);
+        let hidden = Tensor::ones((1, 1, 4), DType::F32, &device).unwrap();
+        let config = Lfm25SamplingConfig {
+            temperature: 50.0,
+            top_k: 2,
+            top_p: 1.0,
+        };
+        let mut rng = SimpleRng::new(23);
+        let before = super::lfm25_device_sampled_audio_codes();
+        for _ in 0..16 {
+            let sample = head.sample(&hidden, &config, &mut rng).unwrap();
+            assert!(matches!(sample, CodebookSample::Device(_)));
+            assert!(sample.to_token().unwrap() < 2);
+        }
+        assert!(super::lfm25_device_sampled_audio_codes() >= before + 16);
     }
 
     /// LFT-3: Depthformer RoPE matches the reference `apply_rotary_emb`
@@ -1650,7 +1701,7 @@ mod tests {
                     if host_index == Some(index) {
                         CodebookSample::Host(token)
                     } else {
-                        CodebookSample::DeviceGreedy(Tensor::new(&[token], device).unwrap())
+                        CodebookSample::Device(Tensor::new(&[token], device).unwrap())
                     }
                 })
                 .collect(),
