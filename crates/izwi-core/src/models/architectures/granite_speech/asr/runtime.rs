@@ -14,7 +14,7 @@ use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
     PagedKvDecodeArgs,
 };
-use crate::backends::{DTypeSelection, DeviceProfile};
+use crate::backends::{parse_dtype_name, DTypeSelection, DeviceProfile, MetalDTypeOverride};
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{
     batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
@@ -24,7 +24,8 @@ use crate::kernels::f16_weight_linear::{
     WeightOnlyF16Load, F16_PROJECTION_MAX_RELATIVE_L2,
 };
 use crate::kernels::numeric_check::{
-    run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, xorshift_values,
+    NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
 };
 use crate::kernels::{
     try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
@@ -180,6 +181,7 @@ pub struct GraniteSpeechRuntime {
     /// loads weight-only F16, else `dtype`.
     audio_dtype: DType,
     encoder_weight_precision: WeightOnlyF16Load,
+    lm_precision: PrecisionLoad,
     encoder: GraniteSpeechEncoder,
     projector: GraniteSpeechProjector,
     text_model: GraniteLanguageModel,
@@ -461,11 +463,34 @@ fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
     interval.clamp(1, max_new_tokens.max(1))
 }
 
+/// Where the selective F16 LM switches default on: Metal, unless F32 is
+/// pinned by `IZWI_GRANITE_SPEECH_DTYPE=f32` or (with no family override)
+/// `IZWI_METAL_DTYPE=f32`, the escape hatches from every lower-precision
+/// Metal policy. Each `IZWI_GRANITE_F16_*` switch still overrides.
+fn granite_selective_f16_default(device: &Device) -> bool {
+    device.is_metal()
+        && !granite_f32_pinned(
+            std::env::var("IZWI_GRANITE_SPEECH_DTYPE").ok().as_deref(),
+            MetalDTypeOverride::from_env(),
+        )
+}
+
+fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool {
+    match family.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => parse_dtype_name(raw) == Some(DType::F32),
+        None => global == MetalDTypeOverride::F32,
+    }
+}
+
 fn granite_f16_lm_head_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_LM_HEAD")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_lm_head_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_lm_head_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_lm_head_policy(
@@ -517,7 +542,11 @@ fn granite_f16_qkv_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_QKV")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_qkv_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_qkv_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_qkv_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
@@ -529,7 +558,11 @@ fn granite_f16_attention_core_enabled(device: &Device, dtype: DType) -> bool {
         .ok()
         .or_else(|| std::env::var("IZWI_GRANITE_F16_ATTN_CORE").ok())
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_core_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_attention_core_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_attention_core_policy(
@@ -544,7 +577,11 @@ fn granite_f16_mlp_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_MLP")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_mlp_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_mlp_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_mlp_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
@@ -556,7 +593,11 @@ fn granite_f16_attention_output_enabled(device: &Device, dtype: DType) -> bool {
         .ok()
         .or_else(|| std::env::var("IZWI_GRANITE_F16_O_PROJ").ok())
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_output_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_attention_output_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_attention_output_policy(
@@ -577,6 +618,20 @@ struct GraniteTextExecutionPlan {
 }
 
 impl GraniteTextExecutionPlan {
+    /// Every LM projection, the head and the attention core in the base
+    /// dtype: the range probe's fallback.
+    const BASE_DTYPE: Self = Self {
+        selective_f16_lm_head: false,
+        selective_f16_qkv: false,
+        f16_attention_core: false,
+        selective_f16_mlp: false,
+        selective_f16_attention_output: false,
+    };
+
+    fn any_f16(self) -> bool {
+        self != Self::BASE_DTYPE
+    }
+
     fn for_device(device: &Device, dtype: DType) -> Self {
         let selective_f16_qkv = granite_f16_qkv_enabled(device, dtype);
         Self {
@@ -586,6 +641,35 @@ impl GraniteTextExecutionPlan {
                 && granite_f16_attention_core_enabled(device, dtype),
             selective_f16_mlp: granite_f16_mlp_enabled(device, dtype),
             selective_f16_attention_output: granite_f16_attention_output_enabled(device, dtype),
+        }
+    }
+}
+
+/// Decoder positions the LM range probe runs.
+const GRANITE_LM_PROBE_TOKENS: usize = 16;
+
+/// What the LM runs below F32, for its load-time range probe: F16 when the
+/// selective F16 projections and attention core sit on F32 weights (report
+/// 13's Apple7/8 policy, which Apple9+ shares until BF16 Metal paged
+/// attention exists), else the base dtype.
+fn granite_lm_precision(
+    dtype: DType,
+    plan: GraniteTextExecutionPlan,
+    device: &DeviceProfile,
+) -> DTypeSelection {
+    if dtype == DType::F32 && plan.any_f16() {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: format!(
+                "Metal selective F16 LM projections, head and attention core on F32 weights ({})",
+                device.metal_bf16_checkpoint_lm_tier().reason
+            )
+            .into(),
+        }
+    } else {
+        DTypeSelection {
+            dtype,
+            reason: format!("{dtype:?} LM weights and activations").into(),
         }
     }
 }
@@ -729,10 +813,47 @@ impl GraniteSpeechRuntime {
         let projector_elapsed = projector_started.elapsed();
 
         let language_model_started = Instant::now();
-        let text_model = GraniteLanguageModel::load(
-            &config.text_config,
-            config.tie_word_embeddings(),
-            vb.pp("language_model"),
+        let lm_plan = GraniteTextExecutionPlan::for_device(&device.device, dtype);
+        let lm_selection = granite_lm_precision(dtype, lm_plan, device);
+        let load_lm = |loaded: DType| {
+            if loaded == lm_selection.dtype {
+                return GraniteLanguageModel::load_with_execution_plan(
+                    &config.text_config,
+                    config.tie_word_embeddings(),
+                    vb.pp("language_model"),
+                    lm_plan,
+                );
+            }
+            // The range probe's fallback: every LM weight and activation F32.
+            let f32_vb = if dtype == DType::F32 {
+                vb.clone()
+            } else if audio_dtype == DType::F32 {
+                audio_vb.clone()
+            } else {
+                unsafe {
+                    staged::metal_staged_safetensors(shard_paths, DType::F32, &device.device)?
+                }
+            };
+            GraniteLanguageModel::load_with_execution_plan(
+                &config.text_config,
+                config.tie_word_embeddings(),
+                f32_vb.pp("language_model"),
+                GraniteTextExecutionPlan::BASE_DTYPE,
+            )
+        };
+        let (text_model, lm_precision) = load_with_precision_fallback(
+            "Granite Speech LM",
+            &lm_selection,
+            device.kind.is_metal(),
+            DType::F32,
+            load_lm,
+            |lm| {
+                run_numeric_self_check(
+                    format!("Granite Speech LM {:?}", lm_selection.dtype),
+                    F16_SAFE_MAX_ABS,
+                    || lm.numeric_probe(GRANITE_LM_PROBE_TOKENS),
+                )
+            },
         )?;
         let language_model_elapsed = language_model_started.elapsed();
 
@@ -763,6 +884,7 @@ impl GraniteSpeechRuntime {
             dtype,
             audio_dtype,
             encoder_weight_precision,
+            lm_precision,
             encoder,
             projector,
             text_model,
@@ -780,6 +902,11 @@ impl GraniteSpeechRuntime {
     /// The encoder's projection precision, and why.
     pub(crate) fn encoder_weight_precision(&self) -> &WeightOnlyF16Load {
         &self.encoder_weight_precision
+    }
+
+    /// The language model's precision, and why.
+    pub(crate) fn lm_precision(&self) -> &PrecisionLoad {
+        &self.lm_precision
     }
 
     pub(crate) fn kv_dtype(&self) -> DType {
@@ -2648,6 +2775,47 @@ impl GraniteLanguageModel {
         self.embed_tokens.forward(&ids).map_err(Error::from)
     }
 
+    /// Whether any part of the LM runs below F32: a lower base dtype, or the
+    /// selective F16 projections and attention core on an F32 base.
+    fn runs_below_f32(&self) -> bool {
+        self.embed_tokens.embeddings().dtype() != DType::F32 || self.execution_plan.any_f16()
+    }
+
+    /// The load-time range probe: `tokens` xorshift-chosen token ids through
+    /// every decoder layer and the head, on a private scratch cache in the
+    /// LM's K/V dtype. Returns each layer's output and the logits.
+    fn numeric_probe(&self, tokens: usize) -> Result<Vec<(String, Tensor)>> {
+        let vocab = self.cfg.vocab_size.max(1);
+        let ids = xorshift_values(tokens, 0x9A11, 1.0)
+            .into_iter()
+            .map(|unit| (((unit + 1.0) * 0.5 * vocab as f32) as usize).min(vocab - 1) as u32)
+            .collect::<Vec<_>>();
+        let embeds = self.embeddings(&ids)?;
+        let mut cache = PhysicalPagedKvCache::scratch_for_probe(
+            &self.device,
+            self.kv_dtype(),
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.hidden_size / self.cfg.num_attention_heads,
+            tokens,
+        )?;
+        let mut outputs = Vec::new();
+        let mut observe = |index: usize, x: &Tensor| {
+            outputs.push((format!("layers.{index}"), x.clone()));
+            Ok(())
+        };
+        let logits = self.forward_with_embeds_observed(
+            &embeds,
+            0,
+            &mut cache,
+            None,
+            None,
+            Some(&mut observe),
+        )?;
+        outputs.push(("logits".to_string(), logits));
+        Ok(outputs)
+    }
+
     fn forward_profiled(
         &self,
         input_ids: &Tensor,
@@ -2860,7 +3028,21 @@ impl GraniteLanguageModel {
         start_pos: usize,
         cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
+        profile: Option<&mut GraniteSpeechDecodeProfiler>,
+    ) -> Result<Tensor> {
+        self.forward_with_embeds_observed(embeds, start_pos, cache, rope_cache, profile, None)
+    }
+
+    /// [`Self::forward_with_embeds_profiled`], passing each decoder layer's
+    /// output to `observe` (the load-time range probe).
+    fn forward_with_embeds_observed(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
+        mut observe: Option<&mut dyn FnMut(usize, &Tensor) -> Result<()>>,
     ) -> Result<Tensor> {
         let (batch, sequence_len, hidden_size) = embeds.dims3()?;
         if batch != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
@@ -2927,6 +3109,9 @@ impl GraniteLanguageModel {
                     rope.as_ref(),
                     None,
                 )?;
+            }
+            if let Some(observe) = observe.as_mut() {
+                observe(idx, &x)?;
             }
         }
         let final_norm_start = profile_start(profiling);
@@ -5893,5 +6078,187 @@ mod tests {
         assert_eq!(&values[..4], &[0.0, -1e4, 0.0, -1e4]);
         assert_eq!(&values[8..12], &[0.0, 0.0, 0.0, 0.0]);
         assert_eq!(&values[12..], &[0.0, -1e4, 0.0, -1e4]);
+    }
+
+    fn probe_text_config() -> GraniteTextConfig {
+        GraniteTextConfig {
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_attention_heads: 4,
+            num_hidden_layers: 2,
+            num_key_value_heads: 2,
+            vocab_size: 96,
+            embedding_multiplier: 12.0,
+            logits_scaling: 8.0,
+            ..tiny_granite_text_config()
+        }
+    }
+
+    /// Random LM weights; `down_scale` multiplies every MLP down projection.
+    fn probe_text_tensors(config: &GraniteTextConfig, down_scale: f32) -> HashMap<String, Tensor> {
+        let (hidden, inter) = (config.hidden_size, config.intermediate_size);
+        let kv = hidden / config.num_attention_heads * config.num_key_value_heads;
+        let mut tensors = HashMap::new();
+        let mut seed = 40;
+        let mut put = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            seed += 1;
+            let tensor = (xorshift_tensor(shape, seed, scale, &Device::Cpu).unwrap()
+                + f64::from(offset))
+            .unwrap();
+            tensors.insert(name, tensor);
+        };
+        put(
+            "model.embed_tokens.weight".into(),
+            &[config.vocab_size, hidden],
+            0.1,
+            0.0,
+        );
+        put("model.norm.weight".into(), &[hidden], 0.1, 1.0);
+        for layer in 0..config.num_hidden_layers {
+            let at = |name: &str| format!("model.layers.{layer}.{name}");
+            put(at("input_layernorm.weight"), &[hidden], 0.1, 1.0);
+            put(at("post_attention_layernorm.weight"), &[hidden], 0.1, 1.0);
+            put(at("self_attn.q_proj.weight"), &[hidden, hidden], 0.2, 0.0);
+            put(at("self_attn.k_proj.weight"), &[kv, hidden], 0.2, 0.0);
+            put(at("self_attn.v_proj.weight"), &[kv, hidden], 0.2, 0.0);
+            put(at("self_attn.o_proj.weight"), &[hidden, hidden], 0.2, 0.0);
+            put(at("mlp.gate_proj.weight"), &[inter, hidden], 0.2, 0.0);
+            put(at("mlp.up_proj.weight"), &[inter, hidden], 0.2, 0.0);
+            put(
+                at("mlp.down_proj.weight"),
+                &[hidden, inter],
+                0.2 * down_scale,
+                0.0,
+            );
+        }
+        tensors
+    }
+
+    const SELECTIVE_F16: GraniteTextExecutionPlan = GraniteTextExecutionPlan {
+        selective_f16_lm_head: true,
+        selective_f16_qkv: true,
+        f16_attention_core: true,
+        selective_f16_mlp: true,
+        selective_f16_attention_output: true,
+    };
+
+    fn probe_language_model(
+        device: &Device,
+        plan: GraniteTextExecutionPlan,
+        down_scale: f32,
+    ) -> GraniteLanguageModel {
+        let config = probe_text_config();
+        let tensors = probe_text_tensors(&config, down_scale)
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.to_device(device).unwrap()))
+            .collect();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        GraniteLanguageModel::load_with_execution_plan(&config, true, vb, plan).unwrap()
+    }
+
+    fn probe_values(lm: &GraniteLanguageModel) -> Vec<(String, Vec<f32>)> {
+        use crate::kernels::numeric_check::host_f32;
+        lm.numeric_probe(GRANITE_LM_PROBE_TOKENS)
+            .unwrap()
+            .into_iter()
+            .map(|(name, tensor)| (name, host_f32(&tensor).unwrap()))
+            .collect()
+    }
+
+    /// The selective F16 LM against its F32 base on the same weights:
+    /// every layer output and the logits within F16 rounding, same top-1.
+    fn assert_selective_f16_lm_tracks_f32(device: &Device) {
+        use crate::kernels::numeric_check::relative_l2;
+        let f16 = probe_language_model(device, SELECTIVE_F16, 1.0);
+        assert!(f16.runs_below_f32() && f16.kv_dtype() == DType::F16);
+        let f32 = probe_language_model(&Device::Cpu, GraniteTextExecutionPlan::BASE_DTYPE, 1.0);
+        assert!(!f32.runs_below_f32());
+        let (low, reference) = (probe_values(&f16), probe_values(&f32));
+        assert_eq!(low.len(), 3);
+        for ((name, low), (_, reference)) in low.iter().zip(&reference) {
+            assert!(low.iter().all(|value| value.is_finite()), "{name}");
+            let rel = relative_l2(low, reference);
+            assert!(
+                rel < 2e-2,
+                "{name}: selective F16 vs F32 relative L2 {rel:e}"
+            );
+        }
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(argmax(&low[2].1), argmax(&reference[2].1));
+    }
+
+    #[test]
+    fn selective_f16_lm_probe_tracks_f32_on_cpu() {
+        assert_selective_f16_lm_tracks_f32(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_selective_f16_lm_probe_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_selective_f16_lm_tracks_f32(&device);
+    }
+
+    /// MLP outputs past F16's range turn the selective F16 LM non-finite or
+    /// out of range; the probe fails and the LM reloads with every
+    /// projection in F32, which stays finite.
+    #[test]
+    fn selective_f16_lm_falls_back_to_f32_when_the_range_probe_fails() {
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test".into(),
+        };
+        let mut loads = Vec::new();
+        let (lm, outcome) = load_with_precision_fallback(
+            "test LM",
+            &selection,
+            true,
+            DType::F32,
+            |dtype| {
+                loads.push(dtype);
+                let plan = if dtype == DType::F16 {
+                    SELECTIVE_F16
+                } else {
+                    GraniteTextExecutionPlan::BASE_DTYPE
+                };
+                Ok::<_, Error>(probe_language_model(&Device::Cpu, plan, 1.0e5))
+            },
+            |lm| {
+                run_numeric_self_check("test LM", F16_SAFE_MAX_ABS, || {
+                    lm.numeric_probe(GRANITE_LM_PROBE_TOKENS)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(loads, [DType::F16, DType::F32]);
+        assert!(outcome.fell_back() && !lm.runs_below_f32());
+        assert!(
+            outcome.reason.ends_with("fell back to F32"),
+            "{}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn granite_selective_f16_honours_the_f32_escape_hatches() {
+        use MetalDTypeOverride::{Auto, F16, F32};
+        assert!(!granite_f32_pinned(None, Auto));
+        assert!(granite_f32_pinned(None, F32));
+        assert!(granite_f32_pinned(Some("fp32"), Auto));
+        // The family override is more specific than the global one.
+        assert!(!granite_f32_pinned(Some("f16"), F32));
+        assert!(granite_f32_pinned(Some("f32"), F16));
+        assert!(granite_f32_pinned(Some(" "), F32));
+        assert!(!granite_selective_f16_default(&Device::Cpu));
     }
 }

@@ -11,7 +11,9 @@ use candle_core::{DType, Tensor, D};
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::{parse_dtype_name, BackendKind, DTypeSelection, DeviceKind, DeviceProfile};
+use crate::backends::{
+    parse_dtype_name, BackendKind, DTypeSelection, DeviceKind, DeviceProfile, MetalDTypeOverride,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -1690,6 +1692,7 @@ impl GraniteSpeechAsrModel {
     fn with_precision_diagnostics(&self, mut diagnostics: serde_json::Value) -> serde_json::Value {
         diagnostics["execution"]["encoder_weight_precision"] =
             self.runtime.encoder_weight_precision().diagnostics();
+        diagnostics["execution"]["lm_precision"] = self.runtime.lm_precision().diagnostics();
         diagnostics
     }
 }
@@ -2143,6 +2146,15 @@ pub(crate) fn select_granite_speech_dtype(
 
     if let Some(raw) = explicit.as_deref() {
         return resolve_explicit_granite_speech_dtype(device, raw);
+    }
+    if device.kind.is_metal()
+        && MetalDTypeOverride::from_env() == MetalDTypeOverride::Auto
+        && device.metal_bf16_checkpoint_lm_tier().dtype == DType::BF16
+    {
+        // Report 13's Apple9+ tier for the BF16 checkpoint (held until
+        // Metal paged attention takes BF16); the encoder stays F32 with
+        // weight-only F16 projections.
+        return Ok(DType::BF16);
     }
 
     config_hint

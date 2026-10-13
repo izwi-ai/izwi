@@ -136,7 +136,11 @@ in F32.
 Granite Speech applies the same split to its conformer audio encoder (about
 0.8 GiB less weight memory); its self-check result appears under
 `execution.encoder_weight_precision`, and `IZWI_GRANITE_SPEECH_DTYPE=f32` (or
-`IZWI_METAL_DTYPE=f32`) keeps the encoder in F32.
+`IZWI_METAL_DTYPE=f32`) keeps the encoder in F32. Granite's language model
+keeps its F16 projections and attention on Metal behind a load-time range
+probe; if the probe fails it loads in F32, and the reason appears under
+`execution.lm_precision`. The same two settings now also keep the language
+model fully in F32.
 
 Whisper runs its F16 checkpoint in F16 on every Apple GPU, as whisper.cpp,
 mlx-whisper and OpenAI Whisper do. The log-mel input, attention softmax,

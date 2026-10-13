@@ -67,6 +67,94 @@ pub(crate) struct PhysicalPagedKvCheckpoint {
 }
 
 impl PhysicalPagedKvCache {
+    /// A private, single-page cache on `device` for a load-time numeric
+    /// probe: `layers` layers of `kv_heads` x `head_dim` K/V in `dtype`, room
+    /// for `tokens` tokens. It lives only for the probe, outside any
+    /// lifecycle-owned arena; a few hundred KB at probe sizes.
+    pub(crate) fn scratch_for_probe(
+        device: &candle_core::Device,
+        dtype: candle_core::DType,
+        layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        tokens: usize,
+    ) -> Result<Self> {
+        use crate::backends::kv::{KvArenaConfig, KvLayerConfig};
+        use crate::backends::{backend_kind_for_device, BackendKind};
+
+        let u32_of = |value: usize, what: &str| {
+            u32::try_from(value)
+                .map_err(|_| Error::InvalidInput(format!("probe cache {what} exceeds u32")))
+        };
+        let backend = backend_kind_for_device(device);
+        let bindings = (0..layers)
+            .map(|layer| {
+                let layer = u32_of(layer, "layer")?;
+                Ok(KvLayerBinding {
+                    model_layer: layer,
+                    physical_layer: layer,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let config = KvArenaConfig {
+            id: KvArenaId {
+                // Never registered with the engine: a fixed identity that no
+                // loaded model instance takes.
+                model_instance: crate::engine::ModelInstanceId::new(u64::MAX),
+                backend,
+                // Metal's location is a registry id, which the arena does
+                // not compare; it only requires an explicit ordinal.
+                device_ordinal: match device.location() {
+                    candle_core::DeviceLocation::Cpu => None,
+                    candle_core::DeviceLocation::Cuda { gpu_id } => {
+                        Some(u32_of(gpu_id, "CUDA device ordinal")?)
+                    }
+                    candle_core::DeviceLocation::Metal { .. } => Some(0),
+                },
+                generation: 1,
+            },
+            group: crate::kv::KvGroupId::new(0),
+            page_tokens: u32_of(tokens.max(1), "token count")?,
+            capacity_pages: 1,
+            growth: None,
+            dtype,
+            layers: bindings
+                .iter()
+                .map(|binding| {
+                    Ok(KvLayerConfig {
+                        binding: *binding,
+                        num_kv_heads: u32_of(kv_heads, "KV head count")?,
+                        key_head_dim: u32_of(head_dim, "head dimension")?,
+                        value_head_dim: u32_of(head_dim, "head dimension")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let arena: Arc<dyn KvArena> = match backend {
+            BackendKind::Cpu => Arc::new(crate::backends::kv::CpuKvArena::new(config)?),
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            BackendKind::Metal | BackendKind::Cuda => Arc::new(
+                crate::backends::kv::CandleAcceleratorKvArena::new_mutation_only(
+                    config,
+                    device.clone(),
+                )?,
+            ),
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            BackendKind::Metal | BackendKind::Cuda => {
+                return Err(Error::InvalidInput(
+                    "probe cache on an accelerator needs the cuda or metal feature".into(),
+                ));
+            }
+        };
+        let block = CacheBlockRef {
+            arena: arena.id(),
+            group: arena.config().group,
+            index: 0,
+            slot_generation: 1,
+        };
+        Self::new(arena, bindings, vec![block], 0)
+    }
+
     pub fn new(
         arena: Arc<dyn KvArena>,
         layer_bindings: Vec<KvLayerBinding>,
@@ -1636,5 +1724,53 @@ mod tests {
             fused_stats.paged_decode_dispatches,
             plain_stats.paged_decode_dispatches
         );
+    }
+
+    /// A probe cache attends causally like any physical cache: the first
+    /// query sees only its own key, so its output is its own value.
+    fn probe_cache_attends_causally(device: &candle_core::Device, dtype: candle_core::DType) {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let (heads, dim, tokens) = (2, 32, 5);
+        let mut cache =
+            PhysicalPagedKvCache::scratch_for_probe(device, dtype, 2, heads, dim, tokens).unwrap();
+        let tensor = |seed| {
+            xorshift_tensor(&[tokens, heads, dim], seed, 1.0, device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+        };
+        let (q, k, v) = (tensor(1), tensor(2), tensor(3));
+        let mut prepared = cache.prepare_append(0, tokens).unwrap();
+        for layer in 0..2 {
+            let out = cache
+                .write_and_attend(layer, &mut prepared, &q, &k, &v, 0.125)
+                .unwrap();
+            assert_eq!(out.dims(), &[tokens, heads, dim]);
+            let out = host_f32(&out).unwrap();
+            assert!(out.iter().all(|value| value.is_finite()));
+            let first_value = host_f32(&v.narrow(0, 0, 1).unwrap()).unwrap();
+            for (got, want) in out[..heads * dim].iter().zip(&first_value) {
+                assert!((got - want).abs() < 1e-2, "{got} vs {want}");
+            }
+        }
+        cache.commit_prepared(prepared).unwrap();
+        assert_eq!(cache.context_len(), tokens);
+        assert!(cache.prepare_append(tokens, 1).is_err(), "one page only");
+    }
+
+    #[test]
+    fn cpu_probe_cache_attends_causally() {
+        probe_cache_attends_causally(&candle_core::Device::Cpu, candle_core::DType::F32);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_probe_cache_attends_causally_in_f16() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        probe_cache_attends_causally(&device, candle_core::DType::F16);
     }
 }
