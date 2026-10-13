@@ -3980,7 +3980,9 @@ mod tests {
         };
         let pointwise = |t: Tensor| Conv1d::new(t, None, Conv1dConfig::default());
         let conv = ConformerConv {
-            pointwise_conv1: pointwise(tensor(&[2 * ENCODER_DIM, ENCODER_DIM, 1])),
+            pointwise_conv1: crate::kernels::f16_weight_linear::PointwiseConv1d::Dense(pointwise(
+                tensor(&[2 * ENCODER_DIM, ENCODER_DIM, 1]),
+            )),
             depthwise_conv: Conv1d::new(
                 tensor(&[ENCODER_DIM, 1, CONV_KERNEL_1D]),
                 None,
@@ -3991,7 +3993,9 @@ mod tests {
                 },
             ),
             conv_norm: LayerNorm::new(tensor(&[ENCODER_DIM]), tensor(&[ENCODER_DIM]), 1e-5),
-            pointwise_conv2: pointwise(tensor(&[ENCODER_DIM, ENCODER_DIM, 1])),
+            pointwise_conv2: crate::kernels::f16_weight_linear::PointwiseConv1d::Dense(pointwise(
+                tensor(&[ENCODER_DIM, ENCODER_DIM, 1]),
+            )),
         };
         let x = tensor(&[2, ENCODER_DIM, 23])
             .pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)
