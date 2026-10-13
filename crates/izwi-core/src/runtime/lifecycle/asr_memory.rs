@@ -1573,12 +1573,13 @@ fn lfm25_audio_plan(model_path: &Path, backend: BackendKind) -> Result<Option<As
 
 /// LFM2.5-Audio (`lfm25_audio/`, `lfm2/backbone.rs`): all four GGUFs load on
 /// every backend. Quantized projections stay quantized; F32 tensors and the
-/// embedding tables (each backbone's `token_embd`, every loaded mmproj tensor,
-/// the vocoder's audio and depth embeddings) are dequantized to F32, the dtype
-/// the loader hard-codes (there is no dtype resolver to call). The main
-/// backbone has no `output.weight`, so its head reads `token_embd` a second
-/// time as a quantized projection, and each backbone keeps its first
-/// `token_embd` read alive until it finishes loading. Each backbone also
+/// embedding tables (the main backbone's `token_embd`, every loaded mmproj
+/// tensor, the vocoder's audio and depth embeddings) are dequantized to F32,
+/// the dtype the loader hard-codes (there is no dtype resolver to call). The
+/// detokenizer backbone runs on vocoder embeddings and skips its `token_embd`.
+/// The main backbone has no `output.weight`, so its head reads `token_embd` a
+/// second time as a quantized projection, and keeps its first `token_embd`
+/// read alive until it finishes loading. Each backbone also
 /// precomputes F32 RoPE tables over its full context (`rope_tables`).
 fn price_lfm25_audio(
     census: &Lfm25AudioCensus,
@@ -1601,11 +1602,13 @@ fn price_lfm25_audio(
         )
     };
     let mut ledger = Ledger::new(backend);
-    for backbone in [&census.main, &census.tokenizer] {
+    for (backbone, embeds_tokens) in [(&census.main, true), (&census.tokenizer, false)] {
         let tensors = by_name(std::slice::from_ref(backbone));
         let embedding = tensor(&tensors, "token_embd.weight")?;
-        ledger.gguf_dense(embedding, DType::F32)?;
-        ledger.hold(embedding.stored_bytes)?;
+        if embeds_tokens {
+            ledger.gguf_dense(embedding, DType::F32)?;
+            ledger.hold(embedding.stored_bytes)?;
+        }
         for (name, tensor) in &tensors {
             if *name == "token_embd.weight" {
                 continue;
@@ -1619,7 +1622,9 @@ fn price_lfm25_audio(
         if !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight") {
             ledger.gguf_stored(embedding)?;
         }
-        ledger.release(embedding.stored_bytes)?;
+        if embeds_tokens {
+            ledger.release(embedding.stored_bytes)?;
+        }
     }
     for tensor in &census.mmproj.tensors {
         if !MMPROJ_UNREAD.contains(&tensor.name.as_str()) {
@@ -2000,7 +2005,7 @@ mod tests {
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [2.08, 2.08, 2.08, 2.08],
+                [1.96, 1.96, 1.96, 1.96],
             ),
         ];
         for (label, plan, [cpu, metal_exact, metal_allocated, cuda]) in rows {
