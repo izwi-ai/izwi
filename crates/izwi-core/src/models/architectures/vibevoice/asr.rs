@@ -48,6 +48,11 @@ const DEFAULT_MAX_NEW_TOKENS: usize = 768;
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 60.0 * 60.0;
 const CUDA_MAX_AUDIO_SECONDS_ENV: &str = "IZWI_VIBEVOICE_ASR_CUDA_MAX_AUDIO_SECS";
 const TOKENIZER_STREAMING_CHUNK_SECONDS: usize = 60;
+/// Text tokens (chat template, timing header, language and caller
+/// instructions) a retained-route prompt may add to its audio placeholders.
+/// The published template takes about 70; a prompt with more text takes the
+/// legacy route instead.
+const RETAINED_PROMPT_TEXT_TOKENS: usize = 512;
 /// Automatic decode budget for a request that omits `max_tokens`. The JSON
 /// transcript costs about 5.5–7.8 tokens per second of speech (Qwen2.5
 /// tokenizer); 12 tokens/s plus a fixed reserve covers dense speech.
@@ -586,6 +591,10 @@ impl VibeVoiceAsrModel {
                 "VibeVoice-ASR prepared prompt exceeds decoder context".into(),
             ));
         }
+        // The preparation stage's workspace is sealed for this bound.
+        if prompt_tokens > self.retained_prompt_token_bound()? {
+            return Ok(VibeVoiceAsrPreparationDecision::LegacyInvocation);
+        }
         let embedding_elements = u64::try_from(prompt_tokens)
             .ok()
             .and_then(|tokens| {
@@ -702,13 +711,10 @@ impl VibeVoiceAsrModel {
         );
         let acoustic_frames =
             asr_placeholder_count(encoder_samples, self.preprocessor.speech_tok_compress_ratio);
-        let prompt_tokens = self
-            .config
-            .decoder_config
-            .max_position_embeddings
-            .ok_or_else(|| {
-                Error::ModelLoadError("VibeVoice ASR decoder context is unbounded".into())
-            })?;
+        // The retained route's largest prompt, not the decoder's 131,072-token
+        // context: that sized a 5.6 GB F32 workspace per prefill row for
+        // prompts of about 520 tokens (VVA-6).
+        let prompt_tokens = self.retained_prompt_token_bound()?;
         Ok(VibeVoiceAsrPreparationStageSeal {
             backend,
             dtype: format!("{:?}", self.dtype).to_ascii_lowercase(),
@@ -720,6 +726,24 @@ impl VibeVoiceAsrModel {
                 prompt_tokens,
             )?,
         })
+    }
+
+    /// The longest prompt the retained route prepares: one tokenizer chunk of
+    /// audio placeholders and [`RETAINED_PROMPT_TEXT_TOKENS`] of text, within
+    /// the decoder context.
+    fn retained_prompt_token_bound(&self) -> Result<usize> {
+        let context = self
+            .config
+            .decoder_config
+            .max_position_embeddings
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice ASR decoder context is unbounded".into())
+            })?;
+        Ok(vibevoice_retained_prompt_token_bound(
+            self.preprocessor.target_sample_rate(),
+            self.preprocessor.speech_tok_compress_ratio,
+            context,
+        ))
     }
 
     pub(crate) fn continuous_decode_workspace_per_row_bytes(&self) -> Result<u64> {
@@ -2940,6 +2964,17 @@ fn audio_rms(samples: &[f32]) -> f32 {
         .sqrt() as f32
 }
 
+fn vibevoice_retained_prompt_token_bound(
+    sample_rate: u32,
+    speech_tok_compress_ratio: usize,
+    context_tokens: usize,
+) -> usize {
+    let chunk = tokenizer_streaming_chunk_samples(sample_rate, speech_tok_compress_ratio);
+    asr_placeholder_count(chunk, speech_tok_compress_ratio)
+        .saturating_add(RETAINED_PROMPT_TEXT_TOKENS)
+        .min(context_tokens)
+}
+
 fn asr_placeholder_count(samples: usize, speech_tok_compress_ratio: usize) -> usize {
     let ratio = speech_tok_compress_ratio.max(1);
     samples.saturating_add(ratio - 1) / ratio
@@ -3576,6 +3611,16 @@ mod tests {
             prompt_instruction(Some("en"), Some("  Microsoft, VibeVoice  ")).as_deref(),
             Some("Microsoft, VibeVoice")
         );
+    }
+
+    #[test]
+    fn retained_prompt_bound_is_one_chunk_of_placeholders_and_its_text() {
+        // 60 s at 24 kHz over a 3,200-sample compression: 450 placeholders.
+        assert_eq!(
+            vibevoice_retained_prompt_token_bound(24_000, 3_200, 131_072),
+            450 + RETAINED_PROMPT_TEXT_TOKENS
+        );
+        assert_eq!(vibevoice_retained_prompt_token_bound(24_000, 3_200, 600), 600);
     }
 
     #[test]
