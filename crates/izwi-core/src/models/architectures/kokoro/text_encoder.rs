@@ -125,8 +125,7 @@ impl KokoroChannelLayerNorm {
             )));
         }
         let x_btc = x.transpose(1, 2).map_err(Error::from)?; // [B,T,C]
-        let mean = x_btc.mean_keepdim(2).map_err(Error::from)?;
-        let var = x_btc.var_keepdim(2).map_err(Error::from)?;
+        let (mean, var) = super::prosody::biased_mean_var_keepdim(&x_btc, 2)?;
         let denom = (var + self.eps)
             .map_err(Error::from)?
             .sqrt()

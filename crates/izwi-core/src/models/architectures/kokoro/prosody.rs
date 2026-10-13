@@ -56,30 +56,37 @@ kernel void kokoro_adain1d_snake_f32(
     threadgroup float sums[KOKORO_ADAIN_THREADS];
     threadgroup float sum_sqs[KOKORO_ADAIN_THREADS];
 
+    // Two passes, mean then squared deviations: the one-pass
+    // E[x^2] - E[x]^2 cancels badly in F32 when |mean| >> std. The variance
+    // is biased (divide by n), as InstanceNorm1d computes it.
     float sum = 0.0f;
-    float sum_sq = 0.0f;
     for (uint t = tid; t < time; t += KOKORO_ADAIN_THREADS) {
-        const float v = input[base + t];
-        sum += v;
-        sum_sq += v * v;
+        sum += input[base + t];
     }
     sums[tid] = sum;
-    sum_sqs[tid] = sum_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
     for (uint stride = KOKORO_ADAIN_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float mean = sums[0] / float(time);
+
+    float sum_sq = 0.0f;
+    for (uint t = tid; t < time; t += KOKORO_ADAIN_THREADS) {
+        const float d = input[base + t] - mean;
+        sum_sq += d * d;
+    }
+    sum_sqs[tid] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = KOKORO_ADAIN_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
             sum_sqs[tid] += sum_sqs[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    const float total = sums[0];
-    const float total_sq = sum_sqs[0];
-    const float mean = total / float(time);
-    const float denom = max(float(time - 1), 1.0f);
-    const float var = max((total_sq - total * total / float(time)) / denom, 0.0f);
+    const float var = sum_sqs[0] / float(time);
     const float inv_std = rsqrt(var + eps);
     const uint affine_base = batch * channels * 2;
     const float scale = affine[affine_base + channel] + 1.0f;
@@ -505,8 +512,7 @@ impl AdaLayerNorm {
                 self.channels, c
             )));
         }
-        let mean = x.mean_keepdim(2).map_err(Error::from)?;
-        let var = x.var_keepdim(2).map_err(Error::from)?;
+        let (mean, var) = biased_mean_var_keepdim(x, 2)?;
         let denom = (var + self.eps)
             .map_err(Error::from)?
             .sqrt()
@@ -567,8 +573,7 @@ impl AdaIN1d {
             }
         }
 
-        let mean = x.mean_keepdim(2).map_err(Error::from)?;
-        let var = x.var_keepdim(2).map_err(Error::from)?;
+        let (mean, var) = biased_mean_var_keepdim(x, 2)?;
         let denom = (var + self.eps)
             .map_err(Error::from)?
             .sqrt()
@@ -687,7 +692,7 @@ impl CustomOp3 for AdaIN1dCpuOp {
         }
 
         let mut out = vec![0.0f32; x.len()];
-        let denom_scale = (time - 1) as f32;
+        let denom_scale = time as f32;
         out.par_chunks_mut(time)
             .enumerate()
             .for_each(|(row, out_row)| {
@@ -715,6 +720,15 @@ impl CustomOp3 for AdaIN1dCpuOp {
             });
         Ok((CpuStorage::F32(out), x_layout.shape().clone()))
     }
+}
+
+/// Mean and biased variance (divide by n) over `dim`, kept: what PyTorch's
+/// `F.layer_norm` and `InstanceNorm1d` normalize with. Candle's
+/// `var_keepdim` divides by n - 1.
+pub(super) fn biased_mean_var_keepdim(x: &Tensor, dim: usize) -> Result<(Tensor, Tensor)> {
+    let mean = x.mean_keepdim(dim)?;
+    let var = x.broadcast_sub(&mean)?.sqr()?.mean_keepdim(dim)?;
+    Ok((mean, var))
 }
 
 fn validate_adain_affine_shape(
@@ -970,7 +984,7 @@ impl CustomOp3 for AdaIN1dSnakeCpuOp {
         }
 
         let mut out = vec![0.0f32; x.len()];
-        let denom_scale = (time - 1) as f32;
+        let denom_scale = time as f32;
         out.par_chunks_mut(time)
             .enumerate()
             .for_each(|(row, out_row)| {
@@ -1379,6 +1393,106 @@ mod tests {
         assert_eq!(expanded, super::super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
     }
 
+    /// KOK-15: every Kokoro norm divides by n like PyTorch (`F.layer_norm`,
+    /// `InstanceNorm1d`), checked against a hand-computed f64 reference on a
+    /// short row (n = 5, where n - 1 would be a 12% gain error) with a large
+    /// mean (which a one-pass variance would also lose).
+    #[test]
+    fn kokoro_norms_use_the_biased_variance() {
+        let device = candle_core::Device::Cpu;
+        let values = [
+            1000.1f32, 999.7, 1000.4, 999.9, 1000.3, -2.0, 0.5, 1.0, 3.5, -1.5,
+        ];
+        let x = Tensor::from_vec(values.to_vec(), (1, 2, 5), &device).unwrap();
+        let eps = 1e-5f64;
+        let reference = values
+            .chunks(5)
+            .flat_map(|row| {
+                let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / 5.0;
+                let var = row
+                    .iter()
+                    .map(|v| (f64::from(*v) - mean).powi(2))
+                    .sum::<f64>()
+                    / 5.0;
+                row.iter()
+                    .map(move |v| ((f64::from(*v) - mean) / (var + eps).sqrt()) as f32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let check = |label: &str, actual: Vec<f32>| {
+            for (got, expected) in actual.iter().zip(&reference) {
+                assert!(
+                    (got - expected).abs() < 2e-3,
+                    "{label}: {got} vs {expected}"
+                );
+            }
+        };
+        // Shared helper (AdaLayerNorm, AdaIN fallback, channel LayerNorm).
+        let (mean, var) = biased_mean_var_keepdim(&x, 2).unwrap();
+        let helper = x
+            .broadcast_sub(&mean)
+            .unwrap()
+            .broadcast_div(&(var + eps).unwrap().sqrt().unwrap())
+            .unwrap();
+        check("helper", helper.flatten_all().unwrap().to_vec1().unwrap());
+        // Fused CPU AdaIN with identity affine (gamma = 0, beta = 0).
+        let zeros = Tensor::zeros((1, 2, 1), candle_core::DType::F32, &device).unwrap();
+        let fused = x
+            .apply_op3_no_bwd(&zeros, &zeros, &AdaIN1dCpuOp { eps })
+            .unwrap();
+        check("cpu adain", fused.flatten_all().unwrap().to_vec1().unwrap());
+    }
+
+    /// KOK-15: the Metal AdaIN + Snake kernel matches the CPU op, including
+    /// rows whose mean dwarfs their spread.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_adain_snake_matches_cpu_with_large_means() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let cpu = candle_core::Device::Cpu;
+        let (channels, time) = (4usize, 37usize);
+        let values = xorshift_values(channels * time, 3, 0.5)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v + if i / time % 2 == 0 { 3000.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (1, channels, time), &cpu).unwrap();
+        let affine = Tensor::from_vec(
+            xorshift_values(channels * 2, 4, 0.3),
+            (1, channels * 2),
+            &cpu,
+        )
+        .unwrap();
+        let alpha =
+            Tensor::from_vec(xorshift_values(channels, 5, 0.4), (1, channels, 1), &cpu).unwrap();
+        let alpha = (alpha + 1.0).unwrap();
+        let reference = host_f32(
+            &x.apply_op3_no_bwd(&affine, &alpha, &AdaIN1dSnakeCpuOp { eps: 1e-5 })
+                .unwrap(),
+        )
+        .unwrap();
+        let metal = host_f32(
+            &x.to_device(&device)
+                .unwrap()
+                .apply_op3_no_bwd(
+                    &affine.to_device(&device).unwrap(),
+                    &alpha.to_device(&device).unwrap(),
+                    &AdaIN1dSnakeMetalOp { eps: 1e-5 },
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        // F32 rounding at a mean of 3000 leaves ~2e-3; the old one-pass
+        // variance was off by 2e2 here, and n - 1 by ~3e-2.
+        let error = max_abs_diff(&metal, &reference);
+        assert!(error < 1e-2, "Metal vs CPU AdaIN max abs {error}");
+    }
+
     /// KOK-16: durations round like `torch.round` (half to even), then
     /// clamp to at least one frame, as kokoro model.py does.
     #[test]
@@ -1411,8 +1525,15 @@ mod tests {
             .to_vec1::<f32>()
             .expect("fused values");
 
+        // The reference normalization: InstanceNorm1d's biased variance.
         let mean = x.mean_keepdim(2).expect("mean");
-        let var = x.var_keepdim(2).expect("var");
+        let var = x
+            .broadcast_sub(&mean)
+            .expect("centre")
+            .sqr()
+            .expect("square")
+            .mean_keepdim(2)
+            .expect("biased var");
         let denom = (var + eps).expect("eps").sqrt().expect("sqrt");
         let xhat = x
             .broadcast_sub(&mean)
@@ -1467,8 +1588,15 @@ mod tests {
             .expect("beta")
             .unsqueeze(2)
             .expect("beta unsqueeze");
+        // The reference normalization: InstanceNorm1d's biased variance.
         let mean = x.mean_keepdim(2).expect("mean");
-        let var = x.var_keepdim(2).expect("var");
+        let var = x
+            .broadcast_sub(&mean)
+            .expect("centre")
+            .sqr()
+            .expect("square")
+            .mean_keepdim(2)
+            .expect("biased var");
         let denom = (var + eps).expect("eps").sqrt().expect("sqrt");
         let xhat = x
             .broadcast_sub(&mean)
