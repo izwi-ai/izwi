@@ -1292,8 +1292,10 @@ mod tests {
         let ResourceAmount::Known(metal_total) = resources(BackendKind::Metal).unified_bytes else {
             panic!("known Metal reservation");
         };
+        // The tiled decoder (16 MiB per conv) holds one tile's im2col, not
+        // the 512 MiB stage im2col: about 0.55 GB, from about 1.0 GB.
         assert!(
-            metal_total < 1_100 * 1024 * 1024,
+            metal_total < 600 * 1024 * 1024,
             "45-word stream reserves {metal_total} bytes on Metal"
         );
     }

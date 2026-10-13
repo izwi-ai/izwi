@@ -12,10 +12,8 @@ use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 
 use super::{
-    kokoro_peak_workspace, KOKORO_DECODER_TIME_EXPANSION, KOKORO_GENERATOR_RESBLOCK_KERNELS,
-    KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS, KOKORO_GENERATOR_UPSAMPLE_RATES,
-    KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK, KOKORO_MAX_SAMPLES_PER_DURATION_FRAME, KOKORO_MAX_SPEED,
-    KOKORO_MIN_SPEED,
+    kokoro_peak_workspace, KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK,
+    KOKORO_MAX_SAMPLES_PER_DURATION_FRAME, KOKORO_MAX_SPEED, KOKORO_MIN_SPEED,
 };
 
 /// Planning pace: duration frames per input character at speed 1. Four is
@@ -58,7 +56,9 @@ pub(crate) fn kokoro_chunk_price(frames: usize, backend: BackendKind) -> Result<
     let overflow = || Error::Overloaded("Kokoro chunk price overflowed".to_string());
     let frames = u64::try_from(frames).map_err(|_| overflow())?;
     let workspace = kokoro_peak_workspace(frames)?;
-    let (cpu_im2col, accelerator_im2col) = kokoro_im2col_bytes(frames)?;
+    // The decoder tiles its convs to 16 MiB each, so a chunk holds one
+    // tile's im2col (KOK-9), not the whole stage's.
+    let (cpu_im2col, accelerator_im2col) = super::decoder::kokoro_decoder_im2col_bytes(frames)?;
     let accelerator_im2col = if backend == BackendKind::Metal {
         accelerator_im2col
             .checked_next_power_of_two()
@@ -83,52 +83,9 @@ pub(crate) fn kokoro_chunk_price(frames: usize, backend: BackendKind) -> Result<
     })
 }
 
-/// im2col buffers of the generator's final-stage resblocks (KOK-9): Candle
-/// lowers each conv1d to im2col + matmul, so a kernel-k conv over C
-/// channels and T steps materializes C·k·T floats. The CPU runs the three
-/// resblock branches concurrently (all kernels live); accelerators run them
-/// in sequence (the widest kernel). `(cpu, accelerator)` bytes.
-fn kokoro_im2col_bytes(frames: u64) -> Result<(u64, u64)> {
-    let overflow = || Error::Overloaded("Kokoro im2col price overflowed".to_string());
-    let steps_per_frame = KOKORO_GENERATOR_UPSAMPLE_RATES
-        .iter()
-        .try_fold(KOKORO_DECODER_TIME_EXPANSION as u64, |scale, rate| {
-            scale.checked_mul(*rate as u64)
-        })
-        .ok_or_else(overflow)?;
-    let channels = (KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS
-        >> KOKORO_GENERATOR_UPSAMPLE_RATES.len()) as u64;
-    let bytes = |kernel_sum: u64| {
-        frames
-            .checked_mul(steps_per_frame)
-            .and_then(|steps| steps.checked_mul(channels))
-            .and_then(|elements| elements.checked_mul(kernel_sum))
-            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>() as u64))
-            .ok_or_else(overflow)
-    };
-    let widest = KOKORO_GENERATOR_RESBLOCK_KERNELS
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0) as u64;
-    let all = KOKORO_GENERATOR_RESBLOCK_KERNELS
-        .iter()
-        .map(|kernel| *kernel as u64)
-        .sum();
-    Ok((bytes(all)?, bytes(widest)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn im2col_matches_the_audited_final_stage_shape() {
-        // 128 channels x 11 taps x 120 steps per frame (report 02, KOK-9).
-        let (cpu, accelerator) = kokoro_im2col_bytes(1).unwrap();
-        assert_eq!(accelerator, 128 * 11 * 120 * 4);
-        assert_eq!(cpu, 128 * (3 + 7 + 11) * 120 * 4);
-    }
 
     #[test]
     fn chunk_frames_follow_text_and_speed_under_the_model_cap() {
