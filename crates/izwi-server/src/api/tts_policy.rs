@@ -1,4 +1,7 @@
 use izwi_core::catalog::ModelFamily;
+pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
+    qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
+};
 use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::ModelVariant;
@@ -26,29 +29,6 @@ pub(crate) fn resolve_tts_output_frames(
         Some(0) | None => Some(model_max_frames),
         Some(_) => unreachable!("positive requested frames handled above"),
     }
-}
-
-pub(crate) fn qwen_tts_auto_max_frames_for_text(text: &str) -> usize {
-    const MIN_AUDIO_SECS: f32 = 4.0;
-    const MAX_AUDIO_SECS_PER_REQUEST: f32 = 120.0;
-    const WORDS_PER_SECOND: f32 = 2.5;
-    const CHARS_PER_WORD: usize = 5;
-    const END_PADDING_SECS: f32 = 2.0;
-
-    let word_count = text.split_whitespace().count();
-    let char_word_equivalent = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .count()
-        .div_ceil(CHARS_PER_WORD);
-    let estimated_words = word_count.max(char_word_equivalent).max(1);
-    let estimated_secs = ((estimated_words as f32) / WORDS_PER_SECOND + END_PADDING_SECS)
-        .clamp(MIN_AUDIO_SECS, MAX_AUDIO_SECS_PER_REQUEST);
-    let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
-    frames.clamp(
-        (MIN_AUDIO_SECS * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-        (MAX_AUDIO_SECS_PER_REQUEST * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-    )
 }
 
 fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {

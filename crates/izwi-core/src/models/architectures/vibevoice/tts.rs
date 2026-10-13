@@ -1827,6 +1827,20 @@ pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
 }
 
+/// Decoder positions one VibeVoice TTS prompt may take before its first
+/// frame: the system prompt, a voice section whose reference is cropped to
+/// 12 s (90 latent frames at 7.5 Hz), the target text that fills the largest
+/// automatic budget (about 130 words) and the speech-output header.
+const STATE_PROMPT_TOKENS: usize = 512;
+
+/// The retained context every VibeVoice TTS request needs in each CFG
+/// domain (positive and negative): one prompt plus the largest automatic
+/// output budget, one position per frame. Load admission guarantees it or
+/// refuses the load; live memory caps only growth above it.
+pub(crate) fn vibevoice_tts_state_floor_tokens() -> usize {
+    STATE_PROMPT_TOKENS + AUTO_MAX_OUTPUT_FRAMES
+}
+
 fn vibevoice_diffusion_plan(
     prediction_head: &VibeVoiceDiffusionHead,
     scheduler: VibeVoiceDiffusionScheduler,

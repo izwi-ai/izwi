@@ -3,6 +3,7 @@
 //! This module provides native Rust implementation for Qwen3-TTS models,
 //! supporting both CustomVoice (preset speakers) and voice cloning modes.
 
+mod budget;
 mod config;
 mod predictor;
 mod rope;
@@ -13,6 +14,11 @@ use speaker_encoder::SpeakerEncoder;
 mod talker;
 mod tokenizer;
 
+pub(crate) use budget::qwen3_tts_state_floor_tokens;
+pub use budget::{
+    qwen3_tts_auto_max_frames_for_text, qwen3_tts_auto_max_output_frames,
+    QWEN3_TTS_AUTO_MAX_AUDIO_SECS,
+};
 pub use config::Qwen3TtsConfig;
 pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
@@ -1033,19 +1039,7 @@ impl Qwen3TtsModel {
             ));
         }
         let full = self.managed_inference_state_contract()?;
-        let mut retained_base = InferenceStateContract {
-            abi: full.abi,
-            domains: vec![full.domains[0].clone()],
-            groups: vec![full.groups[0].clone()],
-        };
-        let StateDomainSpec::PagedAttention(talker) = &mut retained_base.domains[0] else {
-            unreachable!("Qwen3 TTS talker is paged attention")
-        };
-        talker.header.prefix = PrefixPolicy::Disabled;
-        talker.header.checkpoint = CheckpointPolicy::Transactional;
-        retained_base.groups[0].prefix_shareable = false;
-        retained_base.validate()?;
-        let retained = qwen3_tts_retained_state_contract(retained_base, &self.config, self.dtype)?;
+        let retained = qwen3_tts_retained_talker_contract(&full, &self.config, self.dtype)?;
 
         let mut predictor_contract = InferenceStateContract {
             abi: full.abi,
@@ -1150,6 +1144,30 @@ impl Qwen3TtsModel {
     }
 }
 
+/// The retained talker state a loaded model publishes: the talker's pages
+/// from `full` (the two-domain managed contract) and every decode tensor.
+pub(crate) fn qwen3_tts_retained_talker_contract(
+    full: &InferenceStateContract,
+    config: &Qwen3TtsConfig,
+    dtype: DType,
+) -> Result<InferenceStateContract> {
+    let mut retained_base = InferenceStateContract {
+        abi: full.abi,
+        domains: vec![full.domains[0].clone()],
+        groups: vec![full.groups[0].clone()],
+    };
+    let StateDomainSpec::PagedAttention(talker) = &mut retained_base.domains[0] else {
+        return Err(Error::ModelLoadError(
+            "Qwen3 TTS talker state must be paged attention".into(),
+        ));
+    };
+    talker.header.prefix = PrefixPolicy::Disabled;
+    talker.header.checkpoint = CheckpointPolicy::Transactional;
+    retained_base.groups[0].prefix_shareable = false;
+    retained_base.validate()?;
+    qwen3_tts_retained_state_contract(retained_base, config, dtype)
+}
+
 fn qwen3_tts_state_dtype(dtype: DType) -> Result<StateDType> {
     match dtype {
         DType::F32 => Ok(StateDType::F32),
@@ -1250,7 +1268,7 @@ fn qwen3_tts_state_component(
     })
 }
 
-fn qwen3_tts_inference_state_contract(
+pub(crate) fn qwen3_tts_inference_state_contract(
     config: &Qwen3TtsConfig,
     talker_dtype: DType,
     predictor_dtype: DType,
@@ -4382,7 +4400,7 @@ pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsMo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind};
     use crate::engine::{
@@ -4409,7 +4427,8 @@ mod tests {
         }
     }
 
-    fn cache_test_config() -> Qwen3TtsConfig {
+    /// Real Qwen3-TTS-12Hz-0.6B talker and predictor geometry.
+    pub(crate) fn cache_test_config() -> Qwen3TtsConfig {
         Qwen3TtsConfig {
             architectures: vec!["Qwen3TTSForConditionalGeneration".to_string()],
             model_type: "qwen3_tts".to_string(),

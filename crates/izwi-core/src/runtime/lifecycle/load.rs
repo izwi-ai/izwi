@@ -12,7 +12,7 @@ use crate::backends::BackendKind;
 use crate::config::ContextLengthPreference;
 use crate::engine::{
     AdapterInstanceId, CacheMode, ModelInstanceId, ReservationClass, ReservationOwner,
-    ResourceAmount, ResourceLease, ResourceVector, StageDescriptor,
+    ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -188,6 +188,22 @@ fn state_fit_budgets(
 /// variants, and for ASR families without an LLM decoder context).
 fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
     super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
+}
+
+/// The retained-state floor of a TTS variant, in tokens per sequence: one
+/// prompt plus the family's largest automatic output budget (per CFG domain
+/// for VibeVoice). `0` (the page minimum) for every other variant.
+fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
+    let tokens = match variant.family() {
+        crate::catalog::ModelFamily::Qwen3Tts => {
+            crate::models::architectures::qwen3::tts::qwen3_tts_state_floor_tokens()
+        }
+        crate::catalog::ModelFamily::VibeVoiceTts => {
+            crate::models::architectures::vibevoice::tts::vibevoice_tts_state_floor_tokens()
+        }
+        _ => 0,
+    };
+    tokens as u64
 }
 
 fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
@@ -2330,6 +2346,11 @@ impl ModelLifecycleController {
                 },
                 None => None,
             };
+            // A load without an observation leaves its weight under-pricing
+            // untracked; its live state fits keep only the configured reserve
+            // so those bytes, already charged by the live sample, are not
+            // reserved a second time (R-1).
+            let state_fit_reserve = StateFitReserve::for_observed_load(observed_weights.is_some());
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
             // invocation state so live headroom does not charge the model once
@@ -2929,12 +2950,16 @@ impl ModelLifecycleController {
                             ))
                         })?;
                     let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
+                    // One planned ASR chunk per sequence, as every other
+                    // ASR retained-state fit guarantees.
                     let retained = self
                         .core_engine
                         .load_managed_model_state(
                             model_instance_id,
                             &physical_spec.retained,
                             Some(physical_spec.retained_max_tokens),
+                            asr_minimum_tokens(variant),
+                            state_fit_reserve,
                         )
                         .await?;
                     let retained_uses = contracts
@@ -3128,12 +3153,17 @@ impl ModelLifecycleController {
                             .map_or(physical_spec.retained_max_tokens, |tokens| {
                                 physical_spec.retained_max_tokens.min(tokens)
                             });
+                        // The ASR fit above already sized this model's
+                        // retained runtime (bound to the same contract), so
+                        // this fit asks for no floor of its own.
                         let retained = self
                             .core_engine
                             .load_managed_model_state(
                                 model_instance_id,
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
+                                0,
+                                state_fit_reserve,
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -3233,6 +3263,8 @@ impl ModelLifecycleController {
                             model_instance_id,
                             &physical_spec.retained,
                             Some(retained_max_tokens),
+                            tts_state_minimum_tokens(variant),
+                            state_fit_reserve,
                         )
                         .await?;
                     self.model_registry.publish_effective_context(
@@ -3327,6 +3359,8 @@ impl ModelLifecycleController {
                         model_instance_id,
                         retained_contract,
                         retained_max_tokens,
+                        tts_state_minimum_tokens(variant),
+                        state_fit_reserve,
                     )
                     .await?;
                 self.model_registry.publish_effective_context(
@@ -6388,5 +6422,171 @@ mod tests {
         assert!(!runtime.model_manager.is_ready(variant).await);
         assert_eq!(authority.snapshot().reservations, 0);
         std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// A unified-memory machine whose provider samples live memory and
+    /// observes device usage (Metal's `currentAllocatedSize`).
+    #[derive(Debug)]
+    struct ObservedUnifiedProvider {
+        capacity: u64,
+        available: u64,
+        observed: u64,
+    }
+
+    impl PhysicalCapacityProvider for ObservedUnifiedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            let unified = |bytes| ResourceVector {
+                unified_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            };
+            PhysicalCapacitySnapshot {
+                capacity: unified(self.capacity),
+                available: unified(self.available),
+                source: CapacitySource::Test,
+            }
+        }
+
+        fn observed_device_usage_bytes(&self) -> Option<u64> {
+            Some(self.observed)
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// What load admission charged Qwen3-TTS 0.6B's weights at 0adabf16.
+    const TTS_CHARGED_WEIGHT_BYTES: u64 = 2_493_807_108;
+
+    /// Load TTS retained state through the engine's real load path the way
+    /// `load_model` does for an unobserved (non-ASR) load, beside weights the
+    /// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
+    /// observer reports `observed` bytes in use.
+    fn load_tts_retained_state(
+        variant: ModelVariant,
+        contract: &crate::kv::v2::InferenceStateContract,
+        maximum_tokens: usize,
+        capacity: u64,
+        available: u64,
+        observed: u64,
+    ) -> crate::error::Result<u64> {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedUnifiedProvider {
+                capacity,
+                available,
+                observed,
+            }),
+        ));
+        let weights = ResourceVector {
+            unified_bytes: ResourceAmount::Known(TTS_CHARGED_WEIGHT_BYTES),
+            ..ResourceVector::zero()
+        };
+        let _weights = authority.reserve_with_initial_materialized(
+            ReservationOwner::new(ReservationClass::Model, variant.to_string()),
+            weights,
+            weights,
+        )?;
+        assert!(
+            authority.untracked_device_bytes(BackendKind::Cpu).unwrap() > 0,
+            "observed usage must exceed what the ledger materialized"
+        );
+        let mut config = crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_retained_sequences: 1,
+            max_staged_transactions: 1,
+            ..Default::default()
+        };
+        config.portable_context_auto = true;
+        let mut core =
+            crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+        let runtime = core.load_managed_model_state(
+            ModelInstanceId::new(4_101),
+            contract,
+            Some(maximum_tokens),
+            super::tts_state_minimum_tokens(variant),
+            crate::engine::StateFitReserve::for_observed_load(false),
+        )?;
+        Ok(runtime.logical_token_reach())
+    }
+
+    /// R-1: Qwen3-TTS retained state collapsed to one 64-token page on
+    /// Metal, cutting every CustomVoice request at 54 frames and refusing
+    /// every clone. The fit must reach every request's prompt plus its
+    /// automatic budget whatever live memory reads, spend live growth above
+    /// it without reserving the unobserved weight under-pricing a second
+    /// time, and refuse with a 503 naming the shortfall when planning
+    /// headroom cannot hold the floor.
+    #[test]
+    fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_headroom() {
+        use crate::models::architectures::qwen3::tts::{
+            qwen3_tts_auto_max_frames_for_text, qwen3_tts_auto_max_output_frames,
+            qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+            tests::cache_test_config,
+        };
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let config = cache_test_config();
+        let full = qwen3_tts_inference_state_contract(
+            &config,
+            candle_core::DType::F32,
+            candle_core::DType::F32,
+            crate::models::shared::attention::paged::default_kv_page_size(),
+        )
+        .unwrap();
+        let contract =
+            qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32).unwrap();
+        // A clone prompt with the longest reference: role and codec-prefix
+        // tokens plus 320 reference codes.
+        let max_clone_prefill = 9 + 320 + 1;
+        let paragraph = "Good morning. Today we are testing a speech system that reads \
+            longer passages aloud, and we want to hear whether every sentence comes out \
+            clearly without the voice drifting, rushing, or stopping before the final word.";
+        assert!(qwen3_tts_auto_max_frames_for_text(paragraph) < qwen3_tts_auto_max_output_frames());
+        let required = (max_clone_prefill + qwen3_tts_auto_max_output_frames()) as u64;
+        let maximum = 3_072;
+        let budget = 11 * GIB + 440 * 1024 * 1024;
+        let observed = 6_000_000_000;
+
+        // Live memory is far below planning and the observed usage leaves
+        // nothing above the measured untracked bytes: the floor holds.
+        let reach = load_tts_retained_state(variant, &contract, maximum, budget, GIB / 2, observed)
+            .unwrap();
+        assert!(reach >= required, "effective context {reach} < {required}");
+        assert!(reach < maximum as u64, "live memory must still cap growth");
+
+        // With 3 GiB live, the configured reserve leaves growth for the full
+        // context; the unobserved weight under-pricing is not reserved again.
+        let reach = load_tts_retained_state(variant, &contract, maximum, budget, 3 * GIB, observed)
+            .unwrap();
+        assert_eq!(reach, maximum as u64);
+
+        // A floor planning headroom cannot hold refuses the load (503).
+        let tight = TTS_CHARGED_WEIGHT_BYTES + GIB + 64 * 1024 * 1024;
+        match load_tts_retained_state(variant, &contract, maximum, tight, tight, observed) {
+            Err(Error::Overloaded(message)) => {
+                assert!(message.contains("shortfall_bytes="), "{message}")
+            }
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        }
+    }
+
+    /// R-1 for VibeVoice: every request returned 400 against a 64-token
+    /// context. Both CFG domains must reach a prompt plus the largest
+    /// automatic budget.
+    #[test]
+    fn vibevoice_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_headroom() {
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        let variant = ModelVariant::VibeVoice15BTts;
+        let contract =
+            crate::models::architectures::vibevoice::vibevoice_tts_retained_test_contract(
+                candle_core::DType::F32,
+            );
+        // System prompt, a 12 s voice reference (90 latents plus markers)
+        // and the target text that fills the largest automatic budget.
+        let longest = "word ".repeat(1_000);
+        let required = (30 + 96 + 200 + vibevoice_tts_auto_max_frames_for_text(&longest)) as u64;
+        let maximum = 1_536;
+        let budget = 11 * GIB + 440 * 1024 * 1024;
+        let reach =
+            load_tts_retained_state(variant, &contract, maximum, budget, GIB / 2, 6_000_000_000)
+                .unwrap();
+        assert!(reach >= required, "effective context {reach} < {required}");
+        assert!(reach < maximum as u64, "live memory must still cap growth");
     }
 }

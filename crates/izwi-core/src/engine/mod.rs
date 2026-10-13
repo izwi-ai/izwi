@@ -63,6 +63,7 @@ pub(crate) use cache::composite::{
 #[cfg(test)]
 pub(crate) use cache::managed::ManagedKvCacheManager;
 pub(crate) use cache::managed::ManagedKvModelRuntime;
+pub(crate) use cache::managed::StateFitReserve;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
@@ -3068,12 +3069,16 @@ impl Engine {
         model_instance: ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
         self.core.write().await.load_managed_model_state(
             model_instance,
             retained_state,
             logical_context_tokens,
+            minimum_tokens,
+            reserve,
         )
     }
 
@@ -3118,6 +3123,8 @@ impl Engine {
                 portable_state_copies,
                 rows,
                 minimum_tokens,
+                // ASR loads reconcile their observed weight growth.
+                StateFitReserve::MeasuredUntracked,
             )
     }
 

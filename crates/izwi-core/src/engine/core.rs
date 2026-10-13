@@ -18,7 +18,7 @@ use super::cache::composite::{
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
 use super::cache::managed::{
-    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom, StateFitReserve,
 };
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
@@ -3279,6 +3279,17 @@ impl EngineCore {
         })
     }
 
+    /// An engine core whose managed state fits against `authority`.
+    #[cfg(test)]
+    pub(crate) fn new_with_managed_authority_for_test(
+        config: EngineCoreConfig,
+        authority: Arc<super::ResourceAuthority>,
+    ) -> Result<Self> {
+        let mut worker_config = WorkerConfig::from(&config);
+        worker_config.resource_authority = Some(authority);
+        Self::new_with_worker(config, worker_config)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_unified_executor(
         config: EngineCoreConfig,
@@ -5518,26 +5529,16 @@ impl EngineCore {
         Ok(Some(runtime))
     }
 
+    /// Retained ASR or TTS state on the engine's own row limits, fitted
+    /// within live memory above `minimum_tokens` per sequence (see
+    /// [`Self::load_managed_model_state_with_portable_copies_and_rows`]).
     pub(crate) fn load_managed_model_state(
         &mut self,
         model_instance: super::ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
-    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
-        self.load_managed_model_state_with_portable_copies(
-            model_instance,
-            retained_state,
-            logical_context_tokens,
-            1,
-        )
-    }
-
-    pub(crate) fn load_managed_model_state_with_portable_copies(
-        &mut self,
-        model_instance: super::ModelInstanceId,
-        retained_state: &crate::kv::v2::InferenceStateContract,
-        logical_context_tokens: Option<usize>,
-        portable_state_copies: u32,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let rows = (
             self.config.max_retained_sequences,
@@ -5547,15 +5548,20 @@ impl EngineCore {
             model_instance,
             retained_state,
             logical_context_tokens,
-            portable_state_copies,
+            1,
             rows,
-            0,
+            minimum_tokens,
+            reserve,
         )
     }
 
-    /// ASR retained state with its own `(retained, staged)` row counts, at
-    /// most the engine's (ADM-6): the engine rows are sized for chat (on CUDA
-    /// one per 256 MiB of device memory), far wider than ASR concurrency.
+    /// Retained ASR or TTS state with its own `(retained, staged)` row
+    /// counts, at most the engine's (ADM-6): the engine rows are sized for
+    /// chat (on CUDA one per 256 MiB of device memory), far wider than ASR
+    /// concurrency. `minimum_tokens` is the floor every sequence must reach
+    /// (one ASR chunk, one TTS prompt plus its output budget); a floor that
+    /// planning headroom cannot hold refuses the load with `Overloaded`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_managed_model_state_with_portable_copies_and_rows(
         &mut self,
         model_instance: super::ModelInstanceId,
@@ -5564,6 +5570,7 @@ impl EngineCore {
         portable_state_copies: u32,
         (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         if retained_rows == 0
             || staged_rows == 0
@@ -5571,12 +5578,13 @@ impl EngineCore {
             || staged_rows > self.config.max_staged_transactions
         {
             return Err(Error::ModelLoadError(
-                "ASR state row limits exceed configured capacity".into(),
+                "retained state row limits exceed configured capacity".into(),
             ));
         }
         let backend = self.managed_kv_cache.worker_backend();
-        // Only ASR retained state loads through here; it fits within live
-        // memory so the requests it serves can run beside it.
+        // ASR and TTS retained state fit within live memory so the requests
+        // they serve can run beside them; the floor is admitted against
+        // planning headroom.
         let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
@@ -5584,7 +5592,10 @@ impl EngineCore {
             logical_context_tokens,
             portable_state_copies,
             (retained_rows, staged_rows),
-            PortableFitHeadroom::Live { minimum_tokens },
+            PortableFitHeadroom::Live {
+                minimum_tokens,
+                reserve,
+            },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5687,8 +5698,12 @@ impl EngineCore {
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
-            // Whisper's decoder state: ASR, fitted within live memory.
-            PortableFitHeadroom::Live { minimum_tokens },
+            // Whisper's decoder state: ASR, fitted within live memory. Its
+            // load reconciles observed weight growth.
+            PortableFitHeadroom::Live {
+                minimum_tokens,
+                reserve: StateFitReserve::MeasuredUntracked,
+            },
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;

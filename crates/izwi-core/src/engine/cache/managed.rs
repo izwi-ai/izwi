@@ -518,14 +518,47 @@ impl Default for ManagedKvCacheManager {
 /// What a portable managed-state fit may spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortableFitHeadroom {
-    /// Stable planning headroom (chat and TTS state).
+    /// Stable planning headroom (chat and Fish state).
     Planning,
     /// Planning headroom clamped to live memory
-    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR state, which
-    /// must leave room for the requests it serves. `minimum_tokens` is the
-    /// one-chunk floor each sequence must reach (`0`: the page minimum); it
+    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR and TTS
+    /// retained state, which must leave room for the requests it serves.
+    /// `minimum_tokens` is the floor each sequence must reach (one ASR chunk,
+    /// or one TTS prompt plus its output budget; `0`: the page minimum); it
     /// is admitted against planning headroom or the load is refused.
-    Live { minimum_tokens: u64 },
+    Live {
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    },
+}
+
+/// The safety reserve a live state fit leaves free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateFitReserve {
+    /// The configured floor or the measured untracked device memory,
+    /// whichever is larger (ADM-11). Right for a load whose weight growth
+    /// was observed and reconciled: what remains untracked is pool slack and
+    /// other growth that recurs beside the state.
+    MeasuredUntracked,
+    /// The configured floor alone, for a load without a device observation.
+    /// Its weights are priced from the checkpoint, not observed, so on Metal
+    /// the whole under-pricing (Qwen3-TTS 0.6B: about 5.2 GB held against
+    /// 2.5 GB charged) reads as untracked memory. The live sample already
+    /// charges those bytes, so reserving them again left no growth budget
+    /// and collapsed TTS state to one page (R-1).
+    Configured,
+}
+
+impl StateFitReserve {
+    /// The reserve for a load that did (`true`) or did not observe its
+    /// weight growth.
+    pub(crate) const fn for_observed_load(observed: bool) -> Self {
+        if observed {
+            Self::MeasuredUntracked
+        } else {
+            Self::Configured
+        }
+    }
 }
 
 impl ManagedKvCacheManager {
@@ -613,11 +646,16 @@ impl ManagedKvCacheManager {
         let planning = authority.planning_headroom_bytes(self.worker_backend)?;
         let (growth_headroom, safety_reserve_bytes) = match headroom {
             PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
-            // ASR state keeps the one reserve its invocation fit keeps too:
-            // the configured floor or the measured untracked growth (ADM-11).
-            PortableFitHeadroom::Live { .. } => (
+            // Retained state keeps the one reserve its invocation fit keeps
+            // too: the configured floor or, for an observed load, the
+            // measured untracked growth (ADM-11).
+            PortableFitHeadroom::Live { reserve, .. } => (
                 authority.state_fit_headroom_bytes(self.worker_backend)?,
-                authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+                match reserve {
+                    StateFitReserve::MeasuredUntracked => authority
+                        .state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+                    StateFitReserve::Configured => safety_reserve_bytes,
+                },
             ),
         };
         let ResourceAmount::Known(headroom_bytes) = planning else {
@@ -676,7 +714,7 @@ impl ManagedKvCacheManager {
         };
 
         let floor_tokens = match headroom {
-            PortableFitHeadroom::Live { minimum_tokens } => minimum_tokens,
+            PortableFitHeadroom::Live { minimum_tokens, .. } => minimum_tokens,
             PortableFitHeadroom::Planning => 0,
         };
         let minimum_tokens = u64::from(page_tokens_hint)
@@ -685,10 +723,11 @@ impl ManagedKvCacheManager {
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
             let message = format!(
-                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
+                minimum_bytes - floor_budget_bytes
             );
-            // An ASR floor that planning headroom cannot hold is a capacity
-            // refusal (503), not a load defect.
+            // An ASR or TTS floor that planning headroom cannot hold is a
+            // capacity refusal (503), not a load defect.
             return Err(match headroom {
                 PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
                 PortableFitHeadroom::Planning => Error::ModelLoadError(message),
@@ -5976,7 +6015,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
-        let live = fit(PortableFitHeadroom::Live { minimum_tokens: 0 });
+        let live = fit(PortableFitHeadroom::Live {
+            minimum_tokens: 0,
+            reserve: StateFitReserve::MeasuredUntracked,
+        });
         assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
 
         // Right after a large load live memory can read below the reserve
@@ -6008,6 +6050,7 @@ mod tests {
                 1,
                 PortableFitHeadroom::Live {
                     minimum_tokens: floor,
+                    reserve: StateFitReserve::MeasuredUntracked,
                 },
             )
         };
