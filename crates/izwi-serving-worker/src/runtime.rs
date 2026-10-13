@@ -573,10 +573,14 @@ pub struct RuntimeRealtimeTtsExecutor {
 }
 
 impl RuntimeRealtimeTtsExecutor {
-    /// The output spec is resolved from the loaded runtime's codec rate, the
-    /// same surface the single-node realtime voice route announces.
+    /// The output spec is announced at session admission, before any audio,
+    /// so it carries the model's own output rate (Fish 44.1 kHz), not the
+    /// codec default (TPIPE-22); a chunk at another rate is refused.
     pub async fn new(runtime: Arc<RuntimeService>, variant: ModelVariant) -> Self {
-        let sample_rate = runtime.sample_rate().await;
+        let sample_rate = match variant.tts_output_sample_rate_hint() {
+            Some(rate) => rate,
+            None => runtime.sample_rate().await,
+        };
         Self {
             runtime,
             variant,
@@ -672,6 +676,7 @@ impl RealtimeStageRunner for RuntimeRealtimeTtsRunner {
         Ok(Box::new(RuntimeTtsStageStream {
             chunks: chunk_rx,
             generation: Some(generation),
+            sample_rate: self.output_audio.sample_rate,
         }))
     }
 }
@@ -679,6 +684,8 @@ impl RealtimeStageRunner for RuntimeRealtimeTtsRunner {
 struct RuntimeTtsStageStream {
     chunks: tokio::sync::mpsc::Receiver<AudioChunk>,
     generation: Option<tokio::task::JoinHandle<Result<(), CoreError>>>,
+    /// The rate the session announced.
+    sample_rate: u32,
 }
 
 impl Drop for RuntimeTtsStageStream {
@@ -693,6 +700,12 @@ impl Drop for RuntimeTtsStageStream {
 impl RealtimeTtsStageStream for RuntimeTtsStageStream {
     async fn next_chunk(&mut self) -> Result<Option<AudioChunk>, CoreError> {
         match self.chunks.recv().await {
+            Some(chunk) if chunk.sample_rate != 0 && chunk.sample_rate != self.sample_rate => {
+                Err(CoreError::InferenceError(format!(
+                    "TTS audio at {} Hz does not match the session's announced {} Hz",
+                    chunk.sample_rate, self.sample_rate
+                )))
+            }
             Some(chunk) => Ok(Some(chunk)),
             None => match self.generation.take() {
                 None => Ok(None),

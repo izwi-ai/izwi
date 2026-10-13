@@ -849,6 +849,20 @@ impl ModelVariant {
         }
     }
 
+    /// The sample rate this TTS variant's audio comes out at, for surfaces
+    /// that announce it before the first chunk (realtime sessions).
+    pub fn tts_output_sample_rate_hint(&self) -> Option<u32> {
+        match self.family() {
+            crate::catalog::ModelFamily::FishS2Tts => Some(44_100),
+            crate::catalog::ModelFamily::Qwen3Tts
+            | crate::catalog::ModelFamily::KokoroTts
+            | crate::catalog::ModelFamily::VoxtralTts
+            | crate::catalog::ModelFamily::VibeVoiceTts
+            | crate::catalog::ModelFamily::Lfm25Audio => Some(24_000),
+            _ => None,
+        }
+    }
+
     /// Max output duration hint in seconds for this TTS variant, if known.
     pub fn tts_max_output_seconds_hint(&self) -> Option<f32> {
         let frames = self.tts_max_output_frames_hint()?;
@@ -1188,6 +1202,28 @@ mod tests {
     use crate::catalog::ModelTask;
 
     use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
+
+    /// TPIPE-22: the announced realtime rate is each family's real output
+    /// rate (Fish's codec runs at 44.1 kHz).
+    #[test]
+    fn tts_output_sample_rate_hints_match_the_model_codecs() {
+        assert_eq!(
+            ModelVariant::FishAudioS2Pro.tts_output_sample_rate_hint(),
+            Some(crate::models::architectures::fish_s2::FishS2DacConfig::current().sample_rate)
+        );
+        assert_eq!(
+            ModelVariant::Lfm25Audio15BGguf.tts_output_sample_rate_hint(),
+            Some(24_000)
+        );
+        assert_eq!(
+            ModelVariant::Kokoro82M.tts_output_sample_rate_hint(),
+            Some(24_000)
+        );
+        assert_eq!(
+            ModelVariant::WhisperLargeV3Turbo.tts_output_sample_rate_hint(),
+            None
+        );
+    }
 
     #[test]
     fn chat_capabilities_expose_reasoning_effort_only_for_qwen38() {

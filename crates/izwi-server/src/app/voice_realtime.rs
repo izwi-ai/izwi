@@ -2390,20 +2390,24 @@ async fn stream_tts_to_socket(
         .await
         .map_err(|err| format!("Failed to load TTS model: {err}"))?;
 
-    let sample_rate = state.runtime.sample_rate().await;
-    let encoder = AudioEncoder::new(sample_rate, 1);
-
-    send_turn_json(
-        out_tx,
-        output_generation,
-        json!({
-            "type": "assistant_audio_start",
-            "utterance_id": utterance_id,
-            "utterance_seq": utterance_seq,
-            "sample_rate": sample_rate,
-            "audio_format": "pcm_i16",
-        }),
-    );
+    // The audio is announced at the model's own rate, read from its first
+    // chunk, not the codec default (TPIPE-22: a 44.1 kHz model played at
+    // 0.54x when labelled 24 kHz).
+    let fallback_sample_rate = state.runtime.sample_rate().await;
+    let mut announced_rate: Option<u32> = None;
+    let announce = |sample_rate: u32| {
+        send_turn_json(
+            out_tx,
+            output_generation,
+            json!({
+                "type": "assistant_audio_start",
+                "utterance_id": utterance_id,
+                "utterance_seq": utterance_seq,
+                "sample_rate": sample_rate,
+                "audio_format": "pcm_i16",
+            }),
+        );
+    };
 
     let gen_config = GenerationConfig {
         streaming: true,
@@ -2445,6 +2449,14 @@ async fn stream_tts_to_socket(
         if chunk.samples.is_empty() && !chunk.is_final {
             continue;
         }
+        let (sample_rate, first) = realtime_chunk_rate(
+            &mut announced_rate,
+            chunk.sample_rate_or(fallback_sample_rate),
+        )?;
+        if first {
+            announce(sample_rate);
+        }
+        let encoder = AudioEncoder::new(sample_rate, 1);
 
         let encoded = encoder
             .encode(&chunk.samples, AudioFormat::RawI16)
@@ -2475,6 +2487,9 @@ async fn stream_tts_to_socket(
 
     match generation_task.join().await {
         Ok(Ok(())) => {
+            if announced_rate.is_none() {
+                announce(fallback_sample_rate);
+            }
             send_turn_json(
                 out_tx,
                 output_generation,
@@ -2488,6 +2503,26 @@ async fn stream_tts_to_socket(
         }
         Ok(Err(err)) => Err(format!("TTS failed: {err}")),
         Err(err) => Err(format!("TTS streaming task failed: {err}")),
+    }
+}
+
+/// The rate a realtime utterance's audio is labelled with: its first chunk's
+/// (`true` when this chunk announces it). A later chunk at another rate is
+/// refused rather than mislabelled.
+fn realtime_chunk_rate(
+    announced: &mut Option<u32>,
+    chunk_rate: u32,
+) -> Result<(u32, bool), String> {
+    let chunk_rate = chunk_rate.max(1);
+    match *announced {
+        None => {
+            *announced = Some(chunk_rate);
+            Ok((chunk_rate, true))
+        }
+        Some(rate) if rate == chunk_rate => Ok((rate, false)),
+        Some(rate) => Err(format!(
+            "TTS audio changed sample rate mid-utterance ({rate} Hz to {chunk_rate} Hz)"
+        )),
     }
 }
 
@@ -3423,6 +3458,22 @@ mod tests {
             pre_roll_ms: 100,
             input_sample_rate_hint: Some(16_000),
         })
+    }
+
+    /// TPIPE-22: an utterance is labelled with its first chunk's rate (44.1
+    /// kHz for Fish), and a chunk at another rate is refused.
+    #[test]
+    fn realtime_audio_is_labelled_with_the_models_rate() {
+        let mut announced = None;
+        assert_eq!(
+            realtime_chunk_rate(&mut announced, 44_100),
+            Ok((44_100, true))
+        );
+        assert_eq!(
+            realtime_chunk_rate(&mut announced, 44_100),
+            Ok((44_100, false))
+        );
+        assert!(realtime_chunk_rate(&mut announced, 24_000).is_err());
     }
 
     #[test]
