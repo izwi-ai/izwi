@@ -20,7 +20,9 @@ use crate::models::architectures::voxtral::{
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
-use super::acoustic::{AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT};
+use super::acoustic::{
+    seeded_flow_noise, AudioSpecialToken, FlowMatchingAudioTransformer, AUDIO_SPECIAL_TOKEN_COUNT,
+};
 use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
 use super::config::VoxtralTtsConfig;
 use super::retained::{
@@ -565,6 +567,11 @@ impl VoxtralTtsModel {
         let hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Voxtral TTS retained decode has no hidden state".into())
         })?;
+        let noise = seeded_flow_noise(
+            &[(state.params.seed, state.frames.len())],
+            self.config.multimodal.audio_model_args.n_acoustic_codebook,
+            hidden.device(),
+        )?;
         let generated = pipeline
             .acoustic_transformer
             .forward_audio_codes_with_feedback_tensor(
@@ -572,6 +579,7 @@ impl VoxtralTtsModel {
                 state.params.cfg_alpha,
                 state.params.n_decoding_steps,
                 !state.frames.is_empty(),
+                noise.as_ref(),
             )?;
         let feedback_tensor = generated.shifted_code_tensor;
         let frame = generated.frames.into_iter().next().ok_or_else(|| {
@@ -660,6 +668,14 @@ impl VoxtralTtsModel {
             .collect::<Result<Vec<_>>>()?;
         let hidden = Tensor::cat(&hidden_rows, 0)?;
         let first = &states[0];
+        let noise = seeded_flow_noise(
+            &states
+                .iter()
+                .map(|state| (state.params.seed, state.frames.len()))
+                .collect::<Vec<_>>(),
+            self.config.multimodal.audio_model_args.n_acoustic_codebook,
+            hidden.device(),
+        )?;
         let generated = pipeline
             .acoustic_transformer
             .forward_audio_codes_with_feedback_tensor(
@@ -667,6 +683,7 @@ impl VoxtralTtsModel {
                 first.params.cfg_alpha,
                 first.params.n_decoding_steps,
                 !first.frames.is_empty(),
+                noise.as_ref(),
             )?;
         if generated.frames.len() != states.len() {
             return Err(Error::InferenceError(format!(
@@ -841,6 +858,11 @@ impl VoxtralTtsPipeline {
 
         for (pos, frame_idx) in (prompt.input_ids.len()..).zip(0..max_frames) {
             let acoustic_start = Instant::now();
+            let noise = seeded_flow_noise(
+                &[(params.seed, frames.len())],
+                model.config.multimodal.audio_model_args.n_acoustic_codebook,
+                last_hidden.device(),
+            )?;
             let generated = self
                 .acoustic_transformer
                 .forward_audio_codes_with_feedback_tensor(
@@ -848,6 +870,7 @@ impl VoxtralTtsPipeline {
                     params.cfg_alpha,
                     params.n_decoding_steps,
                     !frames.is_empty(),
+                    noise.as_ref(),
                 )
                 .map_err(|err| {
                     Error::InferenceError(format!("Voxtral TTS acoustic generation failed: {err}"))

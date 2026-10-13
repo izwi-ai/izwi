@@ -227,6 +227,7 @@ impl FlowMatchingAudioTransformer {
             cfg_alpha,
             n_decoding_steps,
             true,
+            None,
         )
     }
 
@@ -236,6 +237,7 @@ impl FlowMatchingAudioTransformer {
         cfg_alpha: f32,
         n_decoding_steps: usize,
         allow_end_audio: bool,
+        initial_noise: Option<&Tensor>,
     ) -> Result<Vec<Vec<u32>>> {
         Ok(self
             .forward_audio_codes_with_feedback_tensor(
@@ -243,6 +245,7 @@ impl FlowMatchingAudioTransformer {
                 cfg_alpha,
                 n_decoding_steps,
                 allow_end_audio,
+                initial_noise,
             )?
             .frames)
     }
@@ -253,6 +256,7 @@ impl FlowMatchingAudioTransformer {
         cfg_alpha: f32,
         n_decoding_steps: usize,
         allow_end_audio: bool,
+        initial_noise: Option<&Tensor>,
     ) -> Result<VoxtralGeneratedAudioCodes> {
         let llm_hidden = match llm_hidden.rank() {
             1 => llm_hidden.unsqueeze(0)?,
@@ -285,6 +289,7 @@ impl FlowMatchingAudioTransformer {
                 &llm_hidden,
                 cfg_alpha,
                 n_decoding_steps,
+                initial_noise,
             )
             .map_err(|err| Error::InferenceError(format!("acoustic frame decode failed: {err}")))?;
         let mut frames = Vec::with_capacity(semantic_selection.codes.len());
@@ -318,17 +323,25 @@ impl FlowMatchingAudioTransformer {
         llm_hidden: &Tensor,
         cfg_alpha: f32,
         n_decoding_steps: usize,
+        initial_noise: Option<&Tensor>,
     ) -> Result<DecodedAcousticCodes> {
         let batch = semantic_codes.len();
         let dtype = llm_hidden.dtype();
         let device = llm_hidden.device();
-        let mut sampled = Tensor::randn(
-            0.0f32,
-            1.0f32,
-            (batch, self.generation.n_acoustic_codebooks),
-            device,
-        )?
-        .to_dtype(dtype)?;
+        let shape = (batch, self.generation.n_acoustic_codebooks);
+        let mut sampled = match initial_noise {
+            Some(noise) if noise.dims() == [shape.0, shape.1] => {
+                noise.to_device(device)?.to_dtype(dtype)?
+            }
+            Some(noise) => {
+                return Err(Error::InvalidInput(format!(
+                    "Voxtral flow-matching noise {:?} does not match {:?}",
+                    noise.dims(),
+                    shape
+                )))
+            }
+            None => Tensor::randn(0.0f32, 1.0f32, shape, device)?.to_dtype(dtype)?,
+        };
         let llm_hidden_zero = Tensor::zeros(llm_hidden.shape(), dtype, device)?;
         let n_steps = n_decoding_steps.max(1);
         for step in 0..n_steps {
@@ -498,6 +511,62 @@ impl AcousticFeedForward {
         let hidden = ops::silu(&gate)?.broadcast_mul(&up)?;
         linear_forward_last_dim(&self.w2, &hidden)
     }
+}
+
+/// Initial flow-matching noise for rows `(seed, frame)`: standard normal
+/// values from a counter-based stream keyed by the row's seed and frame
+/// index, so a frame retried or re-batched gets the same noise. `None` when
+/// every row is unseeded (seed 0), which keeps Candle's device `randn`; an
+/// unseeded row in a seeded batch draws a time-based seed.
+pub(crate) fn seeded_flow_noise(
+    rows: &[(u64, usize)],
+    codebooks: usize,
+    device: &candle_core::Device,
+) -> Result<Option<Tensor>> {
+    if rows.iter().all(|(seed, _)| *seed == 0) {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(rows.len() * codebooks);
+    for &(seed, frame) in rows {
+        let seed = if seed == 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        } else {
+            seed
+        };
+        values.extend(gaussian_stream(seed, frame as u64, codebooks));
+    }
+    Ok(Some(Tensor::from_vec(
+        values,
+        (rows.len(), codebooks),
+        device,
+    )?))
+}
+
+/// `count` standard normal values (Box-Muller over a splitmix64-seeded
+/// xorshift64*) for one (seed, frame) key.
+fn gaussian_stream(seed: u64, frame: u64, count: usize) -> Vec<f32> {
+    let mut state = seed ^ frame.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut next_u64 = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut uniform = || ((next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+    let mut values = Vec::with_capacity(count + 1);
+    while values.len() < count {
+        let (u1, u2) = (uniform(), uniform());
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = std::f64::consts::TAU * u2;
+        values.push((radius * angle.cos()) as f32);
+        values.push((radius * angle.sin()) as f32);
+    }
+    values.truncate(count);
+    values
 }
 
 /// The reference `TimeEmbedding(dim, theta=10000.0)` (vllm-omni
@@ -1042,6 +1111,61 @@ mod tests {
         assert_eq!(codes[0][0], AudioSpecialToken::End.id());
         assert!(codes[0][1] >= AUDIO_SPECIAL_TOKEN_COUNT);
         assert!(codes[0][2] >= AUDIO_SPECIAL_TOKEN_COUNT);
+    }
+
+    /// VXT-12: seeded flow-matching noise is a pure function of (seed,
+    /// frame): reproducible, independent of batch position, standard normal,
+    /// and actually used as the ODE's starting point.
+    #[test]
+    fn seeded_flow_noise_is_reproducible_and_drives_the_frame() {
+        let device = Device::Cpu;
+        assert!(seeded_flow_noise(&[(0, 3), (0, 4)], 2, &device)
+            .unwrap()
+            .is_none());
+        let single = seeded_flow_noise(&[(7, 3)], 2, &device).unwrap().unwrap();
+        let batched = seeded_flow_noise(&[(9, 0), (7, 3)], 2, &device)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            single.to_vec2::<f32>().unwrap()[0],
+            batched.to_vec2::<f32>().unwrap()[1]
+        );
+        assert_ne!(gaussian_stream(7, 3, 2), gaussian_stream(7, 4, 2));
+        let values = gaussian_stream(42, 0, 20_000);
+        let mean = values.iter().map(|v| f64::from(*v)).sum::<f64>() / values.len() as f64;
+        let var = values
+            .iter()
+            .map(|v| (f64::from(*v) - mean).powi(2))
+            .sum::<f64>()
+            / values.len() as f64;
+        assert!(
+            mean.abs() < 0.03 && (var - 1.0).abs() < 0.05,
+            "mean {mean}, var {var}"
+        );
+
+        // The tiny transformer has zero weights, so the velocity is zero and
+        // the frame's codes are the quantized starting noise (end-of-audio is
+        // masked so the acoustic codes are decoded at all).
+        let config = tiny_acoustic_config();
+        let vb = VarBuilder::from_tensors(tiny_acoustic_tensors(&device), DType::F32, &device);
+        let transformer = FlowMatchingAudioTransformer::load(&config, vb).unwrap();
+        let hidden = Tensor::zeros((1, 4), DType::F32, &device).unwrap();
+        let run = |noise: &Tensor| {
+            transformer
+                .forward_audio_codes_with_steps_and_eos_policy(&hidden, 1.2, 1, false, Some(noise))
+                .unwrap()
+        };
+        let frames = (0..8)
+            .map(|frame| {
+                let noise = seeded_flow_noise(&[(11, frame)], 2, &device)
+                    .unwrap()
+                    .unwrap();
+                let codes = run(&noise);
+                assert_eq!(codes, run(&noise), "frame {frame} is not reproducible");
+                codes
+            })
+            .collect::<Vec<_>>();
+        assert!(frames.windows(2).any(|pair| pair[0] != pair[1]));
     }
 
     /// VXT-12: the time embedding uses the reference's fixed theta 10000,
