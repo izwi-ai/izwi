@@ -57,7 +57,7 @@ use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
-    WorkloadClass,
+    TtsStopReason, WorkloadClass,
 };
 use izwi_hooks::Principal;
 
@@ -196,6 +196,12 @@ struct SpeechStreamEvent {
     audio_duration_secs: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rtf: Option<f32>,
+    /// On `final`: why generation ended (`stop`, `length` or
+    /// `context_length`), when a frame budget applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     record: Option<SpeechHistoryRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,6 +215,7 @@ struct StreamRequestStatistics {
     measured: bool,
     tokens: usize,
     execution_ms: f32,
+    stop_reason: Option<TtsStopReason>,
 }
 
 impl StreamRequestStatistics {
@@ -218,6 +225,7 @@ impl StreamRequestStatistics {
             if chunk.is_final {
                 self.tokens = stats.tokens_generated;
                 self.execution_ms = stats.generation_time_ms;
+                self.stop_reason = stats.stop_reason;
             } else {
                 self.tokens = self.tokens.saturating_add(stats.tokens_generated);
                 self.execution_ms += stats.generation_time_ms;
@@ -392,6 +400,8 @@ async fn prepare_stream_pcm(
                 generation_time_ms: None,
                 audio_duration_secs: None,
                 rtf: None,
+                stop_reason: None,
+                output_truncated: None,
                 record: None,
                 error: None,
             },
@@ -844,7 +854,7 @@ async fn create_record(
         return Ok((StatusCode::ACCEPTED, Json(placeholder)).into_response());
     }
 
-    let (record, _) = synthesize_record_internal(
+    let (record, _, stop_reason) = synthesize_record_internal(
         &state,
         &ctx,
         ctx.tenant_key(),
@@ -861,7 +871,23 @@ async fn create_record(
     )
     .await?;
 
-    Ok(Json(record).into_response())
+    let mut response = Json(record).into_response();
+    if let Some(stop_reason) = stop_reason {
+        let headers = response.headers_mut();
+        headers.insert(
+            "X-Stop-Reason",
+            axum::http::HeaderValue::from_static(stop_reason.as_str()),
+        );
+        headers.insert(
+            "X-Output-Truncated",
+            axum::http::HeaderValue::from_static(if stop_reason.truncated() {
+                "true"
+            } else {
+                "false"
+            }),
+        );
+    }
+    Ok(response)
 }
 
 async fn accept_durable_text_tts_record(
@@ -1546,7 +1572,7 @@ async fn execute_batch_tts_stage(
             .await;
     }
 
-    let (_record, output_artifact) = match synthesize_record_internal(
+    let (_record, output_artifact, _) = match synthesize_record_internal(
         state,
         &ctx,
         request.tenant_key,
@@ -1793,7 +1819,7 @@ pub(crate) async fn synthesize_record(
         None,
     )
     .await
-    .map(|(record, _)| record)
+    .map(|(record, _, _)| record)
 }
 
 async fn synthesize_record_internal(
@@ -1814,6 +1840,7 @@ async fn synthesize_record_internal(
     (
         SpeechHistoryRecord,
         Option<crate::batch_runtime::types::RuntimeArtifact>,
+        Option<TtsStopReason>,
     ),
     ApiError,
 > {
@@ -1833,7 +1860,8 @@ async fn synthesize_record_internal(
             projection_attempt,
             batch_publication,
         )
-        .await;
+        .await
+        .map(|(record, artifact)| (record, artifact, None));
     }
     if let Some(attempt) = attempt {
         attempt
@@ -1862,6 +1890,7 @@ async fn synthesize_record_internal(
     // cancels the engine work.
     let runtime = state.runtime.clone();
     let output = generate_long_form_tts(&runtime, variant, generation_request).await?;
+    let stop_reason = output.stop_reason;
 
     let encoder = AudioEncoder::new(output.sample_rate, 1);
     let output_samples = output.samples.clone();
@@ -1940,7 +1969,7 @@ async fn synthesize_record_internal(
         }
         .map_err(map_store_error)?
         .ok_or_else(|| ApiError::internal("TTS attempt lost its route projection"))?;
-        return Ok((record, output_artifact));
+        return Ok((record, output_artifact, stop_reason));
     }
 
     state
@@ -1967,7 +1996,7 @@ async fn synthesize_record_internal(
         })
         .await
         .map_err(map_store_error)
-        .map(|record| (record, None))
+        .map(|record| (record, None, stop_reason))
 }
 
 async fn stream_record_creation(
@@ -2041,6 +2070,8 @@ async fn stream_record_creation(
             generation_time_ms: None,
             audio_duration_secs: None,
             rtf: None,
+            stop_reason: None,
+            output_truncated: None,
             record: Some(placeholder),
             error: None,
         },
@@ -2077,6 +2108,8 @@ async fn stream_record_creation(
                         generation_time_ms: None,
                         audio_duration_secs: None,
                         rtf: None,
+                        stop_reason: None,
+                        output_truncated: None,
                         record: None,
                         error: Some(message),
                     },
@@ -2107,6 +2140,8 @@ async fn stream_record_creation(
                         generation_time_ms: None,
                         audio_duration_secs: None,
                         rtf: None,
+                        stop_reason: None,
+                        output_truncated: None,
                         record: None,
                         error: None,
                     },
@@ -2146,6 +2181,7 @@ async fn stream_record_creation(
         let mut total_tokens = 0usize;
         let mut execution_time_ms = 0.0f32;
         let mut statistics_measured = true;
+        let mut stop_reasons = Vec::new();
         let split_request_count = planned_count;
         let mut first_pcm_ms = None;
         let mut last_pcm_ms = None;
@@ -2233,6 +2269,8 @@ async fn stream_record_creation(
                                 generation_time_ms: None,
                                 audio_duration_secs: None,
                                 rtf: None,
+                                stop_reason: None,
+                                output_truncated: None,
                                 record: None,
                                 error: Some(format!("Failed to encode stream chunk: {err}")),
                             },
@@ -2281,6 +2319,8 @@ async fn stream_record_creation(
                         generation_time_ms: None,
                         audio_duration_secs: None,
                         rtf: None,
+                        stop_reason: None,
+                        output_truncated: None,
                         record: None,
                         error: None,
                     },
@@ -2305,6 +2345,7 @@ async fn stream_record_creation(
             total_tokens = total_tokens.saturating_add(request_statistics.tokens);
             execution_time_ms += request_statistics.execution_ms;
             statistics_measured &= request_statistics.measured;
+            stop_reasons.push(request_statistics.stop_reason);
             drop(chunk_rx);
             let generation_outcome = generation_task.await;
             if encoding_failed || stream_closed {
@@ -2334,6 +2375,7 @@ async fn stream_record_creation(
         if failed {
             mark_failed(stream_terminal_failure_message(failure_message)).await;
         } else {
+            let stop_reason = TtsStopReason::combine(stop_reasons);
             let generation_time_ms = stream_started.elapsed().as_secs_f32() * 1000.0;
             let rtf = if audio_duration_secs > 0.0 {
                 (generation_time_ms / 1000.0) / audio_duration_secs
@@ -2406,6 +2448,8 @@ async fn stream_record_creation(
                                     generation_time_ms: Some(generation_time_ms),
                                     audio_duration_secs: Some(audio_duration_secs),
                                     rtf: Some(rtf),
+                                    stop_reason: stop_reason.map(TtsStopReason::as_str),
+                                    output_truncated: stop_reason.map(TtsStopReason::truncated),
                                     record: Some(record),
                                     error: None,
                                 },
@@ -2442,6 +2486,8 @@ async fn stream_record_creation(
                 generation_time_ms: None,
                 audio_duration_secs: None,
                 rtf: None,
+                stop_reason: None,
+                output_truncated: None,
                 record: None,
                 error: None,
             },
@@ -3096,6 +3142,45 @@ mod tests {
             vec![0.0; 4096],
         ));
         assert_eq!(unknown.tokens, 0);
+    }
+
+    /// The first-party stream reports why each request ended: the terminal
+    /// chunk's reason is kept, and the `final` event names the combined one.
+    #[test]
+    fn stream_final_event_reports_the_stop_reason() {
+        let mut statistics = StreamRequestStatistics::default();
+        let mut terminal = AudioChunk::final_chunk("request".into(), 1, Vec::new());
+        terminal.stats = Some(izwi_core::ChunkStats {
+            generation_time_ms: 25.0,
+            tokens_generated: 313,
+            rtf: 0.3,
+            stop_reason: Some(TtsStopReason::OutputBudget),
+        });
+        statistics.observe(&terminal);
+        let stop_reason =
+            TtsStopReason::combine([Some(TtsStopReason::EndOfSpeech), statistics.stop_reason]);
+        let event = SpeechStreamEvent {
+            event: "final",
+            timing: None,
+            request_id: None,
+            sequence: None,
+            audio_base64: None,
+            sample_count: None,
+            sample_rate: None,
+            audio_format: None,
+            tokens_generated: None,
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            stop_reason: stop_reason.map(TtsStopReason::as_str),
+            output_truncated: stop_reason.map(TtsStopReason::truncated),
+            record: None,
+            error: None,
+        };
+        assert_eq!(
+            to_stream_json(event),
+            r#"{"event":"final","stop_reason":"length","output_truncated":true}"#
+        );
     }
 
     #[test]
