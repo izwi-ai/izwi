@@ -434,7 +434,10 @@ impl DeviceProfile {
     /// The Metal decoder-LM tier for a BF16 checkpoint (report 13): BF16 on
     /// Apple9+ GPUs, F16 on Apple7/8. See [`metal_bf16_checkpoint_lm_tier`].
     pub fn metal_bf16_checkpoint_lm_tier(&self) -> DTypeSelection {
-        metal_bf16_checkpoint_lm_tier(self.metal_supports_fast_bf16())
+        metal_bf16_checkpoint_lm_tier(
+            self.metal_supports_fast_bf16(),
+            METAL_PAGED_ATTENTION_SUPPORTS_BF16,
+        )
     }
 
     /// Whether this profile's device is an Apple9+ GPU (M3/M4/M5), the tier
@@ -1164,11 +1167,25 @@ fn metal_weight_only_f16_selection(
 /// - Apple7/8 (M1/M2): F16, because BF16 ran at 0.81x of F16 there
 ///   (llama.cpp #29770). F16 narrows BF16's range to 65504, so each family
 ///   gates it behind a load-time range probe with an F32 fallback.
-pub fn metal_bf16_checkpoint_lm_tier(fast_bf16: bool) -> DTypeSelection {
-    if fast_bf16 {
+///
+/// The BF16 tier also needs `bf16_paged_attention`: every decoder LM here
+/// attends through izwi's Metal paged-attention kernels, which take F32 and
+/// F16 only ([`METAL_PAGED_ATTENTION_SUPPORTS_BF16`]). Until they take BF16
+/// (or K/V is stored in F16 under BF16 activations, as llama.cpp does), an
+/// Apple9+ GPU takes the F16 tier and the reason says why.
+pub fn metal_bf16_checkpoint_lm_tier(
+    fast_bf16: bool,
+    bf16_paged_attention: bool,
+) -> DTypeSelection {
+    if fast_bf16 && bf16_paged_attention {
         DTypeSelection {
             dtype: DType::BF16,
             reason: "Metal BF16-checkpoint LM tier: BF16 on an Apple9+ GPU (capability-selected; awaiting M3+ validation)".into(),
+        }
+    } else if fast_bf16 {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "Metal BF16-checkpoint LM tier: F16 on an Apple9+ GPU, behind a load-time range probe; the BF16 tier waits for BF16 Metal paged attention".into(),
         }
     } else {
         DTypeSelection {
@@ -1177,6 +1194,10 @@ pub fn metal_bf16_checkpoint_lm_tier(fast_bf16: bool) -> DTypeSelection {
         }
     }
 }
+
+/// Whether izwi's Metal paged-attention kernels (`kernels/metal.rs`) take
+/// BF16 queries and K/V. They are compiled for F32 and F16 only.
+pub const METAL_PAGED_ATTENTION_SUPPORTS_BF16: bool = false;
 
 /// An Apple GPU family (`MTLGPUFamilyApple<N>`): M1 is Apple7, M2 Apple8,
 /// M3 and M4 Apple9, M5 Apple10.
@@ -1664,12 +1685,22 @@ mod tests {
 
     #[test]
     fn bf16_checkpoint_lm_tier_is_bf16_only_on_apple9_and_newer() {
-        let fast = metal_bf16_checkpoint_lm_tier(true);
+        let fast = metal_bf16_checkpoint_lm_tier(true, true);
         assert_eq!(fast.dtype, DType::BF16);
         assert!(fast.reason.contains("Apple9+"), "{}", fast.reason);
-        let slow = metal_bf16_checkpoint_lm_tier(false);
-        assert_eq!(slow.dtype, DType::F16);
-        assert!(slow.reason.contains("range probe"), "{}", slow.reason);
+        // Without BF16 paged attention an Apple9+ GPU takes the F16 tier.
+        let held = metal_bf16_checkpoint_lm_tier(true, false);
+        assert_eq!(held.dtype, DType::F16);
+        assert!(
+            held.reason.contains("BF16 Metal paged attention"),
+            "{}",
+            held.reason
+        );
+        for bf16_attention in [false, true] {
+            let slow = metal_bf16_checkpoint_lm_tier(false, bf16_attention);
+            assert_eq!(slow.dtype, DType::F16);
+            assert!(slow.reason.contains("range probe"), "{}", slow.reason);
+        }
         // A profile that cannot read an Apple9+ family takes the F16 tier.
         assert_eq!(
             metal_test_profile().metal_bf16_checkpoint_lm_tier().dtype,
@@ -1678,7 +1709,7 @@ mod tests {
         for family in 7..=10 {
             let family = AppleGpuFamily(family);
             assert_eq!(
-                metal_bf16_checkpoint_lm_tier(family.supports_fast_bf16()).dtype,
+                metal_bf16_checkpoint_lm_tier(family.supports_fast_bf16(), true).dtype,
                 if family >= AppleGpuFamily::FAST_BF16 {
                     DType::BF16
                 } else {

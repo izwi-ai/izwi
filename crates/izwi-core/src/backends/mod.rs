@@ -26,7 +26,7 @@ pub use device::{
     metal_runtime_supported, metal_supports_fast_bf16, parse_dtype_name, AppleGpuFamily,
     DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest,
     DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector, MetalDTypeOverride,
-    METAL_DTYPE_ENV,
+    METAL_DTYPE_ENV, METAL_PAGED_ATTENTION_SUPPORTS_BF16,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,
