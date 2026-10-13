@@ -1633,11 +1633,21 @@ pub struct SpeechTokenizerDecodeStats {
 
 impl SpeechTokenizerDecoder {
     /// Load decoder from speech_tokenizer directory.
-    pub fn load(model_dir: &std::path::Path, device: Device, dtype: DType) -> Result<Self> {
+    /// Load the decoder, and the reference encoder when `load_encoder`
+    /// (voice cloning is its only user).
+    pub fn load(
+        model_dir: &std::path::Path,
+        device: Device,
+        dtype: DType,
+        load_encoder: bool,
+    ) -> Result<Self> {
         info!("Loading speech tokenizer decoder from {:?}", model_dir);
 
         let config_str = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let speech_cfg: SpeechTokenizerConfig = serde_json::from_str(&config_str)?;
+        let mut speech_cfg: SpeechTokenizerConfig = serde_json::from_str(&config_str)?;
+        if !load_encoder {
+            speech_cfg.encoder_config = None;
+        }
         let weights_path = model_dir.join("model.safetensors");
         let root_vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
@@ -2606,7 +2616,7 @@ mod tests {
                 })
                 .unwrap()
         };
-        let decoder = SpeechTokenizerDecoder::load(&dir, Device::Cpu, DType::F32).unwrap();
+        let decoder = SpeechTokenizerDecoder::load(&dir, Device::Cpu, DType::F32, true).unwrap();
         let frames = 72;
         let codes = xorshift_codes(16, frames, 2048);
         let started = std::time::Instant::now();

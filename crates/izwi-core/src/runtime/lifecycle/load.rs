@@ -43,6 +43,8 @@ mod asr_memory;
 mod qwen36moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
+#[path = "tts_memory.rs"]
+mod tts_memory;
 
 pub(super) fn now_unix_millis() -> u64 {
     SystemTime::now()
@@ -529,6 +531,13 @@ fn admit_asr_request_floor(
     Ok(authorization)
 }
 
+/// Whether a load of `variant` is reconciled against the device observer:
+/// the families whose admission is a residency plan (ASR and TTS), so an
+/// observed excess means the plan under-prices the loader.
+fn reconciles_device_usage(variant: ModelVariant) -> bool {
+    asr_memory::is_asr_variant(variant) || tts_memory::has_plan(variant)
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,7 +604,11 @@ fn retry_load_peak_bytes(
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
     if let Some((model_path, device)) = asr_checkpoint {
-        if let Ok(Some(plan)) = asr_memory::resource_plan(variant, model_path, device) {
+        let plan = match asr_memory::resource_plan(variant, model_path, device) {
+            Ok(None) => tts_memory::resource_plan(variant, model_path, device),
+            plan => plan,
+        };
+        if let Ok(Some(plan)) = plan {
             if let ResourceAmount::Known(bytes) =
                 load_domain_bytes(plan.load_authorization, backend)
             {
@@ -1719,6 +1732,12 @@ impl ModelLifecycleController {
         {
             return Ok(plan);
         }
+        // So do the TTS families (Fish has its own plan above).
+        if let Some(plan) =
+            tts_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
+        {
+            return Ok(plan);
+        }
         let estimate = if backend == BackendKind::Cuda {
             model_memory_estimate(variant)
         } else {
@@ -1871,10 +1890,11 @@ impl ModelLifecycleController {
         }
     }
 
-    /// One reconciliation checkpoint for an ASR load, or `None` for other
-    /// families and backends without a device observer (CPU).
+    /// One reconciliation checkpoint for a load priced by a residency plan
+    /// (ASR and TTS), or `None` for other families and backends without a
+    /// device observer (CPU).
     fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
-        if !asr_memory::is_asr_variant(variant) {
+        if !reconciles_device_usage(variant) {
             return None;
         }
         let authority = self.coordinator.resource_authority();

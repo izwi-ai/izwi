@@ -323,6 +323,21 @@ pub struct VibeVoiceTtsModel {
     model_identity: [u8; 32],
 }
 
+/// The dtype [`VibeVoiceTtsModel::load`] reads every weight at on `device`
+/// (`IZWI_VIBEVOICE_TTS_DTYPE`, or the family default).
+pub(crate) fn vibevoice_tts_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    Ok(std::env::var("IZWI_VIBEVOICE_TTS_DTYPE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            device.select_model_dtype_checked(ModelFamily::VibeVoiceTts, Some(raw), "VibeVoice TTS")
+        })
+        .transpose()?
+        .unwrap_or_else(|| device.select_model_dtype(ModelFamily::VibeVoiceTts, None)))
+}
+
 impl VibeVoiceTtsModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::VibeVoice15BTts {
@@ -347,20 +362,7 @@ impl VibeVoiceTtsModel {
         let diffusion_config = config.diffusion_head_config.clone().ok_or_else(|| {
             Error::ModelLoadError("VibeVoice TTS config missing diffusion head".to_string())
         })?;
-        let dtype = std::env::var("IZWI_VIBEVOICE_TTS_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(|raw| {
-                device.select_model_dtype_checked(
-                    ModelFamily::VibeVoiceTts,
-                    Some(raw),
-                    "VibeVoice TTS",
-                )
-            })
-            .transpose()?
-            .unwrap_or_else(|| device.select_model_dtype(ModelFamily::VibeVoiceTts, None));
+        let dtype = vibevoice_tts_weight_dtype(&device)?;
         let vb = load_model_weights(model_dir, dtype, &device.device)?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;

@@ -1387,10 +1387,66 @@ pub struct Qwen3TtsDiagnostics {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Qwen3TtsDTypePlan {
-    talker: DType,
-    code_predictor: DType,
-    speech_tokenizer: DType,
+pub(crate) struct Qwen3TtsDTypePlan {
+    pub(crate) talker: DType,
+    pub(crate) code_predictor: DType,
+    pub(crate) speech_tokenizer: DType,
+}
+
+/// What [`Qwen3TtsModel::load`] reads from a checkpoint, resolved from its
+/// `config.json` and the device the way the loader resolves it, so load
+/// admission prices the same representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen3TtsLoadLayout {
+    pub(crate) dtypes: Qwen3TtsDTypePlan,
+    /// The ECAPA x-vector encoder (`speaker_encoder.*`, F32): Base
+    /// (voice-clone) checkpoints that ship one.
+    pub(crate) speaker_encoder: bool,
+    /// The speech-tokenizer encoder (`encoder.*`): only voice cloning encodes
+    /// reference audio, so the other variants never load it.
+    pub(crate) tokenizer_encoder: bool,
+}
+
+impl Qwen3TtsLoadLayout {
+    pub(crate) fn resolve(config: &Qwen3TtsConfig, device: &DeviceProfile) -> Result<Self> {
+        let (is_custom_voice_model, is_voice_clone_model) = qwen3_tts_model_kind(config);
+        let dtypes = select_qwen3_tts_dtypes(
+            device,
+            qwen3_tts_dtype_override().as_deref(),
+            is_custom_voice_model,
+            is_voice_clone_model,
+        )?;
+        Ok(Self {
+            dtypes,
+            speaker_encoder: is_voice_clone_model && config.speaker_encoder_config.is_some(),
+            tokenizer_encoder: is_voice_clone_model,
+        })
+    }
+}
+
+/// The load layout of the Qwen3-TTS checkpoint in `model_dir` on `device`.
+pub(crate) fn qwen3_tts_load_layout(
+    model_dir: &Path,
+    device: &DeviceProfile,
+) -> Result<Qwen3TtsLoadLayout> {
+    let config: Qwen3TtsConfig =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    Qwen3TtsLoadLayout::resolve(&config, device)
+}
+
+/// `(custom_voice, voice_clone)`: which kind of checkpoint `config` is.
+fn qwen3_tts_model_kind(config: &Qwen3TtsConfig) -> (bool, bool) {
+    let model_type = config
+        .tts_model_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "");
+    let custom_voice = model_type == "customvoice";
+    let voice_clone = model_type == "base"
+        || model_type == "voiceclone"
+        || model_type == "voicecloning"
+        || config.talker_config.spk_id.is_empty();
+    (custom_voice, voice_clone)
 }
 
 /// The operator's Qwen3-TTS precision override. Only
@@ -1686,23 +1742,8 @@ impl Qwen3TtsModel {
         info!("Model type: {}", config.tts_model_type);
         info!("Model size: {}", config.tts_model_size);
 
-        let model_type_normalized = config
-            .tts_model_type
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', '_'], "");
-        let is_custom_voice_model = model_type_normalized == "customvoice";
-        let is_voice_clone_model = model_type_normalized == "base"
-            || model_type_normalized == "voiceclone"
-            || model_type_normalized == "voicecloning"
-            || config.talker_config.spk_id.is_empty();
-        let dtype_override = qwen3_tts_dtype_override();
-        let dtype_plan = select_qwen3_tts_dtypes(
-            &device,
-            dtype_override.as_deref(),
-            is_custom_voice_model,
-            is_voice_clone_model,
-        )?;
+        let layout = Qwen3TtsLoadLayout::resolve(&config, &device)?;
+        let dtype_plan = layout.dtypes;
         let (talker_state_dtype, predictor_state_dtype) =
             select_qwen3_tts_state_dtypes(&device, dtype_plan, kv_cache_dtype)?;
 
@@ -1759,6 +1800,7 @@ impl Qwen3TtsModel {
             &speech_tokenizer_path,
             device.device.clone(),
             dtype_plan.speech_tokenizer,
+            layout.tokenizer_encoder,
         )?;
 
         info!(
@@ -1771,7 +1813,7 @@ impl Qwen3TtsModel {
             predictor_state_dtype,
         );
         let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
-        let speaker_encoder = if is_voice_clone_model {
+        let speaker_encoder = if layout.speaker_encoder {
             load_speaker_encoder(&config, &weights_path, &device.device)?
         } else {
             None

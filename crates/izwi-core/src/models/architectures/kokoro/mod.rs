@@ -38,7 +38,7 @@ use self::text_encoder::KokoroTextEncoder;
 use self::voice::VoiceLibrary;
 pub(crate) use self::voice::KOKORO_MODEL_MEMO_MAX_BYTES;
 
-const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
+pub(crate) const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
 const CONFIG_FILE: &str = "config.json";
 const VOICES_DIR: &str = "voices";
 const KOKORO_MAX_PHONEMES_PER_INPUT_CHAR: usize = 16;
@@ -85,7 +85,7 @@ const KOKORO_ACCELERATOR_LIVE_STAGE_BUFFERS: u64 = 9;
 // voicing mask, phase/radian intermediates, and a collected sine buffer. Forty
 // f32 values per final-rate sample is a conservative bound over those vectors.
 const KOKORO_HARMONIC_HOST_F32_PER_SAMPLE: u64 = 40;
-const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
+pub(crate) const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
     "bert",
     "bert_encoder",
     "predictor",
