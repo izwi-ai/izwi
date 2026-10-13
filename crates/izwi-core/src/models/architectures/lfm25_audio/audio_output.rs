@@ -10,10 +10,7 @@ use crate::backends::kv::{
     PagedKvDecodeArgs,
 };
 use crate::error::{Error, Result};
-use crate::kernels::{
-    try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_rope_pair_bshd,
-    try_fused_silu_mul_with_status,
-};
+use crate::kernels::{try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_silu_mul_with_status};
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::record_rope_kernel;
@@ -29,7 +26,9 @@ use super::config::{
     LFM25_DEPTHFORMER_QUERY_HEADS as DEPTHFORMER_HEADS,
 };
 const DEPTHFORMER_NORM_EPS: f64 = 1e-5;
-const DEPTHFORMER_ROPE_BASE: f32 = 10_000.0;
+/// The reference Depthformer's `MHA(theta=1_000_000.0)` (liquid-audio
+/// transformer.py; llama.cpp audio-decoder uses base 1e6 too).
+const DEPTHFORMER_ROPE_BASE: f64 = 1_000_000.0;
 
 pub struct Lfm25AudioHead {
     frame_embedding: Embedding,
@@ -749,7 +748,6 @@ struct DepthAttention {
     qk_norm_weight: Tensor,
     cos: Tensor,
     sin: Tensor,
-    cos_sin: Tensor,
 }
 
 #[derive(Debug, Clone)]
@@ -860,7 +858,6 @@ impl DepthAttention {
         let qk_norm_weight = Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
         let (cos, sin) =
             precompute_freqs(dim / DEPTHFORMER_HEADS, DEPTHFORMER_ROPE_BASE, 32, device)?;
-        let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         Ok(Self {
             qkv,
             o_proj,
@@ -869,7 +866,6 @@ impl DepthAttention {
             qk_norm_weight,
             cos,
             sin,
-            cos_sin,
         })
     }
 
@@ -938,21 +934,12 @@ impl DepthAttention {
             (self.q_norm.forward(&q)?, self.k_norm.forward(&k)?)
         };
 
-        let (q, k) = if let Some((q, k)) =
-            try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, index_pos)?
-        {
-            (
-                q.transpose(1, 2)?.contiguous()?,
-                k.transpose(1, 2)?.contiguous()?,
-            )
-        } else {
-            let q = q.transpose(1, 2)?.contiguous()?;
-            let k = k.transpose(1, 2)?.contiguous()?;
-            (
-                apply_rotary_emb(&q, &self.cos, &self.sin, index_pos)?,
-                apply_rotary_emb(&k, &self.cos, &self.sin, index_pos)?,
-            )
-        };
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let k = k.transpose(1, 2)?.contiguous()?;
+        let (q, k) = (
+            apply_rotary_emb(&q, &self.cos, &self.sin, index_pos)?,
+            apply_rotary_emb(&k, &self.cos, &self.sin, index_pos)?,
+        );
 
         let queries = q.squeeze(0)?.transpose(0, 1)?.contiguous()?;
         let keys = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
@@ -1045,18 +1032,12 @@ impl DepthAttention {
         for row in 0..batch {
             let q = q.narrow(0, row, 1)?;
             let k = k.narrow(0, row, 1)?;
-            let (q, k) = if let Some((q, k)) =
-                try_apply_rotary_emb_pair_bshd(&q, &k, &self.cos_sin, positions[row])?
-            {
-                (q.transpose(1, 2)?, k.transpose(1, 2)?)
-            } else {
-                let q = q.transpose(1, 2)?.contiguous()?;
-                let k = k.transpose(1, 2)?.contiguous()?;
-                (
-                    apply_rotary_emb(&q, &self.cos, &self.sin, positions[row])?,
-                    apply_rotary_emb(&k, &self.cos, &self.sin, positions[row])?,
-                )
-            };
+            let q = q.transpose(1, 2)?.contiguous()?;
+            let k = k.transpose(1, 2)?.contiguous()?;
+            let (q, k) = (
+                apply_rotary_emb(&q, &self.cos, &self.sin, positions[row])?,
+                apply_rotary_emb(&k, &self.cos, &self.sin, positions[row])?,
+            );
             queries.push(q.reshape((DEPTHFORMER_HEADS, head_dim))?);
             keys.push(k.reshape((DEPTHFORMER_KV_HEADS, head_dim))?);
         }
@@ -1368,46 +1349,40 @@ fn load_optional_tensor_any(
     Ok(None)
 }
 
+/// RoPE cos/sin `[positions, head_dim / 2]`, built on the host in f64 (device
+/// fast-math cos/sin is not exact) and uploaded once.
 fn precompute_freqs(
     head_dim: usize,
-    freq_base: f32,
+    freq_base: f64,
     context_length: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<f32> = (0..head_dim)
-        .step_by(2)
-        .map(|idx| 1.0f32 / freq_base.powf(idx as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let angles = Tensor::arange(0u32, context_length as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    Ok((angles.cos()?, angles.sin()?))
+    let half = head_dim / 2;
+    let mut cos = Vec::with_capacity(context_length * half);
+    let mut sin = Vec::with_capacity(context_length * half);
+    for position in 0..context_length {
+        for pair in 0..half {
+            let inv_freq = 1.0 / freq_base.powf((2 * pair) as f64 / head_dim as f64);
+            let angle = position as f64 * inv_freq;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (context_length, half), device)?,
+        Tensor::from_vec(sin, (context_length, half), device)?,
+    ))
 }
 
+/// The reference's complex-multiply RoPE on `[batch, heads, seq, head_dim]`:
+/// dimensions `(2i, 2i + 1)` form one pair (`view_as_complex` over
+/// "(D two)"; llama.cpp `LLAMA_ROPE_TYPE_NORM`), not `(i, i + head_dim / 2)`.
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor, index_pos: usize) -> Result<Tensor> {
     let (_, _, seq_len, _) = x.dims4()?;
     let cos = cos.narrow(0, index_pos, seq_len)?;
     let sin = sin.narrow(0, index_pos, seq_len)?;
     record_rope_kernel();
-    candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin).map_err(Error::from)
-}
-
-fn try_apply_rotary_emb_pair_bshd(
-    q: &Tensor,
-    k: &Tensor,
-    cos_sin: &Tensor,
-    index_pos: usize,
-) -> Result<Option<(Tensor, Tensor)>> {
-    let (_, seq_len, _, _) = q.dims4()?;
-    let packed = cos_sin.narrow(0, index_pos, seq_len)?.contiguous()?;
-    if let Some((q, k)) = try_fused_rope_pair_bshd(&q.contiguous()?, &k.contiguous()?, &packed) {
-        record_rope_kernel();
-        record_rope_kernel();
-        return Ok(Some((q, k)));
-    }
-    Ok(None)
+    candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin).map_err(Error::from)
 }
 
 fn ensure_rank3(hidden: &Tensor) -> Result<Tensor> {
@@ -1425,6 +1400,57 @@ fn ensure_rank3(hidden: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::{CodebookSample, Lfm25SampledAudioFrame};
     use candle_core::{DType, Device, Tensor};
+
+    /// LFT-3: Depthformer RoPE matches the reference `apply_rotary_emb`
+    /// (complex multiply over adjacent pairs, theta 1e6) at codebook
+    /// positions 4..7 for the published head_dim 32.
+    #[test]
+    fn depthformer_rope_is_interleaved_with_base_1e6() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let (heads, seq, head_dim, start) = (2usize, 4usize, 32usize, 4usize);
+        let x = xorshift_tensor(&[1, heads, seq, head_dim], 3, 1.0, &Device::Cpu).unwrap();
+        let (cos, sin) =
+            super::precompute_freqs(head_dim, super::DEPTHFORMER_ROPE_BASE, 32, &Device::Cpu)
+                .unwrap();
+        let out = host_f32(&super::apply_rotary_emb(&x, &cos, &sin, start).unwrap()).unwrap();
+        let input = host_f32(&x).unwrap();
+        let mut reference = vec![0f32; input.len()];
+        for row in 0..heads * seq {
+            let position = (start + row % seq) as f64;
+            for pair in 0..head_dim / 2 {
+                let angle = position / 1e6f64.powf((2 * pair) as f64 / head_dim as f64);
+                let base = row * head_dim + 2 * pair;
+                let (a, b) = (f64::from(input[base]), f64::from(input[base + 1]));
+                reference[base] = (a * angle.cos() - b * angle.sin()) as f32;
+                reference[base + 1] = (a * angle.sin() + b * angle.cos()) as f32;
+            }
+        }
+        let error = max_abs_diff(&out, &reference);
+        assert!(error < 1e-5, "Depthformer RoPE max abs error {error}");
+    }
+
+    /// The interleaved RoPE runs on Metal (Candle's `rope_i` kernel) and
+    /// agrees with the CPU result.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_depthformer_rope_matches_cpu() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let x = xorshift_tensor(&[1, 2, 3, 32], 5, 1.0, &Device::Cpu).unwrap();
+        let run = |device: &Device| {
+            let (cos, sin) =
+                super::precompute_freqs(32, super::DEPTHFORMER_ROPE_BASE, 32, device).unwrap();
+            let x = x.to_device(device).unwrap();
+            host_f32(&super::apply_rotary_emb(&x, &cos, &sin, 5).unwrap()).unwrap()
+        };
+        let error = max_abs_diff(&run(&device), &run(&Device::Cpu));
+        assert!(error < 1e-5, "Metal vs CPU RoPE max abs error {error}");
+    }
 
     fn frame(tokens: &[u32], host_index: Option<usize>) -> Lfm25SampledAudioFrame {
         frame_on_device(tokens, host_index, &Device::Cpu)
