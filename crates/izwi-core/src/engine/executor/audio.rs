@@ -787,10 +787,10 @@ impl NativeExecutor {
                     ),
                 )?;
             }
+            let committed_len = assembler.text().len();
             match settled.as_ref() {
                 Some(overlap) => {
                     let provisional = assembler.provisional_chunk_text(&partial_text, overlap);
-                    let committed_len = assembler.text().len();
                     assembler.push_settled_chunk_text(&chunk_text, overlap);
                     if !assembler.text()[committed_len..].starts_with(&provisional) {
                         debug!(
@@ -801,6 +801,18 @@ impl NativeExecutor {
                 None => {
                     assembler.push_chunk_text_with_overlap(&chunk_text, overlap_secs);
                 }
+            }
+            // What this chunk added after overlap dedup. The chunk texts
+            // concatenate to the transcript, so with the chunk's time range
+            // they form the response's default segments.
+            if let Some(entry) = chunk_diagnostics
+                .last_mut()
+                .and_then(|value| value.as_object_mut())
+            {
+                entry.insert(
+                    "committed_text".to_string(),
+                    json!(assembler.text()[committed_len..].trim_start()),
+                );
             }
             cursor.align(assembler.text(), "");
 
@@ -1556,6 +1568,58 @@ mod tests {
             })
             .collect();
         (samples, chunk_plan)
+    }
+
+    #[test]
+    fn chunk_diagnostics_record_the_text_each_chunk_committed() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 5];
+        // The second chunk overlaps the first by one second; the third
+        // follows a gap.
+        let chunk_plan = vec![
+            AudioChunk {
+                start_sample: 0,
+                end_sample: 30,
+            },
+            AudioChunk {
+                start_sample: 20,
+                end_sample: 40,
+            },
+            AudioChunk {
+                start_sample: 42,
+                end_sample: 50,
+            },
+        ];
+        let texts = ["one two three", "three four", "five"];
+        let mut sequence = 0usize;
+        let mut idx = 0usize;
+        let chunked = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-committed",
+            &|| false,
+            None,
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                idx += 1;
+                Ok(AsrChunkTranscription {
+                    text: texts[idx - 1].to_string(),
+                    diagnostics: None,
+                })
+            },
+        )
+        .expect("chunk plan should complete");
+
+        let committed: Vec<&str> = chunked
+            .chunk_diagnostics
+            .iter()
+            .map(|entry| entry["committed_text"].as_str().expect("committed text"))
+            .collect();
+        assert_eq!(chunked.text, "one two three four five");
+        assert_eq!(committed, ["one two three", "four", "five"]);
     }
 
     #[test]

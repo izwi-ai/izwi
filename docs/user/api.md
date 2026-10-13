@@ -318,7 +318,7 @@ Multipart fields:
 | `language` | Optional language hint. Granite Speech accepts IBM's codes and names (base: en, fr, de, es, pt, ja; plus drops ja), names it in the instruction, and rejects other languages with `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (`Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (`Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
 | `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. |
 | `max_tokens` | Optional ASR decoder token budget. |
@@ -361,6 +361,8 @@ Multipart fields:
   }
 }
 ```
+
+`verbose_json` always includes `segments`. Without word or segment timestamps from the model or the aligner, each long-form chunk becomes one segment covering its time range, and a short file gets one segment spanning the whole audio. `words` appears only when `timestamp_granularities[]` includes `word`. If forced alignment fails, the transcript is still returned with segments, without `words`, and the failure is reported as `izwi_asr_diagnostics.alignment_error`.
 
 SSE events:
 

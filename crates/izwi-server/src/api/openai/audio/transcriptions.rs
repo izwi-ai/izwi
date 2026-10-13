@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
@@ -261,6 +261,7 @@ pub async fn transcriptions(
     let mut words = None;
     let mut segments = None;
     let mut subtitle_segments = None;
+    let mut alignment_error = None;
     let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
     let model_words = extract_model_timestamp_words(output.asr_diagnostics.as_ref());
     let model_segments = extract_model_timestamp_segments(output.asr_diagnostics.as_ref());
@@ -278,7 +279,9 @@ pub async fn transcriptions(
         && ((timestamp_request.words && words.is_none())
             || (timestamp_request.segments && segments.is_none()))
     {
-        let alignments = state
+        // The transcription already succeeded; an aligner failure costs the
+        // word timings, not the transcript.
+        match state
             .runtime
             .force_align_bytes_with_model_and_language(
                 audio_bytes.as_slice(),
@@ -286,16 +289,24 @@ pub async fn transcriptions(
                 output.language.as_deref().or(req.language.as_deref()),
                 req.aligner_model.as_deref(),
             )
-            .await?;
-        let timestamp_words = alignments_to_timestamp_words(alignments);
-        if timestamp_request.words && words.is_none() {
-            words = Some(timestamp_words.clone());
-        }
-        if timestamp_request.segments && segments.is_none() {
-            segments = Some(build_timestamp_segments(
-                &timestamp_words,
-                &chunk_boundaries,
-            ));
+            .await
+        {
+            Ok(alignments) => {
+                let timestamp_words = alignments_to_timestamp_words(alignments);
+                if timestamp_request.words && words.is_none() {
+                    words = Some(timestamp_words.clone());
+                }
+                if timestamp_request.segments && segments.is_none() {
+                    segments = Some(build_timestamp_segments(
+                        &timestamp_words,
+                        &chunk_boundaries,
+                    ));
+                }
+            }
+            Err(err) => {
+                warn!("Forced alignment failed; returning untimed words: {}", err);
+                alignment_error = Some(err.to_string());
+            }
         }
     } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
         if !model_segments.is_empty() {
@@ -333,6 +344,23 @@ pub async fn transcriptions(
         }
     }
 
+    // OpenAI's verbose_json defaults to segment granularity, and a failed
+    // alignment still answers with segments.
+    if response_format == "verbose_json"
+        && segments.is_none()
+        && (timestamp_request.segments || !timestamp_request.any() || alignment_error.is_some())
+    {
+        segments = Some(fallback_timestamp_segments(
+            &output.text,
+            output.duration_secs,
+            output.asr_diagnostics.as_ref(),
+            model_segments,
+            &model_words,
+            &chunk_boundaries,
+        ));
+    }
+    let asr_diagnostics = with_alignment_error(output.asr_diagnostics, alignment_error);
+
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let rtf = if output.duration_secs > 0.0 {
@@ -359,7 +387,7 @@ pub async fn transcriptions(
                     segments,
                     processing_time_ms: elapsed_ms,
                     rtf,
-                    izwi_asr_diagnostics: output.asr_diagnostics,
+                    izwi_asr_diagnostics: asr_diagnostics,
                 })
                 .unwrap(),
             ))
@@ -799,6 +827,99 @@ fn build_timestamp_segments(
     }
 
     segments
+}
+
+/// Segments when no timestamp source was asked for or it failed: the model's
+/// own segments or words, else one segment per long-form chunk (its committed
+/// text over its time range), else one segment spanning the audio.
+fn fallback_timestamp_segments(
+    text: &str,
+    duration_secs: f32,
+    diagnostics: Option<&serde_json::Value>,
+    model_segments: Vec<TranscriptionTimestampSegment>,
+    model_words: &[TranscriptionTimestampWord],
+    chunk_boundaries: &[f32],
+) -> Vec<TranscriptionTimestampSegment> {
+    if !model_segments.is_empty() {
+        return model_segments;
+    }
+    if !model_words.is_empty() {
+        return build_timestamp_segments(model_words, chunk_boundaries);
+    }
+    let chunk_segments = extract_chunk_transcript_segments(diagnostics);
+    if !chunk_segments.is_empty() {
+        return chunk_segments;
+    }
+    let mut segments = Vec::new();
+    push_timestamp_segment(
+        &mut segments,
+        0.0,
+        duration_secs.max(0.0),
+        &[text.to_string()],
+    );
+    segments
+}
+
+/// One segment per long-form chunk from the chunk executor's diagnostics.
+/// Overlapping chunks start where the previous segment ended, so segments
+/// never overlap and their texts concatenate to the transcript.
+fn extract_chunk_transcript_segments(
+    diagnostics: Option<&serde_json::Value>,
+) -> Vec<TranscriptionTimestampSegment> {
+    let Some(chunks) = diagnostics
+        .and_then(|diagnostics| {
+            diagnostics
+                .get("chunking")
+                .or_else(|| diagnostics.get("model_diagnostics")?.get("chunking"))
+        })
+        .and_then(|chunking| chunking.get("chunk_transcriptions"))
+        .and_then(|chunks| chunks.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut segments = Vec::new();
+    let mut previous_end = 0.0f32;
+    for chunk in chunks {
+        let text = chunk
+            .get("committed_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        let start = chunk.get("start_seconds").and_then(|value| value.as_f64());
+        let end = chunk.get("end_seconds").and_then(|value| value.as_f64());
+        let (Some(start), Some(end)) = (start, end) else {
+            continue;
+        };
+        if text.is_empty() || !start.is_finite() || !end.is_finite() {
+            continue;
+        }
+        let start = (start as f32).max(previous_end);
+        let end = (end as f32).max(start);
+        push_timestamp_segment(&mut segments, start, end, &[text.to_string()]);
+        previous_end = end;
+    }
+    segments
+}
+
+/// Report a forced-alignment failure in the diagnostics of a response that
+/// otherwise succeeded.
+fn with_alignment_error(
+    diagnostics: Option<serde_json::Value>,
+    alignment_error: Option<String>,
+) -> Option<serde_json::Value> {
+    let Some(alignment_error) = alignment_error else {
+        return diagnostics;
+    };
+    let mut diagnostics = match diagnostics {
+        Some(serde_json::Value::Object(root)) => root,
+        Some(other) => serde_json::Map::from_iter([("model_diagnostics".to_string(), other)]),
+        None => serde_json::Map::new(),
+    };
+    diagnostics.insert(
+        "alignment_error".to_string(),
+        serde_json::Value::String(alignment_error),
+    );
+    Some(serde_json::Value::Object(diagnostics))
 }
 
 fn timestamp_segment_crosses_chunk_boundary(
@@ -1602,5 +1723,79 @@ mod tests {
         assert!(srt.contains("2\n00:00:02,000 --> 00:00:02,400"));
         assert!(vtt.starts_with("WEBVTT"));
         assert!(vtt.contains("00:00:02.000 --> 00:00:02.400"));
+    }
+
+    #[test]
+    fn default_segments_follow_the_long_form_chunks() {
+        let diagnostics = serde_json::json!({
+            "chunking": {
+                "chunk_transcriptions": [
+                    { "start_seconds": 0.0, "end_seconds": 30.0, "committed_text": "one two three" },
+                    { "start_seconds": 28.5, "end_seconds": 55.0, "committed_text": "four" },
+                    { "start_seconds": 55.0, "end_seconds": 60.0, "committed_text": "" },
+                    { "skipped": true }
+                ]
+            }
+        });
+
+        let segments = fallback_timestamp_segments(
+            "one two three four",
+            60.0,
+            Some(&diagnostics),
+            Vec::new(),
+            &[],
+            &[],
+        );
+
+        let spans: Vec<(f32, f32, &str)> = segments
+            .iter()
+            .map(|segment| (segment.start, segment.end, segment.text.as_str()))
+            .collect();
+        assert_eq!(spans, [(0.0, 30.0, "one two three"), (30.0, 55.0, "four")]);
+        assert_eq!(segments[1].id, 1);
+    }
+
+    #[test]
+    fn default_segments_prefer_model_timings_then_span_a_single_window() {
+        let model_words = vec![
+            TranscriptionTimestampWord {
+                word: "Hello".to_string(),
+                start: 0.2,
+                end: 0.6,
+            },
+            TranscriptionTimestampWord {
+                word: "there.".to_string(),
+                start: 0.7,
+                end: 1.1,
+            },
+        ];
+        let from_words =
+            fallback_timestamp_segments("Hello there.", 3.0, None, Vec::new(), &model_words, &[]);
+        assert_eq!(from_words.len(), 1);
+        assert_eq!((from_words[0].start, from_words[0].end), (0.2, 1.1));
+
+        let single = fallback_timestamp_segments("Hello there.", 3.0, None, Vec::new(), &[], &[]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            (single[0].start, single[0].end, single[0].text.as_str()),
+            (0.0, 3.0, "Hello there.")
+        );
+
+        assert!(fallback_timestamp_segments("  ", 3.0, None, Vec::new(), &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn alignment_errors_are_reported_in_the_diagnostics() {
+        assert_eq!(with_alignment_error(None, None), None);
+        let diagnostics = with_alignment_error(
+            Some(serde_json::json!({ "model_family": "parakeet" })),
+            Some("aligner window exceeded".to_string()),
+        )
+        .expect("diagnostics");
+        assert_eq!(diagnostics["model_family"], "parakeet");
+        assert_eq!(diagnostics["alignment_error"], "aligner window exceeded");
+
+        let created = with_alignment_error(None, Some("boom".to_string())).expect("diagnostics");
+        assert_eq!(created["alignment_error"], "boom");
     }
 }
