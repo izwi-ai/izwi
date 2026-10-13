@@ -100,6 +100,30 @@ struct AcousticTimeTable {
     projected: Tensor,
 }
 
+static VOXTRAL_ACOUSTIC_FRAME_READBACKS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_FRAME_READBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of device-to-host copies made while selecting frame
+/// codes (semantic and acoustic). The packed CUDA path makes one per frame.
+pub fn voxtral_acoustic_frame_readbacks() -> u64 {
+    VOXTRAL_ACOUSTIC_FRAME_READBACKS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_frame_readbacks() -> u64 {
+    THREAD_FRAME_READBACKS.with(|reads| reads.get())
+}
+
+fn record_frame_readback() {
+    VOXTRAL_ACOUSTIC_FRAME_READBACKS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_FRAME_READBACKS.with(|reads| reads.set(reads.get() + 1));
+}
+
 static VOXTRAL_ACOUSTIC_STEP_UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -318,6 +342,20 @@ impl FlowMatchingAudioTransformer {
 
         let semantic_logits = linear_forward_last_dim(&self.semantic_codebook_output, &llm_hidden)
             .map_err(|err| Error::InferenceError(format!("semantic projection failed: {err}")))?;
+        if llm_hidden.device().is_cuda() {
+            return self
+                .packed_frame(
+                    &llm_hidden,
+                    &semantic_logits,
+                    cfg_alpha,
+                    n_decoding_steps,
+                    allow_end_audio,
+                    initial_noise,
+                )
+                .map_err(|err| {
+                    Error::InferenceError(format!("acoustic frame decode failed: {err}"))
+                });
+        }
         let semantic_selection = semantic_code_selection_from_logits_with_eos_policy(
             &semantic_logits,
             self.generation.semantic_codebook_size,
@@ -366,29 +404,105 @@ impl FlowMatchingAudioTransformer {
         n_decoding_steps: usize,
         initial_noise: Option<&Tensor>,
     ) -> Result<DecodedAcousticCodes> {
-        let batch = semantic_codes.len();
-        let dtype = llm_hidden.dtype();
-        let device = llm_hidden.device();
-        let shape = (batch, self.generation.n_acoustic_codebooks);
-        let sampled = match initial_noise {
-            Some(noise) if noise.dims() == [shape.0, shape.1] => {
-                noise.to_device(device)?.to_dtype(dtype)?
-            }
-            Some(noise) => {
-                return Err(Error::InvalidInput(format!(
-                    "Voxtral flow-matching noise {:?} does not match {:?}",
-                    noise.dims(),
-                    shape
-                )))
-            }
-            None => Tensor::randn(0.0f32, 1.0f32, shape, device)?.to_dtype(dtype)?,
-        };
+        let sampled = self.initial_flow_state(semantic_codes.len(), llm_hidden, initial_noise)?;
         let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
         shifted_acoustic_codes_from_sampled_tensor(
             &sampled,
             semantic_codes,
             self.generation.acoustic_codebook_size,
         )
+    }
+
+    /// The flow's starting state for `batch` rows: `initial_noise` when given
+    /// (it must be `[batch, n_acoustic_codebooks]`), else device `randn`.
+    fn initial_flow_state(
+        &self,
+        batch: usize,
+        llm_hidden: &Tensor,
+        initial_noise: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let dtype = llm_hidden.dtype();
+        let device = llm_hidden.device();
+        let shape = (batch, self.generation.n_acoustic_codebooks);
+        match initial_noise {
+            Some(noise) if noise.dims() == [shape.0, shape.1] => {
+                Ok(noise.to_device(device)?.to_dtype(dtype)?)
+            }
+            Some(noise) => Err(Error::InvalidInput(format!(
+                "Voxtral flow-matching noise {:?} does not match {:?}",
+                noise.dims(),
+                shape
+            ))),
+            None => Ok(Tensor::randn(0.0f32, 1.0f32, shape, device)?.to_dtype(dtype)?),
+        }
+    }
+
+    /// One frame with a single device readback (used on CUDA): the semantic
+    /// argmax and its score stay on the device while the flow runs (it does
+    /// not depend on them), then the argmax, the score and the quantized
+    /// acoustic codes come back in one packed `[rows, 2 + n_acoustic]` F32
+    /// copy. The per-path code took three copies per frame. A non-finite
+    /// selected score falls back to the host semantic selection, as before.
+    fn packed_frame(
+        &self,
+        llm_hidden: &Tensor,
+        semantic_logits: &Tensor,
+        cfg_alpha: f32,
+        n_decoding_steps: usize,
+        allow_end_audio: bool,
+        initial_noise: Option<&Tensor>,
+    ) -> Result<VoxtralGeneratedAudioCodes> {
+        let batch = llm_hidden.dim(0)?;
+        let allowed = (self.generation.semantic_codebook_size + AUDIO_SPECIAL_TOKEN_COUNT as usize)
+            .min(semantic_logits.dim(1)?);
+        let (indices, scores) = semantic_argmax_tensors(semantic_logits, allowed, allow_end_audio)?;
+        let sampled = self.initial_flow_state(batch, llm_hidden, initial_noise)?;
+        let sampled = self.integrate_flow(sampled, llm_hidden, cfg_alpha, n_decoding_steps)?;
+        let acoustic =
+            shifted_acoustic_code_tensor(&sampled, self.generation.acoustic_codebook_size)?;
+        let packed = Tensor::cat(
+            &[
+                indices.to_dtype(DType::F32)?.unsqueeze(1)?,
+                scores,
+                acoustic.to_dtype(DType::F32)?,
+            ],
+            1,
+        )?;
+        record_frame_readback();
+        let rows = packed.to_vec2::<f32>()?;
+        let semantic = if rows.iter().all(|row| row[1].is_finite()) {
+            SemanticCodeSelection {
+                codes: rows.iter().map(|row| row[0] as u32).collect(),
+                code_tensor: Some(indices.unsqueeze(1)?),
+            }
+        } else {
+            semantic_code_selection_from_logits_host(semantic_logits, allowed, allow_end_audio)?
+        };
+        let end = AudioSpecialToken::End.id();
+        let empty = apply_audio_token_offset(AudioSpecialToken::Empty.id());
+        let contains_end = semantic.codes.contains(&end);
+        let frames = rows
+            .iter()
+            .zip(&semantic.codes)
+            .map(|(row, &code)| {
+                let mut frame = Vec::with_capacity(self.generation.num_codebooks);
+                frame.push(code);
+                if code == end {
+                    frame.extend(std::iter::repeat_n(empty, row.len() - 2));
+                } else {
+                    frame.extend(row[2..].iter().map(|value| *value as u32));
+                }
+                frame
+            })
+            .collect();
+        let shifted_code_tensor = match (semantic.code_tensor, contains_end) {
+            (Some(semantic), false) => Some(Tensor::cat(&[semantic, acoustic], 1)?),
+            _ => None,
+        };
+        Ok(VoxtralGeneratedAudioCodes {
+            frames,
+            shifted_code_tensor,
+        })
     }
 
     /// The load-time precision probe for one frame: the semantic logits and
@@ -778,11 +892,10 @@ fn shifted_acoustic_codes_from_sampled_tensor(
     shifted_acoustic_codes_from_sampled_tensor_host(sampled, semantic_codes, acoustic_codebook_size)
 }
 
-fn shifted_acoustic_codes_from_sampled_tensor_cuda(
-    sampled: &Tensor,
-    semantic_codes: &[u32],
-    acoustic_codebook_size: usize,
-) -> Result<Option<DecodedAcousticCodes>> {
+/// The flow state quantized to shifted acoustic codes on the device
+/// (`round((clamp(x) + 1) / 2 * (size - 1)) + 2`, as [`fsq_unit_to_code`] and
+/// [`apply_audio_token_offset`] compute on the host), as U32.
+fn shifted_acoustic_code_tensor(sampled: &Tensor, acoustic_codebook_size: usize) -> Result<Tensor> {
     let shifted = sampled
         .clamp(-1.0, 1.0)?
         .to_dtype(DType::F32)?
@@ -800,6 +913,16 @@ fn shifted_acoustic_codes_from_sampled_tensor_cuda(
             sampled.device(),
         )?)?
         .to_dtype(DType::U32)?;
+    Ok(shifted)
+}
+
+fn shifted_acoustic_codes_from_sampled_tensor_cuda(
+    sampled: &Tensor,
+    semantic_codes: &[u32],
+    acoustic_codebook_size: usize,
+) -> Result<Option<DecodedAcousticCodes>> {
+    let shifted = shifted_acoustic_code_tensor(sampled, acoustic_codebook_size)?;
+    record_frame_readback();
     let mut rows = shifted.to_vec2::<u32>()?;
     let contains_end = semantic_codes
         .iter()
@@ -824,6 +947,7 @@ fn shifted_acoustic_codes_from_sampled_tensor_host(
     acoustic_codebook_size: usize,
 ) -> Result<DecodedAcousticCodes> {
     let sampled = sampled.clamp(-1.0, 1.0)?.to_dtype(DType::F32)?;
+    record_frame_readback();
     let rows = sampled.to_vec2::<f32>()?;
     let mut output = Vec::with_capacity(semantic_codes.len());
     for (semantic, row) in semantic_codes.iter().zip(rows) {
@@ -930,6 +1054,31 @@ fn semantic_code_selection_from_logits_cuda(
     if allowed == 0 {
         return Ok(None);
     }
+    let (indices, selected_scores) = semantic_argmax_tensors(logits, allowed, allow_end_audio)?;
+    record_frame_readback();
+    let selected_scores = selected_scores.to_vec2::<f32>()?;
+    if selected_scores
+        .iter()
+        .flatten()
+        .any(|score| !score.is_finite())
+    {
+        return Ok(None);
+    }
+    record_frame_readback();
+    let codes = indices.to_vec1::<u32>()?;
+    Ok(Some(SemanticCodeSelection {
+        codes,
+        code_tensor: Some(indices.unsqueeze(1)?),
+    }))
+}
+
+/// The device argmax over the allowed semantic codes (`[rows]` U32) and the
+/// selected scores (`[rows, 1]` F32), left on the device.
+fn semantic_argmax_tensors(
+    logits: &Tensor,
+    allowed: usize,
+    allow_end_audio: bool,
+) -> Result<(Tensor, Tensor)> {
     let batch = logits.dim(0)?;
     let token_logits = logits.narrow(1, 0, allowed)?;
     let mask = semantic_validity_mask(batch, allowed, allow_end_audio);
@@ -938,22 +1087,10 @@ fn semantic_code_selection_from_logits_cuda(
         .to_dtype(token_logits.dtype())?;
     let masked = mask.where_cond(&token_logits, &neg_inf)?;
     let indices = masked.argmax(D::Minus1)?.to_dtype(DType::U32)?;
-    let selected_scores = masked
+    let scores = masked
         .gather(&indices.unsqueeze(1)?, 1)?
-        .to_dtype(DType::F32)?
-        .to_vec2::<f32>()?;
-    if selected_scores
-        .iter()
-        .flatten()
-        .any(|score| !score.is_finite())
-    {
-        return Ok(None);
-    }
-    let codes = indices.to_vec1::<u32>()?;
-    Ok(Some(SemanticCodeSelection {
-        codes,
-        code_tensor: Some(indices.unsqueeze(1)?),
-    }))
+        .to_dtype(DType::F32)?;
+    Ok((indices, scores))
 }
 
 fn semantic_validity_mask(batch: usize, allowed: usize, allow_end_audio: bool) -> Vec<u8> {
@@ -976,6 +1113,7 @@ fn semantic_code_selection_from_logits_host(
     allowed: usize,
     allow_end_audio: bool,
 ) -> Result<SemanticCodeSelection> {
+    record_frame_readback();
     let rows = logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
     let codes = rows
         .into_iter()
@@ -1283,6 +1421,72 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         assert!(frames.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    /// VXT-10: the packed frame path (CUDA's) gives the same frames and
+    /// feedback tensor as the per-path selection with one readback per
+    /// frame (the per-path code takes two on the host path and three on
+    /// CUDA), including end-of-audio rows.
+    #[test]
+    fn packed_frame_matches_per_path_selection_in_one_readback() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = Device::Cpu;
+        let config = tiny_acoustic_config();
+        let random = tiny_acoustic_tensors(&device)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, tensor))| {
+                let value = if name.contains("norm") {
+                    tensor
+                } else {
+                    xorshift_tensor(tensor.dims(), 0x9ACC + index as u64, 0.5, &device).unwrap()
+                };
+                (name, value)
+            })
+            .collect::<HashMap<_, _>>();
+        let zero = tiny_acoustic_tensors(&device);
+        for (tensors, expect_end) in [(random, false), (zero, true)] {
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            let transformer = FlowMatchingAudioTransformer::load(&config, vb).unwrap();
+            let hidden = xorshift_tensor(&[3, 4], 0xC0DE, 1.0, &device).unwrap();
+            let noise = xorshift_tensor(&[3, 2], 0xD00D, 1.0, &device).unwrap();
+            for allow_end in [true, false] {
+                let before = thread_frame_readbacks();
+                let expected = transformer
+                    .forward_audio_codes_with_feedback_tensor(
+                        &hidden,
+                        1.2,
+                        4,
+                        allow_end,
+                        Some(&noise),
+                    )
+                    .unwrap();
+                assert_eq!(thread_frame_readbacks() - before, 2);
+                let logits =
+                    linear_forward_last_dim(&transformer.semantic_codebook_output, &hidden)
+                        .unwrap();
+                let before = thread_frame_readbacks();
+                let packed = transformer
+                    .packed_frame(&hidden, &logits, 1.2, 4, allow_end, Some(&noise))
+                    .unwrap();
+                assert_eq!(thread_frame_readbacks() - before, 1);
+                assert_eq!(packed.frames, expected.frames);
+                let has_end = packed
+                    .frames
+                    .iter()
+                    .any(|frame| frame[0] == AudioSpecialToken::End.id());
+                if expect_end || !allow_end {
+                    assert_eq!(has_end, expect_end && allow_end);
+                }
+                assert_eq!(packed.shifted_code_tensor.is_some(), !has_end);
+                if let Some(tensor) = &packed.shifted_code_tensor {
+                    assert_eq!(tensor.to_vec2::<u32>().unwrap(), packed.frames);
+                }
+            }
+        }
     }
 
     /// The pre-VXT-10 flow-matching loop: every step re-uploads `t`, re-runs
