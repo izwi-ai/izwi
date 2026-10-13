@@ -245,10 +245,7 @@ pub async fn speech(
     if let Some(stop_reason) = result.stop_reason {
         builder = builder
             .header("X-Stop-Reason", stop_reason.as_str())
-            .header(
-                "X-Output-Truncated",
-                (stop_reason == TtsStopReason::OutputBudget).to_string(),
-            );
+            .header("X-Output-Truncated", stop_reason.truncated().to_string());
     }
     if let Some(diagnostics) = result.diagnostics.as_ref() {
         builder = builder.header("X-Izwi-Tts-Diagnostics", diagnostics.to_string());
@@ -414,10 +411,7 @@ async fn fish_file_speech(
         if let Some(stop_reason) = stats.stop_reason {
             builder = builder
                 .header("X-Stop-Reason", stop_reason.as_str())
-                .header(
-                    "X-Output-Truncated",
-                    (stop_reason == TtsStopReason::OutputBudget).to_string(),
-                );
+                .header("X-Output-Truncated", stop_reason.truncated().to_string());
         }
     }
     if let Some(fallback) = resolved_format.fallback {

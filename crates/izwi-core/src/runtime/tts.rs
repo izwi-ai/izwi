@@ -551,7 +551,12 @@ impl RuntimeService {
             total_tokens,
             total_time_ms,
             diagnostics,
-            stop_reason: TtsStopReason::for_budget(budget_frames, total_tokens),
+            stop_reason: tts_stop_reason(
+                resolved_variant,
+                budget_frames,
+                &output.latency_breakdown,
+                total_tokens,
+            ),
         })
     }
 
@@ -649,12 +654,42 @@ impl RuntimeService {
             generation_time_ms: output.generation_time.as_secs_f32() * 1000.0,
             tokens_generated: output.num_tokens,
             rtf: output.rtf(),
-            stop_reason: TtsStopReason::for_budget(budget_frames, output.num_tokens),
+            stop_reason: tts_stop_reason(
+                resolved_variant,
+                budget_frames,
+                &output.latency_breakdown,
+                output.num_tokens,
+            ),
         });
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
         info!("Streaming generation complete via core engine");
         Ok(())
     }
+}
+
+/// Why an engine TTS request ended. The engine's decode accounting counts
+/// committed audio frames (`decode_tokens`) and decode steps separately;
+/// `num_tokens` (scheduler tokens) is not a frame count for every family,
+/// so it is only the fallback. Only Qwen3-TTS is known to end on a decode
+/// step that commits no frame, so only its step count separates end of
+/// speech from a context stop.
+fn tts_stop_reason(
+    variant: ModelVariant,
+    budget_frames: usize,
+    breakdown: &Option<crate::engine::LatencyBreakdown>,
+    num_tokens: usize,
+) -> Option<TtsStopReason> {
+    let frames = breakdown
+        .as_ref()
+        .and_then(|breakdown| breakdown.decode_tokens)
+        .unwrap_or(num_tokens);
+    let steps = breakdown
+        .as_ref()
+        .filter(|breakdown| {
+            breakdown.decode_tokens.is_some() && variant.family() == ModelFamily::Qwen3Tts
+        })
+        .map(|breakdown| breakdown.decode_steps as usize);
+    TtsStopReason::classify(budget_frames, frames, steps)
 }
 
 fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
@@ -753,6 +788,64 @@ mod tests {
                 assert!(!tts_streaming_uses_final_only(is_cuda, variant, false));
             }
         }
+    }
+
+    /// The live CPU Qwen runs: short (54 steps / 53 frames) and long
+    /// (983 / 982) ended on EOS but were reported as budget stops, because
+    /// the scheduler token count is not a frame count; medium (313 / 313)
+    /// really hit its budget. A family without the end-of-speech step
+    /// signal never reads as a context stop.
+    #[test]
+    fn engine_tts_stop_reason_reads_frames_and_the_end_of_speech_step() {
+        let breakdown = |steps: u32, frames: usize| {
+            Some(crate::engine::LatencyBreakdown {
+                queue_wait_ms: 0.0,
+                media_decode_ms: None,
+                normalization_ms: None,
+                prefill_ms: 0.0,
+                decode_ms: 0.0,
+                decode_wall_ms: None,
+                decode_tokens: Some(frames),
+                post_first_token_ms: None,
+                sampling_ms: None,
+                codec_ms: None,
+                postprocess_ms: None,
+                ttft_ms: None,
+                total_ms: 0.0,
+                prefill_steps: 1,
+                decode_steps: steps,
+            })
+        };
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let reason = |variant, budget, b: Option<_>, tokens| {
+            tts_stop_reason(variant, budget, &b, tokens).unwrap()
+        };
+        assert_eq!(
+            reason(qwen, 82, breakdown(54, 53), 864),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(qwen, 1_500, breakdown(983, 982), 15_712),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(qwen, 313, breakdown(313, 313), 5_008),
+            TtsStopReason::OutputBudget
+        );
+        assert_eq!(
+            reason(qwen, 313, breakdown(200, 200), 3_200),
+            TtsStopReason::ContextLimit
+        );
+        let vibevoice = ModelVariant::VibeVoice15BTts;
+        assert_eq!(
+            reason(vibevoice, 384, breakdown(200, 200), 200),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(vibevoice, 384, None, 384),
+            TtsStopReason::OutputBudget
+        );
+        assert_eq!(tts_stop_reason(qwen, 0, &breakdown(5, 5), 5), None);
     }
 
     /// Phase 0 capability contract for every enabled TTS variant: the route

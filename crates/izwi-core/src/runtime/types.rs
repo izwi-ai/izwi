@@ -389,17 +389,42 @@ pub enum TtsStopReason {
     /// The output-frame budget ended it: the audio may be cut short.
     #[serde(rename = "length")]
     OutputBudget,
+    /// The loaded context ended it before the budget: the audio may be cut
+    /// short.
+    #[serde(rename = "context_length")]
+    ContextLimit,
 }
 
 impl TtsStopReason {
-    /// The stop reason of a generation that produced `frames` against a
-    /// budget of `budget_frames`; `None` without a frame budget (`0`).
-    pub fn for_budget(budget_frames: usize, frames: usize) -> Option<Self> {
-        (budget_frames > 0).then_some(if frames >= budget_frames {
+    /// The stop reason of a generation that committed `frames` audio frames
+    /// against a budget of `budget_frames` (`None` without a budget, `0`).
+    ///
+    /// `decode_steps`, when the family reports it, tells end of speech from
+    /// a context stop: a model that ends on its own runs one more decode step
+    /// (the end-of-speech step) than it commits frames, while a request cut
+    /// by the context the request was fitted to stops with every step
+    /// committed. Without it, an early stop is taken as end of speech.
+    pub fn classify(
+        budget_frames: usize,
+        frames: usize,
+        decode_steps: Option<usize>,
+    ) -> Option<Self> {
+        if budget_frames == 0 {
+            return None;
+        }
+        Some(if frames >= budget_frames {
             Self::OutputBudget
         } else {
-            Self::EndOfSpeech
+            match decode_steps {
+                Some(steps) if steps <= frames => Self::ContextLimit,
+                _ => Self::EndOfSpeech,
+            }
         })
+    }
+
+    /// Whether the audio may be cut short.
+    pub fn truncated(self) -> bool {
+        !matches!(self, Self::EndOfSpeech)
     }
 
     /// The combined reason of several segments: a budget stop in any
@@ -408,19 +433,20 @@ impl TtsStopReason {
         let mut combined = Some(Self::EndOfSpeech);
         for reason in reasons {
             match reason {
-                Some(Self::OutputBudget) => return Some(Self::OutputBudget),
                 Some(Self::EndOfSpeech) => {}
+                Some(cut) => return Some(cut),
                 None => combined = None,
             }
         }
         combined
     }
 
-    /// The OpenAI-style label: `stop` or `length`.
+    /// The label: `stop`, `length` (budget) or `context_length`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EndOfSpeech => "stop",
             Self::OutputBudget => "length",
+            Self::ContextLimit => "context_length",
         }
     }
 }
@@ -477,15 +503,32 @@ mod tests {
     /// `stop`, and a combined long-form result is cut if any segment was.
     #[test]
     fn tts_stop_reason_reports_budget_stops_and_combines_segments() {
-        assert_eq!(TtsStopReason::for_budget(0, 400), None);
+        assert_eq!(TtsStopReason::classify(0, 400, None), None);
+        // Live, CPU Qwen: short 54 steps / 53 frames and long 983 / 982
+        // ended on EOS; medium 313 / 313 ran into its 313-frame budget.
         assert_eq!(
-            TtsStopReason::for_budget(400, 400),
-            Some(TtsStopReason::OutputBudget)
-        );
-        assert_eq!(
-            TtsStopReason::for_budget(400, 252),
+            TtsStopReason::classify(82, 53, Some(54)),
             Some(TtsStopReason::EndOfSpeech)
         );
+        assert_eq!(
+            TtsStopReason::classify(1_500, 982, Some(983)),
+            Some(TtsStopReason::EndOfSpeech)
+        );
+        assert_eq!(
+            TtsStopReason::classify(313, 313, Some(313)),
+            Some(TtsStopReason::OutputBudget)
+        );
+        // Stopped before the budget with every step committed: the context.
+        assert_eq!(
+            TtsStopReason::classify(313, 200, Some(200)),
+            Some(TtsStopReason::ContextLimit)
+        );
+        assert_eq!(
+            TtsStopReason::classify(400, 252, None),
+            Some(TtsStopReason::EndOfSpeech)
+        );
+        assert!(TtsStopReason::ContextLimit.truncated());
+        assert!(!TtsStopReason::EndOfSpeech.truncated());
         let stop = Some(TtsStopReason::EndOfSpeech);
         let cut = Some(TtsStopReason::OutputBudget);
         assert_eq!(TtsStopReason::combine([stop, stop]), stop);
