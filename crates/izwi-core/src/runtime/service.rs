@@ -357,6 +357,69 @@ fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVect
     resources
 }
 
+/// The working set of one ASR request for `variant` (PIPE-15), replacing the
+/// generic "64 MiB + 8 × input" price: the request's retained input plus the
+/// model's request envelope over `audio_secs` (one full chunk while the
+/// length is still unknown, which bounds any length because longer audio is
+/// chunked). The envelope's accelerator part is charged here only for the
+/// families whose encoder workspace no preparation stage prices (Nemotron,
+/// Voxtral); the others reserve it per physical batch when they dispatch.
+/// `None` for a variant without an envelope, which keeps the generic price.
+fn asr_transient_resources(
+    backend: BackendKind,
+    variant: ModelVariant,
+    input_bytes: usize,
+    audio_secs: Option<f32>,
+) -> Result<Option<ResourceVector>> {
+    use super::lifecycle::asr_envelope;
+    const CUDA_DEVICE_BASE_BYTES: u64 = 64 * 1024 * 1024;
+    let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
+        return Ok(None);
+    };
+    let Some(envelope) = asr_envelope::request_envelope(variant, secs, backend)? else {
+        return Ok(None);
+    };
+    let unpriced_encoder = matches!(
+        variant.family(),
+        ModelFamily::NemotronAsr | ModelFamily::Voxtral
+    );
+    let accelerator_bytes = if unpriced_encoder {
+        envelope.accelerator_bytes
+    } else {
+        0
+    };
+    let host_bytes = (input_bytes as u64)
+        .checked_add(envelope.host_bytes)
+        .ok_or_else(|| Error::Overloaded("ASR request envelope overflow".into()))?;
+    let overflow = || Error::Overloaded("ASR request envelope overflow".into());
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(
+                host_bytes
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            )
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(
+                host_bytes
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            )
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host_bytes);
+            resources.device_bytes = ResourceAmount::Known(
+                CUDA_DEVICE_BASE_BYTES
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            );
+        }
+    }
+    Ok(Some(resources))
+}
+
 const AUDIO_DECODE_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
 const PREPARATION_COPY_QUANTUM_BYTES: usize = 1024 * 1024;
 
@@ -3862,6 +3925,18 @@ impl RuntimeService {
             effective_context,
             input_bytes,
         );
+        if task_type == TaskType::ASR {
+            // The audio length is unknown before decoding; one full chunk
+            // bounds the request whatever its length.
+            if let Some(resources) = asr_transient_resources(
+                self.backend_router.context().backend_kind,
+                variant,
+                input_bytes,
+                None,
+            )? {
+                spec.resources = resources;
+            }
+        }
         spec.resources = spec.resources.checked_add(additional_resources)?;
         if task_decodes_audio(task_type) {
             spec.resources = spec.resources.checked_add(audio_decode_resources(
@@ -3941,6 +4016,18 @@ impl RuntimeService {
             },
             input_bytes,
         );
+        if request.task_type == TaskType::ASR {
+            if let Some(variant) = request.model_variant {
+                if let Some(resources) = asr_transient_resources(
+                    self.backend_router.context().backend_kind,
+                    variant,
+                    input_bytes,
+                    request.prepared_asr_input_duration_secs(),
+                )? {
+                    spec.resources = resources;
+                }
+            }
+        }
         // Price the durable prompt/position/token journal and overlapping
         // suspension/restoration copies in the request's existing host lease.
         // This is separate from the generic request/text/workspace allowance.
@@ -10621,7 +10708,51 @@ mod tests {
             .coordinator_job_for_request(&request)
             .expect("prepared Qwen ASR coordinator job");
         assert_eq!(observation.host_bytes, after as u64);
-        assert_eq!(spec.resources, transient_resources(backend, after));
+        assert_eq!(
+            Some(spec.resources),
+            asr_transient_resources(backend, variant, after, Some(257.0 / 16_000.0)).unwrap()
+        );
+    }
+
+    /// ASR requests are priced by the model's envelope over their audio, not
+    /// by a multiple of their input: an hour of decoded audio costs one
+    /// chunk's working set beside the retained samples (PIPE-15).
+    #[test]
+    fn asr_requests_price_the_model_envelope_instead_of_an_input_multiple() {
+        const HOUR_SAMPLES: usize = 3_600 * 16_000;
+        let input = HOUR_SAMPLES * std::mem::size_of::<f32>();
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let generic = transient_resources(backend, input);
+            for variant in [
+                ModelVariant::Qwen3Asr06BGguf,
+                ModelVariant::WhisperLargeV3Turbo,
+                ModelVariant::Nemotron35AsrStreaming06B,
+            ] {
+                let hour = asr_transient_resources(backend, variant, input, Some(3_600.0))
+                    .unwrap()
+                    .unwrap();
+                let chunk = asr_transient_resources(backend, variant, input, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(hour, chunk, "{variant} {backend:?}");
+                assert!(
+                    hour.workspace_bytes().unwrap() < generic.workspace_bytes().unwrap(),
+                    "{variant} {backend:?}"
+                );
+                let bytes = |resources: ResourceVector| match backend {
+                    BackendKind::Cpu => resources.host_bytes,
+                    BackendKind::Metal => resources.unified_bytes,
+                    BackendKind::Cuda => resources.host_bytes,
+                };
+                assert!(
+                    matches!(bytes(hour), ResourceAmount::Known(value) if value > input as u64)
+                );
+            }
+        }
+        assert_eq!(
+            asr_transient_resources(BackendKind::Cpu, ModelVariant::Kokoro82M, 1, None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -10646,9 +10777,12 @@ mod tests {
             .unwrap();
 
         let host_bytes = retained_engine_request_input_bytes(&request).unwrap();
-        let expected = transient_resources(backend, host_bytes)
-            .checked_add(asr_encoder_retained_resources(backend, 0, encoder_bytes).unwrap())
-            .unwrap();
+        let expected =
+            asr_transient_resources(backend, variant, host_bytes, Some(257.0 / 16_000.0))
+                .unwrap()
+                .unwrap()
+                .checked_add(asr_encoder_retained_resources(backend, 0, encoder_bytes).unwrap())
+                .unwrap();
         let (spec, observation) = runtime
             .coordinator_job_for_request(&request)
             .expect("prepared Whisper ASR coordinator job");

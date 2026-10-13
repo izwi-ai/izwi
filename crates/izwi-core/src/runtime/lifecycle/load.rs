@@ -1773,6 +1773,49 @@ impl ModelLifecycleController {
         })
     }
 
+    /// Reserve one ASR request envelope per execution slot for the state
+    /// fits to leave free, or `None` for a variant without one.
+    fn hold_asr_request_envelope(
+        &self,
+        variant: ModelVariant,
+        backend: BackendKind,
+    ) -> Result<Option<ResourceLease>> {
+        let slots = self.coordinator.physical_execution_admission().capacity();
+        let Some(envelope) =
+            super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
+        else {
+            return Ok(None);
+        };
+        let mut resources = ResourceVector::zero();
+        match backend {
+            BackendKind::Cpu => {
+                resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+            }
+            BackendKind::Metal => {
+                resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+            }
+            BackendKind::Cuda => {
+                resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
+                resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
+            }
+        }
+        let lease = self.coordinator.resource_authority().reserve(
+            ReservationOwner::new(
+                ReservationClass::Model,
+                format!("{variant}:asr-request-envelope"),
+            ),
+            resources,
+        )?;
+        info!(
+            model = %variant,
+            request_slots = slots,
+            host_bytes = envelope.host_bytes,
+            accelerator_bytes = envelope.accelerator_bytes,
+            "Holding the ASR request envelope out of the state fits"
+        );
+        Ok(Some(lease))
+    }
+
     async fn reserve_model_resources(
         &self,
         requested_variant: ModelVariant,
@@ -2180,6 +2223,11 @@ impl ModelLifecycleController {
                 resource_plan.deferred_resident_authorization,
                 observed_weights,
             )?;
+            // The request envelope stays out of reach of every state fit below
+            // (ADM-4): the fits spend headroom less pending claims, so held
+            // here, one full chunk per execution slot is still free when the
+            // first request runs beside the fitted state.
+            let request_envelope_hold = self.hold_asr_request_envelope(variant, backend)?;
             let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
@@ -3268,6 +3316,7 @@ impl ModelLifecycleController {
                     );
                 }
             }
+            drop(request_envelope_hold);
             let state_allocation_ms = state_started.elapsed().as_secs_f64() * 1000.0;
             let binding_started = Instant::now();
             self.bind_loaded_model_bundle_draft(
@@ -4988,6 +5037,81 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// On a 16 GB M1 Pro-like Metal budget (0.9 × the 12.7 GB working set),
+    /// a state fit that spends everything it may see after the model's
+    /// weights and the held request envelope still leaves one full-chunk
+    /// envelope free once the hold is released (ADM-1, ADM-4).
+    #[test]
+    fn state_fits_leave_one_request_envelope_on_a_16_gb_metal_budget() {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        const BUDGET: u64 = 11_441_804_076;
+        let unified = |bytes| ResourceVector {
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        };
+        // Metal-allocated resident weights from the residency plans.
+        for (variant, resident_gib) in [
+            (ModelVariant::Qwen3Asr06BGguf, 1.54),
+            (ModelVariant::Qwen3Asr17BGguf, 3.30),
+            (ModelVariant::Lfm25Audio15BGguf, 2.08),
+            (ModelVariant::GraniteSpeech412BPlus, 5.87),
+        ] {
+            let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                Arc::new(VectorCapacityProvider {
+                    snapshot: PhysicalCapacitySnapshot {
+                        capacity: unified(BUDGET),
+                        available: unified(BUDGET),
+                        source: CapacitySource::Test,
+                    },
+                }),
+            ));
+            let resident = (resident_gib * GIB) as u64;
+            let _model = authority
+                .reserve_with_initial_materialized(
+                    ReservationOwner::new(ReservationClass::Model, "weights"),
+                    unified(resident),
+                    unified(resident),
+                )
+                .unwrap();
+            let envelope = super::super::asr_envelope::deferred_request_envelope(
+                variant,
+                BackendKind::Metal,
+                1,
+            )
+            .unwrap()
+            .unwrap()
+            .total_bytes()
+            .unwrap();
+            let hold = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Model, "envelope"),
+                    unified(envelope),
+                )
+                .unwrap();
+            let ResourceAmount::Known(fit) = authority
+                .state_fit_headroom_bytes(BackendKind::Metal)
+                .unwrap()
+            else {
+                panic!("known headroom");
+            };
+            let _state = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Cache, "greedy-state"),
+                    unified(fit),
+                )
+                .unwrap();
+            drop(hold);
+            let ResourceAmount::Known(left) = authority
+                .planning_headroom_bytes(BackendKind::Metal)
+                .unwrap()
+            else {
+                panic!("known headroom");
+            };
+            assert!(left >= envelope, "{variant}: {left} < {envelope}");
+            assert!(fit > 0, "{variant}");
+        }
     }
 
     /// The weight lease records the smaller of the estimate and the observed
