@@ -1271,6 +1271,12 @@ mod tests {
             dac: super::super::dac::tiny_for_batch_tests(),
             semantic_allowed_mask: mask,
             dtype: candle_core::DType::F32,
+            precision: crate::kernels::numeric_check::PrecisionLoad::unchecked(
+                &crate::backends::DTypeSelection {
+                    dtype: candle_core::DType::F32,
+                    reason: "test fixture".into(),
+                },
+            ),
         });
         model
     }

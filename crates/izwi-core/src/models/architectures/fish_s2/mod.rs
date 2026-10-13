@@ -9,10 +9,14 @@ use serde::Serialize;
 
 use sampling::FishS2SamplingDistribution;
 
-use crate::backends::DeviceProfile;
+use crate::backends::{DTypeSelection, DeviceProfile};
 use crate::catalog::ModelVariant;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_values, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
 pub mod artifacts;
@@ -82,6 +86,8 @@ struct FishS2NativeRuntime {
     dac: FishS2DacDecoder,
     semantic_allowed_mask: Vec<bool>,
     dtype: DType,
+    /// The transformers' dtype after the load-time check, and why.
+    precision: PrecisionLoad,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +131,9 @@ pub struct FishS2TtsDiagnostics {
     pub semantic_end_token_id: u32,
     pub max_seq_len: usize,
     pub codec_support: &'static str,
+    /// The slow/fast transformers' load precision and self-check (FSH-11);
+    /// `None` without the native runtime.
+    pub precision: Option<serde_json::Value>,
 }
 
 /// Model-authored terminal reason. Exhausting a budget is incomplete speech.
@@ -271,6 +280,10 @@ impl FishS2TtsModel {
             semantic_end_token_id: self.config.semantic_end_token_id,
             max_seq_len: self.config.max_seq_len,
             codec_support: fish_s2_codec_support_name(self.codec.support),
+            precision: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.precision.diagnostics()),
         }
     }
 
@@ -325,6 +338,80 @@ impl FishS2TtsModel {
     }
 }
 
+/// Slow-stack positions the load-time self-check runs.
+const FISH_S2_PROBE_TOKENS: usize = 16;
+
+/// The load-time self-check (report 13, FSH-11): see
+/// [`fish_s2_numeric_probe`]. Every probed tensor must be finite and below
+/// the F16-safe range.
+fn fish_s2_numeric_self_check(
+    slow: &FishS2SlowTransformer,
+    fast: &FishS2FastDecoder,
+    device: &candle_core::Device,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check("Fish S2", F16_SAFE_MAX_ABS, || {
+        fish_s2_numeric_probe(slow, fast, device)
+    })
+}
+
+/// Xorshift text token ids (below the semantic range) for
+/// [`FISH_S2_PROBE_TOKENS`] positions through every slow layer, on a
+/// scratch cache in the weights' dtype, and the semantic head; then one
+/// fast-codebook frame from the last slow hidden state with an xorshift
+/// semantic code. Returns the slow hidden states and logits and the fast
+/// logits of every depth.
+fn fish_s2_numeric_probe(
+    slow: &FishS2SlowTransformer,
+    fast: &FishS2FastDecoder,
+    device: &candle_core::Device,
+) -> Result<Vec<(String, Tensor)>> {
+    let cfg = slow.config();
+    let text_tokens = cfg.semantic_start_token_id.max(1);
+    let draws = xorshift_values(FISH_S2_PROBE_TOKENS + 1, 0xF15A, 1.0);
+    let pick = |draw: f32, limit: u32| ((draw.abs() * limit as f32) as u32).min(limit - 1);
+    let ids = draws[..FISH_S2_PROBE_TOKENS]
+        .iter()
+        .map(|draw| pick(*draw, text_tokens))
+        .collect::<Vec<_>>();
+    let mut values = vec![ids];
+    values.extend((0..cfg.num_codebooks).map(|_| vec![0u32; FISH_S2_PROBE_TOKENS]));
+    let prompt = tokenizer::FishS2ConditioningPrompt {
+        values,
+        vq_mask: vec![false; FISH_S2_PROBE_TOKENS],
+        prompt_length: FISH_S2_PROBE_TOKENS,
+    };
+    let embeds = slow.embed_prompt(&prompt)?;
+    let dtype = embeds.dtype();
+    let mut slow_cache = PhysicalPagedKvCache::scratch_for_probe(
+        device,
+        dtype,
+        cfg.num_hidden_layers,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        FISH_S2_PROBE_TOKENS,
+    )?;
+    let output = slow.forward_embeds(&embeds, 0, &mut slow_cache, true)?;
+    let fast_cfg = fast.config();
+    let mut fast_cache = PhysicalPagedKvCache::scratch_for_probe(
+        device,
+        dtype,
+        fast_cfg.num_hidden_layers,
+        fast_cfg.num_key_value_heads,
+        fast_cfg.head_dim,
+        fast_cfg.num_codebooks,
+    )?;
+    let last = output
+        .hidden_states
+        .narrow(1, FISH_S2_PROBE_TOKENS - 1, 1)?;
+    let semantic_code = pick(draws[FISH_S2_PROBE_TOKENS], fast_cfg.codebook_size as u32);
+    let fast_logits = fast.numeric_probe(&last, semantic_code, &mut fast_cache)?;
+    Ok(vec![
+        ("slow_hidden".to_string(), output.hidden_states),
+        ("slow_logits".to_string(), output.logits),
+        ("fast_logits".to_string(), fast_logits),
+    ])
+}
+
 fn next_fish_s2_model_identity() -> Result<u64> {
     NEXT_FISH_S2_MODEL_IDENTITY
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -343,20 +430,45 @@ impl FishS2NativeRuntime {
         codec.ensure_native_supported()?;
         let tokenizer = FishS2PromptTokenizer::load(model_dir, config)?;
         let dtype_override = std::env::var(FISH_S2_DTYPE_ENV).ok();
-        let weights = FishS2Weights::load(model_dir, device, dtype_override.as_deref())?;
-        let dtype = weights.dtype();
-        let mut slow = FishS2SlowTransformer::load(
-            FishS2SlowConfig::from_config(config)?,
-            weights.var_builder(),
+        let selection = DTypeSelection {
+            dtype: FishS2Weights::resolve_dtype(model_dir, &device, dtype_override.as_deref())?,
+            reason: match dtype_override.as_deref().map(str::trim) {
+                Some(raw) if !raw.is_empty() => format!("{FISH_S2_DTYPE_ENV}={raw}").into(),
+                _ => format!("Fish S2 {:?} dtype policy", device.kind).into(),
+            },
+        };
+        let eos = tokenizer.specials().eos;
+        // On Metal a dtype below F32 must keep the trunk's activations finite
+        // and in range (FSH-11: norm gains reach 48), or the slow and fast
+        // transformers reload in F32.
+        let ((slow, fast, device), precision) = load_with_precision_fallback(
+            "Fish S2",
+            &selection,
+            device.kind.is_metal(),
+            DType::F32,
+            |dtype| -> Result<_> {
+                let weights = FishS2Weights::load_with_dtype(model_dir, device.clone(), dtype)?;
+                let mut slow = FishS2SlowTransformer::load(
+                    FishS2SlowConfig::from_config(config)?,
+                    weights.var_builder(),
+                )?;
+                slow.configure_semantic_head(eos)?;
+                let fast = FishS2FastDecoder::load(
+                    FishS2FastConfig::from_config(config)?,
+                    weights.var_builder(),
+                )?;
+                Ok((slow, fast, weights.device().clone()))
+            },
+            |(slow, fast, device)| fish_s2_numeric_self_check(slow, fast, device),
         )?;
-        slow.configure_semantic_head(tokenizer.specials().eos)?;
-        let fast = FishS2FastDecoder::load(
-            FishS2FastConfig::from_config(config)?,
-            weights.var_builder(),
-        )?;
-        let codec_weights = codec.load_weights(weights.device(), DType::F32)?;
+        tracing::info!(
+            "Fish S2 precision: {:?} ({})",
+            precision.loaded,
+            precision.reason
+        );
+        let codec_weights = codec.load_weights(&device, DType::F32)?;
         let dac = FishS2DacDecoder::load(FishS2DacConfig::current(), codec_weights.var_builder())?;
-        let semantic_allowed_mask = slow.semantic_allowed_mask(tokenizer.specials().eos)?;
+        let semantic_allowed_mask = slow.semantic_allowed_mask(eos)?;
 
         Ok(Self {
             tokenizer,
@@ -364,7 +476,8 @@ impl FishS2NativeRuntime {
             fast,
             dac,
             semantic_allowed_mask,
-            dtype,
+            dtype: precision.loaded,
+            precision,
         })
     }
 
@@ -748,6 +861,194 @@ mod smoke;
 
 #[cfg(test)]
 mod streaming_smoke;
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+    use crate::kernels::numeric_check::xorshift_tensor;
+    use candle_core::Device;
+    use candle_nn::VarBuilder;
+    use std::collections::BTreeMap;
+
+    /// A tiny two-layer slow transformer and one-layer fast decoder with
+    /// xorshift weights and every RMSNorm gain set to `norm_gain`, in `dtype`.
+    fn tiny_random_parts(
+        device: &Device,
+        dtype: DType,
+        norm_gain: f32,
+    ) -> (FishS2SlowTransformer, FishS2FastDecoder) {
+        let slow_cfg = FishS2SlowConfig {
+            vocab_size: 32,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            max_seq_len: 32,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            codebook_size: 8,
+            num_codebooks: 2,
+            semantic_start_token_id: 20,
+            semantic_end_token_id: 27,
+            scale_codebook_embeddings: true,
+        };
+        let fast_cfg = FishS2FastConfig {
+            input_hidden_size: 4,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            codebook_size: 8,
+            num_codebooks: 3,
+            semantic_start_token_id: 20,
+            semantic_end_token_id: 27,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+        };
+        let mut shapes = BTreeMap::new();
+        shapes.insert("embed_tokens.weight".to_string(), vec![32, 4]);
+        shapes.insert("codebook_embeddings.weight".to_string(), vec![16, 4]);
+        shapes.insert("fast_project_in.weight".to_string(), vec![4, 4]);
+        shapes.insert("fast_project_in.bias".to_string(), vec![4]);
+        shapes.insert("fast_embeddings.weight".to_string(), vec![8, 4]);
+        shapes.insert("fast_output.weight".to_string(), vec![8, 4]);
+        let layer = |prefix: &str, shapes: &mut BTreeMap<String, Vec<usize>>| {
+            for (name, shape) in [
+                ("self_attn.qkv_proj.weight", vec![8, 4]),
+                ("self_attn.o_proj.weight", vec![4, 4]),
+                ("mlp.gate_proj.weight", vec![8, 4]),
+                ("mlp.up_proj.weight", vec![8, 4]),
+                ("mlp.down_proj.weight", vec![4, 8]),
+            ] {
+                shapes.insert(format!("{prefix}.{name}"), shape);
+            }
+        };
+        layer("layers.0", &mut shapes);
+        layer("layers.1", &mut shapes);
+        layer("fast_layers.0", &mut shapes);
+        let mut tensors = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, shape))| {
+                let tensor = xorshift_tensor(&shape, 0xF500 + index as u64, 0.5, device).unwrap();
+                (name, tensor)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let gain = |dim: usize| Tensor::full(norm_gain, dim, device).unwrap();
+        for name in [
+            "norm.weight",
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "layers.1.input_layernorm.weight",
+            "layers.1.post_attention_layernorm.weight",
+            "fast_norm.weight",
+            "fast_layers.0.input_layernorm.weight",
+            "fast_layers.0.post_attention_layernorm.weight",
+        ] {
+            tensors.insert(name.to_string(), gain(4));
+        }
+        for name in [
+            "layers.0.self_attn.q_norm.weight",
+            "layers.0.self_attn.k_norm.weight",
+            "layers.1.self_attn.q_norm.weight",
+            "layers.1.self_attn.k_norm.weight",
+        ] {
+            tensors.insert(
+                name.to_string(),
+                Tensor::ones(2, DType::F32, device).unwrap(),
+            );
+        }
+        let vb = VarBuilder::from_tensors(tensors, dtype, device);
+        let mut slow = FishS2SlowTransformer::load(slow_cfg, vb.clone()).unwrap();
+        slow.configure_semantic_head(1).unwrap();
+        let fast = FishS2FastDecoder::load(fast_cfg, vb).unwrap();
+        (slow, fast)
+    }
+
+    /// FSH-11: the probe runs every slow layer and the semantic head, then a
+    /// fast frame; on a healthy tiny model it passes in F16 and tracks F32.
+    #[test]
+    fn fish_probe_passes_in_f16_and_tracks_f32() {
+        let device = Device::Cpu;
+        let report = |dtype| {
+            let (slow, fast) = tiny_random_parts(&device, dtype, 1.0);
+            fish_s2_numeric_self_check(&slow, &fast, &device)
+        };
+        let full = report(DType::F32);
+        let half = report(DType::F16);
+        assert!(full.passed, "{}", full.reason);
+        assert!(half.passed, "{}", half.reason);
+        let names = half
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["slow_hidden", "slow_logits", "fast_logits"]);
+        for (half, full) in half.tensors.iter().zip(&full.tensors) {
+            assert!(
+                (half.max_abs - full.max_abs).abs() <= 0.05 * full.max_abs.max(1.0),
+                "{}: F16 max |x| {} vs F32 {}",
+                half.name,
+                half.max_abs,
+                full.max_abs
+            );
+        }
+    }
+
+    /// FSH-11: when large norm gains push F16 activations out of range, the
+    /// self-check fails and the transformers reload in F32; healthy gains
+    /// keep F16.
+    #[test]
+    fn fish_self_check_falls_back_to_f32_when_f16_activations_overflow() {
+        let device = Device::Cpu;
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test policy".into(),
+        };
+        for (norm_gain, expected) in [(1.0f32, DType::F16), (3.0e3, DType::F32)] {
+            let (_, precision) = load_with_precision_fallback(
+                "tiny Fish S2",
+                &selection,
+                true,
+                DType::F32,
+                |dtype| Ok::<_, Error>(tiny_random_parts(&device, dtype, norm_gain)),
+                |(slow, fast)| fish_s2_numeric_self_check(slow, fast, &device),
+            )
+            .unwrap();
+            assert_eq!(precision.loaded, expected, "{}", precision.reason);
+            assert_eq!(precision.fell_back(), expected == DType::F32);
+        }
+    }
+
+    /// FSH-11: the probe runs on Metal in F16 and passes on the healthy
+    /// tiny model, tracking CPU F32.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_fish_probe_passes_in_f16() {
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let (slow, fast) = tiny_random_parts(&metal, DType::F16, 1.0);
+        let report = fish_s2_numeric_self_check(&slow, &fast, &metal);
+        assert!(report.passed, "{}", report.reason);
+        let (slow, fast) = tiny_random_parts(&Device::Cpu, DType::F32, 1.0);
+        let cpu = fish_s2_numeric_self_check(&slow, &fast, &Device::Cpu);
+        for (metal, cpu) in report.tensors.iter().zip(&cpu.tensors) {
+            assert!(
+                (metal.max_abs - cpu.max_abs).abs() <= 0.05 * cpu.max_abs.max(1.0),
+                "{}: Metal F16 {} vs CPU F32 {}",
+                metal.name,
+                metal.max_abs,
+                cpu.max_abs
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

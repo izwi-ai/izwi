@@ -400,6 +400,30 @@ impl FishS2FastDecoder {
         Ok(frames)
     }
 
+    /// The load-time precision probe for one frame from `slow_hidden`
+    /// (`[1, 1, input_hidden]`) whose semantic code is `semantic_code`: every
+    /// depth's logits, stacked, choosing each next code greedily on the
+    /// device. Uses `cache` as a fresh invocation.
+    pub(crate) fn numeric_probe(
+        &self,
+        slow_hidden: &Tensor,
+        semantic_code: u32,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<Tensor> {
+        cache.reset_invocation()?;
+        let hidden = self.project_slow_hidden(slow_hidden)?;
+        self.forward_step_inner(&hidden, 0, cache, false)?;
+        let mut current = self.codebook_embedding(semantic_code)?;
+        let mut logits = Vec::with_capacity(self.cfg.num_codebooks);
+        for depth in 1..self.cfg.num_codebooks {
+            let step = self.forward_step(&current, depth, cache)?;
+            let code = step.i((0, 0))?.argmax_keepdim(0)?.reshape((1, 1))?;
+            current = self.embeddings.forward(&code)?;
+            logits.push(step);
+        }
+        Tensor::cat(&logits, 1).map_err(Error::from)
+    }
+
     /// Per-row resident draws for one frame, or `None` for the host path
     /// (CPU, or a policy the device sampler does not serve).
     fn resident_draws(

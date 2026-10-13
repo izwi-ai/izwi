@@ -203,13 +203,33 @@ impl FishS2Weights {
         device: DeviceProfile,
         dtype_override: Option<&str>,
     ) -> Result<Self> {
-        validate_fish_s2_backend(&device)?;
+        let dtype = Self::resolve_dtype(model_dir, &device, dtype_override)?;
+        Self::load_with_dtype(model_dir, device, dtype)
+    }
+
+    /// The dtype [`Self::load`] would pick: the override, else the device
+    /// policy for the checkpoint's dtype.
+    pub(crate) fn resolve_dtype(
+        model_dir: &Path,
+        device: &DeviceProfile,
+        dtype_override: Option<&str>,
+    ) -> Result<DType> {
+        validate_fish_s2_backend(device)?;
         let config_path = model_dir.join("config.json");
         let config_str = fs::read_to_string(&config_path).map_err(|err| {
             Error::ModelLoadError(format!("Failed to read {}: {err}", config_path.display()))
         })?;
         let checkpoint_dtype = checkpoint_dtype_from_config_json(&config_str);
-        let dtype = select_fish_s2_dtype(&device, dtype_override, checkpoint_dtype)?;
+        select_fish_s2_dtype(device, dtype_override, checkpoint_dtype)
+    }
+
+    /// Map the shards at `dtype` (already validated for `device`).
+    pub(crate) fn load_with_dtype(
+        model_dir: &Path,
+        device: DeviceProfile,
+        dtype: DType,
+    ) -> Result<Self> {
+        validate_fish_s2_backend(&device)?;
         let index = FishS2WeightIndex::load(model_dir)?;
         let shard_paths = index.shard_paths();
         let remapped_to_source = index
