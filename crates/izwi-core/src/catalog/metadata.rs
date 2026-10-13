@@ -550,12 +550,12 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
-            Self::ParakeetTdt06BV3 => 10_036_761_167,   // ~9.35 GB
+            Self::ParakeetTdt06BV3 => 2_509_332_480,    // .nemo 2,509,332,480 B (HF tree, Oct 2026)
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
             Self::Qwen3Asr06BGguf => 1_012_824_608,     // HF x-linked-size, Mar 2026
             Self::Qwen3Asr17BGguf => 2_512_740_320,     // HF x-linked-size, Mar 2026
             Self::VibeVoiceAsr => 17_348_198_410,       // safetensors index metadata total_size
-            Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
+            Self::Nemotron35AsrStreaming06B => 2_368_284_501, // .nemo bytes, HF tree, Oct 2026
             Self::GraniteSpeech412B => 4_626_414_392,   // safetensors index metadata total_size
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
@@ -575,7 +575,7 @@ impl ModelVariant {
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
-            Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
+            Self::VoxtralMini4BRealtime2602 => 8_874_376_007, // resolved download total, Oct 2026
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth

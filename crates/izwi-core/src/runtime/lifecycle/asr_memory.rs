@@ -31,7 +31,8 @@
 //!   allocations, so only their high-water mark counts. CPU and CUDA release a
 //!   buffer when it drops.
 //! - CUDA host staging, which is the whole CUDA host authorization: the largest
-//!   per-tensor host copy, or the NeMo extraction buffer of a first load.
+//!   per-tensor host copy (NeMo archives stream to disk, so a first load adds
+//!   no extraction buffer).
 //! - The Nemotron model memo bound, resident on the load device.
 //!
 //! Approximations, each conservative unless noted:
@@ -1141,11 +1142,9 @@ fn parakeet_plan(
     if !paths.nemo_path.is_file() {
         return Ok(None);
     }
-    // First load: `tar -xOf` reads each archive member into one growing host
-    // buffer, the checkpoint (most of the archive) included.
+    // First load: the archive is streamed to disk through small buffers.
     let payload = nemo_payload_bytes(&paths.nemo_path)?;
-    let extraction = payload.checked_next_power_of_two().ok_or_else(overflow)?;
-    price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, extraction, 0).map(Some)
+    price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some)
 }
 
 fn nemotron_plan(
@@ -2585,7 +2584,7 @@ mod tests {
     }
 
     /// Before extraction a NeMo load is priced from the archive payload, after
-    /// Parakeet's in-memory extraction buffer is freed.
+    /// any host extraction buffer is freed.
     #[test]
     fn first_nemo_loads_price_the_payload_and_the_extraction_buffer() {
         let payload: u64 = 2_509_332_480;

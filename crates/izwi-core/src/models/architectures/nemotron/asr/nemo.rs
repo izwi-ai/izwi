@@ -1,12 +1,9 @@
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs;
 use std::path::{Path, PathBuf};
-
-use flate2::read::GzDecoder;
-use tar::Archive;
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::weights::nemo::{extract_entry_to_file, open_nemo_archive};
 
 use super::config::NemotronConfigInventory;
 
@@ -61,6 +58,14 @@ pub(crate) fn nemotron_checkpoint_paths(
     })
 }
 
+/// Whether `nemotron-native/` holds everything a load reads (config and
+/// checkpoint), so the model is ready without its `.nemo`.
+pub(crate) fn nemotron_native_artifacts_complete(model_dir: &Path, variant: ModelVariant) -> bool {
+    nemotron_checkpoint_paths(model_dir, variant).is_ok_and(|paths| {
+        paths.extracted_dir.join("model_config.yaml").is_file() && paths.checkpoint_path.is_file()
+    })
+}
+
 pub fn ensure_nemotron_artifacts(
     model_dir: &Path,
     variant: ModelVariant,
@@ -70,7 +75,9 @@ pub fn ensure_nemotron_artifacts(
         extracted_dir,
         checkpoint_path,
     } = nemotron_checkpoint_paths(model_dir, variant)?;
-    if !nemo_path.exists() {
+    // A complete extracted directory is enough on its own: the `.nemo` is
+    // only its source and may be deleted to reclaim its 2.4 GB (NEM-15).
+    if !nemo_path.exists() && !nemotron_native_artifacts_complete(model_dir, variant) {
         return Err(Error::ModelNotFound(format!(
             "Missing .nemo checkpoint for {} at {}",
             variant.dir_name(),
@@ -206,73 +213,13 @@ fn discover_tokenizer_paths(extracted_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn open_nemo_archive(nemo_path: &Path) -> Result<Archive<Box<dyn Read>>> {
-    let mut file = File::open(nemo_path).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed opening .nemo archive {}: {}",
-            nemo_path.display(),
-            e
-        ))
-    })?;
-    let mut magic = [0u8; 2];
-    let read = file.read(&mut magic).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed reading .nemo archive header {}: {}",
-            nemo_path.display(),
-            e
-        ))
-    })?;
-    file.seek(SeekFrom::Start(0)).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed rewinding .nemo archive {}: {}",
-            nemo_path.display(),
-            e
-        ))
-    })?;
-
-    let reader: Box<dyn Read> = if read == 2 && magic == [0x1f, 0x8b] {
-        Box::new(GzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
-    Ok(Archive::new(reader))
-}
-
-fn extract_entry_to_file<R: Read>(entry: &mut tar::Entry<'_, R>, dest: &Path) -> Result<()> {
-    let tmp_path = dest.with_extension("tmp");
-    let mut tmp_file = File::create(&tmp_path).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed creating temp extraction file {}: {}",
-            tmp_path.display(),
-            e
-        ))
-    })?;
-
-    io::copy(entry, &mut tmp_file).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed writing extracted .nemo entry to {}: {}",
-            tmp_path.display(),
-            e
-        ))
-    })?;
-
-    fs::rename(&tmp_path, dest).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed moving extracted artifact into {}: {}",
-            dest.display(),
-            e
-        ))
-    })?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use std::fs::File;
     use std::io::Write;
     use tar::Builder;
     use uuid::Uuid;
@@ -353,6 +300,33 @@ model:
         let msg = err.to_string();
         assert!(msg.contains("model_weights.ckpt"), "{msg}");
 
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    /// A complete `nemotron-native/` is ready without its `.nemo`; a partial
+    /// one still needs the archive.
+    #[test]
+    fn complete_native_directory_loads_without_the_nemo() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("nemotron-native-only-{}", Uuid::new_v4()));
+        let variant = ModelVariant::Nemotron35AsrStreaming06B;
+        let model_dir = temp_dir.join(variant.dir_name());
+        let native = model_dir.join("nemotron-native");
+        fs::create_dir_all(&native).unwrap();
+        fs::write(
+            native.join("model_config.yaml"),
+            "model:\n  preprocessor:\n    sample_rate: 16000\n",
+        )
+        .unwrap();
+        assert!(!nemotron_native_artifacts_complete(&model_dir, variant));
+        assert!(matches!(
+            ensure_nemotron_artifacts(&model_dir, variant),
+            Err(Error::ModelNotFound(_))
+        ));
+        fs::write(native.join("model_weights.ckpt"), b"checkpoint").unwrap();
+        assert!(nemotron_native_artifacts_complete(&model_dir, variant));
+        let artifacts = ensure_nemotron_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(artifacts.checkpoint_path, native.join("model_weights.ckpt"));
         fs::remove_dir_all(temp_dir).unwrap();
     }
 

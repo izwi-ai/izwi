@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -7,6 +6,9 @@ use candle_core::pickle::read_pth_tensor_info;
 
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::shared::weights::nemo::{
+    ensure_free_disk, extract_entry_to_file, open_nemo_archive,
+};
 
 #[derive(Debug, Clone)]
 pub struct ParakeetArtifacts {
@@ -51,6 +53,17 @@ pub(crate) fn parakeet_checkpoint_paths(
     })
 }
 
+/// Whether `parakeet-native/` holds everything a load reads (config,
+/// tokenizer and a checkpoint, original or repacked), so the model is ready
+/// without its `.nemo`.
+pub(crate) fn parakeet_native_artifacts_complete(model_dir: &Path, variant: ModelVariant) -> bool {
+    parakeet_checkpoint_paths(model_dir, variant).is_ok_and(|paths| {
+        paths.extracted_dir.join("model_config.yaml").is_file()
+            && paths.extracted_dir.join("tokenizer.vocab").is_file()
+            && (paths.checkpoint_path.is_file() || paths.repacked_checkpoint_path.is_file())
+    })
+}
+
 pub fn ensure_parakeet_artifacts(
     model_dir: &Path,
     variant: ModelVariant,
@@ -61,7 +74,9 @@ pub fn ensure_parakeet_artifacts(
         checkpoint_path,
         repacked_checkpoint_path,
     } = parakeet_checkpoint_paths(model_dir, variant)?;
-    if !nemo_path.exists() {
+    // A complete extracted directory is enough on its own: the `.nemo` is
+    // only its source and may be deleted to reclaim its 2.5 GB (PKT-9).
+    if !nemo_path.exists() && !parakeet_native_artifacts_complete(model_dir, variant) {
         return Err(Error::ModelNotFound(format!(
             "Missing .nemo checkpoint for {} at {}",
             variant.dir_name(),
@@ -80,7 +95,8 @@ pub fn ensure_parakeet_artifacts(
     let model_config_path = extracted_dir.join("model_config.yaml");
     let tokenizer_vocab_path = extracted_dir.join("tokenizer.vocab");
 
-    if !(model_config_path.exists() && tokenizer_vocab_path.exists() && checkpoint_path.exists()) {
+    let has_checkpoint = checkpoint_path.exists() || repacked_checkpoint_path.exists();
+    if !(model_config_path.exists() && tokenizer_vocab_path.exists() && has_checkpoint) {
         extract_from_nemo(
             &nemo_path,
             &model_config_path,
@@ -104,115 +120,61 @@ pub fn ensure_parakeet_artifacts(
     })
 }
 
+/// Stream the three members a load reads out of the archive in one pass:
+/// each goes straight to its file through a small copy buffer, after a free
+/// disk check, instead of `tar -xOf` collecting the 2.5 GB checkpoint in host
+/// memory first (PKT-9).
 fn extract_from_nemo(
     nemo_path: &Path,
     model_config_path: &Path,
     tokenizer_vocab_path: &Path,
     checkpoint_path: &Path,
 ) -> Result<()> {
-    let listing = tar_list(nemo_path)?;
-
-    let model_config_entry = find_tar_entry(&listing, "model_config.yaml")?;
-    let tokenizer_vocab_entry = find_tar_entry(&listing, "tokenizer.vocab")?;
-    let checkpoint_entry = find_tar_entry(&listing, "model_weights.ckpt")?;
-
-    extract_tar_entry_to_file(nemo_path, &model_config_entry, model_config_path)?;
-    extract_tar_entry_to_file(nemo_path, &tokenizer_vocab_entry, tokenizer_vocab_path)?;
-    extract_tar_entry_to_file(nemo_path, &checkpoint_entry, checkpoint_path)?;
-
-    Ok(())
-}
-
-fn tar_list(nemo_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("tar")
-        .arg("-tf")
-        .arg(nemo_path)
-        .output()
-        .map_err(|e| {
+    let mut archive = open_nemo_archive(nemo_path)?;
+    let mut members = [
+        ("model_config.yaml", model_config_path, false),
+        ("tokenizer.vocab", tokenizer_vocab_path, false),
+        ("model_weights.ckpt", checkpoint_path, false),
+    ];
+    for entry in archive.entries().map_err(|e| {
+        Error::ModelLoadError(format!(
+            "Failed reading .nemo archive {}: {}",
+            nemo_path.display(),
+            e
+        ))
+    })? {
+        let mut entry = entry.map_err(|e| {
             Error::ModelLoadError(format!(
-                "Failed to list .nemo archive {}: {}",
+                "Failed iterating .nemo archive {}: {}",
                 nemo_path.display(),
                 e
             ))
         })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let entry_path = entry
+            .path()
+            .map_err(|e| {
+                Error::ModelLoadError(format!(
+                    "Failed reading archive entry path in {}: {}",
+                    nemo_path.display(),
+                    e
+                ))
+            })?
+            .to_string_lossy()
+            .into_owned();
+        if let Some(member) = members
+            .iter_mut()
+            .find(|(suffix, _, found)| !*found && entry_path.ends_with(suffix))
+        {
+            extract_entry_to_file(&mut entry, member.1)?;
+            member.2 = true;
+        }
+    }
+    if let Some((suffix, _, _)) = members.iter().find(|(_, _, found)| !*found) {
         return Err(Error::ModelLoadError(format!(
-            "Failed to list .nemo archive {}: {}",
-            nemo_path.display(),
-            stderr.trim()
+            "Unable to locate {suffix} inside .nemo archive {}",
+            nemo_path.display()
         )));
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect())
-}
-
-fn find_tar_entry(entries: &[String], suffix: &str) -> Result<String> {
-    entries
-        .iter()
-        .find(|e| e.ends_with(suffix))
-        .cloned()
-        .ok_or_else(|| {
-            Error::ModelLoadError(format!("Unable to locate {} inside .nemo archive", suffix))
-        })
-}
-
-fn extract_tar_entry_to_file(nemo_path: &Path, entry: &str, dest: &Path) -> Result<()> {
-    let tmp_path = dest.with_extension("tmp");
-    let mut tmp_file = File::create(&tmp_path).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed creating temp extraction file {}: {}",
-            tmp_path.display(),
-            e
-        ))
-    })?;
-
-    let output = Command::new("tar")
-        .arg("-xOf")
-        .arg(nemo_path)
-        .arg(entry)
-        .output()
-        .map_err(|e| {
-            Error::ModelLoadError(format!(
-                "Failed extracting {} from {}: {}",
-                entry,
-                nemo_path.display(),
-                e
-            ))
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::ModelLoadError(format!(
-            "Failed extracting {} from {}: {}",
-            entry,
-            nemo_path.display(),
-            stderr.trim()
-        )));
-    }
-
-    tmp_file.write_all(&output.stdout).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed writing extracted file {}: {}",
-            tmp_path.display(),
-            e
-        ))
-    })?;
-
-    fs::rename(&tmp_path, dest).map_err(|e| {
-        Error::ModelLoadError(format!(
-            "Failed moving extracted artifact into {}: {}",
-            dest.display(),
-            e
-        ))
-    })?;
-
     Ok(())
 }
 
@@ -229,6 +191,15 @@ fn normalize_checkpoint_if_needed(
         return Ok(repacked.to_path_buf());
     }
 
+    // Unpacking and repacking hold two more copies of the checkpoint on disk.
+    let checkpoint_bytes = fs::metadata(checkpoint_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    ensure_free_disk(
+        extracted_dir,
+        checkpoint_bytes.saturating_mul(2),
+        &format!("repacking {}", checkpoint_path.display()),
+    )?;
     let temp_extract_dir = extracted_dir.join("checkpoint_repack_tmp");
     if temp_extract_dir.exists() {
         let _ = fs::remove_dir_all(&temp_extract_dir);
@@ -307,4 +278,79 @@ fn normalize_checkpoint_if_needed(
     })?;
 
     Ok(repacked.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tar::Builder;
+    use uuid::Uuid;
+
+    fn add_archive_file(builder: &mut Builder<File>, path: &str, contents: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, contents).unwrap();
+    }
+
+    /// The members stream out of the archive in one pass into their files;
+    /// a missing member is reported by name.
+    #[test]
+    fn extraction_streams_each_member_to_its_file() {
+        let dir = std::env::temp_dir().join(format!("parakeet-nemo-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let nemo = dir.join("model.nemo");
+        let mut builder = Builder::new(File::create(&nemo).unwrap());
+        add_archive_file(&mut builder, "./model_config.yaml", b"config");
+        add_archive_file(&mut builder, "./abc_tokenizer.vocab", b"vocab");
+        add_archive_file(&mut builder, "./model_weights.ckpt", &[7u8; 4096]);
+        builder.finish().unwrap();
+        drop(builder);
+
+        let (config, vocab, ckpt) = (
+            dir.join("model_config.yaml"),
+            dir.join("tokenizer.vocab"),
+            dir.join("model_weights.ckpt"),
+        );
+        extract_from_nemo(&nemo, &config, &vocab, &ckpt).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"config");
+        assert_eq!(fs::read(&vocab).unwrap(), b"vocab");
+        assert_eq!(fs::read(&ckpt).unwrap(), vec![7u8; 4096]);
+
+        let partial = dir.join("partial.nemo");
+        let mut builder = Builder::new(File::create(&partial).unwrap());
+        add_archive_file(&mut builder, "./model_config.yaml", b"config");
+        builder.finish().unwrap();
+        drop(builder);
+        let error = extract_from_nemo(&partial, &config, &vocab, &ckpt)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tokenizer.vocab"), "{error}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A complete `parakeet-native/` (original or repacked checkpoint) is
+    /// ready without the `.nemo`.
+    #[test]
+    fn complete_native_directory_needs_no_nemo() {
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let dir = std::env::temp_dir().join(format!("parakeet-native-{}", Uuid::new_v4()));
+        let paths = parakeet_checkpoint_paths(&dir, variant).unwrap();
+        fs::create_dir_all(&paths.extracted_dir).unwrap();
+        fs::write(paths.extracted_dir.join("model_config.yaml"), "config").unwrap();
+        fs::write(paths.extracted_dir.join("tokenizer.vocab"), "vocab").unwrap();
+        assert!(!parakeet_native_artifacts_complete(&dir, variant));
+        assert!(matches!(
+            ensure_parakeet_artifacts(&dir, variant),
+            Err(Error::ModelNotFound(_))
+        ));
+        fs::write(&paths.repacked_checkpoint_path, "ckpt").unwrap();
+        assert!(parakeet_native_artifacts_complete(&dir, variant));
+        fs::remove_file(&paths.repacked_checkpoint_path).unwrap();
+        fs::write(&paths.checkpoint_path, "ckpt").unwrap();
+        assert!(parakeet_native_artifacts_complete(&dir, variant));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -42,8 +42,8 @@ use crate::models::shared::weights::mlx;
 use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
-pub(crate) use nemo::parakeet_checkpoint_paths;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
+pub(crate) use nemo::{parakeet_checkpoint_paths, parakeet_native_artifacts_complete};
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 

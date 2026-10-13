@@ -22,6 +22,9 @@ use tracing::{debug, info, warn};
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::{Error, Result};
+use crate::models::architectures::nemotron::asr::nemotron_native_artifacts_complete;
+use crate::models::architectures::parakeet::asr::parakeet_native_artifacts_complete;
+use crate::models::shared::weights::nemo::ensure_free_disk;
 
 const HF_BASE_URL: &str = "https://huggingface.co";
 const CHUNK_SIZE: usize = 8192; // 8KB chunks for streaming
@@ -393,6 +396,23 @@ fn qwen38_bundle_is_complete(model_dir: &Path) -> bool {
         && manifest.repo_id == ModelVariant::Qwen3827BFp8.repo_id()
         && manifest.revision == ModelVariant::QWEN38_27B_FP8_ARTIFACT_REVISION
         && recorded_files == selected_files
+}
+
+/// Bytes a download still writes: every `(file, expected bytes, present)`
+/// not yet present, and for a `.nemo` the family unpacks on first load, the
+/// extracted checkpoint (about the archive's size) beside it.
+fn download_disk_requirement(files: &[(&str, u64, bool)], extracts_nemo: bool) -> u64 {
+    files
+        .iter()
+        .filter(|(_, _, present)| !*present)
+        .map(|(file, bytes, _)| {
+            if extracts_nemo && file.ends_with(".nemo") {
+                bytes.saturating_mul(2)
+            } else {
+                *bytes
+            }
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 #[derive(Debug, Clone)]
@@ -969,7 +989,10 @@ impl ModelDownloader {
                         ModelVariant::ParakeetTdt06BV3 => "parakeet-tdt-0.6b-v3.nemo",
                         _ => unreachable!("checked by is_parakeet_nemo"),
                     };
-                    return path.join(nemo_file).exists();
+                    // The extracted checkpoint is complete without its
+                    // archive once a first load has unpacked it (PKT-9).
+                    return path.join(nemo_file).exists()
+                        || parakeet_native_artifacts_complete(&path, variant);
                 }
 
                 let has_config = path.join("config.json").exists();
@@ -1001,7 +1024,10 @@ impl ModelDownloader {
                         .iter()
                         .all(|file| path.join(file).exists())
             }
-            ModelFamily::NemotronAsr => path.join("nemotron-3.5-asr-streaming-0.6b.nemo").exists(),
+            ModelFamily::NemotronAsr => {
+                path.join("nemotron-3.5-asr-streaming-0.6b.nemo").exists()
+                    || nemotron_native_artifacts_complete(&path, variant)
+            }
             ModelFamily::GraniteSpeechAsr => granite_speech_required_files(variant)
                 .iter()
                 .all(|file| path.join(file).exists()),
@@ -1094,6 +1120,39 @@ impl ModelDownloader {
         }
     }
 
+    /// Refuse a download its volume cannot hold before any byte is fetched:
+    /// the files still missing, plus, for the NeMo ASR families, the
+    /// checkpoint a first load extracts beside the archive (PKT-9, ADM-14).
+    fn ensure_download_disk_space(
+        &self,
+        variant: ModelVariant,
+        local_dir: &Path,
+        plans: &[FileDownloadPlan],
+    ) -> Result<()> {
+        let files = plans
+            .iter()
+            .map(|plan| {
+                let present =
+                    std::fs::metadata(local_dir.join(&plan.local_file)).is_ok_and(|metadata| {
+                        !(plan.strict_size_check
+                            && plan.expected_size > 0
+                            && metadata.len() != plan.expected_size)
+                    });
+                (plan.local_file.as_str(), plan.expected_size, present)
+            })
+            .collect::<Vec<_>>();
+        let extracts_nemo = matches!(
+            variant.family(),
+            ModelFamily::ParakeetAsr | ModelFamily::NemotronAsr
+        );
+        let required = download_disk_requirement(&files, extracts_nemo);
+        ensure_free_disk(
+            local_dir,
+            required,
+            &format!("downloading {}", variant.dir_name()),
+        )
+    }
+
     /// Download a model with multi-progress bar display
     pub async fn download(&self, variant: ModelVariant) -> Result<PathBuf> {
         let local_dir = self.model_path(variant);
@@ -1103,6 +1162,7 @@ impl ModelDownloader {
 
         // Create overall progress bar
         let file_plans = self.get_file_download_plans(variant).await?;
+        self.ensure_download_disk_space(variant, &local_dir, &file_plans)?;
         let total_bytes: u64 = file_plans.iter().map(|plan| plan.expected_size).sum();
 
         let overall_pb = self.multi_progress.add(ProgressBar::new(total_bytes));
@@ -1326,6 +1386,7 @@ impl ModelDownloader {
         info!("Downloading {} to {:?}", variant.repo_id(), local_dir);
 
         let file_plans = self.get_file_download_plans(variant).await?;
+        self.ensure_download_disk_space(variant, &local_dir, &file_plans)?;
         let total_files = file_plans.len();
         let total_bytes: u64 = file_plans.iter().map(|plan| plan.expected_size).sum();
         let mut downloaded_bytes: u64 = 0;
@@ -2232,7 +2293,7 @@ impl ModelDownloader {
             }
         } else if file == "consolidated.safetensors" {
             match variant {
-                ModelVariant::VoxtralMini4BRealtime2602 => 8_900_000_000,
+                ModelVariant::VoxtralMini4BRealtime2602 => 8_859_358_720,
                 ModelVariant::Voxtral4BTts2603 => 8_650_000_000,
                 _ => 8_000_000_000,
             }
@@ -2278,8 +2339,8 @@ impl ModelDownloader {
             550_000
         } else if file.ends_with(".nemo") {
             match variant {
-                ModelVariant::ParakeetTdt06BV3 => 10_036_761_167,
-                ModelVariant::Nemotron35AsrStreaming06B => 2_370_000_000,
+                ModelVariant::ParakeetTdt06BV3 => 2_509_332_480,
+                ModelVariant::Nemotron35AsrStreaming06B => 2_368_284_501,
                 ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
                 ModelVariant::Nemotron3Diarization => 200_000_000,
                 _ => 4_000_000_000,
@@ -2435,6 +2496,51 @@ impl ModelDownloader {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// A download needs the bytes still missing; a fresh `.nemo` also needs
+    /// its extracted checkpoint beside it.
+    #[test]
+    fn download_disk_requirement_counts_missing_files_and_nemo_extraction() {
+        let files = [
+            ("model.nemo", 2_500, false),
+            ("README.md", 10, false),
+            ("done.bin", 1_000, true),
+        ];
+        assert_eq!(download_disk_requirement(&files, true), 5_010);
+        assert_eq!(download_disk_requirement(&files, false), 2_510);
+        assert_eq!(
+            download_disk_requirement(&[("model.nemo", 2_500, true)], true),
+            0
+        );
+    }
+
+    /// NeMo ASR models are ready from a complete extracted directory alone,
+    /// so the 2.5 GB archive can be deleted after the first load.
+    #[test]
+    fn nemo_asr_models_are_ready_from_their_native_directory() {
+        let (downloader, temp_dir) = test_downloader();
+        for (variant, native, files) in [
+            (
+                ModelVariant::ParakeetTdt06BV3,
+                "parakeet-native",
+                &["model_config.yaml", "tokenizer.vocab", "model_weights.ckpt"][..],
+            ),
+            (
+                ModelVariant::Nemotron35AsrStreaming06B,
+                "nemotron-native",
+                &["model_config.yaml", "model_weights.ckpt"][..],
+            ),
+        ] {
+            let dir = downloader.model_path(variant).join(native);
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(!downloader.is_downloaded(variant), "{variant}");
+            for file in files {
+                std::fs::write(dir.join(file), b"x").unwrap();
+            }
+            assert!(downloader.is_downloaded(variant), "{variant}");
+        }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     fn test_downloader() -> (ModelDownloader, PathBuf) {
         let temp_dir =
