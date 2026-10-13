@@ -928,19 +928,19 @@ impl ParakeetAsrModel {
                 let predictor = Tensor::cat(&predictor_rows, 0)?;
                 let logits = self.joint_batch_rows(&encoded, &predictor)?;
                 let (_, output_width) = logits.dims2()?;
+                let token_end = self.blank_idx + 1;
+                if output_width < token_end + self.num_durations {
+                    return Err(Error::InferenceError(
+                        "Parakeet retained joint output has invalid geometry".into(),
+                    ));
+                }
+                // One readback for every row's label and duration.
+                let selections =
+                    tdt_batch_labels_and_durations(&logits, token_end, self.num_durations)?;
                 let mut emitted = Vec::new();
                 for (index, row) in rows.iter_mut().enumerate() {
-                    let token_end = self.blank_idx + 1;
-                    if output_width < token_end + self.num_durations {
-                        return Err(Error::InferenceError(
-                            "Parakeet retained joint output has invalid geometry".into(),
-                        ));
-                    }
-                    let row_logits = logits.i(index)?;
-                    let label = argmax_1d(&row_logits.narrow(0, 0, token_end)?)?;
-                    let duration =
-                        argmax_1d(&row_logits.narrow(0, token_end, self.num_durations)?)?
-                            .min(self.num_durations.saturating_sub(1));
+                    let (label, duration) = selections[index];
+                    let duration = duration.min(self.num_durations.saturating_sub(1));
                     let mut jump = duration;
                     if label == self.blank_idx && jump == 0 {
                         jump = 1;
@@ -954,7 +954,7 @@ impl ParakeetAsrModel {
                         .state
                         .counters
                         .device_argmax_scalar_reads
-                        .saturating_add(2);
+                        .saturating_add(1);
                     if label == self.blank_idx {
                         row.state.counters.tdt_blank_steps =
                             row.state.counters.tdt_blank_steps.saturating_add(1);
@@ -1590,14 +1590,10 @@ impl ParakeetNetwork {
                 .squeeze(0)?
                 .squeeze(0)?; // [V + 1 + num_durations]
 
-            let token_logits = logits.i(..(blank_idx + 1))?;
-            let duration_logits = logits.i((blank_idx + 1)..)?;
-
             counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
             counters.device_argmax_scalar_reads =
-                counters.device_argmax_scalar_reads.saturating_add(2);
-            let mut label = argmax_1d(&token_logits)?;
-            let duration_idx = argmax_1d(&duration_logits)?;
+                counters.device_argmax_scalar_reads.saturating_add(1);
+            let (mut label, duration_idx) = tdt_label_and_duration(&logits, blank_idx + 1)?;
             let mut jump = duration_idx.min(num_durations.saturating_sub(1));
 
             if label == blank_idx && jump == 0 {
@@ -1617,14 +1613,11 @@ impl ParakeetNetwork {
                     .squeeze(0)?
                     .squeeze(0)?;
 
-                let token_logits = logits.i(..(blank_idx + 1))?;
-                let duration_logits = logits.i((blank_idx + 1)..)?;
-
                 counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
                 counters.device_argmax_scalar_reads =
-                    counters.device_argmax_scalar_reads.saturating_add(2);
-                label = argmax_1d(&token_logits)?;
-                let duration_idx = argmax_1d(&duration_logits)?;
+                    counters.device_argmax_scalar_reads.saturating_add(1);
+                let duration_idx;
+                (label, duration_idx) = tdt_label_and_duration(&logits, blank_idx + 1)?;
                 jump = duration_idx.min(num_durations.saturating_sub(1));
 
                 if label == blank_idx && jump == 0 {
@@ -2752,24 +2745,45 @@ fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
 }
 
-fn argmax_1d(x: &Tensor) -> Result<usize> {
-    let width = x.dims1()?;
-    if width == 0 {
-        return Err(Error::InferenceError(
-            "Parakeet argmax received empty logits".to_string(),
-        ));
+/// The TDT label (argmax over `logits[..token_end]`) and duration index
+/// (argmax over the rest) of one joint output, read back together: one
+/// device-to-host sync per joint step instead of two.
+fn tdt_label_and_duration(logits: &Tensor, token_end: usize) -> Result<(usize, usize)> {
+    let width = logits.dims1()?;
+    if token_end == 0 || width <= token_end {
+        return Err(Error::InferenceError(format!(
+            "Parakeet TDT joint output of width {width} has no token or duration logits after {token_end}"
+        )));
     }
-    let idx = x.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
+    let selected =
+        tdt_batch_labels_and_durations(&logits.unsqueeze(0)?, token_end, width - token_end)?;
+    Ok(selected[0])
+}
+
+/// Per-row TDT label and duration indices of a `(rows, width)` joint output
+/// with one readback for all rows.
+fn tdt_batch_labels_and_durations(
+    logits: &Tensor,
+    token_end: usize,
+    num_durations: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let (rows, width) = logits.dims2()?;
+    if token_end == 0 || num_durations == 0 || width < token_end + num_durations {
+        return Err(Error::InferenceError(format!(
+            "Parakeet TDT joint output of width {width} cannot hold {token_end} token and {num_durations} duration logits"
+        )));
+    }
+    let labels = logits.narrow(1, 0, token_end)?.argmax(D::Minus1)?;
+    let durations = logits
+        .narrow(1, token_end, num_durations)?
+        .argmax(D::Minus1)?;
+    let selected = Tensor::stack(&[labels, durations], 0)?.to_dtype(DType::U32)?;
     crate::models::shared::telemetry::record_dtype_cast();
-    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
-    let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
-    usize::try_from(idx)
-        .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
+    crate::models::shared::telemetry::record_host_read(DType::U32, 2 * rows);
+    let selected = selected.to_vec2::<u32>()?;
+    (0..rows)
+        .map(|row| Ok((selected[0][row] as usize, selected[1][row] as usize)))
+        .collect()
 }
 
 fn resampled_len(len: usize, src_rate: u32, dst_rate: u32) -> usize {
@@ -2806,7 +2820,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        argmax_1d, build_rel_positional_embedding, parakeet_encoded_len_for_samples,
+        build_rel_positional_embedding, parakeet_encoded_len_for_samples,
         parakeet_max_emittable_tokens, parakeet_preparation_bytes,
         parakeet_tensor_is_f16_projection, plan_encoder_windows, subsampled_len_3x,
         tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
@@ -2815,6 +2829,7 @@ mod tests {
         ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
         TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
+    use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
     use crate::model::ModelVariant;
@@ -3803,24 +3818,58 @@ mod tests {
         }
     }
 
+    /// The pre-change per-head argmax: one scalar readback per head.
+    fn reference_argmax(x: &Tensor) -> usize {
+        x.argmax(candle_core::D::Minus1)
+            .unwrap()
+            .to_dtype(DType::U32)
+            .unwrap()
+            .to_scalar::<u32>()
+            .unwrap() as usize
+    }
+
     #[test]
-    fn parakeet_argmax_selects_half_logits_on_device() {
+    fn parakeet_tdt_argmax_selects_half_logits_on_device() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2], (4,), &device)
+        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2, 0.5, 0.9, -1.0], (7,), &device)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
 
-        assert_eq!(argmax_1d(&logits).unwrap(), 2);
+        assert_eq!(tdt_label_and_duration(&logits, 4).unwrap(), (2, 1));
     }
 
     #[test]
-    fn parakeet_argmax_rejects_empty_logits() {
+    fn parakeet_tdt_argmax_rejects_missing_heads() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
-        let err = argmax_1d(&logits).expect_err("empty logits should be rejected");
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2], (2,), &device).unwrap();
+        assert!(tdt_label_and_duration(&logits, 2).is_err());
+        assert!(tdt_label_and_duration(&logits, 0).is_err());
+        let empty = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        assert!(tdt_label_and_duration(&empty, 0).is_err());
+    }
 
-        assert!(format!("{err}").contains("Parakeet argmax received empty logits"));
+    /// One combined readback selects the same label and duration as the two
+    /// per-head argmax readbacks it replaces, for single rows and batches.
+    #[test]
+    fn combined_tdt_readback_matches_per_head_argmax() {
+        let device = Device::Cpu;
+        let (token_end, durations, rows) = (8193, 5, 3);
+        let values = XorShift(0x7DD4_1A2B).values(rows * (token_end + durations), 8.0, 0.0);
+        let logits = Tensor::from_vec(values, (rows, token_end + durations), &device).unwrap();
+        let batch = tdt_batch_labels_and_durations(&logits, token_end, durations).unwrap();
+        for (row, &selected) in batch.iter().enumerate() {
+            let row_logits = logits.get(row).unwrap();
+            let expected = (
+                reference_argmax(&row_logits.narrow(0, 0, token_end).unwrap()),
+                reference_argmax(&row_logits.narrow(0, token_end, durations).unwrap()),
+            );
+            assert_eq!(selected, expected);
+            assert_eq!(
+                tdt_label_and_duration(&row_logits, token_end).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
