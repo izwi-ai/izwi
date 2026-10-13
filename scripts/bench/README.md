@@ -450,3 +450,34 @@ word counts, returned duration and rtf, segment counts, the number of long-form
 chunks that stopped on their token budget, and the peak footprint per model.
 Run it with the same matrix before and after a change and compare the summaries;
 the deterministic scorer checks live in `test-score-asr-matrix.py`.
+
+## Live TTS matrix
+
+`run-tts-matrix.sh` runs a fixed set of text cases for every listed TTS model
+through the OpenAI `/v1/audio/speech` route, non-stream and SSE. As with the ASR
+matrix, each model gets its own `izwi-server` with an isolated database, media
+and spool directory and a footprint guard (`--guard-mb`). The harness also
+refuses a busy port and checks that its own server owns it, and on macOS waits
+for `--min-free-pct` free memory before each model.
+
+```bash
+cargo build --release -p izwi-server --features izwi-server/metal
+scripts/bench/run-tts-matrix.sh --backend metal \
+    --models Kokoro-82M:kokoro,Qwen3-TTS-12Hz-0.6B-CustomVoice:qwen_cv \
+    --asr-base http://127.0.0.1:18090
+```
+
+Each model names its case family (`kokoro`, `lfm`, `qwen_cv`, `qwen_base`,
+`qwen_greedy`, `vibevoice`, `voxtral`, `fish`). Texts are a 9-word sentence, a
+45-word paragraph, a numbers sentence, a 250-word passage and a leading-dash
+probe; clone families use `data/fox.wav` with `data/fox.md` as the reference.
+Cases are written as WAV plus JSON under `<out>/<model>/cases/`.
+
+`score-tts-matrix.py score` writes `summary.json` with audio-health statistics
+(duration, level, peak, leading and trailing silence), the stop reason
+(`X-Stop-Reason` or the SSE `audio.done` event), `decode_steps` and
+`decode_tokens` (equal means the budget, not end of speech, stopped the model),
+the terminal SSE event, and the peak footprint per model. With `--asr-base`,
+every WAV is transcribed by a separately started ASR server (Nemotron on CPU
+by default) and scored by WER. The deterministic checks live in
+`test-score-tts-matrix.py`.
