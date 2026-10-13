@@ -166,7 +166,7 @@ for model in "${MODEL_LIST[@]}"; do
         RUST_LOG="${RUST_LOG:-info}" "${SERVER}" > "${server_log}" 2>&1 &
     server_pid=$!
     for _ in $(seq 1 120); do
-        curl -sf "${BASE}/health" >/dev/null 2>&1 && break
+        curl -sf "${BASE}/v1/health" >/dev/null 2>&1 && break
         sleep 1
     done
     guard_server "${server_pid}" "${memory_log}" &
