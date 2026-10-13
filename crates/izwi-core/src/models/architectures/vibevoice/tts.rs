@@ -798,18 +798,7 @@ impl VibeVoiceTtsModel {
         )?);
         state.scaled_latents.push(latent_frame);
         state.managed_completions_drained = false;
-        state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
-        if !state.finished && state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
-            let predicted = next_tts_control_token_from_hidden(
-                &self.language_model,
-                state.last_hidden.as_ref().ok_or_else(|| {
-                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
-                })?,
-                self.tokenizer.specials(),
-            )?;
-            state.finished = predicted == self.tokenizer.specials().speech_end
-                || predicted == self.tokenizer.specials().endoftext;
-        }
+        state.finished = self.retained_frame_ends_row(state)?;
         let step = VibeVoiceTtsRetainedDecodeStep {
             frames_generated: state.scaled_latents.len(),
             finished: state.finished,
@@ -911,7 +900,11 @@ impl VibeVoiceTtsModel {
             )?);
             state.scaled_latents.push(latent_frame);
             state.managed_completions_drained = false;
-            state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
+            // Same stop rule as the scalar step: a row whose next control
+            // token is speech_end / endoftext finishes now, instead of
+            // falling back to the scalar step next quantum and sampling one
+            // more latent from its end-of-speech state (VVT-6).
+            state.finished = self.retained_frame_ends_row(state)?;
             let step = VibeVoiceTtsRetainedDecodeStep {
                 frames_generated: state.scaled_latents.len(),
                 finished: state.finished,
@@ -920,6 +913,32 @@ impl VibeVoiceTtsModel {
             steps.push(step);
         }
         Ok(steps)
+    }
+
+    /// Whether a row is done after committing a frame: the frame cap, or,
+    /// from [`MIN_FRAMES_BEFORE_STOP`] frames on, the LM predicting a
+    /// non-diffusion control token next. The reference stops there and
+    /// never samples a latent for `speech_end` / `endoftext`.
+    fn retained_frame_ends_row(&self, state: &VibeVoiceTtsRetainedState) -> Result<bool> {
+        let frames = state.scaled_latents.len();
+        if frames >= state.params.max_frames.max(1) {
+            return Ok(true);
+        }
+        if frames < MIN_FRAMES_BEFORE_STOP {
+            return Ok(false);
+        }
+        let predicted = next_tts_control_token_from_hidden(
+            &self.language_model,
+            state.last_hidden.as_ref().ok_or_else(|| {
+                Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+            })?,
+            self.tokenizer.specials(),
+        )?;
+        Ok(control_token_ends_speech(
+            frames,
+            predicted,
+            self.tokenizer.specials(),
+        ))
     }
 
     pub(crate) fn retained_decode_batch_eligible(
@@ -2032,6 +2051,18 @@ fn next_tts_control_token_from_hidden(
     select_next_tts_control_token(&scores)
 }
 
+/// The stop rule shared by the scalar and batched decode steps: after
+/// `frames` committed frames, a predicted `speech_end` or `endoftext` ends the
+/// row once the minimum length is reached; `speech_pad` continues it.
+fn control_token_ends_speech(
+    frames: usize,
+    predicted: u32,
+    specials: &VibeVoiceSpecialTokens,
+) -> bool {
+    frames >= MIN_FRAMES_BEFORE_STOP
+        && (predicted == specials.speech_end || predicted == specials.endoftext)
+}
+
 fn tts_control_tokens(specials: &VibeVoiceSpecialTokens) -> [u32; 3] {
     [specials.speech_pad, specials.speech_end, specials.endoftext]
 }
@@ -2559,6 +2590,35 @@ mod tests {
             select_next_tts_control_token(&[(3, 2.0), (2, 3.0), (1, 0.5)]).unwrap(),
             2
         );
+    }
+
+    /// VVT-6: the scalar and batched steps share one stop rule; a row that
+    /// predicts speech_end or endoftext after the minimum length is finished
+    /// at that frame, so no latent is ever sampled from the end state.
+    #[test]
+    fn control_token_stop_rule_matches_the_reference_loop() {
+        let specials = VibeVoiceSpecialTokens::default();
+        let min = MIN_FRAMES_BEFORE_STOP;
+        assert!(!control_token_ends_speech(
+            min - 1,
+            specials.speech_end,
+            &specials
+        ));
+        assert!(control_token_ends_speech(
+            min,
+            specials.speech_end,
+            &specials
+        ));
+        assert!(control_token_ends_speech(
+            min + 7,
+            specials.endoftext,
+            &specials
+        ));
+        assert!(!control_token_ends_speech(
+            min + 7,
+            specials.speech_pad,
+            &specials
+        ));
     }
 
     #[test]
