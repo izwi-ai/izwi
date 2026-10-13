@@ -99,8 +99,43 @@ fn qwen3_tts_plan(
     let Some(files) = census_of(&paths)? else {
         return Ok(None);
     };
-    price_qwen3_tts(&files, backend, &layout).map(Some)
+    price_qwen3_tts_with_fallback(&files, backend, &layout).map(Some)
 }
+
+/// The Qwen3-TTS plan as loaded: with weight-only F16, its F16 residency
+/// and a load peak that also fits the dense reload a failed load-time
+/// self-check falls back to.
+fn price_qwen3_tts_with_fallback(
+    files: &[CensusFile],
+    backend: BackendKind,
+    layout: &Qwen3TtsLoadLayout,
+) -> Result<AsrResidencyPlan> {
+    let plan = price_qwen3_tts(files, backend, layout)?;
+    if !layout.weight_only_f16 {
+        return Ok(plan);
+    }
+    let dense = price_qwen3_tts(
+        files,
+        backend,
+        &Qwen3TtsLoadLayout {
+            weight_only_f16: false,
+            ..*layout
+        },
+    )?;
+    Ok(plan.with_fallback_peak(&dense))
+}
+
+/// Whether a Qwen3-TTS tensor loads as weight-only F16 when the layout asks
+/// for it: the talker and predictor attention and MLP projections, the text
+/// projection, and the text embedding (F16 storage, F32 compute).
+fn qwen3_tts_weight_only_f16_tensor(name: &str) -> bool {
+    name.starts_with("talker.")
+        && (name.ends_with("_proj.weight")
+            || name.starts_with("talker.text_projection.")
+            || name == QWEN3_TTS_TEXT_EMBEDDING)
+}
+
+const QWEN3_TTS_TEXT_EMBEDDING: &str = "talker.model.text_embedding.weight";
 
 /// Qwen3-TTS (`qwen3/tts/mod.rs`): every tensor through
 /// `staged::metal_staged_safetensors`, the talker and code predictor at
@@ -121,6 +156,18 @@ fn price_qwen3_tts(
     let mut ledger = Ledger::staged(backend);
     for tensor in &model.tensors {
         let name = tensor.name.as_str();
+        if layout.weight_only_f16 && qwen3_tts_weight_only_f16_tensor(name) {
+            // Read on the host, converted there and uploaded once at F16
+            // (biases stay F32); the text embedding passes through F32.
+            if name == QWEN3_TTS_TEXT_EMBEDDING {
+                ledger.host_converted_through(tensor, Some(DType::F32), DType::F16)?;
+            } else if name.ends_with(".bias") {
+                ledger.host_converted(tensor, DType::F32)?;
+            } else {
+                ledger.host_converted(tensor, DType::F16)?;
+            }
+            continue;
+        }
         let dtype = if name.starts_with("talker.code_predictor.") {
             layout.dtypes.code_predictor
         } else if name.starts_with("talker.") {
@@ -225,7 +272,33 @@ fn voxtral_tts_plan(
     let Some(files) = census_of(&[model_path.join("consolidated.safetensors")])? else {
         return Ok(None);
     };
-    price_voxtral_tts(&files, backend, &metadata.dtype_plan).map(Some)
+    price_voxtral_tts_as_loaded(&files, backend, &metadata.dtype_plan).map(Some)
+}
+
+/// The Voxtral-TTS plan as loaded: a lower-precision Metal tier is kept
+/// only if its load-time self-check passes, else the transformers reload at
+/// F32, so the load peak also fits that.
+fn price_voxtral_tts_as_loaded(
+    files: &[CensusFile],
+    backend: BackendKind,
+    dtypes: &VoxtralTtsDTypePlan,
+) -> Result<AsrResidencyPlan> {
+    let plan = price_voxtral_tts(files, backend, dtypes)?;
+    if backend == BackendKind::Metal
+        && (dtypes.language_model != DType::F32 || dtypes.acoustic_transformer != DType::F32)
+    {
+        let dense = price_voxtral_tts(
+            files,
+            backend,
+            &VoxtralTtsDTypePlan {
+                language_model: DType::F32,
+                acoustic_transformer: DType::F32,
+                codec: dtypes.codec,
+            },
+        )?;
+        return Ok(plan.with_fallback_peak(&dense));
+    }
+    Ok(plan)
 }
 
 /// Voxtral-TTS (`voxtral/tts/model.rs`): three `VarBuilder`s over the mapped
@@ -286,7 +359,7 @@ mod tests {
     }
 
     fn qwen(files: &[CensusFile], voice_clone: bool, backend: BackendKind) -> AsrResidencyPlan {
-        price_qwen3_tts(files, backend, &qwen_layout(voice_clone, backend)).unwrap()
+        price_qwen3_tts_with_fallback(files, backend, &qwen_layout(voice_clone, backend)).unwrap()
     }
 
     fn kokoro(backend: BackendKind) -> AsrResidencyPlan {
@@ -306,13 +379,15 @@ mod tests {
 
     /// Report 08 table B, resident weights per backend (CPU, Metal as
     /// allocated, CUDA), with the load peak each must stay under:
-    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU and Metal: 0.6B Base is
-    ///   4.04 GiB, as the report measured. The staged loader casts on the
-    ///   host on Metal, so the 5.29 GiB the report saw from device casts
-    ///   into power-of-two buffers (the 1.19 GiB text embedding took 2 GiB)
-    ///   is gone. CUDA keeps the talker and predictor BF16 beside an F32
-    ///   speech tokenizer. CustomVoice skips the speech-tokenizer encoder
-    ///   (0.24 GiB) it never runs.
+    /// - Qwen3-TTS CustomVoice/Base load F32 on CPU: 0.6B Base is 4.04 GiB,
+    ///   as the report measured. On Metal the talker and predictor
+    ///   projections and the text embedding load as weight-only F16 (F32
+    ///   compute), host-cast and uploaded at exact size: 2.48 GiB, against
+    ///   the 5.29 GiB the report saw from device F32 casts into
+    ///   power-of-two buffers. Its load peak also fits the dense reload a
+    ///   failed self-check falls back to. CUDA keeps the talker and
+    ///   predictor BF16 beside an F32 speech tokenizer. CustomVoice skips the
+    ///   speech-tokenizer encoder (0.24 GiB) it never runs.
     /// - Kokoro is its 0.305 GiB F32 checkpoint read from the nested
     ///   `.pth`, not the 2 GiB catalog figure.
     /// - VibeVoice is F32 on CPU (10.07 GiB), F16 on Metal and BF16 on
@@ -333,17 +408,17 @@ mod tests {
             (
                 "Qwen3-TTS-0.6B-CustomVoice",
                 Box::new(|b| qwen(&qwen06_cv, false, b)),
-                [3.80, 3.80, 2.11],
+                [3.80, 2.24, 2.11],
             ),
             (
                 "Qwen3-TTS-0.6B-Base",
                 Box::new(|b| qwen(&qwen06_base, true, b)),
-                [4.04, 4.04, 2.36],
+                [4.04, 2.48, 2.36],
             ),
             (
                 "Qwen3-TTS-1.7B-CustomVoice",
                 Box::new(|b| qwen(&qwen17_cv, false, b)),
-                [7.57, 7.57, 4.00],
+                [7.57, 4.20, 4.00],
             ),
             ("Kokoro-82M", Box::new(kokoro), [0.30, 0.30, 0.30]),
             ("VibeVoice-1.5B", Box::new(vibevoice), [10.07, 5.41, 5.04]),
@@ -370,6 +445,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Weight-only F16 on Metal prices the F16 residency, and a load peak
+    /// that still fits the dense F32 reload its load-time self-check falls
+    /// back to.
+    #[test]
+    fn qwen_weight_only_f16_prices_f16_residency_and_the_dense_fallback_peak() {
+        let _env = env_lock();
+        let files = census!("qwen3_tts_12hz_0_6b_custom_voice.json");
+        let layout = qwen_layout(false, BackendKind::Metal);
+        assert!(layout.weight_only_f16);
+        let dense_layout = Qwen3TtsLoadLayout {
+            weight_only_f16: false,
+            ..layout
+        };
+        let f16 = price_qwen3_tts_with_fallback(&files, BackendKind::Metal, &layout)
+            .unwrap()
+            .estimate()
+            .unwrap();
+        let dense = price_qwen3_tts(&files, BackendKind::Metal, &dense_layout)
+            .unwrap()
+            .estimate()
+            .unwrap();
+        assert!(f16.resident_bytes * 3 < dense.resident_bytes * 2);
+        assert!(f16.load_peak_bytes >= dense.load_peak_bytes);
     }
 
     /// The reference-audio components load only for voice cloning: a
@@ -589,6 +689,45 @@ mod tests {
         );
         drop(runtime);
         std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// Voxtral's F16 Metal tier prices F16 residency with a load peak that
+    /// fits the F32 reload its self-check falls back to.
+    #[test]
+    fn voxtral_metal_f16_tier_prices_the_f32_fallback_peak() {
+        let tensor = |name: &str| CensusTensor {
+            name: name.into(),
+            dtype: StoredDType::Dense(DType::BF16),
+            shape: vec![1 << 20],
+            stored_bytes: 2 << 20,
+        };
+        let files = [CensusFile {
+            path: PathBuf::from("consolidated.safetensors"),
+            tensors: vec![
+                tensor("layers.0.attention.wq.weight"),
+                tensor("acoustic_transformer.layers.0.wq.weight"),
+            ],
+        }];
+        let f16 = VoxtralTtsDTypePlan {
+            language_model: DType::F16,
+            acoustic_transformer: DType::F16,
+            codec: DType::F32,
+        };
+        let f32 = VoxtralTtsDTypePlan {
+            language_model: DType::F32,
+            acoustic_transformer: DType::F32,
+            codec: DType::F32,
+        };
+        let loaded = price_voxtral_tts_as_loaded(&files, BackendKind::Metal, &f16)
+            .unwrap()
+            .estimate()
+            .unwrap();
+        let dense = price_voxtral_tts(&files, BackendKind::Metal, &f32)
+            .unwrap()
+            .estimate()
+            .unwrap();
+        assert!(loaded.resident_bytes < dense.resident_bytes);
+        assert!(loaded.load_peak_bytes >= dense.load_peak_bytes);
     }
 
     /// Admission prices a TTS load by its plan, not the catalog, and the

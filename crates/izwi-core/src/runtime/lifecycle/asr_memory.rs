@@ -208,6 +208,15 @@ pub(super) struct AsrResidencyPlan {
 }
 
 impl AsrResidencyPlan {
+    /// This plan, with a load peak that also covers `fallback`: a loader
+    /// that checks a lower-precision form at load and reloads densely when
+    /// the check fails passes through both.
+    pub(super) fn with_fallback_peak(mut self, fallback: &Self) -> Self {
+        self.load_peak_bytes = self.load_peak_bytes.max(fallback.load_peak_bytes);
+        self.host_staging_bytes = self.host_staging_bytes.max(fallback.host_staging_bytes);
+        self
+    }
+
     pub(super) fn from_ledger(ledger: Ledger, memo_bytes: u64) -> Result<Self> {
         let ledger = ledger.finish()?;
         Ok(Self {
@@ -776,9 +785,25 @@ impl Ledger {
     /// A weight read on the host at its stored dtype, converted there to
     /// `dtype` and uploaded once at its exact size (`F16WeightLinear`): the
     /// host read and its converted copy are alive beside the upload.
-    fn host_converted(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+    pub(super) fn host_converted(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+        self.host_converted_through(tensor, None, dtype)
+    }
+
+    /// [`Self::host_converted`] for a weight the loader converts through an
+    /// `intermediate` host form first (Qwen3-TTS's F16 text embedding is read
+    /// at F32, then converted): that form is alive beside the others.
+    pub(super) fn host_converted_through(
+        &mut self,
+        tensor: &CensusTensor,
+        intermediate: Option<DType>,
+        dtype: DType,
+    ) -> Result<()> {
         let bytes = dense_bytes(tensor.elements(), dtype)?;
-        let host = sum(&[tensor.stored_bytes, bytes])?;
+        let intermediate = match intermediate {
+            Some(form) => dense_bytes(tensor.elements(), form)?,
+            None => 0,
+        };
+        let host = sum(&[tensor.stored_bytes, intermediate, bytes])?;
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {
                 logical: bytes,
