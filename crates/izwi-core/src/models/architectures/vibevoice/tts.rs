@@ -135,6 +135,9 @@ pub struct VibeVoiceTtsProfile {
     pub final_decode_ms: f32,
     /// Chunks of the final decode ([`VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES`]).
     pub final_decode_chunks: usize,
+    /// Frames whose waveform came from the generation-time streaming decode
+    /// instead of a final decode.
+    pub final_audio_from_frames: usize,
     pub host_audio_ms: f32,
     pub frames_generated: usize,
     pub diffusion_steps: usize,
@@ -174,6 +177,9 @@ struct EncodedReference {
 
 struct GeneratedSpeechFeedback {
     embed: Tensor,
+    /// This frame's waveform from the streaming acoustic decode
+    /// (`[1, 1, 3200]`), the same samples a final decode would produce.
+    audio: Tensor,
     acoustic_decode_ms: f32,
     semantic_encode_ms: f32,
     connector_ms: f32,
@@ -266,6 +272,9 @@ pub(crate) struct VibeVoiceTtsRetainedState {
     acoustic_clock: u64,
     semantic_clock: u64,
     scaled_latents: Vec<Tensor>,
+    /// Per-frame waveforms decoded during generation, parallel to
+    /// `scaled_latents` and checkpointed with it.
+    frame_audio: Vec<Tensor>,
     frame_noises: Vec<Tensor>,
     finished: bool,
     active_quantum: Option<u64>,
@@ -290,6 +299,7 @@ struct VibeVoiceTtsRetainedCheckpointPayload {
     acoustic_clock: u64,
     semantic_clock: u64,
     scaled_latents: Vec<Tensor>,
+    frame_audio: Vec<Tensor>,
     finished: bool,
     staged_step: Option<VibeVoiceTtsRetainedDecodeStep>,
     managed_completions_drained: bool,
@@ -612,6 +622,7 @@ impl VibeVoiceTtsModel {
             acoustic_clock: 0,
             semantic_clock: 0,
             scaled_latents: Vec::with_capacity(max_frames),
+            frame_audio: Vec::with_capacity(max_frames),
             frame_noises,
             finished: false,
             active_quantum: None,
@@ -645,6 +656,7 @@ impl VibeVoiceTtsModel {
                 acoustic_clock: 0,
                 semantic_clock: 0,
                 scaled_latents: Vec::new(),
+                frame_audio: Vec::new(),
                 finished: false,
                 staged_step: None,
                 managed_completions_drained: true,
@@ -797,6 +809,7 @@ impl VibeVoiceTtsModel {
             "VibeVoice retained TTS negative decode",
         )?);
         state.scaled_latents.push(latent_frame);
+        state.frame_audio.push(feedback.audio);
         state.managed_completions_drained = false;
         state.finished = self.retained_frame_ends_row(state)?;
         let step = VibeVoiceTtsRetainedDecodeStep {
@@ -899,6 +912,7 @@ impl VibeVoiceTtsModel {
                 "VibeVoice retained TTS batched negative decode",
             )?);
             state.scaled_latents.push(latent_frame);
+            state.frame_audio.push(feedback.audio);
             state.managed_completions_drained = false;
             // Same stop rule as the scalar step: a row whose next control
             // token is speech_end / endoftext finishes now, instead of
@@ -983,19 +997,12 @@ impl VibeVoiceTtsModel {
         profile.frames_generated = state.scaled_latents.len();
         profile.diffusion_steps =
             vibevoice_effective_diffusion_steps(self.device.kind, state.params.diffusion_steps);
-        let scaled_latents = Tensor::cat(&state.scaled_latents, 1)?;
-        let unscaled = unscale_latents(
-            &scaled_latents,
-            &state.artifact.normalization.bias,
-            &state.artifact.normalization.scale,
+        let samples = self.final_audio(
+            &state.scaled_latents,
+            &state.frame_audio,
+            &state.artifact.normalization,
+            &mut profile,
         )?;
-        let started = Instant::now();
-        // Read back per chunk inside the decode, so host_audio_ms stays 0.
-        let (samples, chunks) = self
-            .acoustic_tokenizer
-            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
-        profile.final_decode_ms = elapsed_ms(started);
-        profile.final_decode_chunks = chunks;
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
@@ -1149,6 +1156,7 @@ impl VibeVoiceTtsModel {
         )?;
         profile.diffusion_steps = diffusion_plan.steps.len();
         let mut scaled_latents = Vec::with_capacity(max_frames);
+        let mut frame_audio = Vec::with_capacity(max_frames);
         for ((pos, negative_pos), frame_idx) in
             (prompt.input_ids.len()..).zip(1usize..).zip(0..max_frames)
         {
@@ -1199,6 +1207,7 @@ impl VibeVoiceTtsModel {
             profile.feedback_semantic_encode_ms += feedback.semantic_encode_ms;
             profile.feedback_connector_ms += feedback.connector_ms;
             scaled_latents.push(latent_frame);
+            frame_audio.push(feedback.audio);
 
             let (hidden, negative_hidden) = {
                 let (positive, negative) = leases.lease_pair_mut(
@@ -1240,26 +1249,19 @@ impl VibeVoiceTtsModel {
         }
 
         profile.frames_generated = scaled_latents.len();
-        let scaled_latents = Tensor::cat(&scaled_latents, 1)?;
-        let unscaled = unscale_latents(
+        let samples = self.final_audio(
             &scaled_latents,
-            &reference.normalization.bias,
-            &reference.normalization.scale,
+            &frame_audio,
+            &reference.normalization,
+            &mut profile,
         )?;
-        let started = Instant::now();
-        // Read back per chunk inside the decode, so host_audio_ms stays 0.
-        let (samples, chunks) = self
-            .acoustic_tokenizer
-            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
-        profile.final_decode_ms = elapsed_ms(started);
-        profile.final_decode_chunks = chunks;
         let kernel_telemetry_end = kernel_telemetry_snapshot();
         apply_kernel_telemetry_delta(&mut profile, &kernel_telemetry_start, &kernel_telemetry_end);
         info!(?profile, "VibeVoice TTS generation profile");
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
-            frames_generated: scaled_latents.dim(1)?,
+            frames_generated: scaled_latents.len(),
             profile,
         })
     }
@@ -1288,6 +1290,39 @@ impl VibeVoiceTtsModel {
             scaled_latents,
             normalization,
         })
+    }
+
+    /// The utterance waveform. The streaming decode that feeds the semantic
+    /// encoder has already produced every frame's samples, and with causal
+    /// convs and carried caches they equal a whole-sequence decode, so they
+    /// are concatenated and read back once instead of decoding again (VVT-10).
+    /// A missing frame falls back to the chunked final decode.
+    fn final_audio(
+        &self,
+        scaled_latents: &[Tensor],
+        frame_audio: &[Tensor],
+        normalization: &LatentNormalization,
+        profile: &mut VibeVoiceTtsProfile,
+    ) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        if frame_audio.len() == scaled_latents.len() {
+            let samples = VibeVoiceAcousticTokenizer::concat_frame_audio(frame_audio)?;
+            profile.host_audio_ms = elapsed_ms(started);
+            profile.final_audio_from_frames = frame_audio.len();
+            return Ok(samples);
+        }
+        let unscaled = unscale_latents(
+            &Tensor::cat(scaled_latents, 1)?,
+            &normalization.bias,
+            &normalization.scale,
+        )?;
+        // Read back per chunk inside the decode, so host_audio_ms stays 0.
+        let (samples, chunks) = self
+            .acoustic_tokenizer
+            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
+        profile.final_decode_ms = elapsed_ms(started);
+        profile.final_decode_chunks = chunks;
+        Ok(samples)
     }
 
     fn latent_normalization(&self, latents: &Tensor) -> Result<LatentNormalization> {
@@ -1344,6 +1379,7 @@ impl VibeVoiceTtsModel {
         )?;
         Ok(GeneratedSpeechFeedback {
             embed,
+            audio: audio_chunk,
             acoustic_decode_ms,
             semantic_encode_ms,
             connector_ms: connector_acoustic_ms + elapsed_ms(started),
@@ -1403,6 +1439,7 @@ impl VibeVoiceTtsModel {
         )?;
         Ok(GeneratedSpeechFeedback {
             embed,
+            audio: audio_chunk,
             acoustic_decode_ms,
             semantic_encode_ms,
             connector_ms: connector_acoustic_ms + elapsed_ms(started),
@@ -1673,6 +1710,7 @@ impl VibeVoiceTtsRetainedState {
                 acoustic_clock: self.acoustic_clock,
                 semantic_clock: self.semantic_clock,
                 scaled_latents: self.scaled_latents.clone(),
+                frame_audio: self.frame_audio.clone(),
                 finished: self.finished,
                 staged_step: self.staged_step.clone(),
                 managed_completions_drained: self.managed_completions_drained,
@@ -1720,6 +1758,7 @@ impl VibeVoiceTtsRetainedState {
         self.acoustic_clock = payload.acoustic_clock;
         self.semantic_clock = payload.semantic_clock;
         self.scaled_latents = payload.scaled_latents;
+        self.frame_audio = payload.frame_audio;
         self.finished = payload.finished;
         self.staged_step = payload.staged_step;
         self.managed_completions_drained = payload.managed_completions_drained;

@@ -373,6 +373,19 @@ impl VibeVoiceAcousticTokenizer {
         Ok((samples, chunks))
     }
 
+    /// Per-frame decoder outputs (`[1, 1, samples]` each, in order) as one
+    /// host F32 waveform, with a single readback.
+    pub(crate) fn concat_frame_audio(frames: &[Tensor]) -> Result<Vec<f32>> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        Tensor::cat(frames, 2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .map_err(Error::from)
+    }
+
     /// [`Self::decode_frames`] continuing from `cache`; same latent layout.
     fn decode_streaming(
         &self,
@@ -3625,6 +3638,33 @@ mod tests {
                 "{chunk_frames}-frame chunks diverge by {error}"
             );
         }
+    }
+
+    /// VVT-10: the waveforms the generation loop decodes frame by frame,
+    /// through one carried streaming cache, concatenate to the whole-sequence
+    /// decode, so the final audio can reuse them.
+    #[test]
+    fn per_frame_streaming_audio_concatenates_to_the_whole_decode() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let tokenizer = xorshift_acoustic_tokenizer();
+        let latents = xorshift_tensor(&[1, 23, 64], 41, 1.0, &Device::Cpu).unwrap();
+        let mut cache = TokenizerStreamingState::new();
+        let frames = (0..23)
+            .map(|frame| {
+                tokenizer
+                    .decode_streaming(&latents.narrow(1, frame, 1).unwrap(), &mut cache)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let reused = VibeVoiceAcousticTokenizer::concat_frame_audio(&frames).unwrap();
+        let whole = host_f32(&tokenizer.decode_frames(&latents).unwrap()).unwrap();
+        let scale = whole.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let error = max_abs_diff(&reused, &whole);
+        assert!(
+            error <= 1e-5 * scale.max(1.0),
+            "reused frames diverge by {error}"
+        );
     }
 
     /// VVT-1: a final decode of exactly `vae_dim` (64) frames used to pass
