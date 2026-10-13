@@ -1357,6 +1357,16 @@ struct Qwen3TtsDTypePlan {
     speech_tokenizer: DType,
 }
 
+/// The operator's Qwen3-TTS precision override. Only
+/// `IZWI_QWEN_TTS_DTYPE` applies: `IZWI_QWEN_DTYPE` lowers Qwen ASR and chat
+/// precision, and must not silently switch TTS to a precision that corrupts
+/// its speech (NR-3).
+fn qwen3_tts_dtype_override() -> Option<String> {
+    std::env::var(QWEN3_TTS_DTYPE_ENV).ok()
+}
+
+const QWEN3_TTS_DTYPE_ENV: &str = "IZWI_QWEN_TTS_DTYPE";
+
 fn select_qwen3_tts_dtypes(
     device: &DeviceProfile,
     dtype_override: Option<&str>,
@@ -1366,6 +1376,17 @@ fn select_qwen3_tts_dtypes(
     if let Some(raw) = dtype_override.map(str::trim).filter(|raw| !raw.is_empty()) {
         let dtype =
             device.select_model_dtype_checked(ModelFamily::Qwen3Tts, Some(raw), "Qwen3 TTS")?;
+        // No lower-precision tier is validated for these checkpoints yet:
+        // all-F16 (and BF16) Metal CustomVoice/Base produce structurally
+        // valid but corrupted speech (QTTS-10/11).
+        if device.kind.is_metal()
+            && (is_custom_voice_model || is_voice_clone_model)
+            && dtype != DType::F32
+        {
+            return Err(Error::ModelLoadError(format!(
+                "{QWEN3_TTS_DTYPE_ENV}={raw} is not supported for Qwen3-TTS CustomVoice or Base models on Metal: {dtype:?} produces corrupted speech; unset it or use f32"
+            )));
+        }
         return Ok(Qwen3TtsDTypePlan {
             talker: dtype,
             code_predictor: dtype,
@@ -1639,9 +1660,7 @@ impl Qwen3TtsModel {
             || model_type_normalized == "voiceclone"
             || model_type_normalized == "voicecloning"
             || config.talker_config.spk_id.is_empty();
-        let dtype_override = std::env::var("IZWI_QWEN_TTS_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
+        let dtype_override = qwen3_tts_dtype_override();
         let dtype_plan = select_qwen3_tts_dtypes(
             &device,
             dtype_override.as_deref(),
@@ -5354,6 +5373,56 @@ pub(crate) mod tests {
         assert_eq!(
             select_qwen3_tts_state_dtypes(&cpu, cpu_compute, "float16").unwrap(),
             (DType::F32, DType::F32)
+        );
+    }
+
+    /// NR-3: the shared `IZWI_QWEN_DTYPE` (Qwen ASR and chat) must not
+    /// change Qwen3-TTS precision, and a lower-precision TTS override on
+    /// Metal CustomVoice/Base is refused instead of corrupting speech.
+    #[test]
+    fn qwen_tts_precision_ignores_shared_qwen_dtype_and_refuses_low_precision_on_metal() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = (
+            std::env::var("IZWI_QWEN_DTYPE").ok(),
+            std::env::var(QWEN3_TTS_DTYPE_ENV).ok(),
+        );
+        std::env::set_var("IZWI_QWEN_DTYPE", "f16");
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        assert_eq!(qwen3_tts_dtype_override(), None);
+        std::env::set_var(QWEN3_TTS_DTYPE_ENV, "bf16");
+        assert_eq!(qwen3_tts_dtype_override().as_deref(), Some("bf16"));
+        for (name, value) in [
+            ("IZWI_QWEN_DTYPE", previous.0),
+            (QWEN3_TTS_DTYPE_ENV, previous.1),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        for (custom_voice, clone) in [(true, false), (false, true)] {
+            for raw in ["f16", "bf16"] {
+                let error = select_qwen3_tts_dtypes(&metal, Some(raw), custom_voice, clone)
+                    .expect_err("low-precision CustomVoice/Base must be refused on Metal");
+                assert!(error.to_string().contains(QWEN3_TTS_DTYPE_ENV), "{error}");
+            }
+            assert_eq!(
+                select_qwen3_tts_dtypes(&metal, Some("f32"), custom_voice, clone)
+                    .unwrap()
+                    .talker,
+                DType::F32
+            );
+        }
+        // VoiceDesign already runs at F16 on Metal by default.
+        assert_eq!(
+            select_qwen3_tts_dtypes(&metal, Some("f16"), false, false)
+                .unwrap()
+                .talker,
+            DType::F16
         );
     }
 
