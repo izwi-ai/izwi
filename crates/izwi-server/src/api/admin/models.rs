@@ -109,6 +109,11 @@ pub struct AdminSpeechModelCapabilities {
     pub supports_reference_voice: bool,
     pub supports_voice_description: bool,
     pub supports_streaming: bool,
+    /// What a streaming request delivers on this server (TPIPE-3):
+    /// `chunked`, `final_only` (the whole utterance as one chunk) or
+    /// `unsupported`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
 }
@@ -255,6 +260,7 @@ impl From<SpeechModelCapabilities> for AdminSpeechModelCapabilities {
             supports_reference_voice: capabilities.supports_reference_voice,
             supports_voice_description: capabilities.supports_voice_description,
             supports_streaming: capabilities.supports_streaming,
+            streaming_mode: None,
             supports_speed_control: capabilities.supports_speed_control,
             supports_auto_long_form: capabilities.supports_auto_long_form,
         }
@@ -425,7 +431,13 @@ pub async fn list_models(
             .map(|info| {
                 let diagnostics = runtime_diagnostics.get(info.variant.dir_name()).cloned();
                 let pinned = pinned_variants.contains(&info.variant);
-                AdminModelInfo::from_model_info(info, diagnostics, pinned)
+                let variant = info.variant;
+                let mut model = AdminModelInfo::from_model_info(info, diagnostics, pinned);
+                if let Some(speech) = model.speech_capabilities.as_mut() {
+                    speech.streaming_mode =
+                        Some(state.runtime.tts_streaming_mode(variant).as_str());
+                }
+                model
             })
             .collect(),
     }))
@@ -450,11 +462,15 @@ pub async fn get_model_info(
 
     let runtime_diagnostics = loaded_model_diagnostics_by_variant(&state).await;
     let pinned = state.runtime.pinned_model_variants().await.contains(&variant);
-    Ok(Json(AdminModelInfo::from_model_info(
+    let mut model = AdminModelInfo::from_model_info(
         info,
         runtime_diagnostics.get(variant.dir_name()).cloned(),
         pinned,
-    )))
+    );
+    if let Some(speech) = model.speech_capabilities.as_mut() {
+        speech.streaming_mode = Some(state.runtime.tts_streaming_mode(variant).as_str());
+    }
+    Ok(Json(model))
 }
 
 async fn loaded_model_diagnostics_by_variant(

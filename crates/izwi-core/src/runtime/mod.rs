@@ -67,7 +67,7 @@ pub use types::{
     DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
     GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions, RuntimeRequestContext,
     SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
-    SpeechToSpeechGeneration, TtsStopReason,
+    SpeechToSpeechGeneration, TtsStopReason, TtsStreamingMode,
 };
 pub use voice_metrics::{
     prometheus_voice_metric_name, prometheus_voice_metric_type, voice_metric_catalog,

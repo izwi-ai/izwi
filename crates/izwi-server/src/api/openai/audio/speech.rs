@@ -555,6 +555,7 @@ async fn stream_speech(
     resolved_format: ResolvedSpeechFormat,
 ) -> Result<Response<Body>, ApiError> {
     let stream_entry_started = Instant::now();
+    let streaming_mode = state.runtime.tts_streaming_mode(variant);
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
     let mut gen_request = build_generation_request(&req, correlation_id, true, variant);
@@ -891,6 +892,9 @@ async fn stream_speech(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache, no-transform")
         .header("X-Accel-Buffering", "no")
+        // Whether this stream is progressive or one final chunk (TPIPE-3).
+        .header("X-Izwi-Streaming-Mode", streaming_mode.as_str())
+        .header("Access-Control-Expose-Headers", "X-Izwi-Streaming-Mode")
         .body(Body::from_stream(stream))
         .unwrap())
 }

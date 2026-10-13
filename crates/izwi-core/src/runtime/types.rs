@@ -380,6 +380,27 @@ impl AudioChunk {
     }
 }
 
+/// How a TTS model's streaming route delivers audio on the loaded runtime
+/// (TPIPE-3): progressive chunks, the whole utterance as one final chunk, or
+/// no streaming at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsStreamingMode {
+    Chunked,
+    FinalOnly,
+    Unsupported,
+}
+
+impl TtsStreamingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunked => "chunked",
+            Self::FinalOnly => "final_only",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 /// Why speech generation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TtsStopReason {

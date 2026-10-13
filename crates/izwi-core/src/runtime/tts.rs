@@ -27,6 +27,7 @@ use crate::runtime::telemetry::{
 };
 use crate::runtime::types::{
     AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult, TtsStopReason,
+    TtsStreamingMode,
 };
 use crate::runtime::CoordinatorLane;
 
@@ -357,6 +358,36 @@ fn tts_streaming_uses_final_only(
         ModelFamily::Qwen3Tts => !(is_cuda && chunked_codec_stream_enabled),
         ModelFamily::Lfm25Audio | ModelFamily::VibeVoiceTts => true,
         _ => false,
+    }
+}
+
+/// The streaming mode `variant` actually delivers on a CUDA or non-CUDA
+/// runtime: the same policy the streaming route follows.
+fn tts_streaming_mode(
+    is_cuda: bool,
+    variant: ModelVariant,
+    chunked_codec_stream_enabled: bool,
+) -> TtsStreamingMode {
+    if !variant
+        .speech_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_streaming)
+    {
+        TtsStreamingMode::Unsupported
+    } else if tts_streaming_uses_final_only(is_cuda, variant, chunked_codec_stream_enabled) {
+        TtsStreamingMode::FinalOnly
+    } else {
+        TtsStreamingMode::Chunked
+    }
+}
+
+impl RuntimeService {
+    /// How a streaming request for `variant` delivers audio here (TPIPE-3).
+    pub fn tts_streaming_mode(&self, variant: ModelVariant) -> TtsStreamingMode {
+        tts_streaming_mode(
+            self.device.kind.is_cuda(),
+            variant,
+            qwen_tts_cuda_chunked_codec_stream_enabled(),
+        )
     }
 }
 
@@ -774,6 +805,49 @@ mod tests {
     use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// TPIPE-3: the advertised streaming mode of every enabled TTS variant
+    /// is what its streaming route does on each backend: Qwen3-TTS streams
+    /// progressively only with the CUDA chunked codec, Kokoro and Fish
+    /// stream in chunks, and families without streaming say so.
+    #[test]
+    fn advertised_streaming_mode_is_what_the_route_does() {
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.is_enabled() && variant.speech_capabilities().is_some())
+        {
+            for (is_cuda, chunked) in [(false, false), (true, false), (true, true)] {
+                let mode = tts_streaming_mode(is_cuda, variant, chunked);
+                let streams = variant.speech_capabilities().unwrap().supports_streaming;
+                let expected = if !streams {
+                    TtsStreamingMode::Unsupported
+                } else if tts_streaming_uses_final_only(is_cuda, variant, chunked) {
+                    TtsStreamingMode::FinalOnly
+                } else {
+                    TtsStreamingMode::Chunked
+                };
+                assert_eq!(mode, expected, "{variant} cuda={is_cuda} chunked={chunked}");
+            }
+        }
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        assert_eq!(
+            tts_streaming_mode(false, qwen, false),
+            TtsStreamingMode::FinalOnly
+        );
+        assert_eq!(
+            tts_streaming_mode(true, qwen, true),
+            TtsStreamingMode::Chunked
+        );
+        assert_eq!(
+            tts_streaming_mode(false, ModelVariant::Kokoro82M, false),
+            TtsStreamingMode::Chunked
+        );
+        assert_eq!(
+            tts_streaming_mode(false, ModelVariant::Voxtral4BTts2603, false),
+            TtsStreamingMode::Unsupported
+        );
+    }
 
     #[test]
     fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
