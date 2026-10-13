@@ -5,7 +5,8 @@
 //! root-level layer structure compared to standard Qwen3.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
@@ -21,8 +22,8 @@ use crate::kv::v2::{
 };
 use crate::kv::KvDecodeBatchMetadata;
 use crate::models::architectures::qwen3::core::{
-    build_mrope_cache, build_rope_cache, qwen3_decoder_cache_domain, Qwen3Config,
-    Qwen3DecoderCacheGeometry,
+    build_mrope_cache, build_rope_cache, build_rope_inv_freqs, qwen3_decoder_cache_domain,
+    Qwen3Config, Qwen3DecoderCacheGeometry,
 };
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
@@ -58,6 +59,8 @@ pub struct VoxtralLM {
     use_mrope: bool,
     /// DS1.6 catalog verdict for committed prefix reuse on the load backend.
     prefix_reuse: bool,
+    /// Model-lifetime RoPE cos/sin over positions, sliced per step.
+    rope_positions: LmRopePositionTable,
 }
 
 struct VoxtralLayer {
@@ -127,6 +130,7 @@ impl VoxtralLM {
             cfg,
             use_mrope,
             prefix_reuse,
+            rope_positions: LmRopePositionTable::default(),
         })
     }
 
@@ -405,7 +409,7 @@ impl VoxtralLM {
             let mut completions =
                 KvWriteCompletionCollector::new(arena.config(), lowered.logical_slots())?;
             let layer_result = (|| -> Result<Tensor> {
-                let rope = LmRopeTables::default();
+                let rope = LmRopeTables::with_positions(&self.rope_positions);
                 let mut x = embeds.clone();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let cache_refs = caches
@@ -509,7 +513,7 @@ impl VoxtralLM {
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
-        let rope = LmRopeTables::default();
+        let rope = LmRopeTables::with_positions(&self.rope_positions);
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward_managed(
@@ -913,7 +917,19 @@ impl VoxtralAttention {
                 dtype: x.dtype(),
                 device: x.device().location(),
             };
-            let (cos, sin) = rope.get_or_build(key, || self.rope_tables(&x, start_pos, None))?;
+            let (cos, sin) = rope.get_or_build(key, || match rope.positions {
+                // Plain RoPE: a view of the model's host-built table, so a
+                // step uploads nothing.
+                Some(positions) if !self.use_mrope => positions.slice(
+                    self.head_dim,
+                    self.rope_theta,
+                    start_pos,
+                    seq_len,
+                    x.dtype(),
+                    x.device(),
+                ),
+                _ => self.rope_tables(&x, start_pos, None),
+            })?;
             return apply_interleaved_rotary_emb(&x, &cos, &sin);
         }
         let (cos, sin) = self.rope_tables(&x, start_pos, position_ids)?;
@@ -927,6 +943,7 @@ impl VoxtralAttention {
         position_ids: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let seq_len = x.dim(1)?;
+        record_rope_upload();
         let tables = if self.use_mrope {
             let position_ids = if let Some(position_ids) = position_ids {
                 position_ids.clone()
@@ -980,12 +997,21 @@ struct LmRopeKey {
 /// k): 2 x 26 host-angle uploads and device cos/sin per decode step, and per
 /// row in a decode batch. A table is reused only for an identical key.
 #[derive(Default)]
-struct LmRopeTables {
+struct LmRopeTables<'a> {
     tables: RefCell<Vec<(LmRopeKey, (Tensor, Tensor))>>,
     builds: Cell<usize>,
+    /// The model's position table, when the forward has one.
+    positions: Option<&'a LmRopePositionTable>,
 }
 
-impl LmRopeTables {
+impl<'a> LmRopeTables<'a> {
+    fn with_positions(positions: &'a LmRopePositionTable) -> Self {
+        Self {
+            positions: Some(positions),
+            ..Self::default()
+        }
+    }
+
     fn get_or_build(
         &self,
         key: LmRopeKey,
@@ -1003,6 +1029,123 @@ impl LmRopeTables {
         self.builds.set(self.builds.get() + 1);
         self.tables.borrow_mut().push((key, tables.clone()));
         Ok(tables)
+    }
+}
+
+static VOXTRAL_LM_ROPE_UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_ROPE_UPLOADS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Process-wide count of Voxtral LM RoPE table uploads. With the position
+/// table this grows only when a sequence first reaches a new length bucket,
+/// not on every step (it was one upload per LM step, and per row in a
+/// decode batch).
+pub fn voxtral_lm_rope_uploads() -> u64 {
+    VOXTRAL_LM_ROPE_UPLOADS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_rope_uploads() -> u64 {
+    THREAD_ROPE_UPLOADS.with(Cell::get)
+}
+
+fn record_rope_upload() {
+    VOXTRAL_LM_ROPE_UPLOADS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_ROPE_UPLOADS.with(|uploads| uploads.set(uploads.get() + 1));
+}
+
+/// Plain-RoPE cos/sin for positions `0..capacity`, built on the host (each
+/// angle `pos as f32 * inv_freq`, as `build_rope_cache` computes it) and
+/// uploaded once per (geometry, dtype, device). The capacity doubles when a
+/// sequence outgrows it, and every step takes a view of its positions.
+#[derive(Default)]
+struct LmRopePositionTable {
+    tables: Mutex<Vec<LmRopePositions>>,
+}
+
+struct LmRopePositions {
+    head_dim: usize,
+    rope_theta_bits: u64,
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl LmRopePositionTable {
+    const MIN_CAPACITY: usize = 256;
+
+    fn slice(
+        &self,
+        head_dim: usize,
+        rope_theta: f64,
+        start_pos: usize,
+        seq_len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let end = start_pos
+            .checked_add(seq_len)
+            .ok_or_else(|| Error::InvalidInput("Voxtral RoPE position overflow".into()))?;
+        let mut tables = self
+            .tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = |table: &LmRopePositions| {
+            table.head_dim == head_dim
+                && table.rope_theta_bits == rope_theta.to_bits()
+                && table.dtype == dtype
+                && table.device == device.location()
+        };
+        let existing = tables.iter().position(matches);
+        let capacity = match existing {
+            Some(index) => tables[index].cos.dim(0)?,
+            None => 0,
+        };
+        let index = if let Some(index) = existing.filter(|_| end <= capacity) {
+            index
+        } else {
+            let capacity = end.max(capacity * 2).max(Self::MIN_CAPACITY);
+            let inv_freqs = build_rope_inv_freqs(head_dim, rope_theta);
+            let half_dim = inv_freqs.len();
+            let mut cos = Vec::with_capacity(capacity * half_dim);
+            let mut sin = Vec::with_capacity(capacity * half_dim);
+            for pos in 0..capacity {
+                for &inv in &inv_freqs {
+                    let angle = pos as f32 * inv;
+                    cos.push(angle.cos());
+                    sin.push(angle.sin());
+                }
+            }
+            let table = LmRopePositions {
+                head_dim,
+                rope_theta_bits: rope_theta.to_bits(),
+                dtype,
+                device: device.location(),
+                cos: Tensor::from_vec(cos, (capacity, half_dim), device)?.to_dtype(dtype)?,
+                sin: Tensor::from_vec(sin, (capacity, half_dim), device)?.to_dtype(dtype)?,
+            };
+            record_rope_upload();
+            match existing {
+                Some(index) => {
+                    tables[index] = table;
+                    index
+                }
+                None => {
+                    tables.push(table);
+                    tables.len() - 1
+                }
+            }
+        };
+        let table = &tables[index];
+        Ok((
+            table.cos.narrow(0, start_pos, seq_len)?,
+            table.sin.narrow(0, start_pos, seq_len)?,
+        ))
     }
 }
 
@@ -1340,6 +1483,83 @@ pub(crate) mod tests {
         }
         // Two position spans across 2 layers x {q, k}: two builds, not eight.
         assert_eq!(shared.builds.get(), 2);
+    }
+
+    /// VXT-10: the model's position table gives the same cos/sin bits as
+    /// building the table per step, and uploads only when a sequence first
+    /// outgrows it (256 positions, then doubling).
+    #[test]
+    fn rope_position_table_slices_match_per_step_tables_bit_identically() {
+        let device = Device::Cpu;
+        let table = LmRopePositionTable::default();
+        let before = thread_rope_uploads();
+        for (start_pos, seq_len) in [(0usize, 5usize), (7, 1), (255, 1), (300, 4), (40, 3)] {
+            let (cos, sin) = table
+                .slice(8, 1_000_000.0, start_pos, seq_len, DType::F32, &device)
+                .unwrap();
+            let (expected_cos, expected_sin) =
+                build_rope_cache(seq_len, 8, start_pos, 1_000_000.0, &device, DType::F32).unwrap();
+            assert_eq!(bits(&expected_cos), bits(&cos), "cos at {start_pos}");
+            assert_eq!(bits(&expected_sin), bits(&sin), "sin at {start_pos}");
+        }
+        // One upload for 0..256 and one when position 303 needed 0..512.
+        assert_eq!(thread_rope_uploads() - before, 2);
+    }
+
+    /// VXT-10: prefill, scalar decode steps and a batched decode step share
+    /// the model's position table: one upload in all, where every LM step
+    /// (and every row of a batched step) used to upload its own table.
+    #[test]
+    fn lm_steps_upload_rope_tables_once() {
+        let device = Device::Cpu;
+        let model = tiny_ada_model(&device, 1);
+        let t_cond = Tensor::from_vec(xorshift_values(4, 0x510E_527F), (1, 4), &device).unwrap();
+        let scales = model.ada_scales(&t_cond).unwrap();
+        let (_, mut caches) = shared_decode_caches(2, 917, 16);
+        let mut b = caches.remove(1);
+        let mut a = caches.remove(0);
+        let before = thread_rope_uploads();
+        for cache in [&mut a, &mut b] {
+            model
+                .forward_managed_with_embeds(
+                    &deterministic_embeds(3, 7, &device),
+                    0,
+                    cache,
+                    None,
+                    Some(&scales),
+                )
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        for step in 0..3 {
+            model
+                .forward_managed_with_embeds(
+                    &deterministic_embeds(1, 20 + step, &device),
+                    3 + step,
+                    &mut a,
+                    None,
+                    Some(&scales),
+                )
+                .unwrap();
+            a.take_completed_writes();
+        }
+        let batch = Tensor::cat(
+            &[
+                deterministic_embeds(1, 31, &device),
+                deterministic_embeds(1, 37, &device),
+            ],
+            0,
+        )
+        .unwrap();
+        model
+            .forward_managed_decode_batch_with_embeds(
+                &batch,
+                &[6, 3],
+                &mut [&mut a, &mut b],
+                Some(&scales),
+            )
+            .unwrap();
+        assert_eq!(thread_rope_uploads() - before, 1);
     }
 
     /// Precomputed Ada gains drive prefill, scalar decode and batched decode;
