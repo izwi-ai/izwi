@@ -17,10 +17,11 @@ pub use config::KokoroConfig;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use candle_core::pickle::read_pth_tensor_info;
+use candle_core::pickle::PthTensors;
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use tracing::info;
@@ -605,91 +606,24 @@ impl KokoroTtsModel {
         validate_kokoro_output_contract(&config)?;
 
         let dtype = DType::F32;
-        let checkpoint_tensor_counts =
-            inspect_and_validate_checkpoint(&checkpoint_path, &device.device, dtype)?;
+        let checkpoint = KokoroCheckpoint::open(&checkpoint_path, &device.device, dtype)?;
 
         let phonemizer = EspeakPhonemizer::auto()?;
         let voices = VoiceLibrary::new(voices_dir, device.device.clone(), dtype)?;
-        let bert = {
-            let vb =
-                VarBuilder::from_pth_with_state(&checkpoint_path, dtype, "bert", &device.device)
-                    .map_err(|e| {
-                        Error::ModelLoadError(format!(
-                            "Failed to create Kokoro BERT VarBuilder for {}: {}",
-                            checkpoint_path.display(),
-                            e
-                        ))
-                    })?;
-            albert::CustomAlbert::load(
-                &albert::AlbertModelConfig::from_kokoro(&config),
-                vb.pp("module"),
-            )?
-        };
-        let bert_encoder = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "bert_encoder",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro bert_encoder VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            candle_nn::linear(
-                config.plbert.hidden_size,
-                config.hidden_dim,
-                vb.pp("module"),
-            )
-            .map_err(Error::from)?
-        };
-        let prosody = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "predictor",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro predictor VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            KokoroProsodyPredictor::load(&config, vb)?
-        };
-        let text_encoder = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "text_encoder",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro text_encoder VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            KokoroTextEncoder::load(&config, vb)?
-        };
-        let decoder = {
-            let vb =
-                VarBuilder::from_pth_with_state(&checkpoint_path, dtype, "decoder", &device.device)
-                    .map_err(|e| {
-                        Error::ModelLoadError(format!(
-                            "Failed to create Kokoro decoder VarBuilder for {}: {}",
-                            checkpoint_path.display(),
-                            e
-                        ))
-                    })?;
-            decoder::KokoroDecoder::load(&config, vb)?
-        };
+        let bert = albert::CustomAlbert::load(
+            &albert::AlbertModelConfig::from_kokoro(&config),
+            checkpoint.submodule("bert")?.pp("module"),
+        )?;
+        let bert_encoder = candle_nn::linear(
+            config.plbert.hidden_size,
+            config.hidden_dim,
+            checkpoint.submodule("bert_encoder")?.pp("module"),
+        )
+        .map_err(Error::from)?;
+        let prosody = KokoroProsodyPredictor::load(&config, checkpoint.submodule("predictor")?)?;
+        let text_encoder = KokoroTextEncoder::load(&config, checkpoint.submodule("text_encoder")?)?;
+        let decoder = decoder::KokoroDecoder::load(&config, checkpoint.submodule("decoder")?)?;
+        let checkpoint_tensor_counts = checkpoint.tensor_counts;
 
         info!(
             "Loaded Kokoro scaffolding from {:?} (phonemizer={}, submodules={:?})",
@@ -1314,37 +1248,76 @@ impl KokoroTtsModel {
     }
 }
 
-fn inspect_and_validate_checkpoint(
-    checkpoint_path: &Path,
-    device: &candle_core::Device,
-    dtype: DType,
-) -> Result<HashMap<String, usize>> {
-    let mut counts = HashMap::new();
-    for key in CHECKPOINT_SUBMODULE_KEYS {
-        let infos = read_pth_tensor_info(checkpoint_path, false, Some(key)).map_err(|e| {
-            Error::ModelLoadError(format!(
-                "Failed to inspect Kokoro checkpoint submodule '{key}' in {}: {}",
-                checkpoint_path.display(),
-                e
-            ))
-        })?;
-        if infos.is_empty() {
-            return Err(Error::ModelLoadError(format!(
-                "Kokoro checkpoint submodule '{key}' in {} has no tensors",
-                checkpoint_path.display()
-            )));
-        }
-        let _vb =
-            VarBuilder::from_pth_with_state(checkpoint_path, dtype, key, device).map_err(|e| {
+static KOKORO_CHECKPOINT_PARSES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_CHECKPOINT_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of Kokoro checkpoint state-dict parses (one pickle
+/// read of `kokoro-v1_0.pth` per submodule).
+pub fn kokoro_checkpoint_parses() -> u64 {
+    KOKORO_CHECKPOINT_PARSES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_checkpoint_parses() -> u64 {
+    THREAD_CHECKPOINT_PARSES.with(|parses| parses.get())
+}
+
+fn record_checkpoint_parse() {
+    KOKORO_CHECKPOINT_PARSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_CHECKPOINT_PARSES.with(|parses| parses.set(parses.get() + 1));
+}
+
+/// The checkpoint's submodule state dicts, each parsed once and shared by
+/// validation (the tensor counts) and weight loading (the VarBuilders).
+struct KokoroCheckpoint {
+    submodules: HashMap<&'static str, VarBuilder<'static>>,
+    tensor_counts: HashMap<String, usize>,
+}
+
+impl KokoroCheckpoint {
+    fn open(checkpoint_path: &Path, device: &candle_core::Device, dtype: DType) -> Result<Self> {
+        let mut submodules = HashMap::new();
+        let mut tensor_counts = HashMap::new();
+        for key in CHECKPOINT_SUBMODULE_KEYS {
+            let tensors = PthTensors::new(checkpoint_path, Some(key)).map_err(|e| {
                 Error::ModelLoadError(format!(
-                    "Failed to create Candle VarBuilder for Kokoro submodule '{key}' in {}: {}",
+                    "Failed to inspect Kokoro checkpoint submodule '{key}' in {}: {}",
                     checkpoint_path.display(),
                     e
                 ))
             })?;
-        counts.insert((*key).to_string(), infos.len());
+            record_checkpoint_parse();
+            let count = tensors.tensor_infos().len();
+            if count == 0 {
+                return Err(Error::ModelLoadError(format!(
+                    "Kokoro checkpoint submodule '{key}' in {} has no tensors",
+                    checkpoint_path.display()
+                )));
+            }
+            submodules.insert(
+                *key,
+                VarBuilder::from_backend(Box::new(tensors), dtype, device.clone()),
+            );
+            tensor_counts.insert((*key).to_string(), count);
+        }
+        Ok(Self {
+            submodules,
+            tensor_counts,
+        })
     }
-    Ok(counts)
+
+    fn submodule(&self, key: &str) -> Result<VarBuilder<'static>> {
+        self.submodules.get(key).cloned().ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Kokoro checkpoint submodule '{key}' was not opened"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1596,6 +1569,32 @@ mod tests {
             kokoro_peak_workspace(u64::MAX),
             Err(Error::Overloaded(message)) if message.contains("workspace overflowed")
         ));
+    }
+
+    /// KOK-19: loading parses each checkpoint submodule's pickle once (five
+    /// parses), sharing it between validation and the weight VarBuilders;
+    /// it used to be parsed three times per submodule (fifteen).
+    #[test]
+    #[ignore = "requires the local Kokoro artifact (IZWI_KOKORO_MODEL_DIR)"]
+    fn kokoro_load_parses_each_checkpoint_submodule_once() {
+        let model_dir = {
+            let _guard = crate::env_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::var_os("IZWI_KOKORO_MODEL_DIR")
+                .expect("set IZWI_KOKORO_MODEL_DIR to the local Kokoro-82M directory")
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu")).expect("cpu device");
+        let before = thread_checkpoint_parses();
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        assert_eq!(
+            thread_checkpoint_parses() - before,
+            CHECKPOINT_SUBMODULE_KEYS.len() as u64
+        );
+        let counts = model.checkpoint_tensor_counts();
+        assert_eq!(counts.len(), CHECKPOINT_SUBMODULE_KEYS.len());
+        assert!(counts.values().all(|count| *count > 0), "{counts:?}");
     }
 
     #[test]
