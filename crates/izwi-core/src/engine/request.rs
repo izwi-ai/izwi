@@ -901,6 +901,63 @@ enum BorrowedEngineAudioInput<'a> {
     Bytes(&'a Vec<u8>),
 }
 
+/// Which upload field a digest was computed from, and that buffer's address
+/// and length. Replacing the upload through a public field changes it, so
+/// the accessors then hash the new bytes in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AsrSourceAudioIdentity {
+    base64: bool,
+    address: usize,
+    len: usize,
+}
+
+impl AsrSourceAudioIdentity {
+    fn of(audio: BorrowedEngineAudioInput<'_>) -> Self {
+        match audio {
+            BorrowedEngineAudioInput::Base64(value) => Self {
+                base64: true,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+            BorrowedEngineAudioInput::Bytes(value) => Self {
+                base64: false,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AsrSourceAudioDigest {
+    identity: AsrSourceAudioIdentity,
+    digest: u64,
+}
+
+/// Hash of an encoded upload's bytes and representation.
+fn asr_source_audio_digest(audio: BorrowedEngineAudioInput<'_>) -> u64 {
+    #[cfg(test)]
+    ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.set(count.get() + 1));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match audio {
+        BorrowedEngineAudioInput::Base64(value) => {
+            0_u8.hash(&mut hasher);
+            value.as_bytes().hash(&mut hasher);
+        }
+        BorrowedEngineAudioInput::Bytes(value) => {
+            1_u8.hash(&mut hasher);
+            value.as_slice().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full upload hashes on this thread, for tests that count them.
+    static ASR_SOURCE_AUDIO_FULL_HASHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl EngineAudioInput {
     fn is_empty(&self) -> bool {
         match self {
@@ -1089,6 +1146,10 @@ pub struct EngineCoreRequest {
     pub(super) prepared_sequence_input_tokens: Option<usize>,
     pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
     pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
+    /// Digest of the encoded upload, keyed by the buffer it was computed
+    /// from. Preparation hashes the upload once; the per-step accessors reuse
+    /// the digest while the same buffer is in place.
+    pub(super) asr_source_audio_digest: Option<AsrSourceAudioDigest>,
     pub(super) prepared_asr_encoder_artifact: Option<PreparedAsrEncoderArtifact>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
@@ -1502,32 +1563,66 @@ impl EngineCoreRequest {
         self.selected_asr_prompt().map(String::as_str)
     }
 
+    /// Identity of an ASR request's routed source: model, encoded upload,
+    /// language, prompt and timestamp option. Prepared artifacts record it
+    /// and every executor accessor re-checks it. Hashing a large upload is
+    /// the expensive part, so accessors reuse the digest that preparation
+    /// computed while the same upload buffer is in place, and hash in full
+    /// only when the buffer was replaced (or on a clone of the request).
     fn asr_execution_source_fingerprint(&self, model_variant: ModelVariant) -> Result<u64> {
+        let audio = self.asr_execution_source_audio(model_variant)?;
+        let identity = AsrSourceAudioIdentity::of(audio);
+        let digest = match self.asr_source_audio_digest {
+            Some(cached) if cached.identity == identity => cached.digest,
+            _ => asr_source_audio_digest(audio),
+        };
+        Ok(self.asr_execution_source_fingerprint_with(model_variant, digest))
+    }
+
+    /// Hash the upload in full, cache the digest for the accessors, and
+    /// return the source fingerprint. Every preparation install calls this,
+    /// so an artifact always records the fingerprint of the bytes as they
+    /// were when it was prepared.
+    fn refresh_asr_execution_source_fingerprint(
+        &mut self,
+        model_variant: ModelVariant,
+    ) -> Result<u64> {
+        let audio = self.asr_execution_source_audio(model_variant)?;
+        let cached = AsrSourceAudioDigest {
+            identity: AsrSourceAudioIdentity::of(audio),
+            digest: asr_source_audio_digest(audio),
+        };
+        self.asr_source_audio_digest = Some(cached);
+        Ok(self.asr_execution_source_fingerprint_with(model_variant, cached.digest))
+    }
+
+    fn asr_execution_source_audio(
+        &self,
+        model_variant: ModelVariant,
+    ) -> Result<BorrowedEngineAudioInput<'_>> {
         if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} source identity does not match its routed task/model",
                 self.id
             )));
         }
-        let audio = self.selected_audio_input().ok_or_else(|| {
+        self.selected_audio_input().ok_or_else(|| {
             Error::InvalidInput(format!("ASR request {} is missing audio input", self.id))
-        })?;
+        })
+    }
+
+    fn asr_execution_source_fingerprint_with(
+        &self,
+        model_variant: ModelVariant,
+        audio_digest: u64,
+    ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model_variant.hash(&mut hasher);
-        match audio {
-            BorrowedEngineAudioInput::Base64(value) => {
-                0_u8.hash(&mut hasher);
-                value.as_bytes().hash(&mut hasher);
-            }
-            BorrowedEngineAudioInput::Bytes(value) => {
-                1_u8.hash(&mut hasher);
-                value.as_slice().hash(&mut hasher);
-            }
-        }
+        audio_digest.hash(&mut hasher);
         self.asr_language_for_execution().hash(&mut hasher);
         self.asr_prompt_for_execution().hash(&mut hasher);
         self.asr_native_word_timestamps.hash(&mut hasher);
-        Ok(hasher.finish())
+        hasher.finish()
     }
 
     pub(crate) fn speech_messages_for_execution(&self) -> &[ChatMessage] {
@@ -2819,7 +2914,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if let Some(current) = self.prepared_asr_audio.as_ref() {
             if current.model_variant == model_variant
                 && current.sample_rate == sample_rate
@@ -2896,7 +2991,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
             if current.model_variant == model_variant
                 && current.source_fingerprint == source_fingerprint
@@ -2960,7 +3055,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3018,7 +3113,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3076,7 +3171,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3134,7 +3229,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3212,7 +3307,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -4524,6 +4619,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4587,6 +4683,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4650,6 +4747,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4710,6 +4808,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4771,6 +4870,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4832,6 +4932,7 @@ impl EngineCoreRequest {
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -5935,6 +6036,42 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
 
         request.asr_prompt = Some("changed".to_string());
+        assert!(request
+            .prepared_asr_audio_for_executor()
+            .unwrap_err()
+            .to_string()
+            .contains("changed after decoded-audio preparation"));
+    }
+
+    #[test]
+    fn prepared_asr_accessors_reuse_the_preparation_digest_of_the_upload() {
+        let full_hashes = || super::ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.get());
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let upload = (0..4 * 1024 * 1024).map(|i| i as u8).collect::<Vec<_>>();
+        let mut request = EngineCoreRequest::asr_bytes(upload.clone()).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5], 16_000)
+            .unwrap();
+        let after_install = full_hashes();
+        for _ in 0..50 {
+            request.prepared_asr_audio_for_executor().unwrap().unwrap();
+        }
+        assert_eq!(
+            full_hashes(),
+            after_install,
+            "accessors rehashed the upload"
+        );
+
+        // A clone owns another buffer, so its accessor hashes in full once.
+        let cloned = request.clone();
+        cloned.prepared_asr_audio_for_executor().unwrap().unwrap();
+        assert_eq!(full_hashes(), after_install + 1);
+
+        // Replacing the upload with different bytes of the same length is
+        // drift, detected by a full hash of the new buffer.
+        let mut changed = upload;
+        changed[0] ^= 1;
+        request.audio_bytes = Some(changed);
         assert!(request
             .prepared_asr_audio_for_executor()
             .unwrap_err()
