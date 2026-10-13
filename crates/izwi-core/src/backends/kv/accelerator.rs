@@ -7,6 +7,7 @@ use candle_core::{DType, Device, DeviceLocation, Tensor};
 use crate::backends::BackendKind;
 use crate::error::Error;
 use crate::kv::{CacheBlockRef, KvArenaId, KvDecodeBatchMetadata, KvLayerBinding, KvSlotRef};
+use crate::models::shared::memory::exact::exact_zeros;
 use crate::runtime::rollout::KvProviderRollout;
 use crate::Result;
 
@@ -834,12 +835,12 @@ impl CandleAcceleratorKvArena {
                 config.page_tokens as usize,
                 layer.num_kv_heads as usize,
             );
-            let keys = Tensor::zeros(
+            let keys = exact_zeros(
                 (common.0, common.1, common.2, layer.key_head_dim as usize),
                 storage_dtype,
                 &device,
             )?;
-            let values = Tensor::zeros(
+            let values = exact_zeros(
                 (common.0, common.1, common.2, layer.value_head_dim as usize),
                 storage_dtype,
                 &device,
@@ -1901,12 +1902,12 @@ impl KvArena for CandleAcceleratorKvArena {
         let current_indices = accelerator_indices(&current_rows, &self.device)?;
         for (binding, layer) in layers.iter() {
             let common = (target, self.config.page_tokens as usize, layer.num_kv_heads);
-            let keys = Tensor::zeros(
+            let keys = exact_zeros(
                 (common.0, common.1, common.2, layer.key_head_dim),
                 self.storage_dtype,
                 &self.device,
             )?;
-            let values = Tensor::zeros(
+            let values = exact_zeros(
                 (common.0, common.1, common.2, layer.value_head_dim),
                 self.storage_dtype,
                 &self.device,
