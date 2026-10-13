@@ -31,6 +31,7 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
+use crate::models::shared::weights::staged;
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -667,7 +668,7 @@ impl GraniteSpeechRuntime {
         let load_started = Instant::now();
         let mmap_started = Instant::now();
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(
+            staged::metal_staged_safetensors(shard_paths, dtype, &device.device).map_err(
                 |err| {
                     Error::ModelLoadError(format!(
                         "Failed to mmap Granite Speech safetensors: {err}"
@@ -3095,14 +3096,21 @@ impl GraniteTextAttention {
     ) -> Result<Self> {
         let geometry = granite_text_attention_geometry(config)?;
         let head_dim = geometry.key_head_dim();
-        let o_proj = linear_no_bias(geometry.query_width(), config.hidden_size, vb.pp("o_proj"))?;
+        // Read the selective-F16 projection at F16 and pre-scale it there: an
+        // F32 read, an F32 product and an F16 cast would leave two released
+        // full-size F32 buffers per layer for Metal's pool to hold.
+        let o_proj_vb = if execution_plan.selective_f16_attention_output {
+            vb.to_dtype(DType::F16)
+        } else {
+            vb.clone()
+        };
+        let o_proj = linear_no_bias(
+            geometry.query_width(),
+            config.hidden_size,
+            o_proj_vb.pp("o_proj"),
+        )?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
-        let o_proj = if execution_plan.selective_f16_attention_output {
-            Linear::new(o_proj.weight().to_dtype(DType::F16)?, None)
-        } else {
-            o_proj
-        };
         let o_proj = GraniteLinearNoBias::new(o_proj)?;
         let qkv_proj =
             GraniteTextQkvProjection::load(config, head_dim, vb, execution_plan.selective_f16_qkv)?;
@@ -3824,10 +3832,17 @@ impl GraniteTextMlp {
         prescale_residual: bool,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
+        // As for o_proj: a selective-F16 down projection is read and
+        // pre-scaled at F16.
+        let mlp_vb = if execution_plan.selective_f16_mlp {
+            vb.to_dtype(DType::F16)
+        } else {
+            vb
+        };
         let down_proj = linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
-            vb.pp("down_proj"),
+            mlp_vb.pp("down_proj"),
         )?;
         let down_proj = maybe_prescale_residual_linear(
             down_proj,
@@ -3835,15 +3850,14 @@ impl GraniteTextMlp {
             prescale_residual,
         )?;
         if execution_plan.selective_f16_mlp {
-            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb.to_dtype(DType::F16))?;
-            let down_proj =
-                GraniteLinearNoBias::from_weight(down_proj.weight().to_dtype(DType::F16)?)?;
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, mlp_vb)?;
+            let down_proj = GraniteLinearNoBias::from_weight(down_proj.weight().clone())?;
             Ok(Self::SelectiveF16(GraniteTextF16Mlp {
                 gate_up_proj,
                 down_proj,
             }))
         } else {
-            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb)?;
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, mlp_vb)?;
             Ok(Self::Model {
                 gate_up_proj,
                 down_proj: GraniteLinearNoBias::new(down_proj)?,

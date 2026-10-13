@@ -30,6 +30,7 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::attention::physical::PhysicalPagedKvCheckpoint;
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::weights::staged;
 
 use super::super::layers::exact_gelu;
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
@@ -3433,7 +3434,7 @@ fn load_weights<'a>(
         files.len()
     );
     unsafe {
-        VarBuilder::from_mmaped_safetensors(&files, dtype, &device.device)
+        staged::metal_staged_safetensors(&files, dtype, &device.device)
             .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)))
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
@@ -1672,7 +1672,7 @@ impl ModelLifecycleController {
                         live_headroom,
                         "Reclaiming pooled Metal scratch before rejecting the load"
                     );
-                    MetalPoolManager::global().clear_all();
+                    self.flush_metal_pools().await;
                     self.coordinator
                         .resource_authority()
                         .refresh_physical_capacity_after_release();
@@ -1744,6 +1744,26 @@ impl ModelLifecycleController {
         }
     }
 
+    /// Releases the Metal buffers nothing references any more: izwi's
+    /// padding pool, and Candle's buffer pool, which keeps every released
+    /// buffer until the device next synchronizes (a failed load leaves all of
+    /// its uploads there). Candle reports a failed command buffer once and
+    /// stops tracking it, and releases its pool only after a clean wait, so a
+    /// failed synchronization is retried once.
+    async fn flush_metal_pools(&self) {
+        MetalPoolManager::global().clear_all();
+        for attempt in 1..=2 {
+            match self.core_engine.synchronize_worker_device().await {
+                Ok(()) => return,
+                Err(error) => warn!(
+                    attempt,
+                    error = %error,
+                    "Synchronizing the device to release Candle's buffer pool failed"
+                ),
+            }
+        }
+    }
+
     /// Whether a load failure must trigger the Metal command-buffer OOM
     /// ladder (pooled-scratch flush and one retry before poisoning). Real
     /// Metal backends classify by backend kind; CPU test harnesses opt in
@@ -1785,7 +1805,7 @@ impl ModelLifecycleController {
             // dirty residency state would compound the damage. Fail closed.
             return Err(error);
         }
-        MetalPoolManager::global().clear_all();
+        self.flush_metal_pools().await;
 
         // A retry only makes sense if the flush actually freed enough pooled
         // scratch to fit the model's load peak. Re-probe live headroom after

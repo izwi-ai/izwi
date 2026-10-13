@@ -20,9 +20,13 @@
 //!   `metal_backend/device.rs`, `buf_size`). Host uploads keep their exact size.
 //! - The load peak: resident plus everything alive while loading. Candle keeps a
 //!   Metal shared buffer it released, such as the stored-dtype upload of a cast
-//!   tensor, until the next device synchronization. The safetensors and PyTorch
-//!   loaders never synchronize before the load fence, so all their uploads stay
-//!   until then; every GGUF dequantization synchronizes. Freed private-pool
+//!   tensor, until the next device synchronization. The PyTorch loaders and
+//!   Candle's safetensors backend never synchronize before the load fence, so
+//!   all their uploads stay until then; every GGUF dequantization
+//!   synchronizes. Whisper, Granite and Voxtral read through
+//!   `staged::metal_staged_safetensors`, which on Metal casts on the host,
+//!   uploads exact sizes and synchronizes every
+//!   `METAL_LOAD_SYNC_INTERVAL_BYTES` of uploads ([`Ledger::staged`]). Freed private-pool
 //!   intermediates, such as the parts of a fused projection, are reused by later
 //!   allocations, so only their high-water mark counts. CPU and CUDA release a
 //!   buffer when it drops.
@@ -81,6 +85,7 @@ use crate::models::architectures::voxtral::realtime::model::{
 };
 use crate::models::architectures::whisper::asr::{whisper_weight_dtype, whisper_weight_files};
 use crate::models::shared::weights::gguf::safetensors_weight_files;
+use crate::models::shared::weights::staged::METAL_LOAD_SYNC_INTERVAL_BYTES;
 
 /// Candle 0.11's CUDA `QTensor` allocation pads every quantized buffer by this
 /// many rows of blocks (`quantized/cuda.rs`, `MATRIX_ROW_PADDING`).
@@ -276,6 +281,13 @@ struct Ledger {
     prelude: u64,
     host_peak: u64,
     peak: u64,
+    /// Metal: the loader reads through `staged::metal_staged_safetensors`,
+    /// which converts each tensor on the host, uploads it at its exact size,
+    /// and synchronizes the device every this many uploaded bytes.
+    sync_interval: Option<u64>,
+    /// Metal, staged: the most one step that does not synchronize itself
+    /// leaves held.
+    held_step_max: u64,
 }
 
 impl Ledger {
@@ -298,7 +310,25 @@ impl Ledger {
             prelude: 0,
             host_peak: 0,
             peak: 0,
+            sync_interval: None,
+            held_step_max: 0,
         }
+    }
+
+    /// A ledger for a loader that reads through
+    /// `staged::metal_staged_safetensors`, which is Candle's own backend
+    /// except on Metal.
+    fn staged(backend: BackendKind) -> Self {
+        let mut ledger = Self::new(backend);
+        if ledger.metal() {
+            ledger.sync_interval = Some(METAL_LOAD_SYNC_INTERVAL_BYTES);
+        }
+        ledger
+    }
+
+    /// Metal: the loader converts on the host and uploads exact sizes.
+    fn host_cast(&self) -> bool {
+        self.sync_interval.is_some()
     }
 
     fn metal(&self) -> bool {
@@ -333,6 +363,7 @@ impl Ledger {
             None => {
                 self.extra_max = self.extra_max.max(extra);
                 self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
+                self.held_step_max = self.held_step_max.max(step.held_until_sync);
             }
         }
         Ok(())
@@ -367,17 +398,21 @@ impl Ledger {
     }
 
     /// A tensor read through a Candle `VarBuilder` at `chain[0]` (uploaded at
-    /// its stored dtype, then cast on the device when they differ) and
-    /// rewritten by device ops into each later dtype of `chain`, the last of
-    /// which stays resident. Every form stays alive until the step ends.
+    /// its stored dtype, then cast on the device when they differ; a staged
+    /// Metal loader casts on the host and uploads the result) and rewritten by
+    /// device ops into each later dtype of `chain`, the last of which stays
+    /// resident. Every form stays alive until the step ends.
     fn var(&mut self, tensor: &CensusTensor, source: Source, chain: &[DType]) -> Result<()> {
         let (&first, rest) = chain.split_first().ok_or_else(overflow)?;
         let stored = tensor.stored_bytes;
         let elements = tensor.elements();
         let cast = tensor.dtype != StoredDType::Dense(first);
         // Allocated bytes of each form; the first is the upload itself (exact
-        // size) unless a cast wrote it.
+        // size) unless a device cast wrote it.
         let first_exact = dense_bytes(elements, first)?;
+        if self.host_cast() {
+            return self.staged_var(tensor, first_exact, cast, rest);
+        }
         let mut forms = vec![if cast {
             self.kernel(first_exact)?
         } else {
@@ -428,6 +463,40 @@ impl Ledger {
         self.apply(step)
     }
 
+    /// Metal, staged: [`Self::var`] for a tensor whose host copy (stored
+    /// bytes) is converted on the host when `cast` and uploaded at `upload`
+    /// bytes; later forms of the chain are device ops, as there.
+    fn staged_var(
+        &mut self,
+        tensor: &CensusTensor,
+        upload: u64,
+        cast: bool,
+        rest: &[DType],
+    ) -> Result<()> {
+        let stored = tensor.stored_bytes;
+        let elements = tensor.elements();
+        let host = sum(&[stored, if cast { upload } else { 0 }])?;
+        let mut logical = upload;
+        let mut forms = vec![upload];
+        for &dtype in rest {
+            logical = dense_bytes(elements, dtype)?;
+            forms.push(self.kernel(logical)?);
+        }
+        let resident = forms.pop().ok_or_else(overflow)?;
+        // The upload is released once a later form replaces it; the forms
+        // between are private.
+        let released = if rest.is_empty() { 0 } else { upload };
+        let private = sum(&forms)?.saturating_sub(released);
+        self.apply(Step {
+            logical,
+            resident,
+            high: sum(&[resident, released, host])?,
+            held_until_sync: released,
+            intermediates: private,
+            ..Step::default()
+        })
+    }
+
     /// `VarBuilder` tensors read at `dtype` and joined by `Tensor::cat` into
     /// one resident tensor, with `zeros` extra elements the loader synthesizes
     /// (a zero bias part); the parts are dropped.
@@ -443,15 +512,24 @@ impl Ledger {
         let mut private = vec![self.kernel(zero_bytes)?];
         let mut uploads = Vec::with_capacity(parts.len());
         let mut cast_sources = vec![0];
+        let host_cast = self.host_cast();
+        let mut host_copies = vec![0];
         for part in parts {
             let bytes = dense_bytes(part.elements(), dtype)?;
             exact.push(bytes);
+            if host_cast {
+                // Uploaded at `dtype`, exact size, after a host copy and cast.
+                uploads.push(bytes);
+                host_copies.push(sum(&[part.stored_bytes, bytes])?);
+                continue;
+            }
             uploads.push(part.stored_bytes);
             if part.dtype != StoredDType::Dense(dtype) {
                 private.push(self.kernel(bytes)?);
                 cast_sources.push(part.stored_bytes);
             }
         }
+        let largest_host_copy = host_copies.iter().copied().max().unwrap_or(0);
         let logical = sum(&exact)?;
         let largest_upload = uploads.iter().copied().max().unwrap_or(0);
         let largest_cast_source = cast_sources.iter().copied().max().unwrap_or(0);
@@ -472,7 +550,9 @@ impl Ledger {
             BackendKind::Metal => {
                 let resident = self.kernel(logical)?;
                 let uploads = sum(&uploads)?;
-                let host = if source == Source::Copied {
+                let host = if host_cast {
+                    largest_host_copy
+                } else if source == Source::Copied {
                     largest_upload
                 } else {
                     0
@@ -692,8 +772,20 @@ impl Ledger {
             let base = sum(&[base, self.scratch])?;
             if self.held_unsynced > 0 {
                 // Nothing synchronizes before the load fence: every released
-                // upload is still held when the last step runs.
-                let held = sum(&[self.held_unsynced, self.held_max])?;
+                // upload is still held when the last step runs. A staged
+                // loader synchronizes right after the upload that brings its
+                // uploads since the last synchronization to the interval, and
+                // a step releases only uploads it made before its release.
+                // So the steps released since the last synchronization made
+                // less than an interval of uploads after it, except the one
+                // step that straddles it.
+                let held_unsynced = match self.sync_interval {
+                    Some(interval) => self
+                        .held_unsynced
+                        .min(sum(&[interval, self.held_step_max])?),
+                    None => self.held_unsynced,
+                };
+                let held = sum(&[held_unsynced, self.held_max])?;
                 let extra = self.extra_beyond_held_max.max(self.before_sync_max);
                 sum(&[base, held, extra])?
             } else {
@@ -786,7 +878,7 @@ fn price_whisper(
 ) -> Result<AsrResidencyPlan> {
     const ENCODER_POSITIONS: &str = "model.encoder.embed_positions.weight";
     let tensors = by_name(files);
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = Ledger::staged(backend);
     let mut fused = BTreeSet::new();
     for name in tensors.keys() {
         let Some(attention) = name.strip_suffix(".q_proj.weight") else {
@@ -1172,7 +1264,8 @@ fn granite_plan(
 /// Granite Speech (`granite_speech/asr/runtime.rs`): every tensor through a
 /// `VarBuilder` at the base dtype except BatchNorm step counters, with the LM's
 /// representation switches applied: F16 (and fused) Q/K/V and gate/up, o_proj
-/// and down_proj pre-scaled by the residual multiplier and then made F16, and
+/// and down_proj read at F16 (when selective) and then pre-scaled by the
+/// residual multiplier, and
 /// an F16 copy of a tied embedding as the LM head. Each encoder layer adds a
 /// host-built U32 attention distance table.
 fn price_granite(
@@ -1186,18 +1279,17 @@ fn price_granite(
     let dtype = load.dtype;
     let half_if = |enabled: bool| if enabled { DType::F16 } else { dtype };
     let prescaled = representation.residual_prescale && load.residual_multiplier != 1.0;
+    // Read at F16 when selective, then pre-scaled in that dtype.
     let residual_chain = |f16: bool| {
-        let mut chain = vec![dtype];
+        let read = half_if(f16);
         if prescaled {
-            chain.push(dtype);
+            vec![read, read]
+        } else {
+            vec![read]
         }
-        if f16 {
-            chain.push(DType::F16);
-        }
-        chain
     };
     let tensors = by_name(files);
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = Ledger::staged(backend);
     let mut grouped = BTreeSet::new();
     for name in tensors.keys() {
         if !name.starts_with("language_model.") {
@@ -1365,7 +1457,7 @@ fn price_voxtral(
     backend: BackendKind,
     dtype: DType,
 ) -> Result<AsrResidencyPlan> {
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = Ledger::staged(backend);
     for tensor in by_name(files).values() {
         ledger.var(tensor, Source::Mapped, &[dtype])?;
     }
@@ -1770,7 +1862,9 @@ mod tests {
     /// admission report's table B (per-variant dtype sources); Metal's
     /// allocator sizes are computed from the census here (the report gave
     /// only rough figures, and its Whisper 3.80 GiB left out the fused Q/K/V,
-    /// which the Whisper audit's 4.38 GB included).
+    /// which the Whisper audit's 4.38 GB included). Whisper, Granite and
+    /// Voxtral cast on the host on Metal, so only their device-written
+    /// tensors (fusions, pre-scales, computed tables) round up.
     #[test]
     fn plans_match_the_per_backend_residency_table() {
         let _env = env_lock();
@@ -1795,7 +1889,7 @@ mod tests {
             (
                 "Whisper-L-v3-Turbo",
                 Box::new(whisper),
-                [3.01, 3.01, 4.08, 1.51],
+                [3.01, 3.01, 3.48, 1.51],
             ),
             (
                 "Qwen3-ASR-0.6B",
@@ -1810,7 +1904,7 @@ mod tests {
             (
                 "Granite-Speech-Plus",
                 Box::new(granite),
-                [7.87, 5.60, 6.11, 3.93],
+                [7.87, 5.60, 5.87, 3.93],
             ),
             (
                 "VibeVoice-ASR",
@@ -1820,7 +1914,7 @@ mod tests {
             (
                 "Voxtral-Mini-4B-RT",
                 Box::new(voxtral),
-                [16.50, 8.25, 10.50, 8.25],
+                [16.50, 8.25, 8.25, 8.25],
             ),
             (
                 "LFM2.5-Audio-1.5B",
@@ -1966,9 +2060,13 @@ mod tests {
                 .resident_bytes,
             1280 * 1280 * 4
         );
-        // The safetensors loaders never synchronize before the fence: the
-        // load peak holds every cast tensor's upload beside the residents.
-        for (label, plan, uploads) in [
+        // Candle's safetensors backend never synchronizes before the fence:
+        // a plain ledger holds every cast tensor's upload beside the
+        // residents. The staged loaders (Whisper, Granite, Voxtral)
+        // synchronize every interval of uploads instead, so their staging is
+        // bounded by the interval and their largest tensors, not the
+        // checkpoint.
+        for (label, plan, files) in [
             (
                 "Whisper",
                 whisper(BackendKind::Metal),
@@ -1985,24 +2083,78 @@ mod tests {
                 census!("voxtral_mini_4b_realtime_2602.json"),
             ),
         ] {
-            let uploads = stored(&uploads, |t| !t.name.ends_with("num_batches_tracked"));
+            let uploads = stored(&files, |t| !t.name.ends_with("num_batches_tracked"));
             let staging = plan.load_peak_bytes - plan.resident_bytes;
+            // Each bound term is at most an F32 copy of the largest tensor.
+            let bound = METAL_LOAD_SYNC_INTERVAL_BYTES + 4 * 2 * largest(&files);
             assert!(
-                staging >= uploads && staging - uploads < 128 << 20,
-                "{label}: staging {staging}, uploads {uploads}"
+                staging < uploads && staging <= bound,
+                "{label}: staging {staging}, uploads {uploads}, bound {bound}"
             );
         }
-        // Whisper's live Metal load reached about 6.3 GB with the process.
+        // Whisper's live Metal load reached about 6.3 GB with the process
+        // when every upload was held to the fence (5.61 GiB priced).
         assert_gib(
             "Whisper Metal load peak",
             whisper(BackendKind::Metal).load_peak_bytes,
-            5.61,
+            WHISPER_METAL_LOAD_PEAK_GIB,
         );
         assert_gib(
             "Granite Metal load peak",
             granite(BackendKind::Metal).load_peak_bytes,
-            10.11,
+            GRANITE_METAL_LOAD_PEAK_GIB,
         );
+    }
+
+    /// Staged: 5.61 and 10.11 GiB when every upload was held to the fence.
+    const WHISPER_METAL_LOAD_PEAK_GIB: f64 = 4.13;
+    const GRANITE_METAL_LOAD_PEAK_GIB: f64 = 7.30;
+
+    /// A staged Metal loader casts on the host, so its uploads keep their
+    /// exact sizes, and it synchronizes every interval of uploads, so the
+    /// held staging stops growing with the checkpoint.
+    #[test]
+    fn staged_metal_loads_upload_exact_sizes_and_hold_one_interval() {
+        let tensor = |dtype, rows: usize| {
+            census_tensor("w".into(), StoredDType::Dense(dtype), vec![rows, 1280])
+        };
+        // 6.6 MB of F32 from F16: an 8 MiB buffer when cast on the device,
+        // its exact size when cast on the host.
+        let f16 = tensor(DType::F16, 1280);
+        let mut ledger = Ledger::staged(BackendKind::Metal);
+        ledger.var(&f16, Source::Mapped, &[DType::F32]).unwrap();
+        let plan = AsrResidencyPlan::from_ledger(ledger, 0).unwrap();
+        assert_eq!(plan.resident_bytes, 1280 * 1280 * 4);
+        // A chain's device steps still round and release the upload: 128
+        // F16-then-pre-scaled 8 MiB projections release 1 GiB in all.
+        let projection = tensor(DType::BF16, 4096);
+        let projection_bytes = 4096 * 1280 * 2;
+        let peak = |mut ledger: Ledger| {
+            for _ in 0..128 {
+                ledger
+                    .var(&projection, Source::Mapped, &[DType::F16, DType::F16])
+                    .unwrap();
+            }
+            AsrResidencyPlan::from_ledger(ledger, 0).unwrap()
+        };
+        let unsynced = peak(Ledger::new(BackendKind::Metal));
+        let staged = peak(Ledger::staged(BackendKind::Metal));
+        assert_eq!(staged.resident_bytes, unsynced.resident_bytes);
+        let held = |plan: AsrResidencyPlan| plan.load_peak_bytes - plan.resident_bytes;
+        assert!(held(unsynced) >= 128 * projection_bytes);
+        // The interval, the step straddling the synchronization, and one
+        // step's host copy and cast beside it.
+        let bound = METAL_LOAD_SYNC_INTERVAL_BYTES + projection_bytes + 2 * projection_bytes;
+        assert!(
+            held(staged) <= bound,
+            "staged held {} > bound {bound}",
+            held(staged)
+        );
+        assert!(held(staged) >= METAL_LOAD_SYNC_INTERVAL_BYTES);
+        // CPU and CUDA keep Candle's backend.
+        for backend in [BackendKind::Cpu, BackendKind::Cuda] {
+            assert_eq!(peak(Ledger::staged(backend)), peak(Ledger::new(backend)));
+        }
     }
 
     /// CUDA prices the device from the plan and authorizes only host staging

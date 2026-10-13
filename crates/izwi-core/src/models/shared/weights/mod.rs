@@ -4,3 +4,4 @@ pub mod gguf;
 pub mod layout;
 pub mod mlx;
 pub mod pytorch;
+pub mod staged;

@@ -39,6 +39,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::weights::staged;
 use crate::tokenizer::Tokenizer;
 
 use super::model::Whisper as LocalWhisper;
@@ -1095,7 +1096,7 @@ impl WhisperTurboAsrModel {
 
         let weight_files = whisper_weight_files(model_dir)?;
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&weight_files, model_dtype, &device.device)?
+            staged::metal_staged_safetensors(&weight_files, model_dtype, &device.device)?
         };
 
         let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);
