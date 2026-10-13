@@ -19,17 +19,50 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::model::download::DownloadState;
 use izwi_core::{
-    parse_model_variant, ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus,
-    ModelVariant, SpeechModelCapabilities,
+    parse_model_variant, removed_model_variant, ChatModelCapabilities, ChatReasoningEffort,
+    ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
 };
 
 /// Response for model list
 #[derive(Serialize, ToSchema)]
 pub struct AdminModelsResponse {
     pub models: Vec<AdminModelInfo>,
+    /// Downloads of variants whose support was removed, still on disk. They
+    /// are never deleted automatically; `DELETE /v1/admin/models/{variant}`
+    /// with the listed `variant` reclaims the space.
+    #[serde(default)]
+    pub removed_models: Vec<AdminRemovedModelInfo>,
     /// Residency snapshot for the `ollama ps`-style observability surface.
     #[serde(default)]
     pub residency: AdminResidencySummary,
+}
+
+/// A leftover download of a removed variant.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminRemovedModelInfo {
+    pub variant: String,
+    pub display_name: String,
+    /// Always `removed`.
+    pub status: String,
+    pub local_path: String,
+    pub size_bytes: u64,
+    /// The supported variant to use instead.
+    pub replacement: String,
+    pub reason: String,
+}
+
+impl From<izwi_core::model::RemovedModelDownload> for AdminRemovedModelInfo {
+    fn from(download: izwi_core::model::RemovedModelDownload) -> Self {
+        Self {
+            variant: download.removed.id.to_string(),
+            display_name: download.removed.display_name.to_string(),
+            status: "removed".to_string(),
+            local_path: download.local_path.to_string_lossy().into_owned(),
+            size_bytes: download.size_bytes,
+            replacement: download.removed.replacement.dir_name().to_string(),
+            reason: download.removed.reason.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
@@ -376,7 +409,16 @@ pub async fn list_models(
         max_loaded_models: state.runtime.config().max_loaded_models,
         model_keep_alive_secs: state.runtime.config().model_keep_alive_secs,
     };
+    let removed_models = state
+        .runtime
+        .model_manager()
+        .removed_model_downloads()
+        .await
+        .into_iter()
+        .map(AdminRemovedModelInfo::from)
+        .collect();
     Ok(Json(AdminModelsResponse {
+        removed_models,
         residency,
         models: models
             .into_iter()
@@ -514,6 +556,26 @@ pub async fn delete_model(
     State(state): State<AppState>,
     Path(variant): Path<String>,
 ) -> Result<Json<DownloadResponse>, ApiError> {
+    // A removed variant cannot load or run, so its leftover download is
+    // deleted directly (the only operation it still supports).
+    if let Some(removed) = removed_model_variant(&variant) {
+        info!("Deleting removed model download: {}", removed.id);
+        if !state
+            .runtime
+            .model_manager()
+            .delete_removed_model(removed)
+            .await?
+        {
+            return Err(ApiError::not_found(format!(
+                "Removed model {} has no download to delete",
+                removed.id
+            )));
+        }
+        return Ok(Json(DownloadResponse {
+            status: "deleted",
+            message: format!("Removed model {} deleted successfully", removed.id),
+        }));
+    }
     let variant = parse_variant(&variant)?;
     info!("Deleting model: {}", variant);
 
@@ -889,6 +951,19 @@ fn model_precision_rank(dir_name: &str) -> u8 {
 mod tests {
     use super::*;
     use izwi_core::LoadedModelDiagnostics;
+
+    /// P1.0: naming a removed variant (CLI `pull` reads it through this
+    /// route) is a 400 that names the dense replacement.
+    #[test]
+    fn removed_model_ids_are_bad_requests_naming_the_replacement() {
+        let error = parse_variant("Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit").unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            error.message.contains("Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+            "{}",
+            error.message
+        );
+    }
 
     #[test]
     fn admin_model_runtime_diagnostics_preserve_qwen38_family_and_policy_values() {

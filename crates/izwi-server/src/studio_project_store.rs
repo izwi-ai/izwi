@@ -2490,6 +2490,13 @@ where
     db.query_all_raw(statement).await.context(context)
 }
 
+/// A stored model id as the application reads it: a removed variant is
+/// replaced by its supported counterpart, so projects saved before the
+/// removal keep rendering (P1.0).
+fn normalize_stored_model_id(model_id: Option<String>) -> Option<String> {
+    model_id.map(|id| izwi_core::normalize_stored_model_id(&id).into_owned())
+}
+
 fn map_project_summary_row(row: &QueryResult) -> anyhow::Result<StudioProjectSummary> {
     let voice_mode_raw: String = row.try_get_by_index(6)?;
     let segment_count = row.try_get_by_index::<i64>(10)?;
@@ -2502,7 +2509,7 @@ fn map_project_summary_row(row: &QueryResult) -> anyhow::Result<StudioProjectSum
         updated_at: i64_to_u64(row.try_get_by_index(2)?),
         name: row.try_get_by_index(3)?,
         source_filename: row.try_get_by_index(4)?,
-        model_id: row.try_get_by_index(5)?,
+        model_id: normalize_stored_model_id(row.try_get_by_index(5)?),
         voice_mode: StudioProjectVoiceMode::from_db_value(voice_mode_raw.as_str())
             .unwrap_or(StudioProjectVoiceMode::BuiltIn),
         speaker: row.try_get_by_index(7)?,
@@ -2523,7 +2530,7 @@ fn map_project_row(row: &QueryResult) -> anyhow::Result<StudioProjectRecord> {
         name: row.try_get_by_index(3)?,
         source_filename: row.try_get_by_index(4)?,
         source_text: row.try_get_by_index(5)?,
-        model_id: row.try_get_by_index(6)?,
+        model_id: normalize_stored_model_id(row.try_get_by_index(6)?),
         voice_mode: StudioProjectVoiceMode::from_db_value(voice_mode_raw.as_str())
             .unwrap_or(StudioProjectVoiceMode::BuiltIn),
         speaker: row.try_get_by_index(8)?,
@@ -2542,7 +2549,7 @@ fn map_segment_row(row: &QueryResult) -> anyhow::Result<StudioProjectSegmentReco
         position: i64_to_usize(row.try_get_by_index(2)?).unwrap_or_default(),
         input_chars: text.chars().count(),
         text,
-        model_id: row.try_get_by_index(4)?,
+        model_id: normalize_stored_model_id(row.try_get_by_index(4)?),
         voice_mode: voice_mode_raw
             .as_deref()
             .and_then(StudioProjectVoiceMode::from_db_value),
@@ -2678,6 +2685,48 @@ mod tests {
             .await
             .expect("schema should initialize");
         store
+    }
+
+    /// P1.0: a project saved with a removed model id reads back with the
+    /// supported counterpart, so it keeps rendering after the removal.
+    #[tokio::test]
+    async fn stored_removed_model_ids_read_back_as_their_dense_replacement() {
+        let root = test_env_root("studio-project-removed-model");
+        std::fs::create_dir_all(&root).expect("root should be created");
+        let store = initialize_test_store(root.join("test.sqlite3"), root.join("media")).await;
+        let removed = "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit".to_string();
+        let created = store
+            .create_project(NewStudioProjectRecord {
+                name: "Old project".to_string(),
+                source_filename: None,
+                source_text: "Hello world.".to_string(),
+                model_id: Some(removed.clone()),
+                voice_mode: StudioProjectVoiceMode::BuiltIn,
+                speaker: Some("Vivian".to_string()),
+                saved_voice_id: None,
+                speed: None,
+                segments: vec![NewStudioProjectSegment {
+                    position: 0,
+                    text: "Hello world.".to_string(),
+                    model_id: Some(removed),
+                    voice_mode: Some(StudioProjectVoiceMode::BuiltIn),
+                    speaker: Some("Vivian".to_string()),
+                    saved_voice_id: None,
+                }],
+            })
+            .await
+            .expect("project should be created");
+        let dense = Some("Qwen3-TTS-12Hz-0.6B-CustomVoice");
+        assert_eq!(created.model_id.as_deref(), dense);
+        assert_eq!(created.segments[0].model_id.as_deref(), dense);
+        let read = store
+            .get_project(created.id.clone())
+            .await
+            .expect("read should succeed")
+            .expect("project should exist");
+        assert_eq!(read.model_id.as_deref(), dense);
+        assert_eq!(read.segments[0].model_id.as_deref(), dense);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

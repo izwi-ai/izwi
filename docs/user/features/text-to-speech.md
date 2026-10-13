@@ -207,8 +207,8 @@ curl -X POST http://localhost:8080/v1/audio/speech \
 | `Kokoro-82M` | ~0.4 GB | Good | Fast |
 | `Qwen3-TTS-12Hz-0.6B-Base` | ~2.3 GB | Good | Fast |
 | `Qwen3-TTS-12Hz-1.7B-Base` | ~4.2 GB | Better | Medium |
-| `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit` | ~1.6 GB | Good | Fast |
-| `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` | ~2.2 GB | Better | Medium |
+| `Qwen3-TTS-12Hz-0.6B-CustomVoice` | ~2.3 GB | Good | Fast |
+| `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~4.2 GB | Better | Medium |
 | `VibeVoice-1.5B` | ~5.0 GB | Better long-form/reference voice | Medium |
 | `Voxtral-4B-TTS-2603` | ~8.1 GB | Better | Medium |
 

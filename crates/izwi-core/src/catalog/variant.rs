@@ -116,23 +116,151 @@ pub enum InferenceBackendHint {
 #[derive(Debug, Clone)]
 pub struct ParseModelVariantError {
     input: String,
+    removed: Option<&'static RemovedModelVariant>,
 }
 
 impl ParseModelVariantError {
     fn new(input: impl Into<String>) -> Self {
         Self {
             input: input.into(),
+            removed: None,
         }
+    }
+
+    fn removed(input: impl Into<String>, removed: &'static RemovedModelVariant) -> Self {
+        Self {
+            input: input.into(),
+            removed: Some(removed),
+        }
+    }
+
+    /// The removed variant the input named, if it named one.
+    pub fn removed_variant(&self) -> Option<&'static RemovedModelVariant> {
+        self.removed
     }
 }
 
 impl fmt::Display for ParseModelVariantError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Unsupported model identifier: {}",
-            self.input.trim().if_empty("<empty>")
-        )
+        match self.removed {
+            Some(removed) => write!(
+                f,
+                "Model {} is no longer supported: {}. Use {} instead; it needs more memory, so it is not substituted automatically",
+                removed.id,
+                removed.reason,
+                removed.replacement.dir_name()
+            ),
+            None => write!(
+                f,
+                "Unsupported model identifier: {}",
+                self.input.trim().if_empty("<empty>")
+            ),
+        }
+    }
+}
+
+/// A catalog variant whose support was removed. Requests that name it are
+/// refused with its replacement, stored references to it normalize to the
+/// replacement on read, and a leftover download stays listed (and
+/// deletable) until the user removes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedModelVariant {
+    /// The former variant id, which was also its model directory name.
+    pub id: &'static str,
+    pub repo_id: &'static str,
+    pub display_name: &'static str,
+    /// The supported variant that serves the same purpose.
+    pub replacement: ModelVariant,
+    pub reason: &'static str,
+}
+
+const MLX_4BIT_QWEN3_TTS_REMOVAL_REASON: &str = "the mlx 4-bit Qwen3-TTS conversions never reach end of speech and produce unintelligible audio";
+
+/// The five mlx 4-bit Qwen3-TTS conversions (QTTS-22, decision 7).
+pub const REMOVED_MODEL_VARIANTS: &[RemovedModelVariant] = &[
+    RemovedModelVariant {
+        id: "Qwen3-TTS-12Hz-0.6B-Base-4bit",
+        repo_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit",
+        display_name: "Qwen3-TTS 0.6B Base 4-bit",
+        replacement: ModelVariant::Qwen3Tts12Hz06BBase,
+        reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+    },
+    RemovedModelVariant {
+        id: "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+        repo_id: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+        display_name: "Qwen3-TTS 0.6B CustomVoice 4-bit",
+        replacement: ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+    },
+    RemovedModelVariant {
+        id: "Qwen3-TTS-12Hz-1.7B-Base-4bit",
+        repo_id: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit",
+        display_name: "Qwen3-TTS 1.7B Base 4-bit",
+        replacement: ModelVariant::Qwen3Tts12Hz17BBase,
+        reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+    },
+    RemovedModelVariant {
+        id: "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
+        repo_id: "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
+        display_name: "Qwen3-TTS 1.7B CustomVoice 4-bit",
+        replacement: ModelVariant::Qwen3Tts12Hz17BCustomVoice,
+        reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+    },
+    RemovedModelVariant {
+        id: "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
+        repo_id: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
+        display_name: "Qwen3-TTS 1.7B VoiceDesign 4-bit",
+        replacement: ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
+        reason: MLX_4BIT_QWEN3_TTS_REMOVAL_REASON,
+    },
+];
+
+/// The removed variant `input` names: an exact former id, repo id or
+/// display name, or any 4-bit Qwen3-TTS spelling.
+pub fn removed_model_variant(input: &str) -> Option<&'static RemovedModelVariant> {
+    let normalized = normalize_identifier(input.trim());
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(removed) = REMOVED_MODEL_VARIANTS.iter().find(|removed| {
+        [removed.id, removed.repo_id, removed.display_name]
+            .iter()
+            .any(|alias| normalize_identifier(alias) == normalized)
+    }) {
+        return Some(removed);
+    }
+    let qwen_tts_4bit = normalized.contains("qwen3")
+        && normalized.contains("tts")
+        && !normalized.contains("tokenizer")
+        && (normalized.contains("4bit") || normalized.contains("int4"));
+    if !qwen_tts_4bit {
+        return None;
+    }
+    let is_17b = normalized.contains("17b") || normalized.contains("17");
+    let replacement = match (
+        is_17b,
+        normalized.contains("customvoice"),
+        normalized.contains("voicedesign"),
+    ) {
+        (true, _, true) => ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
+        (true, true, _) => ModelVariant::Qwen3Tts12Hz17BCustomVoice,
+        (true, _, _) => ModelVariant::Qwen3Tts12Hz17BBase,
+        (false, true, _) => ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        (false, _, _) => ModelVariant::Qwen3Tts12Hz06BBase,
+    };
+    REMOVED_MODEL_VARIANTS
+        .iter()
+        .find(|removed| removed.replacement == replacement)
+}
+
+/// A stored model id with any removed variant replaced by its supported
+/// counterpart (the replacement's id). Stored settings, Studio projects and
+/// queued jobs read through this, so data written before a removal keeps
+/// working; history keeps its original label and does not.
+pub fn normalize_stored_model_id(id: &str) -> std::borrow::Cow<'_, str> {
+    match removed_model_variant(id) {
+        Some(removed) => std::borrow::Cow::Borrowed(removed.replacement.dir_name()),
+        None => std::borrow::Cow::Borrowed(id),
     }
 }
 
@@ -158,19 +286,14 @@ impl ModelVariant {
 
         match self {
             Qwen3Tts12Hz06BBase
-            | Qwen3Tts12Hz06BBase4Bit
             | Qwen3Tts12Hz06BBase8Bit
             | Qwen3Tts12Hz06BBaseBf16
             | Qwen3Tts12Hz06BCustomVoice
-            | Qwen3Tts12Hz06BCustomVoice4Bit
             | Qwen3Tts12Hz06BCustomVoice8Bit
             | Qwen3Tts12Hz06BCustomVoiceBf16
             | Qwen3Tts12Hz17BBase
-            | Qwen3Tts12Hz17BBase4Bit
             | Qwen3Tts12Hz17BCustomVoice
-            | Qwen3Tts12Hz17BCustomVoice4Bit
             | Qwen3Tts12Hz17BVoiceDesign
-            | Qwen3Tts12Hz17BVoiceDesign4Bit
             | Qwen3Tts12Hz17BVoiceDesign8Bit
             | Qwen3Tts12Hz17BVoiceDesignBf16 => ModelFamily::Qwen3Tts,
             Kokoro82M => ModelFamily::KokoroTts,
@@ -239,6 +362,10 @@ pub fn parse_model_variant(input: &str) -> Result<ModelVariant, ParseModelVarian
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(ParseModelVariantError::new(input));
+    }
+
+    if let Some(removed) = removed_model_variant(trimmed) {
+        return Err(ParseModelVariantError::removed(input, removed));
     }
 
     let normalized = normalize_identifier(trimmed);
@@ -434,7 +561,11 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
 
     if normalized.contains("qwen3") && normalized.contains("tts") {
         let is_17b = normalized.contains("17b") || normalized.contains("17");
-        let q4 = normalized.contains("4bit") || normalized.contains("int4");
+        // 4-bit ids name removed variants; `removed_model_variant` refuses
+        // them before this heuristic, and none may resolve to a dense one.
+        if normalized.contains("4bit") || normalized.contains("int4") {
+            return None;
+        }
         let q8 = normalized.contains("8bit") || normalized.contains("int8");
         let bf16 = normalized.contains("bf16") || normalized.contains("bfloat16");
 
@@ -443,41 +574,32 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         }
 
         if is_17b && normalized.contains("voicedesign") {
-            return Some(match (q4, q8, bf16) {
-                (true, _, _) => Qwen3Tts12Hz17BVoiceDesign4Bit,
-                (_, true, _) => Qwen3Tts12Hz17BVoiceDesign8Bit,
-                (_, _, true) => Qwen3Tts12Hz17BVoiceDesignBf16,
+            return Some(match (q8, bf16) {
+                (true, _) => Qwen3Tts12Hz17BVoiceDesign8Bit,
+                (_, true) => Qwen3Tts12Hz17BVoiceDesignBf16,
                 _ => Qwen3Tts12Hz17BVoiceDesign,
             });
         }
 
         if is_17b && normalized.contains("customvoice") {
-            return Some(match (q4, q8, bf16) {
-                (true, _, _) => Qwen3Tts12Hz17BCustomVoice4Bit,
-                _ => Qwen3Tts12Hz17BCustomVoice,
-            });
+            return Some(Qwen3Tts12Hz17BCustomVoice);
         }
 
         if is_17b {
-            return Some(match (q4, q8, bf16) {
-                (true, _, _) => Qwen3Tts12Hz17BBase4Bit,
-                _ => Qwen3Tts12Hz17BBase,
-            });
+            return Some(Qwen3Tts12Hz17BBase);
         }
 
         if normalized.contains("customvoice") {
-            return Some(match (q4, q8, bf16) {
-                (true, _, _) => Qwen3Tts12Hz06BCustomVoice4Bit,
-                (_, true, _) => Qwen3Tts12Hz06BCustomVoice8Bit,
-                (_, _, true) => Qwen3Tts12Hz06BCustomVoiceBf16,
+            return Some(match (q8, bf16) {
+                (true, _) => Qwen3Tts12Hz06BCustomVoice8Bit,
+                (_, true) => Qwen3Tts12Hz06BCustomVoiceBf16,
                 _ => Qwen3Tts12Hz06BCustomVoice,
             });
         }
 
-        return Some(match (q4, q8, bf16) {
-            (true, _, _) => Qwen3Tts12Hz06BBase4Bit,
-            (_, true, _) => Qwen3Tts12Hz06BBase8Bit,
-            (_, _, true) => Qwen3Tts12Hz06BBaseBf16,
+        return Some(match (q8, bf16) {
+            (true, _) => Qwen3Tts12Hz06BBase8Bit,
+            (_, true) => Qwen3Tts12Hz06BBaseBf16,
             _ => Qwen3Tts12Hz06BBase,
         });
     }
@@ -756,8 +878,93 @@ mod tests {
 
     #[test]
     fn parse_by_display_name() {
-        let parsed = parse_model_variant("Qwen3-TTS 0.6B Base 4-bit").unwrap();
-        assert_eq!(parsed, ModelVariant::Qwen3Tts12Hz06BBase4Bit);
+        let parsed = parse_model_variant("Qwen3-TTS 0.6B Base").unwrap();
+        assert_eq!(parsed, ModelVariant::Qwen3Tts12Hz06BBase);
+    }
+
+    /// The UI's route preference lists name only catalog variants that are
+    /// enabled, by their exact id: a removed or catalog-disabled id there
+    /// silently falls through to a later choice.
+    #[test]
+    fn ui_route_preferred_models_exist_in_the_catalog_and_are_enabled() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../ui/src/features/models/catalog/routeModelCatalog.ts");
+        let source = std::fs::read_to_string(&path).expect("UI route catalog");
+        let mut checked = 0;
+        for block in source.split("export const ").skip(1) {
+            let Some((name, rest)) = block.split_once(" = [") else {
+                continue;
+            };
+            if !name.contains("PREFERRED") {
+                continue;
+            }
+            let list = rest.split_once("] as const").expect(name).0;
+            for id in list.split('"').skip(1).step_by(2) {
+                let variant = parse_model_variant(id)
+                    .unwrap_or_else(|error| panic!("{name} names {id}: {error}"));
+                assert_eq!(variant.dir_name(), id, "{name} must use the exact id");
+                assert!(variant.is_enabled(), "{name} names disabled {id}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "parsed only {checked} preferred ids");
+    }
+
+    /// P1.0: the mlx 4-bit Qwen3-TTS variants are removed. Every spelling of
+    /// them is refused with its dense replacement named, none resolves to a
+    /// catalog variant, and stored ids normalize to the replacement.
+    #[test]
+    fn removed_mlx_4bit_qwen_tts_ids_are_refused_with_their_dense_replacement() {
+        let cases = [
+            (
+                "Qwen3-TTS-12Hz-0.6B-Base-4bit",
+                ModelVariant::Qwen3Tts12Hz06BBase,
+            ),
+            (
+                "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
+                ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            ),
+            (
+                "Qwen3-TTS 1.7B Base 4-bit",
+                ModelVariant::Qwen3Tts12Hz17BBase,
+            ),
+            (
+                "qwen3-tts-1.7b-customvoice-int4",
+                ModelVariant::Qwen3Tts12Hz17BCustomVoice,
+            ),
+            (
+                "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
+                ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
+            ),
+        ];
+        for (input, replacement) in cases {
+            let error = parse_model_variant(input).expect_err(input);
+            assert_eq!(
+                error.removed_variant().unwrap().replacement,
+                replacement,
+                "{input}"
+            );
+            assert!(
+                error.to_string().contains(replacement.dir_name()),
+                "{error}"
+            );
+            assert!(parse_tts_model_variant(input).is_err(), "{input}");
+            assert_eq!(normalize_stored_model_id(input), replacement.dir_name());
+        }
+        for removed in REMOVED_MODEL_VARIANTS {
+            assert!(parse_model_variant(removed.id).is_err());
+            assert!(removed.replacement.is_enabled() && removed.replacement.is_tts());
+        }
+        assert!(ModelVariant::all().iter().all(|variant| {
+            !(variant.family() == ModelFamily::Qwen3Tts && variant.dir_name().contains("4bit"))
+                && removed_model_variant(variant.dir_name()).is_none()
+        }));
+        // Supported ids are untouched, including the 4-bit forced aligner.
+        assert_eq!(normalize_stored_model_id("Kokoro-82M"), "Kokoro-82M");
+        assert_eq!(
+            parse_model_variant("Qwen3-ForcedAligner-0.6B-4bit").unwrap(),
+            ModelVariant::Qwen3ForcedAligner06B4Bit
+        );
     }
 
     #[test]

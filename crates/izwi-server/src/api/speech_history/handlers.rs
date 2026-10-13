@@ -1501,7 +1501,9 @@ async fn execute_batch_tts_stage(
     let mut request: BatchSpeechRequest = serde_json::from_value(claimed.job.request_json.clone())
         .context("Failed to decode TTS batch request")?;
     hydrate_batch_reference_audio(state, &claimed, &mut request.request).await?;
-    let variant = parse_tts_model_variant(request.model_id.as_str())
+    // A job queued before its model's support was removed runs on the
+    // supported counterpart (stored data normalizes on read, P1.0).
+    let variant = parse_tts_model_variant(&izwi_core::normalize_stored_model_id(&request.model_id))
         .map_err(|err| anyhow::anyhow!("Unsupported TTS model: {err}"))?;
     let ctx = RequestContext::new(
         claimed

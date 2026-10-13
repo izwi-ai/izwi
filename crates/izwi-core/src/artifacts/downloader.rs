@@ -2311,8 +2311,6 @@ impl ModelDownloader {
                 match variant {
                     ModelVariant::Qwen3Tts12Hz06BBase
                     | ModelVariant::Qwen3Tts12Hz06BCustomVoice => 1_800_000_000,
-                    ModelVariant::Qwen3Tts12Hz17BBase4Bit
-                    | ModelVariant::Qwen3Tts12Hz17BCustomVoice4Bit => 2_330_000_000,
                     ModelVariant::Qwen3Tts12Hz17BBase
                     | ModelVariant::Qwen3Tts12Hz17BCustomVoice
                     | ModelVariant::Qwen3Tts12Hz17BVoiceDesign => 3_850_000_000,
@@ -2477,7 +2475,7 @@ impl ModelDownloader {
     }
 
     /// Calculate directory size recursively
-    fn dir_size(path: &Path) -> Result<u64> {
+    pub(crate) fn dir_size(path: &Path) -> Result<u64> {
         let mut size = 0;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;

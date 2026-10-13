@@ -4,30 +4,37 @@ type RouteModelLike = Pick<ModelInfo, "variant" | "status">;
 
 export const TEXT_TO_SPEECH_PREFERRED_MODELS = [
   "Kokoro-82M",
-  "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
-  "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
-  "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
-  "Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
   "Qwen3-TTS-12Hz-0.6B-CustomVoice",
   "Qwen3-TTS-12Hz-1.7B-CustomVoice",
 ] as const;
 
 export const VOICE_CLONING_PREFERRED_MODELS = [
   "FishAudio-S2-Pro",
-  "Qwen3-TTS-12Hz-0.6B-Base-4bit",
-  "Qwen3-TTS-12Hz-0.6B-Base-8bit",
-  "Qwen3-TTS-12Hz-0.6B-Base-bf16",
   "Qwen3-TTS-12Hz-0.6B-Base",
-  "Qwen3-TTS-12Hz-1.7B-Base-4bit",
   "Qwen3-TTS-12Hz-1.7B-Base",
 ] as const;
 
 export const VOICE_DESIGN_PREFERRED_MODELS = [
-  "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
-  "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
-  "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
   "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ] as const;
+
+/**
+ * Variants whose support was removed, with the supported counterpart a
+ * stored selection is normalized to on read. The mlx 4-bit Qwen3-TTS
+ * conversions never reach end of speech and produce unintelligible audio.
+ */
+export const REMOVED_MODEL_REPLACEMENTS: Readonly<Record<string, string>> = {
+  "Qwen3-TTS-12Hz-0.6B-Base-4bit": "Qwen3-TTS-12Hz-0.6B-Base",
+  "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit": "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "Qwen3-TTS-12Hz-1.7B-Base-4bit": "Qwen3-TTS-12Hz-1.7B-Base",
+  "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit": "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+};
+
+/** A stored model id with a removed variant replaced by its counterpart. */
+export function normalizeStoredModelId(variant: string): string {
+  return REMOVED_MODEL_REPLACEMENTS[variant] ?? variant;
+}
 
 export const TRANSCRIPTION_PREFERRED_MODELS = [
   "Qwen3-ASR-0.6B-GGUF",

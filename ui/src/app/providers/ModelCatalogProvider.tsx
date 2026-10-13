@@ -15,6 +15,7 @@ import {
   trackModelLoaded,
 } from "@/app/analytics/events";
 import { useNotifications } from "@/app/providers/NotificationProvider";
+import { normalizeStoredModelId } from "@/features/models/catalog/routeModelCatalog";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import { VIEW_CONFIGS } from "@/types";
 import { isSpeechPipelineManagedModel } from "@/features/speech-text/modelFilters";
@@ -49,7 +50,10 @@ const USER_SELECTED_MODEL_STORAGE_KEY = "izwi.modelCatalog.userSelectedModel";
 
 function readPersistedUserSelectedModel(): string | null {
   try {
-    return window.localStorage.getItem(USER_SELECTED_MODEL_STORAGE_KEY);
+    const stored = window.localStorage.getItem(USER_SELECTED_MODEL_STORAGE_KEY);
+    // A selection saved before its variant was removed reads back as the
+    // supported counterpart.
+    return stored === null ? null : normalizeStoredModelId(stored);
   } catch {
     return null;
   }

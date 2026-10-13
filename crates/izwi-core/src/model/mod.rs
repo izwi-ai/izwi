@@ -13,5 +13,5 @@ pub use crate::residency::{
     ModelResidencyState,
 };
 pub use download::{DownloadProgress, ModelDownloader};
-pub use manager::ModelManager;
+pub use manager::{ModelManager, RemovedModelDownload};
 pub use weights::ModelWeights;
