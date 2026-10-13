@@ -8,7 +8,12 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, type ModelInfo, type ModelResidencySummary } from "@/api";
+import {
+  api,
+  type ModelInfo,
+  type ModelResidencySummary,
+  type RemovedModelInfo,
+} from "@/api";
 import {
   trackModelDownloadCompleted,
   trackModelDownloadStarted,
@@ -29,6 +34,7 @@ interface ModelCatalogContextValue {
   downloadProgress: ModelDownloadProgressMap;
   readyModelsCount: number;
   residencySummary: ModelResidencySummary | null;
+  removedModels: RemovedModelInfo[];
   selectModel: (variant: string | null) => void;
   reportError: (message: string) => void;
   clearError: () => void;
@@ -82,6 +88,7 @@ export function ModelCatalogProvider({
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [residencySummary, setResidencySummary] =
     useState<ModelResidencySummary | null>(null);
+  const [removedModels, setRemovedModels] = useState<RemovedModelInfo[]>([]);
   const [selectedModel, setSelectedModelState] = useState<string | null>(() =>
     readPersistedUserSelectedModel(),
   );
@@ -169,6 +176,7 @@ export function ModelCatalogProvider({
 
       setModels(mergedModels);
       setResidencySummary(response.residency ?? null);
+      setRemovedModels(response.removed_models ?? []);
       setCatalogError(null);
       setSelectedModelState((current) => {
         if (
@@ -821,6 +829,7 @@ export function ModelCatalogProvider({
       downloadProgress,
       readyModelsCount: models.filter((model) => model.status === "ready").length,
       residencySummary,
+      removedModels,
       selectModel,
       reportError,
       clearError,
@@ -843,6 +852,7 @@ export function ModelCatalogProvider({
       loading,
       models,
       refreshModels,
+      removedModels,
       reportError,
       residencySummary,
       selectModel,

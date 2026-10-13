@@ -19,6 +19,64 @@ function buildModel(overrides: Partial<ModelInfo>): ModelInfo {
 }
 
 describe("MyModelsPage", () => {
+  it("lists removed downloads and deletes them by their removed variant", () => {
+    const onDelete = vi.fn();
+    render(
+      <MyModelsPage
+        models={[]}
+        removedModels={[
+          {
+            variant: "Qwen3-TTS-12Hz-0.6B-Base-4bit",
+            display_name: "Qwen3-TTS 0.6B Base 4-bit",
+            status: "removed",
+            local_path: "/tmp/qwen-4bit",
+            size_bytes: 1_610_612_736,
+            replacement: "Qwen3-TTS-12Hz-0.6B-Base",
+            reason: "The mlx 4-bit variants are no longer supported.",
+          },
+        ]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={onDelete}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Removed models still on disk"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Qwen3-TTS 0.6B Base 4-bit")).toBeInTheDocument();
+    expect(
+      screen.getByText(/1\.50 GB · use Qwen3-TTS-12Hz-0\.6B-Base instead/),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Delete Qwen3-TTS 0.6B Base 4-bit" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    expect(onDelete).toHaveBeenCalledWith("Qwen3-TTS-12Hz-0.6B-Base-4bit");
+  });
+
+  it("shows no removed-models section when nothing removed is on disk", () => {
+    render(
+      <MyModelsPage
+        models={[]}
+        loading={false}
+        downloadProgress={{}}
+        onDownload={vi.fn()}
+        onLoad={vi.fn()}
+        onUnload={vi.fn()}
+        onDelete={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByText("Removed models still on disk"),
+    ).not.toBeInTheDocument();
+  });
+
   it("allows a loading model to be cancelled", () => {
     const onUnload = vi.fn();
     render(

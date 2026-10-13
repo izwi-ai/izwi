@@ -69,8 +69,21 @@ export interface ModelResidencySummary {
   model_keep_alive_secs: number;
 }
 
+/** A download of a variant whose support was removed, still on disk. */
+export interface RemovedModelInfo {
+  variant: string;
+  display_name: string;
+  status: "removed";
+  local_path: string;
+  size_bytes: number;
+  /** The supported variant to use instead. */
+  replacement: string;
+  reason: string;
+}
+
 export interface ModelsResponse {
   models: ModelInfo[];
+  removed_models?: RemovedModelInfo[];
   residency?: ModelResidencySummary;
 }
 

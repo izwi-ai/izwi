@@ -12,6 +12,7 @@ export type {
   ModelInfo,
   ModelResidencySummary,
   ModelsResponse,
+  RemovedModelInfo,
   SpeechModelCapabilities,
 } from "@/shared/api/models";
 

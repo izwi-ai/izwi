@@ -111,6 +111,7 @@ export function AppRoutes() {
     downloadProgress,
     readyModelsCount,
     residencySummary,
+    removedModels,
     selectModel,
     reportError,
     refreshModels,
@@ -151,6 +152,7 @@ export function AppRoutes() {
 
   const modelsPageProps: ModelsRouteProps = {
     models,
+    removedModels,
     loading,
     downloadProgress,
     onDownload: downloadModel,
