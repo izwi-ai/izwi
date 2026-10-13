@@ -163,6 +163,27 @@ fn portable_invocation_context_intent(
     }
 }
 
+/// `(floor, growth)` budgets of a portable state fit. Required state (the
+/// model-authored minimum, an explicit context) is admitted against
+/// planning headroom; live headroom (`live`, already clamped to planning)
+/// caps only the automatic growth above it. Right after a large load the
+/// live sample undercounts memory the OS reclaims on demand (clean
+/// file-backed pages of the checkpoint just read, compressible pages):
+/// Granite's 10 MiB minimum was refused against 0.8 GB live beside 1 GiB of
+/// reserve while planning headroom held gigabytes.
+fn state_fit_budgets(
+    planning_bytes: u64,
+    live: ResourceAmount,
+    safety_reserve_bytes: u64,
+) -> (u64, u64) {
+    let floor = planning_bytes.saturating_sub(safety_reserve_bytes);
+    let growth = match live {
+        ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+        ResourceAmount::Unknown => floor,
+    };
+    (floor, growth.min(floor))
+}
+
 fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
     available_bytes / remaining_groups.max(1)
 }
@@ -1318,7 +1339,9 @@ impl ModelLifecycleController {
         // configured floor or the measured untracked growth, not a catalog
         // difference.
         let authority = self.coordinator.resource_authority();
-        let (headroom, safety_reserve_bytes) = if asr_memory::is_asr_variant(variant) {
+        let asr = asr_memory::is_asr_variant(variant);
+        let headroom = authority.planning_headroom_bytes(backend)?;
+        let (live_headroom, safety_reserve_bytes) = if asr {
             (
                 authority.state_fit_headroom_bytes(backend)?,
                 authority.state_safety_reserve_bytes(
@@ -1328,9 +1351,17 @@ impl ModelLifecycleController {
             )
         } else {
             (
-                authority.planning_headroom_bytes(backend)?,
+                headroom,
                 portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes),
             )
+        };
+        // A capacity shortfall of ASR state is a 503, not a load defect.
+        let does_not_fit = |message: String| {
+            if asr {
+                Error::Overloaded(message)
+            } else {
+                Error::ModelLoadError(message)
+            }
         };
         let ResourceAmount::Known(headroom_bytes) = headroom else {
             let Some((_, maximum)) = axis_bounds else {
@@ -1346,9 +1377,10 @@ impl ModelLifecycleController {
                 .publish_effective_context(variant, fallback)?;
             return Ok(());
         };
-        let budget = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let (budget, growth_budget) =
+            state_fit_budgets(headroom_bytes, live_headroom, safety_reserve_bytes);
         let automatic_budget =
-            automatic_state_group_budget(budget, remaining_automatic_state_groups);
+            automatic_state_group_budget(growth_budget, remaining_automatic_state_groups);
         let required = |tokens: Option<u64>| -> Result<u64> {
             let mut candidate = descriptor.clone();
             if let Some(tokens) = tokens {
@@ -1377,7 +1409,7 @@ impl ModelLifecycleController {
         let Some((minimum, maximum)) = axis_bounds else {
             let bytes = required(None)?;
             if bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -1393,7 +1425,7 @@ impl ModelLifecycleController {
         let selected = if let PortableInvocationContextIntent::Explicit { selected } = intent {
             let bytes = required(Some(selected))?;
             if bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -1409,7 +1441,7 @@ impl ModelLifecycleController {
             }
             let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -2299,6 +2331,13 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
+            if asr_memory::is_asr_variant(variant) {
+                // The cached live sample can predate the fence that released
+                // the load's staging; the state fits read a fresh one.
+                self.coordinator
+                    .resource_authority()
+                    .refresh_physical_capacity_after_release();
+            }
             let request_envelope_hold = self.hold_asr_request_envelope(variant, backend)?;
             let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
@@ -3623,7 +3662,7 @@ mod tests {
         model_resource_plan, now_unix_millis, plan_invocation_allocations,
         portable_context_reserve_bytes, portable_invocation_context_intent,
         qwen38_representation_memory_estimate, reconcile_observed_growth,
-        residency_budget_has_capacity, select_lru_eviction_candidate,
+        residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
         validate_scratch_only_invocation_publication, DeviceUsageSample,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
         QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
@@ -5134,6 +5173,33 @@ mod tests {
             reconcile_observed_growth(variant, "weight load", sample(MIB, 0), sample(0, 0), 0)
                 .unwrap(),
             0
+        );
+    }
+
+    /// The Granite shape from a live Metal run: after the weights land, live
+    /// headroom (0.8 GB) is below the 1 GiB reserve while planning headroom
+    /// holds gigabytes. The minimum state must still be admitted (against
+    /// planning); live memory caps only growth above it.
+    #[test]
+    fn asr_state_floor_is_admitted_against_planning_when_live_undercounts() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let reserve = GIB;
+        let (floor, growth) =
+            state_fit_budgets(5 * GIB, ResourceAmount::Known(796_545_836), reserve);
+        assert_eq!(floor, 4 * GIB);
+        assert_eq!(growth, 0);
+        assert!(
+            10_485_760 <= floor,
+            "a one-page minimum fits the floor budget"
+        );
+        let (floor, growth) = state_fit_budgets(5 * GIB, ResourceAmount::Known(3 * GIB), reserve);
+        assert_eq!((floor, growth), (4 * GIB, 2 * GIB));
+        // Live never raises growth above the planning floor.
+        let (floor, growth) = state_fit_budgets(2 * GIB, ResourceAmount::Known(9 * GIB), reserve);
+        assert_eq!((floor, growth), (GIB, GIB));
+        assert_eq!(
+            state_fit_budgets(2 * GIB, ResourceAmount::Unknown, reserve),
+            (GIB, GIB)
         );
     }
 

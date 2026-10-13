@@ -608,11 +608,9 @@ impl ManagedKvCacheManager {
         let Some(authority) = self.resource_authority.as_ref() else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let (headroom_bytes, safety_reserve_bytes) = match headroom {
-            PortableFitHeadroom::Planning => (
-                authority.planning_headroom_bytes(self.worker_backend)?,
-                safety_reserve_bytes,
-            ),
+        let planning = authority.planning_headroom_bytes(self.worker_backend)?;
+        let (growth_headroom, safety_reserve_bytes) = match headroom {
+            PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
             // ASR state keeps the one reserve its invocation fit keeps too:
             // the configured floor or the measured untracked growth (ADM-11).
             PortableFitHeadroom::Live => (
@@ -620,10 +618,20 @@ impl ManagedKvCacheManager {
                 authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
             ),
         };
-        let ResourceAmount::Known(headroom_bytes) = headroom_bytes else {
+        let ResourceAmount::Known(headroom_bytes) = planning else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        // The model-authored minimum is admitted against planning headroom;
+        // live memory caps only growth above it. Right after a large load the
+        // live sample undercounts what the OS reclaims on demand (clean
+        // file-backed pages of the checkpoint just read, compressible
+        // pages), so a live floor refused even a one-page state.
+        let floor_budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let growth_budget_bytes = match growth_headroom {
+            ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+            ResourceAmount::Unknown => floor_budget_bytes,
+        }
+        .min(floor_budget_bytes);
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
         let state_plan = negotiate_state_plan(
@@ -667,11 +675,18 @@ impl ManagedKvCacheManager {
 
         let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
         let minimum_bytes = required_bytes(minimum_tokens)?;
-        if minimum_bytes > budget_bytes {
-            return Err(Error::ModelLoadError(format!(
+        if minimum_bytes > floor_budget_bytes {
+            let message = format!(
                 "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
-            )));
+            );
+            // An ASR floor that planning headroom cannot hold is a capacity
+            // refusal (503), not a load defect.
+            return Err(match headroom {
+                PortableFitHeadroom::Live => Error::Overloaded(message),
+                PortableFitHeadroom::Planning => Error::ModelLoadError(message),
+            });
         }
+        let budget_bytes = growth_budget_bytes.max(minimum_bytes);
         if required_bytes(maximum_tokens)? <= budget_bytes {
             return Ok(maximum_tokens);
         }
@@ -5955,6 +5970,43 @@ mod tests {
         assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
         let live = fit(PortableFitHeadroom::Live);
         assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
+
+        // Right after a large load live memory can read below the reserve
+        // (Granite on Metal: 0.8 GB live beside a 1 GiB reserve). The
+        // minimum is admitted against planning headroom, so the fit returns
+        // it instead of failing the load; only growth is capped by live.
+        let fit_with = |capacity: u64, available: u64| {
+            ManagedKvCacheManager::for_worker(
+                Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
+                    TestCapacityProvider {
+                        snapshot: PhysicalCapacitySnapshot {
+                            capacity: host_bytes_vector(capacity),
+                            available: host_bytes_vector(available),
+                            source: CapacitySource::Test,
+                        },
+                    },
+                )))),
+                BackendKind::Cpu,
+                Device::Cpu,
+            )
+            .fit_portable_logical_token_reach(
+                ModelInstanceId::new(902),
+                &contract,
+                4_096,
+                RESERVE,
+                64,
+                8,
+                8,
+                1,
+                PortableFitHeadroom::Live,
+            )
+        };
+        assert_eq!(fit_with(RESERVE + bytes(4_096), RESERVE / 2).unwrap(), 64);
+        // A minimum that planning headroom cannot hold is a capacity refusal.
+        assert!(matches!(
+            fit_with(RESERVE + bytes(64) - 1, RESERVE + bytes(64) - 1),
+            Err(Error::Overloaded(_))
+        ));
     }
 
     fn host_bytes_vector(bytes: u64) -> ResourceVector {
