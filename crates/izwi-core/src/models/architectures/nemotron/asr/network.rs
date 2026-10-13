@@ -3849,8 +3849,11 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
     argmax_1d_host(x)
 }
 
+/// Select on the device (a 4-byte index readback) on CUDA and Metal instead
+/// of reading every logit back (13,088 F32 per joint step). Candle's device
+/// argmax breaks ties toward the lowest index, as the host loop does.
 fn argmax_uses_device(x: &Tensor) -> bool {
-    x.device().is_cuda()
+    x.device().is_cuda() || x.device().is_metal()
 }
 
 fn use_rnnt_cached_projection(device: &Device) -> bool {
@@ -4010,6 +4013,39 @@ mod tests {
             .map(|d| if d.is_finite() { d } else { f32::INFINITY })
             .fold(0.0f32, f32::max);
         assert!(diff <= 1e-5, "max |diff| {diff}");
+    }
+
+    /// The device argmax now used on Metal selects the same index as the
+    /// host scan it replaces, including the first index among equal maxima.
+    #[test]
+    fn device_argmax_matches_host_scan_on_unstructured_and_tied_logits() {
+        let device = Device::Cpu;
+        let mut state = 0x3C6E_F372_FE94_F82Bu64;
+        let mut logits = (0..13_088)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 20) as f32 - 8.0
+            })
+            .collect::<Vec<_>>();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let x = Tensor::from_vec(logits.clone(), logits.len(), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            assert_eq!(
+                argmax_1d_device(&x).unwrap(),
+                argmax_1d_host(&x).unwrap(),
+                "{dtype:?}"
+            );
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        logits[17] = max + 1.0;
+        logits[9_001] = max + 1.0;
+        let x = Tensor::from_vec(logits.clone(), logits.len(), &device).unwrap();
+        assert_eq!(argmax_1d_host(&x).unwrap(), 17);
+        assert_eq!(argmax_1d_device(&x).unwrap(), 17);
     }
 
     fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
