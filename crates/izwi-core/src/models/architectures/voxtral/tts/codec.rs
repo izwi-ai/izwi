@@ -267,10 +267,30 @@ impl VoxtralCodecDecoder {
     }
 
     pub fn decode_timeline(&self, timeline: &VoxtralCodecTimeline) -> Result<Vec<f32>> {
+        self.decode_timeline_chunks(timeline, 0, true, VOXTRAL_CODEC_CHUNK_FRAMES)
+            .map(|(samples, _)| samples)
+    }
+
+    /// Per-chunk emission: the audio of the codec chunks starting at or after
+    /// frame `from` (a chunk boundary) that are complete. Chunks decode
+    /// independently (as the reference's chunked decode does), so a chunk's
+    /// audio never depends on later frames, and emitting the complete ones as
+    /// they fill reproduces [`Self::decode_timeline`] chunk for chunk. With
+    /// `finished`, the last, partial chunk is complete too. Returns the
+    /// samples and the frame after the last chunk decoded.
+    pub fn decode_timeline_chunks(
+        &self,
+        timeline: &VoxtralCodecTimeline,
+        from: usize,
+        finished: bool,
+        chunk_frames: usize,
+    ) -> Result<(Vec<f32>, usize)> {
         let trimmed = timeline.trim_at_end_audio();
         let frames = trimmed.generated_frame_count();
+        // Frames past end-of-audio are trimmed, so the audio is final.
+        let finished = finished || frames < timeline.generated_frame_count();
         if frames == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), from));
         }
         if trimmed.codebook_count() != self.quantizer.num_codebooks {
             return Err(Error::AudioError(format!(
@@ -281,10 +301,17 @@ impl VoxtralCodecDecoder {
         }
 
         let mut samples = Vec::new();
-        for range in self.config.chunk_ranges(frames) {
-            let chunk_frames = range.end - range.start;
+        let mut next = from;
+        for range in chunk_ranges(frames, chunk_frames) {
+            if range.start < from {
+                continue;
+            }
+            let chunk_len = range.end - range.start;
+            if !finished && chunk_len < chunk_frames.max(1) {
+                break;
+            }
             let codes = trimmed.to_unshifted_tensor_range(
-                range,
+                range.clone(),
                 self.quantizer.semantic_codebook.embeddings().device(),
             )?;
             let audio = self.decode_unshifted_codes(&codes)?;
@@ -292,10 +319,11 @@ impl VoxtralCodecDecoder {
                 .to_dtype(DType::F32)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
-            trim_samples_to_frames(&mut chunk, chunk_frames, &self.config)?;
+            trim_samples_to_frames(&mut chunk, chunk_len, &self.config)?;
             samples.extend(chunk);
+            next = range.end;
         }
-        Ok(samples)
+        Ok((samples, next))
     }
 
     pub fn decode_unshifted_codes(&self, codes: &Tensor) -> Result<Tensor> {
@@ -1213,6 +1241,61 @@ mod tests {
         let timeline = VoxtralCodecTimeline::new(vec![semantic, acoustic_a, acoustic_b]).unwrap();
         let samples = decoder.decode_timeline(&timeline).unwrap();
         assert_eq!(samples.len(), 4);
+    }
+
+    /// Per-chunk emission: emitting each complete codec chunk as frames
+    /// arrive (and the partial last chunk once finished) reproduces the
+    /// whole timeline decode, and end-of-audio finishes the stream early.
+    #[test]
+    fn chunked_emission_reproduces_the_timeline_decode() {
+        let device = Device::Cpu;
+        let config = tiny_codec_config();
+        let tensors = tiny_codec_tensors(&device);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device).pp("audio_tokenizer");
+        let decoder = VoxtralCodecDecoder::load(&config, vb).unwrap();
+        let code = |i: usize, k: usize| apply_audio_token_offset(((i * 7 + k * 3) % 3) as u32);
+        let timeline_of = |frames: usize| {
+            VoxtralCodecTimeline::new(
+                (0..3)
+                    .map(|k| (0..frames).map(|i| code(i, k)).collect())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let chunk = 2;
+        let whole = decoder
+            .decode_timeline_chunks(&timeline_of(7), 0, true, chunk)
+            .unwrap()
+            .0;
+        let mut streamed = Vec::new();
+        let mut emitted = 0;
+        for frames in 1..=7 {
+            let (samples, next) = decoder
+                .decode_timeline_chunks(&timeline_of(frames), emitted, false, chunk)
+                .unwrap();
+            assert_eq!(next, frames - frames % chunk);
+            streamed.extend(samples);
+            emitted = next;
+        }
+        let (tail, next) = decoder
+            .decode_timeline_chunks(&timeline_of(7), emitted, true, chunk)
+            .unwrap();
+        streamed.extend(tail);
+        assert_eq!(next, 7);
+        assert_eq!(streamed, whole);
+
+        // End-of-audio trims the timeline and completes its partial chunk.
+        let mut ended = timeline_of(5);
+        ended.shifted_codebooks[0][3] = AudioSpecialToken::End.id();
+        let (samples, next) = decoder
+            .decode_timeline_chunks(&ended, 2, false, chunk)
+            .unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(samples.len(), config_samples(&decoder, 1));
+    }
+
+    fn config_samples(decoder: &VoxtralCodecDecoder, frames: usize) -> usize {
+        decoder.config.samples_for_frames(frames).unwrap()
     }
 
     /// VXT-8: reflect padding matches the reference `pad1d` (NumPy

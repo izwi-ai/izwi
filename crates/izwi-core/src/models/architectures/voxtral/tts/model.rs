@@ -31,7 +31,9 @@ use super::acoustic::{
     seeded_flow_noise, AcousticGenerationConfig, AudioSpecialToken, FlowMatchingAudioTransformer,
     AUDIO_SPECIAL_TOKEN_COUNT,
 };
-use super::codec::{VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline};
+use super::codec::{
+    VoxtralCodecConfig, VoxtralCodecDecoder, VoxtralCodecTimeline, VOXTRAL_CODEC_CHUNK_FRAMES,
+};
 use super::config::VoxtralTtsConfig;
 use super::retained::{
     validate_acoustic_cohort, voxtral_tts_stage_resource_envelope, VoxtralTtsDecodeBatch,
@@ -734,6 +736,39 @@ impl VoxtralTtsModel {
             sample_rate: self.codec_config.sample_rate,
             frames_generated,
         })
+    }
+}
+
+impl VoxtralTtsModel {
+    /// Per-chunk emission for a retained state: the audio of codec chunks
+    /// completed since the last call, exactly as
+    /// [`Self::retained_codec_finalize`] decodes them (chunks decode
+    /// independently). In the codec phase, it also decodes the last
+    /// partial chunk and finishes the state. Call between quanta; a request
+    /// streamed this way finishes with this call instead of the finalize.
+    pub(crate) fn stream_retained_codec_chunks(
+        &self,
+        state: &mut VoxtralTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        let pipeline = self.pipeline.as_ref().ok_or_else(|| {
+            Error::InferenceError("Voxtral TTS retained codec requires loaded weights".into())
+        })?;
+        if state.frames.is_empty() || state.phase == VoxtralTtsRetainedPhase::Finished {
+            return Ok(Vec::new());
+        }
+        let finished = state.phase == VoxtralTtsRetainedPhase::Codec;
+        let timeline = VoxtralCodecTimeline::new(frames_to_codebooks(state.frames.clone())?)?;
+        let (samples, next) = pipeline.codec_decoder.decode_timeline_chunks(
+            &timeline,
+            state.codec_emitted_frames,
+            finished,
+            VOXTRAL_CODEC_CHUNK_FRAMES,
+        )?;
+        state.codec_emitted_frames = next;
+        if finished {
+            state.phase = VoxtralTtsRetainedPhase::Finished;
+        }
+        Ok(samples)
     }
 }
 
