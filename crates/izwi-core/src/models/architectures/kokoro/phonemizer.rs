@@ -1,8 +1,67 @@
+//! Kokoro's grapheme-to-phoneme front end.
+//!
+//! Kokoro was trained on misaki phonemes (hexgrad/misaki @ fba12365). For
+//! English, misaki looks words up in its gold/silver lexicons and falls back
+//! to espeak-ng through `EspeakFallback`, which rewrites espeak's IPA into
+//! misaki's symbols (diphthongs `A I O Q W Y`, `ɜɹ`, `ᵊ`, the US flap `T`,
+//! no US length marks). Other languages use `EspeakG2P` (tied phonemes to
+//! misaki symbols, language-switch flags and `-` removed). Both keep
+//! punctuation as tokens, so pauses, questions and sentence ends reach the
+//! model.
+//!
+//! This module implements the espeak-based half of that front end: every
+//! word goes through espeak-ng with misaki's espeak-to-misaki (E2M) rules,
+//! and punctuation is kept as tokens. The misaki lexicons are not vendored,
+//! so in-lexicon English words get the fallback's phonemes rather than the
+//! lexicon's. Japanese and Mandarin need misaki's own G2P and are rejected.
+
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
+
+/// Punctuation Kokoro's vocabulary has tokens for (misaki `PUNCTS`). These
+/// pass through to the model; espeak-ng never sees them.
+const KOKORO_PUNCTUATION: &[char] = &[
+    ';', ':', ',', '.', '!', '?', '—', '…', '"', '(', ')', '“', '”',
+];
+
+/// Which misaki conventions a language's phonemes follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KokoroG2p {
+    /// misaki `en.G2P(british=False)`'s espeak fallback.
+    EnglishUs,
+    /// misaki `en.G2P(british=True)`'s espeak fallback.
+    EnglishGb,
+    /// misaki `EspeakG2P` (es, fr-fr, hi, it, pt-br).
+    Espeak,
+}
+
+/// The espeak-ng voice and G2P conventions for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KokoroVoice {
+    pub espeak: &'static str,
+    pub g2p: KokoroG2p,
+}
+
+impl KokoroVoice {
+    const US: Self = Self {
+        espeak: "en-us",
+        g2p: KokoroG2p::EnglishUs,
+    };
+    const GB: Self = Self {
+        espeak: "en-gb",
+        g2p: KokoroG2p::EnglishGb,
+    };
+
+    const fn espeak(espeak: &'static str) -> Self {
+        Self {
+            espeak,
+            g2p: KokoroG2p::Espeak,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EspeakPhonemizer {
@@ -31,28 +90,23 @@ impl EspeakPhonemizer {
         ))
     }
 
+    /// misaki-convention phonemes for `text`, punctuation kept as tokens.
+    /// Usually one espeak-ng call for the whole text (see
+    /// [`phonemize_with`]).
     pub fn phonemize(
         &self,
         text: &str,
         language: Option<&str>,
         speaker: Option<&str>,
     ) -> Result<String> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err(Error::InvalidInput(
-                "Kokoro TTS input text is empty".to_string(),
-            ));
-        }
+        let voice = kokoro_voice_for(language, speaker)?;
+        phonemize_with(text, voice, |input| self.run_espeak(voice.espeak, input))
+    }
 
-        if trimmed.contains('\0') {
-            return Err(Error::InvalidInput(
-                "Kokoro TTS input text contains a NUL character".to_string(),
-            ));
-        }
-
-        let voice = espeak_voice_for(language, speaker);
+    /// One espeak-ng run: IPA with `^` ties, one output line per clause.
+    fn run_espeak(&self, voice: &str, text: &str) -> Result<String> {
         let output = Command::new(&self.bin_path)
-            .args(espeak_args(&voice, trimmed))
+            .args(espeak_args(voice, text))
             .stdin(Stdio::null())
             .output()
             .map_err(|e| {
@@ -62,7 +116,6 @@ impl EspeakPhonemizer {
                     e
                 ))
             })?;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::InferenceError(format!(
@@ -70,27 +123,286 @@ impl EspeakPhonemizer {
                 stderr.trim()
             )));
         }
-
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let normalized = normalize_espeak_ipa(&raw);
-        if normalized.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stderr = stderr.trim();
-            let detail = if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            };
-            return Err(Error::InferenceError(format!(
-                "espeak-ng returned empty phonemes for Kokoro request{detail}"
-            )));
-        }
-        Ok(normalized)
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     pub fn bin_path(&self) -> &Path {
         &self.bin_path
     }
+}
+
+/// One piece of the input: words for espeak-ng, a punctuation token, or a
+/// whitespace run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    Words(String),
+    Punct(char),
+    Space,
+}
+
+/// Split `text` into words, punctuation tokens and whitespace. `...` reads
+/// as `…` and `--`/`–` as `—`. A `.` or `,` between digits (`3.50`,
+/// `1,000`) and a `.` between letters (`U.S`) stay inside the words.
+fn split_pieces(text: &str) -> Vec<Piece> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut pieces = Vec::new();
+    let mut words = String::new();
+    let flush = |words: &mut String, pieces: &mut Vec<Piece>| {
+        if !words.is_empty() {
+            pieces.push(Piece::Words(std::mem::take(words)));
+        }
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let (token, width) = if ch == '.' && chars.get(i + 1..i + 3) == Some(&['.', '.']) {
+            (Some('…'), 3)
+        } else if ch == '-' && next == Some('-') {
+            (Some('—'), 2)
+        } else if ch == '–' {
+            (Some('—'), 1)
+        } else if KOKORO_PUNCTUATION.contains(&ch) && !inside_word(ch, prev, next) {
+            (Some(ch), 1)
+        } else {
+            (None, 1)
+        };
+        match token {
+            Some(punct) => {
+                flush(&mut words, &mut pieces);
+                pieces.push(Piece::Punct(punct));
+            }
+            None if ch.is_whitespace() => {
+                flush(&mut words, &mut pieces);
+                if pieces.last() != Some(&Piece::Space) {
+                    pieces.push(Piece::Space);
+                }
+            }
+            None => words.push(ch),
+        }
+        i += width;
+    }
+    flush(&mut words, &mut pieces);
+    // Word pieces separated only by whitespace merge into one clause, so it
+    // reaches espeak whole (stress and linking depend on neighbours).
+    let mut merged: Vec<Piece> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if let Piece::Words(next) = &piece {
+            if let [.., Piece::Words(_), Piece::Space] = merged.as_slice() {
+                merged.pop();
+                if let Some(Piece::Words(words)) = merged.last_mut() {
+                    words.push(' ');
+                    words.push_str(next);
+                }
+                continue;
+            }
+        }
+        merged.push(piece);
+    }
+    merged
+}
+
+/// A `.` or `,` between digits (`3.50`, `1,000`) or a `.` between letters
+/// (`U.S`) belongs to the word, not the punctuation.
+fn inside_word(ch: char, prev: Option<char>, next: Option<char>) -> bool {
+    let between =
+        |test: fn(&char) -> bool| prev.is_some_and(|c| test(&c)) && next.is_some_and(|c| test(&c));
+    ((ch == '.' || ch == ',') && between(char::is_ascii_digit))
+        || (ch == '.' && between(|c| c.is_alphabetic()))
+}
+
+/// Phonemes for `text` in `voice`'s conventions, with `run` invoking
+/// espeak-ng on a string. The word segments between punctuation tokens go
+/// to espeak-ng in one call, joined by commas: espeak-ng ends a clause (and
+/// an output line) at every comma, so line `i` is segment `i`. If the line
+/// count does not match (espeak-ng split or merged a clause on its own),
+/// each segment is phonemized separately instead.
+pub(crate) fn phonemize_with(
+    text: &str,
+    voice: KokoroVoice,
+    mut run: impl FnMut(&str) -> Result<String>,
+) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput(
+            "Kokoro TTS input text is empty".to_string(),
+        ));
+    }
+    if trimmed.contains('\0') {
+        return Err(Error::InvalidInput(
+            "Kokoro TTS input text contains a NUL character".to_string(),
+        ));
+    }
+    let pieces = split_pieces(trimmed);
+    let segments = pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Words(words) => Some(words.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut phonemized = Vec::with_capacity(segments.len());
+    if !segments.is_empty() {
+        let lines = espeak_lines(&run(&segments.join(", "))?);
+        if lines.len() == segments.len() {
+            phonemized = lines;
+        } else {
+            for segment in &segments {
+                phonemized.push(espeak_lines(&run(segment)?).join(" "));
+            }
+        }
+    }
+    let mut phonemized = phonemized
+        .into_iter()
+        .map(|line| espeak_to_misaki(&line, voice.g2p));
+    let mut out = String::with_capacity(trimmed.len() * 2);
+    for piece in &pieces {
+        match piece {
+            Piece::Words(_) => {
+                if let Some(phonemes) = phonemized.next() {
+                    out.push_str(&phonemes);
+                }
+            }
+            Piece::Punct(punct) => out.push(*punct),
+            Piece::Space => {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    let out = out.trim().to_string();
+    if !out
+        .chars()
+        .any(|ch| !KOKORO_PUNCTUATION.contains(&ch) && ch != ' ')
+    {
+        return Err(Error::InferenceError(
+            "espeak-ng returned empty phonemes for Kokoro request".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// espeak-ng's output, one cleaned line per clause.
+fn espeak_lines(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(normalize_espeak_ipa)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// espeak-ng IPA (with `^` ties) to misaki's symbols: misaki's
+/// `EspeakFallback` for English, `EspeakG2P` otherwise.
+pub(crate) fn espeak_to_misaki(ipa: &str, g2p: KokoroG2p) -> String {
+    let mut ps = remove_language_flags(ipa);
+    match g2p {
+        KokoroG2p::EnglishUs | KokoroG2p::EnglishGb => {
+            // misaki EspeakFallback.E2M, longest first.
+            for (old, new) in [
+                ("ʔˌn\u{329}", "tᵊn"),
+                ("ʔn\u{329}", "tᵊn"),
+                ("ʔn", "tᵊn"),
+                ("a^ɪ", "I"),
+                ("a^ʊ", "W"),
+                ("d^ʒ", "ʤ"),
+                ("e^ɪ", "A"),
+                ("t^ʃ", "ʧ"),
+                ("ɔ^ɪ", "Y"),
+                ("ə^l", "ᵊl"),
+                ("ʔ", "t"),
+                ("r", "ɹ"),
+                ("x", "k"),
+                ("ç", "k"),
+                ("ɐ", "ə"),
+                ("ɚ", "əɹ"),
+                ("ɬ", "l"),
+                ("ʲ", ""),
+            ] {
+                ps = ps.replace(old, new);
+            }
+            ps = syllabic_to_schwa(&ps);
+            if g2p == KokoroG2p::EnglishGb {
+                ps = ps
+                    .replace("e^ə", "ɛː")
+                    .replace("iə", "ɪə")
+                    .replace("ə^ʊ", "Q");
+            } else {
+                ps = ps
+                    .replace("o^ʊ", "O")
+                    .replace("ɜːɹ", "ɜɹ")
+                    .replace("ɜː", "ɜɹ")
+                    .replace("ɪə", "iə")
+                    .replace('ː', "")
+                    .replace('ɾ', "T");
+            }
+        }
+        KokoroG2p::Espeak => {
+            for (old, new) in [
+                ("a^ɪ", "I"),
+                ("a^ʊ", "W"),
+                ("d^z", "ʣ"),
+                ("d^ʒ", "ʤ"),
+                ("e^ɪ", "A"),
+                ("o^ʊ", "O"),
+                ("ə^ʊ", "Q"),
+                ("s^s", "S"),
+                ("t^s", "ʦ"),
+                ("t^ʃ", "ʧ"),
+                ("ɔ^ɪ", "Y"),
+            ] {
+                ps = ps.replace(old, new);
+            }
+            ps = ps.replace('-', "");
+        }
+    }
+    ps.replace('^', "")
+}
+
+/// misaki: a syllabic consonant `C̩` becomes `ᵊC`.
+fn syllabic_to_schwa(ps: &str) -> String {
+    let chars = ps.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(ps.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars.get(i + 1) == Some(&'\u{329}') && !chars[i].is_whitespace() {
+            out.push('ᵊ');
+            out.push(chars[i]);
+            i += 2;
+        } else {
+            if chars[i] != '\u{329}' {
+                out.push(chars[i]);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Strip espeak-ng's language-switch flags such as `(en)` and `(fr)`.
+fn remove_language_flags(ipa: &str) -> String {
+    let mut out = String::with_capacity(ipa.len());
+    let mut rest = ipa;
+    while let Some(start) = rest.find('(') {
+        let after = &rest[start + 1..];
+        match after.find(')') {
+            Some(end)
+                if end > 0
+                    && after[..end]
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '-') =>
+            {
+                out.push_str(&rest[..start]);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push_str(&rest[..=start]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The espeak-ng argument vector for one phonemization call.
@@ -101,10 +413,11 @@ impl EspeakPhonemizer {
 /// The `--` terminator makes getopt treat everything after it as an operand, so
 /// the text is always phonemized literally. The text must stay the final
 /// argument, after the terminator.
-fn espeak_args<'a>(voice: &'a str, text: &'a str) -> [&'a OsStr; 6] {
+fn espeak_args<'a>(voice: &'a str, text: &'a str) -> [&'a OsStr; 7] {
     [
         OsStr::new("-q"),
-        OsStr::new("--ipa=3"),
+        OsStr::new("--ipa"),
+        OsStr::new("--tie=^"),
         OsStr::new("-v"),
         OsStr::new(voice),
         OsStr::new("--"),
@@ -129,57 +442,82 @@ fn resolve_bin(candidate: &str) -> Option<PathBuf> {
     }
 }
 
-pub fn espeak_voice_for(language: Option<&str>, speaker: Option<&str>) -> String {
-    if let Some(lang) = language {
-        let l = lang.trim().to_ascii_lowercase();
-        if !l.is_empty() {
-            if l.starts_with("en") {
-                return "en-us".to_string();
-            }
-            if l.starts_with("ja") {
-                return "ja".to_string();
-            }
-            if l.starts_with("zh") {
-                return "cmn".to_string();
-            }
-            if l.starts_with("es") {
-                return "es".to_string();
-            }
-            if l.starts_with("fr") {
-                return "fr-fr".to_string();
-            }
-            if l.starts_with("it") {
-                return "it".to_string();
-            }
-            if l.starts_with("pt") {
-                return "pt".to_string();
-            }
-            if l.starts_with("hi") {
-                return "hi".to_string();
-            }
-            if l.starts_with("de") {
-                return "de".to_string();
-            }
-        }
-    }
+/// Whether Kokoro can phonemize for `speaker`: Japanese (`j*`) and Mandarin
+/// (`z*`) voices need misaki's own G2P, which is not ported.
+pub fn kokoro_speaker_supported(speaker: &str) -> bool {
+    !matches!(
+        speaker.chars().next().map(|c| c.to_ascii_lowercase()),
+        Some('j') | Some('z')
+    )
+}
 
+fn unsupported_language(name: &str) -> Error {
+    Error::InvalidInput(format!(
+        "Kokoro does not support {name} yet: it needs misaki's {name} G2P, which is not available; use an English, Spanish, French, Hindi, Italian or Portuguese voice"
+    ))
+}
+
+/// The espeak-ng voice and G2P conventions for a request (misaki pipeline
+/// `LANG_CODES`). An explicit British language (`en-gb`, `en_GB`, `en-uk`,
+/// "british") is British English; an explicit `en-us` or "american" is US
+/// English; a generic English (`en`, "english") follows the voice's prefix,
+/// so British voices (`bf_`/`bm_`) get British phonemes. Portuguese is
+/// Brazilian (`pt-br`). Japanese and Mandarin, by language or by voice
+/// (`j*`/`z*`), are rejected as invalid input.
+pub fn kokoro_voice_for(language: Option<&str>, speaker: Option<&str>) -> Result<KokoroVoice> {
     let prefix = speaker
-        .and_then(|s| s.split('_').next())
-        .and_then(|p| p.chars().next())
+        .and_then(|s| s.trim().chars().next())
         .map(|c| c.to_ascii_lowercase());
-
     match prefix {
-        Some('j') => "ja".to_string(),
-        Some('z') => "cmn".to_string(),
-        Some('p') => "pt".to_string(),
-        Some('i') => "it".to_string(),
-        Some('f') => "fr-fr".to_string(),
-        Some('e') => "es".to_string(),
-        Some('h') => "hi".to_string(),
-        Some('b') => "en-gb".to_string(),
-        Some('a') | Some('m') | Some('u') => "en-us".to_string(),
-        _ => "en-us".to_string(),
+        Some('j') => return Err(unsupported_language("Japanese")),
+        Some('z') => return Err(unsupported_language("Mandarin")),
+        _ => {}
     }
+    let from_prefix = match prefix {
+        Some('b') => KokoroVoice::GB,
+        Some('e') => KokoroVoice::espeak("es"),
+        Some('f') => KokoroVoice::espeak("fr-fr"),
+        Some('h') => KokoroVoice::espeak("hi"),
+        Some('i') => KokoroVoice::espeak("it"),
+        Some('p') => KokoroVoice::espeak("pt-br"),
+        _ => KokoroVoice::US,
+    };
+    let Some(language) = language
+        .map(|l| l.trim().to_ascii_lowercase().replace('_', "-"))
+        .filter(|l| !l.is_empty())
+    else {
+        return Ok(from_prefix);
+    };
+    let l = language.as_str();
+    let voice = if matches!(l, "en-gb" | "en-uk" | "british" | "british english") {
+        KokoroVoice::GB
+    } else if matches!(l, "en-us" | "american" | "american english") {
+        KokoroVoice::US
+    } else if l.starts_with("en") || l == "english" {
+        match from_prefix.g2p {
+            KokoroG2p::EnglishGb => KokoroVoice::GB,
+            _ => KokoroVoice::US,
+        }
+    } else if l.starts_with("ja") || l == "japanese" {
+        return Err(unsupported_language("Japanese"));
+    } else if l.starts_with("zh") || l.starts_with("cmn") || matches!(l, "chinese" | "mandarin") {
+        return Err(unsupported_language("Mandarin"));
+    } else if l.starts_with("es") || l == "spanish" {
+        KokoroVoice::espeak("es")
+    } else if l.starts_with("fr") || l == "french" {
+        KokoroVoice::espeak("fr-fr")
+    } else if l.starts_with("it") || l == "italian" {
+        KokoroVoice::espeak("it")
+    } else if l.starts_with("pt") || l == "portuguese" {
+        KokoroVoice::espeak("pt-br")
+    } else if l.starts_with("hi") || l == "hindi" {
+        KokoroVoice::espeak("hi")
+    } else if l.starts_with("de") || l == "german" {
+        KokoroVoice::espeak("de")
+    } else {
+        from_prefix
+    };
+    Ok(voice)
 }
 
 pub fn normalize_espeak_ipa(raw: &str) -> String {
@@ -190,7 +528,7 @@ pub fn normalize_espeak_ipa(raw: &str) -> String {
         let mapped = match ch {
             '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FE0F}' => None,
             '\r' | '\n' | '\t' => Some(' '),
-            // Common eSpeak combining tie; Kokoro vocab uses precomposed affricates too.
+            // Common eSpeak combining tie; ties arrive as `^` (`--tie=^`).
             '\u{0361}' => None,
             _ if ch.is_control() => None,
             _ => Some(ch),
@@ -208,20 +546,13 @@ pub fn normalize_espeak_ipa(raw: &str) -> String {
             }
         }
     }
-
-    let out = out
-        .replace("dʒ", "ʤ")
-        .replace("tʃ", "ʧ")
-        .replace("d\u{200d}ʒ", "ʤ")
-        .replace("t\u{200d}ʃ", "ʧ");
-
     out.trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{espeak_args, espeak_voice_for, normalize_espeak_ipa, EspeakPhonemizer};
-    use std::ffi::OsStr;
+    use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn espeak_args_terminate_options_before_user_text() {
@@ -267,11 +598,11 @@ mod tests {
         let minus = espeak
             .phonemize("-5 degrees outside.", Some("en"), None)
             .expect("`-5 degrees` must phonemize");
-        assert!(minus.starts_with("mˈaɪnəs"), "got {minus:?}");
+        assert!(minus.starts_with("mˈInəs"), "got {minus:?}");
         let item = espeak
             .phonemize("- First item, then second.", Some("en"), None)
             .expect("`- First item` must phonemize");
-        assert!(item.contains("fˈɜːst"), "got {item:?}");
+        assert!(item.contains("fˈɜɹst"), "got {item:?}");
         let version = espeak
             .phonemize("--version", Some("en"), None)
             .expect("`--version` must phonemize");
@@ -307,11 +638,193 @@ mod tests {
         assert_eq!(normalize_espeak_ipa(raw), "həlˈoʊ wˈɜːld");
     }
 
+    /// KOK-4: golden espeak-ng 1.52 lines (`--ipa --tie=^`) through misaki's
+    /// `EspeakFallback` rules, derived by hand from misaki @ fba12365
+    /// `espeak.py` (the E2M table, the syllabic rule, then the US or GB
+    /// rewrites). misaki itself gives `həlˈO wˈɜɹld` for "Hello world".
     #[test]
-    fn infers_espeak_voice_from_kokoro_speaker_prefix() {
-        assert_eq!(espeak_voice_for(None, Some("af_heart")), "en-us");
-        assert_eq!(espeak_voice_for(None, Some("bf_lily")), "en-gb");
-        assert_eq!(espeak_voice_for(None, Some("jf_alpha")), "ja");
-        assert_eq!(espeak_voice_for(None, Some("zf_xiaobei")), "cmn");
+    fn english_espeak_ipa_maps_to_misaki_symbols() {
+        let us = [
+            ("həlˈo^ʊ wˈɜːld", "həlˈO wˈɜɹld"),
+            ("nˈo^ʊ wˈɔːɾɚ", "nˈO wˈɔTəɹ"),
+            ("nˈɜːs bˈʌʔn̩ lˈɪɾə^l", "nˈɜɹs bˈʌtᵊn lˈɪTᵊl"),
+            ("wˈe^ɪt", "wˈAt"),
+            ("a^ɪm fˈa^ɪn", "Im fˈIn"),
+            ("hˈa^ʊ ɑːɹ juː", "hˈW ɑɹ ju"),
+            ("bˈɔ^ɪ d^ʒˈʌmpt t^ʃˈiːz", "bˈY ʤˈʌmpt ʧˈiz"),
+            ("ɹˈi^əli", "ɹˈiəli"),
+            ("lˈɑːk (fr)lə(en)", "lˈɑk lə"),
+        ];
+        for (raw, expected) in us {
+            assert_eq!(
+                espeak_to_misaki(raw, KokoroG2p::EnglishUs),
+                expected,
+                "US {raw}"
+            );
+        }
+        let gb = [
+            ("həlˈə^ʊ wˈɜːld", "həlˈQ wˈɜːld"),
+            ("nˈə^ʊ wˈɔːtə", "nˈQ wˈɔːtə"),
+            ("ðˈe^ə", "ðˈɛː"),
+            ("nˈiə", "nˈɪə"),
+            ("fˈa^ɪn", "fˈIn"),
+        ];
+        for (raw, expected) in gb {
+            assert_eq!(
+                espeak_to_misaki(raw, KokoroG2p::EnglishGb),
+                expected,
+                "GB {raw}"
+            );
+        }
+        let other = [
+            ("t^ʃˈa^ʊ", "ʧˈW"),
+            ("kˌomʊ vosˌe estˈa", "kˌomʊ vosˌe estˈa"),
+            ("pit^sa d^zˈe-ɾo", "piʦa ʣˈeɾo"),
+        ];
+        for (raw, expected) in other {
+            assert_eq!(
+                espeak_to_misaki(raw, KokoroG2p::Espeak),
+                expected,
+                "espeak {raw}"
+            );
+        }
+    }
+
+    /// KOK-3: punctuation becomes tokens in its original place, the words
+    /// between it reach espeak-ng in one call (line `i` is segment `i`), and
+    /// a line-count mismatch falls back to one call per segment.
+    #[test]
+    fn punctuation_is_kept_and_segments_are_phonemized_in_one_call() {
+        let calls = RefCell::new(Vec::new());
+        let fake = |input: &str| -> Result<String> {
+            calls.borrow_mut().push(input.to_string());
+            Ok(input
+                .split(", ")
+                .map(|segment| format!("{}^", segment.to_lowercase()))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+        let out = phonemize_with(
+            "Wait, really? Yes. No! He said “Hi” (twice) -- then... left; costs 3.50, 1,000 in the U.S. too",
+            KokoroVoice::US,
+            fake,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "wait, ɹeally? yes. no! he said “hi” (twice) — then… left; costs 3.50, 1,000 in the u.s. too"
+        );
+        assert_eq!(calls.borrow().len(), 1, "{:?}", calls.borrow());
+        assert_eq!(
+            calls.borrow()[0],
+            "Wait, really, Yes, No, He said, Hi, twice, then, left, costs 3.50, 1,000 in the U.S, too"
+        );
+
+        // espeak-ng merging two clauses: each segment is retried alone.
+        let calls = RefCell::new(0usize);
+        let merging = |input: &str| -> Result<String> {
+            *calls.borrow_mut() += 1;
+            Ok(input.replace(", ", " "))
+        };
+        let out = phonemize_with("One, two.", KokoroVoice::US, merging).unwrap();
+        assert_eq!(out, "One, two.");
+        assert_eq!(*calls.borrow(), 3);
+
+        assert!(phonemize_with("?!", KokoroVoice::US, |_| Ok(String::new())).is_err());
+        assert!(phonemize_with("   ", KokoroVoice::US, |_| Ok(String::new())).is_err());
+    }
+
+    /// KOK-3/KOK-4 live: the pinned espeak-ng 1.52 output through misaki's
+    /// rules, punctuation kept. "No!" is `nˈO!`, not the split `oʊ` the
+    /// model heard as "now".
+    #[test]
+    fn live_espeak_matches_misaki_fallback_goldens() {
+        let Some(espeak) = installed_espeak() else {
+            return;
+        };
+        let version = Command::new(espeak.bin_path())
+            .arg("--version")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        if !version.contains("1.52") {
+            eprintln!("skipping goldens pinned to espeak-ng 1.52: {version}");
+            return;
+        }
+        for (text, language, speaker, expected) in [
+            (
+                "Wait, really? Yes. No!",
+                None,
+                Some("af_heart"),
+                "wˈAt, ɹˈiəli? jˈɛs. nˈO!",
+            ),
+            (
+                "Hello world.",
+                Some("en"),
+                Some("af_heart"),
+                "həlˈO wˈɜɹld.",
+            ),
+            (
+                "Hello world.",
+                Some("en"),
+                Some("bm_george"),
+                "həlˈQ wˈɜːld.",
+            ),
+            (
+                "Hello world.",
+                Some("en-us"),
+                Some("bm_george"),
+                "həlˈO wˈɜɹld.",
+            ),
+            (
+                "The water is better, isn't it?",
+                None,
+                Some("af_heart"),
+                "ðə wˈɔTəɹɹ ɪz bˈɛTəɹ, ˈɪzənt ɪt?",
+            ),
+            (
+                "Olá, como você está?",
+                Some("pt"),
+                Some("pf_dora"),
+                "olˈa, kˌomʊ vosˌe estˈa?",
+            ),
+        ] {
+            let got = espeak.phonemize(text, language, speaker).unwrap();
+            assert_eq!(got, expected, "{text} ({language:?}, {speaker:?})");
+        }
+    }
+
+    /// KOK-5/KOK-6/KOK-7: British voices get British English for a generic
+    /// "en"; explicit variants win; Portuguese is Brazilian; Japanese and
+    /// Mandarin, by language or voice, are invalid input.
+    #[test]
+    fn voice_resolution_follows_misaki_language_codes() {
+        let voice = |language, speaker| kokoro_voice_for(language, speaker).unwrap();
+        assert_eq!(voice(None, Some("af_heart")), KokoroVoice::US);
+        assert_eq!(voice(None, Some("bf_lily")), KokoroVoice::GB);
+        assert_eq!(voice(Some("en"), Some("bm_george")), KokoroVoice::GB);
+        assert_eq!(voice(Some("English"), Some("bm_george")), KokoroVoice::GB);
+        assert_eq!(voice(Some("en-GB"), Some("af_heart")), KokoroVoice::GB);
+        assert_eq!(voice(Some("en_GB"), Some("af_heart")), KokoroVoice::GB);
+        assert_eq!(voice(Some("en-us"), Some("bm_george")), KokoroVoice::US);
+        assert_eq!(voice(Some("en"), Some("af_heart")), KokoroVoice::US);
+        assert_eq!(voice(Some("pt"), None).espeak, "pt-br");
+        assert_eq!(voice(None, Some("pf_dora")).espeak, "pt-br");
+        assert_eq!(voice(Some("Spanish"), None).espeak, "es");
+        assert_eq!(voice(None, Some("ff_siwis")).espeak, "fr-fr");
+        for (language, speaker) in [
+            (Some("ja"), None),
+            (Some("zh"), Some("af_heart")),
+            (Some("Mandarin"), None),
+            (None, Some("jf_alpha")),
+            (None, Some("zm_yunxi")),
+            (Some("en"), Some("zf_xiaobei")),
+        ] {
+            let err = kokoro_voice_for(language, speaker).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+        }
+        assert!(kokoro_speaker_supported("af_heart"));
+        assert!(!kokoro_speaker_supported("jf_alpha"));
+        assert!(!kokoro_speaker_supported("zm_yunxi"));
     }
 }

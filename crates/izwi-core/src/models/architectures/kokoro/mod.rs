@@ -649,8 +649,16 @@ impl KokoroTtsModel {
         })
     }
 
+    /// The voices Kokoro can speak. Japanese (`j*`) and Mandarin (`z*`)
+    /// voice packs ship with the checkpoint but are hidden: their G2P is not
+    /// ported, and requests for them are rejected as invalid input.
     pub fn available_speakers(&self) -> Result<Vec<String>> {
-        self.voices.list_speakers()
+        Ok(self
+            .voices
+            .list_speakers()?
+            .into_iter()
+            .filter(|speaker| phonemizer::kokoro_speaker_supported(speaker))
+            .collect())
     }
 
     pub fn prepare_request(
@@ -1197,6 +1205,10 @@ impl KokoroTtsModel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("af_heart");
+        if !phonemizer::kokoro_speaker_supported(requested) {
+            // Japanese and Mandarin voices: the typed unsupported-language error.
+            phonemizer::kokoro_voice_for(None, Some(requested))?;
+        }
         if let Some(exact) = speakers.iter().find(|s| s.as_str() == requested) {
             return Ok(exact.clone());
         }
@@ -1732,6 +1744,34 @@ mod tests {
         assert!(result.samples.iter().all(|v| v.is_finite()));
     }
 
+    /// KOK-3 live: punctuation reaches the model as tokens, so pauses and
+    /// sentence ends change the (deterministic) durations.
+    #[test]
+    fn kokoro_local_punctuation_changes_the_audio_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu"))
+            .expect("detect cpu device for Kokoro punctuation check");
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        let prepared = model
+            .prepare_request("Wait, really? Yes. No!", Some("af_heart"), None, 1.0)
+            .expect("prepare punctuated request");
+        assert!(prepared.phonemes.ends_with("nˈO!"), "{}", prepared.phonemes);
+        let samples = |text: &str| {
+            model
+                .generate_with_seed_for_test(text, Some("af_heart"), None, 1.0, 7)
+                .expect("generate")
+                .samples
+                .len()
+        };
+        assert_ne!(
+            samples("Wait, really? Yes. No!"),
+            samples("Wait really Yes No")
+        );
+    }
+
     #[test]
     fn kokoro_local_audio_regression_cpu_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
@@ -1769,8 +1809,11 @@ mod tests {
         );
 
         assert_eq!(result.sample_rate, KokoroConfig::TARGET_SAMPLE_RATE);
-        assert_eq!(result.samples.len(), 52_800, "unexpected sample length");
-        assert!((duration_s - 2.2).abs() < 0.02, "duration_s={duration_s}");
+        // misaki-convention phonemes (KOK-3/KOK-4): "həlˈO mI nˈAm ɪz bˈɛlə"
+        // has single-token diphthongs, so it is shorter than raw espeak's
+        // 52,800 samples.
+        assert_eq!(result.samples.len(), 49_800, "unexpected sample length");
+        assert!((duration_s - 2.075).abs() < 0.02, "duration_s={duration_s}");
         assert!((rms - 0.047_011).abs() < 0.015, "rms={rms}");
         assert!((peak - 0.373_43).abs() < 0.15, "peak={peak}");
         assert!((zcr - 0.222_845).abs() < 0.08, "zcr={zcr}");
