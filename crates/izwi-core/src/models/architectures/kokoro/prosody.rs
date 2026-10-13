@@ -389,7 +389,8 @@ fn bounded_duration_frames(
                 "Kokoro duration predictor produced a non-finite value".to_string(),
             ));
         }
-        let duration = value.round().max(1.0) as u32;
+        // `torch.round(duration).clamp(min=1)`: halves round to even.
+        let duration = value.round_ties_even().max(1.0) as u32;
         expanded_frames = expanded_frames
             .checked_add(duration as usize)
             .ok_or_else(|| {
@@ -1376,6 +1377,16 @@ mod tests {
                 .unwrap();
         assert_eq!(durations.len(), 512);
         assert_eq!(expanded, super::super::KOKORO_MAX_EXPANDED_FRAMES_PER_CHUNK);
+    }
+
+    /// KOK-16: durations round like `torch.round` (half to even), then
+    /// clamp to at least one frame, as kokoro model.py does.
+    #[test]
+    fn durations_round_half_to_even_like_torch() {
+        let (durations, expanded) =
+            bounded_duration_frames(vec![0.5, 1.5, 2.5, 3.49, 4.5, 0.2], 1_000).unwrap();
+        assert_eq!(durations, vec![1, 2, 2, 3, 4, 1]);
+        assert_eq!(expanded, 13);
     }
 
     #[test]
