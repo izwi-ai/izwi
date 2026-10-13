@@ -118,6 +118,23 @@ impl RequestPhaseTiming {
     }
 }
 
+/// Steps on which one session's execution plan may fail to begin before the
+/// request fails. The run loop retries a failed step every 50 ms at most, so
+/// a plan that can never begin used to retry forever (TPIPE-15, LFA-10); a
+/// transient failure clears well within this bound.
+const MAX_PLAN_BEGIN_ATTEMPTS: u32 = 64;
+
+/// Count one more failed plan begin for `session`: whether its attempts are
+/// now exhausted.
+fn plan_begin_attempts_exhausted(
+    attempts: &mut HashMap<super::SessionKey, u32>,
+    session: &super::SessionKey,
+) -> bool {
+    let count = attempts.entry(session.clone()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count >= MAX_PLAN_BEGIN_ATTEMPTS
+}
+
 /// Why [`EngineCore::begin_execution_plan`] did not register a plan.
 #[derive(Debug)]
 enum PlanBeginError {
@@ -588,6 +605,9 @@ pub struct EngineCore {
     pending_terminal_outputs: VecDeque<CommittedExecutorOutput>,
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
+    /// Consecutive steps on which a session's execution plan failed to
+    /// begin; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`] (TPIPE-15).
+    plan_begin_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
     /// Each session's current run of refused batch workspaces.
@@ -3265,6 +3285,7 @@ impl EngineCore {
             incremental_stream_sessions: HashSet::new(),
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
+            plan_begin_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
             workspace_waits: HashMap::new(),
@@ -3682,6 +3703,7 @@ impl EngineCore {
         self.active_stream_batches
             .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.plan_begin_attempts.remove(session);
         self.workspace_waits.remove(session);
     }
 
@@ -4450,25 +4472,36 @@ impl EngineCore {
             .cloned()
             .collect::<Vec<_>>();
         let mut contract_failures = Vec::new();
+        let mut exhausted = Vec::new();
         for scheduled in &all_scheduled {
+            let session = scheduled.session_key();
             match self.begin_execution_plan(scheduled).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.plan_begin_attempts.remove(&session);
+                }
                 Err(PlanBeginError::AdapterContract(error)) => {
-                    contract_failures.push((scheduled.session_key(), error));
+                    contract_failures.push((session, error));
                 }
                 Err(PlanBeginError::Engine(error)) => {
+                    if plan_begin_attempts_exhausted(&mut self.plan_begin_attempts, &session) {
+                        exhausted.push((session, error));
+                        continue;
+                    }
                     self.rollback_unexecuted_schedule(&all_scheduled);
                     return Err(error);
                 }
             }
         }
-        if !contract_failures.is_empty() {
+        if !contract_failures.is_empty() || !exhausted.is_empty() {
             // Rescheduling would select the same unsupported work on every
             // step. Fail those requests now and commit their terminal outputs;
             // the rest of this schedule runs on the next step.
             self.rollback_unexecuted_schedule(&all_scheduled);
             for (session, error) in contract_failures {
                 self.fail_adapter_contract_mismatch(&session, error).await;
+            }
+            for (session, error) in exhausted {
+                self.fail_unstartable_plan(&session, error).await;
             }
             let capacity = self.config.resolved_physical_execution_capacity();
             return Ok(Some(PreparedEngineStep::with_execution_policy(
@@ -5163,6 +5196,34 @@ impl EngineCore {
     /// Fail a request whose bound adapter cannot run the work its executor
     /// schedules. Nothing was dispatched, so the session is released like any
     /// other terminal failure.
+    /// A session whose plan failed to begin on [`MAX_PLAN_BEGIN_ATTEMPTS`]
+    /// consecutive steps fails terminally instead of retrying forever.
+    async fn fail_unstartable_plan(&mut self, session: &super::SessionKey, error: Error) {
+        warn!(
+            request_id = %session.request_id,
+            session_epoch = session.epoch,
+            error = %error,
+            attempts = MAX_PLAN_BEGIN_ATTEMPTS,
+            "Execution plan could not begin; failing the request"
+        );
+        self.plan_begin_attempts.remove(session);
+        let message =
+            format!("execution could not begin after {MAX_PLAN_BEGIN_ATTEMPTS} attempts: {error}");
+        self.terminate_request_session(
+            session,
+            ExecutorOutput::error(session.request_id.clone(), message.clone()),
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::Internal,
+                scope: FailureScope::Row,
+                retry: RetryDisposition::Never,
+                health: HealthImpact::None,
+                message,
+            }),
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted),
+        )
+        .await;
+    }
+
     async fn fail_adapter_contract_mismatch(&mut self, session: &super::SessionKey, error: Error) {
         warn!(
             request_id = %session.request_id,
@@ -5993,6 +6054,7 @@ impl EngineCore {
         self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
+        self.plan_begin_attempts.clear();
         self.workspace_retry_progress.clear();
         self.workspace_waits.clear();
         self.workspace_row_limits.clear();
@@ -7125,6 +7187,23 @@ mod tests {
             core.pending_terminal_outputs.is_empty(),
             "a completed scheduler session must not receive a second terminal event"
         );
+    }
+
+    /// TPIPE-15: a plan that fails to begin is retried, but only for
+    /// [`MAX_PLAN_BEGIN_ATTEMPTS`] consecutive steps per session, and a
+    /// successful begin or another session does not share the count.
+    #[test]
+    fn plan_begin_retries_are_bounded_per_session() {
+        let mut attempts = HashMap::new();
+        let session = super::super::SessionKey::new("stuck".into(), 1);
+        let other = super::super::SessionKey::new("other".into(), 1);
+        for _ in 1..MAX_PLAN_BEGIN_ATTEMPTS {
+            assert!(!plan_begin_attempts_exhausted(&mut attempts, &session));
+        }
+        assert!(!plan_begin_attempts_exhausted(&mut attempts, &other));
+        assert!(plan_begin_attempts_exhausted(&mut attempts, &session));
+        attempts.remove(&session);
+        assert!(!plan_begin_attempts_exhausted(&mut attempts, &session));
     }
 
     #[tokio::test]
