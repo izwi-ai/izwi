@@ -2638,7 +2638,7 @@ fn resolve_speech_history_output_frames(
 fn normalize_for_model_capabilities(
     route_kind: SpeechRouteKind,
     variant: ModelVariant,
-    mut req: CreateSpeechHistoryRecordRequest,
+    req: CreateSpeechHistoryRecordRequest,
 ) -> Result<CreateSpeechHistoryRecordRequest, ApiError> {
     let capabilities = variant.speech_capabilities().ok_or_else(|| {
         ApiError::bad_request(format!(
@@ -2668,9 +2668,7 @@ fn normalize_for_model_capabilities(
         .map(has_non_empty_text)
         .unwrap_or(false);
 
-    if req.speed.is_some() && !capabilities.supports_speed_control {
-        req.speed = None;
-    }
+    crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
 
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(
@@ -3480,19 +3478,26 @@ mod tests {
     }
 
     #[test]
-    fn speed_is_ignored_for_models_without_speed_control() {
+    fn speed_is_refused_for_models_without_speed_control() {
+        let request = |speed| CreateSpeechHistoryRecordRequest {
+            model_id: Some("LFM2.5-Audio-1.5B-GGUF".to_string()),
+            speed,
+            speaker: Some("US Female".to_string()),
+            ..base_request()
+        };
+        let error = normalize_for_model_capabilities(
+            SpeechRouteKind::TextToSpeech,
+            ModelVariant::Lfm25Audio15BGguf,
+            request(Some(1.2)),
+        )
+        .expect_err("an unsupported speed is refused, not dropped");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         let normalized = normalize_for_model_capabilities(
             SpeechRouteKind::TextToSpeech,
             ModelVariant::Lfm25Audio15BGguf,
-            CreateSpeechHistoryRecordRequest {
-                model_id: Some("LFM2.5-Audio-1.5B-GGUF".to_string()),
-                speed: Some(1.2),
-                speaker: Some("US Female".to_string()),
-                ..base_request()
-            },
+            request(Some(1.0)),
         )
-        .expect("request should normalize");
-
-        assert_eq!(normalized.speed, None);
+        .expect("speed 1.0 is always honoured");
+        assert_eq!(normalized.speed, Some(1.0));
     }
 }

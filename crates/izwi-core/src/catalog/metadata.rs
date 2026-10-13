@@ -708,7 +708,7 @@ impl ModelVariant {
                 supports_reference_voice: true,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Qwen3Tts12Hz06BCustomVoice
@@ -719,7 +719,7 @@ impl ModelVariant {
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Qwen3Tts12Hz17BCustomVoice => SpeechModelCapabilities {
@@ -728,7 +728,7 @@ impl ModelVariant {
                 supports_reference_voice: false,
                 supports_voice_description: true,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Qwen3Tts12Hz17BVoiceDesign
@@ -739,7 +739,7 @@ impl ModelVariant {
                 supports_reference_voice: false,
                 supports_voice_description: true,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Kokoro82M => SpeechModelCapabilities {
@@ -1109,6 +1109,20 @@ pub struct SpeechModelCapabilities {
     pub supports_streaming: bool,
     pub supports_speed_control: bool,
     pub supports_auto_long_form: bool,
+}
+
+impl SpeechModelCapabilities {
+    /// The `speed` a model with speed control honours, inclusive. A request
+    /// outside it (or any speed but 1.0 for a model without speed control)
+    /// is refused rather than silently clamped or dropped (TPIPE-10).
+    pub const SPEED_RANGE: (f32, f32) = (0.5, 2.0);
+
+    /// Whether this model honours `speed`.
+    pub fn honours_speed(&self, speed: f32) -> bool {
+        speed == 1.0
+            || (self.supports_speed_control
+                && (Self::SPEED_RANGE.0..=Self::SPEED_RANGE.1).contains(&speed))
+    }
 }
 
 /// Machine-readable controls exposed by chat-capable model runtimes.
@@ -1583,7 +1597,7 @@ mod tests {
                 supports_reference_voice: true,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );
@@ -1599,7 +1613,7 @@ mod tests {
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );
@@ -1611,7 +1625,7 @@ mod tests {
                 supports_reference_voice: false,
                 supports_voice_description: true,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );

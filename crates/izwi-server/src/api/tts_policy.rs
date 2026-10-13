@@ -20,6 +20,34 @@ pub(crate) fn tts_max_text_bytes() -> usize {
         .unwrap_or(1024 * 1024)
 }
 
+/// Refuse a `speed` the model cannot honour with 400 (TPIPE-10): any speed
+/// but 1.0 on a model without speed control, or one outside the supported
+/// range, instead of clamping or dropping it silently.
+pub(crate) fn validate_speech_speed(
+    variant: ModelVariant,
+    speed: Option<f32>,
+) -> Result<(), crate::error::ApiError> {
+    let Some(speed) = speed else {
+        return Ok(());
+    };
+    let capabilities = variant.speech_capabilities();
+    if capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.honours_speed(speed))
+        || (capabilities.is_none() && speed == 1.0)
+    {
+        return Ok(());
+    }
+    let (low, high) = izwi_core::catalog::SpeechModelCapabilities::SPEED_RANGE;
+    Err(crate::error::ApiError::bad_request(
+        if capabilities.is_some_and(|capabilities| capabilities.supports_speed_control) {
+            format!("`speed` must be between {low} and {high} for {variant}; got {speed}")
+        } else {
+            format!("{variant} does not support speed control; omit `speed` or set it to 1.0")
+        },
+    ))
+}
+
 /// Refuse an over-limit speech input with 413 before any model loads.
 pub(crate) fn check_tts_input_length(text: &str) -> Result<(), crate::error::ApiError> {
     let limit = tts_max_text_bytes();
@@ -166,6 +194,29 @@ fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TPIPE-10: Qwen3-TTS reads no `speed`, so it no longer advertises
+    /// speed control and refuses any speed but 1.0; Kokoro honours 0.5-2.0
+    /// and refuses a speed it would have clamped.
+    #[test]
+    fn speed_is_honoured_or_refused_never_clamped_or_dropped() {
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let kokoro = ModelVariant::Kokoro82M;
+        assert!(validate_speech_speed(qwen, None).is_ok());
+        assert!(validate_speech_speed(qwen, Some(1.0)).is_ok());
+        let error = validate_speech_speed(qwen, Some(1.5)).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("does not support speed control"));
+        assert!(validate_speech_speed(kokoro, Some(0.5)).is_ok());
+        assert!(validate_speech_speed(kokoro, Some(2.0)).is_ok());
+        let error = validate_speech_speed(kokoro, Some(0.25)).unwrap_err();
+        assert!(
+            error.message.contains("between 0.5 and 2"),
+            "{}",
+            error.message
+        );
+        assert!(validate_speech_speed(ModelVariant::FishAudioS2Pro, Some(0.9)).is_err());
+    }
 
     #[test]
     fn qwen_auto_budget_is_text_sized_and_bounded() {

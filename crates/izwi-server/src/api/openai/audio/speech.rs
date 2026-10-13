@@ -150,6 +150,7 @@ pub async fn speech(
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
     validate_speech_voice_contract(&req, variant)?;
+    crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     let streaming = resolve_streaming_mode(&req)?;
     let resolved_format = parse_response_format(
         req.response_format.as_deref().unwrap_or("wav"),

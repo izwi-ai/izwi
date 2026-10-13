@@ -397,7 +397,7 @@ pub(super) struct IncrementalModelExecutionReady {
 /// Speech-rate range every TTS request is clamped to. Clients may send
 /// OpenAI's 0.25–4.0; the engine supports 0.5–2.0 (as `izwi tts --speed`
 /// documents).
-pub(crate) const TTS_SPEED_RANGE: (f32, f32) = (0.5, 2.0);
+pub(crate) const TTS_SPEED_RANGE: (f32, f32) = crate::catalog::SpeechModelCapabilities::SPEED_RANGE;
 
 pub(crate) fn clamp_tts_speed(speed: f32) -> f32 {
     speed.clamp(TTS_SPEED_RANGE.0, TTS_SPEED_RANGE.1)
