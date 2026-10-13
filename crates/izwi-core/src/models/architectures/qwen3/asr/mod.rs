@@ -1997,7 +1997,10 @@ impl Qwen3AsrModel {
                         qwen3_runtime_profile_delta(state.profile_start),
                     );
                 }
-                let (detected_language, text) = parse_asr_output(&step.text, language);
+                // `step.text` is already parsed; parse the raw output once so
+                // the detected language survives and a transcript that starts
+                // with "language ..." is not stripped twice.
+                let (detected_language, text) = parse_asr_output(&state.assembled, language);
                 return Ok(AsrTranscriptionOutput {
                     text,
                     language: detected_language,
@@ -2851,14 +2854,11 @@ impl Qwen3AsrModel {
         })
     }
 
+    /// Raw output for [`parse_asr_output`]. Like upstream's
+    /// `batch_decode(skip_special_tokens=True)`, it keeps the non-special
+    /// `<asr_text>` marker that separates `language X` from the transcript.
     fn decode_generated_untrimmed(&self, tokens: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = tokens
-            .iter()
-            .copied()
-            .filter(|id| !is_special_generation_token(&self.specials, *id))
-            .collect();
-        let text = self.tokenizer.decode_text(&filtered)?;
-        Ok(text)
+        decode_raw_asr_output(&self.tokenizer, &self.specials, tokens)
     }
 
     fn forward_with_audio(
@@ -4349,6 +4349,22 @@ fn build_mrope_positions(
     } else {
         (start_pos..start_pos + seq_len).map(|p| p as i64).collect()
     }
+}
+
+/// Raw output for [`parse_asr_output`]. Like upstream's
+/// `batch_decode(skip_special_tokens=True)`, it keeps the non-special
+/// `<asr_text>` marker that separates `language X` from the transcript.
+fn decode_raw_asr_output(
+    tokenizer: &AsrTokenizer,
+    specials: &SpecialTokenIds,
+    tokens: &[u32],
+) -> Result<String> {
+    let filtered: Vec<u32> = tokens
+        .iter()
+        .copied()
+        .filter(|id| specials.asr_text == Some(*id) || !is_special_generation_token(specials, *id))
+        .collect();
+    tokenizer.decode_text(&filtered)
 }
 
 fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
@@ -5864,6 +5880,41 @@ mod tests {
             forced_language_name(Some("en")),
             Some("English".to_string())
         );
+    }
+
+    #[test]
+    fn gguf_output_splits_on_the_asr_text_marker_like_upstream() {
+        let tokenizer = super::tokenizer::gguf_shaped_test_tokenizer(Some("qwen3_asr")).unwrap();
+        let specials = tokenizer.specials().clone();
+        let marker = specials.asr_text.expect("<asr_text> resolved");
+        let generate = |meta: &str, text: &str| {
+            let mut ids = tokenizer.encode_text(meta).unwrap();
+            ids.push(marker);
+            ids.extend(tokenizer.encode_text(text).unwrap());
+            ids.push(specials.eos);
+            decode_raw_asr_output(&tokenizer, &specials, &ids).unwrap()
+        };
+        // Expected values follow qwen_asr.inference.utils.parse_asr_output.
+        let cases = [
+            ("language Chinese", "你好", Some("Chinese"), "你好"),
+            ("language English", "and then", Some("English"), "and then"),
+            ("language English", "123", Some("English"), "123"),
+            ("language None", "", None, ""),
+        ];
+        for (meta, text, language, expected) in cases {
+            let raw = generate(meta, text);
+            let (parsed_language, parsed) = parse_asr_output(&raw, None);
+            assert_eq!(parsed_language.as_deref(), language, "{raw}");
+            assert_eq!(parsed, expected, "{raw}");
+        }
+        // Forced language: the prompt ends in "language German<asr_text>", so
+        // the model emits text only and it is returned as-is.
+        let mut ids = tokenizer.encode_text("Hallo Welt").unwrap();
+        ids.push(specials.eos);
+        let raw = decode_raw_asr_output(&tokenizer, &specials, &ids).unwrap();
+        let (language, text) = parse_asr_output(&raw, Some("german"));
+        assert_eq!(language.as_deref(), Some("German"));
+        assert_eq!(text, "Hallo Welt");
     }
 
     #[test]
