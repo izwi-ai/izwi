@@ -342,13 +342,24 @@ pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Re
     )?;
     Ok(total)
 }
-fn qwen_tts_streaming_uses_final_only(
+
+/// Streaming requests that run the non-stream engine route and send the
+/// whole utterance as one final chunk. LFM and VibeVoice executors publish
+/// no streamed audio and no final marker, so an engine stream for them
+/// always failed after the full compute (TPIPE-4); Qwen streams
+/// progressively only with the opt-in CUDA chunked codec.
+fn tts_streaming_uses_final_only(
     is_cuda: bool,
     variant: ModelVariant,
     chunked_codec_stream_enabled: bool,
 ) -> bool {
-    matches!(variant.family(), ModelFamily::Qwen3Tts) && !(is_cuda && chunked_codec_stream_enabled)
+    match variant.family() {
+        ModelFamily::Qwen3Tts => !(is_cuda && chunked_codec_stream_enabled),
+        ModelFamily::Lfm25Audio | ModelFamily::VibeVoiceTts => true,
+        _ => false,
+    }
 }
+
 async fn send_direct_tts_chunk(
     job: &JobLease,
     chunk_tx: &mpsc::Sender<AudioChunk>,
@@ -461,7 +472,7 @@ impl RuntimeService {
                     .map(|_| variant)
             })
     }
-    async fn qwen_tts_final_only_streaming(
+    async fn final_only_tts_streaming(
         &self,
         mut request: GenerationRequest,
         chunk_tx: mpsc::Sender<AudioChunk>,
@@ -495,7 +506,7 @@ impl RuntimeService {
         }
 
         info!(
-            "Qwen3-TTS streaming emitted final-only audio in {:.1}ms (RTF {:.3}); enable IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM=1 for experimental progressive CUDA codec streaming",
+            "TTS streaming emitted final-only audio in {:.1}ms (RTF {:.3})",
             generation_time_ms, rtf
         );
         Ok(())
@@ -586,12 +597,12 @@ impl RuntimeService {
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
             return result;
         }
-        if qwen_tts_streaming_uses_final_only(
+        if tts_streaming_uses_final_only(
             self.device.kind.is_cuda(),
             resolved_variant,
             qwen_tts_cuda_chunked_codec_stream_enabled(),
         ) {
-            return self.qwen_tts_final_only_streaming(request, chunk_tx).await;
+            return self.final_only_tts_streaming(request, chunk_tx).await;
         }
         let core_params = core_params_from_generation(&request.config);
         let mut core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
@@ -685,7 +696,7 @@ mod tests {
 
     #[test]
     fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
-        assert!(qwen_tts_streaming_uses_final_only(
+        assert!(tts_streaming_uses_final_only(
             true,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             false,
@@ -694,7 +705,7 @@ mod tests {
 
     #[test]
     fn qwen_tts_cuda_streaming_respects_chunked_codec_opt_in() {
-        assert!(!qwen_tts_streaming_uses_final_only(
+        assert!(!tts_streaming_uses_final_only(
             true,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             true,
@@ -703,7 +714,7 @@ mod tests {
 
     #[test]
     fn qwen_tts_non_cuda_streaming_defaults_to_final_only() {
-        assert!(qwen_tts_streaming_uses_final_only(
+        assert!(tts_streaming_uses_final_only(
             false,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
             false,
@@ -712,11 +723,36 @@ mod tests {
 
     #[test]
     fn qwen_tts_final_only_streaming_policy_does_not_affect_non_qwen() {
-        assert!(!qwen_tts_streaming_uses_final_only(
+        assert!(!tts_streaming_uses_final_only(
             true,
             ModelVariant::Kokoro82M,
             false,
         ));
+    }
+
+    /// TPIPE-4: LFM and VibeVoice streams went through the engine stream,
+    /// whose executors emit neither audio nor a final marker, so every
+    /// OpenAI SSE request ended in `audio.failed` after the full compute.
+    /// Their streams now run the non-stream route and send one final
+    /// chunk; Fish and Voxtral keep the engine stream (their executors
+    /// publish audio and the final marker), Kokoro its direct stream.
+    #[test]
+    fn engine_tts_families_without_streamed_audio_stream_final_only() {
+        for is_cuda in [false, true] {
+            for variant in [
+                ModelVariant::Lfm25Audio15BGguf,
+                ModelVariant::VibeVoice15BTts,
+            ] {
+                assert!(tts_streaming_uses_final_only(is_cuda, variant, true));
+                assert_eq!(
+                    tts_route_target(variant, true),
+                    ExecutionTargetKind::TokenEngine
+                );
+            }
+            for variant in [ModelVariant::FishAudioS2Pro, ModelVariant::Voxtral4BTts2603] {
+                assert!(!tts_streaming_uses_final_only(is_cuda, variant, false));
+            }
+        }
     }
 
     #[test]

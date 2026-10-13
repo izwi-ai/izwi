@@ -173,16 +173,14 @@ pub async fn speech(
         .await;
     state.runtime.load_model(variant).await?;
 
-    let timeout = Duration::from_secs(resolve_speech_timeout_secs(
-        state.request_timeout_secs,
-        variant,
-        &req,
-    ));
     let format = resolved_format.format;
     let actual_format = resolved_format.label;
     let format_fallback = resolved_format.fallback;
 
-    let result = tokio::time::timeout(timeout, async {
+    // No wall clock wraps active generation (TPIPE-6): it ends on its own,
+    // on an error, or when the client disconnects and drops this future,
+    // which cancels the engine work.
+    let result = {
         let mut runtime_context = permit.runtime_context();
         runtime_context.tenant_key = tenant_key;
         let mut gen_request = build_generation_request(&req, ctx.correlation_id, false, variant)
@@ -195,10 +193,8 @@ pub async fn speech(
             req.max_output_tokens.or(req.max_tokens),
         );
         crate::api::tts_long_form::generate_long_form_tts(&state.runtime, variant, gen_request)
-            .await
-    })
-    .await
-    .map_err(|_| ApiError::internal("Request timeout"))??;
+            .await?
+    };
 
     let sample_rate = result.sample_rate;
     let samples = result.samples.clone();
@@ -387,15 +383,10 @@ async fn fish_file_speech(
         .await
         .map_err(ApiError::from)
     };
-    let timeout = Duration::from_secs(state.request_timeout_secs.max(1));
-    let (_, (body, length, rate, samples, statistics)) =
-        tokio::time::timeout(timeout, async { tokio::try_join!(generation, collect) })
-            .await
-            .map_err(|_| {
-                ApiError::internal(
-            "Synchronous speech deadline exceeded; use durable speech history for long jobs",
-        )
-            })??;
+    // The plan runs until it completes, fails, stalls (per-segment progress
+    // deadline) or the client disconnects; a fixed wall clock failed long
+    // narrations with a 500 after minutes of work (TPIPE-6).
+    let (_, (body, length, rate, samples, statistics)) = tokio::try_join!(generation, collect)?;
     let duration = samples as f64 / f64::from(rate);
     let elapsed = started.elapsed().as_secs_f64();
     let mut builder = Response::builder()
@@ -416,6 +407,14 @@ async fn fish_file_speech(
         .header("X-Actual-Response-Format", resolved_format.label);
     if let Some(stats) = statistics {
         builder = builder.header("X-Tokens-Generated", stats.tokens_generated);
+        if let Some(stop_reason) = stats.stop_reason {
+            builder = builder
+                .header("X-Stop-Reason", stop_reason.as_str())
+                .header(
+                    "X-Output-Truncated",
+                    (stop_reason == TtsStopReason::OutputBudget).to_string(),
+                );
+        }
     }
     if let Some(fallback) = resolved_format.fallback {
         builder = builder.header("X-Response-Format-Fallback", fallback);
@@ -423,58 +422,6 @@ async fn fish_file_speech(
     builder
         .body(body)
         .map_err(|e| ApiError::internal(e.to_string()))
-}
-
-fn resolve_speech_timeout_secs(
-    default_timeout_secs: u64,
-    variant: ModelVariant,
-    req: &SpeechRequest,
-) -> u64 {
-    // Keep global timeout behavior for non-Qwen TTS families.
-    let Some(model_max_frames) = variant.tts_max_output_frames_hint() else {
-        return default_timeout_secs.max(1);
-    };
-    let Some(frame_rate_hz) = variant.tts_output_frame_rate_hz_hint() else {
-        return default_timeout_secs.max(1);
-    };
-
-    // `0`/omitted means the same model-aware automatic frame budget used by
-    // the first-party product route.
-    let requested_frames = req.max_output_tokens.or(req.max_tokens);
-    let effective_frames = resolve_tts_output_frames(variant, &req.input, requested_frames)
-        .unwrap_or(model_max_frames);
-
-    // Estimate output duration from codec frame budget and requested speed.
-    let speed = req.speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
-    let estimated_audio_secs = ((effective_frames as f64) / (frame_rate_hz as f64)) / speed;
-
-    // Conservative real-time-factor multiplier for non-stream long-form synthesis.
-    let timeout_rtf = std::env::var("IZWI_TTS_TIMEOUT_RTF")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or_else(|| {
-            if variant == ModelVariant::VibeVoice15BTts {
-                izwi_core::runtime_models::architectures::vibevoice::tts::VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF
-            } else {
-                8.0
-            }
-        });
-    let timeout_padding_secs = std::env::var("IZWI_TTS_TIMEOUT_PADDING_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(30);
-    let timeout_max_secs = std::env::var("IZWI_TTS_TIMEOUT_MAX_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60);
-
-    let adaptive_secs = (estimated_audio_secs * timeout_rtf).ceil() as u64;
-    let suggested_secs = adaptive_secs
-        .saturating_add(timeout_padding_secs)
-        .min(timeout_max_secs.max(1));
-
-    default_timeout_secs.max(suggested_secs).max(1)
 }
 
 fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
@@ -1151,86 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen_auto_timeout_expands_for_long_form() {
-        let req = SpeechRequest {
-            model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
-            input: "hello ".repeat(100),
-            voice: Some("Aiden".to_string()),
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: None,
-            language: None,
-            temperature: None,
-            max_tokens: Some(0),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
-
-        let timeout =
-            resolve_speech_timeout_secs(300, ModelVariant::Qwen3Tts12Hz06BCustomVoice, &req);
-        assert!(timeout > 300, "expected adaptive timeout > default");
-    }
-
-    #[test]
-    fn explicit_small_frame_budget_keeps_timeout_near_default() {
-        let req = SpeechRequest {
-            model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
-            input: "hello".to_string(),
-            voice: Some("Aiden".to_string()),
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: Some(1.0),
-            language: None,
-            temperature: None,
-            max_tokens: Some(256),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
-
-        let timeout =
-            resolve_speech_timeout_secs(300, ModelVariant::Qwen3Tts12Hz06BCustomVoice, &req);
-        assert_eq!(timeout, 300);
-    }
-
-    #[test]
-    fn non_qwen_tts_uses_default_timeout() {
-        let req = SpeechRequest {
-            model: "Kokoro-82M".to_string(),
-            input: "hello".to_string(),
-            voice: None,
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: None,
-            language: None,
-            temperature: None,
-            max_tokens: Some(0),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
-
-        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Kokoro82M, &req);
-        assert_eq!(timeout, 300);
-    }
-
-    #[test]
     fn voxtral_tts_omitted_max_tokens_uses_text_sized_auto_budget() {
         let req = SpeechRequest {
             model: "Voxtral-4B-TTS-2603".to_string(),
@@ -1251,9 +1118,6 @@ mod tests {
             reference_text: None,
             saved_voice_id: None,
         };
-
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::Voxtral4BTts2603, &req);
-        assert_eq!(timeout, 72);
 
         let generation = build_generation_request(
             &req,
@@ -1290,9 +1154,6 @@ mod tests {
             saved_voice_id: None,
         };
 
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::VibeVoice15BTts, &req);
-        assert_eq!(timeout, 1_470);
-
         let generation = build_generation_request(
             &req,
             "test-correlation".to_string(),
@@ -1327,10 +1188,6 @@ mod tests {
             reference_text: Some("hello".to_string()),
             saved_voice_id: None,
         };
-
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::FishAudioS2Pro, &req);
-        // The conservative Fish segment estimate includes room for pauses and EOS.
-        assert_eq!(timeout, 98);
 
         let generation = build_generation_request(
             &req,

@@ -539,13 +539,16 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let runtime = state.runtime.clone();
         let task = tokio::spawn(async move { runtime.generate_streaming(request, sender).await });
         let _abort = AbortSpeechTask(task.abort_handle());
-        let segment_timeout = std::env::var("IZWI_TTS_SEGMENT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1800);
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(segment_timeout);
+        // A progress deadline, not a wall clock: a segment fails only when
+        // it publishes nothing for this long (TPIPE-6).
+        let stall_timeout = std::time::Duration::from_secs(
+            std::env::var("IZWI_TTS_SEGMENT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1800),
+        );
+        let mut deadline = tokio::time::Instant::now() + stall_timeout;
         let mut segment_duration = 0.0;
         let mut emitted = false;
         let mut segment_tokens = 0;
@@ -553,9 +556,10 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let mut segment_stop = None;
         while let Some(mut chunk) = tokio::select! {
             chunk = receiver.recv() => chunk,
-            _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::InferenceError("Speech segment timed out".into())),
+            _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::Timeout("Speech segment made no progress".into())),
             _ = output.closed() => return Err(izwi_core::Error::InferenceError("Speech consumer disconnected".into())),
         } {
+            deadline = tokio::time::Instant::now() + stall_timeout;
             if let Some(stats) = &chunk.stats {
                 if chunk.is_final {
                     segment_tokens = stats.tokens_generated;

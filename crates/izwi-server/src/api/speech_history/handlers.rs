@@ -1855,23 +1855,10 @@ async fn synthesize_record_internal(
     let mut runtime_context = permit.runtime_context();
     runtime_context.tenant_key = tenant_key;
     generation_request = generation_request.with_runtime_context(runtime_context);
-    let planned_request_count =
-        expand_generation_requests_for_long_form(&generation_request, variant).len();
-    let timeout = Duration::from_secs(resolve_generation_timeout_secs(
-        state.request_timeout_secs,
-        variant,
-        &input_text,
-        req.max_output_tokens.or(req.max_tokens),
-        req.speed,
-        planned_request_count,
-    ));
-
+    // No wall clock wraps active generation (TPIPE-6); a dropped request
+    // cancels the engine work.
     let runtime = state.runtime.clone();
-    let output = tokio::time::timeout(timeout, async {
-        generate_long_form_tts(&runtime, variant, generation_request).await
-    })
-    .await
-    .map_err(|_| ApiError::internal("Speech generation timed out"))??;
+    let output = generate_long_form_tts(&runtime, variant, generation_request).await?;
 
     let encoder = AudioEncoder::new(output.sample_rate, 1);
     let output_samples = output.samples.clone();
@@ -2726,68 +2713,6 @@ fn has_non_empty_text(raw: &str) -> bool {
     !raw.trim().is_empty()
 }
 
-fn resolve_generation_timeout_secs(
-    default_timeout_secs: u64,
-    variant: ModelVariant,
-    text: &str,
-    requested_frames: Option<usize>,
-    requested_speed: Option<f32>,
-    planned_request_count: usize,
-) -> u64 {
-    let Some(model_max_frames) = variant.tts_max_output_frames_hint() else {
-        return default_timeout_secs.max(1);
-    };
-    let Some(frame_rate_hz) = variant.tts_output_frame_rate_hz_hint() else {
-        return default_timeout_secs.max(1);
-    };
-
-    let effective_frames = resolve_speech_history_output_frames(variant, text, requested_frames)
-        .unwrap_or(model_max_frames);
-
-    let speed = requested_speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
-    let estimated_audio_secs = ((effective_frames as f64) / (frame_rate_hz as f64)) / speed;
-
-    let timeout_rtf = std::env::var("IZWI_TTS_TIMEOUT_RTF")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or_else(|| {
-            if variant == ModelVariant::VibeVoice15BTts {
-                izwi_core::runtime_models::architectures::vibevoice::tts::VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF
-            } else {
-                8.0
-            }
-        });
-    let timeout_padding_secs = std::env::var("IZWI_TTS_TIMEOUT_PADDING_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(30);
-    let timeout_max_secs = std::env::var("IZWI_TTS_TIMEOUT_MAX_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60);
-
-    let adaptive_secs = (estimated_audio_secs * timeout_rtf).ceil() as u64;
-    let suggested_secs = adaptive_secs
-        .saturating_add(timeout_padding_secs)
-        .min(timeout_max_secs.max(1));
-
-    let per_request_timeout_secs = default_timeout_secs.max(suggested_secs).max(1);
-    let request_count = planned_request_count.max(1) as u64;
-    if request_count == 1 {
-        return per_request_timeout_secs;
-    }
-
-    let long_form_timeout_max_secs = std::env::var("IZWI_TTS_LONG_FORM_TIMEOUT_MAX_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(24 * 60 * 60);
-
-    per_request_timeout_secs
-        .saturating_mul(request_count)
-        .min(long_form_timeout_max_secs.max(per_request_timeout_secs))
-}
-
 fn default_audio_filename(route_kind: SpeechRouteKind, extension: &str) -> String {
     let prefix = match route_kind {
         SpeechRouteKind::TextToSpeech => "tts",
@@ -3315,17 +3240,6 @@ mod tests {
             generation.config.options.max_tokens,
             voxtral_tts_auto_max_frames_for_text(&generation.text)
         );
-        assert_eq!(
-            resolve_generation_timeout_secs(
-                1,
-                ModelVariant::Voxtral4BTts2603,
-                &generation.text,
-                None,
-                None,
-                1,
-            ),
-            72
-        );
     }
 
     #[test]
@@ -3347,17 +3261,6 @@ mod tests {
         assert_eq!(
             generation.config.options.max_tokens,
             vibevoice_tts_auto_max_frames_for_text(&generation.text)
-        );
-        assert_eq!(
-            resolve_generation_timeout_secs(
-                1,
-                ModelVariant::VibeVoice15BTts,
-                &generation.text,
-                None,
-                None,
-                1,
-            ),
-            1_470
         );
     }
 
