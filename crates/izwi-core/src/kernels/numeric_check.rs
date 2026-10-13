@@ -17,6 +17,8 @@ use std::borrow::Cow;
 
 use candle_core::{DType, Device, Result, Tensor};
 
+use crate::backends::DTypeSelection;
+
 /// The default max-abs ceiling for a probed tensor: half of F16's 65504, so a
 /// check fails before any value can overflow F16 storage or staging.
 pub const F16_SAFE_MAX_ABS: f32 = 3.0e4;
@@ -226,6 +228,94 @@ where
     }
 }
 
+/// The representation a model loaded with after a lower-precision request:
+/// what was asked for, what loaded, why, and the self-check that decided.
+#[derive(Debug, Clone)]
+pub struct PrecisionLoad {
+    pub requested: DType,
+    pub loaded: DType,
+    pub reason: String,
+    pub self_check: Option<NumericSelfCheckReport>,
+}
+
+impl PrecisionLoad {
+    /// A load that ran no self-check (the reference dtype was selected, or
+    /// the device keeps a lower precision it has always run).
+    pub fn unchecked(selection: &DTypeSelection) -> Self {
+        Self {
+            requested: selection.dtype,
+            loaded: selection.dtype,
+            reason: selection.reason.to_string(),
+            self_check: None,
+        }
+    }
+
+    pub fn fell_back(&self) -> bool {
+        self.loaded != self.requested
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested_dtype": format!("{:?}", self.requested),
+            "loaded_dtype": format!("{:?}", self.loaded),
+            "fell_back": self.fell_back(),
+            "reason": self.reason,
+            "self_check": self.self_check.as_ref().map(NumericSelfCheckReport::diagnostics),
+        })
+    }
+}
+
+/// Loads a model at `selection.dtype` and, when `check` is set and that
+/// dtype is not `fallback`, keeps it only if `self_check` passes; otherwise
+/// the lower-precision model is dropped, the model reloads at `fallback`
+/// and the failed check is recorded as the reason. This is the load-time
+/// gate of the Metal precision recipe (report 13): every lowered dtype
+/// either proves finite and in range on unstructured input, or falls back.
+pub fn load_with_precision_fallback<T, E>(
+    label: &str,
+    selection: &DTypeSelection,
+    check: bool,
+    fallback: DType,
+    mut load: impl FnMut(DType) -> std::result::Result<T, E>,
+    self_check: impl FnOnce(&T) -> NumericSelfCheckReport,
+) -> std::result::Result<(T, PrecisionLoad), E> {
+    let model = load(selection.dtype)?;
+    if !check || selection.dtype == fallback {
+        return Ok((model, PrecisionLoad::unchecked(selection)));
+    }
+    let report = self_check(&model);
+    if report.passed {
+        return Ok((
+            model,
+            PrecisionLoad {
+                requested: selection.dtype,
+                loaded: selection.dtype,
+                reason: selection.reason.to_string(),
+                self_check: Some(report),
+            },
+        ));
+    }
+    tracing::warn!(
+        "{label} {:?} failed its load-time self-check; reloading in {fallback:?}: {}",
+        selection.dtype,
+        report.reason
+    );
+    drop(model);
+    let model = load(fallback)?;
+    Ok((
+        model,
+        PrecisionLoad {
+            requested: selection.dtype,
+            loaded: fallback,
+            reason: format!(
+                "{}; {}; fell back to {fallback:?}",
+                selection.reason, report.reason
+            ),
+            self_check: Some(report),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +401,80 @@ mod tests {
             Ok::<_, candle_core::Error>(Vec::new())
         });
         assert!(!empty.passed);
+    }
+
+    #[test]
+    fn precision_fallback_keeps_the_lower_dtype_only_when_the_check_passes() {
+        let selection = |dtype| DTypeSelection {
+            dtype,
+            reason: "family policy".into(),
+        };
+        let probe = |scale: f32| {
+            move |values: &Tensor| {
+                run_numeric_self_check("probe", F16_SAFE_MAX_ABS, || {
+                    Ok::<_, candle_core::Error>(vec![("y".into(), (values * f64::from(scale))?)])
+                })
+            }
+        };
+        let load = |loads: &mut Vec<DType>, dtype: DType| {
+            loads.push(dtype);
+            Tensor::new(&[1.0f32, -2.0], &Device::Cpu)?.to_dtype(dtype)
+        };
+
+        let mut loads = Vec::new();
+        let (model, outcome) = load_with_precision_fallback(
+            "test",
+            &selection(DType::F16),
+            true,
+            DType::F32,
+            |dtype| load(&mut loads, dtype),
+            probe(1.0),
+        )
+        .unwrap();
+        assert_eq!(
+            (loads.as_slice(), model.dtype()),
+            ([DType::F16].as_slice(), DType::F16)
+        );
+        assert!(!outcome.fell_back() && outcome.self_check.unwrap().passed);
+
+        let mut loads = Vec::new();
+        let (model, outcome) = load_with_precision_fallback(
+            "test",
+            &selection(DType::F16),
+            true,
+            DType::F32,
+            |dtype| load(&mut loads, dtype),
+            probe(1.0e5),
+        )
+        .unwrap();
+        assert_eq!(loads, [DType::F16, DType::F32]);
+        assert_eq!(model.dtype(), DType::F32);
+        assert!(outcome.fell_back());
+        assert!(
+            outcome.reason.starts_with("family policy;")
+                && outcome.reason.ends_with("fell back to F32"),
+            "{}",
+            outcome.reason
+        );
+        let diagnostics = outcome.diagnostics();
+        assert_eq!(diagnostics["requested_dtype"], "F16");
+        assert_eq!(diagnostics["loaded_dtype"], "F32");
+        assert_eq!(diagnostics["self_check"]["passed"], false);
+
+        // No check when it is off, or when the reference dtype was selected.
+        for (dtype, check) in [(DType::F16, false), (DType::F32, true)] {
+            let mut loads = Vec::new();
+            let (_, outcome) = load_with_precision_fallback(
+                "test",
+                &selection(dtype),
+                check,
+                DType::F32,
+                |dtype| load(&mut loads, dtype),
+                |_| unreachable!("no self-check"),
+            )
+            .unwrap();
+            assert_eq!(loads, [dtype]);
+            assert!(outcome.self_check.is_none() && !outcome.fell_back());
+        }
     }
 }
