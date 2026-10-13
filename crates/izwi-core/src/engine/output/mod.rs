@@ -234,19 +234,15 @@ impl OutputProcessor {
                 None
             }
         };
-        let had_error = executor_output.error.is_some();
 
         let audio = executor_output
             .audio
             .unwrap_or_else(|| AudioOutput::empty(self.sample_rate));
-        let num_tokens = if had_error {
-            executor_output.tokens_generated
-        } else {
-            executor_output.tokens_generated.max(
-                // Estimate tokens from audio length if not provided
-                (audio.streamed_samples.unwrap_or(audio.samples.len()) / 256).max(1),
-            )
-        };
+        // The executor's own count in its family's unit (frames, codec
+        // steps, text tokens). Audio length never implies a count: one
+        // sample-based estimate (samples / 256) reported 94 "tokens" a second
+        // for 12.5 Qwen frames (TPIPE-9).
+        let num_tokens = executor_output.tokens_generated;
 
         let token_stats = TokenStats {
             prompt_tokens: executor_output.tokens_processed,
@@ -482,7 +478,8 @@ mod tests {
         let output = processor.process(streaming, 1, Duration::from_secs(1));
         assert_eq!(output.audio.streamed_samples, Some(48_000));
         assert_eq!(output.rtf(), 0.5);
-        assert_eq!(output.num_tokens, 48_000 / 256);
+        // No count reported means none: audio length implies no tokens.
+        assert_eq!(output.num_tokens, 0);
         assert!(output.audio.samples.is_empty());
 
         let mut asr = ExecutorOutput::terminal("input-duration".into());
@@ -494,6 +491,19 @@ mod tests {
             processor.process(asr, 2, Duration::from_secs(1)).num_tokens,
             7
         );
+    }
+
+    /// TPIPE-9: 120 Qwen frames over 10 s of 24 kHz audio report 120, not
+    /// the 937 that samples / 256 gave.
+    #[test]
+    fn generated_tokens_are_the_executors_count_not_an_audio_estimate() {
+        let mut processor = OutputProcessor::new(24_000);
+        let mut output = ExecutorOutput::terminal("frames".into());
+        output.audio = Some(AudioOutput::new(vec![0.0; 240_000], 24_000));
+        output.tokens_generated = 120;
+        let output = processor.process(output, 1, Duration::from_secs(2));
+        assert_eq!(output.num_tokens, 120);
+        assert_eq!(output.rtf(), 0.2);
     }
 
     #[test]

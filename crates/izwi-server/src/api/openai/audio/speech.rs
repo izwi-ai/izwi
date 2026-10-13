@@ -26,7 +26,7 @@ use izwi_core::{
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
-const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
+const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-RTF-Basis, X-Wall-Time-Ms, X-Wall-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
 
 /// OpenAI-compatible speech synthesis request.
 #[derive(Debug, Deserialize)]
@@ -177,6 +177,7 @@ pub async fn speech(
     let permit = state
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
+    let request_started = std::time::Instant::now();
     state.runtime.load_model(variant).await?;
 
     let format = resolved_format.format;
@@ -214,12 +215,24 @@ pub async fn speech(
     let generation_time_ms = result.total_time_ms;
     let rtf = result.rtf();
     let tokens_generated = result.total_tokens;
+    // Two RTF bases, both reported (TPIPE-9): X-RTF over engine execution
+    // (summed across long-form segments) and X-Wall-RTF over the request's
+    // wall time from admission, as the streams report it.
+    let wall_ms = request_started.elapsed().as_secs_f64() * 1000.0;
+    let wall_rtf = if duration_secs > 0.0 {
+        wall_ms / 1000.0 / f64::from(duration_secs)
+    } else {
+        0.0
+    };
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header("X-Generation-Time-Ms", format!("{:.1}", generation_time_ms))
         .header("X-Audio-Duration-Secs", format!("{:.2}", duration_secs))
         .header("X-RTF", format!("{:.3}", rtf))
+        .header("X-RTF-Basis", "engine_execution")
+        .header("X-Wall-Time-Ms", format!("{wall_ms:.1}"))
+        .header("X-Wall-RTF", format!("{wall_rtf:.3}"))
         .header("X-Tokens-Generated", tokens_generated.to_string())
         .header("X-Audio-Sample-Rate", sample_rate.to_string())
         .header(
