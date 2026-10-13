@@ -3022,7 +3022,7 @@ fn continue_asr_resumable_prefill(
     let output = {
         let cache = state.cache.as_mut().expect("validated retained ASR cache");
         if complete {
-            Some(text_model.forward_managed_with_embeds(
+            Some(text_model.forward_managed_last_logits_with_embeds(
                 &span_embeddings,
                 span_start,
                 cache,
@@ -3083,7 +3083,8 @@ fn complete_asr_invocation_prefill(
     })?;
     let position_ids = state.prepared_position_ids.as_ref();
     let prefill_started = Instant::now();
-    let output = text_model.forward_managed_with_embeds(prepared, 0, cache, position_ids)?;
+    let output =
+        text_model.forward_managed_last_logits_with_embeds(prepared, 0, cache, position_ids)?;
     if cache.context_len() != prompt_tokens {
         return Err(Error::InferenceError(format!(
             "Qwen3 ASR invocation prefill committed physical cursor {} instead of {prompt_tokens}",
@@ -5343,10 +5344,10 @@ mod tests {
         assert!(chunked.prepared_position_ids.is_none());
         let full_output = full.unconsumed_output.as_ref().unwrap();
         let chunked_output = chunked.unconsumed_output.as_ref().unwrap();
-        assert_tensor_close(
-            &full_output.narrow(1, 3, 1).unwrap(),
-            &chunked_output.narrow(1, 1, 1).unwrap(),
-        );
+        // Prefill projects only the last prompt row.
+        assert_eq!(full_output.dim(1).unwrap(), 1);
+        assert_eq!(chunked_output.dim(1).unwrap(), 1);
+        assert_tensor_close(full_output, chunked_output);
         assert_eq!(
             full.cache.as_mut().unwrap().take_completed_writes().len(),
             1

@@ -1346,12 +1346,14 @@ impl VibeVoiceAsrModel {
         }
         let complete = span_end == prompt_tokens;
         if complete {
-            let logits = self.language_model.forward_managed_with_embeds(
-                &span,
-                span_start,
-                &mut state.cache,
-                None,
-            )?;
+            let logits = self
+                .language_model
+                .forward_managed_last_logits_with_embeds(
+                    &span,
+                    span_start,
+                    &mut state.cache,
+                    None,
+                )?;
             let next = argmax_last_logits(&logits, self.device.kind.is_cuda())?;
             let step = self.finish_decode_sample(state, next)?;
             state.staged_step = Some(step);
@@ -1692,12 +1694,9 @@ impl VibeVoiceAsrModel {
         let decode_cache_dense_max_tokens = 0;
         let cuda_device_argmax = self.device.kind.is_cuda();
         let prefill_started = Instant::now();
-        let logits = self.language_model.forward_managed_with_embeds(
-            &input_embeds,
-            0,
-            physical_cache,
-            None,
-        )?;
+        let logits = self
+            .language_model
+            .forward_managed_last_logits_with_embeds(&input_embeds, 0, physical_cache, None)?;
         let prefill_ms = elapsed_ms(prefill_started);
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();

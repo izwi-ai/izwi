@@ -3158,6 +3158,26 @@ impl Qwen3Model {
         Ok(logits)
     }
 
+    /// [`Self::forward_managed_with_embeds`] for a prefill that only samples
+    /// the next token: `lm_head` runs on the last row alone and the result is
+    /// `[1, 1, vocab]`. A 30 s Qwen3-ASR chunk otherwise projects ~400 rows
+    /// of 151,936 logits (~243 MB F32) to read one. The prepared KV writes
+    /// still commit only after the logits succeed.
+    pub fn forward_managed_last_logits_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
+        let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?;
+        let logits = self.logits_from_hidden(&last)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
+    }
+
     /// Execute caller-provided embeddings against authoritative KV pages and
     /// return the normalized decoder hidden states without applying `lm_head`.
     ///
@@ -4342,6 +4362,72 @@ mod tests {
             })
             .collect();
         PhysicalPagedKvCache::new(arena, bindings, blocks, 0).unwrap()
+    }
+
+    /// Prefill that projects only the last row returns exactly the last row of
+    /// the full projection and commits the same KV.
+    #[test]
+    fn last_row_prefill_logits_match_full_projection_last_row() {
+        let device = Device::Cpu;
+        let model = tiny_qwen3_model(&device);
+        let mut state = 0x510E_527F_ADE6_82D1u64;
+        let values = (0..7 * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect::<Vec<_>>();
+        let embeds = Tensor::from_vec(values, (1, 7, 4), &device).unwrap();
+        for (start, len) in [(0usize, 7usize), (3, 4), (6, 1)] {
+            let (full_arena, full_bindings) = test_managed_arena();
+            let (last_arena, last_bindings) = test_managed_arena();
+            let mut full = test_managed_cache(full_arena, full_bindings, 0);
+            let mut last = test_managed_cache(last_arena, last_bindings, 0);
+            if start > 0 {
+                let prefix = embeds.narrow(1, 0, start).unwrap();
+                model
+                    .forward_managed_prefill_only_with_embeds(&prefix, 0, &mut full, None)
+                    .unwrap();
+                model
+                    .forward_managed_prefill_only_with_embeds(&prefix, 0, &mut last, None)
+                    .unwrap();
+            }
+            let span = embeds.narrow(1, start, len).unwrap();
+            let full_logits = model
+                .forward_managed_with_embeds(&span, start, &mut full, None)
+                .unwrap();
+            let last_logits = model
+                .forward_managed_last_logits_with_embeds(&span, start, &mut last, None)
+                .unwrap();
+            assert_eq!(last_logits.dims(), &[1, 1, 8]);
+            assert_eq!(full.context_len(), last.context_len());
+            // A one-row matmul may round differently from the multi-row one in
+            // the last ulp (CPU gemm blocking), so compare at 1e-6 relative.
+            let expected = full_logits
+                .narrow(1, len - 1, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let actual = last_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (e, a) in expected.iter().zip(&actual) {
+                let diff = (e - a).abs();
+                assert!(
+                    diff.is_finite() && diff <= 1e-6 * e.abs().max(1.0),
+                    "span {start}+{len}: {e} vs {a}"
+                );
+            }
+            let argmax = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+            };
+            assert_eq!(argmax(&expected), argmax(&actual));
+        }
     }
 
     #[test]
