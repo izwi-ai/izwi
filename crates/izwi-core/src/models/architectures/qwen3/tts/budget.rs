@@ -9,12 +9,16 @@ use super::MAX_VOICE_CLONE_REFERENCE_FRAMES;
 /// split by long form.
 pub const QWEN3_TTS_AUTO_MAX_AUDIO_SECS: f32 = 120.0;
 const AUTO_MIN_AUDIO_SECS: f32 = 4.0;
-/// A slow speaking pace, so a slow voice still reaches end of speech inside
-/// its budget: the `ryan` voice spoke 2.35 words per second live, and a
-/// 2.5 words-per-second budget cut its last words (TPIPE-2).
-const AUTO_WORDS_PER_SECOND: f32 = 2.0;
+/// The expected speaking pace: Qwen3-TTS voices speak about 2.5 English
+/// words per second (the `ryan` voice 2.35 live).
+const AUTO_WORDS_PER_SECOND: f32 = 2.5;
 /// Mandarin and Japanese speech runs about 4-5 characters per second.
-const AUTO_CJK_CHARS_PER_SECOND: f32 = 3.0;
+const AUTO_CJK_CHARS_PER_SECOND: f32 = 4.5;
+/// Sampled pacing varies widely around the expected pace: 16 sampled runs
+/// of one 46-word paragraph ended between 222 and 328 frames. The budget
+/// grants 1.5 times the expected speech, which covers the slowest of them,
+/// so only a runaway that never reaches end of speech is cut (`length`).
+const AUTO_PACE_MARGIN: f32 = 1.5;
 const AUTO_END_PADDING_SECS: f32 = 2.0;
 
 /// Talker positions one request's prompt may take before its first frame.
@@ -28,15 +32,16 @@ pub(crate) const QWEN3_TTS_STATE_PROMPT_TOKENS: usize = 1_024;
 
 const _: () = assert!(QWEN3_TTS_STATE_PROMPT_TOKENS > MAX_VOICE_CLONE_REFERENCE_FRAMES + 16);
 
-/// The automatic output-frame budget for `text`: its speaking time at a slow
-/// pace (per language) plus padding, between 4 s and
+/// The automatic output-frame budget for `text`: 1.5 times its speaking time
+/// at the expected pace (per language) plus padding, between 4 s and
 /// [`QWEN3_TTS_AUTO_MAX_AUDIO_SECS`].
 pub fn qwen3_tts_auto_max_frames_for_text(text: &str) -> usize {
     let estimated_secs = (crate::models::shared::speech_duration::estimated_speech_secs(
         text,
         AUTO_WORDS_PER_SECOND,
         AUTO_CJK_CHARS_PER_SECOND,
-    ) + AUTO_END_PADDING_SECS)
+    ) * AUTO_PACE_MARGIN
+        + AUTO_END_PADDING_SECS)
         .clamp(AUTO_MIN_AUDIO_SECS, QWEN3_TTS_AUTO_MAX_AUDIO_SECS);
     let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
     frames.clamp(
@@ -101,6 +106,21 @@ mod tests {
         // Unspaced Mandarin is budgeted by characters, not as one word.
         let mandarin = "今天我们正在测试一个语音系统".repeat(4);
         assert!(qwen3_tts_auto_max_frames_for_text(&mandarin) >= 56 * 125 / 10 / 4);
+    }
+
+    /// Lane B, Metal: 16 sampled runs of a 46-word English paragraph ended
+    /// between 222 and 328 frames, and its 313-frame budget (2.0 words/s plus
+    /// 2 s) cut the slowest. The budget for 46 words now covers the slowest
+    /// sampled ending with room to spare, while a greedy run that never
+    /// emitted end of speech (400 frames and counting) is still cut as
+    /// `length`.
+    #[test]
+    fn automatic_budget_covers_the_slowest_sampled_pacing() {
+        let paragraph = "spoken ".repeat(46);
+        let budget = qwen3_tts_auto_max_frames_for_text(&paragraph);
+        assert!(budget >= 328 * 11 / 10, "budget {budget} frames");
+        assert!(budget >= 222 * 3 / 2, "budget {budget} frames");
+        assert!(budget < 400 * 12 / 10, "budget {budget} frames");
     }
 
     #[test]
