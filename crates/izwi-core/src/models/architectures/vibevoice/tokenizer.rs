@@ -14,6 +14,7 @@ use crate::backends::state::{
 };
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{depthwise_conv1d, is_depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateDomainId, StateUpdateKind,
@@ -1272,6 +1273,9 @@ fn load_ffn_linear(in_dim: usize, out_dim: usize, bias: bool, vb: VarBuilder) ->
 
 struct SConv1d {
     conv: Conv1d,
+    /// Depthwise mixers run through the shared shift-and-accumulate op
+    /// instead of Candle's per-channel grouped conv.
+    depthwise: bool,
     input_channels: usize,
     causal_padding: usize,
     right_padding: usize,
@@ -1310,12 +1314,25 @@ impl SConv1d {
             let right = padding_total / 2;
             (padding_total - right, right)
         };
+        let depthwise = in_channels == out_channels
+            && is_depthwise_conv1d(conv.weight(), in_channels, groups, stride);
         Ok(Self {
             conv,
+            depthwise,
             input_channels: in_channels,
             causal_padding,
             right_padding,
         })
+    }
+
+    /// The convolution over an already padded input.
+    fn conv_padded(&self, padded: &Tensor) -> Result<Tensor> {
+        if self.depthwise {
+            let spec = DepthwiseConv1dSpec::padded(0, 0).with_dilation(self.conv.config().dilation);
+            return depthwise_conv1d(padded, self.conv.weight(), self.conv.bias(), spec)
+                .map_err(Error::from);
+        }
+        self.conv.forward(padded).map_err(Error::from)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -1324,7 +1341,7 @@ impl SConv1d {
         } else {
             x.clone()
         };
-        self.conv.forward(&x).map_err(Error::from)
+        self.conv_padded(&x)
     }
 
     fn forward_streaming(&self, x: &Tensor, cache: &mut SConv1dStreamingCache) -> Result<Tensor> {
@@ -1346,7 +1363,7 @@ impl SConv1d {
         } else {
             x.clone()
         };
-        let output = self.conv.forward(&padded)?;
+        let output = self.conv_padded(&padded)?;
         cache.update_from_padded_input(&padded, self.causal_padding)?;
         Ok(output)
     }
@@ -1412,7 +1429,7 @@ impl SConv1d {
             }
             x.clone()
         };
-        let output = self.conv.forward(&padded)?;
+        let output = self.conv_padded(&padded)?;
         let output_lengths = valid_lengths
             .iter()
             .map(|length| length / stride)
@@ -2484,6 +2501,93 @@ mod tests {
             &output.mean.transpose(1, 2).unwrap(),
             0.0,
         );
+    }
+
+    /// Depthwise mixers (shared shift-and-accumulate op) match Candle's grouped
+    /// conv on the same padded input: causal and centred padding, with and
+    /// without bias, whole-sequence and streaming.
+    #[test]
+    fn depthwise_mixer_shared_op_matches_candle_grouped_conv() {
+        let device = Device::Cpu;
+        let (channels, kernel, frames) = (24usize, 7usize, 31usize);
+        for (causal, with_bias) in [(true, true), (false, false), (true, false)] {
+            let mut tensors = HashMap::new();
+            let weight = Tensor::from_vec(
+                pseudo_values(channels * kernel, 11),
+                (channels, 1, kernel),
+                &device,
+            )
+            .unwrap();
+            let bias = Tensor::from_vec(pseudo_values(channels, 12), (channels,), &device).unwrap();
+            tensors.insert("conv.conv.weight".to_string(), weight.clone());
+            if with_bias {
+                tensors.insert("conv.conv.bias".to_string(), bias.clone());
+            }
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            let layer = SConv1d::load(
+                channels, channels, kernel, 1, 1, channels, with_bias, causal, vb,
+            )
+            .unwrap();
+            assert!(layer.depthwise);
+            let x = Tensor::from_vec(
+                pseudo_values(2 * channels * frames, 13),
+                (2, channels, frames),
+                &device,
+            )
+            .unwrap();
+            let reference = Conv1d::new(
+                weight.clone(),
+                with_bias.then(|| bias.clone()),
+                Conv1dConfig {
+                    groups: channels,
+                    ..Default::default()
+                },
+            );
+            let padded = x
+                .pad_with_zeros(2, layer.causal_padding, layer.right_padding)
+                .unwrap();
+            let expected = reference.forward(&padded).unwrap();
+            let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+            let actual = layer.forward(&x).unwrap();
+            assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+            assert_eq!(expected.dims(), actual.dims());
+            let diff = (expected.clone() - actual)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(|d| if d.is_finite() { d } else { f32::INFINITY })
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff <= 1e-5,
+                "causal={causal} bias={with_bias}: max |diff| {diff}"
+            );
+
+            if causal {
+                let mut cache = layer.streaming_cache();
+                let chunks = [
+                    x.narrow(2, 0, 13).unwrap(),
+                    x.narrow(2, 13, frames - 13).unwrap(),
+                ]
+                .iter()
+                .map(|chunk| layer.forward_streaming(chunk, &mut cache).unwrap())
+                .collect::<Vec<_>>();
+                let streamed = Tensor::cat(&chunks, 2).unwrap();
+                let diff = (expected - streamed)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(diff <= 1e-5, "streaming max |diff| {diff}");
+            }
+        }
     }
 
     /// Deterministic values in [-0.5, 0.5) (xorshift32).
