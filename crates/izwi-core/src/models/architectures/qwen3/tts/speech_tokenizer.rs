@@ -990,13 +990,13 @@ impl Attention {
         })
     }
 
-    fn apply_rope(&self, x: Tensor) -> Result<Tensor> {
+    fn apply_rope(&self, x: Tensor, start_pos: usize) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
         let (cos, sin) = build_rope_cache(
             seq_len,
             self.head_dim,
-            0,
+            start_pos,
             self.rope_theta,
             x.device(),
             x.dtype(),
@@ -1018,6 +1018,11 @@ impl Attention {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_at(x, 0)
+    }
+
+    /// Attention over `x` whose first row is frame `start_pos`.
+    fn forward_at(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
 
@@ -1034,8 +1039,8 @@ impl Attention {
                 .forward(x)?
                 .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
-        q = self.apply_rope(q)?;
-        k = self.apply_rope(k)?;
+        q = self.apply_rope(q, start_pos)?;
+        k = self.apply_rope(k, start_pos)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
@@ -1143,8 +1148,13 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_at(x, 0)
+    }
+
+    /// The layer over `x` whose first row is frame `start_pos`.
+    fn forward_at(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&normed)?;
+        let attn_out = self.self_attn.forward_at(&normed, start_pos)?;
         let attn_out = attn_out.broadcast_mul(&self.self_attn_layer_scale)?;
         let x = x.broadcast_add(&attn_out)?;
 
@@ -1622,6 +1632,24 @@ pub struct SpeechTokenizerDecoder {
     vocoder_peak_window_frames: AtomicUsize,
 }
 
+/// Incremental decode state of [`SpeechTokenizerDecoder::decode_stream_step`]:
+/// the frames consumed and the bounded causal contexts. Tensors are
+/// immutable, so cloning the state is a cheap, exact checkpoint.
+#[derive(Debug, Clone)]
+pub struct SpeechTokenizerStream {
+    frames: usize,
+    pre_conv_tail: Option<Tensor>,
+    layer_tails: Vec<Option<Tensor>>,
+    latent_tail: Option<Tensor>,
+}
+
+impl SpeechTokenizerStream {
+    /// Codec frames decoded so far.
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
 /// Windowed codec-decode counters for diagnostics.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SpeechTokenizerDecodeStats {
@@ -1995,12 +2023,26 @@ impl SpeechTokenizerDecoder {
         }
         let latents = self.decode_latents(codec_tokens)?;
         let frames = latents.dim(2)?;
+        self.vocode_range(&latents, 0, frames, window_frames)
+    }
+
+    /// Samples for latent frames `from..to` of `latents`, vocoded in windows
+    /// of `window_frames` with the vocoder's causal left context from the
+    /// frames before each window (frames before `from` serve as context
+    /// only), clamped to [-1, 1].
+    fn vocode_range(
+        &self,
+        latents: &Tensor,
+        from: usize,
+        to: usize,
+        window_frames: usize,
+    ) -> Result<Vec<f32>> {
         let window_frames = window_frames.max(1);
         let upsample = self.decode_upsample_rate;
-        let mut audio = Vec::with_capacity(frames.saturating_mul(upsample));
-        let mut start = 0;
-        while start < frames {
-            let end = start.saturating_add(window_frames).min(frames);
+        let mut audio = Vec::with_capacity(to.saturating_sub(from).saturating_mul(upsample));
+        let mut start = from;
+        while start < to {
+            let end = start.saturating_add(window_frames).min(to);
             let context = self.vocoder_context_frames.min(start);
             let span = end - start + context;
             let samples = {
@@ -2030,6 +2072,123 @@ impl SpeechTokenizerDecoder {
             start = end;
         }
         Ok(audio)
+    }
+
+    /// A fresh incremental decode (QTTS-5).
+    pub fn start_stream(&self) -> SpeechTokenizerStream {
+        SpeechTokenizerStream {
+            frames: 0,
+            pre_conv_tail: None,
+            layer_tails: vec![None; self.pre_transformer_layers.len()],
+            latent_tail: None,
+        }
+    }
+
+    /// Decode the next codec frames, `new_tokens[group][frame]` (the frames
+    /// after those `stream` has consumed), and return exactly the samples a
+    /// whole-utterance [`Self::decode`] produces for them (clamped,
+    /// unnormalized). The
+    /// decoder is causal, so earlier output never changes: the pre-conv keeps
+    /// its kernel's tail, each pre-transformer layer its last
+    /// `sliding_window - 1` input frames (and absolute RoPE positions), and
+    /// the vocoder its receptive-field latents. Each step costs its own
+    /// frames plus those bounded contexts, not the prefix.
+    pub fn decode_stream_step(
+        &self,
+        stream: &mut SpeechTokenizerStream,
+        new_tokens: &[Vec<u32>],
+    ) -> Result<Vec<f32>> {
+        let frames = new_tokens.first().map_or(0, Vec::len);
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+        let latents = self.stream_latents(stream, new_tokens)?;
+        let (latents, context) = match &stream.latent_tail {
+            Some(tail) => (Tensor::cat(&[tail, &latents], 2)?, tail.dim(2)?),
+            None => (latents, 0),
+        };
+        let samples =
+            self.vocode_range(&latents, context, context + frames, VOCODER_WINDOW_FRAMES)?;
+        let latent_len = latents.dim(2)?;
+        let kept = self.vocoder_context_frames.min(latent_len);
+        stream.latent_tail = (kept > 0)
+            .then(|| latents.narrow(2, latent_len - kept, kept))
+            .transpose()?;
+        Ok(samples)
+    }
+
+    /// Like [`Self::decode_stream_step`]: the next frames' latents
+    /// (`[1, latent_dim, frames]`), exactly as [`Self::decode_latents`]
+    /// computes them for the whole utterance.
+    fn stream_latents(
+        &self,
+        stream: &mut SpeechTokenizerStream,
+        new_tokens: &[Vec<u32>],
+    ) -> Result<Tensor> {
+        let frames = new_tokens.first().map_or(0, Vec::len);
+        let start = stream.frames;
+        let total = start + frames;
+        let slice = new_tokens;
+        if frames == 0 {
+            return Err(Error::InvalidInput(
+                "speech-tokenizer stream step has no frames".into(),
+            ));
+        }
+        let first_codes = normalized_codec_indices(
+            Some(slice[0].as_slice()),
+            frames,
+            self.rvq_first.codebook.codebook_size,
+        );
+        let first_tensor = Tensor::from_vec(first_codes, (1, frames), &self.device)?;
+        let quantized = self
+            .rvq_first
+            .decode(&first_tensor)?
+            .broadcast_add(&self.rvq_rest.decode(slice, frames, &self.device)?)?;
+
+        // Pre-conv: its causal zero padding is the initial tail.
+        let pad = self.pre_conv.causal_padding;
+        let tail = match &stream.pre_conv_tail {
+            Some(tail) => tail.clone(),
+            None => Tensor::zeros(
+                (quantized.dim(0)?, quantized.dim(1)?, pad),
+                quantized.dtype(),
+                &self.device,
+            )?,
+        };
+        let joined = Tensor::cat(&[&tail, &quantized], 2)?;
+        let hidden = self.pre_conv.conv.forward(&joined)?;
+        let joined_len = joined.dim(2)?;
+        stream.pre_conv_tail = Some(joined.narrow(2, joined_len - pad, pad)?);
+
+        let mut hidden = self
+            .pre_transformer_input_proj
+            .forward(&hidden.transpose(1, 2)?)?;
+        let keep = self.config.sliding_window.saturating_sub(1);
+        for (layer, tail) in self
+            .pre_transformer_layers
+            .iter()
+            .zip(stream.layer_tails.iter_mut())
+        {
+            let (full, cached) = match tail.as_ref() {
+                Some(tail) => (Tensor::cat(&[tail, &hidden], 1)?, tail.dim(1)?),
+                None => (hidden.clone(), 0),
+            };
+            let full_len = full.dim(1)?;
+            let kept = keep.min(full_len);
+            *tail = (kept > 0)
+                .then(|| full.narrow(1, full_len - kept, kept))
+                .transpose()?;
+            hidden = layer
+                .forward_at(&full, start - cached)?
+                .narrow(1, cached, frames)?;
+        }
+        let hidden = self.pre_transformer_norm.forward(&hidden)?;
+        let latents = self
+            .pre_transformer_output_proj
+            .forward(&hidden)?
+            .transpose(1, 2)?;
+        stream.frames = total;
+        Ok(latents)
     }
 
     /// RVQ, pre-conv and the pre-transformer over every frame:
@@ -2521,6 +2680,122 @@ mod tests {
             decoder.decode(&short).unwrap(),
             decoder.decode_windowed(&short, usize::MAX).unwrap()
         );
+    }
+
+    /// QTTS-5: decoding a stream in uneven steps (single frames, steps
+    /// shorter and longer than the sliding window and the vocoder window)
+    /// reproduces the whole-utterance decode sample for sample, so a
+    /// stream never re-decodes its prefix and its chunks join seamlessly.
+    #[test]
+    fn stream_steps_reproduce_the_whole_decode() {
+        use crate::kernels::numeric_check::max_abs_diff;
+
+        let decoder = tiny_decoder();
+        let codes = xorshift_codes(4, 61, 32);
+        let whole = decoder.decode_windowed(&codes, usize::MAX).unwrap();
+        let mut stream = decoder.start_stream();
+        let mut streamed = Vec::new();
+        let mut frames = 0;
+        for step in [1usize, 5, 3, 9, 1, 19, 2, 21] {
+            let end = (frames + step).min(61);
+            let next = codes
+                .iter()
+                .map(|g| g[frames..end].to_vec())
+                .collect::<Vec<_>>();
+            let chunk = decoder.decode_stream_step(&mut stream, &next).unwrap();
+            assert_eq!(chunk.len(), (end - frames) * 24);
+            streamed.extend(chunk);
+            frames = end;
+        }
+        assert_eq!(stream.frames(), 61);
+        let none = vec![Vec::new(); 4];
+        assert!(decoder
+            .decode_stream_step(&mut stream, &none)
+            .unwrap()
+            .is_empty());
+        assert_eq!(streamed.len(), whole.len());
+        let error = max_abs_diff(&streamed, &whole);
+        assert!(error < 1e-5, "streamed decode diverges by {error}");
+    }
+
+    /// QTTS-5: the streamed pre-transformer latents equal the whole
+    /// utterance's where the attention context matters: each layer keeps
+    /// `sliding_window - 1` input frames (one frame less changes the latents
+    /// of every step's first frames about 20x past the tolerance).
+    #[test]
+    fn stream_latents_keep_each_layers_sliding_window_context() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff};
+
+        // Sharp attention (large q/k projections, unit layer scales), so a
+        // frame's latent depends visibly on its window's earlier frames.
+        struct SharpAttentionWeights;
+        impl candle_nn::var_builder::SimpleBackend for SharpAttentionWeights {
+            fn get(
+                &self,
+                shape: candle_core::Shape,
+                name: &str,
+                init: candle_nn::Init,
+                dtype: DType,
+                device: &Device,
+            ) -> candle_core::Result<Tensor> {
+                let base = XorshiftWeights.get(shape, name, init, dtype, device)?;
+                if name.contains("layer_scale") {
+                    base.ones_like()
+                } else if name.contains("q_proj") || name.contains("k_proj") {
+                    base * 8.0
+                } else if name.contains("v_proj")
+                    || name.contains("o_proj")
+                    || name.contains("output_proj")
+                {
+                    base * 4.0
+                } else {
+                    Ok(base)
+                }
+            }
+
+            fn get_unchecked(
+                &self,
+                name: &str,
+                _: DType,
+                _: &Device,
+            ) -> candle_core::Result<Tensor> {
+                candle_core::bail!("unexpected unchecked tensor request {name}")
+            }
+
+            fn contains_tensor(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let decoder = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(SharpAttentionWeights), DType::F32, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let codes = xorshift_codes(4, 40, 32);
+        let whole = host_f32(&decoder.decode_latents(&codes).unwrap()).unwrap();
+        let mut stream = decoder.start_stream();
+        let mut parts = Vec::new();
+        let mut frames = 0;
+        for step in [3usize, 1, 7, 2, 11, 16] {
+            let end = frames + step;
+            let next = codes
+                .iter()
+                .map(|g| g[frames..end].to_vec())
+                .collect::<Vec<_>>();
+            parts.push(decoder.stream_latents(&mut stream, &next).unwrap());
+            frames = end;
+        }
+        let window = decoder.config.sliding_window;
+        assert!(stream
+            .layer_tails
+            .iter()
+            .all(|tail| tail.as_ref().unwrap().dim(1).unwrap() == window - 1));
+        let streamed = host_f32(&Tensor::cat(&parts, 2).unwrap()).unwrap();
+        let error = max_abs_diff(&streamed, &whole);
+        // Float reassociation gives about 1e-6; one frame of missing
+        // context gives about 2e-5.
+        assert!(error < 5e-6, "streamed latents diverge by {error}");
     }
 
     /// The computed vocoder context really covers its receptive field: a

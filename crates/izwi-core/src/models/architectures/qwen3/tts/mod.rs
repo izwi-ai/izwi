@@ -24,7 +24,9 @@ pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
     CodeSelection, SubtalkerSampling, CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
-pub use speech_tokenizer::{SpeechTokenizerDecodeStats, SpeechTokenizerDecoder};
+pub use speech_tokenizer::{
+    SpeechTokenizerDecodeStats, SpeechTokenizerDecoder, SpeechTokenizerStream,
+};
 pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
@@ -554,6 +556,8 @@ pub struct PhysicalTtsDecodeState {
     emitted_frames: usize,
     emitted_samples: usize,
     decode_raw_token_scratch: Vec<Vec<u32>>,
+    /// The incremental codec decode once streaming has emitted audio.
+    codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
 }
 
@@ -576,6 +580,8 @@ struct PhysicalTtsDecodeBatchCheckpoint {
     emitted_frames: usize,
     emitted_samples: usize,
     decode_raw_token_scratch: Vec<Vec<u32>>,
+    /// The incremental codec decode once streaming has emitted audio.
+    codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
 }
 
@@ -612,6 +618,7 @@ impl PhysicalTtsDecodeState {
             emitted_frames: self.emitted_frames,
             emitted_samples: self.emitted_samples,
             decode_raw_token_scratch: self.decode_raw_token_scratch.clone(),
+            codec_stream: self.codec_stream.clone(),
             finished: self.finished,
         }
     }
@@ -637,6 +644,7 @@ impl PhysicalTtsDecodeState {
         self.emitted_frames = checkpoint.emitted_frames;
         self.emitted_samples = checkpoint.emitted_samples;
         self.decode_raw_token_scratch = checkpoint.decode_raw_token_scratch;
+        self.codec_stream = checkpoint.codec_stream;
         self.finished = checkpoint.finished;
     }
 
@@ -1506,6 +1514,20 @@ fn qwen3_tts_dtype_override() -> Option<String> {
 }
 
 const QWEN3_TTS_DTYPE_ENV: &str = "IZWI_QWEN_TTS_DTYPE";
+
+static QWEN3_TTS_CODEC_STREAM_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide count of codec frames decoded incrementally for streaming
+/// (QTTS-5). Each frame is decoded once; the prefix re-decode decoded about
+/// N^2 / (2 * interval) frames for an N-frame stream.
+pub fn qwen3_tts_codec_stream_frames() -> u64 {
+    QWEN3_TTS_CODEC_STREAM_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_qwen3_tts_codec_stream_frames(frames: usize) {
+    QWEN3_TTS_CODEC_STREAM_FRAMES.fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// The talker and code predictor, their projections and the text embedding
 /// stored in F16 on `f16` when given (weight-only F16), else dense.
@@ -3664,6 +3686,7 @@ impl Qwen3TtsModel {
             emitted_frames: 0,
             emitted_samples: 0,
             decode_raw_token_scratch: Vec::new(),
+            codec_stream: None,
             finished: false,
         })
     }
@@ -3679,6 +3702,7 @@ impl Qwen3TtsModel {
             &mut state.emitted_frames,
             &mut state.emitted_samples,
             &mut state.decode_raw_token_scratch,
+            &mut state.codec_stream,
             force,
         )
     }
@@ -3690,6 +3714,7 @@ impl Qwen3TtsModel {
         emitted_frames: &mut usize,
         emitted_samples: &mut usize,
         decode_raw_token_scratch: &mut Vec<Vec<u32>>,
+        codec_stream: &mut Option<SpeechTokenizerStream>,
         force: bool,
     ) -> Result<Vec<f32>> {
         let total_frames = codec_groups.first().map(Vec::len).unwrap_or(0);
@@ -3707,48 +3732,47 @@ impl Qwen3TtsModel {
             }
         }
 
-        let lookahead = if force {
-            0
-        } else {
-            stream_config.decode_lookahead_frames
-        };
-        let target_frames = total_frames.saturating_sub(lookahead);
-        if target_frames <= *emitted_frames {
-            return Ok(Vec::new());
-        }
-
         for group in codec_groups {
-            if group.len() < target_frames {
+            if group.len() < total_frames {
                 return Ok(Vec::new());
             }
         }
-
-        if self.device.kind.is_cuda() && !force && qwen_tts_cuda_chunked_codec_stream_enabled() {
-            let (samples, next_emitted_frames, next_emitted_samples) = self
-                .decode_cuda_stream_chunk(
-                    codec_groups,
-                    *emitted_frames,
-                    *emitted_samples,
-                    target_frames,
-                    stream_config,
-                    decode_raw_token_scratch,
-                )?;
-            *emitted_frames = next_emitted_frames;
-            *emitted_samples = next_emitted_samples;
-            return Ok(samples);
+        if force && *emitted_frames == 0 {
+            // Nothing streamed: one whole-utterance decode, normalized as the
+            // non-streaming output always has been.
+            self.fill_raw_codec_scratch(codec_groups, total_frames, decode_raw_token_scratch)?;
+            let decoded = self.decode_raw_codec_tokens(decode_raw_token_scratch)?;
+            *emitted_frames = total_frames;
+            *emitted_samples = decoded.len();
+            return Ok(decoded);
         }
-
-        self.fill_raw_codec_scratch(codec_groups, target_frames, decode_raw_token_scratch)?;
-        let decoded = self.decode_raw_codec_tokens(decode_raw_token_scratch)?;
-        if decoded.len() <= *emitted_samples {
-            *emitted_frames = target_frames;
+        if total_frames <= *emitted_frames {
             return Ok(Vec::new());
         }
-
-        let new_samples = decoded[*emitted_samples..].to_vec();
-        *emitted_samples = decoded.len();
-        *emitted_frames = target_frames;
-        Ok(new_samples)
+        // Streaming (QTTS-5): the decoder is causal, so each emission decodes
+        // only its new frames against bounded contexts and returns exactly
+        // the whole decode's samples for them: no prefix re-decode, no
+        // lookahead, and no per-chunk normalization (the reference streams
+        // the raw clamped waveform).
+        if codec_stream.is_none() && *emitted_frames != 0 {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS codec stream state is missing after emitted audio".into(),
+            ));
+        }
+        let stream = codec_stream.get_or_insert_with(|| self.speech_tokenizer.start_stream());
+        self.fill_raw_codec_scratch_range(
+            codec_groups,
+            *emitted_frames,
+            total_frames,
+            decode_raw_token_scratch,
+        )?;
+        let samples = self
+            .speech_tokenizer
+            .decode_stream_step(stream, decode_raw_token_scratch)?;
+        record_qwen3_tts_codec_stream_frames(total_frames - *emitted_frames);
+        *emitted_frames = total_frames;
+        *emitted_samples += samples.len();
+        Ok(samples)
     }
 
     /// The voice-clone x-vector as the reference computes it: the ECAPA
@@ -3919,38 +3943,6 @@ impl Qwen3TtsModel {
         let mut raw_codec_tokens: Vec<Vec<u32>> = Vec::new();
         self.fill_raw_codec_scratch(codec_tokens, target_frames, &mut raw_codec_tokens)?;
         self.decode_raw_codec_tokens(&raw_codec_tokens)
-    }
-
-    fn decode_cuda_stream_chunk(
-        &self,
-        codec_tokens: &[Vec<u32>],
-        emitted_frames: usize,
-        emitted_samples: usize,
-        target_frames: usize,
-        stream_config: TtsStreamingConfig,
-        scratch: &mut Vec<Vec<u32>>,
-    ) -> Result<(Vec<f32>, usize, usize)> {
-        let context_frames = emitted_frames.min(
-            stream_config
-                .decode_lookahead_frames
-                .max(stream_config.decode_interval_frames)
-                .max(4),
-        );
-        let start_frame = emitted_frames.saturating_sub(context_frames);
-        let chunk_frames = target_frames.saturating_sub(start_frame);
-        if chunk_frames == 0 {
-            return Ok((Vec::new(), emitted_frames, emitted_samples));
-        }
-
-        self.fill_raw_codec_scratch_range(codec_tokens, start_frame, target_frames, scratch)?;
-        let decoded = self.decode_raw_codec_tokens(scratch)?;
-        let skip_samples = decoded
-            .len()
-            .saturating_mul(emitted_frames.saturating_sub(start_frame))
-            / chunk_frames;
-        let new_samples = decoded.get(skip_samples..).unwrap_or(&[]).to_vec();
-        let emitted_samples = emitted_samples.saturating_add(new_samples.len());
-        Ok((new_samples, target_frames, emitted_samples))
     }
 
     fn fill_raw_codec_scratch(
@@ -5200,6 +5192,7 @@ pub(crate) mod tests {
             emitted_frames: 0,
             emitted_samples: 0,
             decode_raw_token_scratch: Vec::new(),
+            codec_stream: None,
             finished: false,
         }
     }
