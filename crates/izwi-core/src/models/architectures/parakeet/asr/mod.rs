@@ -22,6 +22,7 @@ use crate::backends::state::{
 use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
 use crate::kernels::f16_weight_linear::{
     load_weight_only_f16, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
     F16_PROJECTION_MAX_RELATIVE_L2,
@@ -1416,6 +1417,7 @@ fn parakeet_diagnostics_json(
             "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(device),
             "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
             "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(device),
+            "shared_depthwise_conv1d_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_calls(),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -2129,18 +2131,25 @@ impl ConformerConv {
         ) {
             x = fused;
         } else {
-            x = if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
+            let cfg = self.depthwise_conv.config();
+            if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
                 &x,
                 self.depthwise_conv.weight(),
-                self.depthwise_conv.config().padding,
-                self.depthwise_conv.config().stride,
-                self.depthwise_conv.config().dilation,
+                cfg.padding,
+                cfg.stride,
+                cfg.dilation,
             ) {
-                depthwise
+                x = self.batch_norm.forward_t(&depthwise, false)?;
             } else {
-                self.depthwise_conv.forward(&x)?
-            };
-            x = self.batch_norm.forward_t(&x, false)?;
+                // Non-Metal: shared shift-and-accumulate op with the folded
+                // BatchNorm instead of Candle's per-channel grouped conv.
+                x = depthwise_conv1d(
+                    &x,
+                    &self.folded_depthwise_weight,
+                    Some(&self.folded_depthwise_bias),
+                    DepthwiseConv1dSpec::symmetric(cfg.padding).with_dilation(cfg.dilation),
+                )?;
+            }
             x = swish(&x)?;
         }
         x = self.pointwise_conv2.forward(&x)?;
@@ -3016,6 +3025,46 @@ mod tests {
                 }
             })
             .fold(0.0, f32::max)
+    }
+
+    /// The non-Metal conformer conv (shared shift-and-accumulate depthwise op
+    /// with the folded BatchNorm) matches Candle's per-channel grouped conv
+    /// followed by the unfolded BatchNorm.
+    #[test]
+    fn conformer_conv_shared_depthwise_matches_candle_grouped_conv() {
+        use candle_nn::{Module, ModuleT};
+
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 0x51ED_2701, &device);
+        let values = XorShift(0xC0FF_EE11).values(2 * 37 * TINY.dim, 1.0, 0.0);
+        let x = Tensor::from_vec(values, (2, 37, TINY.dim), &device).unwrap();
+        for layer in &encoder.layers {
+            let conv = &layer.conv;
+            let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+            let actual = conv.forward(&x).unwrap();
+            assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+
+            let h = conv
+                .pointwise_conv1
+                .forward(&x.transpose(1, 2).unwrap())
+                .unwrap();
+            let gate = h.narrow(1, 0, TINY.dim).unwrap();
+            let value = h.narrow(1, TINY.dim, TINY.dim).unwrap();
+            let h = gate
+                .broadcast_mul(&candle_nn::ops::sigmoid(&value).unwrap())
+                .unwrap();
+            let h = conv.depthwise_conv.forward(&h).unwrap();
+            let h = conv.batch_norm.forward_t(&h, false).unwrap();
+            let h = super::swish(&h).unwrap();
+            let expected = conv
+                .pointwise_conv2
+                .forward(&h)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let diff = max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "max |diff| {diff}");
+        }
     }
 
     fn zero_lstm(device: &Device) -> LstmCell {
