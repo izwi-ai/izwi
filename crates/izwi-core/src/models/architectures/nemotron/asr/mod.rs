@@ -23,6 +23,7 @@ use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{InvocationTensorLease, RetainedTensorStateRuntimeV2, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{load_weight_only_f16, WeightOnlyF16Load};
 use crate::kv::v2::{
     AppendStateDomainSpec, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
     InferenceStateContract, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis,
@@ -35,8 +36,8 @@ use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
-pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 pub(crate) use nemo::nemotron_checkpoint_paths;
+pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
 pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
     causal_subsampled_len, default_realtime_state_shape, resample_linear, NemotronEncodeProfile,
@@ -154,6 +155,7 @@ pub struct NemotronAsrModel {
     runtime_plan: NemotronRuntimePlan,
     device_profile: DeviceProfile,
     dtype_selection: DTypeSelection,
+    weight_precision: WeightOnlyF16Load,
 }
 
 struct NemotronOfflinePhysicalState<'a> {
@@ -1895,7 +1897,8 @@ impl NemotronAsrModel {
             "dtype_plan": nemotron_dtype_diagnostics(
                 &self.dtype_selection,
                 &self.device_profile,
-                self.network.dtype()
+                self.network.dtype(),
+                &self.weight_precision,
             ),
             "blank_id": self.network.blank_idx(),
             "native_forward_status": "enabled_offline_fastconformer_rnnt",
@@ -1936,12 +1939,22 @@ impl NemotronAsrModel {
                 )));
             }
         };
-        let network = NemotronNetwork::load(&vb, &artifacts.config_inventory)?;
+        let projection_precision =
+            resolve_nemotron_projection_precision(&device_profile, dtype_selection.dtype);
+        let (network, weight_precision) = load_weight_only_f16(
+            "Nemotron",
+            &projection_precision,
+            &device,
+            |f16| NemotronNetwork::load(&vb, &artifacts.config_inventory, f16),
+            |network| network.weight_only_f16_self_check(&vb),
+        )?;
         info!(
-            "Loaded Nemotron ASR model on {:?} with dtype {:?} ({})",
+            "Loaded Nemotron ASR model on {:?} with dtype {:?} ({}); encoder projections in {} ({})",
             device_profile.kind,
             dtype_selection.dtype,
-            dtype_selection.reason.as_ref()
+            dtype_selection.reason.as_ref(),
+            if weight_precision.projections_f16 { "F16" } else { "the model dtype" },
+            weight_precision.reason
         );
 
         Ok(Self {
@@ -1952,6 +1965,7 @@ impl NemotronAsrModel {
             runtime_plan,
             device_profile,
             dtype_selection,
+            weight_precision,
         })
     }
 
@@ -2762,7 +2776,7 @@ impl NemotronAsrModel {
             "decoder_vocabulary_size": self.decoder.vocab_size(),
             "decoder_source": self.decoder.source(),
             "runtime": self.runtime_plan.diagnostics(),
-            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
+            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
             "prompt": prompt.diagnostics(),
             "prompt_id": prompt_id,
             "blank_id": self.network.blank_idx(),
@@ -2954,7 +2968,7 @@ impl NemotronAsrModel {
                 "prompt": request.prompt.diagnostics(),
                 "prompt_id": prompt_id,
                 "blank_id": self.network.blank_idx(),
-                "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
+                "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
                 "native_forward_status": "enabled_offline_fastconformer_rnnt",
                 "decode_mode": decode_mode,
                 "decode": decoded.stats.diagnostics(),
@@ -2982,6 +2996,69 @@ pub(crate) fn resolve_nemotron_asr_dtype(device_profile: &DeviceProfile) -> Resu
     select_nemotron_asr_dtype(device_profile, dtype_override.as_deref())
 }
 
+/// Whether the encoder's projection weights (subsampling output, FFN,
+/// attention q/k/v/out/pos and pointwise convs) load in F16 on top of an F32
+/// network on `device_profile`: F16 when they do, F32 when every weight stays
+/// at the network dtype. The rest stays F32 as in whisper.cpp's FastConformer
+/// recipe: subsampling convs, depthwise conv and its LayerNorm, LayerNorms,
+/// biases, positional biases, the prompt kernel, the RNNT predictor and the
+/// joint. On Metal `IZWI_NEMOTRON_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`)
+/// keeps them F32. Weight-only F16 needs F32 activations, so a network
+/// resolved to F16 or BF16 keeps its projections at that dtype.
+pub(crate) fn resolve_nemotron_projection_precision(
+    device_profile: &DeviceProfile,
+    network_dtype: DType,
+) -> DTypeSelection {
+    if network_dtype != DType::F32 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: format!(
+                "weight-only F16 needs F32 activations; projections stay at the {network_dtype:?} network dtype"
+            )
+            .into(),
+        };
+    }
+    let family = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
+    device_profile.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (NEMOTRON_ASR_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is one of the encoder projections that
+/// load in F16 when [`resolve_nemotron_projection_precision`] selects F16
+/// (their biases stay F32). Admission prices these at F16.
+pub(crate) fn nemotron_tensor_is_f16_projection(name: &str) -> bool {
+    let Some(encoder) = name.strip_prefix("encoder.") else {
+        return false;
+    };
+    if encoder == "pre_encode.out.weight" {
+        return true;
+    }
+    let Some((index, tail)) = encoder
+        .strip_prefix("layers.")
+        .and_then(|layer| layer.split_once('.'))
+    else {
+        return false;
+    };
+    index.parse::<usize>().is_ok()
+        && matches!(
+            tail,
+            "feed_forward1.linear1.weight"
+                | "feed_forward1.linear2.weight"
+                | "feed_forward2.linear1.weight"
+                | "feed_forward2.linear2.weight"
+                | "self_attn.linear_q.weight"
+                | "self_attn.linear_k.weight"
+                | "self_attn.linear_v.weight"
+                | "self_attn.linear_out.weight"
+                | "self_attn.linear_pos.weight"
+                | "conv.pointwise_conv1.weight"
+                | "conv.pointwise_conv2.weight"
+        )
+}
+
 fn select_nemotron_asr_dtype(
     device_profile: &DeviceProfile,
     dtype_override: Option<&str>,
@@ -3007,6 +3084,7 @@ fn nemotron_dtype_diagnostics(
     selection: &DTypeSelection,
     device_profile: &DeviceProfile,
     actual_network_dtype: DType,
+    weight_precision: &WeightOnlyF16Load,
 ) -> serde_json::Value {
     let cuda_compute_capability = device_profile
         .capabilities
@@ -3021,6 +3099,7 @@ fn nemotron_dtype_diagnostics(
         "supports_f16": device_profile.capabilities.supports_f16,
         "cuda_compute_capability": cuda_compute_capability,
         "cuda_device_name": device_profile.capabilities.cuda_device_name.as_deref(),
+        "weight_precision": weight_precision.diagnostics(),
     })
 }
 
@@ -3393,12 +3472,57 @@ mod tests {
             DType::F32
         );
 
-        let diagnostics = nemotron_dtype_diagnostics(&selection, &cuda_bf16, DType::BF16);
+        let diagnostics = nemotron_dtype_diagnostics(
+            &selection,
+            &cuda_bf16,
+            DType::BF16,
+            &WeightOnlyF16Load::dense("CUDA"),
+        );
         assert_eq!(diagnostics["model_weights"], "BF16");
         assert_eq!(diagnostics["activations"], "BF16");
         assert_eq!(diagnostics["device"], "Cuda");
         assert_eq!(diagnostics["cuda_compute_capability"], "8.9");
         assert_eq!(diagnostics["cuda_device_name"], "test-cuda");
+        assert_eq!(diagnostics["weight_precision"]["projection_weights"], "F32");
+    }
+
+    #[test]
+    fn nemotron_projection_precision_needs_metal_and_f32_activations() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(NEMOTRON_ASR_DTYPE_ENV);
+        std::env::remove_var(crate::backends::METAL_DTYPE_ENV);
+        let cpu = test_device_profile(DeviceKind::Cpu, true, true);
+        let cuda = test_device_profile(DeviceKind::Cuda, true, true);
+        let metal = test_device_profile(DeviceKind::Metal, true, true);
+
+        assert_eq!(
+            resolve_nemotron_projection_precision(&metal, DType::F32).dtype,
+            DType::F16
+        );
+        for (profile, dtype) in [
+            (&cpu, DType::F32),
+            (&cuda, DType::BF16),
+            (&cuda, DType::F32),
+            (&metal, DType::F16),
+        ] {
+            assert_eq!(
+                resolve_nemotron_projection_precision(profile, dtype).dtype,
+                DType::F32,
+                "{:?} {dtype:?}",
+                profile.kind
+            );
+        }
+        std::env::set_var(NEMOTRON_ASR_DTYPE_ENV, "f32");
+        let forced = resolve_nemotron_projection_precision(&metal, DType::F32);
+        std::env::remove_var(NEMOTRON_ASR_DTYPE_ENV);
+        assert_eq!(forced.dtype, DType::F32);
+        assert!(
+            forced.reason.contains(NEMOTRON_ASR_DTYPE_ENV),
+            "{}",
+            forced.reason
+        );
     }
 
     #[test]

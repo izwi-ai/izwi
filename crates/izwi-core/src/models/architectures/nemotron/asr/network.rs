@@ -17,6 +17,12 @@ use super::physical::{NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN, NEMOTRON_OFFLINE_PREDICT
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{
+    PointwiseConv1d, ProjectionLinear, F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -269,17 +275,34 @@ fn insert_bounded_tensor_cache<K>(
     cache.insert(key, tensor);
 }
 
+/// The host-side builder for weights that load in F16: they are read on the
+/// CPU and converted there, so their F32 form never reaches the GPU.
+fn projection_vb<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
+    match f16 {
+        Some(_) => vb.clone().set_device(Device::Cpu),
+        None => vb.clone(),
+    }
+}
+
 impl NemotronNetwork {
-    pub(super) fn load(vb: &VarBuilder, inventory: &NemotronConfigInventory) -> Result<Self> {
+    /// Loads the network with its encoder projections (subsampling output,
+    /// FFN, attention q/k/v/out/pos and pointwise convs) in F16 on `f16` when
+    /// given; see `resolve_nemotron_projection_precision`.
+    pub(super) fn load(
+        vb: &VarBuilder,
+        inventory: &NemotronConfigInventory,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         validate_inventory_for_forward(inventory)?;
 
         let preprocessor = NemotronPreprocessor::load(vb, inventory)?;
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"))?;
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"), f16)?;
 
         let mut layers = Vec::with_capacity(ENCODER_LAYERS);
         for idx in 0..ENCODER_LAYERS {
             layers.push(ConformerLayer::load(
                 vb.pp(format!("encoder.layers.{idx}")),
+                f16,
             )?);
         }
 
@@ -329,6 +352,57 @@ impl NemotronNetwork {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
+        })
+    }
+
+    /// Checks the F16 conversion against the original F32 weight of the first
+    /// FFN projection, then runs the encoder on xorshift log-mel features and
+    /// requires the subsampling output, every layer output and the prompt
+    /// kernel output to be finite and inside the F16-safe range.
+    pub(super) fn weight_only_f16_self_check(&self, vb: &VarBuilder) -> NumericSelfCheckReport {
+        run_numeric_self_check("Nemotron weight-only F16", F16_SAFE_MAX_ABS, || {
+            let layer0 = self
+                .layers
+                .first()
+                .ok_or_else(|| Error::ModelLoadError("Nemotron encoder has no layers".into()))?;
+            if let Some(converted) = layer0.ff1.linear1.as_f16() {
+                let original = mlx::load_linear_no_bias(
+                    ENCODER_DIM,
+                    FF_DIM,
+                    projection_vb(vb, Some(&Device::Cpu))
+                        .pp("encoder.layers.0.feed_forward1.linear1"),
+                )?;
+                let relative = converted.check_against(original.weight(), None, 8)?;
+                if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+                    return Err(Error::ModelLoadError(format!(
+                        "encoder.layers.0.feed_forward1.linear1 in F16 differs from its F32 weights by relative L2 {relative:.3e}"
+                    )));
+                }
+            }
+            let device = vb.device();
+            let frames = 64;
+            let features =
+                xorshift_tensor(&[1, N_MELS, frames], 0xA5A5, 2.0, device)?.to_dtype(self.dtype)?;
+            let (mut x, encoded_len) = self.pre_encode.forward(&features, frames)?;
+            let mut outputs = vec![("pre_encode".to_string(), x.clone())];
+            let pos_emb = self.rel_positional_embedding(encoded_len, x.dtype(), device)?;
+            let att_mask = self.limited_context_mask(
+                encoded_len,
+                self.left_context_frames,
+                self.right_context_frames,
+                x.dtype(),
+                device,
+            )?;
+            for (index, layer) in self.layers.iter().enumerate() {
+                x = layer.forward(&x, &pos_emb, &att_mask)?;
+                outputs.push((format!("layers.{index}"), x.clone()));
+            }
+            let prompt_id = self.prompt_dictionary.values().copied().min().unwrap_or(0);
+            outputs.push((
+                "prompt_kernel".to_string(),
+                self.prompt_kernel.forward(&x, prompt_id)?,
+            ));
+            Ok::<_, Error>(outputs)
         })
     }
 
@@ -2278,12 +2352,12 @@ struct ConvSubsamplingDw {
     conv3: Conv2d,
     conv5: Conv2d,
     conv6: Conv2d,
-    out: Linear,
+    out: ProjectionLinear,
     out_feature_bins: usize,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
         let stride_cfg = causal_stride2_conv_config();
         let point_cfg = Conv2dConfig {
             stride: 1,
@@ -2311,7 +2385,9 @@ impl ConvSubsamplingDw {
             point_cfg,
             vb.pp("conv.6"),
         )?;
-        let (out, out_feature_bins) = load_subsampling_out_projection(vb.pp("out"))?;
+        let (out, out_feature_bins) =
+            load_subsampling_out_projection(projection_vb(&vb, f16).pp("out"))?;
+        let out = ProjectionLinear::new(out, f16)?;
 
         Ok(Self {
             conv0,
@@ -2549,16 +2625,16 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
         Ok(Self {
             norm_ff1: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward1"))?,
-            ff1: FeedForward::load(vb.pp("feed_forward1"))?,
+            ff1: FeedForward::load(vb.pp("feed_forward1"), f16)?,
             norm_self_att: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_self_att"))?,
-            self_attn: RelPosSelfAttention::load(vb.pp("self_attn"))?,
+            self_attn: RelPosSelfAttention::load(vb.pp("self_attn"), f16)?,
             norm_conv: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_conv"))?,
-            conv: ConformerConv::load(vb.pp("conv"))?,
+            conv: ConformerConv::load(vb.pp("conv"), f16)?,
             norm_ff2: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward2"))?,
-            ff2: FeedForward::load(vb.pp("feed_forward2"))?,
+            ff2: FeedForward::load(vb.pp("feed_forward2"), f16)?,
             norm_out: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_out"))?,
         })
     }
@@ -2647,15 +2723,22 @@ impl ConformerLayer {
 }
 
 struct FeedForward {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ProjectionLinear,
+    linear2: ProjectionLinear,
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let vb = projection_vb(&vb, f16);
         Ok(Self {
-            linear1: mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?,
-            linear2: mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?,
+            linear1: ProjectionLinear::new(
+                mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?,
+                f16,
+            )?,
+            linear2: ProjectionLinear::new(
+                mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?,
+                f16,
+            )?,
         })
     }
 
@@ -2669,20 +2752,24 @@ impl FeedForward {
 }
 
 struct ConformerConv {
-    pointwise_conv1: Conv1d,
+    pointwise_conv1: PointwiseConv1d,
     depthwise_conv: Conv1d,
     conv_norm: LayerNorm,
-    pointwise_conv2: Conv1d,
+    pointwise_conv2: PointwiseConv1d,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let pointwise_conv1 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM * 2,
-            1,
-            Conv1dConfig::default(),
-            vb.pp("pointwise_conv1"),
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let pointwise_vb = projection_vb(&vb, f16);
+        let pointwise_conv1 = PointwiseConv1d::new(
+            mlx::load_conv1d_no_bias(
+                ENCODER_DIM,
+                ENCODER_DIM * 2,
+                1,
+                Conv1dConfig::default(),
+                pointwise_vb.pp("pointwise_conv1"),
+            )?,
+            f16,
         )?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
@@ -2701,12 +2788,15 @@ impl ConformerConv {
             pointwise_conv1,
             depthwise_conv,
             conv_norm: load_conv_channel_layer_norm(vb.pp("batch_norm"))?,
-            pointwise_conv2: mlx::load_conv1d_no_bias(
-                ENCODER_DIM,
-                ENCODER_DIM,
-                1,
-                Conv1dConfig::default(),
-                vb.pp("pointwise_conv2"),
+            pointwise_conv2: PointwiseConv1d::new(
+                mlx::load_conv1d_no_bias(
+                    ENCODER_DIM,
+                    ENCODER_DIM,
+                    1,
+                    Conv1dConfig::default(),
+                    pointwise_vb.pp("pointwise_conv2"),
+                )?,
+                f16,
             )?,
         })
     }
@@ -2789,23 +2879,30 @@ fn load_conv_channel_layer_norm(vb: VarBuilder) -> Result<LayerNorm> {
 }
 
 struct RelPosSelfAttention {
-    linear_q: Linear,
-    linear_k: Linear,
-    linear_v: Linear,
-    linear_out: Linear,
-    linear_pos: Linear,
+    linear_q: ProjectionLinear,
+    linear_k: ProjectionLinear,
+    linear_v: ProjectionLinear,
+    linear_out: ProjectionLinear,
+    linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let projection_vb = projection_vb(&vb, f16);
+        let projection = |name: &str| -> Result<ProjectionLinear> {
+            Ok(ProjectionLinear::new(
+                mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, projection_vb.pp(name))?,
+                f16,
+            )?)
+        };
         Ok(Self {
-            linear_q: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_q"))?,
-            linear_k: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_k"))?,
-            linear_v: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_v"))?,
-            linear_out: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_out"))?,
-            linear_pos: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_pos"))?,
+            linear_q: projection("linear_q")?,
+            linear_k: projection("linear_k")?,
+            linear_v: projection("linear_v")?,
+            linear_out: projection("linear_out")?,
+            linear_pos: projection("linear_pos")?,
             pos_bias_u: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?,
             pos_bias_v: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?,
         })
@@ -3926,7 +4023,8 @@ mod tests {
             )
             .unwrap(),
             Some(Tensor::zeros(ENCODER_DIM, DType::F32, &device).unwrap()),
-        );
+        )
+        .into();
 
         ConvSubsamplingDw {
             conv0,
@@ -3961,7 +4059,11 @@ mod tests {
     }
 
     fn zero_prompt_kernel() -> PromptKernel {
-        let device = Device::Cpu;
+        zero_prompt_kernel_on(&Device::Cpu)
+    }
+
+    fn zero_prompt_kernel_on(device: &Device) -> PromptKernel {
+        let device = device.clone();
         PromptKernel {
             linear0: Linear::new(
                 Tensor::zeros(
@@ -4105,7 +4207,60 @@ mod tests {
             .map(|(name, seed, shape, scale)| (name.to_string(), hashed_tensor(seed, shape, scale)))
             .collect::<HashMap<_, _>>();
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        ConvSubsamplingDw::load(vb).unwrap()
+        ConvSubsamplingDw::load(vb, None).unwrap()
+    }
+
+    /// A one-layer F32 network with the hashed subsampler and layer, loaded
+    /// with weight-only F16 projections on `device` when `f16`, and the
+    /// checkpoint it came from (under the production tensor names).
+    fn hashed_encoder_network(
+        device: &Device,
+        f16: bool,
+        layer_tensors: HashMap<String, Tensor>,
+    ) -> (NemotronNetwork, VarBuilder<'static>) {
+        let mut tensors = HashMap::new();
+        let subsampling = hashed_subsampling();
+        for (name, tensor) in [
+            ("conv.0.weight", subsampling.conv0.weight()),
+            ("conv.2.weight", subsampling.conv2.weight()),
+            ("conv.3.weight", subsampling.conv3.weight()),
+            ("conv.5.weight", subsampling.conv5.weight()),
+            ("conv.6.weight", subsampling.conv6.weight()),
+        ] {
+            tensors.insert(format!("encoder.pre_encode.{name}"), tensor.clone());
+        }
+        for (name, conv) in [
+            ("conv.0", &subsampling.conv0),
+            ("conv.2", &subsampling.conv2),
+            ("conv.3", &subsampling.conv3),
+            ("conv.5", &subsampling.conv5),
+            ("conv.6", &subsampling.conv6),
+        ] {
+            tensors.insert(
+                format!("encoder.pre_encode.{name}.bias"),
+                conv.bias().unwrap().clone(),
+            );
+        }
+        let ProjectionLinear::Dense(out) = &subsampling.out else {
+            unreachable!("loaded dense");
+        };
+        tensors.insert("encoder.pre_encode.out.weight".into(), out.weight().clone());
+        tensors.insert(
+            "encoder.pre_encode.out.bias".into(),
+            out.bias().unwrap().clone(),
+        );
+        for (name, tensor) in layer_tensors {
+            tensors.insert(format!("encoder.layers.0.{name}"), tensor);
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        let f16 = f16.then_some(device);
+        let mut network = rnnt_test_network(vec![0.0; 4], 1);
+        network.pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"), f16).unwrap();
+        network.layers = vec![ConformerLayer::load(vb.pp("encoder.layers.0"), f16).unwrap()];
+        network.prompt_kernel = zero_prompt_kernel_on(device);
+        network.left_context_frames = 56;
+        network.right_context_frames = 13;
+        (network, vb)
     }
 
     fn nemo_reference() -> serde_json::Value {
@@ -4250,6 +4405,13 @@ mod tests {
     /// One real-dimension Conformer layer with hashed weights, loaded through
     /// production code.
     fn hashed_conformer_layer() -> ConformerLayer {
+        let vb = VarBuilder::from_tensors(hashed_conformer_tensors(), DType::F32, &Device::Cpu);
+        ConformerLayer::load(vb, None).unwrap()
+    }
+
+    /// The hashed layer's checkpoint tensors, named as under
+    /// `encoder.layers.{i}`.
+    fn hashed_conformer_tensors() -> HashMap<String, Tensor> {
         let d = ENCODER_DIM;
         let mut seed = 100u32;
         let mut tensors = HashMap::new();
@@ -4327,8 +4489,7 @@ mod tests {
             1.0 / 32.0,
             0.0,
         );
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        ConformerLayer::load(vb).unwrap()
+        tensors
     }
 
     #[test]
@@ -4394,6 +4555,214 @@ mod tests {
             );
             eprintln!("right={right}: streaming vs offline max abs diff {diff:.2e}");
         }
+    }
+
+    fn relative_l2_of(values: &Tensor, reference: &Tensor) -> f64 {
+        use crate::kernels::numeric_check::{host_f32, relative_l2};
+        relative_l2(&host_f32(values).unwrap(), &host_f32(reference).unwrap())
+    }
+
+    /// The weight-only F16 layer tracks the F32 layer offline and streams
+    /// exactly like its own offline pass.
+    #[test]
+    fn weight_only_f16_conformer_layer_matches_f32_offline_and_streaming() {
+        let device = Device::Cpu;
+        let reference = hashed_conformer_layer();
+        let vb = VarBuilder::from_tensors(hashed_conformer_tensors(), DType::F32, &device);
+        let layer = ConformerLayer::load(vb, Some(&device)).unwrap();
+        assert!(layer.ff1.linear1.as_f16().is_some());
+        assert!(layer.self_attn.linear_pos.as_f16().is_some());
+        assert!(layer.conv.pointwise_conv2.as_f16().is_some());
+        assert_eq!(layer.conv.depthwise_conv.weight().dtype(), DType::F32);
+
+        let (len, left, right) = (2 * 14 + 3, 56, 13);
+        let x = hashed_tensor(41, (1, len, ENCODER_DIM), 1.0);
+        let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &device).unwrap();
+        let mask = build_limited_context_mask(len, left, right, &device).unwrap();
+        let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
+        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &mask).unwrap());
+        assert!(rel > 0.0 && rel < 1e-2, "offline relative L2 {rel:e}");
+
+        let mut state = ConformerLayerStreamState::new();
+        let mut streamed = Vec::new();
+        for (start, q_len) in streaming_chunks(len, right) {
+            let cache_len = state
+                .attn_cache
+                .as_ref()
+                .map_or(0, |cache| cache.dim(1).unwrap());
+            let key_len = cache_len + q_len;
+            let pos_pair = build_streaming_rel_positional_embedding(
+                q_len,
+                key_len,
+                cache_len,
+                ENCODER_DIM,
+                &device,
+            )
+            .unwrap();
+            let mask = build_streaming_limited_context_mask(
+                q_len,
+                key_len,
+                cache_len,
+                start % (right + 1),
+                left,
+                right,
+                &device,
+            )
+            .unwrap();
+            let chunk = x.narrow(1, start, q_len).unwrap();
+            streamed.push(
+                layer
+                    .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                    .unwrap(),
+            );
+        }
+        let refs = streamed.iter().collect::<Vec<_>>();
+        let rel = relative_l2_of(&Tensor::cat(&refs, 1).unwrap(), &offline);
+        assert!(rel < 1e-5, "streaming vs offline relative L2 {rel:e}");
+    }
+
+    /// Admission's F16 tensor set is exactly the set the loader converts.
+    #[test]
+    fn f16_projection_names_match_the_loader() {
+        use super::super::nemotron_tensor_is_f16_projection;
+
+        let (network, vb) = hashed_encoder_network(&Device::Cpu, true, hashed_conformer_tensors());
+        drop(vb);
+        let layer = &network.layers[0];
+        let converted = [
+            &network.pre_encode.out,
+            &layer.ff1.linear1,
+            &layer.ff1.linear2,
+            &layer.ff2.linear1,
+            &layer.ff2.linear2,
+            &layer.self_attn.linear_q,
+            &layer.self_attn.linear_k,
+            &layer.self_attn.linear_v,
+            &layer.self_attn.linear_out,
+            &layer.self_attn.linear_pos,
+        ]
+        .into_iter()
+        .map(|projection| projection.as_f16().unwrap())
+        .chain([
+            layer.conv.pointwise_conv1.as_f16().unwrap(),
+            layer.conv.pointwise_conv2.as_f16().unwrap(),
+        ])
+        .map(|linear| linear.out_features() * linear.in_features())
+        .sum::<usize>();
+        let named = hashed_conformer_tensors()
+            .iter()
+            .map(|(name, tensor)| (format!("encoder.layers.0.{name}"), tensor.elem_count()))
+            .chain([(
+                "encoder.pre_encode.out.weight".to_string(),
+                ENCODER_DIM * CONV_SUB_CHANNELS * 17,
+            )])
+            .filter(|(name, _)| nemotron_tensor_is_f16_projection(name))
+            .map(|(_, elements)| elements)
+            .sum::<usize>();
+        assert_eq!(named, converted);
+        for name in [
+            "encoder.pre_encode.out.bias",
+            "encoder.layers.0.conv.depthwise_conv.weight",
+            "encoder.layers.0.conv.batch_norm.weight",
+            "prompt_kernel.0.weight",
+            "joint.joint_net.2.weight",
+        ] {
+            assert!(!nemotron_tensor_is_f16_projection(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn weight_only_f16_self_check_passes_and_catches_overflow_and_bad_conversions() {
+        let device = Device::Cpu;
+        let (network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        assert!(network.pre_encode.out.as_f16().is_some());
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(report.passed, "{}", report.reason);
+        // pre_encode, one layer and the prompt kernel.
+        assert_eq!(report.tensors.len(), 3);
+
+        // A weight F16 cannot hold makes the layer output non-finite.
+        let mut tensors = hashed_conformer_tensors();
+        let name = "feed_forward2.linear2.weight";
+        let mut values = tensors[name]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        values[0] = 1.0e5;
+        let shape = tensors[name].dims().to_vec();
+        tensors.insert(
+            name.into(),
+            Tensor::from_vec(values, shape, &device).unwrap(),
+        );
+        let (network, vb) = hashed_encoder_network(&device, true, tensors);
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(!report.passed);
+        assert!(report.reason.contains("layers.0"), "{}", report.reason);
+
+        // A conversion that does not match the checkpoint fails the transform
+        // check even though every output stays finite.
+        let (mut network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        let swapped = network.layers[0].ff2.linear1.clone();
+        network.layers[0].ff1.linear1 = swapped;
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(!report.passed);
+        assert!(
+            report.reason.contains("feed_forward1.linear1"),
+            "{}",
+            report.reason
+        );
+    }
+
+    /// Production loading on Metal: the projections take ggml's f16 x f32
+    /// kernel, the self-check passes on the device, and the layer matches
+    /// the CPU F32 layer.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_weight_only_f16_engages_ggml_and_matches_cpu_f32() {
+        use crate::kernels::f16_weight_linear::F16WeightLinearPath;
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let (network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(report.passed, "{}", report.reason);
+        let layer = &network.layers[0];
+        for projection in [
+            &network.pre_encode.out,
+            &layer.ff1.linear1,
+            &layer.ff2.linear2,
+            &layer.self_attn.linear_q,
+            &layer.self_attn.linear_pos,
+        ] {
+            assert_eq!(
+                projection.as_f16().unwrap().path(),
+                F16WeightLinearPath::GgmlF16F32
+            );
+        }
+        assert_eq!(
+            layer.conv.pointwise_conv1.as_f16().unwrap().path(),
+            F16WeightLinearPath::GgmlF16F32
+        );
+
+        let len = 31;
+        let x = hashed_tensor(43, (1, len, ENCODER_DIM), 1.0);
+        let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
+        let mask = build_limited_context_mask(len, 56, 13, &Device::Cpu).unwrap();
+        let reference = hashed_conformer_layer()
+            .forward(&x, &pos_emb, &mask)
+            .unwrap();
+        let on_metal = layer
+            .forward(
+                &x.to_device(&device).unwrap(),
+                &pos_emb.to_device(&device).unwrap(),
+                &mask.to_device(&device).unwrap(),
+            )
+            .unwrap();
+        let rel = relative_l2_of(&on_metal, &reference);
+        assert!(rel < 1e-2, "relative L2 {rel:e}");
     }
 
     #[test]

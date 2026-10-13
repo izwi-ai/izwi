@@ -117,20 +117,21 @@ overrides that choice for every family:
 | Value | Effect |
 |-------|--------|
 | `auto` (default) | Each family's Metal policy. |
-| `f32` | F32 weights and activations for every family that uses the shared dtype policy, and F32 encoder weights for Parakeet. Use this if a model produces wrong or empty output on Metal. |
+| `f32` | F32 weights and activations for every family that uses the shared dtype policy, and F32 encoder weights for Parakeet and Nemotron. Use this if a model produces wrong or empty output on Metal. |
 | `f16`, `bf16` | Lower-precision default for families that use the shared dtype policy. Experimental. BF16 is slower than F16 on M1 and M2. |
 
 A per-family variable such as `IZWI_WHISPER_DTYPE` is more specific and takes
 precedence over `IZWI_METAL_DTYPE`. On Metal, a per-family `f16` or `bf16`
 setting is now applied as written instead of being replaced with F32.
 
-On Metal, Parakeet stores its encoder's linear and pointwise-convolution
-weights in F16 and keeps activations, normalization, convolutions and the
-decoder in F32, as whisper.cpp does. This roughly halves its weight memory
-(about 2.5 GB to 1.3 GB). A numeric self-check runs at load; if it fails,
-Parakeet loads in F32 and the reason appears in the transcription
-diagnostics under `weight_precision`. Set `IZWI_PARAKEET_ASR_DTYPE=f32` (or
-`IZWI_METAL_DTYPE=f32`) to keep every Parakeet weight in F32.
+On Metal, Parakeet and Nemotron store their encoder's linear and
+pointwise-convolution weights in F16 and keep activations, normalization,
+convolutions and the decoder in F32, as whisper.cpp does. This roughly halves
+their weight memory (about 2.5 GB to 1.3 GB each). A numeric self-check runs
+at load; if it fails, the model loads in F32 and the reason appears in its
+diagnostics under `weight_precision`. Set `IZWI_PARAKEET_ASR_DTYPE=f32` or
+`IZWI_NEMOTRON_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) to keep every weight
+in F32.
 
 ---
 

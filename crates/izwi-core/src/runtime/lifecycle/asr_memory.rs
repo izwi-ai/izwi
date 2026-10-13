@@ -67,7 +67,8 @@ use crate::models::architectures::granite_speech::asr::{
 };
 use crate::models::architectures::lfm25_audio::lfm25_audio_load_layout;
 use crate::models::architectures::nemotron::asr::{
-    nemotron_checkpoint_paths, resolve_nemotron_asr_dtype, NEMOTRON_MODEL_MEMO_MAX_BYTES,
+    nemotron_checkpoint_paths, nemotron_tensor_is_f16_projection, resolve_nemotron_asr_dtype,
+    resolve_nemotron_projection_precision, NEMOTRON_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::parakeet::asr::{
     parakeet_checkpoint_paths, parakeet_tensor_is_f16_projection,
@@ -1094,7 +1095,7 @@ impl NemoFamily {
     fn is_f16_projection(self, name: &str) -> bool {
         match self {
             Self::Parakeet => parakeet_tensor_is_f16_projection(name),
-            Self::Nemotron => false,
+            Self::Nemotron => nemotron_tensor_is_f16_projection(name),
         }
     }
 
@@ -1155,15 +1156,25 @@ fn nemotron_plan(
 ) -> Result<Option<AsrResidencyPlan>> {
     let paths = nemotron_checkpoint_paths(model_path, variant)?;
     let dtype = resolve_nemotron_asr_dtype(device)?.dtype;
+    let f16_projections = resolve_nemotron_projection_precision(device, dtype).dtype == DType::F16;
     if paths.checkpoint_path.is_file() {
         if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
-            return price_nemo(&[file], backend, dtype, NemoFamily::Nemotron, false).map(Some);
+            return price_nemo(
+                &[file],
+                backend,
+                dtype,
+                NemoFamily::Nemotron,
+                f16_projections,
+            )
+            .map(Some);
         }
     }
     if !paths.nemo_path.is_file() {
         return Ok(None);
     }
     // First load: the archive is streamed to disk through small buffers.
+    // Without a tensor list it is priced at `dtype` throughout, an
+    // over-estimate when the projections load in F16.
     let payload = nemo_payload_bytes(&paths.nemo_path)?;
     let memo = NemoFamily::Nemotron.memo_bytes();
     price_nemo_first_load(backend, payload, dtype, 0, memo).map(Some)
@@ -1816,13 +1827,16 @@ mod tests {
     }
 
     fn nemotron(backend: BackendKind) -> AsrResidencyPlan {
-        let dtype = resolve_nemotron_asr_dtype(&profile(backend)).unwrap().dtype;
+        let profile = profile(backend);
+        let dtype = resolve_nemotron_asr_dtype(&profile).unwrap().dtype;
+        let f16_projections =
+            resolve_nemotron_projection_precision(&profile, dtype).dtype == DType::F16;
         price_nemo(
             &census!("nemotron_3_5_asr_streaming_0_6b.json"),
             backend,
             dtype,
             NemoFamily::Nemotron,
-            false,
+            f16_projections,
         )
         .unwrap()
     }
@@ -1948,7 +1962,7 @@ mod tests {
             (
                 "Nemotron-3.5-ASR-0.6B",
                 Box::new(nemotron),
-                [2.38, 2.38, 2.38, 1.20],
+                [2.38, 1.24, 1.24, 1.20],
             ),
             (
                 "Whisper-L-v3-Turbo",
@@ -2048,10 +2062,17 @@ mod tests {
         assert_eq!(weights, 2_508_229_144);
         assert_eq!(weights - projections * 2, 1_291_880_984);
         // Nemotron: F32 on CPU and Metal; BF16 on CUDA plus transposed copies
-        // of the two LSTM layers' input and hidden weights.
+        // of the two LSTM layers' input and hidden weights. Metal stores the
+        // encoder projections in F16, as for Parakeet (a 4352-wide
+        // subsampling output projection).
         let files = census!("nemotron_3_5_asr_streaming_0_6b.json");
         let weights = stored(&files, |t| !t.name.starts_with("preprocessor."));
         assert_eq!(nemotron(BackendKind::Cpu).resident_bytes, weights);
+        let projections = 1024 * 4352 + 24 * (4 * 4096 * 1024 + 5 * 1024 * 1024 + 3 * 1024 * 1024);
+        assert_eq!(
+            nemotron(BackendKind::Metal).logical_resident_bytes,
+            weights - projections * 2
+        );
         assert_eq!(
             nemotron(BackendKind::Cuda).resident_bytes,
             weights / 2 + 4 * 2560 * 640 * 2
