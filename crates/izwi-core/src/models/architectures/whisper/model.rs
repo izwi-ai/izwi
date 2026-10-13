@@ -316,10 +316,11 @@ impl ResidualAttentionBlock {
             .forward_dense_self_attention(&self.attn_ln.forward(x)?)?;
         let x = (x + attn)?;
         let mlp = self.mlp_linear2.forward(
-            &self
-                .mlp_linear1
-                .forward(&self.mlp_ln.forward(&x)?)?
-                .gelu()?,
+            &gelu(
+                &self
+                    .mlp_linear1
+                    .forward(&self.mlp_ln.forward(&x)?)?,
+            )?,
         )?;
         Ok((x + mlp)?)
     }
@@ -378,10 +379,11 @@ impl ResidualAttentionBlock {
         x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
 
         let mlp = self.mlp_linear2.forward(
-            &self
-                .mlp_linear1
-                .forward(&self.mlp_ln.forward(&x)?)?
-                .gelu()?,
+            &gelu(
+                &self
+                    .mlp_linear1
+                    .forward(&self.mlp_ln.forward(&x)?)?,
+            )?,
         )?;
         Ok((x + mlp)?)
     }
@@ -426,13 +428,20 @@ impl ResidualAttentionBlock {
         x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
 
         let mlp = self.mlp_linear2.forward(
-            &self
-                .mlp_linear1
-                .forward(&self.mlp_ln.forward(&x)?)?
-                .gelu()?,
+            &gelu(
+                &self
+                    .mlp_linear1
+                    .forward(&self.mlp_ln.forward(&x)?)?,
+            )?,
         )?;
         Ok((x + mlp)?)
     }
+}
+
+/// Exact (erf) GELU, as OpenAI Whisper's `nn.GELU()`/`F.gelu` and HF's
+/// `ACT2FN["gelu"]` compute it. Candle's `gelu()` is the tanh approximation.
+fn gelu(x: &Tensor) -> Result<Tensor> {
+    Ok(x.gelu_erf()?)
 }
 
 fn sinusoids(length: usize, channels: usize, device: &Device, dtype: DType) -> Result<Tensor> {
@@ -510,11 +519,11 @@ impl AudioEncoder {
         let _enter = self.span.enter();
         let x = {
             let _enter = self.conv1_span.enter();
-            self.conv1.forward(x)?.gelu()?
+            gelu(&self.conv1.forward(x)?)?
         };
         let x = {
             let _enter = self.conv2_span.enter();
-            self.conv2.forward(&x)?.gelu()?
+            gelu(&self.conv2.forward(&x)?)?
         };
         let x = x.transpose(1, 2)?;
         let (_bsize, seq_len, _hidden) = x.dims3()?;
@@ -785,10 +794,21 @@ impl Whisper {
 #[cfg(test)]
 mod tests {
     use super::{
-        flatten_token_major, reshape_head_major, reshape_token_major, sinusoids,
+        flatten_token_major, gelu, reshape_head_major, reshape_token_major, sinusoids,
         whisper_metal_sdpa_env_value_enabled,
     };
     use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn gelu_is_exact_erf_like_openai_whisper() {
+        let x = Tensor::new(&[1.0f32, -1.0, 3.0], &Device::Cpu).expect("input");
+        let y = gelu(&x).expect("gelu").to_vec1::<f32>().expect("values");
+        // torch.nn.functional.gelu(torch.tensor([1., -1., 3.])), approximate="none".
+        let expected = [0.841_344_7f32, -0.158_655_26, 2.995_950_2];
+        for (got, want) in y.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "gelu {got} != {want}");
+        }
+    }
 
     #[test]
     fn sinusoidal_embedding_uses_requested_dtype() {

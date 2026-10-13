@@ -945,8 +945,10 @@ impl AudioTower {
     }
 }
 
+/// Exact (erf) GELU: the reference audio tower uses `F.gelu` and
+/// `ACT2FN["gelu"]` (`modeling_qwen3_asr.py`), not the tanh approximation.
 fn gelu(x: &Tensor) -> Result<Tensor> {
-    x.gelu().map_err(Error::from)
+    x.gelu_erf().map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -954,6 +956,17 @@ mod tests {
     use super::*;
     use candle_core::shape::ShapeWithOneHole;
     use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn audio_tower_gelu_is_exact_erf() {
+        let x = Tensor::new(&[1.0f32, -1.0, 3.0], &Device::Cpu).unwrap();
+        let y = gelu(&x).unwrap().to_vec1::<f32>().unwrap();
+        // torch.nn.functional.gelu(torch.tensor([1., -1., 3.])), approximate="none".
+        let expected = [0.841_344_7f32, -0.158_655_26, 2.995_950_2];
+        for (got, want) in y.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "gelu {got} != {want}");
+        }
+    }
 
     fn deterministic_tensor(
         elements: usize,

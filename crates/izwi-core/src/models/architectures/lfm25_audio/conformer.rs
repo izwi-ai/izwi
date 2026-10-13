@@ -1292,22 +1292,10 @@ fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
 }
 
+/// Exact (erf) GELU: liquid-audio's adapter `MLP` uses `nn.GELU()`
+/// (`approximate="none"`), not the tanh approximation.
 fn gelu(x: &Tensor) -> Result<Tensor> {
-    if x.device().is_cuda() {
-        // Candle gelu uses the same tanh approximation (gelu_erf does not).
-        return x.gelu().map_err(Error::from);
-    }
-    let coeff = 0.044715f32;
-    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-    let dtype = x.dtype();
-    let x3 = x.powf(3.0)?;
-    let coeff_t = Tensor::new(&[coeff], x.device())?.to_dtype(dtype)?;
-    let sqrt_t = Tensor::new(&[sqrt_2_over_pi], x.device())?.to_dtype(dtype)?;
-    let one = Tensor::new(&[1f32], x.device())?.to_dtype(dtype)?;
-    let half = Tensor::new(&[0.5f32], x.device())?.to_dtype(dtype)?;
-    let inner = (x + x3.broadcast_mul(&coeff_t)?)?.broadcast_mul(&sqrt_t)?;
-    let out = x.broadcast_mul(&one.broadcast_add(&inner.tanh()?)?)?;
-    out.broadcast_mul(&half).map_err(Error::from)
+    x.gelu_erf().map_err(Error::from)
 }
 
 pub fn subsampled_len_3x(mut len: usize) -> usize {
@@ -1394,7 +1382,14 @@ mod tests {
         )
         .unwrap();
         assert_close(&x.silu().unwrap(), &super::swish(&x).unwrap(), 1e-6);
-        assert_close(&x.gelu().unwrap(), &super::gelu(&x).unwrap(), 1e-6);
+        assert_close(&x.gelu_erf().unwrap(), &super::gelu(&x).unwrap(), 1e-6);
+        // torch.nn.functional.gelu(torch.tensor([1., -1., 3.])), approximate="none".
+        let probe = Tensor::new(&[1.0f32, -1.0, 3.0], &device).unwrap();
+        let values = super::gelu(&probe).unwrap().to_vec1::<f32>().unwrap();
+        let expected = [0.841_344_7f32, -0.158_655_26, 2.995_950_2];
+        for (got, want) in values.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "gelu {got} != {want}");
+        }
         // Non-contiguous scores exercise the layout normalization required by
         // Candle's dedicated last-dimension softmax kernel.
         let scores = Tensor::from_vec(
