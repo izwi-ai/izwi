@@ -1620,58 +1620,13 @@ impl Qwen3AsrModel {
         if !is_gguf && is_quantized {
             validate_quantization_config(&config)?;
         }
-        let text_dtype_override = std::env::var("IZWI_QWEN_ASR_TEXT_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok())
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(str::to_string);
-        let text_dtype = if let Some(raw) = text_dtype_override.as_deref() {
-            device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR text")?
-        } else if is_quantized {
-            let requested =
-                parse_asr_dtype(config.thinker_config.dtype.as_deref()).unwrap_or(DType::BF16);
-            let selected = select_quantized_text_dtype(&device, model_family, requested);
-            debug!(
-                "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
-                requested, selected, device.kind
-            );
-            selected
-        } else if device.kind.is_metal() {
-            // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
-            // utterances. Prefer f32 unless the user explicitly overrides it.
-            DType::F32
-        } else {
-            device.select_model_dtype(model_family, None)
-        };
-        let audio_dtype_override = std::env::var("IZWI_QWEN_ASR_AUDIO_DTYPE").ok();
-        let audio_dtype = if is_gguf {
-            match audio_dtype_override.as_deref().map(str::trim) {
-                Some(raw) if !raw.is_empty() => {
-                    let requested = device.select_model_dtype_checked(
-                        model_family,
-                        Some(raw),
-                        "Qwen ASR audio",
-                    )?;
-                    if requested != text_dtype {
-                        warn!(
-                            "Qwen ASR GGUF requested audio dtype {:?} differs from text dtype {:?}; loading a second GGUF VarBuilder",
-                            requested, text_dtype
-                        );
-                    }
-                    requested
-                }
-                _ => qwen3_asr_default_audio_dtype(device.kind, true, text_dtype),
-            }
-        } else {
-            match audio_dtype_override.as_deref().map(str::trim) {
-                Some(raw) if !raw.is_empty() => {
-                    device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?
-                }
-                _ => qwen3_asr_default_audio_dtype(device.kind, false, text_dtype),
-            }
-        };
+        let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+            &device,
+            model_family,
+            is_gguf,
+            is_quantized,
+            config.thinker_config.dtype.as_deref(),
+        )?;
 
         // Pre-initialize shared scratch pools up front to keep first-use
         // allocation costs out of ASR prefill/decode hot loops.
@@ -3369,7 +3324,14 @@ fn alignment_distribution_is_degenerate(
         || span <= (audio_duration_ms / 20).max(1)
 }
 
-fn resolve_qwen_asr_gguf_path(model_dir: &Path, variant: ModelVariant) -> Option<PathBuf> {
+/// The thinker dtype hint a GGUF checkpoint implies: the published GGUFs are
+/// converted from BF16 weights and carry no dtype of their own.
+pub(crate) const QWEN3_ASR_GGUF_CHECKPOINT_DTYPE: &str = "bf16";
+
+pub(crate) fn resolve_qwen_asr_gguf_path(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Option<PathBuf> {
     if let Some(filename) = qwen_asr_gguf_filename(variant) {
         let candidate = model_dir.join(filename);
         if candidate.exists() {
@@ -3464,7 +3426,7 @@ fn parse_qwen3_asr_config_from_gguf(
             audio_start_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_start_token_id"),
             audio_end_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_end_token_id"),
             audio_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_token_id"),
-            dtype: Some("bf16".to_string()),
+            dtype: Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE.to_string()),
         },
         support_languages: Vec::new(),
         timestamp_token_id: None,
@@ -3565,7 +3527,7 @@ fn qwen3_asr_gguf_qmatmul_text_policy(override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(true)
 }
 
-fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
+pub(crate) fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
     let override_enabled = env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
     qwen3_asr_gguf_qmatmul_text_policy(override_enabled)
 }
@@ -3657,6 +3619,60 @@ fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
         )));
     }
     Ok(vec![weights_path])
+}
+
+/// The text and audio-tower weight dtypes the Qwen3-ASR loader selects on
+/// `device`, honouring `IZWI_QWEN_ASR_TEXT_DTYPE` (or `IZWI_QWEN_DTYPE`) and
+/// `IZWI_QWEN_ASR_AUDIO_DTYPE`. `checkpoint_dtype` is the thinker config's dtype
+/// hint. Load admission prices the checkpoint with the same selection
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn qwen3_asr_weight_dtypes(
+    device: &DeviceProfile,
+    model_family: ModelFamily,
+    is_gguf: bool,
+    is_quantized: bool,
+    checkpoint_dtype: Option<&str>,
+) -> Result<(DType, DType)> {
+    let text_dtype_override = std::env::var("IZWI_QWEN_ASR_TEXT_DTYPE")
+        .ok()
+        .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok())
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    let text_dtype = if let Some(raw) = text_dtype_override.as_deref() {
+        device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR text")?
+    } else if is_quantized {
+        let requested = parse_asr_dtype(checkpoint_dtype).unwrap_or(DType::BF16);
+        let selected = select_quantized_text_dtype(device, model_family, requested);
+        debug!(
+            "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
+            requested, selected, device.kind
+        );
+        selected
+    } else if device.kind.is_metal() {
+        // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
+        // utterances. Prefer f32 unless the user explicitly overrides it.
+        DType::F32
+    } else {
+        device.select_model_dtype(model_family, None)
+    };
+    let audio_dtype_override = std::env::var("IZWI_QWEN_ASR_AUDIO_DTYPE").ok();
+    let audio_dtype = match audio_dtype_override.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            let requested =
+                device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?;
+            if is_gguf && requested != text_dtype {
+                warn!(
+                    "Qwen ASR GGUF requested audio dtype {:?} differs from text dtype {:?}; loading a second GGUF VarBuilder",
+                    requested, text_dtype
+                );
+            }
+            requested
+        }
+        _ => qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
+    };
+    Ok((text_dtype, audio_dtype))
 }
 
 fn select_quantized_text_dtype(

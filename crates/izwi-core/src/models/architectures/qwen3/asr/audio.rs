@@ -40,6 +40,10 @@ fn conv_stack_output_len(input_len: usize) -> usize {
     conv_output_len(conv_output_len(conv_output_len(input_len)))
 }
 
+/// Rows of the F32 sinusoidal position table the audio tower builds on the
+/// host and uploads at load (priced by `runtime/lifecycle/asr_memory.rs`).
+pub(crate) const QWEN3_ASR_AUDIO_POSITIONS: usize = 1500;
+
 struct SinusoidalPositionEmbedding {
     embedding: Tensor,
 }
@@ -518,7 +522,8 @@ impl AudioTower {
         let ln_post = layer_norm(cfg.d_model, 1e-5, vb.pp("ln_post"))?;
         let proj1 = mlx::load_linear(cfg.d_model, cfg.d_model, vb.pp("proj1"))?;
         let proj2 = mlx::load_linear(cfg.d_model, cfg.output_dim, vb.pp("proj2"))?;
-        let pos_embed = SinusoidalPositionEmbedding::new(1500, cfg.d_model, vb.device())?;
+        let pos_embed =
+            SinusoidalPositionEmbedding::new(QWEN3_ASR_AUDIO_POSITIONS, cfg.d_model, vb.device())?;
 
         Ok(Self {
             conv2d1,

@@ -17,10 +17,22 @@ pub struct ParakeetArtifacts {
     pub tokenizer_vocab_path: PathBuf,
 }
 
-pub fn ensure_parakeet_artifacts(
+/// Where `ensure_parakeet_artifacts` finds the `.nemo` archive and puts the
+/// checkpoint it extracts, computed without touching the filesystem. Load
+/// admission reads these headers (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone)]
+pub(crate) struct ParakeetCheckpointPaths {
+    pub(crate) nemo_path: PathBuf,
+    pub(crate) extracted_dir: PathBuf,
+    pub(crate) checkpoint_path: PathBuf,
+    /// The zip-repacked copy loaded when Candle cannot read the original.
+    pub(crate) repacked_checkpoint_path: PathBuf,
+}
+
+pub(crate) fn parakeet_checkpoint_paths(
     model_dir: &Path,
     variant: ModelVariant,
-) -> Result<ParakeetArtifacts> {
+) -> Result<ParakeetCheckpointPaths> {
     let nemo_filename = match variant {
         ModelVariant::ParakeetTdt06BV3 => "parakeet-tdt-0.6b-v3.nemo",
         _ => {
@@ -30,8 +42,25 @@ pub fn ensure_parakeet_artifacts(
             )));
         }
     };
+    let extracted_dir = model_dir.join("parakeet-native");
+    Ok(ParakeetCheckpointPaths {
+        nemo_path: model_dir.join(nemo_filename),
+        checkpoint_path: extracted_dir.join("model_weights.ckpt"),
+        repacked_checkpoint_path: extracted_dir.join("model_weights.repacked.ckpt"),
+        extracted_dir,
+    })
+}
 
-    let nemo_path = model_dir.join(nemo_filename);
+pub fn ensure_parakeet_artifacts(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<ParakeetArtifacts> {
+    let ParakeetCheckpointPaths {
+        nemo_path,
+        extracted_dir,
+        checkpoint_path,
+        repacked_checkpoint_path,
+    } = parakeet_checkpoint_paths(model_dir, variant)?;
     if !nemo_path.exists() {
         return Err(Error::ModelNotFound(format!(
             "Missing .nemo checkpoint for {} at {}",
@@ -40,7 +69,6 @@ pub fn ensure_parakeet_artifacts(
         )));
     }
 
-    let extracted_dir = model_dir.join("parakeet-native");
     fs::create_dir_all(&extracted_dir).map_err(|e| {
         Error::ModelLoadError(format!(
             "Failed to create Parakeet cache directory {}: {}",
@@ -51,7 +79,6 @@ pub fn ensure_parakeet_artifacts(
 
     let model_config_path = extracted_dir.join("model_config.yaml");
     let tokenizer_vocab_path = extracted_dir.join("tokenizer.vocab");
-    let checkpoint_path = extracted_dir.join("model_weights.ckpt");
 
     if !(model_config_path.exists() && tokenizer_vocab_path.exists() && checkpoint_path.exists()) {
         extract_from_nemo(
@@ -62,7 +89,11 @@ pub fn ensure_parakeet_artifacts(
         )?;
     }
 
-    let checkpoint_path = normalize_checkpoint_if_needed(&checkpoint_path, &extracted_dir)?;
+    let checkpoint_path = normalize_checkpoint_if_needed(
+        &checkpoint_path,
+        &extracted_dir,
+        &repacked_checkpoint_path,
+    )?;
 
     Ok(ParakeetArtifacts {
         nemo_path,
@@ -185,14 +216,17 @@ fn extract_tar_entry_to_file(nemo_path: &Path, entry: &str, dest: &Path) -> Resu
     Ok(())
 }
 
-fn normalize_checkpoint_if_needed(checkpoint_path: &Path, extracted_dir: &Path) -> Result<PathBuf> {
+fn normalize_checkpoint_if_needed(
+    checkpoint_path: &Path,
+    extracted_dir: &Path,
+    repacked: &Path,
+) -> Result<PathBuf> {
     if read_pth_tensor_info(checkpoint_path, false, None).is_ok() {
         return Ok(checkpoint_path.to_path_buf());
     }
 
-    let repacked = extracted_dir.join("model_weights.repacked.ckpt");
-    if repacked.exists() && read_pth_tensor_info(&repacked, false, None).is_ok() {
-        return Ok(repacked);
+    if repacked.exists() && read_pth_tensor_info(repacked, false, None).is_ok() {
+        return Ok(repacked.to_path_buf());
     }
 
     let temp_extract_dir = extracted_dir.join("checkpoint_repack_tmp");
@@ -255,7 +289,7 @@ fn normalize_checkpoint_if_needed(checkpoint_path: &Path, extracted_dir: &Path) 
         )));
     }
 
-    fs::rename(&repacked_tmp, &repacked).map_err(|e| {
+    fs::rename(&repacked_tmp, repacked).map_err(|e| {
         Error::ModelLoadError(format!(
             "Failed to finalize repacked checkpoint {}: {}",
             repacked.display(),
@@ -264,7 +298,7 @@ fn normalize_checkpoint_if_needed(checkpoint_path: &Path, extracted_dir: &Path) 
     })?;
 
     // Validate once before returning.
-    read_pth_tensor_info(&repacked, false, None).map_err(|e| {
+    read_pth_tensor_info(repacked, false, None).map_err(|e| {
         Error::ModelLoadError(format!(
             "Repacked checkpoint is still unreadable ({}): {}",
             repacked.display(),
@@ -272,5 +306,5 @@ fn normalize_checkpoint_if_needed(checkpoint_path: &Path, extracted_dir: &Path) 
         ))
     })?;
 
-    Ok(repacked)
+    Ok(repacked.to_path_buf())
 }

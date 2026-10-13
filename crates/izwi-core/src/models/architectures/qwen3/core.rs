@@ -785,14 +785,17 @@ fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
-fn qwen3_dense_projection_fusion_enabled(device: &Device) -> bool {
+pub(crate) fn qwen3_dense_projection_fusion_enabled(device: &Device) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_DENSE_PROJECTION_FUSION")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
     qwen3_dense_projection_fusion_policy(device.is_metal(), override_enabled)
 }
 
-fn qwen3_dense_projection_fusion_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+pub(crate) fn qwen3_dense_projection_fusion_policy(
+    is_metal: bool,
+    override_enabled: Option<bool>,
+) -> bool {
     override_enabled.unwrap_or(is_metal)
 }
 
@@ -812,13 +815,23 @@ fn qwen3_qk_rms_norm_fusion_policy(
 }
 
 fn qwen3_quantized_projection_grouping_enabled(device: &Device, cfg: &Qwen3Config) -> bool {
+    qwen3_quantized_projection_grouping_for_hidden_size(device, cfg.hidden_size)
+}
+
+/// Whether the quantized Q/K/V and gate/up projections of a trunk with
+/// `hidden_size` are packed into one `QMatMul` each on `device`. Load admission
+/// prices the packed form (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn qwen3_quantized_projection_grouping_for_hidden_size(
+    device: &Device,
+    hidden_size: usize,
+) -> bool {
     let override_enabled = std::env::var("IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    qwen3_quantized_projection_grouping_policy(device.is_metal(), cfg.hidden_size, override_enabled)
+    qwen3_quantized_projection_grouping_policy(device.is_metal(), hidden_size, override_enabled)
 }
 
-fn qwen3_quantized_projection_grouping_policy(
+pub(crate) fn qwen3_quantized_projection_grouping_policy(
     is_metal: bool,
     hidden_size: usize,
     override_enabled: Option<bool>,

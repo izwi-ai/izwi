@@ -405,6 +405,19 @@ struct VibeVoiceAsrDecodeCheckpointPayload {
     managed_completions_drained: bool,
 }
 
+/// The weight dtype the VibeVoice-ASR loader selects on `device`, honouring
+/// `IZWI_VIBEVOICE_ASR_DTYPE`. Load admission prices the checkpoint at this
+/// dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn vibevoice_asr_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    let requested = std::env::var("IZWI_VIBEVOICE_ASR_DTYPE").ok();
+    match requested.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            device.select_model_dtype_checked(ModelFamily::VibeVoiceAsr, Some(raw), "VibeVoice ASR")
+        }
+        _ => Ok(device.select_model_dtype(ModelFamily::VibeVoiceAsr, None)),
+    }
+}
+
 impl VibeVoiceAsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         if variant != ModelVariant::VibeVoiceAsr {
@@ -419,20 +432,7 @@ impl VibeVoiceAsrModel {
             ));
         }
         let preprocessor = VibeVoicePreprocessorConfig::load(model_dir)?;
-        let dtype = std::env::var("IZWI_VIBEVOICE_ASR_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(|raw| {
-                device.select_model_dtype_checked(
-                    ModelFamily::VibeVoiceAsr,
-                    Some(raw),
-                    "VibeVoice ASR",
-                )
-            })
-            .transpose()?
-            .unwrap_or_else(|| device.select_model_dtype(ModelFamily::VibeVoiceAsr, None));
+        let dtype = vibevoice_asr_weight_dtype(&device)?;
         let vb = load_model_weights(model_dir, dtype, &device.device)?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;

@@ -1039,6 +1039,49 @@ pub struct WhisperTurboAsrModel {
     cuda_dtype_shim: bool,
 }
 
+/// The weight dtype the Whisper loader selects on `device`, honouring
+/// `IZWI_WHISPER_DTYPE`. Load admission prices the checkpoint at this dtype
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn whisper_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    let requested = std::env::var("IZWI_WHISPER_DTYPE").ok();
+    match requested.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            device.select_model_dtype_checked(ModelFamily::WhisperAsr, Some(raw), "Whisper")
+        }
+        _ => Ok(device.select_model_dtype(ModelFamily::WhisperAsr, None)),
+    }
+}
+
+/// The safetensors files the Whisper loader maps: the shards of
+/// `model.safetensors.index.json` when present, else `model.safetensors`.
+/// Load admission prices the same files (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn whisper_weight_files(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![model_dir.join("model.safetensors")]);
+    }
+    let index_data = fs::read_to_string(index_path)?;
+    let index: serde_json::Value = serde_json::from_str(&index_data)?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            Error::InvalidInput("Invalid Whisper safetensors index format".to_string())
+        })?;
+
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    Ok(shard_files
+        .iter()
+        .map(|file| model_dir.join(file))
+        .collect())
+}
+
 impl WhisperTurboAsrModel {
     pub fn load(model_dir: &Path, device: DeviceProfile) -> Result<Self> {
         let config_path = model_dir.join("config.json");
@@ -1048,50 +1091,11 @@ impl WhisperTurboAsrModel {
         let generation = read_generation_config(model_dir)?;
         let tokenizer = Tokenizer::from_path(model_dir)?;
 
-        let dtype_override = std::env::var("IZWI_WHISPER_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let model_dtype = match dtype_override.as_deref() {
-            Some(raw) => {
-                device.select_model_dtype_checked(ModelFamily::WhisperAsr, Some(raw), "Whisper")?
-            }
-            None => device.select_model_dtype(ModelFamily::WhisperAsr, None),
-        };
+        let model_dtype = whisper_weight_dtype(&device)?;
 
-        let index_path = model_dir.join("model.safetensors.index.json");
-        let vb = if index_path.exists() {
-            let index_data = fs::read_to_string(index_path)?;
-            let index: serde_json::Value = serde_json::from_str(&index_data)?;
-            let weight_map = index
-                .get("weight_map")
-                .and_then(|value| value.as_object())
-                .ok_or_else(|| {
-                    Error::InvalidInput("Invalid Whisper safetensors index format".to_string())
-                })?;
-
-            let mut shard_files: Vec<String> = weight_map
-                .values()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect();
-            shard_files.sort();
-            shard_files.dedup();
-
-            let shard_paths: Vec<std::path::PathBuf> = shard_files
-                .iter()
-                .map(|file| model_dir.join(file))
-                .collect();
-
-            unsafe {
-                VarBuilder::from_mmaped_safetensors(&shard_paths, model_dtype, &device.device)?
-            }
-        } else {
-            let model_path = model_dir.join("model.safetensors");
-            unsafe {
-                VarBuilder::from_mmaped_safetensors(&[model_path], model_dtype, &device.device)?
-            }
+        let weight_files = whisper_weight_files(model_dir)?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&weight_files, model_dtype, &device.device)?
         };
 
         let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);

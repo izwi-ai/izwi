@@ -38,6 +38,11 @@ use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 
+/// The dtype the Parakeet loader materializes every weight in, on every
+/// backend. Load admission prices the checkpoint at it
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) const PARAKEET_WEIGHT_DTYPE: DType = DType::F32;
+
 const SAMPLE_RATE: u32 = 16_000;
 const PRED_HIDDEN: usize = 640;
 const SUBSAMPLING_FACTOR: usize = 8;
@@ -872,14 +877,15 @@ impl ParakeetAsrModel {
         let (artifacts, decoder, vb) = if variant.is_parakeet_nemo() {
             let artifacts = ensure_parakeet_artifacts(model_dir, variant)?;
             let tokenizer_vocab = decode::load_tokenizer_vocab(&artifacts.tokenizer_vocab_path)?;
-            let vb = VarBuilder::from_pth(&artifacts.checkpoint_path, DType::F32, &device)
-                .map_err(|e| {
-                    Error::ModelLoadError(format!(
-                        "Failed to load Parakeet checkpoint {}: {}",
-                        artifacts.checkpoint_path.display(),
-                        e
-                    ))
-                })?;
+            let vb =
+                VarBuilder::from_pth(&artifacts.checkpoint_path, PARAKEET_WEIGHT_DTYPE, &device)
+                    .map_err(|e| {
+                        Error::ModelLoadError(format!(
+                            "Failed to load Parakeet checkpoint {}: {}",
+                            artifacts.checkpoint_path.display(),
+                            e
+                        ))
+                    })?;
             (Some(artifacts), ParakeetDecoder::Vocab(tokenizer_vocab), vb)
         } else if variant.is_parakeet_mlx() {
             let weights_path = model_dir.join("model.safetensors");

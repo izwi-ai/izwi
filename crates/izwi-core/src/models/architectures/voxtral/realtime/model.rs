@@ -1,7 +1,7 @@
 //! Main Voxtral Realtime model implementation.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -236,19 +236,11 @@ fn voxtral_realtime_offline_frame_limit(
 impl VoxtralRealtimeModel {
     /// Load model from directory
     pub fn load(model_dir: &Path, device: DeviceProfile, prefix_reuse: bool) -> Result<Self> {
-        // Try params.json (Voxtral format) first, then config.json (standard)
-        let config_path = if model_dir.join("params.json").exists() {
-            model_dir.join("params.json")
-        } else {
-            model_dir.join("config.json")
-        };
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))?;
+        let config_str = read_voxtral_config(model_dir)?;
         let config: VoxtralConfig = serde_json::from_str(&config_str)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse config: {}", e)))?;
         let runtime_config = load_voxtral_runtime_config(model_dir)?;
-        let checkpoint_dtype =
-            checkpoint_dtype_from_config_json(&config_str).or(runtime_config.checkpoint_dtype);
+        let checkpoint_dtype = voxtral_checkpoint_dtype(&config_str, &runtime_config);
         let geometry = realtime_audio_geometry(&config, &runtime_config);
         let audio_length_per_tok = geometry.audio_length_per_tok;
 
@@ -3396,61 +3388,87 @@ fn offline_streaming_padding_samples(
     (left_pad, right_pad)
 }
 
+/// The safetensors files `VoxtralRealtimeModel::load` maps: the Mistral
+/// `consolidated.safetensors` when present, else the HF shards of
+/// `model.safetensors.index.json`, else `model.safetensors`. Load admission
+/// prices the same files (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn voxtral_realtime_weight_files(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    let consolidated_path = model_dir.join("consolidated.safetensors");
+    if consolidated_path.exists() {
+        return Ok(vec![consolidated_path]);
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![model_dir.join("model.safetensors")]);
+    }
+    let index_data = std::fs::read_to_string(&index_path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
+    let index: serde_json::Value = serde_json::from_str(&index_data)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
+
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| Error::InvalidInput("Invalid weight map".to_string()))?;
+
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    Ok(shard_files.iter().map(|f| model_dir.join(f)).collect())
+}
+
 fn load_weights<'a>(
     model_dir: &'a Path,
     dtype: DType,
     device: &'a DeviceProfile,
 ) -> Result<VarBuilder<'a>> {
-    // Voxtral uses consolidated.safetensors (single file)
-    let consolidated_path = model_dir.join("consolidated.safetensors");
-    if consolidated_path.exists() {
-        info!("Loading Voxtral from consolidated.safetensors");
-        unsafe {
-            return VarBuilder::from_mmaped_safetensors(
-                &[consolidated_path],
-                dtype,
-                &device.device,
-            )
-            .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)));
-        }
+    let files = voxtral_realtime_weight_files(model_dir)?;
+    info!(
+        "Loading Voxtral weights from {} safetensors file(s)",
+        files.len()
+    );
+    unsafe {
+        VarBuilder::from_mmaped_safetensors(&files, dtype, &device.device)
+            .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)))
     }
+}
 
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    if index_path.exists() {
-        let index_data = std::fs::read_to_string(&index_path)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
-        let index: serde_json::Value = serde_json::from_str(&index_data)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
-
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .ok_or_else(|| Error::InvalidInput("Invalid weight map".to_string()))?;
-
-        let mut shard_files: Vec<String> = weight_map
-            .values()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        shard_files.sort();
-        shard_files.dedup();
-
-        let shard_paths: Vec<std::path::PathBuf> =
-            shard_files.iter().map(|f| model_dir.join(f)).collect();
-
-        info!("Loading Voxtral with {} shard files", shard_paths.len());
-
-        unsafe {
-            VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load shards: {}", e)))
-        }
+/// Voxtral's own `params.json` when present, else the HF `config.json`.
+fn read_voxtral_config(model_dir: &Path) -> Result<String> {
+    let config_path = if model_dir.join("params.json").exists() {
+        model_dir.join("params.json")
     } else {
-        let weights_path = model_dir.join("model.safetensors");
-        unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)))
-        }
-    }
+        model_dir.join("config.json")
+    };
+    std::fs::read_to_string(&config_path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))
+}
+
+fn voxtral_checkpoint_dtype(
+    config_str: &str,
+    runtime_config: &VoxtralRuntimeConfig,
+) -> Option<DType> {
+    checkpoint_dtype_from_config_json(config_str).or(runtime_config.checkpoint_dtype)
+}
+
+/// The weight dtype `VoxtralRealtimeModel::load` selects for the checkpoint
+/// in `model_dir` on `device`. Load admission prices the checkpoint at this
+/// dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn voxtral_realtime_weight_dtype(
+    model_dir: &Path,
+    device: &DeviceProfile,
+) -> Result<DType> {
+    let config_str = read_voxtral_config(model_dir)?;
+    let runtime_config = load_voxtral_runtime_config(model_dir)?;
+    Ok(select_voxtral_dtype(
+        device,
+        voxtral_checkpoint_dtype(&config_str, &runtime_config),
+    ))
 }
 
 fn load_voxtral_runtime_config(model_dir: &Path) -> Result<VoxtralRuntimeConfig> {

@@ -33,18 +33,43 @@ pub struct NemotronArtifacts {
     pub config_inventory: NemotronConfigInventory,
 }
 
-pub fn ensure_nemotron_artifacts(
+/// Where `ensure_nemotron_artifacts` finds the `.nemo` archive and puts the
+/// checkpoint it extracts, computed without touching the filesystem. Load
+/// admission reads these headers (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone)]
+pub(crate) struct NemotronCheckpointPaths {
+    pub(crate) nemo_path: PathBuf,
+    pub(crate) extracted_dir: PathBuf,
+    pub(crate) checkpoint_path: PathBuf,
+}
+
+pub(crate) fn nemotron_checkpoint_paths(
     model_dir: &Path,
     variant: ModelVariant,
-) -> Result<NemotronArtifacts> {
+) -> Result<NemotronCheckpointPaths> {
     if variant != ModelVariant::Nemotron35AsrStreaming06B {
         return Err(Error::InvalidInput(format!(
             "Unsupported Nemotron ASR variant: {}",
             variant.dir_name()
         )));
     }
+    let extracted_dir = model_dir.join("nemotron-native");
+    Ok(NemotronCheckpointPaths {
+        nemo_path: model_dir.join(NEMOTRON_NEMO_FILENAME),
+        checkpoint_path: extracted_dir.join("model_weights.ckpt"),
+        extracted_dir,
+    })
+}
 
-    let nemo_path = model_dir.join(NEMOTRON_NEMO_FILENAME);
+pub fn ensure_nemotron_artifacts(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<NemotronArtifacts> {
+    let NemotronCheckpointPaths {
+        nemo_path,
+        extracted_dir,
+        checkpoint_path,
+    } = nemotron_checkpoint_paths(model_dir, variant)?;
     if !nemo_path.exists() {
         return Err(Error::ModelNotFound(format!(
             "Missing .nemo checkpoint for {} at {}",
@@ -53,7 +78,6 @@ pub fn ensure_nemotron_artifacts(
         )));
     }
 
-    let extracted_dir = model_dir.join("nemotron-native");
     fs::create_dir_all(&extracted_dir).map_err(|e| {
         Error::ModelLoadError(format!(
             "Failed to create Nemotron cache directory {}: {}",
@@ -63,7 +87,6 @@ pub fn ensure_nemotron_artifacts(
     })?;
 
     let model_config_path = extracted_dir.join("model_config.yaml");
-    let checkpoint_path = extracted_dir.join("model_weights.ckpt");
 
     if !model_config_path.exists() || !checkpoint_path.exists() {
         extract_nemotron_entries(

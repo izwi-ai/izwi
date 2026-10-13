@@ -1919,9 +1919,7 @@ impl NemotronAsrModel {
         validate_config_output_vocabulary(&artifacts.config_inventory)?;
         let decoder = NemotronDecoder::load(&artifacts)?;
         let device = select_device_for_nemotron(&device_profile);
-        let dtype_override = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
-        let dtype_selection =
-            select_nemotron_asr_dtype(&device_profile, dtype_override.as_deref())?;
+        let dtype_selection = resolve_nemotron_asr_dtype(&device_profile)?;
         let checkpoint_display = artifacts.checkpoint_path.display();
         let vb = match VarBuilder::from_pth(
             &artifacts.checkpoint_path,
@@ -2971,6 +2969,14 @@ fn public_artifact_filename(path: &Path) -> Option<String> {
 
 fn select_device_for_nemotron(device_profile: &DeviceProfile) -> Device {
     device_profile.device.clone()
+}
+
+/// The weight dtype the Nemotron loader selects on `device_profile`, honouring
+/// `IZWI_NEMOTRON_ASR_DTYPE`. Load admission prices the checkpoint at this
+/// dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn resolve_nemotron_asr_dtype(device_profile: &DeviceProfile) -> Result<DTypeSelection> {
+    let dtype_override = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
+    select_nemotron_asr_dtype(device_profile, dtype_override.as_deref())
 }
 
 fn select_nemotron_asr_dtype(

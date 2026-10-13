@@ -1045,12 +1045,9 @@ impl ProjectionHead {
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
-        let (cos, sin) = precompute_freqs(
-            cfg.embedding_length / cfg.attention_head_count,
-            cfg.rope_freq_base as f32,
-            cfg.context_length,
-            device,
-        )?;
+        let (context_length, head_dim) = rope_table_geometry(&cfg)?;
+        let (cos, sin) =
+            precompute_freqs(head_dim, cfg.rope_freq_base as f32, context_length, device)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -1870,6 +1867,18 @@ fn normalize_shortconv_weight(
         )));
     }
     conv_weight.contiguous().map_err(Error::from)
+}
+
+/// The (positions, head dim) of the RoPE cos/sin tables a backbone
+/// precomputes at load: F32 `cos` and `sin` of `[positions, head_dim / 2]`
+/// plus their `[positions, head_dim]` concatenation. Load admission prices
+/// them (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn rope_table_geometry(cfg: &Lfm2BackboneConfig) -> Result<(usize, usize)> {
+    let head_dim = cfg
+        .embedding_length
+        .checked_div(cfg.attention_head_count)
+        .ok_or_else(|| Error::ModelLoadError("LFM2 attention head count is zero".into()))?;
+    Ok((cfg.context_length, head_dim))
 }
 
 fn precompute_freqs(
