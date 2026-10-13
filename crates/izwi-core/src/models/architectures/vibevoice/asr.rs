@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor, D};
+use candle_nn::VarBuilder;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -413,6 +414,16 @@ struct VibeVoiceAsrDecodeCheckpointPayload {
     managed_completions_drained: bool,
 }
 
+/// ASR encodes speech and never decodes latents, so it loads the acoustic
+/// tokenizer without its decoder; admission prices it the same way
+/// (`runtime/lifecycle/asr_memory.rs`).
+fn load_asr_acoustic_tokenizer(
+    config: &VibeVoiceTokenizerConfig,
+    vb: VarBuilder,
+) -> Result<VibeVoiceAcousticTokenizer> {
+    VibeVoiceAcousticTokenizer::load_encoder_only(config, vb)
+}
+
 /// The weight dtype the VibeVoice-ASR loader selects on `device`, honouring
 /// `IZWI_VIBEVOICE_ASR_DTYPE`. Load admission prices the checkpoint at this
 /// dtype (`runtime/lifecycle/asr_memory.rs`).
@@ -444,7 +455,7 @@ impl VibeVoiceAsrModel {
         let vb = load_model_weights(model_dir, dtype, &device.device)?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;
-        let acoustic_tokenizer = VibeVoiceAcousticTokenizer::load(
+        let acoustic_tokenizer = load_asr_acoustic_tokenizer(
             &config.acoustic_tokenizer_config,
             vb.pp("model.acoustic_tokenizer"),
         )?;
@@ -3863,6 +3874,49 @@ mod tests {
         assert_eq!(audio.len(), 6);
         assert!(audio.iter().all(|sample| sample.is_finite()));
         assert!(!stats.normalized);
+    }
+
+    #[test]
+    fn asr_loads_the_acoustic_tokenizer_without_its_decoder() {
+        let config: VibeVoiceTokenizerConfig = serde_json::from_value(json!({
+            "encoder_depths": "1-1",
+            "encoder_ratios": [2],
+            "decoder_ratios": [2],
+            "encoder_n_filters": 1,
+            "decoder_n_filters": 1,
+            "vae_dim": 4
+        }))
+        .unwrap();
+        /// Zeros for every requested shape; no optional tensor exists.
+        struct ShapedZeros;
+        impl candle_nn::var_builder::SimpleBackend for ShapedZeros {
+            fn get(
+                &self,
+                shape: candle_core::Shape,
+                _: &str,
+                _: candle_nn::Init,
+                dtype: DType,
+                device: &Device,
+            ) -> candle_core::Result<Tensor> {
+                Tensor::zeros(shape, dtype, device)
+            }
+            fn get_unchecked(
+                &self,
+                name: &str,
+                _: DType,
+                _: &Device,
+            ) -> candle_core::Result<Tensor> {
+                candle_core::bail!("unexpected unchecked tensor request {name}")
+            }
+            fn contains_tensor(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let vb = VarBuilder::from_backend(Box::new(ShapedZeros), DType::F32, Device::Cpu);
+        let tokenizer = load_asr_acoustic_tokenizer(&config, vb).unwrap();
+        let latents = Tensor::zeros((1, 4, 1), DType::F32, &Device::Cpu).unwrap();
+        let error = tokenizer.decode(&latents).unwrap_err();
+        assert!(error.to_string().contains("encoder-only"), "{error}");
     }
 
     #[test]

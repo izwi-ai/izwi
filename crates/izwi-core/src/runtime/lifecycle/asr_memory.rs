@@ -1449,11 +1449,14 @@ fn vibevoice_plan(
     price_vibevoice(&files, backend, dtype, fused).map(Some)
 }
 
+/// The TTS-only acoustic decoder, which VibeVoice-ASR does not load.
+const VIBEVOICE_ASR_UNLOADED_DECODER: &str = "model.acoustic_tokenizer.decoder.";
+
 /// VibeVoice-ASR (`vibevoice/asr.rs`): every tensor through a `VarBuilder` at
-/// `dtype`, the TTS-only acoustic decoder included, except the TTS prediction
-/// head and speech scaling factors of a TTS checkpoint. With dense projection
-/// fusion (`qwen3/core.rs`), each LM layer's Q/K/V weights and biases and its
-/// gate/up weights are concatenated.
+/// `dtype`, except the acoustic decoder (ASR loads the acoustic tokenizer
+/// encoder-only) and a TTS checkpoint's prediction head and speech scaling
+/// factors. With dense projection fusion (`qwen3/core.rs`), each LM layer's
+/// Q/K/V weights and biases and its gate/up weights are concatenated.
 fn price_vibevoice(
     files: &[CensusFile],
     backend: BackendKind,
@@ -1497,6 +1500,7 @@ fn price_vibevoice(
     }
     for (name, tensor) in &tensors {
         let tts_only = name.starts_with("model.prediction_head.")
+            || name.starts_with(VIBEVOICE_ASR_UNLOADED_DECODER)
             || matches!(
                 *name,
                 "model.speech_scaling_factor" | "model.speech_bias_factor"
@@ -1986,7 +1990,7 @@ mod tests {
             (
                 "VibeVoice-ASR",
                 Box::new(vibevoice),
-                [32.31, 32.31, 57.52, 16.16],
+                [31.03, 31.03, 56.22, 15.52],
             ),
             (
                 "Voxtral-Mini-4B-RT",
@@ -2100,14 +2104,18 @@ mod tests {
         );
         // VibeVoice and Voxtral keep their BF16 checkpoint as is on CUDA.
         let files = census!("vibevoice_asr.json");
+        let asr_loaded = |t: &CensusTensor| !t.name.starts_with(VIBEVOICE_ASR_UNLOADED_DECODER);
         assert_eq!(
             vibevoice(BackendKind::Cuda).resident_bytes,
-            stored(&files, |_| true)
+            stored(&files, asr_loaded)
         );
         assert_eq!(
             vibevoice(BackendKind::Cpu).resident_bytes,
-            2 * stored(&files, |_| true)
+            2 * stored(&files, asr_loaded)
         );
+        // The acoustic decoder is TTS-only: about 0.64 GiB of BF16 not loaded.
+        let decoder = stored(&files, |t| !asr_loaded(t));
+        assert!(decoder > 600 << 20 && decoder < 700 << 20, "{decoder}");
         let files = census!("voxtral_mini_4b_realtime_2602.json");
         assert_eq!(
             voxtral(BackendKind::Cuda).resident_bytes,

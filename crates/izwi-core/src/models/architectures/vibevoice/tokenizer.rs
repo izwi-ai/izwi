@@ -70,7 +70,8 @@ impl TokenizerStreamingState {
 
 pub struct VibeVoiceAcousticTokenizer {
     encoder: TokenizerEncoder,
-    decoder: TokenizerDecoder,
+    /// TTS only: ASR loads the encoder alone ([`Self::load_encoder_only`]).
+    decoder: Option<TokenizerDecoder>,
     fix_std: f32,
     std_dist_type: String,
     vae_dim: usize,
@@ -78,8 +79,21 @@ pub struct VibeVoiceAcousticTokenizer {
 
 impl VibeVoiceAcousticTokenizer {
     pub fn load(config: &VibeVoiceTokenizerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load_parts(config, vb, true)
+    }
+
+    /// The encoder half only. ASR never decodes latents back to audio, so it
+    /// skips the decoder's weights (about 0.69 GB in BF16).
+    pub fn load_encoder_only(config: &VibeVoiceTokenizerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::load_parts(config, vb, false)
+    }
+
+    fn load_parts(
+        config: &VibeVoiceTokenizerConfig,
+        vb: VarBuilder,
+        with_decoder: bool,
+    ) -> Result<Self> {
         let encoder_depths = config.encoder_depths_vec()?;
-        let decoder_depths = config.decoder_depths_vec()?;
         let encoder = TokenizerEncoder::load(
             TokenizerStackConfig {
                 dimension: config.vae_dim,
@@ -101,13 +115,22 @@ impl VibeVoiceAcousticTokenizer {
             },
             vb.pp("encoder"),
         )?;
+        if !with_decoder {
+            return Ok(Self {
+                encoder,
+                decoder: None,
+                fix_std: config.fix_std,
+                std_dist_type: config.std_dist_type.clone(),
+                vae_dim: config.vae_dim,
+            });
+        }
         let decoder = TokenizerDecoder::load(
             TokenizerStackConfig {
                 dimension: config.vae_dim,
                 channels: config.channels,
                 n_filters: config.decoder_n_filters,
                 ratios: config.decoder_ratios_vec(),
-                depths: decoder_depths,
+                depths: config.decoder_depths_vec()?,
                 causal: config.causal,
                 kernel_size: config.kernel_size,
                 last_kernel_size: config.last_kernel_size,
@@ -124,7 +147,7 @@ impl VibeVoiceAcousticTokenizer {
         )?;
         Ok(Self {
             encoder,
-            decoder,
+            decoder: Some(decoder),
             fix_std: config.fix_std,
             std_dist_type: config.std_dist_type.clone(),
             vae_dim: config.vae_dim,
@@ -143,8 +166,18 @@ impl VibeVoiceAcousticTokenizer {
         self.encoder.streaming_state_geometry()
     }
 
-    pub(crate) fn decoder_state_geometry(&self) -> Vec<VibeVoiceTokenizerStateComponentGeometry> {
-        self.decoder.streaming_state_geometry()
+    pub(crate) fn decoder_state_geometry(
+        &self,
+    ) -> Result<Vec<VibeVoiceTokenizerStateComponentGeometry>> {
+        Ok(self.decoder()?.streaming_state_geometry())
+    }
+
+    fn decoder(&self) -> Result<&TokenizerDecoder> {
+        self.decoder.as_ref().ok_or_else(|| {
+            Error::InferenceError(
+                "VibeVoice acoustic tokenizer was loaded encoder-only for ASR".into(),
+            )
+        })
     }
 
     fn encode_streaming(
@@ -296,7 +329,7 @@ impl VibeVoiceAcousticTokenizer {
         } else {
             latents.transpose(1, 2)?
         };
-        self.decoder.forward(&latents)
+        self.decoder()?.forward(&latents)
     }
 
     fn decode_streaming(
@@ -309,8 +342,8 @@ impl VibeVoiceAcousticTokenizer {
         } else {
             latents.transpose(1, 2)?
         };
-        self.decoder
-            .forward_streaming(&latents, cache.decoder_mut(&self.decoder))
+        let decoder = self.decoder()?;
+        decoder.forward_streaming(&latents, cache.decoder_mut(decoder))
     }
 
     pub(crate) fn decode_streaming_physical(
@@ -320,15 +353,16 @@ impl VibeVoiceAcousticTokenizer {
         advance_frames: u64,
         lease: &mut InvocationTensorLease,
     ) -> Result<Tensor> {
+        let decoder = self.decoder()?;
         let mut cache = TokenizerStreamingState::new();
-        let expected_cursor = hydrate_decoder_cache(lease, &self.decoder, &mut cache)?;
+        let expected_cursor = hydrate_decoder_cache(lease, decoder, &mut cache)?;
         let output = self.decode_streaming(latents, &mut cache)?;
         commit_decoder_cache(
             lease,
             domain,
             expected_cursor,
             advance_frames,
-            &self.decoder,
+            decoder,
             cache.decoder.as_ref().ok_or_else(|| {
                 Error::InferenceError(
                     "VibeVoice acoustic decoder did not initialize physical state".into(),
@@ -355,18 +389,19 @@ impl VibeVoiceAcousticTokenizer {
                 "VibeVoice acoustic retained decode must advance exactly one codec frame".into(),
             ));
         }
+        let decoder = self.decoder()?;
         let mut cache = TokenizerStreamingState::new();
         hydrate_retained_decoder_base(
             arena,
             transaction,
             domain,
             expected_cursor,
-            &self.decoder,
+            decoder,
             &mut cache,
             "acoustic decoder",
         )?;
         let output = self.decode_streaming(latents, &mut cache)?;
-        let values = retained_state_values(self.decoder.collect_streaming_state(
+        let values = retained_state_values(decoder.collect_streaming_state(
             cache.decoder.as_ref().ok_or_else(|| {
                 Error::InferenceError(
                     "VibeVoice acoustic retained decoder did not initialize state".into(),
@@ -2452,7 +2487,7 @@ mod tests {
     fn supplied_acoustic_noise_is_retry_exact_and_checked() {
         let tokenizer = VibeVoiceAcousticTokenizer {
             encoder: tiny_encoder(),
-            decoder: tiny_decoder(),
+            decoder: Some(tiny_decoder()),
             fix_std: 0.5,
             std_dist_type: "normal".into(),
             vae_dim: 1,
@@ -2484,7 +2519,7 @@ mod tests {
 
         let deterministic = VibeVoiceAcousticTokenizer {
             encoder: tiny_encoder(),
-            decoder: tiny_decoder(),
+            decoder: Some(tiny_decoder()),
             fix_std: 0.0,
             std_dist_type: "none".into(),
             vae_dim: 1,
@@ -2874,6 +2909,52 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(expected.len(), 156);
         assert_eq!(requested, expected);
+    }
+
+    #[test]
+    fn asr_acoustic_tokenizer_loads_no_decoder_weights() {
+        let config = r#"{"causal": true, "channels": 1, "conv_bias": true,
+            "conv_norm": "none", "corpus_normalize": 0.0, "decoder_depths": null,
+            "decoder_n_filters": 1, "decoder_ratios": [8, 5, 5, 4, 2, 2],
+            "disable_last_norm": true, "encoder_depths": "3-3-3-3-3-3-8",
+            "encoder_n_filters": 1, "encoder_ratios": [8, 5, 5, 4, 2, 2], "fix_std": 0.5,
+            "layer_scale_init_value": 1e-06, "layernorm": "RMSNorm",
+            "layernorm_elementwise_affine": true, "layernorm_eps": 1e-05,
+            "mixer_layer": "depthwise_conv", "pad_mode": "constant",
+            "std_dist_type": "gaussian", "vae_dim": 64, "weight_init_value": 0.01}"#;
+        let config: VibeVoiceTokenizerConfig = serde_json::from_str(config).unwrap();
+        let load = |encoder_only: bool| {
+            let requested = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let vb = VarBuilder::from_backend(
+                Box::new(RecordingZeros(requested.clone())),
+                DType::F32,
+                Device::Cpu,
+            );
+            let tokenizer = if encoder_only {
+                VibeVoiceAcousticTokenizer::load_encoder_only(&config, vb)
+            } else {
+                VibeVoiceAcousticTokenizer::load(&config, vb)
+            }
+            .unwrap();
+            let names = requested.lock().unwrap().clone();
+            (tokenizer, names)
+        };
+        let (full, full_names) = load(false);
+        let (asr, asr_names) = load(true);
+        let decoder = |names: &[String]| {
+            names
+                .iter()
+                .filter(|name| name.starts_with("decoder."))
+                .count()
+        };
+        assert!(decoder(&full_names) > 0);
+        assert_eq!(decoder(&asr_names), 0);
+        assert_eq!(asr_names.len(), full_names.len() - decoder(&full_names));
+        assert!(full.decoder_state_geometry().is_ok());
+        let latents = Tensor::zeros((1, 64, 1), DType::F32, &Device::Cpu).unwrap();
+        let error = asr.decode(&latents).unwrap_err();
+        assert!(error.to_string().contains("encoder-only"), "{error}");
+        assert!(asr.decoder_state_geometry().is_err());
     }
 
     #[test]
