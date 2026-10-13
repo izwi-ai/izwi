@@ -755,6 +755,83 @@ mod tests {
         }
     }
 
+    /// Phase 0 capability contract for every enabled TTS variant: the route
+    /// the runtime takes for non-stream and stream requests is the one the
+    /// registry advertises (VXT-1); streaming is advertised exactly when a
+    /// streaming capability is published; a streamed request that runs on
+    /// the engine belongs to a family whose executor publishes audio and a
+    /// final marker, or it runs final-only (TPIPE-3/4); and the automatic
+    /// frame budget grows with text and stays inside the model's maximum
+    /// (TPIPE-2).
+    #[test]
+    fn every_tts_family_route_matches_its_advertised_capability_and_budget() {
+        use crate::models::architectures::qwen3::tts::qwen3_tts_auto_max_frames_for_text;
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        use crate::runtime::adapters::RuntimeAdapterRegistry;
+        // Families whose engine executors call `stream_audio` and publish
+        // the final marker.
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 3] = [
+            ModelFamily::Qwen3Tts,
+            ModelFamily::FishS2Tts,
+            ModelFamily::VoxtralTts,
+        ];
+        let registry = RuntimeAdapterRegistry::built_in();
+        let short = "Hello there.";
+        let paragraph = "The committee reviewed every proposal in detail. ".repeat(6);
+        let flood = "word ".repeat(20_000);
+        let mut checked = 0;
+        for variant in ModelVariant::all().iter().copied() {
+            if !variant.is_enabled() || !variant.is_tts() {
+                continue;
+            }
+            checked += 1;
+            let capabilities = variant.speech_capabilities().expect("speech capabilities");
+            let tts = registry
+                .require(CapabilityKind::Tts, variant)
+                .unwrap_or_else(|error| panic!("{variant}: {error}"));
+            assert_eq!(
+                tts.execution_target,
+                tts_route_target(variant, false),
+                "{variant}: non-stream route"
+            );
+            match registry.require(CapabilityKind::StreamingTts, variant) {
+                Ok(streaming) => {
+                    assert!(capabilities.supports_streaming, "{variant}");
+                    assert_eq!(
+                        streaming.execution_target,
+                        tts_route_target(variant, true),
+                        "{variant}: stream route"
+                    );
+                }
+                Err(_) => assert!(!capabilities.supports_streaming, "{variant}"),
+            }
+            for is_cuda in [false, true] {
+                for chunked in [false, true] {
+                    let engine_stream = tts_route_target(variant, true)
+                        == ExecutionTargetKind::TokenEngine
+                        && !tts_streaming_uses_final_only(is_cuda, variant, chunked);
+                    assert!(
+                        !engine_stream || ENGINE_STREAM_EMITTERS.contains(&variant.family()),
+                        "{variant}: an engine stream would end without audio"
+                    );
+                }
+            }
+            let budget: Option<fn(&str) -> usize> = match variant.family() {
+                ModelFamily::Qwen3Tts => Some(qwen3_tts_auto_max_frames_for_text),
+                ModelFamily::VibeVoiceTts => Some(vibevoice_tts_auto_max_frames_for_text),
+                ModelFamily::VoxtralTts => Some(voxtral_tts_auto_max_frames_for_text),
+                _ => None,
+            };
+            if let Some(budget) = budget {
+                let maximum = variant.tts_max_output_frames_hint().expect("frame hint");
+                assert!(budget(short) > 0, "{variant}");
+                assert!(budget(&paragraph) > budget(short), "{variant}");
+                assert!(budget(&flood) <= maximum, "{variant}");
+            }
+        }
+        assert!(checked >= 8, "only {checked} TTS variants were checked");
+    }
+
     #[test]
     fn direct_tts_retained_input_includes_reference_and_config_strings() {
         let mut request = GenerationRequest::new("speak");

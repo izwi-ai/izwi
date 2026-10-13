@@ -6596,6 +6596,41 @@ mod tests {
         }
     }
 
+    /// Phase 0 state-ceiling contract: every TTS family whose load fits
+    /// retained state guarantees one full request (its longest prompt plus
+    /// its largest automatic output budget), and families sized elsewhere
+    /// ask for no floor.
+    #[test]
+    fn tts_state_floor_covers_one_full_request_per_family() {
+        use crate::catalog::ModelFamily;
+        use crate::models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        let flood = "word ".repeat(20_000);
+        let floor = |variant| super::tts_state_minimum_tokens(variant) as usize;
+        for variant in ModelVariant::all().iter().copied() {
+            if !variant.is_enabled() || !variant.is_tts() {
+                continue;
+            }
+            let required = match variant.family() {
+                // 320 reference codes plus role and codec-prefix tokens.
+                ModelFamily::Qwen3Tts => 330 + qwen3_tts_auto_max_output_frames(),
+                // A 12 s voice reference (90 latents) plus its markers.
+                ModelFamily::VibeVoiceTts => 96 + vibevoice_tts_auto_max_frames_for_text(&flood),
+                // A preset voice prompt plus CUDA's frame maximum.
+                ModelFamily::VoxtralTts => 256 + ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES,
+                _ => {
+                    assert_eq!(floor(variant), 0, "{variant}");
+                    continue;
+                }
+            };
+            assert!(
+                floor(variant) >= required,
+                "{variant}: floor {} < {required}",
+                floor(variant)
+            );
+        }
+    }
+
     /// R-1 for VibeVoice: every request returned 400 against a 64-token
     /// context. Both CFG domains must reach a prompt plus the largest
     /// automatic budget.
