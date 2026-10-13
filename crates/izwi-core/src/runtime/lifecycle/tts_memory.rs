@@ -423,9 +423,10 @@ mod tests {
         }
     }
 
-    /// Voxtral-TTS splits one checkpoint across three `VarBuilder`s: the
-    /// acoustic transformer and the codec at their own dtypes, the rest at
-    /// the LM's. CPU and Metal resolve F32 everywhere; CUDA resolves BF16.
+    /// Voxtral-TTS splits one checkpoint across `VarBuilder`s: the acoustic
+    /// transformer and the codec at their own dtypes, the rest at the LM's.
+    /// CPU resolves F32 everywhere; Metal resolves the LM tier (F16) for the
+    /// LM and acoustic transformer and F32 for the codec; CUDA resolves BF16.
     #[test]
     fn voxtral_tts_prices_each_stage_at_its_resolved_dtype() {
         use crate::models::architectures::voxtral::tts::model::select_voxtral_tts_dtypes;
@@ -444,11 +445,12 @@ mod tests {
                 tensor("audio_tokenizer.decoder.0.weight", 1 << 16),
             ],
         }];
-        let elements = (1u64 << 20) + (1 << 18) + (1 << 16);
-        for (backend, element_bytes) in [
-            (BackendKind::Cpu, 4),
-            (BackendKind::Metal, 4),
-            (BackendKind::Cuda, 2),
+        let transformer_elements = (1u64 << 20) + (1 << 18);
+        let codec_elements = 1u64 << 16;
+        for (backend, transformer_bytes, codec_bytes) in [
+            (BackendKind::Cpu, 4, 4),
+            (BackendKind::Metal, 2, 4),
+            (BackendKind::Cuda, 2, 2),
         ] {
             let dtypes = select_voxtral_tts_dtypes(&profile(backend), None).unwrap();
             let estimate = price_voxtral_tts(&files, backend, &dtypes)
@@ -458,7 +460,7 @@ mod tests {
             // Power-of-two element counts: Metal's rounding changes nothing.
             assert_eq!(
                 estimate.resident_bytes,
-                elements * element_bytes,
+                transformer_elements * transformer_bytes + codec_elements * codec_bytes,
                 "{backend:?}"
             );
         }
