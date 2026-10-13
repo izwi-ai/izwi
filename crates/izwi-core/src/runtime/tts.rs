@@ -513,10 +513,38 @@ impl RuntimeService {
     }
 }
 
+/// Speak numbers, currency, dates, times and units as words when the
+/// request asks for it, or leaves it unset for a family that normalizes by
+/// default (`batch.tts.normalize_text`, TPIPE-26). English text only.
+fn normalize_speech_text(
+    mut request: GenerationRequest,
+    variant: ModelVariant,
+) -> GenerationRequest {
+    use crate::models::shared::text_normalize::{
+        family_normalizes_by_default, is_english, normalize_english,
+    };
+    let enabled = request
+        .config
+        .options
+        .speech
+        .normalize_text
+        .unwrap_or_else(|| family_normalizes_by_default(variant.family()));
+    if enabled
+        && is_english(
+            request.language.as_deref(),
+            request.config.options.speaker.as_deref(),
+        )
+    {
+        request.text = normalize_english(&request.text);
+    }
+    request
+}
+
 impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
+        let request = normalize_speech_text(request, resolved_variant);
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -570,6 +598,7 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
+        let request = normalize_speech_text(request, resolved_variant);
         if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
@@ -795,6 +824,47 @@ mod tests {
     /// the scheduler token count is not a frame count; medium (313 / 313)
     /// really hit its budget. A family without the end-of-speech step
     /// signal never reads as a context stop.
+    /// Kokoro speaks "$1,250.75" and "March 3rd" as words by default; a
+    /// family that reads them itself is left alone unless the request asks,
+    /// and a request can turn Kokoro's off.
+    #[test]
+    fn speech_text_normalization_follows_the_family_default_and_the_request() {
+        let text = "It costs $1,250.75 on March 3rd.";
+        let spoken = "It costs one thousand two hundred fifty dollars and seventy-five cents on March third.";
+        let request = |normalize_text: Option<bool>| {
+            let mut request = GenerationRequest::new(text);
+            request.config.options.speech.normalize_text = normalize_text;
+            request
+        };
+        assert_eq!(
+            normalize_speech_text(request(None), ModelVariant::Kokoro82M).text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(None), ModelVariant::Qwen3Tts12Hz06BCustomVoice).text,
+            text
+        );
+        assert_eq!(
+            normalize_speech_text(
+                request(Some(true)),
+                ModelVariant::Qwen3Tts12Hz06BCustomVoice
+            )
+            .text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(Some(false)), ModelVariant::Kokoro82M).text,
+            text
+        );
+        // Non-English text is never rewritten.
+        let mut japanese = request(None);
+        japanese.config.options.speaker = Some("jf_alpha".into());
+        assert_eq!(
+            normalize_speech_text(japanese, ModelVariant::Kokoro82M).text,
+            text
+        );
+    }
+
     #[test]
     fn engine_tts_stop_reason_reads_frames_and_the_end_of_speech_step() {
         let breakdown = |steps: u32, frames: usize| {

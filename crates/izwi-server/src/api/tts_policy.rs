@@ -62,6 +62,11 @@ pub struct SpeechSamplingRequest {
     /// VibeVoice diffusion steps per frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_steps: Option<usize>,
+    /// Speak numbers, currency, dates, times and units as words (English).
+    /// Unset keeps the model's default: on for Kokoro, off for models that
+    /// read them themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalize_text: Option<bool>,
 }
 
 impl SpeechSamplingRequest {
@@ -84,6 +89,7 @@ impl SpeechSamplingRequest {
             subtalker_top_p: self.subtalker_top_p,
             cfg_scale: self.cfg_scale,
             diffusion_steps: self.diffusion_steps,
+            normalize_text: self.normalize_text,
         }
     }
 }

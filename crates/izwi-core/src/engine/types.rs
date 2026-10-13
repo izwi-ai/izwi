@@ -122,6 +122,10 @@ pub struct SpeechSamplingOptions {
     /// VibeVoice diffusion steps per frame.
     #[serde(default)]
     pub diffusion_steps: Option<usize>,
+    /// English text normalization (numbers, currency, dates, times, units)
+    /// before synthesis; unset keeps the family's default (on for Kokoro).
+    #[serde(default)]
+    pub normalize_text: Option<bool>,
 }
 
 impl SpeechSamplingOptions {
