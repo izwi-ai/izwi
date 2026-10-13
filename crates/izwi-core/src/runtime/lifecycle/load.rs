@@ -539,6 +539,28 @@ fn reconciles_device_usage(variant: ModelVariant) -> bool {
     asr_memory::is_asr_variant(variant) || tts_memory::has_plan(variant)
 }
 
+/// A request envelope in `backend`'s ledger domains: host and accelerator
+/// share one memory on CPU and Metal; CUDA splits them.
+fn request_envelope_resources(
+    backend: BackendKind,
+    envelope: super::asr_envelope::AsrRequestEnvelope,
+) -> Result<ResourceVector> {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
+            resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
+        }
+    }
+    Ok(resources)
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1945,36 +1967,28 @@ impl ModelLifecycleController {
         )
     }
 
-    /// Reserve one ASR request envelope per execution slot for the state
-    /// fits to leave free, or `None` for a variant without one.
-    fn hold_asr_request_envelope(
+    /// Reserve one request envelope per execution slot for the state fits
+    /// to leave free (ASR: one full chunk; TTS: one request at the largest
+    /// automatic budget), or `None` for a variant without one.
+    async fn hold_request_envelope(
         &self,
         variant: ModelVariant,
         backend: BackendKind,
     ) -> Result<Option<ResourceLease>> {
         let slots = self.coordinator.physical_execution_admission().capacity();
-        let Some(envelope) =
-            super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
-        else {
-            return Ok(None);
-        };
-        let mut resources = ResourceVector::zero();
-        match backend {
-            BackendKind::Cpu => {
-                resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
-            }
-            BackendKind::Metal => {
-                resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
-            }
-            BackendKind::Cuda => {
-                resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
-                resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
-            }
-        }
+        let (envelope, label) =
+            match super::asr_envelope::deferred_request_envelope(variant, backend, slots)? {
+                Some(envelope) => (envelope, "asr"),
+                None => match self.tts_request_envelope(variant).await? {
+                    Some(envelope) => (envelope.scaled(slots)?, "tts"),
+                    None => return Ok(None),
+                },
+            };
+        let resources = request_envelope_resources(backend, envelope)?;
         let lease = self.coordinator.resource_authority().reserve(
             ReservationOwner::new(
                 ReservationClass::Model,
-                format!("{variant}:asr-request-envelope"),
+                format!("{variant}:{label}-request-envelope"),
             ),
             resources,
         )?;
@@ -1983,9 +1997,28 @@ impl ModelLifecycleController {
             request_slots = slots,
             host_bytes = envelope.host_bytes,
             accelerator_bytes = envelope.accelerator_bytes,
-            "Holding the ASR request envelope out of the state fits"
+            "Holding the {label} request envelope out of the state fits"
         );
         Ok(Some(lease))
+    }
+
+    /// One TTS request's envelope, priced by the loaded model (P2.3), for
+    /// the families whose load fits state beside it: Qwen3-TTS.
+    async fn tts_request_envelope(
+        &self,
+        variant: ModelVariant,
+    ) -> Result<Option<super::asr_envelope::AsrRequestEnvelope>> {
+        if variant.family() != crate::catalog::ModelFamily::Qwen3Tts {
+            return Ok(None);
+        }
+        let Some(model) = self.model_registry.get_qwen_tts(variant).await else {
+            return Ok(None);
+        };
+        let (host_bytes, accelerator_bytes) = model.request_envelope_bytes()?;
+        Ok(Some(super::asr_envelope::AsrRequestEnvelope {
+            host_bytes,
+            accelerator_bytes,
+        }))
     }
 
     async fn reserve_model_resources(
@@ -2425,14 +2458,14 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
-            if asr_memory::is_asr_variant(variant) {
+            if reconciles_device_usage(variant) {
                 // The cached live sample can predate the fence that released
                 // the load's staging; the state fits read a fresh one.
                 self.coordinator
                     .resource_authority()
                     .refresh_physical_capacity_after_release();
             }
-            let request_envelope_hold = self.hold_asr_request_envelope(variant, backend)?;
+            let request_envelope_hold = self.hold_request_envelope(variant, backend).await?;
             let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.

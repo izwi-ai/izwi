@@ -2234,6 +2234,31 @@ impl Qwen3TtsModel {
         Ok((host.max(1), accelerator.max(1)))
     }
 
+    /// What one request holds while it runs at the largest automatic budget
+    /// (one full prompt, the automatic frame cap), as (host, accelerator)
+    /// bytes: the larger of its prefill and its per-row decode workspace
+    /// (separate stages; decode includes one codec window), plus the output
+    /// buffer the runtime reserves. Load holds it out of the state fits
+    /// (P2.3).
+    pub(crate) fn request_envelope_bytes(&self) -> Result<(u64, u64)> {
+        let prompt = budget::QWEN3_TTS_STATE_PROMPT_TOKENS;
+        let frames = qwen3_tts_auto_max_output_frames();
+        let voice_clone = qwen3_tts_model_kind(&self.config).1;
+        let (prefill_host, prefill_accelerator) =
+            self.resumable_prefill_workspace_bytes(prompt, frames, voice_clone)?;
+        let (decode_host, decode_accelerator) =
+            self.continuous_decode_bounded_workspace_per_row_bytes(prompt, frames)?;
+        let output = u64::try_from(self.speech_tokenizer.decoded_sample_upper_bound(frames)?)
+            .ok()
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS request envelope overflow".into()))?;
+        let host = prefill_host
+            .max(decode_host)
+            .checked_add(output)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS request envelope overflow".into()))?;
+        Ok((host, prefill_accelerator.max(decode_accelerator)))
+    }
+
     /// Frame-bounded scheduler accounting for one continuously decoded row.
     /// Host memory includes retained codec history, the rollback-safe codec
     /// scratch clone, bounded semantic history, and commit-fenced waveform

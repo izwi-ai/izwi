@@ -525,6 +525,33 @@ mod tests {
         std::fs::remove_dir_all(missing).unwrap();
     }
 
+    /// P2.3: the TTS request envelope is held like the ASR one: one per
+    /// execution slot, in the backend's domains (one memory on CPU and
+    /// Metal, host and device on CUDA).
+    #[test]
+    fn request_envelopes_scale_by_slot_and_map_to_the_backend_domains() {
+        use super::super::super::asr_envelope::AsrRequestEnvelope;
+        let envelope = AsrRequestEnvelope {
+            host_bytes: 300,
+            accelerator_bytes: 700,
+        }
+        .scaled(2)
+        .unwrap();
+        assert_eq!(
+            (envelope.host_bytes, envelope.accelerator_bytes),
+            (600, 1_400)
+        );
+        let cpu = super::super::request_envelope_resources(BackendKind::Cpu, envelope).unwrap();
+        assert_eq!(cpu.host_bytes, ResourceAmount::Known(2_000));
+        let metal = super::super::request_envelope_resources(BackendKind::Metal, envelope).unwrap();
+        assert_eq!(metal.unified_bytes, ResourceAmount::Known(2_000));
+        let cuda = super::super::request_envelope_resources(BackendKind::Cuda, envelope).unwrap();
+        assert_eq!(
+            (cuda.host_bytes, cuda.device_bytes),
+            (ResourceAmount::Known(600), ResourceAmount::Known(1_400))
+        );
+    }
+
     /// The runtime's load admission takes the TTS plan.
     #[test]
     fn runtime_admission_prices_tts_loads_by_their_plan() {
