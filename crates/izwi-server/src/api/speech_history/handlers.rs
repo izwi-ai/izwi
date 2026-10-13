@@ -125,6 +125,9 @@ pub struct CreateSpeechHistoryRecordRequest {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// izwi speech-sampling extensions; unset keeps the family default.
+    #[serde(flatten)]
+    pub sampling: crate::api::tts_policy::SpeechSamplingRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2545,6 +2548,7 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         generation_config.options.top_k = top_k;
     }
+    generation_config.options.speech = req.sampling.options(req.temperature, req.top_k);
     generation_config.options.speaker = req.speaker.clone();
 
     GenerationRequest {
@@ -2965,6 +2969,7 @@ mod tests {
             max_output_tokens: None,
             top_k: None,
             stream: None,
+            sampling: Default::default(),
         }
     }
 

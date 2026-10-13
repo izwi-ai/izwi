@@ -9,6 +9,62 @@ use izwi_core::runtime_models::architectures::vibevoice::tts::{
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::ModelVariant;
 
+/// Optional speech-sampling fields a request may set beside `temperature`
+/// and `top_k`. Anything left unset keeps the model family's reference
+/// default (TPIPE-24): Qwen3-TTS generation_config, LFM 0.8 / top-k 64,
+/// VibeVoice CFG 1.3 with 10 steps, fish-speech 0.7 / 0.7, Voxtral greedy.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SpeechSamplingRequest {
+    /// Nucleus sampling threshold, in (0, 1].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Repetition penalty (Qwen3-TTS), >= 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// Qwen3-TTS residual-codebook sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_do_sample: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_top_p: Option<f32>,
+    /// VibeVoice classifier-free guidance scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_scale: Option<f32>,
+    /// VibeVoice diffusion steps per frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffusion_steps: Option<usize>,
+}
+
+impl SpeechSamplingRequest {
+    /// The engine's speech sampling for a request that also set `temperature`
+    /// and `top_k` (each `None` when the client left it unset).
+    pub(crate) fn options(
+        &self,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+    ) -> izwi_core::SpeechSamplingOptions {
+        izwi_core::SpeechSamplingOptions {
+            temperature,
+            top_p: self.top_p,
+            top_k,
+            repetition_penalty: self.repetition_penalty,
+            seed: self.seed,
+            subtalker_do_sample: self.subtalker_do_sample,
+            subtalker_temperature: self.subtalker_temperature,
+            subtalker_top_k: self.subtalker_top_k,
+            subtalker_top_p: self.subtalker_top_p,
+            cfg_scale: self.cfg_scale,
+            diffusion_steps: self.diffusion_steps,
+        }
+    }
+}
+
 pub(crate) fn resolve_tts_output_frames(
     variant: ModelVariant,
     text: &str,

@@ -73,7 +73,8 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
-    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference,
+    VibeVoiceTtsGenerationParams, VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
@@ -758,6 +759,86 @@ fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> 
             Error::InvalidInput("runtime retained input size exceeds u64".to_string())
         })?,
     ))
+}
+
+/// VibeVoice sampling for a request: unset fields keep the reference demo's
+/// CFG 1.3 and `default_diffusion_steps` (10) (TPIPE-24, VVT-5).
+fn vibevoice_tts_request_params(
+    params: &GenerationParams,
+    text: &str,
+    default_diffusion_steps: usize,
+) -> VibeVoiceTtsGenerationParams {
+    let auto_frame_budget = params.max_tokens == 0;
+    VibeVoiceTtsGenerationParams {
+        cfg_scale: params
+            .speech
+            .cfg_scale
+            .unwrap_or(VIBEVOICE_TTS_DEFAULT_CFG_SCALE),
+        diffusion_steps: params
+            .speech
+            .diffusion_steps
+            .unwrap_or(default_diffusion_steps)
+            .max(1),
+        max_frames: if auto_frame_budget {
+            vibevoice_tts_auto_max_frames_for_text(text)
+        } else {
+            params
+                .max_tokens
+                .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+        },
+        auto_frame_budget,
+    }
+}
+
+/// Fish S2 sampling for a request: unset fields keep fish-speech's serving
+/// defaults, and the seed defaults to one derived from the request id.
+fn fish_s2_request_params(params: &GenerationParams, request_id: &str) -> FishS2GenerationParams {
+    let defaults = FishS2GenerationParams::default();
+    FishS2GenerationParams {
+        max_frames: if params.max_tokens == 0 {
+            defaults.max_frames
+        } else {
+            params
+                .max_tokens
+                .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+        },
+        temperature: params.speech.temperature.unwrap_or(defaults.temperature),
+        top_p: params.speech.top_p.unwrap_or(defaults.top_p),
+        top_k: params
+            .audio_top_k
+            .or(params.speech.top_k)
+            .unwrap_or(defaults.top_k),
+        seed: params
+            .speech
+            .seed
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id)),
+        ..defaults
+    }
+}
+
+/// Voxtral sampling for a request: unset fields keep Voxtral's defaults
+/// (greedy semantic codes), and the flow-matching seed defaults to one
+/// derived from the request id, so a retried frame redraws the same noise.
+fn voxtral_tts_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+    context_limit: usize,
+) -> VoxtralTtsGenerationParams {
+    let speech = &params.speech;
+    let defaults = VoxtralTtsGenerationParams::default();
+    VoxtralTtsGenerationParams {
+        max_frames: params
+            .max_tokens
+            .max(1)
+            .min(context_limit.saturating_sub(1).max(1)),
+        temperature: speech.temperature.unwrap_or(defaults.temperature).max(0.0),
+        top_p: speech.top_p.unwrap_or(defaults.top_p).clamp(0.0, 1.0),
+        top_k: speech.top_k.unwrap_or(defaults.top_k),
+        seed: speech
+            .seed
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+        ..defaults
+    }
 }
 
 fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
@@ -6187,20 +6268,8 @@ impl RuntimeService {
             text: reference_text.to_string(),
         };
         let requested_speaker = request.tts_speaker_for_execution().map(str::to_string);
-        let auto_frame_budget = request.params.max_tokens == 0;
-        let params = VibeVoiceTtsGenerationParams {
-            cfg_scale: 1.5,
-            diffusion_steps: model.default_diffusion_steps().max(1),
-            max_frames: if auto_frame_budget {
-                vibevoice_tts_auto_max_frames_for_text(&text)
-            } else {
-                request
-                    .params
-                    .max_tokens
-                    .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
-            },
-            auto_frame_budget,
-        };
+        let params =
+            vibevoice_tts_request_params(&request.params, &text, model.default_diffusion_steps());
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("VibeVoice TTS retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
@@ -6385,25 +6454,7 @@ impl RuntimeService {
             sample_rate,
             text: reference_text.to_string(),
         };
-        let params = FishS2GenerationParams {
-            max_frames: if request.params.max_tokens == 0 {
-                FishS2GenerationParams::default().max_frames
-            } else {
-                request
-                    .params
-                    .max_tokens
-                    .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
-            },
-            temperature: request.params.temperature,
-            top_p: request.params.top_p,
-            top_k: request
-                .params
-                .audio_top_k
-                .or_else(|| (request.params.top_k > 0).then_some(request.params.top_k))
-                .unwrap_or(FishS2GenerationParams::default().top_k),
-            seed: EngineCoreRequest::chat_request_seed(&request.id),
-            ..FishS2GenerationParams::default()
-        };
+        let params = fish_s2_request_params(&request.params, &request.id);
         params.validate()?;
         let memory = model.preparation_memory(&text, &reference, context_limit)?;
         // The text clone and decoded reference were constructed under the initial
@@ -6606,14 +6657,7 @@ impl RuntimeService {
             .map(str::to_string)
             .or_else(|| model.available_speakers().into_iter().next())
             .ok_or_else(|| Error::InvalidInput("Voxtral TTS has no available voice".into()))?;
-        let params = VoxtralTtsGenerationParams {
-            max_frames: request
-                .params
-                .max_tokens
-                .max(1)
-                .min(context_limit.saturating_sub(1).max(1)),
-            ..Default::default()
-        };
+        let params = voxtral_tts_request_params(&request.params, &request.id, context_limit);
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Voxtral TTS retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
@@ -6936,7 +6980,7 @@ impl RuntimeService {
         job: JobLease,
         residency_lease: Option<&ModelResidencyLease>,
     ) -> Result<(EngineCoreRequest, JobLease)> {
-        request.normalize_tts_params_before_preparation();
+        request.normalize_tts_params_before_preparation()?;
         let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease)
             .await?;
@@ -10842,6 +10886,50 @@ mod tests {
         assert_eq!(
             Some(spec.resources),
             asr_transient_resources(backend, variant, after, Some(257.0 / 16_000.0)).unwrap()
+        );
+    }
+
+    /// TPIPE-24: unset speech sampling keeps each family's reference
+    /// default instead of the shared chat defaults, and request fields
+    /// override it.
+    #[test]
+    fn speech_family_params_keep_reference_defaults_until_the_request_sets_them() {
+        let unset = GenerationParams::default();
+        let vibevoice = vibevoice_tts_request_params(&unset, "Hello there.", 10);
+        assert_eq!((vibevoice.cfg_scale, vibevoice.diffusion_steps), (1.3, 10));
+        let fish = fish_s2_request_params(&unset, "request-a");
+        assert_eq!((fish.temperature, fish.top_p, fish.top_k), (0.7, 0.7, 30));
+        assert_eq!(fish.seed, EngineCoreRequest::chat_request_seed("request-a"));
+        let voxtral = voxtral_tts_request_params(&unset, "request-a", 4096);
+        assert_eq!(
+            (voxtral.temperature, voxtral.top_p, voxtral.top_k),
+            (0.0, 1.0, 0)
+        );
+        assert_ne!(voxtral.seed, 0, "retried frames redraw the same noise");
+
+        let mut set = GenerationParams::default();
+        set.speech.cfg_scale = Some(2.0);
+        set.speech.diffusion_steps = Some(20);
+        set.speech.temperature = Some(0.5);
+        set.speech.top_p = Some(0.9);
+        set.speech.top_k = Some(12);
+        set.speech.seed = Some(99);
+        let vibevoice = vibevoice_tts_request_params(&set, "Hello there.", 10);
+        assert_eq!((vibevoice.cfg_scale, vibevoice.diffusion_steps), (2.0, 20));
+        let fish = fish_s2_request_params(&set, "request-a");
+        assert_eq!(
+            (fish.temperature, fish.top_p, fish.top_k, fish.seed),
+            (0.5, 0.9, 12, 99)
+        );
+        let voxtral = voxtral_tts_request_params(&set, "request-a", 4096);
+        assert_eq!(
+            (
+                voxtral.temperature,
+                voxtral.top_p,
+                voxtral.top_k,
+                voxtral.seed
+            ),
+            (0.5, 0.9, 12, 99)
         );
     }
 

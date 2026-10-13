@@ -3731,10 +3731,12 @@ impl EngineCoreRequest {
     /// checks it against the request, so a later clamp (engine admission)
     /// failed every request outside the range with "changed after
     /// preparation" (KOK-20).
-    pub(crate) fn normalize_tts_params_before_preparation(&mut self) {
+    pub(crate) fn normalize_tts_params_before_preparation(&mut self) -> Result<()> {
         if self.task_type == TaskType::TTS {
             self.params.speed = clamp_tts_speed(self.params.speed);
+            self.params.speech.validate()?;
         }
+        Ok(())
     }
 
     pub(crate) fn lfm25_audio_tts_messages_for_preparation(&self) -> Result<Vec<ChatMessage>> {
@@ -3834,11 +3836,15 @@ impl EngineCoreRequest {
     }
 
     pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
-        // A per-request seed derived from the request id, as audio chat does.
+        // Unset fields keep the reference 0.8 / top-k 64; the seed defaults
+        // to one derived from the request id, as audio chat does.
+        let speech = &self.params.speech;
         Lfm25AudioGenerationConfig::tts(
-            self.params.audio_temperature,
-            self.params.audio_top_k,
-            Self::chat_request_seed(&self.id),
+            self.params.audio_temperature.or(speech.temperature),
+            self.params.audio_top_k.or(speech.top_k),
+            speech
+                .seed
+                .unwrap_or_else(|| Self::chat_request_seed(&self.id)),
         )
     }
 
@@ -4137,26 +4143,14 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| ready.qwen_tts.as_ref())
             .map(|prepared| prepared.max_frames);
-        TtsGenerationParams {
-            temperature: self.params.temperature.max(0.0),
-            top_p: self.params.top_p.clamp(0.0, 1.0),
-            top_k: if self.params.top_k == 0 {
-                50
-            } else {
-                self.params.top_k
-            },
-            repetition_penalty: self.params.repetition_penalty.max(1.0),
-            max_frames: if let Some(max_frames) = prepared_max_frames {
-                max_frames
-            } else if self.params.max_tokens == 0 {
-                model_max_frames
-            } else {
-                self.params.max_tokens.clamp(16, model_max_frames.max(16))
-            },
-            subtalker: TtsGenerationParams::subtalker_for_request_temperature(
-                self.params.temperature,
-            ),
-        }
+        let max_frames = if let Some(max_frames) = prepared_max_frames {
+            max_frames
+        } else if self.params.max_tokens == 0 {
+            model_max_frames
+        } else {
+            self.params.max_tokens.clamp(16, model_max_frames.max(16))
+        };
+        TtsGenerationParams::for_request(&self.params.speech, max_frames)
     }
 
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
@@ -5873,6 +5867,7 @@ impl RequestProcessor {
         // Clamp speed (already applied before TTS preparation, so the
         // prepared artifact and execution see the same value).
         params.speed = clamp_tts_speed(params.speed);
+        params.speech.validate()?;
 
         // Validate repetition penalty
         if params.repetition_penalty < 1.0 {
@@ -6098,7 +6093,7 @@ mod tests {
         for (requested, expected) in [(0.25, 0.5), (4.0, 2.0), (1.25, 1.25)] {
             let mut request = super::EngineCoreRequest::tts("Speed probe.");
             request.params.speed = requested;
-            request.normalize_tts_params_before_preparation();
+            request.normalize_tts_params_before_preparation().unwrap();
             assert_eq!(request.params.speed, expected);
             let prepared_speed = request.params.speed;
             let admitted = super::RequestProcessor::new(super::EngineCoreConfig::default())
@@ -7572,5 +7567,77 @@ mod tests {
         request.params.audio_top_k = Some(10);
         let config = request.lfm25_audio_tts_generation_config();
         assert_eq!((config.audio.temperature, config.audio.top_k), (0.5, 10));
+        // The speech request fields reach LFM too; a seed overrides the
+        // request-derived one.
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.3);
+        request.params.speech.top_k = Some(8);
+        request.params.speech.seed = Some(42);
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.3, 8));
+        assert_eq!(config.seed, 42);
+    }
+
+    /// TPIPE-24: the shared chat defaults (temperature 0.7, top-p 0.9,
+    /// repetition penalty 1.1) used to reach Qwen3-TTS sampling. Unset
+    /// fields now keep the published generation_config, and request fields
+    /// override it, sub-talker included.
+    #[test]
+    fn qwen_tts_unset_sampling_keeps_generation_config_defaults() {
+        let request = EngineCoreRequest::tts("hello");
+        assert_eq!(request.params.temperature, 0.7, "chat default is present");
+        let params = request.qwen_tts_generation_params();
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (0.9, 1.0, 50)
+        );
+        assert_eq!(params.repetition_penalty, 1.05);
+        assert!(params.subtalker.do_sample);
+        assert_eq!(
+            (
+                params.subtalker.temperature,
+                params.subtalker.top_k,
+                params.subtalker.top_p
+            ),
+            (0.9, 50, 1.0)
+        );
+        assert_eq!(params.seed, 0);
+
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.6);
+        request.params.speech.top_p = Some(0.8);
+        request.params.speech.subtalker_top_k = Some(20);
+        request.params.speech.subtalker_do_sample = Some(false);
+        request.params.speech.seed = Some(7);
+        let params = request.qwen_tts_generation_params();
+        assert_eq!((params.temperature, params.top_p), (0.6, 0.8));
+        assert_eq!(params.subtalker.top_k, 20);
+        assert!(!params.subtalker.do_sample);
+        assert_eq!(params.seed, 7);
+
+        // A greedy request stays greedy for every codebook.
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.0);
+        assert!(!request.qwen_tts_generation_params().subtalker.do_sample);
+    }
+
+    /// Out-of-range speech sampling is an input error before preparation.
+    #[test]
+    fn invalid_speech_sampling_is_rejected_before_preparation() {
+        for mutate in [
+            (|s: &mut super::super::SpeechSamplingOptions| s.top_p = Some(0.0))
+                as fn(&mut super::super::SpeechSamplingOptions),
+            |s| s.temperature = Some(f32::NAN),
+            |s| s.cfg_scale = Some(-1.0),
+            |s| s.diffusion_steps = Some(0),
+            |s| s.repetition_penalty = Some(0.5),
+        ] {
+            let mut request = EngineCoreRequest::tts("hello");
+            mutate(&mut request.params.speech);
+            assert!(matches!(
+                request.normalize_tts_params_before_preparation(),
+                Err(Error::InvalidInput(_))
+            ));
+        }
     }
 }

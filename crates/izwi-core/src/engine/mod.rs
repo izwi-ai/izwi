@@ -189,7 +189,7 @@ pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, LatencyBreakdown, Priority,
-    RequestId, SequenceId, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
+    RequestId, SequenceId, SpeechSamplingOptions, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
 };
 
 use crate::error::{Error, Result};

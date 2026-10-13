@@ -182,11 +182,15 @@ pub struct TtsGenerationParams {
     pub max_frames: usize,
     /// Residual-codebook sampling (the reference's `subtalker_*` settings).
     pub subtalker: SubtalkerSampling,
+    /// Sampling seed; 0 seeds from the clock.
+    pub seed: u64,
 }
 
 impl Default for TtsGenerationParams {
     fn default() -> Self {
-        // Mirrors the official generation_config defaults.
+        // Every published Qwen3-TTS checkpoint ships the same
+        // generation_config.json: sampling at temperature 0.9, top-k 50,
+        // top-p 1.0, repetition penalty 1.05, and the same for the sub-talker.
         Self {
             temperature: 0.9,
             top_p: 1.0,
@@ -194,6 +198,43 @@ impl Default for TtsGenerationParams {
             repetition_penalty: 1.05,
             max_frames: crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES,
             subtalker: SubtalkerSampling::default(),
+            seed: 0,
+        }
+    }
+}
+
+impl TtsGenerationParams {
+    /// The request's sampling over the generation_config defaults: a field
+    /// the request left unset keeps the published default (TPIPE-24). A
+    /// greedy request (temperature 0) keeps every codebook greedy unless it
+    /// sets sub-talker sampling itself.
+    pub fn for_request(speech: &crate::engine::SpeechSamplingOptions, max_frames: usize) -> Self {
+        let defaults = Self::default();
+        let temperature = speech.temperature.unwrap_or(defaults.temperature).max(0.0);
+        let mut subtalker = Self::subtalker_for_request_temperature(temperature);
+        if let Some(do_sample) = speech.subtalker_do_sample {
+            subtalker.do_sample = do_sample;
+        }
+        if let Some(value) = speech.subtalker_temperature {
+            subtalker.temperature = value.max(0.0);
+        }
+        if let Some(value) = speech.subtalker_top_k {
+            subtalker.top_k = value;
+        }
+        if let Some(value) = speech.subtalker_top_p {
+            subtalker.top_p = value.clamp(0.0, 1.0);
+        }
+        Self {
+            temperature,
+            top_p: speech.top_p.unwrap_or(defaults.top_p).clamp(0.0, 1.0),
+            top_k: speech.top_k.unwrap_or(defaults.top_k),
+            repetition_penalty: speech
+                .repetition_penalty
+                .unwrap_or(defaults.repetition_penalty)
+                .max(1.0),
+            max_frames,
+            subtalker,
+            seed: speech.seed.unwrap_or(0),
         }
     }
 }
@@ -963,19 +1004,13 @@ impl TtsGenerationParams {
     /// Convert external generation config to TTS sampling params.
     pub fn from_generation_config(cfg: &crate::runtime::GenerationConfig) -> Self {
         let opts = &cfg.options;
-        Self {
-            temperature: opts.temperature.max(0.0),
-            top_p: opts.top_p.clamp(0.0, 1.0),
-            top_k: if opts.top_k == 0 { 50 } else { opts.top_k },
-            repetition_penalty: opts.repetition_penalty.max(1.0),
-            max_frames: if opts.max_tokens == 0 {
-                crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES
-            } else {
-                opts.max_tokens
-                    .clamp(16, crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
-            },
-            subtalker: Self::subtalker_for_request_temperature(opts.temperature),
-        }
+        let max_frames = if opts.max_tokens == 0 {
+            crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES
+        } else {
+            opts.max_tokens
+                .clamp(16, crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
+        };
+        Self::for_request(&opts.speech, max_frames)
     }
 }
 
@@ -3371,7 +3406,7 @@ impl Qwen3TtsModel {
             last_hidden,
             last_logits,
             tensor_sequence: None,
-            rng: SimpleRng::new(),
+            rng: SimpleRng::seeded(prepared.params.seed),
             params: prepared.params,
             stream_config,
             emitted_frames: 0,
@@ -4312,6 +4347,17 @@ struct SimpleRng {
 }
 
 impl SimpleRng {
+    /// A seeded generator, or a clock-seeded one for seed 0.
+    fn seeded(seed: u64) -> Self {
+        if seed == 0 {
+            Self::new()
+        } else {
+            Self {
+                state: seed ^ 0xA076_1D64_78BD_642F,
+            }
+        }
+    }
+
     fn new() -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5589,10 +5635,10 @@ pub(crate) mod tests {
             }
         );
         let mut config = crate::runtime::GenerationConfig::default();
-        config.options.temperature = 0.7;
+        config.options.speech.temperature = Some(0.7);
         let sampled = TtsGenerationParams::from_generation_config(&config).subtalker;
         assert_eq!(sampled, SubtalkerSampling::default());
-        config.options.temperature = 0.0;
+        config.options.speech.temperature = Some(0.0);
         let greedy = TtsGenerationParams::from_generation_config(&config).subtalker;
         assert!(greedy.is_greedy());
     }

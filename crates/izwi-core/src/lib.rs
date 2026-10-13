@@ -70,9 +70,10 @@ pub use engine::{
     OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, Priority,
     ReadyQuantum, RequestProcessor, RequestStatus, ResourceAmount, ResourceEstimate,
     ResourceLedger, ResourceReservation, ResourceVector, RetryDisposition, Scheduler,
-    SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, StageDescriptor, StageId,
-    StageProgressKind, StageShapePolicy, StateDisposition, StreamingOutput, TerminalOutcome,
-    TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass, YieldReason,
+    SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, SpeechSamplingOptions,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
+    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
+    YieldReason,
 };
 
 // Legacy re-exports for backward compatibility

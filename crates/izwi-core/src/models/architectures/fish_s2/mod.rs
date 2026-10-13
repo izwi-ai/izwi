@@ -543,8 +543,9 @@ impl Default for FishS2GenerationParams {
     fn default() -> Self {
         Self {
             max_frames: ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES,
-            temperature: 0.8,
-            top_p: 0.8,
+            // fish-speech serving defaults at 1ff3c3ed (2026-10-13).
+            temperature: 0.7,
+            top_p: 0.7,
             top_k: 30,
             seed: 0,
             repetition_aware: true,
@@ -793,8 +794,9 @@ mod tests {
             params.max_frames,
             ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES
         );
-        assert_eq!(params.temperature, 0.8);
-        assert_eq!(params.top_p, 0.8);
+        // fish-speech serving defaults at 1ff3c3ed.
+        assert_eq!(params.temperature, 0.7);
+        assert_eq!(params.top_p, 0.7);
     }
 
     #[test]

@@ -81,6 +81,10 @@ pub struct SpeechRequest {
     /// Optional saved voice identifier resolved server-side.
     #[serde(default)]
     pub saved_voice_id: Option<String>,
+    /// izwi extensions: speech sampling (`top_p`, `seed`, `subtalker_*`,
+    /// `cfg_scale`, `diffusion_steps`, `repetition_penalty`).
+    #[serde(flatten)]
+    pub sampling: crate::api::tts_policy::SpeechSamplingRequest,
 }
 
 #[derive(Debug, Serialize)]
@@ -925,6 +929,7 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
     }
+    gen_config.options.speech = req.sampling.options(req.temperature, req.top_k);
     gen_config.options.speaker = req.voice.clone();
 
     GenerationRequest {
@@ -1097,6 +1102,60 @@ mod tests {
         .is_none());
     }
 
+    /// TPIPE-24: unset sampling stays unset for the engine (so family
+    /// defaults apply), and the izwi extension fields reach it.
+    #[test]
+    fn speech_sampling_fields_reach_the_engine_and_unset_stays_unset() {
+        let unset: SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice", "input": "hello", "voice": "ryan"
+        }))
+        .unwrap();
+        let generation = build_generation_request(
+            &unset,
+            "c".into(),
+            false,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        );
+        assert_eq!(
+            generation.config.options.speech,
+            izwi_core::SpeechSamplingOptions::default()
+        );
+
+        let set: SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "VibeVoice-1.5B", "input": "hello", "temperature": 0.5, "top_k": 12,
+            "top_p": 0.9, "seed": 7, "subtalker_temperature": 0.6, "subtalker_top_k": 20,
+            "subtalker_top_p": 0.95, "subtalker_do_sample": false, "cfg_scale": 1.5,
+            "diffusion_steps": 20, "repetition_penalty": 1.2
+        }))
+        .unwrap();
+        let speech =
+            build_generation_request(&set, "c".into(), false, ModelVariant::VibeVoice15BTts)
+                .config
+                .options
+                .speech;
+        assert_eq!(
+            (speech.temperature, speech.top_k, speech.top_p, speech.seed),
+            (Some(0.5), Some(12), Some(0.9), Some(7))
+        );
+        assert_eq!(
+            (
+                speech.subtalker_temperature,
+                speech.subtalker_top_k,
+                speech.subtalker_top_p,
+                speech.subtalker_do_sample
+            ),
+            (Some(0.6), Some(20), Some(0.95), Some(false))
+        );
+        assert_eq!(
+            (
+                speech.cfg_scale,
+                speech.diffusion_steps,
+                speech.repetition_penalty
+            ),
+            (Some(1.5), Some(20), Some(1.2))
+        );
+    }
+
     #[test]
     fn voxtral_tts_omitted_max_tokens_uses_text_sized_auto_budget() {
         let req = SpeechRequest {
@@ -1117,6 +1176,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let generation = build_generation_request(
@@ -1152,6 +1212,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let generation = build_generation_request(
@@ -1187,6 +1248,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let generation = build_generation_request(
@@ -1221,6 +1283,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let generation = build_generation_request(
@@ -1256,6 +1319,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1283,6 +1347,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
@@ -1310,6 +1375,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1337,6 +1403,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("reference words".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1397,6 +1464,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
         assert!(resolve_streaming_mode(&req).expect("streaming mode"));
     }
