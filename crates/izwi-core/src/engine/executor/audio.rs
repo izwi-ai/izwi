@@ -1,6 +1,7 @@
 use izwi_asr_toolkit::{
-    plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
-    AudioChunk, SettledChunkOverlap, SpeechChunkPlan, TranscriptAssembler,
+    chunk_seam_secs, plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig,
+    AsrSpeechChunkConfig, AudioChunk, SettledChunkOverlap, SpeechChunkPlan, TimedWord,
+    TranscriptAssembler,
 };
 use serde_json::json;
 use std::time::Instant;
@@ -74,6 +75,8 @@ pub(super) struct AsrChunkTranscription {
 pub(super) struct ChunkedAsrTranscription {
     pub(super) text: String,
     pub(super) chunk_diagnostics: Vec<serde_json::Value>,
+    /// The transcript's word timings, when every chunk was merged by time.
+    pub(super) timestamp_words: Option<Vec<TimedWord>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -691,6 +694,7 @@ impl NativeExecutor {
             return Ok(ChunkedAsrTranscription {
                 text: String::new(),
                 chunk_diagnostics: Vec::new(),
+                timestamp_words: None,
             });
         }
 
@@ -717,6 +721,10 @@ impl NativeExecutor {
         let stable_text_streaming = stream_tx.is_some() && holdback_chars > 0;
         let mut previous_chunk_end: Option<usize> = None;
         let mut chunk_diagnostics = Vec::new();
+        // Word timings of the transcript so far, while every committed chunk
+        // was merged by time.
+        let mut timestamp_words: Option<Vec<TimedWord>> = Some(Vec::new());
+        let mut timed_chunks = 0usize;
         let cancelled = || Error::Cancelled(request_id.to_string());
         for (idx, chunk) in chunk_plan.iter().enumerate() {
             if is_cancelled() {
@@ -742,6 +750,17 @@ impl NativeExecutor {
             // overlap (speech-island plans) are merged without boundary dedup.
             let overlap_secs = previous_chunk_end.map_or(0.0, |end| {
                 samples_to_seconds(end.saturating_sub(chunk.start_sample), sample_rate)
+            });
+            // Seams with the neighbouring chunks, for chunks merged by time.
+            let chunk_start_secs = samples_to_seconds(chunk.start_sample, sample_rate);
+            let chunk_end_secs = samples_to_seconds(chunk.end_sample, sample_rate);
+            let seam_after = previous_chunk_end
+                .map(|end| chunk_seam_secs(samples_to_seconds(end, sample_rate), chunk_start_secs));
+            let seam_until = chunk_plan.get(idx + 1).map(|next| {
+                chunk_seam_secs(
+                    chunk_end_secs,
+                    samples_to_seconds(next.start_sample, sample_rate),
+                )
             });
             previous_chunk_end = Some(chunk.end_sample);
             let prefix_text = assembler.text().to_string();
@@ -817,6 +836,9 @@ impl NativeExecutor {
                 return Err(cancelled());
             }
             let chunk_text = chunk_result.text.clone();
+            let chunk_words = chunk_result.diagnostics.as_ref().and_then(|diagnostics| {
+                chunk_timed_words(diagnostics, &chunk_text, chunk_start_secs)
+            });
             let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
             chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
                 idx,
@@ -843,19 +865,36 @@ impl NativeExecutor {
                 )?;
             }
             let committed_len = assembler.text().len();
-            match settled.as_ref() {
-                Some(overlap) => {
-                    let provisional = assembler.provisional_chunk_text(&partial_text, overlap);
-                    assembler.push_settled_chunk_text(&chunk_text, overlap);
-                    if !assembler.text()[committed_len..].starts_with(&provisional) {
-                        debug!(
-                            "ASR chunk {idx} of request {request_id} committed text that differs from its streamed partials"
-                        );
+            let provisional = settled
+                .as_ref()
+                .map(|overlap| assembler.provisional_chunk_text(&partial_text, overlap));
+            // A chunk with word timings is merged by time while every chunk
+            // before it was; otherwise by text, which ends timing for the rest
+            // of the transcript.
+            match (chunk_words, timestamp_words.as_mut()) {
+                (Some(words), Some(merged_words)) => {
+                    merged_words
+                        .extend(assembler.push_timed_chunk_words(&words, seam_after, seam_until));
+                    timed_chunks += 1;
+                }
+                _ => {
+                    timestamp_words = None;
+                    match settled.as_ref() {
+                        Some(overlap) => {
+                            assembler.push_settled_chunk_text(&chunk_text, overlap);
+                        }
+                        None => {
+                            assembler.push_chunk_text_with_overlap(&chunk_text, overlap_secs);
+                        }
                     }
                 }
-                None => {
-                    assembler.push_chunk_text_with_overlap(&chunk_text, overlap_secs);
-                }
+            }
+            if provisional.is_some_and(|provisional| {
+                !assembler.text()[committed_len..].starts_with(&provisional)
+            }) {
+                debug!(
+                    "ASR chunk {idx} of request {request_id} committed text that differs from its streamed partials"
+                );
             }
             // What this chunk added after overlap dedup. The chunk texts
             // concatenate to the transcript, so with the chunk's time range
@@ -923,6 +962,7 @@ impl NativeExecutor {
         Ok(ChunkedAsrTranscription {
             text: assembler.finish(),
             chunk_diagnostics,
+            timestamp_words: timestamp_words.filter(|_| timed_chunks > 0),
         })
     }
 
@@ -1130,6 +1170,47 @@ fn holdback_start(committed: &str, provisional: &str, holdback_chars: usize) -> 
         }
     }
     0
+}
+
+/// A chunk's word timings from its model diagnostics (`timestamp_words`,
+/// timed from the chunk's start), placed on the input timeline. `None` when
+/// the model reported no word timings for the chunk's text: a model may
+/// report an empty list for a task that does not time words.
+fn chunk_timed_words(
+    diagnostics: &serde_json::Value,
+    chunk_text: &str,
+    chunk_start_secs: f32,
+) -> Option<Vec<TimedWord>> {
+    let words = diagnostics.get("timestamp_words")?.as_array()?;
+    if words.is_empty() && !chunk_text.trim().is_empty() {
+        return None;
+    }
+    words
+        .iter()
+        .map(|word| {
+            Some(TimedWord {
+                text: word.get("word")?.as_str()?.to_string(),
+                start_secs: chunk_start_secs + word.get("start_time_seconds")?.as_f64()? as f32,
+                end_secs: chunk_start_secs + word.get("end_time_seconds")?.as_f64()? as f32,
+            })
+        })
+        .collect()
+}
+
+/// `timestamp_words` diagnostics for a transcript's word timings.
+pub(super) fn timestamp_words_json(words: &[TimedWord]) -> serde_json::Value {
+    serde_json::Value::Array(
+        words
+            .iter()
+            .map(|word| {
+                json!({
+                    "word": word.text,
+                    "start_time_seconds": word.start_secs,
+                    "end_time_seconds": word.end_secs,
+                })
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
@@ -2054,6 +2135,164 @@ mod tests {
             &["I don't know.", "I don't know why."],
             "I don't know. I don't know why.",
         );
+    }
+
+    /// Run `chunks` (text and `timestamp_words` diagnostics, timed from each
+    /// chunk's start) through the chunk executor, streaming.
+    fn run_timed_chunks(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunks: &[(&str, Option<serde_json::Value>)],
+    ) -> (super::ChunkedAsrTranscription, String) {
+        let samples = vec![0.0f32; chunk_plan.last().expect("chunks").end_sample];
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let mut chunk_idx = 0usize;
+        let chunked =
+            NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                "req-timed",
+                &|| false,
+                Some(&tx),
+                EngineStreamPolicy::FailOnFull,
+                &mut sequence,
+                &samples,
+                sr,
+                chunk_plan,
+                &NativeExecutor::asr_long_form_config(),
+                AsrChunkStreamOptions::default(),
+                |_chunk_audio, _sr, _prefix, _partial| {
+                    let (text, words) = &chunks[chunk_idx];
+                    chunk_idx += 1;
+                    Ok(AsrChunkTranscription {
+                        text: text.to_string(),
+                        diagnostics: words
+                            .clone()
+                            .map(|words| serde_json::json!({ "timestamp_words": words })),
+                    })
+                },
+            )
+            .expect("timed chunk plan should complete");
+        let streamed = tx
+            .take()
+            .expect("staged events")
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect::<String>();
+        (chunked, streamed)
+    }
+
+    fn words_json(words: &[(&str, f32, f32)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            words
+                .iter()
+                .map(|(word, start, end)| {
+                    serde_json::json!({
+                        "word": word,
+                        "start_time_seconds": start,
+                        "end_time_seconds": end,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Chunks that time their words merge by time: the one-word overlap
+    /// ("fox.") that text dedup cannot see is kept once, the transcript's
+    /// word timings come back on the input timeline, and the stream matches
+    /// the final text.
+    #[test]
+    fn timed_chunks_merge_by_word_time() {
+        // 10 Hz: chunk 0 covers 0-8 s, chunk 1 7-15 s; they hand over at 7.5 s.
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        let (chunked, streamed) = run_timed_chunks(
+            &chunk_plan,
+            10,
+            &[
+                (
+                    "the quick fox.",
+                    Some(words_json(&[
+                        ("the", 5.0, 5.4),
+                        ("quick", 5.5, 6.5),
+                        ("fox.", 7.0, 7.6),
+                    ])),
+                ),
+                (
+                    "fox. It ran.",
+                    Some(words_json(&[
+                        ("fox.", 0.0, 0.6),
+                        ("It", 1.0, 1.3),
+                        ("ran.", 1.4, 2.0),
+                    ])),
+                ),
+            ],
+        );
+        assert_eq!(chunked.text, "the quick fox. It ran.");
+        assert_eq!(streamed, chunked.text);
+        let words = chunked.timestamp_words.expect("timed transcript");
+        let texts = words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["the", "quick", "fox.", "It", "ran."]);
+        assert_eq!((words[3].start_secs, words[3].end_secs), (8.0, 8.3));
+    }
+
+    /// A phrase repeated just after the overlap looks like overlap text to the
+    /// text merge, which drops it; by time it lies past the seam and stays.
+    #[test]
+    fn timed_chunks_keep_a_repeat_the_text_merge_would_drop() {
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        let first = (
+            "you say I know",
+            Some(words_json(&[
+                ("you", 4.0, 4.3),
+                ("say", 4.4, 4.8),
+                ("I", 6.0, 6.2),
+                ("know", 6.2, 6.6),
+            ])),
+        );
+        let second = (
+            "I know that",
+            Some(words_json(&[
+                ("I", 0.6, 0.8),
+                ("know", 0.8, 1.2),
+                ("that", 1.3, 1.6),
+            ])),
+        );
+        let (timed, _) = run_timed_chunks(&chunk_plan, 10, &[first.clone(), second.clone()]);
+        assert_eq!(timed.text, "you say I know I know that");
+        let (by_text, _) = run_timed_chunks(&chunk_plan, 10, &[(first.0, None), (second.0, None)]);
+        assert_eq!(by_text.text, "you say I know that");
+    }
+
+    /// A chunk without word timings for its text (no list, or an empty list
+    /// beside non-empty text) is merged by text, and the transcript then
+    /// reports no word timings.
+    #[test]
+    fn untimed_chunk_falls_back_to_the_text_merge() {
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        for untimed in [None, Some(serde_json::json!([]))] {
+            let (chunked, streamed) = run_timed_chunks(
+                &chunk_plan,
+                10,
+                &[
+                    ("one two three four", untimed.clone()),
+                    ("two three four five", untimed),
+                ],
+            );
+            assert_eq!(chunked.text, "one two three four five");
+            assert_eq!(streamed, chunked.text);
+            assert!(chunked.timestamp_words.is_none());
+        }
     }
 
     #[test]

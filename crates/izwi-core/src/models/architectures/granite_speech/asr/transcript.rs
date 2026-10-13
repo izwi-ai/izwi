@@ -24,14 +24,6 @@ pub struct GraniteSpeechParsedTranscript {
     pub timestamp_words: Vec<GraniteSpeechTimestampWord>,
 }
 
-/// One chunk's words, timed relative to the chunk's start.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GraniteSpeechTimestampChunk {
-    pub start_seconds: f32,
-    pub end_seconds: f32,
-    pub words: Vec<GraniteSpeechTimestampWord>,
-}
-
 /// Silence entry the timestamp task emits between words.
 const SILENCE_MARKER: &str = "_";
 /// Tags carry the end time in centiseconds modulo 1000, so they roll over
@@ -51,55 +43,6 @@ pub fn parse_granite_speech_output(raw: &str) -> GraniteSpeechParsedTranscript {
         segments: parse_speaker_segments(&text),
         timestamp_words,
         text,
-    }
-}
-
-/// Place each chunk's words on the input timeline and keep one copy of the
-/// audio two neighbouring chunks both transcribed: the overlap is split at
-/// its midpoint and a word belongs to the chunk whose side holds its end.
-/// A chunk's truncated last word ends past the midpoint, so the next chunk's
-/// complete copy is the one kept.
-pub fn merge_granite_speech_timestamp_chunks(
-    chunks: &[GraniteSpeechTimestampChunk],
-) -> Vec<GraniteSpeechTimestampWord> {
-    let mut merged = Vec::new();
-    let mut previous_end = 0.0f32;
-    for (index, chunk) in chunks.iter().enumerate() {
-        let lower = index
-            .checked_sub(1)
-            .map(|previous| overlap_boundary(&chunks[previous], chunk));
-        let upper = chunks
-            .get(index + 1)
-            .map(|next| overlap_boundary(chunk, next));
-        for word in &chunk.words {
-            let end = chunk.start_seconds + word.end_time_seconds;
-            if lower.is_some_and(|boundary| end <= boundary)
-                || upper.is_some_and(|boundary| end > boundary)
-            {
-                continue;
-            }
-            let start = (chunk.start_seconds + word.start_time_seconds)
-                .max(previous_end)
-                .min(end);
-            previous_end = previous_end.max(end);
-            merged.push(GraniteSpeechTimestampWord {
-                word: word.word.clone(),
-                start_time_seconds: start,
-                end_time_seconds: end,
-            });
-        }
-    }
-    merged
-}
-
-fn overlap_boundary(
-    earlier: &GraniteSpeechTimestampChunk,
-    later: &GraniteSpeechTimestampChunk,
-) -> f32 {
-    if later.start_seconds < earlier.end_seconds {
-        (later.start_seconds + earlier.end_seconds) / 2.0
-    } else {
-        earlier.end_seconds
     }
 }
 
@@ -350,63 +293,5 @@ mod tests {
     fn parser_removes_speaker_labels_from_timestamp_words() {
         let parsed = parse_granite_speech_output("[Speaker 1]: hello [T:045]");
         assert_eq!(parsed.timestamp_words, vec![word("hello", 0.0, 0.45)]);
-    }
-
-    #[test]
-    fn merge_offsets_chunks_and_keeps_one_copy_of_the_overlap() {
-        // Chunk 0 covers 0-24 s, chunk 1 covers 21-45 s: the shared 21-24 s
-        // splits at 22.5 s. "cut" is chunk 0's truncated copy of "cutoff".
-        let chunks = vec![
-            GraniteSpeechTimestampChunk {
-                start_seconds: 0.0,
-                end_seconds: 24.0,
-                words: vec![
-                    word("one", 0.0, 20.5),
-                    word("two", 20.5, 22.0),
-                    word("three", 22.0, 23.0),
-                    word("cut", 23.0, 24.0),
-                ],
-            },
-            GraniteSpeechTimestampChunk {
-                start_seconds: 21.0,
-                end_seconds: 45.0,
-                words: vec![
-                    word("two", 0.0, 1.0),
-                    word("three", 1.0, 2.0),
-                    word("cutoff", 2.0, 3.4),
-                    word("four", 3.4, 5.0),
-                ],
-            },
-        ];
-        assert_eq!(
-            merge_granite_speech_timestamp_chunks(&chunks),
-            vec![
-                word("one", 0.0, 20.5),
-                word("two", 20.5, 22.0),
-                word("three", 22.0, 23.0),
-                word("cutoff", 23.0, 24.4),
-                word("four", 24.4, 26.0),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_drops_words_timed_past_a_chunk_that_has_no_overlap() {
-        let chunks = vec![
-            GraniteSpeechTimestampChunk {
-                start_seconds: 0.0,
-                end_seconds: 10.0,
-                words: vec![word("inside", 0.0, 9.0), word("beyond", 9.0, 11.0)],
-            },
-            GraniteSpeechTimestampChunk {
-                start_seconds: 10.0,
-                end_seconds: 20.0,
-                words: vec![word("next", 0.5, 1.0)],
-            },
-        ];
-        assert_eq!(
-            merge_granite_speech_timestamp_chunks(&chunks),
-            vec![word("inside", 0.0, 9.0), word("next", 10.5, 11.0)]
-        );
     }
 }

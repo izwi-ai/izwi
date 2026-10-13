@@ -2,7 +2,7 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::models::architectures::granite_speech::asr::{
-    granite_speech_chunked_timestamp_transcript, granite_speech_request_plan, GraniteSpeechTask,
+    granite_speech_request_plan, GraniteSpeechTask,
 };
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
@@ -41,8 +41,8 @@ use super::super::{
     SessionKey, WorkUnit,
 };
 use super::audio::{
-    decode_request_audio_with_rate, AsrChunkTranscription, AsrRouteCapabilities,
-    ChunkedAsrTranscription, PlannedAsrChunks,
+    decode_request_audio_with_rate, timestamp_words_json, AsrChunkTranscription,
+    AsrRouteCapabilities, ChunkedAsrTranscription, PlannedAsrChunks,
 };
 use super::state::{
     ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode,
@@ -7255,24 +7255,7 @@ impl NativeExecutor {
                         })
                     },
                 )?;
-                // Timestamp chunks carry their own word timings; the merged
-                // words replace the overlap-deduplicated text.
-                let timestamps = (granite_task == GraniteSpeechTask::WordTimestamps)
-                    .then(|| {
-                        granite_speech_chunked_timestamp_transcript(&chunked.chunk_diagnostics)
-                    })
-                    .flatten();
-                let (text, mut diagnostics) = Self::chunked_asr_result(&chunk_plan, chunked);
-                let text = match timestamps {
-                    Some((text, words)) => {
-                        if let Some(root) = diagnostics.as_mut().and_then(|d| d.as_object_mut()) {
-                            root.insert("timestamp_words".to_string(), words);
-                        }
-                        text
-                    }
-                    None => text,
-                };
-                return Ok((text, diagnostics));
+                return Ok(Self::chunked_asr_result(&chunk_plan, chunked));
             }
 
             // Granite's public auto budget is admitted at its conservative
@@ -7502,15 +7485,17 @@ impl NativeExecutor {
         }))
     }
 
-    /// Transcript and diagnostics of a chunked run of `plan`.
+    /// Transcript and diagnostics of a chunked run of `plan`, with the word
+    /// timings of a transcript merged by time as `timestamp_words`.
     fn chunked_asr_result(
         plan: &PlannedAsrChunks,
         chunked: ChunkedAsrTranscription,
     ) -> (String, Option<serde_json::Value>) {
-        (
-            chunked.text,
-            Some(plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics)),
-        )
+        let mut diagnostics = plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics);
+        if let (Some(words), Some(root)) = (chunked.timestamp_words, diagnostics.as_object_mut()) {
+            root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+        }
+        (chunked.text, Some(diagnostics))
     }
 
     fn with_audio_decode_timing(

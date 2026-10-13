@@ -523,6 +523,32 @@ const MAX_CHAR_OVERLAP: usize = 120;
 pub struct TranscriptAssembler {
     config: AsrLongFormConfig,
     merged: String,
+    /// End of the last word committed by time.
+    timed_end_secs: f32,
+}
+
+/// A transcribed word timed in seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedWord {
+    pub text: String,
+    pub start_secs: f32,
+    pub end_secs: f32,
+}
+
+impl TimedWord {
+    fn midpoint_secs(&self) -> f32 {
+        (self.start_secs + self.end_secs) / 2.0
+    }
+}
+
+/// Where two consecutive chunks hand over: the middle of the audio both
+/// cover, or the earlier chunk's end when they do not overlap.
+pub fn chunk_seam_secs(earlier_end_secs: f32, later_start_secs: f32) -> f32 {
+    if later_start_secs < earlier_end_secs {
+        (later_start_secs + earlier_end_secs) / 2.0
+    } else {
+        earlier_end_secs
+    }
 }
 
 /// Overlap decision for a chunk whose text is still arriving, settled once the
@@ -565,7 +591,44 @@ impl TranscriptAssembler {
         Self {
             config,
             merged: String::new(),
+            timed_end_secs: 0.0,
         }
+    }
+
+    /// Commit a chunk by its word timings instead of its text. `words` are on
+    /// the input timeline; a word belongs to this chunk when its midpoint lies
+    /// after the seam with the previous chunk (`after_secs`) and no later than
+    /// the seam with the next one (`until_secs`). Words of the shared audio
+    /// are therefore kept exactly once, and a word a chunk boundary cut lands
+    /// on the side holding most of it. Returns the kept words, each starting
+    /// no earlier than the previous kept word ended.
+    pub fn push_timed_chunk_words(
+        &mut self,
+        words: &[TimedWord],
+        after_secs: Option<f32>,
+        until_secs: Option<f32>,
+    ) -> Vec<TimedWord> {
+        let mut kept = Vec::new();
+        for word in words {
+            let text = word.text.trim();
+            let midpoint = word.midpoint_secs();
+            if text.is_empty()
+                || after_secs.is_some_and(|seam| midpoint <= seam)
+                || until_secs.is_some_and(|seam| midpoint > seam)
+            {
+                continue;
+            }
+            let end_secs = word.end_secs.max(word.start_secs);
+            let start_secs = word.start_secs.max(self.timed_end_secs).min(end_secs);
+            self.timed_end_secs = self.timed_end_secs.max(end_secs);
+            append_with_spacing(&mut self.merged, text);
+            kept.push(TimedWord {
+                text: text.to_string(),
+                start_secs,
+                end_secs,
+            });
+        }
+        kept
     }
 
     /// Push chunk text and get the incremental delta added to the merged output.
@@ -1348,6 +1411,102 @@ mod tests {
             assembler.push_chunk_text_with_overlap(text, *overlap_secs);
         }
         assembler.finish()
+    }
+
+    fn timed(text: &str, start_secs: f32, end_secs: f32) -> TimedWord {
+        TimedWord {
+            text: text.to_string(),
+            start_secs,
+            end_secs,
+        }
+    }
+
+    /// Chunk 0 covers 0-24 s and chunk 1 21-45 s, so they hand over at
+    /// 22.5 s. Each word of the shared audio is kept once, from the chunk
+    /// holding its midpoint: chunk 0's truncated "cut" yields to chunk 1's
+    /// complete "cutoff", and chunk 1's copies of "two" and "three" drop.
+    #[test]
+    fn timed_chunks_keep_each_overlap_word_once() {
+        let seam = chunk_seam_secs(24.0, 21.0);
+        assert_eq!(seam, 22.5);
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        let first = assembler.push_timed_chunk_words(
+            &[
+                timed("one", 0.0, 20.5),
+                timed("two", 20.5, 22.0),
+                timed("three", 22.0, 23.0),
+                timed("cut", 23.0, 24.0),
+            ],
+            None,
+            Some(seam),
+        );
+        assert_eq!(
+            first,
+            vec![
+                timed("one", 0.0, 20.5),
+                timed("two", 20.5, 22.0),
+                timed("three", 22.0, 23.0),
+            ]
+        );
+        let second = assembler.push_timed_chunk_words(
+            &[
+                timed("two", 21.0, 22.0),
+                timed("three", 22.0, 23.0),
+                timed("cutoff", 23.0, 24.4),
+                timed("four", 24.4, 26.0),
+            ],
+            Some(seam),
+            None,
+        );
+        assert_eq!(
+            second,
+            vec![timed("cutoff", 23.0, 24.4), timed("four", 24.4, 26.0)]
+        );
+        assert_eq!(assembler.text(), "one two three cutoff four");
+    }
+
+    /// Text dedup needs three matching words; by time a one-word overlap
+    /// merges, and a genuine repeat in audio that is not shared survives.
+    #[test]
+    fn timed_chunks_merge_short_overlaps_and_keep_genuine_repeats() {
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        let seam = chunk_seam_secs(8.0, 7.0);
+        assembler.push_timed_chunk_words(
+            &[timed("the", 5.0, 5.5), timed("fox.", 6.9, 7.6)],
+            None,
+            Some(seam),
+        );
+        assembler.push_timed_chunk_words(
+            &[
+                timed("fox.", 7.0, 7.6),
+                timed("The", 7.8, 8.0),
+                timed("fox.", 8.1, 8.6),
+            ],
+            Some(seam),
+            None,
+        );
+        assert_eq!(assembler.text(), "the fox. The fox.");
+    }
+
+    /// Words a model times past its chunk's seam belong to the next chunk,
+    /// and starts never run backwards across the seam.
+    #[test]
+    fn timed_chunks_drop_words_past_the_seam_and_keep_starts_monotonic() {
+        let mut assembler = TranscriptAssembler::new(AsrLongFormConfig::default());
+        let seam = chunk_seam_secs(10.0, 10.0);
+        let first = assembler.push_timed_chunk_words(
+            &[timed("inside", 0.0, 9.0), timed("beyond", 9.5, 11.0)],
+            None,
+            Some(seam),
+        );
+        assert_eq!(first, vec![timed("inside", 0.0, 9.0)]);
+        let second = assembler.push_timed_chunk_words(
+            &[timed("next", 8.8, 11.6), timed(" ", 11.6, 12.0)],
+            Some(seam),
+            None,
+        );
+        assert_eq!(second, vec![timed("next", 9.0, 11.6)]);
+        assert_eq!(assembler.text(), "inside next");
     }
 
     #[test]
