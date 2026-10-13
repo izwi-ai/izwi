@@ -49,6 +49,8 @@ const PRED_HIDDEN: usize = 640;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
+/// Seconds per encoder frame: 10 ms feature hop × 8× subsampling.
+const ENCODER_FRAME_SECONDS: f64 = FRAME_HOP_MS as f64 * SUBSAMPLING_FACTOR as f64 / 1000.0;
 pub(crate) const PARAKEET_RETAINED_PREFILL_STAGE: &str = "asr.prefill.parakeet.predictor";
 pub(crate) const PARAKEET_RETAINED_DECODE_STAGE: &str = "asr.decode.parakeet.joint";
 pub(crate) const PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
@@ -346,6 +348,7 @@ pub(crate) struct ParakeetRetainedDecodeState {
     emit_count_at_t: usize,
     guard_steps: usize,
     token_ids: Vec<usize>,
+    token_frames: Vec<TdtTokenFrame>,
     assembled: String,
     counters: ParakeetDecodeCounters,
     finished: bool,
@@ -426,6 +429,103 @@ impl ParakeetDecoder {
             }
         }
     }
+
+    /// Whether the SentencePiece piece for `id` opens a word (`▁` prefix).
+    fn starts_word(&self, id: usize) -> bool {
+        match self {
+            Self::Vocab(vocab) => vocab.get(id).is_some_and(|piece| piece.starts_with('▁')),
+            Self::HfTokenizer(tokenizer) => u32::try_from(id)
+                .ok()
+                .and_then(|id| tokenizer.id_to_token(id))
+                .is_some_and(|piece| piece.starts_with('▁')),
+        }
+    }
+
+    /// Word timings in the `timestamp_words` shape the API reads, from each
+    /// emitted token's encoder frame and TDT duration.
+    fn timestamp_words(
+        &self,
+        token_ids: &[usize],
+        token_frames: &[TdtTokenFrame],
+    ) -> serde_json::Value {
+        let words = tdt_word_timestamps(
+            token_ids,
+            token_frames,
+            |id| self.starts_word(id),
+            |ids| self.decode(ids),
+        );
+        serde_json::Value::Array(
+            words
+                .into_iter()
+                .map(|word| {
+                    serde_json::json!({
+                        "word": word.text,
+                        "start_time_seconds": word.start_frame as f64 * ENCODER_FRAME_SECONDS,
+                        "end_time_seconds": word.end_frame as f64 * ENCODER_FRAME_SECONDS,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Where TDT emitted a token: the encoder frame the joint read and the
+/// duration (in frames) it predicted with the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TdtTokenFrame {
+    frame: usize,
+    duration: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TdtWordTimestamp {
+    text: String,
+    start_frame: usize,
+    end_frame: usize,
+}
+
+/// Group emitted tokens into words as NeMo does for TDT timestamps: a word
+/// starts at its first token's frame and ends at its last token's frame plus
+/// that token's duration. Punctuation-only words join the word before them.
+fn tdt_word_timestamps(
+    token_ids: &[usize],
+    token_frames: &[TdtTokenFrame],
+    starts_word: impl Fn(usize) -> bool,
+    decode: impl Fn(&[usize]) -> String,
+) -> Vec<TdtWordTimestamp> {
+    let count = token_ids.len().min(token_frames.len());
+    let mut words: Vec<TdtWordTimestamp> = Vec::new();
+    let mut start = 0usize;
+    for end in 1..=count {
+        if end < count && !starts_word(token_ids[end]) {
+            continue;
+        }
+        let group = start..end;
+        start = end;
+        let text = decode(&token_ids[group.clone()]).trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let start_frame = token_frames[group.start].frame;
+        let end_frame = token_frames[group]
+            .iter()
+            .map(|emission| emission.frame + emission.duration)
+            .max()
+            .unwrap_or(start_frame)
+            .max(start_frame);
+        match words.last_mut() {
+            Some(previous) if !text.chars().any(char::is_alphanumeric) => {
+                previous.text.push_str(&text);
+                previous.end_frame = previous.end_frame.max(end_frame);
+            }
+            _ => words.push(TdtWordTimestamp {
+                text,
+                start_frame,
+                end_frame,
+            }),
+        }
+    }
+    words
 }
 
 impl ParakeetAsrModel {
@@ -584,6 +684,7 @@ impl ParakeetAsrModel {
                     emit_count_at_t: 0,
                     guard_steps: 0,
                     token_ids: Vec::new(),
+                    token_frames: Vec::new(),
                     assembled: String::new(),
                     counters: ParakeetDecodeCounters::default(),
                     finished: false,
@@ -700,6 +801,11 @@ impl ParakeetAsrModel {
         if let Some(stop_reason) = state.stop_reason {
             diagnostics["stop_reason"] = stop_reason.into();
         }
+        // The cursor runs over the whole windowed encoding, so frames are
+        // already offsets from the start of the audio.
+        diagnostics["timestamp_words"] = self
+            .decoder
+            .timestamp_words(&state.token_ids, &state.token_frames);
         ParakeetAsrTranscriptionOutput {
             text: state.assembled.clone(),
             language: artifact.language.clone(),
@@ -790,6 +896,10 @@ impl ParakeetAsrModel {
                         continue;
                     }
                     row.state.token_ids.push(label);
+                    row.state.token_frames.push(TdtTokenFrame {
+                        frame: t_cur,
+                        duration,
+                    });
                     emitted.push((index, label));
                 }
                 if !emitted.is_empty() {
@@ -1064,11 +1174,13 @@ impl ParakeetAsrModel {
         drop(log_mel);
 
         let mut token_ids = Vec::<usize>::new();
+        let mut token_frames = Vec::<TdtTokenFrame>::new();
         let mut assembled = String::new();
         let mut decode_counters = ParakeetDecodeCounters::default();
 
-        let mut on_token = |token_id: usize| {
+        let mut on_token = |token_id: usize, emission: TdtTokenFrame| {
             token_ids.push(token_id);
+            token_frames.push(emission);
             let decoded = self.decoder.decode(&token_ids);
             let delta = text_delta(&assembled, &decoded);
             if !delta.is_empty() {
@@ -1108,7 +1220,7 @@ impl ParakeetAsrModel {
         decode_counters.tdt_emitted_tokens = token_ids.len();
         timings.model_total_ms = elapsed_ms(model_started);
 
-        let diagnostics = parakeet_diagnostics_json(
+        let mut diagnostics = parakeet_diagnostics_json(
             &self.variant,
             self.preprocessor.device(),
             self.network.encoder.geometry,
@@ -1124,6 +1236,7 @@ impl ParakeetAsrModel {
             language,
             self.max_symbols,
         );
+        diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -1287,7 +1400,7 @@ impl ParakeetNetwork {
         num_durations: usize,
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
 
@@ -1321,7 +1434,7 @@ impl ParakeetNetwork {
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
         predictor_state: &mut InvocationTensorLease,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?;
         let predictor_out =
@@ -1354,7 +1467,7 @@ impl ParakeetNetwork {
         counters: &mut ParakeetDecodeCounters,
         mut predictor_out: Tensor,
         mut predictor_step: impl FnMut(usize) -> Result<Tensor>,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let mut t = 0usize;
         let mut last_emit_t = usize::MAX;
@@ -1369,6 +1482,8 @@ impl ParakeetNetwork {
             guard_steps += 1;
 
             let t_cur = t;
+            // Frame the joint read when it produced `label`.
+            let mut frame = t_cur;
             let enc_t = encoded.i((t_cur, ..))?.unsqueeze(0)?.unsqueeze(0)?; // [1,1,D]
             let logits = self
                 .joint
@@ -1395,6 +1510,7 @@ impl ParakeetNetwork {
 
             while label == blank_idx && t < encoded_len {
                 counters.tdt_blank_steps = counters.tdt_blank_steps.saturating_add(1);
+                frame = t;
                 let enc_t = encoded.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
                 let logits = self
                     .joint
@@ -1436,7 +1552,13 @@ impl ParakeetNetwork {
                 continue;
             }
 
-            on_token(label);
+            on_token(
+                label,
+                TdtTokenFrame {
+                    frame,
+                    duration: jump,
+                },
+            );
             predictor_out = predictor_step(label)?;
         }
 
@@ -2502,11 +2624,11 @@ mod tests {
     use super::{
         argmax_1d, build_rel_positional_embedding, parakeet_encoded_len_for_samples,
         parakeet_max_emittable_tokens, parakeet_preparation_bytes, plan_encoder_windows,
-        subsampled_len_3x, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
-        ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
-        ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        subsampled_len_3x, tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing,
+        Joint, LstmCell, ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder,
+        ParakeetLogMel, ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
         ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
-        DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
     use crate::backends::BackendKind;
     use crate::error::{Error, Result};
@@ -2853,6 +2975,66 @@ mod tests {
         assert_eq!(steps.last().unwrap().tokens_generated, bound);
         assert_eq!(steps.len(), bound);
         assert!(diagnostics.get("stop_reason").is_none());
+
+        // Each frame emits max_symbols one-token words with zero duration,
+        // timed at 80 ms per encoder frame.
+        let words = diagnostics["timestamp_words"].as_array().unwrap();
+        assert_eq!(words.len(), bound);
+        for (index, word) in words.iter().enumerate() {
+            let frame = (index / DEFAULT_MAX_SYMBOLS) as f64;
+            assert_eq!(word["word"], "a");
+            assert!((word["start_time_seconds"].as_f64().unwrap() - frame * 0.08).abs() < 1e-9);
+            assert!((word["end_time_seconds"].as_f64().unwrap() - frame * 0.08).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn tdt_words_span_their_tokens_and_absorb_punctuation() {
+        let vocab: Vec<String> = ["▁Hel", "lo", "▁world", "▁,", "▁again", "!", "<unk>"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let decoder = ParakeetDecoder::Vocab(vocab);
+        let emissions = [
+            (0, 2, 1),
+            (1, 3, 2),
+            (2, 6, 1),
+            (3, 8, 0),
+            (6, 9, 0),
+            (4, 10, 3),
+            (5, 13, 1),
+        ];
+        let token_ids: Vec<usize> = emissions.iter().map(|(id, ..)| *id).collect();
+        let token_frames: Vec<TdtTokenFrame> = emissions
+            .iter()
+            .map(|(_, frame, duration)| TdtTokenFrame {
+                frame: *frame,
+                duration: *duration,
+            })
+            .collect();
+
+        let words = tdt_word_timestamps(
+            &token_ids,
+            &token_frames,
+            |id| decoder.starts_word(id),
+            |ids| decoder.decode(ids),
+        );
+
+        let spans: Vec<(&str, usize, usize)> = words
+            .iter()
+            .map(|word| (word.text.as_str(), word.start_frame, word.end_frame))
+            .collect();
+        // `<unk>` decodes to nothing and continues the word before it.
+        assert_eq!(
+            spans,
+            [("Hello", 2, 5), ("world,", 6, 9), ("again!", 10, 14)]
+        );
+
+        let json = decoder.timestamp_words(&token_ids, &token_frames);
+        assert_eq!(json[0]["word"], "Hello");
+        assert!((json[0]["start_time_seconds"].as_f64().unwrap() - 0.16).abs() < 1e-9);
+        assert!((json[0]["end_time_seconds"].as_f64().unwrap() - 0.40).abs() < 1e-9);
+        assert!((json[2]["end_time_seconds"].as_f64().unwrap() - 1.12).abs() < 1e-9);
     }
 
     #[test]
