@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
-    rotary_emb, BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT,
-    RmsNorm, VarBuilder,
+    rotary_emb, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, RmsNorm, VarBuilder,
 };
 
 use crate::backends::kv::{
@@ -17,6 +16,9 @@ use crate::backends::kv::{
 };
 use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{
+    batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
+};
 use crate::kernels::{
     try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
@@ -1891,8 +1893,10 @@ fn encoder_padding_mask(
 struct GraniteConformerConv {
     norm: LayerNorm,
     up_conv: Conv1d,
-    depth_conv: Conv1d,
-    batch_norm: BatchNorm,
+    /// Depthwise kernel `(inner, 1, K)` with the inference BatchNorm folded in.
+    depth_weight: Tensor,
+    depth_bias: Tensor,
+    depth_spec: DepthwiseConv1dSpec,
     down_conv: Conv1d,
 }
 
@@ -1904,6 +1908,29 @@ impl GraniteConformerConv {
             groups: inner,
             ..Default::default()
         };
+        let depth_conv = conv1d_no_bias(
+            inner,
+            inner,
+            config.conv_kernel_size,
+            depth_cfg,
+            vb.pp("depth_conv.conv"),
+        )?;
+        let batch_norm = batch_norm(inner, 1e-5, vb.pp("batch_norm"))?;
+        // Candle's grouped conv runs one convolution per channel (2048 here);
+        // the shared shift-and-accumulate op runs 2K + 2 element-wise ops.
+        let (scale, shift) = batch_norm_affine(
+            batch_norm.running_mean(),
+            batch_norm.running_var(),
+            batch_norm.eps(),
+            batch_norm.weight_and_bias(),
+        )?;
+        let (depth_weight, depth_bias) =
+            fold_channel_affine(depth_conv.weight(), None, &scale, &shift)?;
+        // Same-length output: K / 2 on the left, one fewer on the right for
+        // an even kernel.
+        let width = config.conv_kernel_size;
+        let pad = width / 2;
+        let right = pad.saturating_sub((width + 1) % 2);
         Ok(Self {
             norm: layer_norm(hidden, 1e-5, vb.pp("norm"))?,
             up_conv: conv1d(
@@ -1913,14 +1940,9 @@ impl GraniteConformerConv {
                 Conv1dConfig::default(),
                 vb.pp("up_conv"),
             )?,
-            depth_conv: conv1d_no_bias(
-                inner,
-                inner,
-                config.conv_kernel_size,
-                depth_cfg,
-                vb.pp("depth_conv.conv"),
-            )?,
-            batch_norm: batch_norm(inner, 1e-5, vb.pp("batch_norm"))?,
+            depth_weight,
+            depth_bias,
+            depth_spec: DepthwiseConv1dSpec::padded(pad, right),
             down_conv: conv1d(
                 inner,
                 hidden,
@@ -1931,16 +1953,23 @@ impl GraniteConformerConv {
         })
     }
 
+    fn depthwise_batch_norm_silu(&self, x: &Tensor) -> Result<Tensor> {
+        depthwise_conv1d(
+            x,
+            &self.depth_weight,
+            Some(&self.depth_bias),
+            self.depth_spec,
+        )?
+        .silu()
+        .map_err(Error::from)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.norm.forward(x)?;
         let x = x.transpose(1, 2)?.contiguous()?;
         let x = self.up_conv.forward(&x)?;
         let x = glu_channels(&x)?;
-        let pad = self.depth_conv_weight_width() / 2;
-        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
-        let x = x.pad_with_zeros(2, pad, right)?;
-        let x = self.depth_conv.forward(&x)?;
-        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        let x = self.depthwise_batch_norm_silu(&x)?;
         self.down_conv
             .forward(&x)?
             .transpose(1, 2)?
@@ -1954,21 +1983,13 @@ impl GraniteConformerConv {
         let channel_mask = frame_mask.transpose(1, 2)?.contiguous()?;
         let x = self.up_conv.forward(&x)?;
         let x = glu_channels(&x)?.broadcast_mul(&channel_mask)?;
-        let pad = self.depth_conv_weight_width() / 2;
-        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
-        let x = x.pad_with_zeros(2, pad, right)?;
-        let x = self.depth_conv.forward(&x)?;
-        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        let x = self.depthwise_batch_norm_silu(&x)?;
         self.down_conv
             .forward(&x)?
             .broadcast_mul(&channel_mask)?
             .transpose(1, 2)?
             .contiguous()
             .map_err(Error::from)
-    }
-
-    fn depth_conv_weight_width(&self) -> usize {
-        self.depth_conv.weight().dims().get(2).copied().unwrap_or(1)
     }
 }
 
@@ -4560,6 +4581,137 @@ mod tests {
             GraniteTextMlp::Model { .. } => panic!("expected selective F16 MLP"),
         }
         assert_eq!(model.execution_plan, plan);
+    }
+
+    /// The conformer conv module (shared shift-and-accumulate depthwise op with
+    /// the folded BatchNorm) matches Candle's grouped conv followed by the
+    /// unfolded BatchNorm, for odd and even kernels and with a frame mask.
+    #[test]
+    fn conformer_conv_shared_depthwise_matches_candle_grouped_conv_and_batch_norm() {
+        use candle_nn::ModuleT;
+
+        let device = Device::Cpu;
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        let mut values = |n: usize, scale: f32, offset: f32| {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    offset + scale * ((state >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                })
+                .collect::<Vec<_>>()
+        };
+        for kernel in [15usize, 4] {
+            let mut config = tiny_audio_config().encoder_config;
+            config.hidden_dim = 16;
+            config.conv_expansion_factor = 2;
+            config.conv_kernel_size = kernel;
+            let (hidden, inner) = (16usize, 32usize);
+            let mut tensors = std::collections::HashMap::new();
+            let mut put = |name: &str, shape: &[usize], scale: f32, offset: f32| {
+                let n = shape.iter().product();
+                let t = Tensor::from_vec(values(n, scale, offset), shape, &device).unwrap();
+                tensors.insert(name.to_string(), t.clone());
+                t
+            };
+            let norm_w = put("norm.weight", &[hidden], 0.1, 1.0);
+            let norm_b = put("norm.bias", &[hidden], 0.1, 0.0);
+            let up_w = put("up_conv.weight", &[2 * inner, hidden, 1], 0.25, 0.0);
+            let up_b = put("up_conv.bias", &[2 * inner], 0.1, 0.0);
+            let dw = put("depth_conv.conv.weight", &[inner, 1, kernel], 0.3, 0.0);
+            let gamma = put("batch_norm.weight", &[inner], 0.2, 1.0);
+            let beta = put("batch_norm.bias", &[inner], 0.1, 0.0);
+            let mean = put("batch_norm.running_mean", &[inner], 0.2, 0.0);
+            let var = put("batch_norm.running_var", &[inner], 0.25, 1.0);
+            let down_w = put("down_conv.weight", &[hidden, inner, 1], 0.2, 0.0);
+            let down_b = put("down_conv.bias", &[hidden], 0.1, 0.0);
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            let conv = GraniteConformerConv::load(&config, vb).unwrap();
+
+            let reference = |x: &Tensor, mask: Option<&Tensor>| {
+                let x = candle_nn::LayerNorm::new(norm_w.clone(), norm_b.clone(), 1e-5)
+                    .forward(x)
+                    .unwrap();
+                let x = x.transpose(1, 2).unwrap().contiguous().unwrap();
+                let channel_mask = mask.map(|m| m.transpose(1, 2).unwrap().contiguous().unwrap());
+                let x = Conv1d::new(up_w.clone(), Some(up_b.clone()), Conv1dConfig::default())
+                    .forward(&x)
+                    .unwrap();
+                let mut x = glu_channels(&x).unwrap();
+                if let Some(m) = &channel_mask {
+                    x = x.broadcast_mul(m).unwrap();
+                }
+                let pad = kernel / 2;
+                let right = pad.saturating_sub((kernel + 1) % 2);
+                let x = x.pad_with_zeros(2, pad, right).unwrap();
+                let depth_cfg = Conv1dConfig {
+                    groups: inner,
+                    ..Default::default()
+                };
+                let x = Conv1d::new(dw.clone(), None, depth_cfg)
+                    .forward(&x)
+                    .unwrap();
+                let bn = candle_nn::BatchNorm::new(
+                    inner,
+                    mean.clone(),
+                    var.clone(),
+                    gamma.clone(),
+                    beta.clone(),
+                    1e-5,
+                )
+                .unwrap();
+                let x = bn.forward_t(&x, false).unwrap().silu().unwrap();
+                let mut y = Conv1d::new(
+                    down_w.clone(),
+                    Some(down_b.clone()),
+                    Conv1dConfig::default(),
+                )
+                .forward(&x)
+                .unwrap();
+                if let Some(m) = &channel_mask {
+                    y = y.broadcast_mul(m).unwrap();
+                }
+                y.transpose(1, 2).unwrap().contiguous().unwrap()
+            };
+
+            let x = Tensor::from_vec(values(2 * 29 * hidden, 1.0, 0.0), (2, 29, hidden), &device)
+                .unwrap();
+            let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+            assert_close_1e5(&reference(&x, None), &conv.forward(&x).unwrap());
+            assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+
+            let mask_values = (0..2 * 29)
+                .map(|i| {
+                    if i % 29 < [29, 17][i / 29] {
+                        1.0f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mask = Tensor::from_vec(mask_values, (2, 29, 1), &device).unwrap();
+            assert_close_1e5(
+                &reference(&x, Some(&mask)),
+                &conv.forward_valid_lengths(&x, &mask).unwrap(),
+            );
+        }
+    }
+
+    fn assert_close_1e5(expected: &Tensor, actual: &Tensor) {
+        assert_eq!(expected.dims(), actual.dims());
+        let diff = (expected - actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|d| if d.is_finite() { d } else { f32::INFINITY })
+            .fold(0.0f32, f32::max);
+        assert!(diff <= 1e-5, "max |diff| {diff}");
     }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
