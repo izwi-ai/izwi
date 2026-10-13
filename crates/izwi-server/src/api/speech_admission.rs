@@ -80,7 +80,8 @@ pub(super) fn is_speech_generation(method: &axum::http::Method, path: &str) -> b
     (method == axum::http::Method::POST
         && (path.ends_with("/audio/speech")
             || path.contains("/text-to-speech")
-            || path.contains("/voice-clone")))
+            || path.contains("/voice-clone")
+            || path.contains("/voice-design")))
         || (method == axum::http::Method::GET
             && path.contains("/text-to-speech/")
             && path.ends_with("/events"))
@@ -118,6 +119,22 @@ mod tests {
             &Method::GET,
             "/v1/text-to-speech/record/audio"
         ));
+    }
+
+    /// TPIPE-20: every synthesizing route shares the speech quota, voice
+    /// design included.
+    #[test]
+    fn every_synthesis_route_shares_speech_admission() {
+        use axum::http::Method;
+        for path in [
+            "/v1/audio/speech",
+            "/v1/text-to-speech",
+            "/v1/voice-clones",
+            "/v1/voice-designs",
+        ] {
+            assert!(is_speech_generation(&Method::POST, path), "{path}");
+        }
+        assert!(!is_speech_generation(&Method::GET, "/v1/voice-designs"));
     }
 
     #[test]

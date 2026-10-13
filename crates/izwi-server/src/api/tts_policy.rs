@@ -122,6 +122,17 @@ impl SpeechSamplingRequest {
     }
 }
 
+/// The largest explicit output-frame budget any backend honours for
+/// `variant`.
+fn explicit_frame_ceiling(variant: ModelVariant) -> usize {
+    let hint = variant.tts_max_output_frames_hint().unwrap_or(1);
+    if variant == ModelVariant::Voxtral4BTts2603 {
+        hint.max(ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES)
+    } else {
+        hint
+    }
+}
+
 pub(crate) fn resolve_tts_output_frames(
     variant: ModelVariant,
     text: &str,
@@ -129,7 +140,10 @@ pub(crate) fn resolve_tts_output_frames(
 ) -> Option<usize> {
     let model_max_frames = variant.tts_max_output_frames_hint()?;
     match requested_frames {
-        Some(value) if value > 0 => Some(value.clamp(1, model_max_frames)),
+        // An explicit budget is clamped to the largest any backend honours;
+        // the runtime clamps it again to the loaded backend's limit (Voxtral
+        // allows 2,048 frames on CUDA, not the 1,500-frame hint; TPIPE-19).
+        Some(value) if value > 0 => Some(value.clamp(1, explicit_frame_ceiling(variant))),
         Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
             Some(voxtral_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
@@ -194,6 +208,28 @@ fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TPIPE-19: an explicit Voxtral budget up to CUDA's 2,048 frames
+    /// reaches the runtime (which clamps it to the loaded backend's limit),
+    /// rather than being cut to the 1,500-frame hint here.
+    #[test]
+    fn explicit_budgets_reach_the_runtime_up_to_the_largest_backend_limit() {
+        let voxtral = ModelVariant::Voxtral4BTts2603;
+        assert_eq!(
+            resolve_tts_output_frames(voxtral, "hi", Some(2_000)),
+            Some(2_000)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(voxtral, "hi", Some(9_999)),
+            Some(ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES)
+        );
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let qwen_cap = qwen.tts_max_output_frames_hint().unwrap();
+        assert_eq!(
+            resolve_tts_output_frames(qwen, "hi", Some(usize::MAX)),
+            Some(qwen_cap)
+        );
+    }
 
     /// TPIPE-10: Qwen3-TTS reads no `speed`, so it no longer advertises
     /// speed control and refuses any speed but 1.0; Kokoro honours 0.5-2.0
