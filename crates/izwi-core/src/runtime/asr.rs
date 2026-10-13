@@ -32,6 +32,7 @@ use crate::models::registry::{
 };
 use crate::runtime::adapters::{
     CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+    RuntimeAdapterRegistry, StreamingMode,
 };
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
@@ -430,6 +431,18 @@ fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
 /// come back alike. Cleaning is idempotent, so merged text is unchanged.
 fn asr_transcript_text(text: &str) -> String {
     clean_transcript_text(text, AsrLongFormConfig::default().max_repeated_chars)
+}
+
+/// Whether `variant` streams ASR on a native streaming contract. Its ASR
+/// adapter's streaming mode decides; loaded adapters without one reject a
+/// native contract and accept only transport progress from offline decode.
+pub(super) fn asr_streams_natively(
+    adapters: &RuntimeAdapterRegistry,
+    variant: ModelVariant,
+) -> bool {
+    adapters
+        .require(CapabilityKind::Asr, variant)
+        .is_ok_and(|adapter| adapter.streaming_mode != StreamingMode::None)
 }
 
 /// Transcript language: the caller's hint when given, otherwise the language
@@ -2646,7 +2659,7 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
@@ -2682,27 +2695,8 @@ impl RuntimeService {
                 false,
             )
             .await?;
-        let mut streamed_text = String::new();
-        let output = self
-            .run_admitted_streaming_request(admitted, |chunk| {
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
-                    }
-                }
-                std::future::ready(Ok(()))
-            })
-            .await?;
-        let duration_secs = asr_transcription_duration_secs(&output);
-        let text = asr_transcript_text(&output.text.unwrap_or(streamed_text));
-
-        Ok(AsrTranscription {
-            text,
-            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
-            duration_secs,
-            asr_diagnostics: output.asr_diagnostics,
-        })
+        self.stream_admitted_asr_request(admitted, variant, true, language, on_delta, |_| {})
+            .await
     }
 
     pub(crate) async fn asr_transcribe_bytes_with_variant(
@@ -2932,8 +2926,8 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        mut on_delta: F,
-        mut on_progress: P,
+        on_delta: F,
+        on_progress: P,
         broker_streaming_required: bool,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription>
@@ -2975,6 +2969,37 @@ impl RuntimeService {
                 false,
             )
             .await?;
+        self.stream_admitted_asr_request(
+            admitted,
+            variant,
+            broker_streaming_required,
+            language,
+            on_delta,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Run an admitted ASR request as a stream of text deltas.
+    ///
+    /// `native_stream_requested` asks for the model's native streaming
+    /// contract. A model whose ASR adapter declares no streaming mode is
+    /// offline-only, so its stream runs on the offline route instead: the
+    /// transport still carries the deltas its decode emits (retained per-step
+    /// text, chunk partials).
+    async fn stream_admitted_asr_request<F, P>(
+        &self,
+        admitted: AdmittedEngineRequest,
+        variant: ModelVariant,
+        native_stream_requested: bool,
+        language: Option<&str>,
+        mut on_delta: F,
+        mut on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
         let mut streamed_text = String::new();
         let handle_chunk = |chunk: crate::engine::StreamingOutput| {
             if let Some(progress) = chunk.asr_progress {
@@ -2988,15 +3013,16 @@ impl RuntimeService {
             }
             std::future::ready(Ok(()))
         };
-        let output = if broker_streaming_required {
-            self.run_admitted_streaming_request(admitted, handle_chunk)
-                .await?
-        } else {
-            self.run_admitted_transport_streaming_request(admitted, handle_chunk)
-                .await?
-        };
+        let output =
+            if native_stream_requested && asr_streams_natively(&self.adapter_registry, variant) {
+                self.run_admitted_streaming_request(admitted, handle_chunk)
+                    .await?
+            } else {
+                self.run_admitted_transport_streaming_request(admitted, handle_chunk)
+                    .await?
+            };
         let duration_secs = asr_transcription_duration_secs(&output);
-        let text = asr_transcript_text(&output.text.unwrap_or(streamed_text));
+        let text = asr_transcript_text(output.text.as_deref().unwrap_or(&streamed_text));
 
         Ok(AsrTranscription {
             text,
@@ -4911,6 +4937,22 @@ mod tests {
         assert_eq!(asr_automatic_context(65_536, 1_938, 8), (1_938, 15_504));
         assert_eq!(asr_automatic_context(65_536, 1_938, 0), (1_938, 1_938));
         assert_eq!(asr_automatic_context(1_024, 1_938, 8), (1_024, 1_024));
+    }
+
+    #[test]
+    fn offline_only_asr_models_stream_on_the_offline_route() {
+        let adapters = RuntimeAdapterRegistry::built_in();
+        for variant in [
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Nemotron35AsrStreaming06B,
+        ] {
+            assert!(
+                !asr_streams_natively(&adapters, variant),
+                "{variant} has offline ASR only, so its streams take the offline route"
+            );
+        }
+        let qwen = ModelVariant::Qwen3Asr06BGguf;
+        assert!(asr_streams_natively(&adapters, qwen));
     }
 
     fn env_lock() -> &'static Mutex<()> {

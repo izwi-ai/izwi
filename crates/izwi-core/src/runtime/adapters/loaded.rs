@@ -6426,6 +6426,48 @@ mod tests {
     }
 
     #[test]
+    fn every_asr_stream_route_binds_to_its_loaded_contract() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let mut offline_only = Vec::new();
+        for &variant in ModelVariant::all() {
+            let Ok(metadata) = registry.require(CapabilityKind::Asr, variant) else {
+                continue;
+            };
+            if metadata.execution_target != ExecutionTargetKind::TokenEngine {
+                continue;
+            }
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(7),
+                ModelInstanceId::new(1),
+                variant,
+                BackendKind::Cpu,
+            )
+            .unwrap();
+            install_test_preparation_seals(&draft, BackendKind::Cpu, 1);
+            let execution = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+            // The requirements the runtime binds for a stream=true request.
+            let native = crate::runtime::asr::asr_streams_natively(&registry, variant);
+            let streaming = if native {
+                StreamingRequirements::native(true)
+            } else {
+                offline_only.push(variant);
+                StreamingRequirements::transport_only()
+            };
+            for asr_long_form in [false, true] {
+                let result = execution.contract(streaming.with_asr_long_form(asr_long_form));
+                assert!(
+                    result.is_ok(),
+                    "{variant} stream (native {native}, long-form {asr_long_form}): {:?}",
+                    result.err()
+                );
+            }
+        }
+        assert!(offline_only.contains(&ModelVariant::ParakeetTdt06BV3));
+        assert!(offline_only.contains(&ModelVariant::Nemotron35AsrStreaming06B));
+    }
+
+    #[test]
     fn lfm2_sequence_chat_remains_quantum_committed_when_streaming() {
         let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
