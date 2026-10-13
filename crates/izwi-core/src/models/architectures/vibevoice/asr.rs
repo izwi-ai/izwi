@@ -4085,8 +4085,8 @@ mod tests {
         }
         let vb = VarBuilder::from_backend(Box::new(ShapedZeros), DType::F32, Device::Cpu);
         let tokenizer = load_asr_acoustic_tokenizer(&config, vb, None).unwrap();
-        let latents = Tensor::zeros((1, 4, 1), DType::F32, &Device::Cpu).unwrap();
-        let error = tokenizer.decode(&latents).unwrap_err();
+        let latents = Tensor::zeros((1, 1, 4), DType::F32, &Device::Cpu).unwrap();
+        let error = tokenizer.decode_frames(&latents).unwrap_err();
         assert!(error.to_string().contains("encoder-only"), "{error}");
     }
 

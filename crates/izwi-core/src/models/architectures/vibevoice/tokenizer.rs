@@ -331,27 +331,38 @@ impl VibeVoiceAcousticTokenizer {
         self.sample_with_supplied_noise(output, noise.as_ref())
     }
 
-    pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
-        let latents = if latents.dim(1)? == self.vae_dim {
-            latents.clone()
-        } else {
-            latents.transpose(1, 2)?
-        };
-        self.decoder()?.forward(&latents)
+    /// Decodes frames-last latents `[batch, frames, vae_dim]` (the layout
+    /// [`Self::encode`] returns and TTS generates) to audio `[batch, 1, samples]`.
+    pub fn decode_frames(&self, latents: &Tensor) -> Result<Tensor> {
+        let decoder = self.decoder()?;
+        decoder.forward(&self.frames_last_to_channels_first(latents)?)
     }
 
+    /// [`Self::decode_frames`] continuing from `cache`; same latent layout.
     fn decode_streaming(
         &self,
         latents: &Tensor,
         cache: &mut TokenizerStreamingState,
     ) -> Result<Tensor> {
-        let latents = if latents.dim(1)? == self.vae_dim {
-            latents.clone()
-        } else {
-            latents.transpose(1, 2)?
-        };
         let decoder = self.decoder()?;
+        let latents = self.frames_last_to_channels_first(latents)?;
         decoder.forward_streaming(&latents, cache.decoder_mut(decoder))
+    }
+
+    /// `[batch, frames, vae_dim]` to the decoder's `[batch, vae_dim, frames]`.
+    /// The layout is part of the contract and never inferred from a dimension
+    /// size: at `frames == vae_dim` (64) both layouts have the same shape, and
+    /// guessing once decoded every 64-frame request transposed.
+    fn frames_last_to_channels_first(&self, latents: &Tensor) -> Result<Tensor> {
+        let (_, _, channels) = latents.dims3()?;
+        if channels != self.vae_dim {
+            return Err(Error::InferenceError(format!(
+                "VibeVoice acoustic latents must be [batch, frames, {}], got {:?}",
+                self.vae_dim,
+                latents.dims()
+            )));
+        }
+        latents.transpose(1, 2).map_err(Error::from)
     }
 
     pub(crate) fn decode_streaming_physical(
@@ -2988,8 +2999,8 @@ mod tests {
         assert_eq!(decoder(&asr_names), 0);
         assert_eq!(asr_names.len(), full_names.len() - decoder(&full_names));
         assert!(full.decoder_state_geometry().is_ok());
-        let latents = Tensor::zeros((1, 64, 1), DType::F32, &Device::Cpu).unwrap();
-        let error = asr.decode(&latents).unwrap_err();
+        let latents = Tensor::zeros((1, 1, 64), DType::F32, &Device::Cpu).unwrap();
+        let error = asr.decode_frames(&latents).unwrap_err();
         assert!(error.to_string().contains("encoder-only"), "{error}");
         assert!(asr.decoder_state_geometry().is_err());
     }
@@ -3536,6 +3547,63 @@ mod tests {
         let mut cursor = PhysicalComponentCursor::new(&extra);
         cursor.next(geometry).unwrap();
         assert!(cursor.finish().is_err());
+    }
+
+    /// The published acoustic tokenizer topology (vae_dim 64, causal
+    /// depthwise mixers, RMSNorm) shrunk to two 2x upsampling stages, one
+    /// block each, with xorshift weights.
+    fn xorshift_acoustic_tokenizer() -> VibeVoiceAcousticTokenizer {
+        let config = r#"{"causal": true, "channels": 1, "conv_bias": true,
+            "conv_norm": "none", "corpus_normalize": 0.0, "decoder_depths": null,
+            "decoder_n_filters": 2, "decoder_ratios": [2, 2],
+            "disable_last_norm": true, "encoder_depths": "1-1-1",
+            "encoder_n_filters": 2, "encoder_ratios": [2, 2], "fix_std": 0.5,
+            "layer_scale_init_value": 1e-06, "layernorm": "RMSNorm",
+            "layernorm_elementwise_affine": true, "layernorm_eps": 1e-05,
+            "mixer_layer": "depthwise_conv", "pad_mode": "constant",
+            "std_dist_type": "gaussian", "vae_dim": 64, "weight_init_value": 0.01}"#;
+        let config: VibeVoiceTokenizerConfig = serde_json::from_str(config).unwrap();
+        let vb = VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, Device::Cpu);
+        VibeVoiceAcousticTokenizer::load(&config, vb).unwrap()
+    }
+
+    /// VVT-1: a final decode of exactly `vae_dim` (64) frames used to pass
+    /// `[1, 64, 64]` to the decoder untransposed, because the layout was
+    /// guessed from `dim(1) == vae_dim`. The decoder is causal, so 63, 64 and
+    /// 65 frames must agree on every sample of their common prefix.
+    #[test]
+    fn decode_frames_is_prefix_consistent_at_vae_dim_frames() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let tokenizer = xorshift_acoustic_tokenizer();
+        let latents = xorshift_tensor(&[1, 65, 64], 7, 1.0, &Device::Cpu).unwrap();
+        let decode = |frames: usize| {
+            let audio = tokenizer
+                .decode_frames(&latents.narrow(1, 0, frames).unwrap())
+                .unwrap();
+            assert_eq!(audio.dims(), &[1, 1, frames * 4]);
+            host_f32(&audio).unwrap()
+        };
+        let (a63, a64, a65) = (decode(63), decode(64), decode(65));
+        assert!(
+            a65.iter().any(|v| v.abs() > 1e-3),
+            "decoder output is silent"
+        );
+        let scale = a65.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d64 = max_abs_diff(&a64, &a65[..a64.len()]);
+        let d63 = max_abs_diff(&a63, &a65[..a63.len()]);
+        assert!(
+            d64 <= 1e-5 * scale.max(1.0),
+            "64-frame decode diverges: {d64}"
+        );
+        assert!(
+            d63 <= 1e-5 * scale.max(1.0),
+            "63-frame decode diverges: {d63}"
+        );
+
+        // Channels-first input is rejected instead of being reinterpreted.
+        let channels_first = latents.narrow(1, 0, 3).unwrap().transpose(1, 2).unwrap();
+        assert!(tokenizer.decode_frames(&channels_first).is_err());
     }
 
     fn tiny_encoder() -> TokenizerEncoder {

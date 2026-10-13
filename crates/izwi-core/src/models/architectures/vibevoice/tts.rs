@@ -959,7 +959,7 @@ impl VibeVoiceTtsModel {
             &state.artifact.normalization.scale,
         )?;
         let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode(&unscaled)?;
+        let audio = self.acoustic_tokenizer.decode_frames(&unscaled)?;
         profile.final_decode_ms = elapsed_ms(started);
         let started = Instant::now();
         let samples = audio
@@ -1218,7 +1218,7 @@ impl VibeVoiceTtsModel {
             &reference.normalization.scale,
         )?;
         let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode(&unscaled)?;
+        let audio = self.acoustic_tokenizer.decode_frames(&unscaled)?;
         profile.final_decode_ms = elapsed_ms(started);
         let started = Instant::now();
         let samples = audio
