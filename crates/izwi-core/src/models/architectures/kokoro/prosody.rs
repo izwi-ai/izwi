@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "metal")]
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "metal")]
 use std::sync::{Mutex, OnceLock};
 
@@ -11,11 +12,9 @@ use candle_core::{
 };
 #[cfg(feature = "metal")]
 use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
-use candle_nn::rnn::Direction;
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
 };
-use candle_nn::{LSTMConfig, RNN};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
@@ -1177,68 +1176,140 @@ fn depthwise_pool_forward(pool: &ConvTranspose1d, x: &Tensor) -> Result<Tensor> 
     .map_err(Error::from)
 }
 
+static KOKORO_FUSED_LSTM_STEPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_FUSED_LSTM_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of fused bidirectional LSTM recurrent steps. Each step
+/// advances both directions by one frame, so a `T`-frame sequence costs `T`
+/// steps (Candle's per-direction `LSTM::seq` took `2T`).
+pub fn kokoro_fused_lstm_steps() -> u64 {
+    KOKORO_FUSED_LSTM_STEPS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_fused_lstm_steps() -> u64 {
+    THREAD_FUSED_LSTM_STEPS.with(|steps| steps.get())
+}
+
+fn record_fused_lstm_step() {
+    KOKORO_FUSED_LSTM_STEPS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_FUSED_LSTM_STEPS.with(|steps| steps.set(steps.get() + 1));
+}
+
+/// Single-layer bidirectional LSTM (PyTorch `nn.LSTM(bidirectional=True,
+/// batch_first=True)`, gate order i, f, g, o).
+///
+/// The input projection `x·W_ihᵀ + b_ih + b_hh` of both directions is one
+/// matmul over the whole sequence, and the recurrence advances both
+/// directions together: one batched `[2, B, H]·[2, H, 4H]` matmul and a
+/// handful of element-wise gate ops per frame, with the backward direction
+/// reading a time-reversed copy of its projections.
 #[derive(Debug)]
 pub(crate) struct BiLstm1 {
-    fwd: candle_nn::LSTM,
-    bwd: candle_nn::LSTM,
+    /// `[C, 8H]`: forward then backward `W_ihᵀ`.
+    w_ih_t: Tensor,
+    /// `[8H]`: forward then backward `b_ih + b_hh`.
+    bias: Tensor,
+    /// `[2, H, 4H]`: forward and backward `W_hhᵀ`.
+    w_hh_t: Tensor,
     hidden_dim: usize,
 }
 
 impl BiLstm1 {
     pub(crate) fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg_f = LSTMConfig {
-            direction: Direction::Forward,
-            ..Default::default()
-        };
-        let cfg_b = LSTMConfig {
-            direction: Direction::Backward,
-            ..Default::default()
-        };
+        let gates = 4 * hidden_dim;
+        let mut w_ih_t = Vec::with_capacity(2);
+        let mut w_hh_t = Vec::with_capacity(2);
+        let mut bias = Vec::with_capacity(2);
+        for suffix in ["", "_reverse"] {
+            let w_ih = vb
+                .get((gates, input_dim), &format!("weight_ih_l0{suffix}"))
+                .map_err(Error::from)?;
+            let w_hh = vb
+                .get((gates, hidden_dim), &format!("weight_hh_l0{suffix}"))
+                .map_err(Error::from)?;
+            let b_ih = vb
+                .get(gates, &format!("bias_ih_l0{suffix}"))
+                .map_err(Error::from)?;
+            let b_hh = vb
+                .get(gates, &format!("bias_hh_l0{suffix}"))
+                .map_err(Error::from)?;
+            w_ih_t.push(w_ih.t().map_err(Error::from)?);
+            w_hh_t.push(w_hh.t().map_err(Error::from)?);
+            bias.push((b_ih + b_hh).map_err(Error::from)?);
+        }
         Ok(Self {
-            fwd: candle_nn::lstm(input_dim, hidden_dim, cfg_f, vb.clone()).map_err(Error::from)?,
-            bwd: candle_nn::lstm(input_dim, hidden_dim, cfg_b, vb).map_err(Error::from)?,
+            w_ih_t: Tensor::cat(&w_ih_t, 1)
+                .and_then(|w| w.contiguous())
+                .map_err(Error::from)?,
+            bias: Tensor::cat(&bias, 0).map_err(Error::from)?,
+            w_hh_t: Tensor::stack(&w_hh_t, 0)
+                .and_then(|w| w.contiguous())
+                .map_err(Error::from)?,
             hidden_dim,
         })
     }
 
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, t, _c) = x.dims3().map_err(Error::from)?;
-        let x = x.contiguous().map_err(Error::from)?;
-        let fwd_states = self.fwd.seq(&x).map_err(Error::from)?;
-        let fwd = self
-            .fwd
-            .states_to_tensor(&fwd_states)
-            .map_err(Error::from)?;
+        self.forward_inner(x).map_err(Error::from)
+    }
 
+    fn forward_inner(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let h = self.hidden_dim;
+        let gates = 4 * h;
+        // [B·T, 8H] input projections for both directions in one matmul.
+        let projected = x
+            .contiguous()?
+            .reshape((b * t, c))?
+            .matmul(&self.w_ih_t)?
+            .broadcast_add(&self.bias)?
+            .reshape((b, t, 2, gates))?;
         let rev_idx: Vec<u32> = (0..t as u32).rev().collect();
-        let rev_idx = Tensor::new(&rev_idx[..], x.device()).map_err(Error::from)?;
-        let x_rev = x
-            .index_select(&rev_idx, 1)
-            .map_err(Error::from)?
-            .contiguous()
-            .map_err(Error::from)?;
-        let bwd_states = self.bwd.seq(&x_rev).map_err(Error::from)?;
-        let bwd_rev = self
-            .bwd
-            .states_to_tensor(&bwd_states)
-            .map_err(Error::from)?;
-        let bwd = bwd_rev
-            .contiguous()
-            .map_err(Error::from)?
-            .index_select(&rev_idx, 1)
-            .map_err(Error::from)?;
+        let rev_idx = Tensor::new(&rev_idx[..], x.device())?;
+        let fwd = projected.i((.., .., 0))?;
+        let bwd = projected
+            .i((.., .., 1))?
+            .contiguous()?
+            .index_select(&rev_idx, 1)?;
+        // [T, 2, B, 4H]: frame `s` holds forward time `s` and backward time
+        // `T - 1 - s`.
+        let projected = Tensor::stack(&[fwd, bwd], 0)?
+            .permute((2, 0, 1, 3))?
+            .contiguous()?;
 
-        let out = Tensor::cat(&[fwd, bwd], 2).map_err(Error::from)?;
-        let (_, _, out_c) = out.dims3().map_err(Error::from)?;
-        if out_c != self.hidden_dim * 2 {
-            return Err(Error::InferenceError(format!(
-                "BiLstm1 unexpected output channels {} (expected {}) for batch {}",
-                out_c,
-                self.hidden_dim * 2,
-                b
-            )));
+        let mut hidden = Tensor::zeros((2, b, h), x.dtype(), x.device())?;
+        let mut cell = hidden.clone();
+        let mut outputs = Vec::with_capacity(t);
+        for step in 0..t {
+            let mut g = projected.get(step)?;
+            if step > 0 {
+                g = (g + hidden.matmul(&self.w_hh_t)?)?;
+            }
+            let sig = ops::sigmoid(&g)?;
+            let input_gate = sig.narrow(2, 0, h)?;
+            let forget_gate = sig.narrow(2, h, h)?;
+            let output_gate = sig.narrow(2, 3 * h, h)?;
+            let cell_gate = g.narrow(2, 2 * h, h)?.tanh()?;
+            cell = ((forget_gate * &cell)? + (input_gate * cell_gate)?)?;
+            hidden = (output_gate * cell.tanh()?)?;
+            outputs.push(hidden.clone());
+            record_fused_lstm_step();
         }
-        Ok(out)
+        // [T, 2, B, H] -> forward [B, T, H] and time-restored backward.
+        let outputs = Tensor::stack(&outputs, 0)?;
+        let fwd = outputs.i((.., 0))?.transpose(0, 1)?;
+        let bwd = outputs
+            .i((.., 1))?
+            .contiguous()?
+            .index_select(&rev_idx, 0)?
+            .transpose(0, 1)?;
+        Tensor::cat(&[fwd, bwd], 2)
     }
 }
 
@@ -1400,6 +1471,126 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The previous BiLstm1: two Candle `LSTM`s stepped one direction at a
+    /// time, the backward one over an index-selected reversed copy.
+    fn candle_bilstm_reference(x: &Tensor, hidden: usize, vb: VarBuilder) -> Tensor {
+        use candle_nn::rnn::Direction;
+        use candle_nn::{LSTMConfig, RNN};
+
+        let input = x.dim(2).unwrap();
+        let lstm = |direction| {
+            let cfg = LSTMConfig {
+                direction,
+                ..Default::default()
+            };
+            candle_nn::lstm(input, hidden, cfg, vb.clone()).unwrap()
+        };
+        let (fwd, bwd) = (lstm(Direction::Forward), lstm(Direction::Backward));
+        let t = x.dim(1).unwrap();
+        let rev: Vec<u32> = (0..t as u32).rev().collect();
+        let rev = Tensor::new(&rev[..], x.device()).unwrap();
+        let f = fwd.states_to_tensor(&fwd.seq(x).unwrap()).unwrap();
+        let x_rev = x.index_select(&rev, 1).unwrap().contiguous().unwrap();
+        let b = bwd
+            .states_to_tensor(&bwd.seq(&x_rev).unwrap())
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .index_select(&rev, 1)
+            .unwrap();
+        Tensor::cat(&[f, b], 2).unwrap()
+    }
+
+    /// The fused LSTM gives the same result on Metal as on the CPU.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_fused_bilstm_matches_cpu() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let (input, hidden) = (40usize, 16usize);
+        let run = |device: &candle_core::Device| {
+            let mut tensors = std::collections::HashMap::new();
+            for (n, (name, shape)) in [
+                ("weight_ih_l0", vec![4 * hidden, input]),
+                ("weight_hh_l0", vec![4 * hidden, hidden]),
+                ("bias_ih_l0", vec![4 * hidden]),
+                ("bias_hh_l0", vec![4 * hidden]),
+                ("weight_ih_l0_reverse", vec![4 * hidden, input]),
+                ("weight_hh_l0_reverse", vec![4 * hidden, hidden]),
+                ("bias_ih_l0_reverse", vec![4 * hidden]),
+                ("bias_hh_l0_reverse", vec![4 * hidden]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                tensors.insert(
+                    name.to_string(),
+                    xorshift_tensor(&shape, 300 + n as u64, 0.25, device).unwrap(),
+                );
+            }
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+            let x = xorshift_tensor(&[2, 19, input], 399, 1.0, device).unwrap();
+            let out = BiLstm1::load(input, hidden, vb)
+                .unwrap()
+                .forward(&x)
+                .unwrap();
+            host_f32(&out).unwrap()
+        };
+        let diff = max_abs_diff(&run(&metal), &run(&candle_core::Device::Cpu));
+        assert!(diff <= 1e-4, "max |diff| {diff}");
+    }
+
+    /// KOK-10: the fused bidirectional LSTM (one input-projection matmul,
+    /// both directions per recurrent step) matches the per-direction Candle
+    /// LSTMs, at a toy size and at Kokoro's predictor size (640 -> 2x256),
+    /// in T recurrent steps instead of 2T.
+    #[test]
+    fn fused_bilstm_matches_candle_lstm_in_half_the_steps() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let device = candle_core::Device::Cpu;
+        for (seed, batch, frames, input, hidden) in [
+            (21u64, 2usize, 13usize, 24usize, 8usize),
+            (22, 1, 37, 640, 256),
+        ] {
+            let mut tensors = std::collections::HashMap::new();
+            for (n, suffix) in ["", "_reverse"].into_iter().enumerate() {
+                let seed = seed * 10 + n as u64 * 4;
+                for (k, (name, shape)) in [
+                    ("weight_ih_l0", vec![4 * hidden, input]),
+                    ("weight_hh_l0", vec![4 * hidden, hidden]),
+                    ("bias_ih_l0", vec![4 * hidden]),
+                    ("bias_hh_l0", vec![4 * hidden]),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let scale = 1.0 / (hidden as f32).sqrt();
+                    tensors.insert(
+                        format!("{name}{suffix}"),
+                        xorshift_tensor(&shape, seed + k as u64, scale, &device).unwrap(),
+                    );
+                }
+            }
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            let x = xorshift_tensor(&[batch, frames, input], seed + 99, 1.0, &device).unwrap();
+
+            let lstm = BiLstm1::load(input, hidden, vb.clone()).unwrap();
+            let before = thread_fused_lstm_steps();
+            let fused = lstm.forward(&x).unwrap();
+            assert_eq!(thread_fused_lstm_steps() - before, frames as u64);
+            let reference = candle_bilstm_reference(&x, hidden, vb);
+            assert_eq!(fused.dims(), &[batch, frames, 2 * hidden]);
+            assert_eq!(fused.dims(), reference.dims());
+            let diff = max_abs_diff(&host_f32(&fused).unwrap(), &host_f32(&reference).unwrap());
+            assert!(diff <= 1e-5, "{input}->{hidden}: max |diff| {diff}");
+        }
+    }
 
     /// KOK-10: the AdaIN block's depthwise 2x upsampler runs through the
     /// shared phase-decomposed kernel and matches Candle's grouped
