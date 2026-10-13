@@ -492,6 +492,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_details(
             request_id,
+            &|| false,
             stream_tx,
             stream_policy,
             sequence,
@@ -511,6 +512,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -523,8 +525,9 @@ impl NativeExecutor {
     where
         F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
     {
-        Self::transcribe_with_chunk_plan_with_context_and_details(
+        Self::transcribe_with_chunk_plan_with_details_and_options(
             request_id,
+            is_cancelled,
             stream_tx,
             stream_policy,
             sequence,
@@ -532,6 +535,7 @@ impl NativeExecutor {
             sample_rate,
             chunk_plan,
             chunk_cfg,
+            AsrChunkStreamOptions::default(),
             |chunk_audio, sr, _prefix_text| transcribe_chunk(chunk_audio, sr),
         )
     }
@@ -552,6 +556,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_details_and_options(
             request_id,
+            &|| false,
             stream_tx,
             stream_policy,
             sequence,
@@ -566,6 +571,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details_and_options<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -581,6 +587,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
             request_id,
+            is_cancelled,
             stream_tx,
             stream_policy,
             sequence,
@@ -600,8 +607,15 @@ impl NativeExecutor {
     /// rules) and reconciles the accounting once the chunk text commits.
     /// Families that ignore the emitter keep the plain per-chunk delta
     /// behavior.
+    ///
+    /// `is_cancelled` is polled before every chunk, inside the partial
+    /// emitter and before a finished chunk commits; once it reports true the
+    /// executor stops streaming and returns `Error::Cancelled`. A model call
+    /// already running is not preempted, so an abandoned long-form request
+    /// releases its slot within one chunk instead of after the whole file.
     pub(super) fn transcribe_with_chunk_plan_with_streaming_details_and_options<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -648,7 +662,11 @@ impl NativeExecutor {
         let stable_text_streaming = stream_tx.is_some() && holdback_chars > 0;
         let mut previous_chunk_end: Option<usize> = None;
         let mut chunk_diagnostics = Vec::new();
+        let cancelled = || Error::Cancelled(request_id.to_string());
         for (idx, chunk) in chunk_plan.iter().enumerate() {
+            if is_cancelled() {
+                return Err(cancelled());
+            }
             if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
                 chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
                     idx,
@@ -698,6 +716,10 @@ impl NativeExecutor {
                     if partial_error.is_some() || delta.is_empty() {
                         return;
                     }
+                    if is_cancelled() {
+                        partial_error = Some(cancelled());
+                        return;
+                    }
                     partial_text.push_str(delta);
                     // Stream nothing from this chunk until its text covers the
                     // overlap with the previous chunk; after that its deltas
@@ -735,6 +757,9 @@ impl NativeExecutor {
             };
             if let Some(err) = partial_error {
                 return Err(err);
+            }
+            if is_cancelled() {
+                return Err(cancelled());
             }
             let chunk_text = chunk_result.text.clone();
             let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
@@ -1468,6 +1493,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-partial",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1521,6 +1547,107 @@ mod tests {
         );
     }
 
+    fn three_one_second_chunks(sr: u32) -> (Vec<f32>, Vec<AudioChunk>) {
+        let samples = vec![0.0f32; sr as usize * 3];
+        let chunk_plan = (0..3)
+            .map(|idx| AudioChunk {
+                start_sample: idx * sr as usize,
+                end_sample: (idx + 1) * sr as usize,
+            })
+            .collect();
+        (samples, chunk_plan)
+    }
+
+    #[test]
+    fn chunk_plan_stops_at_the_next_chunk_boundary_after_cancellation() {
+        let sr = 10u32;
+        let (samples, chunk_plan) = three_one_second_chunks(sr);
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let cancelled = std::cell::Cell::new(false);
+        let mut calls = 0usize;
+
+        let result = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-cancel",
+            &|| cancelled.get(),
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                calls += 1;
+                // The client goes away while the first chunk is running.
+                cancelled.set(true);
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk {calls}"),
+                    diagnostics: None,
+                })
+            },
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::Error::Cancelled(ref id)) if id == "req-cancel"),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1, "no chunk may start after cancellation");
+        let events = tx.take().expect("staged events");
+        assert!(events.iter().all(|event| event.text.is_none()));
+        assert!(events.iter().all(|event| !event.is_final));
+    }
+
+    #[test]
+    fn chunk_partial_emitter_stops_streaming_once_cancelled() {
+        let sr = 10u32;
+        let (samples, chunk_plan) = three_one_second_chunks(sr);
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let cancelled = std::cell::Cell::new(false);
+        let mut calls = 0usize;
+
+        let result = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+            "req-cancel-partial",
+            &|| cancelled.get(),
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            AsrChunkStreamOptions {
+                stable_text_holdback_chars: 0,
+            },
+            |_chunk_audio, _sr, _prefix, partial| {
+                calls += 1;
+                let emit = partial.expect("streaming chunk plans pass an emitter");
+                emit("alpha ");
+                cancelled.set(true);
+                emit("beta ");
+                emit("gamma");
+                Ok(AsrChunkTranscription {
+                    text: "alpha beta gamma".to_string(),
+                    diagnostics: None,
+                })
+            },
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::Error::Cancelled(_))),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1);
+        let streamed: String = tx
+            .take()
+            .expect("staged events")
+            .iter()
+            .filter_map(|event| event.text.clone())
+            .collect();
+        assert_eq!(streamed, "alpha");
+    }
+
     #[test]
     fn chunk_plan_streaming_without_partials_keeps_chunk_level_deltas() {
         let sr = 10u32;
@@ -1541,6 +1668,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-no-partial",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1598,6 +1726,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-overlap",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1667,6 +1796,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-holdback",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1734,6 +1864,7 @@ mod tests {
         let chunked =
             NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
                 "req-stream",
+                &|| false,
                 Some(&tx),
                 EngineStreamPolicy::FailOnFull,
                 &mut sequence,
@@ -1865,6 +1996,7 @@ mod tests {
         let mut sequence = 0usize;
         let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
             "req-details",
+            &|| false,
             None,
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1937,6 +2069,7 @@ mod tests {
 
         let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
             "req-progress",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,

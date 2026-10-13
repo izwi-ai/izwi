@@ -378,6 +378,25 @@ fn run_asr_model_call<T>(
     Ok((!request.is_cancelled()).then_some(output))
 }
 
+/// Settle an atomic ASR invocation against cooperative cancellation. The
+/// chunk executor stops with `Cancelled` at the first chunk boundary after the
+/// signal flips; a single-window model call cannot be preempted, so a
+/// cancellation that arrived during it is honored here instead. Either way no
+/// text or staged stream output is published, and `None` tells the caller to
+/// finish the row as cancelled.
+fn settle_atomic_asr_cancellation<T>(
+    request: &EngineCoreRequest,
+    result: Result<T>,
+) -> Result<Option<T>> {
+    match result {
+        Err(Error::Cancelled(_)) => {}
+        Ok(_) if request.is_cancelled() => {}
+        other => return other.map(Some),
+    }
+    let _ = request.take_staged_stream_outputs();
+    Ok(None)
+}
+
 fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
     if scheduled.is_empty()
         || scheduled
@@ -3754,7 +3773,12 @@ impl NativeExecutor {
                 )?;
             }
             Ok(transcription)
-        })?;
+        });
+        let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        };
         let completions = leases.release()?;
         if completions.len() != 2 {
             return Err(Error::InferenceError(
@@ -6942,6 +6966,7 @@ impl NativeExecutor {
                             let chunked = Self::run_blocking(|| {
                                 Self::transcribe_with_chunk_plan_with_details_and_options(
                                     &request.id,
+                                    &|| request.is_cancelled(),
                                     Some(tx),
                                     stream_policy,
                                     &mut sequence,
@@ -6965,7 +6990,13 @@ impl NativeExecutor {
                                         })
                                     },
                                 )
-                            })?;
+                            });
+                            let Some(chunked) = settle_atomic_asr_cancellation(request, chunked)?
+                            else {
+                                return Ok(ModelSessionResult::cancelled(
+                                    ExecutorOutput::cancelled(request.id.clone()),
+                                ));
+                            };
                             let diagnostics = Self::with_audio_decode_timing(
                                 Some(chunk_plan.diagnostics_with_chunk_transcriptions(
                                     chunked.chunk_diagnostics,
@@ -7182,7 +7213,7 @@ impl NativeExecutor {
         let samples = execution_audio.samples();
         let samples_len = samples.len();
 
-        let (text, asr_diagnostics) = Self::run_blocking(|| {
+        let transcription = Self::run_blocking(|| {
             let mut sequence = 0usize;
             if matches!(family, ModelFamily::Voxtral) {
                 let model = self.with_registry(|registry| {
@@ -7197,6 +7228,7 @@ impl NativeExecutor {
                 if chunk_plan.requires_chunk_path() {
                     let chunked = Self::transcribe_with_chunk_plan_with_details(
                         &request.id,
+                        &|| request.is_cancelled(),
                         stream_tx.as_ref(),
                         stream_policy,
                         &mut sequence,
@@ -7307,6 +7339,7 @@ impl NativeExecutor {
             if chunk_plan.requires_chunk_path() {
                 let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
                     &request.id,
+                    &|| request.is_cancelled(),
                     stream_tx.as_ref(),
                     stream_policy,
                     &mut sequence,
@@ -7734,7 +7767,13 @@ impl NativeExecutor {
                 }
             };
             Ok((details.text, details.diagnostics))
-        })?;
+        });
+        let Some((text, asr_diagnostics)) = settle_atomic_asr_cancellation(request, transcription)?
+        else {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        };
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
 
         Ok(ModelSessionResult::atomic(ExecutorOutput {
@@ -8493,6 +8532,41 @@ mod tests {
             &mut checkpoint,
         ));
         assert_eq!(state, 9);
+    }
+
+    #[test]
+    fn atomic_asr_cancellation_discards_output_and_keeps_real_errors() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.set_cancellation_signal(signal.clone());
+
+        assert_eq!(
+            super::settle_atomic_asr_cancellation(&request, Ok(5_u32)).unwrap(),
+            Some(5)
+        );
+        assert!(matches!(
+            super::settle_atomic_asr_cancellation::<u32>(
+                &request,
+                Err(crate::error::Error::InferenceError("boom".into())),
+            ),
+            Err(crate::error::Error::InferenceError(_))
+        ));
+        // The chunk executor's `Cancelled` settles as a cancelled row.
+        assert_eq!(
+            super::settle_atomic_asr_cancellation::<u32>(
+                &request,
+                Err(crate::error::Error::Cancelled(request.id.clone())),
+            )
+            .unwrap(),
+            None
+        );
+        // A single-window call that finished after the signal flipped
+        // publishes nothing.
+        signal.store(true, Ordering::Release);
+        assert_eq!(
+            super::settle_atomic_asr_cancellation(&request, Ok(5_u32)).unwrap(),
+            None
+        );
     }
 
     #[test]
