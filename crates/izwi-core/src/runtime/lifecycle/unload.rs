@@ -507,8 +507,15 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn managed_bundle_retirement_releases_state_and_model_claims_across_reload_cycles() {
+        // Reserves model and state claims on the process-global authority,
+        // which the load.rs OOM-ladder tests poison and load transactions
+        // fill; serialize with them for the whole body.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir = std::env::temp_dir().join(format!(
             "izwi-runtime-managed-reload-test-{}",
             Uuid::new_v4()
