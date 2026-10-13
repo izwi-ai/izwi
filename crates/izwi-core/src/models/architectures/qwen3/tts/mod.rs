@@ -1575,6 +1575,19 @@ fn qwen_tts_uses_device_sampling(device: &DeviceProfile) -> bool {
     device.kind.is_cuda() || device.kind.is_metal()
 }
 
+/// The repetition-penalty history after generating `token`. The reference
+/// (Hugging Face's `RepetitionPenaltyLogitsProcessor` over the talker's
+/// generated ids) penalizes every semantic code generated so far, each once,
+/// so the history keeps each distinct code and never forgets one. It is
+/// bounded by the semantic vocabulary.
+fn record_semantic_history(history: &[u32], token: u32) -> Vec<u32> {
+    let mut next = history.to_vec();
+    if !next.contains(&token) {
+        next.push(token);
+    }
+    next
+}
+
 fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
     frames_generated >= MIN_QWEN_TTS_TOKENS_BEFORE_EOS
 }
@@ -2048,7 +2061,7 @@ impl Qwen3TtsModel {
             .ok_or_else(|| Error::Overloaded("Qwen3-TTS codec history overflow".into()))?;
         let codec_host = checked_bytes(codec_elements, std::mem::size_of::<u32>(), "codec host")?;
         let semantic_host = checked_bytes(
-            frames.min(256),
+            frames.min(self.config.talker_config.vocab_size),
             std::mem::size_of::<u32>(),
             "semantic history",
         )?;
@@ -2517,12 +2530,8 @@ impl Qwen3TtsModel {
                 sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
             }));
         }
-        let mut next_semantic_history = state.semantic_history.clone();
-        next_semantic_history.push(semantic_token);
-        if next_semantic_history.len() > 256 {
-            let drain = next_semantic_history.len() - 256;
-            next_semantic_history.drain(0..drain);
-        }
+        let next_semantic_history =
+            record_semantic_history(&state.semantic_history, semantic_token);
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let talker_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
@@ -3063,12 +3072,8 @@ impl Qwen3TtsModel {
             });
         }
 
-        let mut next_semantic_history = state.semantic_history.clone();
-        next_semantic_history.push(semantic_token);
-        if next_semantic_history.len() > 256 {
-            let drain = next_semantic_history.len() - 256;
-            next_semantic_history.drain(0..drain);
-        }
+        let next_semantic_history =
+            record_semantic_history(&state.semantic_history, semantic_token);
 
         let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
@@ -5734,6 +5739,54 @@ pub(crate) mod tests {
                 thread_qwen3_tts_host_readbacks() - before,
                 1,
                 "temperature {temperature}, device {prefer_device}"
+            );
+        }
+    }
+
+    /// The semantic repetition penalty covers every code generated so far,
+    /// as the reference's does, not just the last 256 frames: a code seen
+    /// once at frame 0 is still penalized 300 frames later, on both the host
+    /// and the candidate sampler.
+    #[test]
+    fn semantic_repetition_penalty_remembers_every_generated_code() {
+        let mut history = record_semantic_history(&[], 5);
+        for frame in 0..300u32 {
+            history = record_semantic_history(&history, 10 + frame % 280);
+        }
+        assert!(history.contains(&5));
+        assert_eq!(history.len(), 281, "each code is kept once");
+
+        // Unpenalized, code 5 narrowly beats code 6; penalized (1.0 / 1.05)
+        // it loses, and the near-zero temperature makes the draw decisive.
+        let mut values = vec![-30.0f32; 300];
+        values[5] = 1.0;
+        values[6] = 0.99;
+        let logits = Tensor::new(values, &candle_core::Device::Cpu).unwrap();
+        let params = TtsGenerationParams {
+            temperature: 1e-3,
+            top_p: 1.0,
+            top_k: 2,
+            repetition_penalty: 1.05,
+            ..Default::default()
+        };
+        for prefer_device in [false, true] {
+            let mut rng = SimpleRng {
+                state: 0x2545_f491_4f6c_dd1d,
+            };
+            assert_eq!(
+                sample_semantic(
+                    &logits,
+                    300,
+                    299,
+                    false,
+                    &params,
+                    &history,
+                    &mut rng,
+                    prefer_device
+                )
+                .unwrap(),
+                6,
+                "prefer_device={prefer_device}"
             );
         }
     }
