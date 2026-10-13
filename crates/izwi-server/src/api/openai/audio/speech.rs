@@ -496,66 +496,22 @@ fn validate_speech_voice_contract(
     req: &SpeechRequest,
     variant: ModelVariant,
 ) -> Result<(), ApiError> {
-    let has_direct_reference_audio = req
-        .reference_audio
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    let has_direct_reference_text = req
-        .reference_text
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    if has_direct_reference_audio != has_direct_reference_text {
-        return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
-        ));
-    }
-
-    if has_direct_reference_audio {
-        let supports_reference_voice = variant
+    let present = |value: Option<&str>| value.map(has_non_empty_text).unwrap_or(false);
+    // OpenAI requires `voice`, so a client sends one even to a model that
+    // speaks only with a reference; it is ignored there, not refused.
+    let speaker = present(req.voice.as_deref())
+        && variant
             .speech_capabilities()
-            .map(|capabilities| capabilities.supports_reference_voice)
-            .unwrap_or(false);
-        if !supports_reference_voice {
-            return Err(ApiError::bad_request(format!(
-                "{variant} does not support reference or saved voices.",
-            )));
-        }
-    }
-
-    let has_voice_description = req
-        .instructions
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    if has_voice_description {
-        let supports_voice_description = variant
-            .speech_capabilities()
-            .map(|capabilities| capabilities.supports_voice_description)
-            .unwrap_or(false);
-        if !supports_voice_description {
-            return Err(ApiError::bad_request(format!(
-                "{variant} does not support voice direction prompts.",
-            )));
-        }
-    }
-
-    match variant {
-        ModelVariant::VibeVoice15BTts if !has_direct_reference_audio => {
-            return Err(ApiError::bad_request(
-                "VibeVoice-1.5B requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-            ));
-        }
-        ModelVariant::FishAudioS2Pro if !has_direct_reference_audio => {
-            return Err(ApiError::bad_request(
-                "FishAudio-S2-Pro requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-            ));
-        }
-        _ => {}
-    }
-
-    Ok(())
+            .is_some_and(|capabilities| capabilities.supports_builtin_voices);
+    crate::api::tts_policy::validate_speech_voice(
+        variant,
+        crate::api::tts_policy::SpeechVoiceRequest {
+            speaker,
+            reference_audio: present(req.reference_audio.as_deref()),
+            reference_text: present(req.reference_text.as_deref()),
+            voice_description: present(req.instructions.as_deref()),
+        },
+    )
 }
 
 async fn stream_speech(
@@ -1377,7 +1333,59 @@ mod tests {
 
         let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
             .expect_err("missing reference should fail");
-        assert!(err.message.contains("FishAudio-S2-Pro requires"));
+        assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    /// TPIPE-12: the OpenAI route applies the same capability-driven voice
+    /// contract as the first-party routes: a Qwen Base model needs a
+    /// reference and a VoiceDesign model needs `instructions`, while the
+    /// required OpenAI `voice` is ignored by a reference-only model.
+    #[test]
+    fn openai_speech_applies_the_shared_voice_contract() {
+        let request = |voice: Option<&str>, instructions: Option<&str>| SpeechRequest {
+            model: "m".to_string(),
+            input: "hello".to_string(),
+            voice: voice.map(str::to_string),
+            response_format: None,
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: None,
+            stream_format: None,
+            instructions: instructions.map(str::to_string),
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+            sampling: Default::default(),
+        };
+        assert!(validate_speech_voice_contract(
+            &request(Some("alloy"), None),
+            ModelVariant::Qwen3Tts12Hz06BBase
+        )
+        .unwrap_err()
+        .message
+        .contains("requires `saved_voice_id`"));
+        assert!(validate_speech_voice_contract(
+            &request(None, None),
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign
+        )
+        .unwrap_err()
+        .message
+        .contains("requires a voice description"));
+        assert!(validate_speech_voice_contract(
+            &request(None, Some("A calm narrator")),
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign
+        )
+        .is_ok());
+        assert!(validate_speech_voice_contract(
+            &request(Some("af_heart"), None),
+            ModelVariant::Kokoro82M
+        )
+        .is_ok());
     }
 
     #[test]

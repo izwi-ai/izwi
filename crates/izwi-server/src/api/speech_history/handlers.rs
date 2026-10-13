@@ -2702,7 +2702,6 @@ fn normalize_for_model_capabilities(
         .as_deref()
         .map(has_non_empty_text)
         .unwrap_or(false);
-    let has_reference = has_reference_audio && has_reference_text;
     let has_voice_description = req
         .voice_description
         .as_deref()
@@ -2714,24 +2713,6 @@ fn normalize_for_model_capabilities(
     if req.stream.unwrap_or(false) && !capabilities.supports_streaming {
         return Err(ApiError::bad_request(format!(
             "{variant} does not support streaming synthesis. Disable `stream` or choose a model with streaming support.",
-        )));
-    }
-
-    if has_speaker && !capabilities.supports_builtin_voices {
-        return Err(ApiError::bad_request(format!(
-            "{variant} does not support built-in speaker selection.",
-        )));
-    }
-
-    if has_reference && !capabilities.supports_reference_voice {
-        return Err(ApiError::bad_request(format!(
-            "{variant} does not support reference or saved voices.",
-        )));
-    }
-
-    if has_voice_description && !capabilities.supports_voice_description {
-        return Err(ApiError::bad_request(format!(
-            "{variant} does not support voice direction prompts.",
         )));
     }
 
@@ -2760,37 +2741,18 @@ fn normalize_for_model_capabilities(
                 ));
             }
         }
-        SpeechRouteKind::TextToSpeech => {
-            if !capabilities.supports_builtin_voices
-                && !capabilities.supports_reference_voice
-                && !capabilities.supports_voice_description
-            {
-                return Err(ApiError::bad_request(format!(
-                    "{variant} does not expose a supported text-to-speech voice mode.",
-                )));
-            }
-
-            if capabilities.supports_reference_voice
-                && !capabilities.supports_builtin_voices
-                && !capabilities.supports_voice_description
-                && !has_reference
-            {
-                return Err(ApiError::bad_request(format!(
-                    "{variant} requires `saved_voice_id` or direct reference audio/text on text-to-speech routes.",
-                )));
-            }
-
-            if capabilities.supports_voice_description
-                && !capabilities.supports_builtin_voices
-                && !capabilities.supports_reference_voice
-                && !has_voice_description
-            {
-                return Err(ApiError::bad_request(format!(
-                    "{variant} requires `voice_description` on text-to-speech routes.",
-                )));
-            }
-        }
+        SpeechRouteKind::TextToSpeech => {}
     }
+    // The voice contract every speech route shares (TPIPE-12).
+    crate::api::tts_policy::validate_speech_voice(
+        variant,
+        crate::api::tts_policy::SpeechVoiceRequest {
+            speaker: has_speaker,
+            reference_audio: has_reference_audio,
+            reference_text: has_reference_text,
+            voice_description: has_voice_description,
+        },
+    )?;
 
     Ok(req)
 }
@@ -3498,7 +3460,7 @@ mod tests {
 
         assert!(err
             .message
-            .contains("requires `saved_voice_id` or direct reference audio/text"));
+            .contains("requires `saved_voice_id` or both `reference_audio` and `reference_text`"));
     }
 
     #[test]
@@ -3512,7 +3474,7 @@ mod tests {
 
         assert!(err
             .message
-            .contains("requires `saved_voice_id` or direct reference audio/text"));
+            .contains("requires `saved_voice_id` or both `reference_audio` and `reference_text`"));
     }
 
     #[test]
@@ -3545,9 +3507,7 @@ mod tests {
         )
         .expect_err("expected voice-design model to require voice_description");
 
-        assert!(err
-            .message
-            .contains("requires `voice_description` on text-to-speech routes"));
+        assert!(err.message.contains("requires a voice description"));
     }
 
     #[test]

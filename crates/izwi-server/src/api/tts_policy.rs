@@ -20,6 +20,80 @@ pub(crate) fn tts_max_text_bytes() -> usize {
         .unwrap_or(1024 * 1024)
 }
 
+/// The voice a speech request asks for, as the routes read it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SpeechVoiceRequest {
+    /// A built-in speaker was named.
+    pub(crate) speaker: bool,
+    pub(crate) reference_audio: bool,
+    pub(crate) reference_text: bool,
+    /// A voice description (VoiceDesign `instructions`).
+    pub(crate) voice_description: bool,
+}
+
+/// The one capability-driven voice contract every speech route applies
+/// (TPIPE-12): a reference comes as audio and transcript together; a model
+/// is given only the voice inputs it supports; and a model whose only voice
+/// mode is a reference (Qwen Base, VibeVoice, Fish) or a description (Qwen
+/// VoiceDesign) must be given one.
+pub(crate) fn validate_speech_voice(
+    variant: ModelVariant,
+    voice: SpeechVoiceRequest,
+) -> Result<(), crate::error::ApiError> {
+    use crate::error::ApiError;
+    let capabilities = variant.speech_capabilities().ok_or_else(|| {
+        ApiError::bad_request(format!("{variant} is not a text-to-speech model."))
+    })?;
+    if voice.reference_audio != voice.reference_text {
+        return Err(ApiError::bad_request(
+            "Provide both `reference_audio` and `reference_text` together.",
+        ));
+    }
+    let reference = voice.reference_audio && voice.reference_text;
+    if voice.speaker && !capabilities.supports_builtin_voices {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support built-in speaker selection.",
+        )));
+    }
+    if reference && !capabilities.supports_reference_voice {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support reference or saved voices.",
+        )));
+    }
+    if voice.voice_description && !capabilities.supports_voice_description {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support voice direction prompts.",
+        )));
+    }
+    if !capabilities.supports_builtin_voices
+        && !capabilities.supports_reference_voice
+        && !capabilities.supports_voice_description
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not expose a supported text-to-speech voice mode.",
+        )));
+    }
+    if capabilities.supports_reference_voice
+        && !capabilities.supports_builtin_voices
+        && !capabilities.supports_voice_description
+        && !reference
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
+        )));
+    }
+    if capabilities.supports_voice_description
+        && !capabilities.supports_builtin_voices
+        && !capabilities.supports_reference_voice
+        && !voice.voice_description
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} requires a voice description (`instructions` or `voice_description`).",
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a `speed` the model cannot honour with 400 (TPIPE-10): any speed
 /// but 1.0 on a model without speed control, or one outside the supported
 /// range, instead of clamping or dropping it silently.
