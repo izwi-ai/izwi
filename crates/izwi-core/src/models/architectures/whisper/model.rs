@@ -315,13 +315,9 @@ impl ResidualAttentionBlock {
             .attn
             .forward_dense_self_attention(&self.attn_ln.forward(x)?)?;
         let x = (x + attn)?;
-        let mlp = self.mlp_linear2.forward(
-            &gelu(
-                &self
-                    .mlp_linear1
-                    .forward(&self.mlp_ln.forward(&x)?)?,
-            )?,
-        )?;
+        let mlp = self.mlp_linear2.forward(&gelu(
+            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
+        )?)?;
         Ok((x + mlp)?)
     }
 
@@ -378,13 +374,9 @@ impl ResidualAttentionBlock {
         )?;
         x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
 
-        let mlp = self.mlp_linear2.forward(
-            &gelu(
-                &self
-                    .mlp_linear1
-                    .forward(&self.mlp_ln.forward(&x)?)?,
-            )?,
-        )?;
+        let mlp = self.mlp_linear2.forward(&gelu(
+            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
+        )?)?;
         Ok((x + mlp)?)
     }
 
@@ -427,13 +419,9 @@ impl ResidualAttentionBlock {
         )?;
         x = (&x + cross_attn.project_output_token_major(&cross_attended)?)?;
 
-        let mlp = self.mlp_linear2.forward(
-            &gelu(
-                &self
-                    .mlp_linear1
-                    .forward(&self.mlp_ln.forward(&x)?)?,
-            )?,
-        )?;
+        let mlp = self.mlp_linear2.forward(&gelu(
+            &self.mlp_linear1.forward(&self.mlp_ln.forward(&x)?)?,
+        )?)?;
         Ok((x + mlp)?)
     }
 }
