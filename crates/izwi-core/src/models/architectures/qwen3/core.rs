@@ -3387,6 +3387,25 @@ impl Qwen3Model {
         self.embed_tokens.forward(input_ids).map_err(Error::from)
     }
 
+    /// A load-time numeric probe: `tokens` xorshift-chosen token ids
+    /// through every layer and the head with stateless attention. Returns
+    /// the logits for a range self-check.
+    pub(crate) fn stateless_numeric_probe(
+        &self,
+        tokens: usize,
+        seed: u64,
+    ) -> Result<Vec<(String, Tensor)>> {
+        let vocab = self.embed_tokens.embeddings().dim(0)?.max(1);
+        let ids = crate::kernels::numeric_check::xorshift_values(tokens, seed, 1.0)
+            .into_iter()
+            .map(|unit| (((unit + 1.0) * 0.5 * vocab as f32) as usize).min(vocab - 1) as u32)
+            .collect::<Vec<_>>();
+        let device = self.embed_tokens.embeddings().device().clone();
+        let ids = Tensor::from_vec(ids, (1, tokens), &device)?;
+        let logits = self.forward_stateless_with_embeds(&self.embeddings(&ids)?, 0, None)?;
+        Ok(vec![("logits".to_string(), logits)])
+    }
+
     pub fn forward_stateless_with_embeds(
         &self,
         embeds: &Tensor,

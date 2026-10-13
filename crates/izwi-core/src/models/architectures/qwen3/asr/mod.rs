@@ -31,8 +31,8 @@ use crate::engine::{StageDescriptor, StageWorkSelector, WorkCost};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kernels::numeric_check::{
-    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, xorshift_values,
-    NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
 };
 use crate::kv::v2::{
     stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
@@ -1645,7 +1645,6 @@ impl Qwen3AsrModel {
         // On Metal a lowered audio or text dtype must pass its own load-time
         // probe, or that component alone reloads in F32 (report 13).
         let check = device.kind.is_metal();
-        let text_vocab_size = text_cfg.vocab_size;
         let (audio_tower, audio_precision, text_model, text_precision) = if let Some(gguf_path) =
             gguf_path.as_ref()
         {
@@ -1702,7 +1701,7 @@ impl Qwen3AsrModel {
                     };
                     Qwen3Model::load(text_cfg.clone(), vb_text)
                 },
-                |model| qwen3_asr_text_self_check(model, text_vocab_size, &device.device),
+                qwen3_asr_text_self_check,
             )?;
             (audio_tower, audio_precision, text_model, text_precision)
         } else {
@@ -3824,21 +3823,9 @@ fn qwen3_asr_audio_self_check(
 /// The text model's load-time probe: xorshift-chosen token ids through every
 /// layer and the head (stateless attention); the logits must be finite and in
 /// the F16-safe range.
-fn qwen3_asr_text_self_check(
-    model: &Qwen3Model,
-    vocab_size: usize,
-    device: &candle_core::Device,
-) -> NumericSelfCheckReport {
+fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
     run_numeric_self_check("Qwen3-ASR text", F16_SAFE_MAX_ABS, || {
-        let vocab = vocab_size.max(1);
-        let ids = xorshift_values(QWEN3_ASR_TEXT_PROBE_TOKENS, 0x7E47, 1.0)
-            .into_iter()
-            .map(|unit| (((unit + 1.0) * 0.5 * vocab as f32) as usize).min(vocab - 1) as u32)
-            .collect::<Vec<_>>();
-        let ids = Tensor::from_vec(ids, (1, QWEN3_ASR_TEXT_PROBE_TOKENS), device)?;
-        let embeds = model.embeddings(&ids)?;
-        let logits = model.forward_stateless_with_embeds(&embeds, 0, None)?;
-        Ok::<_, Error>(vec![("logits".to_string(), logits)])
+        model.stateless_numeric_probe(QWEN3_ASR_TEXT_PROBE_TOKENS, 0x7E47)
     })
 }
 
@@ -6635,10 +6622,8 @@ mod precision_tests {
         assert_eq!(report.tensors[0].name, "audio_tower");
 
         let model = crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test(&device);
-        let report = qwen3_asr_text_self_check(&model, 8, &device);
+        let report = qwen3_asr_text_self_check(&model);
         assert!(report.passed, "{}", report.reason);
-        // A vocabulary larger than the embedding table fails the probe.
-        let report = qwen3_asr_text_self_check(&model, 1 << 20, &device);
-        assert!(!report.passed);
+        assert_eq!(report.tensors[0].name, "logits");
     }
 }
