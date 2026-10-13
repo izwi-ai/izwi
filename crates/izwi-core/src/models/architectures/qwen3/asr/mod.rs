@@ -1297,6 +1297,8 @@ impl Qwen3AsrDiagnostics {
                 "qmatmul_projection_count": self.execution.qmatmul_projection_count,
                 "dense_projection_count": self.execution.dense_projection_count,
                 "dense_bias_projection_count": self.execution.dense_bias_projection_count,
+                "mrope_position_readbacks_total": super::core::qwen3_mrope_position_readbacks(),
+                "sequential_rope_host_tables_total": super::core::qwen3_sequential_rope_host_tables(),
             },
             "timings_ms": {
                 "resample": self.timings.resample_ms,

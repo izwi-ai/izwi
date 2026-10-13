@@ -898,6 +898,38 @@ static QWEN3_PROFILE_LM_HEAD_NS: AtomicU64 = AtomicU64::new(0);
 static QWEN3_PROFILE_SILU_MUL_FUSED_CALLS: AtomicU64 = AtomicU64::new(0);
 static QWEN3_PROFILE_SILU_MUL_FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Device-to-host readbacks of MRoPE position ids (each one is a sync).
+static QWEN3_MROPE_POSITION_READBACKS: AtomicU64 = AtomicU64::new(0);
+/// RoPE tables built on the host for sequential positions under MRoPE.
+static QWEN3_SEQUENTIAL_ROPE_HOST_TABLES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static QWEN3_MROPE_POSITION_READBACKS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn record_mrope_position_readback() {
+    QWEN3_MROPE_POSITION_READBACKS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    QWEN3_MROPE_POSITION_READBACKS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+/// Process-wide count of MRoPE position-id readbacks (device-to-host syncs).
+pub fn qwen3_mrope_position_readbacks() -> u64 {
+    QWEN3_MROPE_POSITION_READBACKS.load(Ordering::Relaxed)
+}
+
+/// Process-wide count of host RoPE tables built for sequential MRoPE positions.
+pub fn qwen3_sequential_rope_host_tables() -> u64 {
+    QWEN3_SEQUENTIAL_ROPE_HOST_TABLES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_mrope_position_readbacks() -> u64 {
+    QWEN3_MROPE_POSITION_READBACKS_THREAD.with(std::cell::Cell::get)
+}
+
 pub fn qwen3_runtime_profiling_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1794,6 +1826,13 @@ impl Qwen3Attention {
         Ok((q, k))
     }
 
+    /// Whether sequential MRoPE positions take the host 1-D table path. With
+    /// fewer than three sections MRoPE falls back to positions from zero, which
+    /// stays on the original path.
+    fn sequential_mrope_uses_host_tables(&self) -> bool {
+        self.use_mrope && self.mrope_section.as_ref().is_some_and(|s| s.len() >= 3)
+    }
+
     fn apply_rope_pair(
         &self,
         q: Tensor,
@@ -1832,6 +1871,17 @@ impl Qwen3Attention {
                     &self.rope_inv_freqs,
                 )?
             }
+        } else if self.sequential_mrope_uses_host_tables() {
+            // Equal sequential positions on all three axes are plain 1-D RoPE:
+            // build the same host tables directly instead of uploading the
+            // positions and reading them back (a sync per layer per row).
+            build_sequential_rope_host_tables(
+                seq_len,
+                start_pos,
+                q.device(),
+                q.dtype(),
+                &self.rope_inv_freqs,
+            )?
         } else if self.use_mrope {
             let mut data = Vec::with_capacity(3 * seq_len);
             let base = start_pos as i64;
@@ -3187,6 +3237,8 @@ impl Qwen3Model {
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let position_ids =
+            self.elide_sequential_mrope_positions(start_pos, sequence_len, position_ids)?;
 
         let mut x = embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -3281,6 +3333,36 @@ impl Qwen3Model {
         Ok(logits)
     }
 
+    /// MRoPE position ids that hold `start_pos..start_pos + seq_len` on every
+    /// axis (all of Qwen3-ASR's: it has no vision spans) are plain 1-D RoPE.
+    /// Check them with one readback per forward and drop them, so every layer
+    /// builds host tables from `start_pos` instead of reading the ids back
+    /// itself. Any other ids (vision spans) pass through unchanged.
+    fn elide_sequential_mrope_positions<'a>(
+        &self,
+        start_pos: usize,
+        seq_len: usize,
+        position_ids: Option<&'a Tensor>,
+    ) -> Result<Option<&'a Tensor>> {
+        let Some(ids) = position_ids else {
+            return Ok(None);
+        };
+        let host_tables = self
+            .layers
+            .first()
+            .is_some_and(|layer| layer.self_attn.sequential_mrope_uses_host_tables());
+        if !host_tables || ids.dims() != [3, seq_len] || ids.dtype() != DType::I64 {
+            return Ok(Some(ids));
+        }
+        record_mrope_position_readback();
+        let sequential = ids.to_vec2::<i64>()?.iter().all(|axis| {
+            axis.iter()
+                .enumerate()
+                .all(|(t, &pos)| u64::try_from(pos).ok() == Some((start_pos + t) as u64))
+        });
+        Ok(if sequential { None } else { Some(ids) })
+    }
+
     pub fn embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids).map_err(Error::from)
     }
@@ -3291,6 +3373,8 @@ impl Qwen3Model {
         start_pos: usize,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let position_ids =
+            self.elide_sequential_mrope_positions(start_pos, embeds.dim(1)?, position_ids)?;
         let mut hidden = embeds.clone();
         for layer in &self.layers {
             hidden = layer.forward_stateless(&hidden, start_pos, position_ids)?;
@@ -3318,6 +3402,8 @@ impl Qwen3Model {
         mut cache: Option<&mut Qwen3Cache>,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let position_ids =
+            self.elide_sequential_mrope_positions(start_pos, embeds.dim(1)?, position_ids)?;
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
             let cache_ref = cache.as_deref_mut();
@@ -3517,6 +3603,37 @@ fn build_rope_cache_with_inv_freqs(
     ))
 }
 
+/// Host cos/sin tables for positions `start_pos..start_pos + seq_len`.
+///
+/// Bit-identical to [`build_mrope_cache_with_inv_freqs`] when every axis holds
+/// those positions (each angle is `pos as f32 * inv` and its `cos`/`sin` are
+/// taken on the host), so precision does not depend on the device's
+/// transcendental functions (Metal compiles them with fast math).
+fn build_sequential_rope_host_tables(
+    seq_len: usize,
+    start_pos: usize,
+    device: &Device,
+    dtype: DType,
+    inv_freqs: &[f32],
+) -> Result<(Tensor, Tensor)> {
+    let half_dim = inv_freqs.len();
+    let mut cos_data = Vec::with_capacity(seq_len * half_dim);
+    let mut sin_data = Vec::with_capacity(seq_len * half_dim);
+    for pos in start_pos..start_pos + seq_len {
+        let pos = pos as f32;
+        for &inv in inv_freqs {
+            let angle = pos * inv;
+            cos_data.push(angle.cos());
+            sin_data.push(angle.sin());
+        }
+    }
+    QWEN3_SEQUENTIAL_ROPE_HOST_TABLES.fetch_add(1, Ordering::Relaxed);
+    Ok((
+        Tensor::from_vec(cos_data, (seq_len, half_dim), device)?.to_dtype(dtype)?,
+        Tensor::from_vec(sin_data, (seq_len, half_dim), device)?.to_dtype(dtype)?,
+    ))
+}
+
 fn build_mrope_cache_with_inv_freqs(
     seq_len: usize,
     head_dim: usize,
@@ -3531,6 +3648,7 @@ fn build_mrope_cache_with_inv_freqs(
         return build_rope_cache_with_inv_freqs(seq_len, 0, device, dtype, inv_freqs);
     }
 
+    record_mrope_position_readback();
     let positions = position_ids.to_vec2::<i64>()?;
     if positions.len() != 3 || positions.iter().any(|axis| axis.len() < seq_len) {
         return build_rope_cache_with_inv_freqs(seq_len, 0, device, dtype, inv_freqs);
@@ -3955,6 +4073,128 @@ mod tests {
             cfg,
             use_mrope: false,
         }
+    }
+
+    fn bitwise(tensor: &Tensor) -> Vec<u32> {
+        tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    fn equal_axis_positions(seq_len: usize, start_pos: usize, device: &Device) -> Tensor {
+        let axis = (0..seq_len).map(|t| (start_pos + t) as i64);
+        let data = axis
+            .clone()
+            .chain(axis.clone())
+            .chain(axis)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(data, (3, seq_len), device).unwrap()
+    }
+
+    #[test]
+    fn sequential_host_rope_tables_match_mrope_with_equal_axes_bit_for_bit() {
+        let device = Device::Cpu;
+        // Qwen3-ASR text geometry: head_dim 128, theta 1e6, interleaved [24, 20, 20].
+        let inv_freqs = build_rope_inv_freqs(128, 1_000_000.0);
+        for (seq_len, start_pos) in [(1, 0), (1, 1), (37, 0), (37, 777), (5, 65_000)] {
+            let ids = equal_axis_positions(seq_len, start_pos, &device);
+            let (mrope_cos, mrope_sin) = build_mrope_cache_with_inv_freqs(
+                seq_len,
+                128,
+                &device,
+                DType::F32,
+                &ids,
+                &[24, 20, 20],
+                &inv_freqs,
+            )
+            .unwrap();
+            let (cos, sin) = build_sequential_rope_host_tables(
+                seq_len,
+                start_pos,
+                &device,
+                DType::F32,
+                &inv_freqs,
+            )
+            .unwrap();
+            assert_eq!(bitwise(&mrope_cos), bitwise(&cos), "cos at {start_pos}");
+            assert_eq!(bitwise(&mrope_sin), bitwise(&sin), "sin at {start_pos}");
+        }
+    }
+
+    /// A two-layer tiny model whose attention uses interleaved MRoPE.
+    fn tiny_mrope_qwen3_model(device: &Device) -> Qwen3Model {
+        let mut model = tiny_qwen3_model(device);
+        model.layers.extend(tiny_qwen3_model(device).layers);
+        model.cfg.num_hidden_layers = 2;
+        model.use_mrope = true;
+        for layer in &mut model.layers {
+            layer.self_attn.use_mrope = true;
+            layer.self_attn.mrope_section = Some(vec![1, 1, 1]);
+        }
+        model
+    }
+
+    /// The pre-change path: every layer receives the ids and reads them back.
+    fn per_layer_mrope_logits(
+        model: &Qwen3Model,
+        embeds: &Tensor,
+        start_pos: usize,
+        ids: &Tensor,
+    ) -> Tensor {
+        let mut hidden = embeds.clone();
+        for layer in &model.layers {
+            hidden = layer
+                .forward_stateless(&hidden, start_pos, Some(ids))
+                .unwrap();
+        }
+        model
+            .logits_from_hidden(&model.norm.forward(&hidden).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn sequential_mrope_positions_read_back_once_per_forward_and_match_per_layer_path() {
+        let device = Device::Cpu;
+        let model = tiny_mrope_qwen3_model(&device);
+        let input_ids = Tensor::new(&[[1u32, 5, 2, 7, 3]], &device).unwrap();
+        let embeds = model.embeddings(&input_ids).unwrap();
+        for start_pos in [0usize, 9] {
+            let ids = equal_axis_positions(5, start_pos, &device);
+            let before = thread_mrope_position_readbacks();
+            let expected = per_layer_mrope_logits(&model, &embeds, start_pos, &ids);
+            assert_eq!(thread_mrope_position_readbacks() - before, 2);
+
+            let before = thread_mrope_position_readbacks();
+            let actual = model
+                .forward_stateless_with_embeds(&embeds, start_pos, Some(&ids))
+                .unwrap();
+            assert_eq!(thread_mrope_position_readbacks() - before, 1);
+            assert_eq!(bitwise(&expected), bitwise(&actual));
+
+            // Decode-style calls pass no ids: no readback at all.
+            let before = thread_mrope_position_readbacks();
+            let decoded = model
+                .forward_stateless_with_embeds(&embeds, start_pos, None)
+                .unwrap();
+            assert_eq!(thread_mrope_position_readbacks() - before, 0);
+            assert_eq!(bitwise(&expected), bitwise(&decoded));
+        }
+
+        // Ids that differ across axes (vision spans) keep the MRoPE path.
+        let data = vec![0i64, 1, 2, 3, 4, 0, 0, 1, 1, 2, 0, 1, 0, 1, 0];
+        let ids = Tensor::from_vec(data, (3, 5), &device).unwrap();
+        let expected = per_layer_mrope_logits(&model, &embeds, 0, &ids);
+        let before = thread_mrope_position_readbacks();
+        let actual = model
+            .forward_stateless_with_embeds(&embeds, 0, Some(&ids))
+            .unwrap();
+        assert_eq!(thread_mrope_position_readbacks() - before, 3);
+        assert_eq!(bitwise(&expected), bitwise(&actual));
     }
 
     fn test_cache() -> Qwen3Cache {
