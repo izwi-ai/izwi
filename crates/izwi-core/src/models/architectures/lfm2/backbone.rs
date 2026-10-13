@@ -1,4 +1,5 @@
 use super::diagnostics;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -24,7 +25,9 @@ use crate::kv::KvDecodeBatchMetadata;
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
-use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+use crate::models::shared::attention::gqa::{
+    banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask,
+};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::record_rope_kernel;
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -621,7 +624,7 @@ impl AttentionLayer {
     fn forward_stateless(
         &self,
         hidden_states: &Tensor,
-        mask: Option<&Tensor>,
+        mask: StatelessAttentionMask<'_>,
         index_pos: usize,
     ) -> Result<Tensor> {
         let (batch_size, seq_len, hidden_size) = hidden_states.dims3()?;
@@ -629,8 +632,10 @@ impl AttentionLayer {
             self.project_qkv(hidden_states, index_pos)?;
 
         if query_states.device().is_cuda() && flash_attention_requested() {
-            let cuda_options =
-                lfm25_cuda_flash_attention_options(mask.is_some(), self.sliding_window);
+            let cuda_options = lfm25_cuda_flash_attention_options(
+                !matches!(mask, StatelessAttentionMask::None),
+                self.sliding_window,
+            );
             if let Some(attn_output) = try_fused_self_attention_with_options(
                 &query_states,
                 &key_states,
@@ -671,16 +676,36 @@ impl AttentionLayer {
             }
         }
 
-        let attn_output = compact_gqa_sdpa_bhsd(
-            &query_states,
-            &key_states,
-            &value_states,
-            mask.map(|mask| CompactGqaMask::Boolean {
-                mask,
-                masked_value: &self.neg_inf,
-            }),
-            1.0 / (self.head_dim as f64).sqrt(),
-        )?;
+        let softmax_scale = 1.0 / (self.head_dim as f64).sqrt();
+        let attn_output = match mask {
+            StatelessAttentionMask::None => compact_gqa_sdpa_bhsd(
+                &query_states,
+                &key_states,
+                &value_states,
+                None,
+                softmax_scale,
+            )?,
+            StatelessAttentionMask::Dense(mask) => compact_gqa_sdpa_bhsd(
+                &query_states,
+                &key_states,
+                &value_states,
+                Some(CompactGqaMask::Boolean {
+                    mask,
+                    masked_value: &self.neg_inf,
+                }),
+                softmax_scale,
+            )?,
+            StatelessAttentionMask::Band(band) => {
+                LFM2_BANDED_STATELESS_ATTENTION_CALLS.fetch_add(1, Ordering::Relaxed);
+                banded_sdpa_bhsd(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    band,
+                    softmax_scale,
+                )?
+            }
+        };
         let attn_output =
             attn_output
                 .transpose(1, 2)?
@@ -1778,17 +1803,36 @@ impl QuantizedLfm2Backbone {
         Ok(output)
     }
 
+    /// Whole-sequence forward without KV state (the LFM2.5-Audio
+    /// detokenizer). With a sliding window, attention runs banded in query
+    /// blocks, so memory grows with the sequence, not its square: the
+    /// detokenizer's 6 x frames positions would otherwise build `[16, T, T]`
+    /// score planes (6.75 GiB at the default 1,024 frames).
     pub(crate) fn forward_embeds_stateless(&self, input_embeds: &Tensor) -> Result<Tensor> {
+        self.forward_embeds_stateless_with(input_embeds, false)
+    }
+
+    fn forward_embeds_stateless_with(
+        &self,
+        input_embeds: &Tensor,
+        force_dense_mask: bool,
+    ) -> Result<Tensor> {
         let (batch, seq_len, hidden) = input_embeds.dims3()?;
         if batch != 1 || hidden != self.cfg.embedding_length || seq_len == 0 {
             return Err(Error::InvalidInput(
                 "LFM2 stateless input does not match the loaded backbone".into(),
             ));
         }
-        let mask = if seq_len <= 1 {
-            None
-        } else {
-            Some(self.mask(seq_len, input_embeds.device())?)
+        let dense_mask;
+        let mask = match self.cfg.attention_sliding_window {
+            _ if seq_len <= 1 => StatelessAttentionMask::None,
+            Some(window) if !force_dense_mask => {
+                StatelessAttentionMask::Band(AttentionBand::causal_window(window))
+            }
+            _ => {
+                dense_mask = self.mask(seq_len, input_embeds.device())?;
+                StatelessAttentionMask::Dense(&dense_mask)
+            }
         };
 
         let mut hidden_states = input_embeds.clone();
@@ -1798,9 +1842,7 @@ impl QuantizedLfm2Backbone {
             let hidden = layer.operator_norm.forward(&hidden_states)?;
             diagnostics::check_layer(&hidden, "operator norm", layer_idx, 0)?;
             let hidden = match &layer.kind {
-                LayerKind::Attention(attention) => {
-                    attention.forward_stateless(&hidden, mask.as_ref(), 0)?
-                }
+                LayerKind::Attention(attention) => attention.forward_stateless(&hidden, mask, 0)?,
                 LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
             };
             diagnostics::check_layer(&hidden, "operator output", layer_idx, 0)?;
@@ -1832,6 +1874,24 @@ impl QuantizedLfm2Backbone {
             .collect();
         Tensor::from_slice(&mask, (seq_len, seq_len), device).map_err(Error::from)
     }
+}
+
+/// Attention masking for [`QuantizedLfm2Backbone::forward_embeds_stateless`].
+#[derive(Clone, Copy)]
+enum StatelessAttentionMask<'a> {
+    /// A single position: nothing to mask.
+    None,
+    /// A host-built `[T, T]` boolean mask (no sliding window).
+    Dense(&'a Tensor),
+    /// A causal sliding window, computed banded in query blocks.
+    Band(AttentionBand),
+}
+
+/// Stateless attention layers computed banded (diagnostics and tests).
+static LFM2_BANDED_STATELESS_ATTENTION_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn lfm2_banded_stateless_attention_calls() -> u64 {
+    LFM2_BANDED_STATELESS_ATTENTION_CALLS.load(Ordering::Relaxed)
 }
 
 fn lfm25_cuda_flash_attention_options(
@@ -2102,6 +2162,182 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(project(&embeds_only), project(&full));
+    }
+
+    /// A three-block LFM2 backbone (attention, ShortConv, attention) with
+    /// 8-wide embeddings, GQA 2:1 and an optional sliding window, written to
+    /// a temporary F32 GGUF and loaded for embeds.
+    fn tiny_windowed_backbone(sliding_window: Option<u32>) -> super::QuantizedLfm2Backbone {
+        use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+        use gguf_file::Value;
+
+        let path =
+            std::env::temp_dir().join(format!("izwi-lfm2-windowed-{}.gguf", uuid::Uuid::new_v4()));
+        let mut metadata = vec![
+            ("general.architecture", Value::String("lfm2".into())),
+            ("lfm2.block_count", Value::U32(3)),
+            ("lfm2.context_length", Value::U32(1024)),
+            ("lfm2.embedding_length", Value::U32(8)),
+            ("lfm2.attention.head_count", Value::U32(2)),
+            (
+                "lfm2.attention.head_count_kv",
+                Value::Array(vec![Value::U32(1), Value::U32(0), Value::U32(1)]),
+            ),
+            ("lfm2.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+            ("lfm2.shortconv.l_cache", Value::U32(3)),
+        ];
+        if let Some(window) = sliding_window {
+            metadata.push(("lfm2.attention.sliding_window", Value::U32(window)));
+        }
+        let mut weights = vec![];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut add = |name: String, shape: &[usize]| {
+            let elements = shape.iter().product::<usize>();
+            let values = (0..elements)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect::<Vec<_>>();
+            let tensor = Tensor::from_vec(values, shape, &Device::Cpu).unwrap();
+            weights.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
+        };
+        add("token_embd.weight".into(), &[7, 8]);
+        add("output_norm.weight".into(), &[8]);
+        add("dense_2.weight".into(), &[5, 8]);
+        for layer in 0..3 {
+            for name in ["attn_norm", "ffn_norm"] {
+                add(format!("blk.{layer}.{name}.weight"), &[8]);
+            }
+            for name in ["ffn_gate", "ffn_up", "ffn_down"] {
+                add(format!("blk.{layer}.{name}.weight"), &[8, 8]);
+            }
+        }
+        for layer in [0, 2] {
+            for name in ["attn_q_norm", "attn_k_norm"] {
+                add(format!("blk.{layer}.{name}.weight"), &[4]);
+            }
+            add(format!("blk.{layer}.attn_q.weight"), &[8, 8]);
+            add(format!("blk.{layer}.attn_k.weight"), &[4, 8]);
+            add(format!("blk.{layer}.attn_v.weight"), &[4, 8]);
+            add(format!("blk.{layer}.attn_output.weight"), &[8, 8]);
+        }
+        add("blk.1.shortconv.in_proj.weight".into(), &[24, 8]);
+        add("blk.1.shortconv.out_proj.weight".into(), &[8, 8]);
+        add("blk.1.shortconv.conv.weight".into(), &[8, 3]);
+        let mut file = std::fs::File::create(&path).unwrap();
+        gguf_file::write(
+            &mut file,
+            &metadata
+                .iter()
+                .map(|(name, value)| (*name, value))
+                .collect::<Vec<_>>(),
+            &weights
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        drop(file);
+        let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&path).unwrap();
+        let config = super::super::config::parse_lfm2_backbone_config(&loader).unwrap();
+        let backbone =
+            super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, &Device::Cpu).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        backbone
+    }
+
+    /// LFT-6: the detokenizer's stateless forward runs its sliding-window
+    /// attention banded (no `[heads, T, T]` planes) and matches the dense
+    /// masked forward across query-block boundaries.
+    #[test]
+    fn stateless_sliding_window_attention_is_banded_and_matches_dense_mask() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let backbone = tiny_windowed_backbone(Some(30));
+        let embeds = xorshift_tensor(&[1, 300, 8], 11, 1.0, &Device::Cpu).unwrap();
+        let before = super::lfm2_banded_stateless_attention_calls();
+        let banded = host_f32(&backbone.forward_embeds_stateless(&embeds).unwrap()).unwrap();
+        // Two attention layers each took the banded path (other tests may
+        // run concurrently, so only a lower bound is exact).
+        assert!(super::lfm2_banded_stateless_attention_calls() - before >= 2);
+        let dense = host_f32(
+            &backbone
+                .forward_embeds_stateless_with(&embeds, true)
+                .unwrap(),
+        )
+        .unwrap();
+        let scale = dense.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(scale > 0.1, "backbone output is degenerate");
+        let error = max_abs_diff(&banded, &dense);
+        assert!(
+            error < 1e-5 * scale.max(1.0),
+            "banded vs dense max abs {error}"
+        );
+
+        // Without a window the dense causal mask stays in use and agrees too.
+        let causal = tiny_windowed_backbone(None);
+        let short = embeds.narrow(1, 0, 40).unwrap();
+        assert_eq!(
+            host_f32(&causal.forward_embeds_stateless(&short).unwrap()).unwrap(),
+            host_f32(&causal.forward_embeds_stateless_with(&short, true).unwrap()).unwrap()
+        );
+    }
+
+    /// The published LFM2.5-Audio detokenizer (window 30, 16 heads) gives the
+    /// same banded and dense output on 600 positions (100 codec frames). The
+    /// weights are dequantized at load: with Q4_0 matmuls the Q8 activation
+    /// quantization turns last-ulp differences between the two op shapes
+    /// into ~6e-3 relative noise, which would hide a real band error. Set
+    /// IZWI_TEST_LFM25_DETOKENIZER_GGUF or keep the default izwi model path.
+    #[test]
+    #[ignore = "needs the local LFM2.5-Audio tokenizer GGUF"]
+    fn published_detokenizer_banded_attention_matches_dense_mask() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+
+        let path = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            std::env::var_os("IZWI_TEST_LFM25_DETOKENIZER_GGUF")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(
+                            "Library/Application Support/izwi/models/LFM2.5-Audio-1.5B-GGUF/\
+                             tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf",
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&path).unwrap();
+        let config = super::super::config::parse_lfm2_backbone_config(&loader).unwrap();
+        assert_eq!(config.attention_sliding_window, Some(30));
+        let width = config.embedding_length;
+        let backbone = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            let previous = std::env::var_os("CANDLE_DEQUANTIZE_ALL");
+            std::env::set_var("CANDLE_DEQUANTIZE_ALL", "1");
+            let backbone =
+                super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, &Device::Cpu);
+            match previous {
+                Some(value) => std::env::set_var("CANDLE_DEQUANTIZE_ALL", value),
+                None => std::env::remove_var("CANDLE_DEQUANTIZE_ALL"),
+            }
+            backbone.unwrap()
+        };
+        let embeds = xorshift_tensor(&[1, 600, width], 13, 1.0, &Device::Cpu).unwrap();
+        let banded = host_f32(&backbone.forward_embeds_stateless(&embeds).unwrap()).unwrap();
+        let dense = host_f32(
+            &backbone
+                .forward_embeds_stateless_with(&embeds, true)
+                .unwrap(),
+        )
+        .unwrap();
+        let rel = relative_l2(&banded, &dense);
+        eprintln!("banded vs dense relative L2 {rel:e}");
+        assert!(rel < 1e-5, "relative L2 {rel}");
     }
 
     #[test]

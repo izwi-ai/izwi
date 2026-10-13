@@ -1900,6 +1900,10 @@ impl Lfm25AudioModel {
                     "audio_frames": audio_frames_generated,
                     "sample_rate": self.decoder_config.output_sample_rate,
                     "samples": samples_len
+                },
+                "detokenizer": {
+                    "banded_attention_calls_total":
+                        crate::models::architectures::lfm2::backbone::lfm2_banded_stateless_attention_calls()
                 }
             })),
         })
