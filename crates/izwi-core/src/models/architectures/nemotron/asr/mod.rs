@@ -23,6 +23,7 @@ use crate::backends::{DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{InvocationTensorLease, RetainedTensorStateRuntimeV2, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{load_weight_only_f16, WeightOnlyF16Load};
 use crate::kv::v2::{
     AppendStateDomainSpec, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
     InferenceStateContract, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis,
@@ -31,16 +32,18 @@ use crate::kv::v2::{
     TensorRole, TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::model::ModelVariant;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
 pub use config::NemotronConfigInventory;
 pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILENAME};
+pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_complete};
 pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
-    default_realtime_state_shape, resample_linear, NemotronEncodeProfile, NemotronNetwork,
-    NemotronRealtimeStateShape, NemotronRnntStreamState, NemotronStreamingEncoderState,
-    NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    causal_subsampled_len, default_realtime_state_shape, resample_linear, NemotronEncodeProfile,
+    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
+    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
 };
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
 
@@ -50,7 +53,16 @@ const DEFAULT_MAX_AUDIO_SECONDS_HINT: f32 = 30.0;
 const STREAMING_FRAME_MS: usize = 80;
 const NEMOTRON_ASR_DTYPE_ENV: &str = "IZWI_NEMOTRON_ASR_DTYPE";
 const NEMOTRON_REALTIME_MAX_SECONDS_ENV: &str = "IZWI_NEMOTRON_REALTIME_MAX_SECONDS";
-const DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS: usize = 300;
+/// Default realtime session length. Retained audio is compacted to the
+/// unconsumed tail, so a session's state does not grow with its length.
+const DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS: usize = 3_600;
+/// Audio span that prices a session's retained state: the physical state
+/// arena, the host audio buffers and the token and text ceilings. The live
+/// feature and encoder tensors are a bounded window, and the token and text
+/// ceilings are enforced, so sessions longer than this span keep the same
+/// reservation and end with an error only if they out-talk those ceilings
+/// (about 10 tokens/s sustained for the whole session).
+const NEMOTRON_REALTIME_STATE_SIZING_SAMPLES: usize = 300 * SAMPLE_RATE as usize;
 const CONSERVATIVE_DECODED_TOKEN_EXPANSION: usize = 4;
 const CONSERVATIVE_NEMOTRON_DECODER_TOKEN_BYTES: usize = 256;
 const REALTIME_HOST_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024;
@@ -153,6 +165,7 @@ pub struct NemotronAsrModel {
     runtime_plan: NemotronRuntimePlan,
     device_profile: DeviceProfile,
     dtype_selection: DTypeSelection,
+    weight_precision: WeightOnlyF16Load,
 }
 
 struct NemotronOfflinePhysicalState<'a> {
@@ -518,7 +531,10 @@ pub struct NemotronStreamingState {
     max_text_bytes: usize,
     emit_partials: bool,
     resampler: NemotronStreamingResampler,
+    /// Target-rate samples `samples_base..buffered_samples`: only the part
+    /// not yet handed to the feature front end is kept.
     samples: Vec<f32>,
+    samples_base: usize,
     buffered_samples: usize,
     consumed_samples: usize,
     chunks_processed: usize,
@@ -530,6 +546,7 @@ pub struct NemotronStreamingState {
     pre_encode_state: NemotronStreamingPreEncodeState,
     encoder_state: NemotronStreamingEncoderState,
     rnnt_state: Option<NemotronRnntStreamState>,
+    detokenizer: IncrementalDetokenizer,
     assembled_text: String,
     emitted_tokens: usize,
 }
@@ -581,6 +598,13 @@ impl NemotronStreamingResampler {
             return Err(Error::InvalidInput(
                 "Audio sample rate must be greater than zero".to_string(),
             ));
+        }
+        // The host reservation prices one packet of at most the sizing span.
+        if samples.len() > NEMOTRON_REALTIME_STATE_SIZING_SAMPLES {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron realtime audio packets are limited to {NEMOTRON_REALTIME_STATE_SIZING_SAMPLES} samples, got {}",
+                samples.len()
+            )));
         }
         if let Some(expected_rate) = self.source_rate {
             if expected_rate != source_rate {
@@ -834,6 +858,7 @@ impl NemotronStreamingState {
             emit_partials,
             resampler: NemotronStreamingResampler::default(),
             samples: Vec::new(),
+            samples_base: 0,
             buffered_samples: 0,
             consumed_samples: 0,
             chunks_processed: 0,
@@ -845,6 +870,7 @@ impl NemotronStreamingState {
             pre_encode_state: NemotronStreamingPreEncodeState::new(),
             encoder_state,
             rnnt_state: None,
+            detokenizer: IncrementalDetokenizer::new(),
             assembled_text: String::new(),
             emitted_tokens: 0,
         }
@@ -852,6 +878,26 @@ impl NemotronStreamingState {
 
     fn attach_rnnt_state(&mut self, rnnt_state: NemotronRnntStreamState) {
         self.rnnt_state = Some(rnnt_state);
+    }
+
+    /// The transcript after the RNNT state's newest tokens. Only the tokens
+    /// since the last emission are detokenized; a final chunk flushes any
+    /// held-back text.
+    fn advance_text(&mut self, decoder: &NemotronDecoder, is_final: bool) -> Result<String> {
+        let token_ids = self
+            .rnnt_state
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron stream is missing RNNT state".into()))?
+            .token_ids();
+        let decode = |ids: &[usize]| -> Result<String> { Ok(decoder.decode(ids)) };
+        let mut delta = self.detokenizer.step(token_ids, decode)?;
+        if is_final {
+            delta.push_str(&self.detokenizer.finish(token_ids, decode)?);
+        }
+        let mut text = String::with_capacity(self.assembled_text.len() + delta.len());
+        text.push_str(&self.assembled_text);
+        text.push_str(&delta);
+        Ok(text)
     }
 
     pub fn profile(&self) -> &NemotronStreamingProfile {
@@ -993,7 +1039,35 @@ impl NemotronStreamingState {
 
         self.consumed_samples = chunk.end_sample;
         self.chunks_processed = self.chunks_processed.saturating_add(1);
+        // The feature front end owns consumed audio from here on.
+        self.samples
+            .drain(..self.consumed_samples - self.samples_base);
+        self.samples_base = self.consumed_samples;
         Ok(())
+    }
+
+    /// Hand `chunk`'s samples to the feature front end and mark it consumed.
+    /// Work and retained audio are O(chunk), however long the session runs.
+    fn feed_ready_chunk(&mut self, chunk: &NemotronStreamChunkRange) -> Result<()> {
+        let start = chunk.start_sample.checked_sub(self.samples_base);
+        let end = chunk.end_sample.checked_sub(self.samples_base);
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(Error::InvalidInput(format!(
+                "Nemotron stream chunk {}..{} starts before the retained audio at {}",
+                chunk.start_sample, chunk.end_sample, self.samples_base
+            )));
+        };
+        let samples = self.samples.get(start..end).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "Invalid Nemotron stream chunk range {}..{} for buffered={}",
+                chunk.start_sample, chunk.end_sample, self.buffered_samples
+            ))
+        })?;
+        self.feature_state.push_samples(samples)?;
+        if chunk.is_final {
+            self.feature_state.finish_input();
+        }
+        self.mark_chunk_consumed(chunk)
     }
 
     pub fn diagnostics(&self) -> serde_json::Value {
@@ -1010,11 +1084,14 @@ impl NemotronStreamingState {
             "emitted_output_samples": self.resampler.emitted_output_samples,
             "buffered_samples": self.buffered_samples,
             "consumed_samples": self.consumed_samples,
+            "retained_samples": self.samples.len(),
+            "retained_preemphasized_samples": self.feature_state.retained_samples(),
             "chunks_processed": self.chunks_processed,
             "events_emitted": self.events_emitted,
             "input_finished": self.input_finished,
             "final_event_emitted": self.final_event_emitted,
             "emitted_tokens": self.emitted_tokens,
+            "detokenized_tokens": self.detokenizer.decoded_tokens(),
             "cache_status": format!("{:?}", self.cache_status),
             "supports_realtime_cache_decode": true,
             "supports_realtime_stream_decode": self.rnnt_state.is_some(),
@@ -1116,8 +1193,10 @@ fn nemotron_realtime_state_contract(
             "Nemotron realtime physical state contains a zero capacity".into(),
         ));
     }
-    let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
-    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    let sizing_samples = max_samples.min(NEMOTRON_REALTIME_STATE_SIZING_SAMPLES);
+    let feature_frames = sizing_samples.div_ceil(shape.hop_length).max(1);
+    // Causal subsampling keeps len / 2 + 1 frames per stride-2 stage.
+    let encoded_frames = causal_subsampled_len(feature_frames, shape.subsampling_factor).max(1);
     let feature = fixed_component(
         1,
         TensorRole::AudioHistory,
@@ -1407,8 +1486,10 @@ fn estimate_realtime_resource_reservation(
         ));
     }
 
-    let feature_frames = max_samples.div_ceil(shape.hop_length).max(1);
-    let encoded_frames = feature_frames.div_ceil(shape.subsampling_factor).max(1);
+    let sizing_samples = max_samples.min(NEMOTRON_REALTIME_STATE_SIZING_SAMPLES);
+    let feature_frames = sizing_samples.div_ceil(shape.hop_length).max(1);
+    // Causal subsampling keeps len / 2 + 1 frames per stride-2 stage.
+    let encoded_frames = causal_subsampled_len(feature_frames, shape.subsampling_factor).max(1);
     let max_output_tokens = encoded_frames
         .checked_mul(shape.max_symbols_per_frame)
         .ok_or_else(realtime_reservation_overflow)?;
@@ -1421,7 +1502,7 @@ fn estimate_realtime_resource_reservation(
         .checked_mul(decoded_token_bytes)
         .ok_or_else(realtime_reservation_overflow)?;
 
-    let audio_capacity = conservative_vec_capacity(max_samples, 4)?;
+    let audio_capacity = conservative_vec_capacity(sizing_samples, 4)?;
     let token_capacity = conservative_vec_capacity(max_output_tokens, 4)?;
     let text_capacity = conservative_vec_capacity(max_text_bytes, 8)?;
     let target_lang_capacity = conservative_vec_capacity(prompt.target_lang.len(), 8)?;
@@ -1587,6 +1668,8 @@ struct NemotronStageTimings {
     encode_profile: Option<NemotronEncodeProfile>,
     rnnt_decode: Duration,
     text_assembly: Duration,
+    /// Tokens passed to the text decoder.
+    detokenized_tokens: u64,
 }
 
 impl NemotronStageTimings {
@@ -1635,6 +1718,7 @@ impl NemotronStageTimings {
             "encode_ms": duration_ms(self.encode),
             "rnnt_decode_ms": duration_ms(self.rnnt_decode),
             "text_assembly_ms": duration_ms(self.text_assembly),
+            "detokenized_tokens": self.detokenized_tokens,
         })
     }
 }
@@ -1892,7 +1976,8 @@ impl NemotronAsrModel {
             "dtype_plan": nemotron_dtype_diagnostics(
                 &self.dtype_selection,
                 &self.device_profile,
-                self.network.dtype()
+                self.network.dtype(),
+                &self.weight_precision,
             ),
             "blank_id": self.network.blank_idx(),
             "native_forward_status": "enabled_offline_fastconformer_rnnt",
@@ -1919,9 +2004,7 @@ impl NemotronAsrModel {
         validate_config_output_vocabulary(&artifacts.config_inventory)?;
         let decoder = NemotronDecoder::load(&artifacts)?;
         let device = select_device_for_nemotron(&device_profile);
-        let dtype_override = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
-        let dtype_selection =
-            select_nemotron_asr_dtype(&device_profile, dtype_override.as_deref())?;
+        let dtype_selection = resolve_nemotron_asr_dtype(&device_profile)?;
         let checkpoint_display = artifacts.checkpoint_path.display();
         let vb = match VarBuilder::from_pth(
             &artifacts.checkpoint_path,
@@ -1935,12 +2018,22 @@ impl NemotronAsrModel {
                 )));
             }
         };
-        let network = NemotronNetwork::load(&vb, &artifacts.config_inventory)?;
+        let projection_precision =
+            resolve_nemotron_projection_precision(&device_profile, dtype_selection.dtype);
+        let (network, weight_precision) = load_weight_only_f16(
+            "Nemotron",
+            &projection_precision,
+            &device,
+            |f16| NemotronNetwork::load(&vb, &artifacts.config_inventory, f16),
+            |network| network.weight_only_f16_self_check(&vb),
+        )?;
         info!(
-            "Loaded Nemotron ASR model on {:?} with dtype {:?} ({})",
+            "Loaded Nemotron ASR model on {:?} with dtype {:?} ({}); encoder projections in {} ({})",
             device_profile.kind,
             dtype_selection.dtype,
-            dtype_selection.reason.as_ref()
+            dtype_selection.reason.as_ref(),
+            if weight_precision.projections_f16 { "F16" } else { "the model dtype" },
+            weight_precision.reason
         );
 
         Ok(Self {
@@ -1951,6 +2044,7 @@ impl NemotronAsrModel {
             runtime_plan,
             device_profile,
             dtype_selection,
+            weight_precision,
         })
     }
 
@@ -2286,12 +2380,7 @@ impl NemotronAsrModel {
 
         let mut prepared = Vec::new();
         while let Some(chunk) = state.next_ready_chunk() {
-            let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
-            state.feature_state.push_samples(&chunk_samples)?;
-            if chunk.is_final {
-                state.feature_state.finish_input();
-            }
-            state.mark_chunk_consumed(&chunk)?;
+            state.feed_ready_chunk(&chunk)?;
             self.drain_streaming_encoder(state, &mut prepared)?;
         }
         self.drain_streaming_encoder(state, &mut prepared)?;
@@ -2381,15 +2470,16 @@ impl NemotronAsrModel {
             drop(rnnt_states);
             let mut outputs = Vec::with_capacity(rows.len());
             for (row, mut batch) in rows.iter_mut().zip(event_batches.drain(..)) {
-                let (tokens, text) = {
-                    let rnnt = row.state.rnnt_state.as_ref().ok_or_else(|| {
+                let tokens = row
+                    .state
+                    .rnnt_state
+                    .as_ref()
+                    .ok_or_else(|| {
                         Error::InferenceError("Nemotron prepared row lost RNNT state".into())
-                    })?;
-                    (
-                        rnnt.token_ids().len(),
-                        self.decoder.decode(rnnt.token_ids()),
-                    )
-                };
+                    })?
+                    .token_ids()
+                    .len();
+                let text = row.state.advance_text(&self.decoder, row.chunk.is_final)?;
                 row.state.emitted_tokens = tokens;
                 batch.record_decoded_text(row.state, text, row.chunk.is_final)?;
                 outputs.push(batch.into_events(row.state));
@@ -2475,13 +2565,7 @@ impl NemotronAsrModel {
                 let Some(chunk) = row.state.next_ready_chunk() else {
                     continue;
                 };
-                let chunk_samples =
-                    row.state.samples[chunk.start_sample..chunk.end_sample].to_vec();
-                row.state.feature_state.push_samples(&chunk_samples)?;
-                if chunk.is_final {
-                    row.state.feature_state.finish_input();
-                }
-                row.state.mark_chunk_consumed(&chunk)?;
+                row.state.feed_ready_chunk(&chunk)?;
                 consumed_chunk = true;
             }
             self.drain_streaming_cohort(rows, &mut event_batches)?;
@@ -2579,12 +2663,7 @@ impl NemotronAsrModel {
         let Some(chunk) = state.next_ready_chunk() else {
             return Ok(());
         };
-        let chunk_samples = state.samples[chunk.start_sample..chunk.end_sample].to_vec();
-        state.feature_state.push_samples(&chunk_samples)?;
-        if chunk.is_final {
-            state.feature_state.finish_input();
-        }
-        state.mark_chunk_consumed(&chunk)?;
+        state.feed_ready_chunk(&chunk)?;
         let prompt_id = self.network.prompt_id(&state.prompt.target_lang)?;
         self.drain_streaming_network(state, prompt_id, batch)
     }
@@ -2622,20 +2701,19 @@ impl NemotronAsrModel {
                 .network
                 .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
             {
-                let (decoded, text) = {
+                let decoded = {
                     let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
                         Error::InferenceError("Nemotron stream is missing RNNT state".to_string())
                     })?;
                     let mut ignored = |_token_id: usize| {};
-                    let decoded = self.network.decode_rnnt_streaming_chunk(
+                    self.network.decode_rnnt_streaming_chunk(
                         rnnt_state,
                         &encoder_chunk.encoded,
                         encoder_chunk.frames,
                         &mut ignored,
-                    )?;
-                    let text = self.decoder.decode(rnnt_state.token_ids());
-                    (decoded, text)
+                    )?
                 };
+                let text = state.advance_text(&self.decoder, encoder_chunk.is_final)?;
                 state.emitted_tokens = decoded.stats.emitted_tokens;
                 batch.record_decoded_text(state, text, encoder_chunk.is_final)?;
                 progressed = true;
@@ -2728,11 +2806,8 @@ impl NemotronAsrModel {
                         Error::InferenceError("Nemotron realtime cohort row lost RNNT state".into())
                     })?;
                     row.state.emitted_tokens = rnnt_state.token_ids().len();
-                    batch.record_decoded_text(
-                        row.state,
-                        self.decoder.decode(rnnt_state.token_ids()),
-                        chunk.is_final,
-                    )?;
+                    let text = row.state.advance_text(&self.decoder, chunk.is_final)?;
+                    batch.record_decoded_text(row.state, text, chunk.is_final)?;
                 }
             }
 
@@ -2761,7 +2836,7 @@ impl NemotronAsrModel {
             "decoder_vocabulary_size": self.decoder.vocab_size(),
             "decoder_source": self.decoder.source(),
             "runtime": self.runtime_plan.diagnostics(),
-            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
+            "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
             "prompt": prompt.diagnostics(),
             "prompt_id": prompt_id,
             "blank_id": self.network.blank_idx(),
@@ -2819,16 +2894,20 @@ impl NemotronAsrModel {
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
+        let mut detokenizer = IncrementalDetokenizer::new();
+        let decode_text = |ids: &[usize]| -> Result<String> { Ok(self.decoder.decode(ids)) };
         let decoded = {
             let mut on_token = |token_id: usize| {
                 token_ids.push(token_id);
                 let text_start = Instant::now();
-                let decoded = self.decoder.decode(&token_ids);
-                let delta = text_delta(&assembled, &decoded);
+                // The decoder is infallible, so a step cannot fail.
+                let delta = detokenizer
+                    .step(&token_ids, decode_text)
+                    .unwrap_or_default();
                 if !delta.is_empty() {
                     on_delta(delta.as_str());
+                    assembled.push_str(&delta);
                 }
-                assembled = decoded;
                 timings.text_assembly += text_start.elapsed();
             };
             let decode_start = Instant::now();
@@ -2848,11 +2927,15 @@ impl NemotronAsrModel {
             timings.rnnt_decode = decode_start.elapsed();
             decoded
         };
-        if assembled.is_empty() {
-            let text_start = Instant::now();
-            assembled = self.decoder.decode(&decoded.token_ids);
-            timings.text_assembly += text_start.elapsed();
+        let text_start = Instant::now();
+        // The callback saw the same tokens the decode returns.
+        let held_back = detokenizer.finish(&decoded.token_ids, decode_text)?;
+        if !held_back.is_empty() {
+            on_delta(held_back.as_str());
+            assembled.push_str(&held_back);
         }
+        timings.text_assembly += text_start.elapsed();
+        timings.detokenized_tokens = detokenizer.decoded_tokens();
 
         Ok(self.build_decode_output(
             assembled,
@@ -2953,7 +3036,7 @@ impl NemotronAsrModel {
                 "prompt": request.prompt.diagnostics(),
                 "prompt_id": prompt_id,
                 "blank_id": self.network.blank_idx(),
-                "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype()),
+                "dtype_plan": nemotron_dtype_diagnostics(&self.dtype_selection, &self.device_profile, self.network.dtype(), &self.weight_precision),
                 "native_forward_status": "enabled_offline_fastconformer_rnnt",
                 "decode_mode": decode_mode,
                 "decode": decoded.stats.diagnostics(),
@@ -2971,6 +3054,77 @@ fn public_artifact_filename(path: &Path) -> Option<String> {
 
 fn select_device_for_nemotron(device_profile: &DeviceProfile) -> Device {
     device_profile.device.clone()
+}
+
+/// The weight dtype the Nemotron loader selects on `device_profile`, honouring
+/// `IZWI_NEMOTRON_ASR_DTYPE`. Load admission prices the checkpoint at this
+/// dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn resolve_nemotron_asr_dtype(device_profile: &DeviceProfile) -> Result<DTypeSelection> {
+    let dtype_override = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
+    select_nemotron_asr_dtype(device_profile, dtype_override.as_deref())
+}
+
+/// Whether the encoder's projection weights (subsampling output, FFN,
+/// attention q/k/v/out/pos and pointwise convs) load in F16 on top of an F32
+/// network on `device_profile`: F16 when they do, F32 when every weight stays
+/// at the network dtype. The rest stays F32 as in whisper.cpp's FastConformer
+/// recipe: subsampling convs, depthwise conv and its LayerNorm, LayerNorms,
+/// biases, positional biases, the prompt kernel, the RNNT predictor and the
+/// joint. On Metal `IZWI_NEMOTRON_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`)
+/// keeps them F32. Weight-only F16 needs F32 activations, so a network
+/// resolved to F16 or BF16 keeps its projections at that dtype.
+pub(crate) fn resolve_nemotron_projection_precision(
+    device_profile: &DeviceProfile,
+    network_dtype: DType,
+) -> DTypeSelection {
+    if network_dtype != DType::F32 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: format!(
+                "weight-only F16 needs F32 activations; projections stay at the {network_dtype:?} network dtype"
+            )
+            .into(),
+        };
+    }
+    let family = std::env::var(NEMOTRON_ASR_DTYPE_ENV).ok();
+    device_profile.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (NEMOTRON_ASR_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is one of the encoder projections that
+/// load in F16 when [`resolve_nemotron_projection_precision`] selects F16
+/// (their biases stay F32). Admission prices these at F16.
+pub(crate) fn nemotron_tensor_is_f16_projection(name: &str) -> bool {
+    let Some(encoder) = name.strip_prefix("encoder.") else {
+        return false;
+    };
+    if encoder == "pre_encode.out.weight" {
+        return true;
+    }
+    let Some((index, tail)) = encoder
+        .strip_prefix("layers.")
+        .and_then(|layer| layer.split_once('.'))
+    else {
+        return false;
+    };
+    index.parse::<usize>().is_ok()
+        && matches!(
+            tail,
+            "feed_forward1.linear1.weight"
+                | "feed_forward1.linear2.weight"
+                | "feed_forward2.linear1.weight"
+                | "feed_forward2.linear2.weight"
+                | "self_attn.linear_q.weight"
+                | "self_attn.linear_k.weight"
+                | "self_attn.linear_v.weight"
+                | "self_attn.linear_out.weight"
+                | "self_attn.linear_pos.weight"
+                | "conv.pointwise_conv1.weight"
+                | "conv.pointwise_conv2.weight"
+        )
 }
 
 fn select_nemotron_asr_dtype(
@@ -2998,6 +3152,7 @@ fn nemotron_dtype_diagnostics(
     selection: &DTypeSelection,
     device_profile: &DeviceProfile,
     actual_network_dtype: DType,
+    weight_precision: &WeightOnlyF16Load,
 ) -> serde_json::Value {
     let cuda_compute_capability = device_profile
         .capabilities
@@ -3012,6 +3167,7 @@ fn nemotron_dtype_diagnostics(
         "supports_f16": device_profile.capabilities.supports_f16,
         "cuda_compute_capability": cuda_compute_capability,
         "cuda_device_name": device_profile.capabilities.cuda_device_name.as_deref(),
+        "weight_precision": weight_precision.diagnostics(),
     })
 }
 
@@ -3261,9 +3417,11 @@ fn should_skip_token(token: &str) -> bool {
     )
 }
 
+/// Collapse whitespace and drop the space a `▁.` or `▁,` piece adds. A space
+/// before `! ? : ;` is kept: the model writes French with it ("Ça va ?").
 fn normalize_decoded_text(mut text: String) -> String {
     text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    for punct in [".", ",", "!", "?", ":", ";"] {
+    for punct in [".", ","] {
         text = text.replace(&format!(" {punct}"), punct);
     }
     text.trim().to_string()
@@ -3285,6 +3443,80 @@ mod tests {
 
     use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector};
     use uuid::Uuid;
+
+    #[test]
+    fn detokenizer_keeps_french_spacing_before_high_punctuation() {
+        let vocab: Vec<String> = [
+            "▁Bonjour",
+            "▁!",
+            "▁Ça",
+            "▁va",
+            "▁?",
+            "▁Oui",
+            "▁,",
+            "▁merci",
+            "▁.",
+            "?",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let ids: Vec<usize> = (0..vocab.len()).collect();
+
+        assert_eq!(
+            decode_vocab_tokens(&ids, &vocab),
+            "Bonjour ! Ça va ? Oui, merci.?"
+        );
+    }
+
+    #[test]
+    fn incremental_deltas_concatenate_to_the_full_vocab_decode() {
+        use crate::models::shared::detokenize::stream_deltas;
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let vocab: Vec<String> = [
+            "▁hel",
+            "lo",
+            "▁world",
+            "▁",
+            "▁.",
+            "▁,",
+            "▁?",
+            ".",
+            "##ing",
+            "<unk>",
+            "<blank>",
+            "<en>",
+            "[PAD]",
+            "▁你",
+            "好",
+            "▁世界",
+            "😀",
+            "▁🎉",
+            "▁Ça",
+            "é",
+            "▁!",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let decoder = NemotronDecoder::Vocab(vocab.clone());
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_5);
+        for _ in 0..500 {
+            let ids = (0..rng.gen_range(0..60))
+                .map(|_| rng.gen_range(0..vocab.len() + 2))
+                .collect::<Vec<_>>();
+            let (deltas, detokenizer) =
+                stream_deltas(&ids, |ids: &[usize]| Ok(decoder.decode(ids)));
+            assert_eq!(
+                deltas.concat(),
+                decode_vocab_tokens(&ids, &vocab),
+                "{ids:?}"
+            );
+            assert_eq!(detokenizer.divergences(), 0, "{ids:?}");
+        }
+    }
 
     #[test]
     fn prompt_condition_defaults_to_auto_language() {
@@ -3357,12 +3589,57 @@ mod tests {
             DType::F32
         );
 
-        let diagnostics = nemotron_dtype_diagnostics(&selection, &cuda_bf16, DType::BF16);
+        let diagnostics = nemotron_dtype_diagnostics(
+            &selection,
+            &cuda_bf16,
+            DType::BF16,
+            &WeightOnlyF16Load::dense("CUDA"),
+        );
         assert_eq!(diagnostics["model_weights"], "BF16");
         assert_eq!(diagnostics["activations"], "BF16");
         assert_eq!(diagnostics["device"], "Cuda");
         assert_eq!(diagnostics["cuda_compute_capability"], "8.9");
         assert_eq!(diagnostics["cuda_device_name"], "test-cuda");
+        assert_eq!(diagnostics["weight_precision"]["projection_weights"], "F32");
+    }
+
+    #[test]
+    fn nemotron_projection_precision_needs_metal_and_f32_activations() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var(NEMOTRON_ASR_DTYPE_ENV);
+        std::env::remove_var(crate::backends::METAL_DTYPE_ENV);
+        let cpu = test_device_profile(DeviceKind::Cpu, true, true);
+        let cuda = test_device_profile(DeviceKind::Cuda, true, true);
+        let metal = test_device_profile(DeviceKind::Metal, true, true);
+
+        assert_eq!(
+            resolve_nemotron_projection_precision(&metal, DType::F32).dtype,
+            DType::F16
+        );
+        for (profile, dtype) in [
+            (&cpu, DType::F32),
+            (&cuda, DType::BF16),
+            (&cuda, DType::F32),
+            (&metal, DType::F16),
+        ] {
+            assert_eq!(
+                resolve_nemotron_projection_precision(profile, dtype).dtype,
+                DType::F32,
+                "{:?} {dtype:?}",
+                profile.kind
+            );
+        }
+        std::env::set_var(NEMOTRON_ASR_DTYPE_ENV, "f32");
+        let forced = resolve_nemotron_projection_precision(&metal, DType::F32);
+        std::env::remove_var(NEMOTRON_ASR_DTYPE_ENV);
+        assert_eq!(forced.dtype, DType::F32);
+        assert!(
+            forced.reason.contains(NEMOTRON_ASR_DTYPE_ENV),
+            "{}",
+            forced.reason
+        );
     }
 
     #[test]
@@ -3548,17 +3825,105 @@ mod tests {
         let reservation =
             estimate_realtime_resource_reservation(16_000, 8, &profile, shape, &prompt).unwrap();
 
+        // 100 feature frames -> 14 causal encoder frames (51, 26, 14).
         assert_eq!(reservation.max_samples, 16_000);
-        assert_eq!(reservation.max_output_tokens, 130);
-        assert_eq!(reservation.max_text_bytes, 4_160);
-        assert_eq!(reservation.host_bytes, 357_946);
-        assert_eq!(reservation.tensor_bytes, 6_411_264);
+        assert_eq!(reservation.max_output_tokens, 140);
+        assert_eq!(reservation.max_text_bytes, 4_480);
+        assert_eq!(reservation.host_bytes, 360_746);
+        assert_eq!(reservation.tensor_bytes, 6_415_360);
         let retained_and_worker_audio_bytes =
             16_000_u64 * 2 * std::mem::size_of::<f32>() as u64 * 2;
         assert!(
             reservation.host_bytes
                 >= REALTIME_HOST_FIXED_OVERHEAD_BYTES + retained_and_worker_audio_bytes
         );
+    }
+
+    #[test]
+    fn realtime_session_cap_no_longer_scales_the_state_reservation() {
+        let profile = NemotronStreamingProfile::new(56, 13).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let shape = default_realtime_state_shape();
+        let five_minutes = realtime_max_samples_for_seconds(16_000, 300).unwrap();
+        let hour = realtime_max_samples_for_seconds(16_000, 3_600).unwrap();
+        let short =
+            estimate_realtime_resource_reservation(five_minutes, 8, &profile, shape, &prompt)
+                .unwrap();
+        let long =
+            estimate_realtime_resource_reservation(hour, 8, &profile, shape, &prompt).unwrap();
+        assert_eq!(long.max_samples, hour);
+        assert_eq!(
+            (
+                long.host_bytes,
+                long.tensor_bytes,
+                long.max_output_tokens,
+                long.max_text_bytes
+            ),
+            (
+                short.host_bytes,
+                short.tensor_bytes,
+                short.max_output_tokens,
+                short.max_text_bytes
+            )
+        );
+        let contract = |max_samples| {
+            nemotron_realtime_state_contract(max_samples, shape, 56, StateDType::F32).unwrap()
+        };
+        assert_eq!(contract(hour), contract(five_minutes));
+        assert_eq!(
+            configured_realtime_max_samples(16_000).unwrap(),
+            DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS * 16_000
+        );
+    }
+
+    #[test]
+    fn streaming_state_retained_audio_stays_flat_over_a_ten_minute_session() {
+        let profile = NemotronStreamingProfile::new(56, 0).unwrap();
+        let prompt = NemotronPromptCondition::resolve(Some("en-US"), None).unwrap();
+        let ten_minutes = 600 * 16_000;
+        let mut state =
+            NemotronStreamingState::new(profile, prompt, 16_000, ten_minutes, 4_096, true);
+        let packet = (0..1_280)
+            .map(|idx| ((idx as f32) * 0.013).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let chunk = state.profile.chunk_samples(16_000);
+        let mut peak_retained = 0;
+        let mut peak_capacity = 0;
+        let mut copied = 0;
+        while state.buffered_samples() + packet.len() <= ten_minutes {
+            state.push_samples(&packet).unwrap();
+            while let Some(range) = state.next_ready_chunk() {
+                copied += range.end_sample - range.start_sample;
+                state.feed_ready_chunk(&range).unwrap();
+                // The feature front end compacts its own context; keep this
+                // test about the stream's sample buffer.
+                state.feature_state = network::NemotronStreamingFeatureState::new();
+            }
+            peak_retained = peak_retained.max(state.samples.len());
+            peak_capacity = peak_capacity.max(state.samples.capacity());
+        }
+        assert_eq!(state.consumed_samples(), ten_minutes);
+        assert_eq!(copied, ten_minutes);
+        // A whole session used to stay in `samples` (9.6M floats here).
+        assert!(
+            peak_retained < chunk + packet.len(),
+            "retained {peak_retained}"
+        );
+        assert!(
+            peak_capacity <= 4 * (chunk + packet.len()),
+            "capacity {peak_capacity}"
+        );
+        assert_eq!(state.diagnostics()["retained_samples"], 0);
+    }
+
+    #[test]
+    fn realtime_packets_beyond_the_priced_span_are_rejected() {
+        let resampler = NemotronStreamingResampler::default();
+        let packet = vec![0.0; NEMOTRON_REALTIME_STATE_SIZING_SAMPLES + 1];
+        let error = resampler
+            .resample_chunk(&packet, 16_000, 16_000, usize::MAX)
+            .unwrap_err();
+        assert!(error.to_string().contains("packets are limited"));
     }
 
     #[test]

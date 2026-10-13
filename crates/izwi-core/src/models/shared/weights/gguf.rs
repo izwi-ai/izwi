@@ -47,6 +47,18 @@ pub struct TensorStorageInventory {
     pub tensor_count: u64,
 }
 
+/// One GGUF tensor as the file header records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufTensorRecord {
+    pub name: String,
+    pub dtype: candle_core::quantized::GgmlDType,
+    /// Dimensions in Candle's row-major order.
+    pub shape: Vec<usize>,
+    pub elements: u64,
+    /// Stored payload bytes.
+    pub bytes: u64,
+}
+
 impl TensorStorageInventory {
     pub(crate) fn push(self, tensor_bytes: u64, tensor_elements: u64) -> Self {
         let total_bytes = self.total_bytes.saturating_add(tensor_bytes);
@@ -208,28 +220,43 @@ impl GgufLoader {
     /// Return exact stored tensor payload bytes and the largest individual
     /// tensor without materializing checkpoint data.
     pub fn tensor_storage_inventory(&self) -> Result<TensorStorageInventory> {
+        Ok(self
+            .tensor_census()?
+            .into_iter()
+            .fold(TensorStorageInventory::default(), |inv, tensor| {
+                inv.push(tensor.bytes, tensor.elements)
+            }))
+    }
+
+    /// Every tensor's name, GGML type, shape and stored payload bytes, read
+    /// from the header without materializing checkpoint data.
+    pub fn tensor_census(&self) -> Result<Vec<GgufTensorRecord>> {
         self.content
             .tensor_infos
-            .values()
-            .try_fold(
-                TensorStorageInventory::default(),
-                |inv, info| {
-                    let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
-                        Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
-                    })?;
-                    let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
-                        Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
-                    })?;
-                    let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
-                        Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
-                    })?;
-                    let bytes = elements
-                        .checked_div(block)
-                        .and_then(|blocks| blocks.checked_mul(type_bytes))
-                        .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
-                    Ok(inv.push(bytes, elements))
-                },
-            )
+            .iter()
+            .map(|(name, info)| {
+                let elements = u64::try_from(info.shape.elem_count()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor element count exceeds u64".into())
+                })?;
+                let block = u64::try_from(info.ggml_dtype.block_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor block size exceeds u64".into())
+                })?;
+                let type_bytes = u64::try_from(info.ggml_dtype.type_size()).map_err(|_| {
+                    Error::ModelLoadError("GGUF tensor type size exceeds u64".into())
+                })?;
+                let bytes = elements
+                    .checked_div(block)
+                    .and_then(|blocks| blocks.checked_mul(type_bytes))
+                    .ok_or_else(|| Error::ModelLoadError("GGUF tensor size overflow".into()))?;
+                Ok(GgufTensorRecord {
+                    name: name.clone(),
+                    dtype: info.ggml_dtype,
+                    shape: info.shape.dims().to_vec(),
+                    elements,
+                    bytes,
+                })
+            })
+            .collect()
     }
 
     /// Get a raw metadata value.
@@ -339,66 +366,53 @@ fn var_builder_from_safetensors(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    // Check if this is a directory or single file
-    if path.is_dir() {
-        // Look for model.safetensors or sharded files
-        let model_path = path.join("model.safetensors");
-        let index_path = path.join("model.safetensors.index.json");
-
-        if model_path.exists() {
-            // Single file
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(
-                    std::slice::from_ref(&model_path),
-                    dtype,
-                    device,
-                )
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)))?
-            };
-            Ok(vb)
-        } else if index_path.exists() {
-            // Sharded model - read index and load all shards
-            let index_data = std::fs::read_to_string(&index_path)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
-            let index: serde_json::Value = serde_json::from_str(&index_data)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
-
-            let weight_map = index
-                .get("weight_map")
-                .and_then(|m| m.as_object())
-                .ok_or_else(|| Error::ModelLoadError("Invalid index format".to_string()))?;
-
-            let mut shard_files: Vec<String> = weight_map
-                .values()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            shard_files.sort();
-            shard_files.dedup();
-
-            let shard_paths: Vec<std::path::PathBuf> =
-                shard_files.iter().map(|f| path.join(f)).collect();
-
-            tracing::info!("Loading sharded model with {} shards", shard_paths.len());
-
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, device)
-                    .map_err(|e| Error::ModelLoadError(format!("Failed to load shards: {}", e)))?
-            };
-            Ok(vb)
-        } else {
-            Err(Error::ModelNotFound(format!(
-                "No model files found in {:?}",
-                path
-            )))
-        }
-    } else {
-        // Single file path
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], dtype, device)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)))?
-        };
-        Ok(vb)
+    let files = safetensors_weight_files(path)?;
+    if files.len() > 1 {
+        tracing::info!("Loading sharded model with {} shards", files.len());
     }
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&files, dtype, device)
+            .map_err(|e| Error::ModelLoadError(format!("Failed to load safetensors: {}", e)))?
+    };
+    Ok(vb)
+}
+
+/// The safetensors files [`load_model_weights`] maps for a non-GGUF `path`: a
+/// directory's `model.safetensors`, else the shards of its
+/// `model.safetensors.index.json`; a file path maps that file.
+pub fn safetensors_weight_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let model_path = path.join("model.safetensors");
+    if model_path.exists() {
+        return Ok(vec![model_path]);
+    }
+    let index_path = path.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Err(Error::ModelNotFound(format!(
+            "No model files found in {:?}",
+            path
+        )));
+    }
+    let index_data = std::fs::read_to_string(&index_path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
+    let index: serde_json::Value = serde_json::from_str(&index_data)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
+
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| Error::ModelLoadError("Invalid index format".to_string()))?;
+
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    Ok(shard_files.iter().map(|f| path.join(f)).collect())
 }
 
 /// Create a VarBuilder from a GGUF file.

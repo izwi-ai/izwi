@@ -18,6 +18,7 @@ use crate::kv::v2::{
     StateDType, StateDomainId, StateDomainSpec, StateGroupId, StateScope, StateStorageFormat,
     StateUpdateKind, TensorComponentSpec,
 };
+use crate::models::shared::memory::exact::exact_zeros_var;
 
 use super::StateBackendRegistry;
 
@@ -234,7 +235,7 @@ impl InvocationTensorArena {
             }
             physical_shape.extend_from_slice(&maximum_shape);
             let dtype = candle_dtype(resolved.storage)?;
-            let storage = Var::zeros(physical_shape.as_slice(), dtype, &device)?;
+            let storage = exact_zeros_var(physical_shape.as_slice(), dtype, &device)?;
             let bytes = tensor_bytes(storage.as_tensor())?;
             let expected = resolved.maximum_bytes.checked_mul(
                 if matches!(

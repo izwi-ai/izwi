@@ -214,6 +214,7 @@ pub(crate) struct AsrRuntimeRequest {
     audio: RuntimeAudioInput,
     language: Option<String>,
     prompt: Option<String>,
+    native_word_timestamps: bool,
 }
 
 impl AsrRuntimeRequest {
@@ -233,6 +234,7 @@ impl AsrRuntimeRequest {
             audio,
             language,
             prompt: None,
+            native_word_timestamps: false,
         })
     }
 
@@ -252,6 +254,7 @@ impl AsrRuntimeRequest {
             audio,
             language,
             prompt: None,
+            native_word_timestamps: false,
         })
     }
 
@@ -267,6 +270,11 @@ impl AsrRuntimeRequest {
         self
     }
 
+    pub(crate) fn with_native_word_timestamps(mut self, enabled: bool) -> Self {
+        self.native_word_timestamps = enabled;
+        self
+    }
+
     pub(crate) fn into_engine_request(self) -> EngineCoreRequest {
         let mut request = match self.audio {
             RuntimeAudioInput::Base64(audio_base64) => EngineCoreRequest::asr(audio_base64),
@@ -279,7 +287,7 @@ impl AsrRuntimeRequest {
         if let Some(prompt) = self.prompt {
             request = request.with_asr_prompt(prompt);
         }
-        request
+        request.with_asr_native_word_timestamps(self.native_word_timestamps)
     }
 }
 

@@ -97,9 +97,12 @@ impl VibeVoiceTokenizerStateDomain {
     }
 }
 
+/// The invocation state: the decoder's paged K/V in `dtype` and the
+/// tokenizer streaming state in `tokenizer_dtype`.
 pub(crate) fn vibevoice_invocation_contract(
     model: &Qwen3Model,
     dtype: DType,
+    tokenizer_dtype: DType,
     preferred_page_tokens: usize,
     domains: &[StateDomainId],
     tokenizer_domains: &[VibeVoiceTokenizerStateDomain],
@@ -123,7 +126,7 @@ pub(crate) fn vibevoice_invocation_contract(
         domains: state_domains,
         groups,
     };
-    vibevoice_invocation_contract_from_state(contract, dtype, tokenizer_domains)
+    vibevoice_invocation_contract_from_state(contract, tokenizer_dtype, tokenizer_domains)
 }
 
 fn vibevoice_invocation_contract_from_state(

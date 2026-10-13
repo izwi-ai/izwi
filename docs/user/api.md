@@ -65,13 +65,13 @@ Common status codes:
 
 | Status | Meaning |
 |--------|---------|
-| `400` | Invalid request shape, model id, unsupported field, or invalid option. |
+| `400` | Invalid request shape, model id, unsupported field, or invalid option, including input the runtime rejects (for example audio over the duration limit). |
 | `403` | Authenticated request or local voice reuse is not permitted by policy metadata. |
 | `404` | Resource, model, media object, or process-local record was not found. |
 | `413` | Body exceeded an upload limit before the handler could parse it. |
 | `415` | Endpoint expected JSON or multipart content but received another content type. |
 | `500` | Runtime, model, storage, or server failure. |
-| `503` | Readiness endpoint reports the server is alive but not ready. |
+| `503` | Temporarily out of capacity: the requested model cannot be loaded while other resident models are busy, or the runtime is overloaded. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
 
 Enterprise builds can inject authentication and policy hooks. Community builds use local anonymous defaults. If an enterprise hook rejects a request, the response can be `401`, `403`, or `500` before the route handler runs.
 
@@ -315,12 +315,12 @@ Multipart fields:
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
-| `language` | Optional language hint. |
+| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (base: en, fr, de, es, pt, ja; plus drops ja), names it in the instruction, and rejects other languages with `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback. |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (Parakeet reports word times from its TDT decoder; `Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). Without it, `verbose_json` returns `segments` only, as OpenAI does. |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt` | Optional ASR prompt/context. Granite Speech uses this for prompt guidance and keyword biasing. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. |
 | `max_tokens` | Optional ASR decoder token budget. |
 | `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
 
@@ -361,6 +361,8 @@ Multipart fields:
   }
 }
 ```
+
+`verbose_json` always includes `segments`. Without word or segment timestamps from the model or the aligner, each long-form chunk becomes one segment covering its time range, and a short file gets one segment spanning the whole audio. `words` appears only when `timestamp_granularities[]` includes `word`. If forced alignment fails, the transcript is still returned with segments, without `words`, and the failure is reported as `izwi_asr_diagnostics.alignment_error`.
 
 SSE events:
 

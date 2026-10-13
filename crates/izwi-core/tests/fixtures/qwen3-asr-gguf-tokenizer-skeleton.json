@@ -1,0 +1,288 @@
+{
+ "_comment": "tokenizer.huggingface.json from qwen3_asr_0.6b_q8_0.gguf (general.architecture=qwen3_asr; the 1.7B GGUF embeds the same JSON) with model.vocab and model.merges emptied; tests refill vocab ids 0..151642. Added tokens stop at 151668, as published.",
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 151643,
+   "content": "<|endoftext|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151644,
+   "content": "<|im_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151645,
+   "content": "<|im_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151646,
+   "content": "<|object_ref_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151647,
+   "content": "<|object_ref_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151648,
+   "content": "<|box_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151649,
+   "content": "<|box_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151650,
+   "content": "<|quad_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151651,
+   "content": "<|quad_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151652,
+   "content": "<|vision_start|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151653,
+   "content": "<|vision_end|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151654,
+   "content": "<|vision_pad|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151655,
+   "content": "<|image_pad|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151656,
+   "content": "<|video_pad|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 151657,
+   "content": "<tool_call>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151658,
+   "content": "</tool_call>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151659,
+   "content": "<|fim_prefix|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151660,
+   "content": "<|fim_middle|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151661,
+   "content": "<|fim_suffix|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151662,
+   "content": "<|fim_pad|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151663,
+   "content": "<|repo_name|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151664,
+   "content": "<|file_sep|>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151665,
+   "content": "<tool_response>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151666,
+   "content": "</tool_response>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151667,
+   "content": "<think>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  },
+  {
+   "id": 151668,
+   "content": "</think>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": false
+  }
+ ],
+ "normalizer": {
+  "type": "NFC"
+ },
+ "pre_tokenizer": {
+  "type": "Sequence",
+  "pretokenizers": [
+   {
+    "type": "Split",
+    "pattern": {
+     "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+    },
+    "behavior": "Isolated",
+    "invert": false
+   },
+   {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": false,
+    "use_regex": false
+   }
+  ]
+ },
+ "post_processor": {
+  "type": "ByteLevel",
+  "add_prefix_space": false,
+  "trim_offsets": false,
+  "use_regex": false
+ },
+ "decoder": {
+  "type": "ByteLevel",
+  "add_prefix_space": false,
+  "trim_offsets": false,
+  "use_regex": false
+ },
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": null,
+  "continuing_subword_prefix": "",
+  "end_of_word_suffix": "",
+  "fuse_unk": false,
+  "byte_fallback": false,
+  "ignore_merges": false,
+  "vocab": {},
+  "merges": []
+ }
+}

@@ -10,13 +10,15 @@ use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
 use crate::engine::{
-    AsrProgress, AsrProgressPhase, EngineCoreRequest, RealtimeAsrSessionHandle, ResourceAmount,
-    ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType, WorkCost, WorkUnit,
+    AsrProgress, AsrProgressPhase, EngineCoreRequest, EngineOutput, RealtimeAsrSessionHandle,
+    ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType,
+    WorkCost, WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
-    parse_granite_speech_output, GraniteSpeechTask,
+    granite_speech_request_plan, parse_granite_speech_output,
+    validate_granite_speech_request_language, GraniteSpeechTask,
 };
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
@@ -30,6 +32,7 @@ use crate::models::registry::{
 };
 use crate::runtime::adapters::{
     CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
+    RuntimeAdapterRegistry, StreamingMode,
 };
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
@@ -48,7 +51,7 @@ use crate::runtime::types::{
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
 use crate::runtime::CoordinatorLane;
-use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig, AudioChunk};
+use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
 enum AsrAudioInput<'a> {
@@ -133,10 +136,17 @@ impl OwnedAsrAudioInput {
     }
 }
 
-const GRANITE_ASR_AUTO_MIN_TOKENS: usize = 76;
+/// IBM's plain-ASR decode budget (`ibm-granite/granite-speech`): 200 new
+/// tokens per 30 s window, never less than one window. It covers punctuated
+/// German at about 1.7 tokens per word.
+const GRANITE_ASR_AUTO_TOKENS_PER_WINDOW: f64 = 200.0;
+const GRANITE_ASR_AUTO_WINDOW_SECONDS: f64 = 30.0;
 const GRANITE_ASR_AUTO_MAX_TOKENS: usize = 2048;
-const GRANITE_ASR_AUTO_BASE_SECONDS: f32 = 28.0;
-const GRANITE_ASR_AUTO_TOKENS_PER_SECOND: f32 = 4.0;
+/// Plus's timestamp task writes `word [T:NNN]` (a tag is 5 tokens, plus
+/// silence tags), about 24 tokens per second of speech measured with the
+/// shipped tokenizer; budget 26 per second and a fixed reserve.
+const GRANITE_TIMESTAMP_TOKENS_PER_SECOND: f64 = 26.0;
+const GRANITE_TIMESTAMP_TOKEN_RESERVE: usize = 64;
 const GRANITE_SAA_MIN_NEW_TOKENS: usize = 800;
 const GRANITE_SAA_MAX_NEW_TOKENS: usize = 2_500;
 const GRANITE_SAA_NEW_TOKENS_PER_SECOND: f32 = 8.0;
@@ -154,7 +164,11 @@ const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 const ASR_REALTIME_MAX_SESSIONS_ENV: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
 const ASR_REALTIME_MAX_LIFETIME_SECS_ENV: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
 const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
-const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 16;
+/// Concurrent realtime sessions, which is also the row count of the realtime
+/// state arena a load allocates up front: Nemotron's is about 37 MB of F32 per
+/// row (twice per session), so 16 sessions held 1.18 GB that a desktop rarely
+/// uses (NEM-4). Servers raise it with `IZWI_ASR_REALTIME_MAX_SESSIONS`.
+const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 4;
 const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 10 * 60;
 const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -163,6 +177,38 @@ const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
 /// planners subtract it from the effective invocation context before
 /// budgeting audio tokens; per-invocation admission uses exact counts.
 pub(crate) const ASR_TEXT_PROMPT_TOKEN_RESERVE: usize = 128;
+
+/// Tokens one ASR decoder sequence needs for one full chunk (P2.5): its text
+/// prompt, the audio tokens of `chunk_secs` at `audio_token_rate`, and
+/// `decode_tokens` of output. No request decodes more than one chunk at a
+/// time (longer input is chunked), so this, not the model's native context,
+/// is the automatic per-sequence ceiling of every LLM-decoder ASR family.
+pub(crate) fn asr_sequence_ceiling(
+    text_prompt_tokens: usize,
+    audio_token_rate: f32,
+    chunk_secs: f32,
+    decode_tokens: usize,
+) -> usize {
+    let audio_tokens = (chunk_secs.max(0.0) * audio_token_rate.max(0.0)).ceil() as usize;
+    text_prompt_tokens
+        .saturating_add(audio_tokens)
+        .saturating_add(decode_tokens)
+}
+
+/// `(sequence, retained)` token bounds of an automatic ASR context: one
+/// `sequence_ceiling` per sequence, and one per concurrent sequence in the
+/// shared retained pool, never above the model's native context.
+pub(crate) fn asr_automatic_context(
+    native_tokens: usize,
+    sequence_ceiling: usize,
+    retained_rows: usize,
+) -> (usize, usize) {
+    let sequence = sequence_ceiling.min(native_tokens);
+    let retained = sequence
+        .saturating_mul(retained_rows.max(1))
+        .min(native_tokens);
+    (sequence, retained)
+}
 
 /// Smallest audio duration in seconds an invocation chunk planner will still
 /// emit before declaring the invocation context infeasible.
@@ -193,9 +239,8 @@ pub(crate) fn solve_invocation_audio_limit(
         return InvocationAudioLimit::Infeasible;
     }
     let fits = |secs: f32| -> bool {
-        let audio_tokens = (secs * audio_token_rate).ceil() as usize;
         text_reserve_tokens
-            .saturating_add(audio_tokens)
+            .saturating_add(invocation_audio_tokens(secs, audio_token_rate))
             .saturating_add(decode_budget_for_duration(secs))
             <= context_tokens
     };
@@ -220,6 +265,23 @@ pub(crate) fn solve_invocation_audio_limit(
         }
     }
     InvocationAudioLimit::Limited(low)
+}
+
+fn invocation_audio_tokens(audio_seconds: f32, audio_token_rate: f32) -> usize {
+    (audio_seconds * audio_token_rate).ceil() as usize
+}
+
+/// Decode tokens `context_tokens` leaves after the prompt of an
+/// `audio_seconds` invocation, under the demand model the chunk planner
+/// solves with (text reserve plus audio tokens at the family's rate).
+pub(crate) fn invocation_decode_room(
+    context_tokens: usize,
+    audio_token_rate: f32,
+    audio_seconds: f32,
+) -> usize {
+    context_tokens.saturating_sub(ASR_TEXT_PROMPT_TOKEN_RESERVE.saturating_add(
+        invocation_audio_tokens(audio_seconds.max(0.0), audio_token_rate),
+    ))
 }
 
 /// Compose the family's audio-seconds hint with the invocation-context budget:
@@ -289,17 +351,63 @@ fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVa
     .then_some(variant)
 }
 
+/// Check a request's language against what the routed ASR model was trained
+/// on, so an unsupported language fails as invalid input before admission.
+/// Only families with a published language list (Granite Speech) check it.
+pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> Result<()> {
+    match variant.family() {
+        ModelFamily::GraniteSpeechAsr => {
+            validate_granite_speech_request_language(variant, language)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// IBM's automatic Granite budget, `ceil(200 * max(1, secs / 30))` tokens.
+/// Callers bound it by the request ceiling and the invocation context.
 pub(crate) fn granite_auto_asr_max_tokens_for_duration(audio_seconds: f32) -> usize {
-    let duration_budget =
-        if audio_seconds.is_finite() && audio_seconds > GRANITE_ASR_AUTO_BASE_SECONDS {
-            ((audio_seconds - GRANITE_ASR_AUTO_BASE_SECONDS) * GRANITE_ASR_AUTO_TOKENS_PER_SECOND)
-                .ceil() as usize
-        } else {
-            0
-        };
-    GRANITE_ASR_AUTO_MIN_TOKENS
-        .saturating_add(duration_budget)
-        .clamp(GRANITE_ASR_AUTO_MIN_TOKENS, GRANITE_ASR_AUTO_MAX_TOKENS)
+    let windows = if audio_seconds.is_finite() {
+        (f64::from(audio_seconds) / GRANITE_ASR_AUTO_WINDOW_SECONDS).max(1.0)
+    } else {
+        1.0
+    };
+    (GRANITE_ASR_AUTO_TOKENS_PER_WINDOW * windows).ceil() as usize
+}
+
+/// Budget for plus's timestamp task, `ceil(26 * secs) + 64` tokens.
+pub(crate) fn granite_timestamp_max_tokens_for_duration(audio_seconds: f32) -> usize {
+    let seconds = if audio_seconds.is_finite() {
+        f64::from(audio_seconds).max(0.0)
+    } else {
+        0.0
+    };
+    (GRANITE_TIMESTAMP_TOKENS_PER_SECOND * seconds).ceil() as usize
+        + GRANITE_TIMESTAMP_TOKEN_RESERVE
+}
+
+/// Decode budget Granite plans an invocation of `audio_seconds` with: the
+/// automatic duration budget of the task the request runs (plain ASR or
+/// plus's word timestamps) under the request ceiling, or the caller's own
+/// `max_tokens`. Chunk planning and per-chunk decoding share it, so a planned
+/// chunk always leaves room for the budget it is decoded with.
+pub(crate) fn granite_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    let ceiling = request.params.max_tokens.max(1);
+    if !request.asr_auto_max_tokens {
+        return ceiling;
+    }
+    let word_timestamps = request.model_variant.is_some_and(|variant| {
+        granite_speech_request_plan(variant, request.asr_native_word_timestamps).task
+            == GraniteSpeechTask::WordTimestamps
+    });
+    let budget = if word_timestamps {
+        granite_timestamp_max_tokens_for_duration(audio_seconds)
+    } else {
+        granite_auto_asr_max_tokens_for_duration(audio_seconds)
+    };
+    budget.min(ceiling)
 }
 
 fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
@@ -308,6 +416,101 @@ fn granite_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
     // avoids decoding compressed public input synchronously on a Tokio worker
     // merely to construct the engine request.
     (variant.family() == ModelFamily::GraniteSpeechAsr).then_some(GRANITE_ASR_AUTO_MAX_TOKENS)
+}
+
+/// Transcribed audio duration. Preparation records it for every family that
+/// decodes before admission; otherwise only the executor's report is known.
+fn asr_transcription_duration_secs(output: &EngineOutput) -> f32 {
+    output
+        .input_audio_duration_secs
+        .unwrap_or(output.audio.duration_secs)
+}
+
+/// The final transcript, cleaned exactly as the long-form assembler cleans
+/// each chunk, so a file decoded in one window and a file merged from chunks
+/// come back alike. Cleaning is idempotent, so merged text is unchanged.
+fn asr_transcript_text(text: &str) -> String {
+    clean_transcript_text(text, AsrLongFormConfig::default().max_repeated_chars)
+}
+
+/// Whether `variant` streams ASR on a native streaming contract. Its ASR
+/// adapter's streaming mode decides; loaded adapters without one reject a
+/// native contract and accept only transport progress from offline decode.
+pub(super) fn asr_streams_natively(
+    adapters: &RuntimeAdapterRegistry,
+    variant: ModelVariant,
+) -> bool {
+    adapters
+        .require(CapabilityKind::Asr, variant)
+        .is_ok_and(|adapter| adapter.streaming_mode != StreamingMode::None)
+}
+
+/// The part of the final transcript a stream has not delivered, so the
+/// deltas concatenate to it: all of it when nothing was streamed, the rest
+/// after the streamed prefix (allowing for leading whitespace the cleanup
+/// trimmed), and nothing when the cleanup rewrote text already sent.
+fn unstreamed_transcript_tail<'a>(streamed: &str, text: &'a str) -> Option<&'a str> {
+    text.strip_prefix(streamed)
+        .or_else(|| text.strip_prefix(streamed.trim_start()))
+        .filter(|tail| !tail.is_empty())
+}
+
+/// Transcript language: the caller's hint when given, otherwise the language
+/// the model detected and reported as `language` in its ASR diagnostics.
+fn asr_response_language(
+    requested: Option<&str>,
+    diagnostics: Option<&serde_json::Value>,
+) -> Option<String> {
+    requested.map(str::to_string).or_else(|| {
+        diagnostics
+            .and_then(|diagnostics| diagnostics.get("language"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// Install the caller's ASR decode budget. An omitted budget is marked
+/// automatic so duration-aware families (Granite, LFM2.5 Audio long-form) may
+/// derive it per chunk, and Parakeet preparation may size it from the encoder
+/// frame count, instead of applying the request default.
+fn apply_asr_max_tokens(
+    request: &mut EngineCoreRequest,
+    variant: ModelVariant,
+    max_tokens: Option<usize>,
+) {
+    if let Some(max_tokens) = max_tokens {
+        request.params.max_tokens = max_tokens;
+        return;
+    }
+    request.asr_auto_max_tokens = true;
+    if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant)
+        .or_else(|| vibevoice_auto_asr_token_ceiling(variant))
+    {
+        request.params.max_tokens = auto_max_tokens;
+    }
+}
+
+/// VibeVoice-ASR's automatic budget is admitted at the reference ceiling and
+/// narrowed to the decoded audio's duration by preparation and the executor.
+fn vibevoice_auto_asr_token_ceiling(variant: ModelVariant) -> Option<usize> {
+    use crate::models::architectures::vibevoice::asr::VIBEVOICE_ASR_AUTO_MAX_TOKENS;
+    (variant.family() == ModelFamily::VibeVoiceAsr).then_some(VIBEVOICE_ASR_AUTO_MAX_TOKENS)
+}
+
+/// Decode budget a VibeVoice-ASR invocation of `audio_seconds` runs with: the
+/// duration budget under the request ceiling when the caller omitted
+/// `max_tokens`, otherwise the caller's own budget.
+pub(crate) fn vibevoice_asr_planned_max_tokens(
+    request: &EngineCoreRequest,
+    audio_seconds: f32,
+) -> usize {
+    use crate::models::architectures::vibevoice::asr::vibevoice_auto_asr_max_tokens_for_duration;
+    let ceiling = request.params.max_tokens.max(1);
+    if request.asr_auto_max_tokens {
+        vibevoice_auto_asr_max_tokens_for_duration(audio_seconds).min(ceiling)
+    } else {
+        ceiling
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2216,7 +2419,7 @@ impl RuntimeService {
                         )?;
 
                     Ok(AsrTranscription {
-                        text: output.text,
+                        text: asr_transcript_text(&output.text),
                         language: output.language,
                         duration_secs,
                         asr_diagnostics: output.diagnostics,
@@ -2236,7 +2439,9 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         streaming: bool,
+        native_word_timestamps: bool,
     ) -> Result<AdmittedEngineRequest> {
+        validate_asr_language(variant, language)?;
         let audio_bytes = match audio_input {
             AsrAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
@@ -2312,14 +2517,10 @@ impl RuntimeService {
                         runtime_context,
                     )?,
                 }
-                .with_prompt(prompt);
+                .with_prompt(prompt)
+                .with_native_word_timestamps(native_word_timestamps);
                 let mut request = runtime_request.into_engine_request();
-                if let Some(max_tokens) = max_tokens {
-                    request.params.max_tokens = max_tokens;
-                } else if let Some(auto_max_tokens) = granite_auto_asr_token_ceiling(variant) {
-                    request.params.max_tokens = auto_max_tokens;
-                    request.asr_auto_max_tokens = true;
-                }
+                apply_asr_max_tokens(&mut request, variant, max_tokens);
                 Ok(request)
             },
         )
@@ -2399,15 +2600,17 @@ impl RuntimeService {
                 correlation_id,
                 RuntimeRequestContext::default(),
                 false,
+                false,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
-        let text = output.text.unwrap_or_default();
+        let duration_secs = asr_transcription_duration_secs(&output);
+        let text = asr_transcript_text(&output.text.unwrap_or_default());
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2466,7 +2669,7 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<AsrTranscription>
     where
         F: FnMut(String) + Send + 'static,
@@ -2499,28 +2702,11 @@ impl RuntimeService {
                 correlation_id,
                 RuntimeRequestContext::default(),
                 true,
+                false,
             )
             .await?;
-        let mut streamed_text = String::new();
-        let output = self
-            .run_admitted_streaming_request(admitted, |chunk| {
-                if let Some(delta) = chunk.text {
-                    if !delta.is_empty() {
-                        streamed_text.push_str(&delta);
-                        on_delta(delta);
-                    }
-                }
-                std::future::ready(Ok(()))
-            })
-            .await?;
-        let text = output.text.unwrap_or(streamed_text);
-
-        Ok(AsrTranscription {
-            text,
-            language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
-            asr_diagnostics: output.asr_diagnostics,
-        })
+        self.stream_admitted_asr_request(admitted, variant, true, language, on_delta, |_| {})
+            .await
     }
 
     pub(crate) async fn asr_transcribe_bytes_with_variant(
@@ -2576,6 +2762,7 @@ impl RuntimeService {
             max_tokens,
             correlation_id,
             RuntimeRequestContext::default(),
+            false,
         )
         .await
     }
@@ -2590,6 +2777,7 @@ impl RuntimeService {
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
     ) -> Result<AsrTranscription> {
         if variant.is_audio_chat() && variant.family() != ModelFamily::Lfm25Audio {
             self.observe_broker_capability_request(CapabilityKind::Asr, Some(variant), false)?;
@@ -2618,15 +2806,17 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 false,
+                native_word_timestamps,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
-        let text = output.text.unwrap_or_default();
+        let duration_secs = asr_transcription_duration_secs(&output);
+        let text = asr_transcript_text(&output.text.unwrap_or_default());
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2746,8 +2936,8 @@ impl RuntimeService {
         prompt: Option<&str>,
         max_tokens: Option<usize>,
         correlation_id: Option<&str>,
-        mut on_delta: F,
-        mut on_progress: P,
+        on_delta: F,
+        on_progress: P,
         broker_streaming_required: bool,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription>
@@ -2786,8 +2976,41 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 true,
+                false,
             )
             .await?;
+        self.stream_admitted_asr_request(
+            admitted,
+            variant,
+            broker_streaming_required,
+            language,
+            on_delta,
+            on_progress,
+        )
+        .await
+    }
+
+    /// Run an admitted ASR request as a stream of text deltas.
+    ///
+    /// `native_stream_requested` asks for the model's native streaming
+    /// contract. A model whose ASR adapter declares no streaming mode is
+    /// offline-only, so its stream runs on the offline route instead: the
+    /// transport still carries the deltas its decode emits (retained per-step
+    /// text, chunk partials). Either way the deltas end with whatever part of
+    /// the final transcript they did not cover, so they concatenate to it.
+    async fn stream_admitted_asr_request<F, P>(
+        &self,
+        admitted: AdmittedEngineRequest,
+        variant: ModelVariant,
+        native_stream_requested: bool,
+        language: Option<&str>,
+        mut on_delta: F,
+        mut on_progress: P,
+    ) -> Result<AsrTranscription>
+    where
+        F: FnMut(String) + Send + 'static,
+        P: FnMut(AsrProgress) + Send + 'static,
+    {
         let mut streamed_text = String::new();
         let handle_chunk = |chunk: crate::engine::StreamingOutput| {
             if let Some(progress) = chunk.asr_progress {
@@ -2801,19 +3024,24 @@ impl RuntimeService {
             }
             std::future::ready(Ok(()))
         };
-        let output = if broker_streaming_required {
-            self.run_admitted_streaming_request(admitted, handle_chunk)
-                .await?
-        } else {
-            self.run_admitted_transport_streaming_request(admitted, handle_chunk)
-                .await?
-        };
-        let text = output.text.unwrap_or(streamed_text);
+        let output =
+            if native_stream_requested && asr_streams_natively(&self.adapter_registry, variant) {
+                self.run_admitted_streaming_request(admitted, handle_chunk)
+                    .await?
+            } else {
+                self.run_admitted_transport_streaming_request(admitted, handle_chunk)
+                    .await?
+            };
+        let duration_secs = asr_transcription_duration_secs(&output);
+        let text = asr_transcript_text(output.text.as_deref().unwrap_or(&streamed_text));
+        if let Some(tail) = unstreamed_transcript_tail(&streamed_text, &text) {
+            on_delta(tail.to_string());
+        }
 
         Ok(AsrTranscription {
             text,
-            language: language.map(|s| s.to_string()),
-            duration_secs: output.audio.duration_secs,
+            language: asr_response_language(language, output.asr_diagnostics.as_ref()),
+            duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
     }
@@ -2984,6 +3212,35 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
     ) -> Result<AsrTranscription> {
+        self.asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+            audio_bytes,
+            model_id,
+            language,
+            prompt,
+            max_tokens,
+            correlation_id,
+            runtime_context,
+            false,
+        )
+        .await
+    }
+
+    /// Like [`Self::asr_transcribe_bytes_with_runtime_context`], optionally
+    /// asking for model-native word timestamps: a model that emits them
+    /// (Granite Speech Plus) returns them as `timestamp_words` in its
+    /// diagnostics; any other model transcribes as usual.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
+        &self,
+        audio_bytes: &[u8],
+        model_id: Option<&str>,
+        language: Option<&str>,
+        prompt: Option<&str>,
+        max_tokens: Option<usize>,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+        native_word_timestamps: bool,
+    ) -> Result<AsrTranscription> {
         let variant = resolve_asr_model_variant(model_id);
         self.asr_transcribe_bytes_with_variant_and_prompt_options_and_runtime_context(
             variant,
@@ -2993,6 +3250,7 @@ impl RuntimeService {
             max_tokens,
             correlation_id,
             runtime_context,
+            native_word_timestamps,
         )
         .await
     }
@@ -3408,6 +3666,7 @@ impl RuntimeService {
         P: FnMut(AsrProgress) + Send + 'static,
     {
         let variant = resolve_speaker_attributed_asr_variant(model_id)?;
+        validate_asr_language(variant, language)?;
         let audio_bytes = audio_input.input_bytes();
         if audio_bytes == 0 {
             return Err(Error::InvalidInput(
@@ -4670,6 +4929,67 @@ mod tests {
     use std::sync::{Condvar, Mutex, OnceLock};
     use uuid::Uuid;
 
+    /// The shared automatic ASR ceiling: prompt, one chunk of audio tokens and
+    /// the decode budget per sequence; one per retained row, under the native
+    /// context. Qwen3-ASR's 1,307 and VibeVoice's retained 1,938 come from it.
+    #[test]
+    fn shared_asr_ceiling_bounds_one_chunk_per_sequence() {
+        assert_eq!(
+            asr_sequence_ceiling(ASR_TEXT_PROMPT_TOKEN_RESERVE, 13.0, 30.0 / 0.95, 768),
+            1_307
+        );
+        assert_eq!(
+            asr_sequence_ceiling(
+                512,
+                7.5,
+                60.0,
+                crate::models::architectures::vibevoice::asr::vibevoice_auto_asr_max_tokens_for_duration(60.0)
+            ),
+            1_938
+        );
+        assert_eq!(asr_sequence_ceiling(128, 13.0, -1.0, 768), 896);
+        assert_eq!(asr_automatic_context(65_536, 1_938, 8), (1_938, 15_504));
+        assert_eq!(asr_automatic_context(65_536, 1_938, 0), (1_938, 1_938));
+        assert_eq!(asr_automatic_context(1_024, 1_938, 8), (1_024, 1_024));
+    }
+
+    #[test]
+    fn offline_only_asr_models_stream_on_the_offline_route() {
+        let adapters = RuntimeAdapterRegistry::built_in();
+        for variant in [
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Nemotron35AsrStreaming06B,
+        ] {
+            assert!(
+                !asr_streams_natively(&adapters, variant),
+                "{variant} has offline ASR only, so its streams take the offline route"
+            );
+        }
+        let qwen = ModelVariant::Qwen3Asr06BGguf;
+        assert!(asr_streams_natively(&adapters, qwen));
+    }
+
+    #[test]
+    fn stream_deltas_end_with_the_unstreamed_transcript_tail() {
+        // Final-only: nothing streamed, the whole transcript is one delta.
+        assert_eq!(
+            unstreamed_transcript_tail("", "hello world"),
+            Some("hello world")
+        );
+        assert_eq!(
+            unstreamed_transcript_tail("hello ", "hello world"),
+            Some("world")
+        );
+        assert_eq!(unstreamed_transcript_tail("hello", "hello"), None);
+        assert_eq!(
+            unstreamed_transcript_tail(" hello", "hello world"),
+            Some(" world")
+        );
+        assert_eq!(unstreamed_transcript_tail("", ""), None);
+        // Cleanup rewrote text already sent: appending cannot repair it.
+        assert_eq!(unstreamed_transcript_tail("aaaaaaaa", "aaa b"), None);
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -5375,14 +5695,100 @@ mod tests {
     }
 
     #[test]
-    fn granite_auto_asr_budget_scales_with_audio_duration() {
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.6), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(28.0), 76);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 204);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(600.0), 2048);
-        assert_eq!(granite_auto_asr_max_tokens_for_duration(1200.0), 2048);
+    fn granite_auto_asr_budget_follows_the_ibm_reference_formula() {
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(0.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(3.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(27.303175), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(30.0), 200);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(31.0), 207);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(60.0), 400);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(540.0), 3_600);
+        assert_eq!(granite_auto_asr_max_tokens_for_duration(f32::NAN), 200);
+    }
+
+    #[test]
+    fn granite_planned_asr_budget_honours_the_request_ceiling() {
+        let granite = ModelVariant::GraniteSpeech412BPlus;
+        let mut auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut auto, granite, None);
+        assert_eq!(granite_asr_planned_max_tokens(&auto, 3.0), 200);
+        assert_eq!(granite_asr_planned_max_tokens(&auto, 60.0), 400);
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto, 540.0),
+            GRANITE_ASR_AUTO_MAX_TOKENS
+        );
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut explicit, granite, Some(96));
+        assert_eq!(granite_asr_planned_max_tokens(&explicit, 60.0), 96);
+    }
+
+    #[test]
+    fn granite_timestamp_budget_covers_tagged_words_and_a_reserve() {
+        assert_eq!(granite_timestamp_max_tokens_for_duration(0.0), 64);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(1.0), 90);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(30.0), 844);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(60.0), 1_624);
+        assert_eq!(granite_timestamp_max_tokens_for_duration(f32::NAN), 64);
+    }
+
+    /// Only plus runs the timestamp task, so only plus gets its budget; a
+    /// base request asking for word timestamps keeps the ASR budget and is
+    /// timed by the aligner.
+    #[test]
+    fn granite_planned_budget_follows_the_task_the_request_runs() {
+        let auto = |variant, word_timestamps| {
+            let mut request = EngineCoreRequest::asr_bytes(vec![1])
+                .with_model_variant(variant)
+                .with_asr_native_word_timestamps(word_timestamps);
+            apply_asr_max_tokens(&mut request, variant, None);
+            request
+        };
+        let plus = ModelVariant::GraniteSpeech412BPlus;
+        let base = ModelVariant::GraniteSpeech412B;
+        assert_eq!(granite_asr_planned_max_tokens(&auto(plus, true), 30.0), 844);
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, true), 60.0),
+            1_624
+        );
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, true), 210.0),
+            GRANITE_ASR_AUTO_MAX_TOKENS
+        );
+        assert_eq!(
+            granite_asr_planned_max_tokens(&auto(plus, false), 30.0),
+            200
+        );
+        assert_eq!(granite_asr_planned_max_tokens(&auto(base, true), 30.0), 200);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1])
+            .with_model_variant(plus)
+            .with_asr_native_word_timestamps(true);
+        apply_asr_max_tokens(&mut explicit, plus, Some(300));
+        assert_eq!(granite_asr_planned_max_tokens(&explicit, 60.0), 300);
+    }
+
+    #[test]
+    fn invocation_decode_room_matches_the_planner_demand_model() {
+        // 30 s at 10 tokens/s: the 128-token text reserve and 300 audio tokens
+        // leave 3,668 of 4,096 for decoding; a small context leaves none.
+        assert_eq!(invocation_decode_room(4_096, 10.0, 30.0), 3_668);
+        assert_eq!(invocation_decode_room(400, 10.0, 30.0), 0);
+
+        // At the solved single-pass limit Granite's budget still fits the room.
+        let InvocationAudioLimit::Limited(limit) = solve_invocation_audio_limit(
+            4_096,
+            10.0,
+            ASR_TEXT_PROMPT_TOKEN_RESERVE,
+            granite_auto_asr_max_tokens_for_duration,
+        ) else {
+            panic!("a 4096-token context must admit Granite audio");
+        };
+        assert!((237.0..=239.0).contains(&limit), "unexpected limit {limit}");
+        assert!(
+            granite_auto_asr_max_tokens_for_duration(limit)
+                <= invocation_decode_room(4_096, 10.0, limit)
+        );
     }
 
     #[test]
@@ -5395,6 +5801,102 @@ mod tests {
             granite_auto_asr_token_ceiling(ModelVariant::WhisperLargeV3Turbo),
             None
         );
+    }
+
+    #[test]
+    fn single_window_and_chunked_transcripts_get_the_same_cleanup() {
+        let raw = "  Total:   1000000000 units.............\n\nNext  line  ";
+        let mut assembler =
+            izwi_asr_toolkit::TranscriptAssembler::new(AsrLongFormConfig::default());
+        assembler.push_chunk_text(raw);
+        let chunked = assembler.finish();
+
+        assert_eq!(
+            asr_transcript_text(raw),
+            "Total: 1000000000 units........\nNext line"
+        );
+        assert_eq!(asr_transcript_text(raw), chunked);
+        assert_eq!(asr_transcript_text(&chunked), chunked);
+    }
+
+    #[test]
+    fn asr_response_language_prefers_the_hint_then_the_detected_language() {
+        let detected = serde_json::json!({ "language": "de" });
+        assert_eq!(
+            asr_response_language(Some("en"), Some(&detected)).as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            asr_response_language(None, Some(&detected)).as_deref(),
+            Some("de")
+        );
+        assert_eq!(asr_response_language(None, None), None);
+        let undetected = serde_json::json!({ "language": null });
+        assert_eq!(asr_response_language(None, Some(&undetected)), None);
+    }
+
+    #[test]
+    fn vibevoice_omitted_budget_is_admitted_at_the_ceiling_and_planned_by_duration() {
+        let vibevoice = ModelVariant::VibeVoiceAsr;
+        let mut auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(vibevoice);
+        apply_asr_max_tokens(&mut auto, vibevoice, None);
+        assert!(auto.asr_auto_max_tokens);
+        assert_eq!(auto.params.max_tokens, 32_768);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 10.0), 512);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 60.0), 976);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 600.0), 7_456);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 3_600.0), 32_768);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(vibevoice);
+        apply_asr_max_tokens(&mut explicit, vibevoice, Some(200));
+        assert!(!explicit.asr_auto_max_tokens);
+        assert_eq!(vibevoice_asr_planned_max_tokens(&explicit, 600.0), 200);
+
+        // The duration budget never exceeds what admission priced.
+        auto.params.max_tokens = 700;
+        assert_eq!(vibevoice_asr_planned_max_tokens(&auto, 60.0), 700);
+    }
+
+    #[test]
+    fn asr_transcription_duration_prefers_prepared_input_over_executor_audio() {
+        let mut output = crate::engine::OutputProcessor::new(16_000).process(
+            crate::engine::ExecutorOutput {
+                audio: Some(crate::engine::AudioOutput::new(Vec::new(), 16_000)),
+                ..crate::engine::ExecutorOutput::terminal("asr-duration".to_string())
+            },
+            1,
+            Duration::from_millis(300),
+        );
+        assert_eq!(output.audio.duration_secs, 0.0);
+        output.input_audio_duration_secs = Some(1.5);
+        assert_eq!(asr_transcription_duration_secs(&output), 1.5);
+
+        // Families without preparation report the decoded input themselves.
+        output.input_audio_duration_secs = None;
+        output.audio.duration_secs = 2.0;
+        assert_eq!(asr_transcription_duration_secs(&output), 2.0);
+    }
+
+    #[test]
+    fn omitted_asr_max_tokens_is_automatic_and_explicit_budget_is_kept() {
+        let default_max_tokens = EngineCoreRequest::asr_bytes(vec![1]).params.max_tokens;
+        let lfm = ModelVariant::Lfm25Audio15BGguf;
+
+        let mut omitted = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(lfm);
+        apply_asr_max_tokens(&mut omitted, lfm, None);
+        assert!(omitted.asr_auto_max_tokens);
+        assert_eq!(omitted.params.max_tokens, default_max_tokens);
+
+        let mut explicit = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(lfm);
+        apply_asr_max_tokens(&mut explicit, lfm, Some(96));
+        assert!(!explicit.asr_auto_max_tokens);
+        assert_eq!(explicit.params.max_tokens, 96);
+
+        let granite = ModelVariant::GraniteSpeech412BPlus;
+        let mut granite_auto = EngineCoreRequest::asr_bytes(vec![1]).with_model_variant(granite);
+        apply_asr_max_tokens(&mut granite_auto, granite, None);
+        assert!(granite_auto.asr_auto_max_tokens);
+        assert_eq!(granite_auto.params.max_tokens, GRANITE_ASR_AUTO_MAX_TOKENS);
     }
 
     #[test]
@@ -5784,6 +6286,9 @@ mod tests {
     // the complete asynchronous load attempt in this test.
     #[allow(clippy::await_holding_lock)]
     async fn parakeet_load_rejects_invalid_nemo_archive() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _guard = env_lock().lock().expect("env lock poisoned");
 
         let root = std::env::temp_dir().join(format!("izwi-parakeet-runtime-{}", Uuid::new_v4()));

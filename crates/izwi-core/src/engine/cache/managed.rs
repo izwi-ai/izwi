@@ -515,6 +515,19 @@ impl Default for ManagedKvCacheManager {
     }
 }
 
+/// What a portable managed-state fit may spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortableFitHeadroom {
+    /// Stable planning headroom (chat and TTS state).
+    Planning,
+    /// Planning headroom clamped to live memory
+    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR state, which
+    /// must leave room for the requests it serves. `minimum_tokens` is the
+    /// one-chunk floor each sequence must reach (`0`: the page minimum); it
+    /// is admitted against planning headroom or the load is refused.
+    Live { minimum_tokens: u64 },
+}
+
 impl ManagedKvCacheManager {
     pub(crate) fn contains_model(&self, model_instance: ModelInstanceId) -> bool {
         self.models.contains_key(&model_instance)
@@ -573,6 +586,7 @@ impl ManagedKvCacheManager {
     /// Resolve the largest portable logical reach whose exact managed-state
     /// plan fits the stable shared-memory envelope. CUDA deliberately bypasses
     /// this path and keeps admission-growable arenas.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fit_portable_logical_token_reach(
         &self,
         model_instance: ModelInstanceId,
@@ -583,6 +597,7 @@ impl ManagedKvCacheManager {
         retained_sequence_rows: u32,
         staged_transaction_rows: u32,
         portable_state_copies: u32,
+        headroom: PortableFitHeadroom,
     ) -> Result<u64> {
         if self.worker_backend == BackendKind::Cuda || maximum_tokens == 0 {
             return Ok(maximum_tokens);
@@ -595,12 +610,30 @@ impl ManagedKvCacheManager {
         let Some(authority) = self.resource_authority.as_ref() else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let ResourceAmount::Known(headroom_bytes) =
-            authority.planning_headroom_bytes(self.worker_backend)?
-        else {
+        let planning = authority.planning_headroom_bytes(self.worker_backend)?;
+        let (growth_headroom, safety_reserve_bytes) = match headroom {
+            PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
+            // ASR state keeps the one reserve its invocation fit keeps too:
+            // the configured floor or the measured untracked growth (ADM-11).
+            PortableFitHeadroom::Live { .. } => (
+                authority.state_fit_headroom_bytes(self.worker_backend)?,
+                authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+            ),
+        };
+        let ResourceAmount::Known(headroom_bytes) = planning else {
             return Ok(maximum_tokens.min(4_096));
         };
-        let budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        // The model-authored minimum is admitted against planning headroom;
+        // live memory caps only growth above it. Right after a large load the
+        // live sample undercounts what the OS reclaims on demand (clean
+        // file-backed pages of the checkpoint just read, compressible
+        // pages), so a live floor refused even a one-page state.
+        let floor_budget_bytes = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let growth_budget_bytes = match growth_headroom {
+            ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+            ResourceAmount::Unknown => floor_budget_bytes,
+        }
+        .min(floor_budget_bytes);
         let page_tokens_hint = u32::try_from(page_tokens_hint)
             .map_err(|_| Error::InvalidInput("managed KV page size exceeds u32".into()))?;
         let state_plan = negotiate_state_plan(
@@ -642,13 +675,26 @@ impl ManagedKvCacheManager {
                 })
         };
 
-        let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
+        let floor_tokens = match headroom {
+            PortableFitHeadroom::Live { minimum_tokens } => minimum_tokens,
+            PortableFitHeadroom::Planning => 0,
+        };
+        let minimum_tokens = u64::from(page_tokens_hint)
+            .max(floor_tokens)
+            .min(maximum_tokens);
         let minimum_bytes = required_bytes(minimum_tokens)?;
-        if minimum_bytes > budget_bytes {
-            return Err(Error::ModelLoadError(format!(
+        if minimum_bytes > floor_budget_bytes {
+            let message = format!(
                 "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
-            )));
+            );
+            // An ASR floor that planning headroom cannot hold is a capacity
+            // refusal (503), not a load defect.
+            return Err(match headroom {
+                PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
+                PortableFitHeadroom::Planning => Error::ModelLoadError(message),
+            });
         }
+        let budget_bytes = growth_budget_bytes.max(minimum_bytes);
         if required_bytes(maximum_tokens)? <= budget_bytes {
             return Ok(maximum_tokens);
         }
@@ -5831,6 +5877,7 @@ mod tests {
                     8,
                     8,
                     1,
+                    PortableFitHeadroom::Planning,
                 )
                 .unwrap(),
             4_096
@@ -5851,10 +5898,152 @@ mod tests {
                 8,
                 8,
                 2,
+                PortableFitHeadroom::Planning,
             )
             .unwrap();
         assert!(selected < 4_096);
         assert!(selected >= 64);
+    }
+
+    /// ASR state fits spend live memory, not only ledger headroom: with the
+    /// ledger empty but most of the machine in use elsewhere, the live fit
+    /// shrinks while the planning fit still takes the whole ceiling.
+    #[test]
+    fn live_portable_fit_shrinks_to_live_headroom_below_planning() {
+        const RESERVE: u64 = 64 * 1024 * 1024;
+        let contract = test_contract();
+        let bytes = |tokens: u64| {
+            let state_plan = negotiate_state_plan(
+                &contract,
+                &StateBackendPlanRequest {
+                    backend: BackendKind::Cpu,
+                    device_ordinal: None,
+                    page_tokens_hint: Some(64),
+                    storage_dtype_hint: None,
+                },
+            )
+            .unwrap();
+            let (allocation, _) = plan_managed_state_capacity(
+                &state_plan,
+                ModelInstanceId::new(902),
+                ManagedStateCapacityRequest {
+                    total_paged_pages: u32::MAX,
+                    logical_token_reach: Some(tokens),
+                    retained_sequence_rows: 8,
+                    staged_transaction_rows: 8,
+                },
+            )
+            .unwrap();
+            let resources = managed_state_resources(
+                BackendKind::Cpu,
+                allocation.maximum_resources(&state_plan).unwrap(),
+            )
+            .unwrap();
+            let ResourceAmount::Known(bytes) = resources.host_bytes else {
+                panic!("test plan must have known host bytes");
+            };
+            bytes
+        };
+        // The ledger admits 4,096 tokens; live memory only 1,024.
+        let capacity = host_bytes_vector(RESERVE + bytes(4_096));
+        let available = host_bytes_vector(RESERVE + bytes(1_024));
+        let manager = ManagedKvCacheManager::for_worker(
+            Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
+                TestCapacityProvider {
+                    snapshot: PhysicalCapacitySnapshot {
+                        capacity,
+                        available,
+                        source: CapacitySource::Test,
+                    },
+                },
+            )))),
+            BackendKind::Cpu,
+            Device::Cpu,
+        );
+        let fit = |headroom| {
+            manager
+                .fit_portable_logical_token_reach(
+                    ModelInstanceId::new(902),
+                    &contract,
+                    4_096,
+                    RESERVE,
+                    64,
+                    8,
+                    8,
+                    1,
+                    headroom,
+                )
+                .unwrap()
+        };
+        assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
+        let live = fit(PortableFitHeadroom::Live { minimum_tokens: 0 });
+        assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
+
+        // Right after a large load live memory can read below the reserve
+        // (Granite on Metal: 0.8 GB live beside a 1 GiB reserve). The
+        // minimum is admitted against planning headroom, so the fit returns
+        // it instead of failing the load; only growth is capped by live.
+        let fit_with = |capacity: u64, available: u64, floor: u64| {
+            ManagedKvCacheManager::for_worker(
+                Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
+                    TestCapacityProvider {
+                        snapshot: PhysicalCapacitySnapshot {
+                            capacity: host_bytes_vector(capacity),
+                            available: host_bytes_vector(available),
+                            source: CapacitySource::Test,
+                        },
+                    },
+                )))),
+                BackendKind::Cpu,
+                Device::Cpu,
+            )
+            .fit_portable_logical_token_reach(
+                ModelInstanceId::new(902),
+                &contract,
+                4_096,
+                RESERVE,
+                64,
+                8,
+                8,
+                1,
+                PortableFitHeadroom::Live {
+                    minimum_tokens: floor,
+                },
+            )
+        };
+        assert_eq!(
+            fit_with(RESERVE + bytes(4_096), RESERVE / 2, 0).unwrap(),
+            64
+        );
+        // A minimum that planning headroom cannot hold is a capacity refusal.
+        assert!(matches!(
+            fit_with(RESERVE + bytes(64) - 1, RESERVE + bytes(64) - 1, 0),
+            Err(Error::Overloaded(_))
+        ));
+        // An ASR floor of one chunk per sequence (Qwen3-ASR's 1,307 tokens):
+        // with live memory below the reserve the fit still reaches the floor
+        // (never a context smaller than one chunk), or refuses with
+        // Overloaded when planning headroom cannot hold it.
+        let reach = fit_with(RESERVE + bytes(4_096), RESERVE / 2, 1_307).unwrap();
+        assert!((1_307..1_307 + 64).contains(&reach), "floor fit {reach}");
+        assert!(matches!(
+            fit_with(RESERVE + bytes(1_024), RESERVE / 2, 1_307),
+            Err(Error::Overloaded(_))
+        ));
+        // A floor above the model's own context is capped by it.
+        assert_eq!(
+            fit_with(RESERVE + bytes(4_096), RESERVE / 2, 1 << 20).unwrap(),
+            4_096
+        );
+    }
+
+    fn host_bytes_vector(bytes: u64) -> ResourceVector {
+        ResourceVector {
+            host_bytes: ResourceAmount::Known(bytes),
+            device_bytes: ResourceAmount::Known(bytes),
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        }
     }
 
     #[test]

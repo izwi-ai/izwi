@@ -11,10 +11,13 @@
 pub mod buffer_pool;
 pub mod cpu_q8;
 pub mod cuda;
+pub mod depthwise_conv;
+pub mod f16_weight_linear;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
+pub mod numeric_check;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
 

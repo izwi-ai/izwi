@@ -1,6 +1,9 @@
 use crate::backends::state::PhysicalStateTransactionId;
 use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
+use crate::models::architectures::granite_speech::asr::{
+    granite_speech_request_plan, GraniteSpeechTask,
+};
 use crate::models::architectures::lfm25_audio::asr_retained::{
     Lfm25AudioAsrDecodeStep, Lfm25AudioAsrQuantumCheckpoint, Lfm25AudioAsrStopReason,
 };
@@ -22,7 +25,10 @@ use crate::models::architectures::whisper::asr::WhisperTerminalTransition;
 use crate::models::registry::{
     NativeAsrDecodeCheckpoint, NativeAsrDecodeStep, NativeAsrGenerationOptions, NativeAsrModel,
 };
-use crate::runtime::granite_auto_asr_max_tokens_for_duration;
+use crate::runtime::{
+    granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
+    invocation_decode_room,
+};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +40,10 @@ use super::super::{
     RealtimePreparationMode, RealtimeStageOutcome, RealtimeSubphase, SequenceRestartReason,
     SessionKey, WorkUnit,
 };
-use super::audio::{decode_request_audio_with_rate, AsrChunkTranscription};
+use super::audio::{
+    decode_request_audio_with_rate, timestamp_words_json, AsrChunkTranscription,
+    AsrRouteCapabilities, ChunkedAsrTranscription, PlannedAsrChunks,
+};
 use super::state::{
     ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode,
     ActiveVoxtralRealtime,
@@ -241,6 +250,123 @@ fn resolve_asr_execution_audio(
     ))
 }
 
+/// Executor path for an ASR request that no realtime or retained-sequence
+/// executor claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicAsrRoute {
+    /// The prepared LFM2.5 Audio lease chunks and decodes the audio itself.
+    Lfm25AudioLongForm,
+    /// The generic path, which resolves a `NativeAsrModel` (or Voxtral) lease.
+    Generic,
+}
+
+/// Audio-chat models are loaded only as audio-chat leases, never into the
+/// `NativeAsrModel` registry that the generic path resolves. Route their
+/// long-form requests to the dedicated executor and fail closed otherwise,
+/// instead of reporting a loaded model as missing.
+fn atomic_asr_route(
+    request: &EngineCoreRequest,
+    variant: crate::model::ModelVariant,
+) -> Result<AtomicAsrRoute> {
+    if !variant.is_audio_chat() {
+        return Ok(AtomicAsrRoute::Generic);
+    }
+    if variant.family() == ModelFamily::Lfm25Audio && request.uses_asr_long_form_atomic() {
+        return Ok(AtomicAsrRoute::Lfm25AudioLongForm);
+    }
+    Err(Error::InvalidInput(format!(
+        "ASR request {} for audio-chat model {variant} has no retained or long-form route",
+        request.id
+    )))
+}
+
+/// LFM2.5 Audio sizes each long-form chunk's decode budget from the chunk's
+/// duration. Only a caller-set limit overrides that; the request default would
+/// otherwise replace it for every chunk.
+fn lfm25_audio_asr_long_form_max_tokens(request: &EngineCoreRequest) -> Option<usize> {
+    (!request.asr_auto_max_tokens).then_some(request.params.max_tokens)
+}
+
+/// Physical model call the generic ASR path makes for a `NativeAsrModel`
+/// family, in every mode (streaming or not, single pass or per chunk). Each
+/// route runs against the lifecycle-owned invocation workspace. There is no
+/// route to the registry's workspace-less APIs: Qwen3 cannot run there at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalAsrRoute {
+    Qwen3,
+    VibeVoice,
+    GraniteSpeech,
+    Whisper,
+    Parakeet,
+    Nemotron,
+}
+
+/// Every family is listed, so a new one has to choose a physical route here
+/// or fail with a typed error before any model call.
+fn physical_asr_route(family: ModelFamily) -> Result<PhysicalAsrRoute> {
+    match family {
+        ModelFamily::Qwen3Asr => Ok(PhysicalAsrRoute::Qwen3),
+        ModelFamily::VibeVoiceAsr => Ok(PhysicalAsrRoute::VibeVoice),
+        ModelFamily::GraniteSpeechAsr => Ok(PhysicalAsrRoute::GraniteSpeech),
+        ModelFamily::WhisperAsr => Ok(PhysicalAsrRoute::Whisper),
+        ModelFamily::ParakeetAsr => Ok(PhysicalAsrRoute::Parakeet),
+        ModelFamily::NemotronAsr => Ok(PhysicalAsrRoute::Nemotron),
+        // Voxtral and LFM2.5 Audio have their own executors; the forced
+        // aligner and the remaining families do not transcribe.
+        ModelFamily::Voxtral
+        | ModelFamily::Lfm25Audio
+        | ModelFamily::Qwen3ForcedAligner
+        | ModelFamily::Qwen3Tts
+        | ModelFamily::KokoroTts
+        | ModelFamily::VoxtralTts
+        | ModelFamily::VibeVoiceTts
+        | ModelFamily::FishS2Tts
+        | ModelFamily::SortformerDiarization
+        | ModelFamily::Qwen3Chat
+        | ModelFamily::Qwen3MoeChat
+        | ModelFamily::Qwen35Chat
+        | ModelFamily::Qwen35MoeChat
+        | ModelFamily::Qwen38Chat
+        | ModelFamily::Lfm2Chat
+        | ModelFamily::Gemma3Chat
+        | ModelFamily::Tokenizer => Err(Error::InvalidInput(format!(
+            "{family:?} has no physical ASR route on the generic executor path"
+        ))),
+    }
+}
+
+/// The route plan the generic path executes. A long-form row runs the plan
+/// its preparation stored, unchanged; a family without a preparation stage
+/// (Nemotron, offline Voxtral) is planned here by the same rule.
+fn asr_execution_route_plan(
+    request: &EngineCoreRequest,
+    samples: &[f32],
+    sample_rate: u32,
+    capabilities: impl FnOnce() -> Result<AsrRouteCapabilities>,
+) -> Result<Arc<PlannedAsrChunks>> {
+    if let Some(plan) = request.prepared_asr_route_plan() {
+        if plan.input_samples != samples.len() || plan.sample_rate != sample_rate {
+            return Err(Error::InferenceError(format!(
+                "ASR request {} route plan does not match its prepared audio",
+                request.id
+            )));
+        }
+        return Ok(plan);
+    }
+    if request.uses_asr_long_form_atomic() {
+        return Err(Error::InferenceError(format!(
+            "long-form ASR request {} lost its prepared route plan",
+            request.id
+        )));
+    }
+    Ok(Arc::new(NativeExecutor::asr_route_plan(
+        samples,
+        sample_rate,
+        &capabilities()?,
+        request.streaming,
+    )))
+}
+
 fn begins_resumable_asr_prefill_state(
     scheduled: &ScheduledRequest,
     resumable_prefill: bool,
@@ -285,6 +411,25 @@ fn run_asr_model_call<T>(
 ) -> Result<Option<T>> {
     let output = run()?;
     Ok((!request.is_cancelled()).then_some(output))
+}
+
+/// Settle an atomic ASR invocation against cooperative cancellation. The
+/// chunk executor stops with `Cancelled` at the first chunk boundary after the
+/// signal flips; a single-window model call cannot be preempted, so a
+/// cancellation that arrived during it is honored here instead. Either way no
+/// text or staged stream output is published, and `None` tells the caller to
+/// finish the row as cancelled.
+fn settle_atomic_asr_cancellation<T>(
+    request: &EngineCoreRequest,
+    result: Result<T>,
+) -> Result<Option<T>> {
+    match result {
+        Err(Error::Cancelled(_)) => {}
+        Ok(_) if request.is_cancelled() => {}
+        other => return other.map(Some),
+    }
+    let _ = request.take_staged_stream_outputs();
+    Ok(None)
 }
 
 fn validate_continuous_asr_batch_shape(scheduled: &[ScheduledRequest]) -> Result<()> {
@@ -2979,6 +3124,8 @@ impl NativeExecutor {
                 samples.len(),
                 sample_rate,
                 &Self::asr_generation_options(request),
+                self.asr_effective_context(variant)
+                    .zip(model.audio_token_rate()),
             );
             let Some(decode_state) = run_asr_model_call(request, || {
                 Self::run_blocking(|| {
@@ -3356,6 +3503,7 @@ impl NativeExecutor {
             let mut finished = false;
             let mut cancelled = false;
             let mut restart = false;
+            let mut diagnostics = None;
             let mut events = Vec::new();
             for _ in 0..iterations {
                 if request.is_cancelled() {
@@ -3408,6 +3556,9 @@ impl NativeExecutor {
                         break;
                     };
                     restart = matches!(action, WhisperTerminalAction::Restart);
+                    if !restart {
+                        diagnostics = active.model.whisper_terminal_diagnostics(&active.state)?;
+                    }
                 } else {
                     // Whisper fallback policy can reject an entire temperature attempt at
                     // EOS. Do not publish provisional text before the policy accepts it.
@@ -3487,25 +3638,35 @@ impl NativeExecutor {
                 active.input_sample_count,
                 completions,
                 restart,
+                diagnostics,
             ))
         })();
-        let (generated, text, finished, cancelled, sample_rate, sample_count, completions, restart) =
-            match execution {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = request.take_staged_stream_outputs()?;
-                    if let Some(checkpoint) = checkpoint.take() {
-                        state_lease
-                            .require_state_mut()?
-                            .state
-                            .rollback_managed_quantum(checkpoint)?;
-                        state_lease.mark_clean();
-                    } else if fresh {
-                        state_lease.discard_state();
-                    }
-                    return Err(error);
+        let (
+            generated,
+            text,
+            finished,
+            cancelled,
+            sample_rate,
+            sample_count,
+            completions,
+            restart,
+            diagnostics,
+        ) = match execution {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = request.take_staged_stream_outputs()?;
+                if let Some(checkpoint) = checkpoint.take() {
+                    state_lease
+                        .require_state_mut()?
+                        .state
+                        .rollback_managed_quantum(checkpoint)?;
+                    state_lease.mark_clean();
+                } else if fresh {
+                    state_lease.discard_state();
                 }
-            };
+                return Err(error);
+            }
+        };
         if cancelled {
             if let Some(checkpoint) = checkpoint.take() {
                 state_lease
@@ -3578,11 +3739,120 @@ impl NativeExecutor {
             tokens_generated: generated,
             finished,
             phase_timing_override: None,
-            asr_diagnostics: None,
+            asr_diagnostics: diagnostics,
             error: None,
             logprobs: Vec::new(),
         })
         .with_managed_cache_completions(completions))
+    }
+
+    /// Run audio that LFM2.5 Audio preparation planned as several chunks. The
+    /// model chunks, decodes and merges internally, using the prepared lease
+    /// and the atomic stage's main-backbone invocation workspace.
+    fn lfm25_audio_asr_long_form_request(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+    ) -> Result<ModelSessionResult> {
+        let model = request
+            .prepared_lfm25_audio_asr_model_lease_for_executor()?
+            .ok_or_else(|| {
+                Error::InferenceError("LFM2.5 Audio long-form ASR lost model residency".into())
+            })?;
+        let (execution_audio, sample_rate, audio_decode_ms) =
+            resolve_asr_execution_audio(request, ModelFamily::Lfm25Audio, || {
+                Self::run_blocking(|| decode_request_audio_with_rate(request))
+            })?;
+        let samples = execution_audio.samples();
+        let max_tokens = lfm25_audio_asr_long_form_max_tokens(request);
+        let stream_tx = Self::stream_sender(request);
+        let stream_policy = request.stream_policy;
+        let mut leases =
+            super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
+        let chunk_plan = asr_execution_route_plan(request, samples, sample_rate, || {
+            Ok(model.asr_route_capabilities())
+        })?;
+        let transcription = Self::run_blocking(|| {
+            let mut sequence = 0usize;
+            let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                &request.id,
+                &|| request.is_cancelled(),
+                stream_tx.as_ref(),
+                stream_policy,
+                &mut sequence,
+                samples,
+                sample_rate,
+                &chunk_plan.chunks,
+                &chunk_plan.config,
+                Self::asr_chunk_stream_options(),
+                |chunk_audio, sr, _prefix_text, partial| {
+                    let chunk_secs = chunk_audio.len() as f32 / sr.max(1) as f32;
+                    let options = NativeAsrGenerationOptions {
+                        max_new_tokens: model
+                            .lfm25_audio_asr_chunk_max_new_tokens(chunk_secs, max_tokens),
+                        ..NativeAsrGenerationOptions::default()
+                    };
+                    let mut no_partials = |_: &str| {};
+                    let emit: &mut dyn FnMut(&str) = match partial {
+                        Some(emit) => emit,
+                        None => &mut no_partials,
+                    };
+                    let output = model
+                        .transcribe_single_pass_with_callback_and_options_from_invocation_workspace(
+                            chunk_audio,
+                            sr,
+                            options,
+                            &mut leases,
+                            emit,
+                        )?;
+                    Ok(AsrChunkTranscription {
+                        text: output.text,
+                        diagnostics: output.diagnostics,
+                    })
+                },
+            )?;
+            let (text, diagnostics) = Self::chunked_asr_result(&chunk_plan, chunked);
+            Ok(crate::models::registry::NativeAsrTranscription {
+                text,
+                language: None,
+                diagnostics,
+            })
+        });
+        let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        };
+        let completions = leases.release()?;
+        if completions.len() != 2 {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio long-form ASR returned an incomplete physical-state completion set"
+                    .into(),
+            ));
+        }
+        let samples_len = samples.len();
+
+        Ok(ModelSessionResult::atomic(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput {
+                streamed_samples: None,
+                samples: Vec::new(),
+                sample_rate,
+                duration_secs: samples_len as f32 / sample_rate as f32,
+            }),
+            text: Some(transcription.text),
+            input_transcription: None,
+            tokens_processed: request.num_prompt_tokens(),
+            tokens_generated: (samples_len / 256).max(1),
+            finished: true,
+            phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
+            asr_diagnostics: Self::with_audio_decode_timing(
+                transcription.diagnostics,
+                audio_decode_ms,
+            ),
+            error: None,
+            logprobs: Vec::new(),
+        }))
     }
 
     fn lfm25_audio_asr_sequence_request(
@@ -4460,19 +4730,6 @@ impl NativeExecutor {
                     )
                 })?;
             let samples_len = samples.len();
-            let chunk_plan = Self::asr_chunk_plan(
-                samples.as_ref(),
-                sample_rate,
-                prepared_model.max_audio_seconds_hint(),
-                false,
-                false,
-            );
-            if chunk_plan.requires_chunk_path() {
-                return Err(Error::InvalidInput(
-                    "managed Qwen3 ASR cannot switch a retained sequence row to the long-audio chunk executor"
-                        .to_string(),
-                ));
-            }
 
             let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
             let cache = managed_cache.take().ok_or_else(|| {
@@ -5985,10 +6242,12 @@ impl NativeExecutor {
             .rows
             .iter_mut()
             .map(|row| {
+                let max_tokens = requests[row.index].params.max_tokens;
                 let active = row.lease.require_state_mut()?;
                 Ok(ParakeetRetainedDecodeBatchRow {
                     artifact: active.artifact.as_ref(),
                     state: &mut active.state,
+                    max_tokens,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -6641,329 +6900,17 @@ impl NativeExecutor {
                 "retained ASR state was routed outside a retained sequence executor".to_string(),
             ));
         }
-        let mut managed_cache = None;
+        match atomic_asr_route(request, variant)? {
+            AtomicAsrRoute::Lfm25AudioLongForm => {
+                return self.lfm25_audio_asr_long_form_request(request, scheduled);
+            }
+            AtomicAsrRoute::Generic => {}
+        }
         let language = request.asr_language_for_execution();
         let asr_prompt = request.asr_prompt_for_execution();
         let generation_options = Self::asr_generation_options(request);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
-        let session = scheduled.session_key();
-
-        if let Some(tx) = stream_tx.as_ref() {
-            if !matches!(family, ModelFamily::Voxtral) {
-                let mut state_lease = ExecutorStateLease::checkout(
-                    &self.asr_decode_states,
-                    session,
-                    variant,
-                    "ASR decode",
-                )?;
-                if state_lease
-                    .state()
-                    .map(|state| state.variant != variant)
-                    .unwrap_or(false)
-                {
-                    state_lease.discard_state();
-                }
-                let (model, new_model_lease) = if let Some(state) = state_lease.state() {
-                    (state.model.clone(), None)
-                } else {
-                    let (model, lease) = self.asr_model_for_request(request, variant)?;
-                    (model, Some(lease))
-                };
-
-                if model.supports_incremental_decode()
-                    && !matches!(family, ModelFamily::NemotronAsr)
-                    && !request.uses_asr_long_form_atomic()
-                {
-                    let mut initial_media_decode_ms = None;
-                    if state_lease.state().is_some() {
-                        if let Some(cache) = managed_cache.take() {
-                            state_lease.mark_dirty();
-                            state_lease
-                                .require_state_mut()?
-                                .state
-                                .install_qwen3_managed_reservation(cache)?;
-                        }
-                    } else {
-                        if request.is_cancelled() {
-                            state_lease.release()?;
-                            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                                request.id.clone(),
-                            )));
-                        }
-                        let audio_decode_started = Instant::now();
-                        let (samples, sample_rate) =
-                            Self::run_blocking(|| decode_request_audio_with_rate(request))?;
-                        let audio_decode_ms = audio_decode_started.elapsed().as_secs_f64() * 1000.0;
-                        initial_media_decode_ms = Some(audio_decode_ms);
-                        let samples_len = samples.len();
-
-                let (streaming_low_latency, allow_speech_planner) =
-                    Self::asr_chunk_plan_streaming_args(
-                        request.streaming,
-                        matches!(family, ModelFamily::WhisperAsr),
-                    );
-                let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
-                    model.max_audio_seconds_hint(),
-                    model.audio_token_rate(),
-                    self.asr_effective_context(variant),
-                    |_| MAX_ASR_NEW_TOKENS,
-                )?;
-                let chunk_plan = Self::asr_chunk_plan(
-                    &samples,
-                    sample_rate,
-                    audio_limit_secs,
-                    streaming_low_latency,
-                    allow_speech_planner,
-                );
-                        if chunk_plan.requires_chunk_path() {
-                            if managed_cache.is_some() {
-                                return Err(Error::InvalidInput(
-                                    "managed Qwen3 ASR cannot switch a scheduled sequence row to the chunked executor"
-                                        .to_string(),
-                                ));
-                            }
-                            let mut sequence = 0usize;
-                            let chunk_stream_options = if matches!(family, ModelFamily::Qwen3Asr) {
-                                Self::asr_chunk_stream_options()
-                            } else {
-                                Default::default()
-                            };
-                            let chunked = Self::run_blocking(|| {
-                                Self::transcribe_with_chunk_plan_with_details_and_options(
-                                    &request.id,
-                                    Some(tx),
-                                    stream_policy,
-                                    &mut sequence,
-                                    &samples,
-                                    sample_rate,
-                                    &chunk_plan.chunks,
-                                    &chunk_plan.config,
-                                    chunk_stream_options,
-                                    |chunk_audio, sr, _prefix_text| {
-                                        let details = model
-                                            .transcribe_with_details_and_prompt_and_options(
-                                                chunk_audio,
-                                                sr,
-                                                language,
-                                                asr_prompt,
-                                                generation_options.clone(),
-                                            )?;
-                                        Ok(AsrChunkTranscription {
-                                            text: details.text,
-                                            diagnostics: details.diagnostics,
-                                        })
-                                    },
-                                )
-                            })?;
-                            let diagnostics = Self::with_audio_decode_timing(
-                                Some(chunk_plan.diagnostics_with_chunk_transcriptions(
-                                    chunked.chunk_diagnostics,
-                                )),
-                                audio_decode_ms,
-                            );
-
-                            return Ok(ModelSessionResult::atomic(ExecutorOutput {
-                                request_id: request.id.clone(),
-                                audio: Some(AudioOutput {
-                                    streamed_samples: None,
-                                    samples: Vec::new(),
-                                    sample_rate,
-                                    duration_secs: if sample_rate > 0 {
-                                        samples_len as f32 / sample_rate as f32
-                                    } else {
-                                        0.0
-                                    },
-                                }),
-                                text: Some(chunked.text),
-                                input_transcription: None,
-                                tokens_processed: request.num_prompt_tokens(),
-                                tokens_generated: (samples_len / 256).max(1),
-                                finished: true,
-                                phase_timing_override: Some(
-                                    ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms),
-                                ),
-                                asr_diagnostics: diagnostics,
-                                error: None,
-                                logprobs: Vec::new(),
-                            }));
-                        }
-
-                        // Keep ASR decode bounded. If EOS is missed, very high caps
-                        // produce runaway gibberish and extreme latency.
-                        let max_new_tokens = request.params.max_tokens.clamp(1, MAX_ASR_NEW_TOKENS);
-                        let cache = managed_cache.take().ok_or_else(|| {
-                            Error::InferenceError(
-                                "incremental Qwen3 ASR requires scheduler-owned physical KV"
-                                    .to_string(),
-                            )
-                        })?;
-                        let decode_state = Self::run_blocking(|| {
-                            model.start_decode_state_with_prompt_managed(
-                                &samples,
-                                sample_rate,
-                                language,
-                                asr_prompt,
-                                max_new_tokens,
-                                cache,
-                            )
-                        })?;
-                        if decode_state.sequence_position() != Some(request.num_prompt_tokens()) {
-                            return Err(Error::InferenceError(
-                                "Qwen3 ASR prepared multimodal span does not match model prefill"
-                                    .to_string(),
-                            ));
-                        }
-                        state_lease.install_state(ActiveAsrDecode {
-                            variant,
-                            model: model.clone(),
-                            _model_lease: new_model_lease
-                                .expect("a new ASR decode state must retain its model lease"),
-                            state: decode_state,
-                            last_tokens_generated: 0,
-                            stream_sequence: 0,
-                            input_sample_rate: sample_rate,
-                            input_sample_count: samples_len,
-                        })?;
-                    }
-
-                    if request.is_cancelled() {
-                        state_lease.release()?;
-                        return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
-                            request.id.clone(),
-                        )));
-                    }
-
-                    let decode_iterations = if scheduled.is_prefill {
-                        1
-                    } else {
-                        scheduled.num_tokens.max(1)
-                    };
-                    state_lease.mark_dirty();
-                    let (
-                        tokens_processed,
-                        total_tokens_generated,
-                        final_text,
-                        finished,
-                        input_sample_rate,
-                        input_sample_count,
-                        managed_cache_completions,
-                    ) = {
-                        let active_state = state_lease.require_state_mut()?;
-                        let mut decode_steps_ran = 0usize;
-                        let mut total_tokens_generated = 0usize;
-                        let mut final_text = String::new();
-                        let mut finished = false;
-
-                        for _ in 0..decode_iterations {
-                            if request.is_cancelled() {
-                                return Ok(ModelSessionResult::cancelled(
-                                    ExecutorOutput::cancelled(request.id.clone()),
-                                ));
-                            }
-                            let step = Self::run_blocking(|| {
-                                active_state.model.decode_step(&mut active_state.state)
-                            })?;
-                            if request.is_cancelled() {
-                                return Ok(ModelSessionResult::cancelled(
-                                    ExecutorOutput::cancelled(request.id.clone()),
-                                ));
-                            }
-                            decode_steps_ran = decode_steps_ran.saturating_add(1);
-                            let step_tokens_generated = step
-                                .tokens_generated
-                                .saturating_sub(active_state.last_tokens_generated);
-                            active_state.last_tokens_generated = step.tokens_generated;
-                            total_tokens_generated =
-                                total_tokens_generated.saturating_add(step_tokens_generated);
-                            final_text = step.text.clone();
-
-                            if !step.delta.is_empty() {
-                                Self::stream_text_with_policy(
-                                    tx,
-                                    stream_policy,
-                                    &request.id,
-                                    &mut active_state.stream_sequence,
-                                    step.delta,
-                                )?;
-                            }
-                            if step.finished {
-                                Self::stream_final_marker_with_policy(
-                                    tx,
-                                    stream_policy,
-                                    &request.id,
-                                    &mut active_state.stream_sequence,
-                                )?;
-                                finished = true;
-                                break;
-                            }
-                        }
-
-                        let tokens_processed = if scheduled.is_prefill {
-                            request.num_prompt_tokens()
-                        } else {
-                            decode_steps_ran.max(1)
-                        };
-                        let input_sample_rate = active_state.input_sample_rate;
-                        let input_sample_count = active_state.input_sample_count;
-                        let managed_cache_completions =
-                            active_state.state.take_managed_write_completions();
-                        (
-                            tokens_processed,
-                            total_tokens_generated,
-                            final_text,
-                            finished,
-                            input_sample_rate,
-                            input_sample_count,
-                            managed_cache_completions,
-                        )
-                    };
-
-                    if finished {
-                        state_lease.release()?;
-                    } else {
-                        state_lease.restore()?;
-                    }
-
-                    return Ok(ModelSessionResult::sequence(ExecutorOutput {
-                        request_id: request.id.clone(),
-                        audio: Some(AudioOutput {
-                            streamed_samples: None,
-                            samples: Vec::new(),
-                            sample_rate: input_sample_rate,
-                            duration_secs: if input_sample_rate > 0 {
-                                input_sample_count as f32 / input_sample_rate as f32
-                            } else {
-                                0.0
-                            },
-                        }),
-                        text: Some(final_text),
-                        input_transcription: None,
-                        tokens_processed,
-                        tokens_generated: total_tokens_generated,
-                        finished,
-                        phase_timing_override: initial_media_decode_ms
-                            .map(ExecutorPhaseTiming::with_media_decode_ms),
-                        asr_diagnostics: None,
-                        error: None,
-                        logprobs: Vec::new(),
-                    })
-                    .with_managed_cache_completions(managed_cache_completions));
-                }
-                if managed_cache.is_some() {
-                    return Err(Error::InferenceError(
-                        "managed Qwen3 ASR reservation reached a non-incremental model".to_string(),
-                    ));
-                }
-            }
-        }
-
-        if managed_cache.is_some() {
-            return Err(Error::InferenceError(
-                "managed Qwen3 ASR reservation requires the incremental streaming graph"
-                    .to_string(),
-            ));
-        }
 
         let (execution_audio, sample_rate, audio_decode_ms) =
             resolve_asr_execution_audio(request, family, || {
@@ -6972,7 +6919,7 @@ impl NativeExecutor {
         let samples = execution_audio.samples();
         let samples_len = samples.len();
 
-        let (text, asr_diagnostics) = Self::run_blocking(|| {
+        let transcription = Self::run_blocking(|| {
             let mut sequence = 0usize;
             if matches!(family, ModelFamily::Voxtral) {
                 let model = self.with_registry(|registry| {
@@ -6983,39 +6930,61 @@ impl NativeExecutor {
                     })
                 })?;
 
-                let chunk_plan = Self::asr_chunk_plan(samples, sample_rate, None, false, false);
+                let chunk_plan = asr_execution_route_plan(request, samples, sample_rate, || {
+                    Ok(model.asr_route_capabilities())
+                })?;
                 if chunk_plan.requires_chunk_path() {
-                    let chunked = Self::transcribe_with_chunk_plan_with_details(
-                        &request.id,
-                        stream_tx.as_ref(),
-                        stream_policy,
-                        &mut sequence,
-                        samples,
-                        sample_rate,
-                        &chunk_plan.chunks,
-                        &chunk_plan.config,
-                        |chunk_audio, sr| {
-                            with_single_invocation_cache(request, scheduled, |cache| {
-                                model.transcribe_with_details_physical(
-                                    chunk_audio,
-                                    sr,
-                                    language,
-                                    cache,
-                                )
-                            })
-                            .map(|details| AsrChunkTranscription {
-                                text: details.text,
-                                diagnostics: details.diagnostics,
-                            })
-                        },
-                    )?;
-                    return Ok((
-                        chunked.text,
-                        Some(
-                            chunk_plan
-                                .diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics),
-                        ),
-                    ));
+                    let chunked =
+                        Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                            &request.id,
+                            &|| request.is_cancelled(),
+                            stream_tx.as_ref(),
+                            stream_policy,
+                            &mut sequence,
+                            samples,
+                            sample_rate,
+                            &chunk_plan.chunks,
+                            &chunk_plan.config,
+                            Self::asr_chunk_stream_options(),
+                            |chunk_audio, sr, _prefix_text, partial| {
+                                if let Some(emit) = partial {
+                                    return with_single_invocation_cache(
+                                        request,
+                                        scheduled,
+                                        |cache| {
+                                            model.transcribe_with_callback_physical(
+                                                chunk_audio,
+                                                sr,
+                                                language,
+                                                emit,
+                                                cache,
+                                            )
+                                        },
+                                    )
+                                    .map(|text| {
+                                        AsrChunkTranscription {
+                                            text,
+                                            diagnostics: None,
+                                        }
+                                    });
+                                }
+                                with_single_invocation_cache(request, scheduled, |cache| {
+                                    model.transcribe_with_details_physical(
+                                        chunk_audio,
+                                        sr,
+                                        language,
+                                        cache,
+                                    )
+                                })
+                                .map(|details| {
+                                    AsrChunkTranscription {
+                                        text: details.text,
+                                        diagnostics: details.diagnostics,
+                                    }
+                                })
+                            },
+                        )?;
+                    return Ok(Self::chunked_asr_result(&chunk_plan, chunked));
                 }
 
                 if request.streaming {
@@ -7061,29 +7030,21 @@ impl NativeExecutor {
                 return Ok((details.text, details.diagnostics));
             }
 
+            let route = physical_asr_route(family)?;
             let (model, _model_lease) = self.asr_model_for_request(request, variant)?;
 
-            let (streaming_low_latency, allow_speech_planner) =
-                Self::asr_chunk_plan_streaming_args(
-                    request.streaming,
-                    matches!(family, ModelFamily::WhisperAsr),
-                );
-            let audio_limit_secs = crate::runtime::compose_invocation_audio_limit(
-                model.max_audio_seconds_hint(),
-                model.audio_token_rate(),
-                self.asr_effective_context(variant),
-                |_| MAX_ASR_NEW_TOKENS,
-            )?;
-            let chunk_plan = Self::asr_chunk_plan(
-                samples,
-                sample_rate,
-                audio_limit_secs,
-                streaming_low_latency,
-                allow_speech_planner,
-            );
+            let granite_plan = matches!(family, ModelFamily::GraniteSpeechAsr)
+                .then(|| granite_speech_request_plan(variant, request.asr_native_word_timestamps));
+            let granite_task = granite_plan.map_or(GraniteSpeechTask::Asr, |plan| plan.task);
+            let effective_context = self.asr_effective_context(variant);
+            let invocation_context = effective_context.zip(model.audio_token_rate());
+            let chunk_plan = asr_execution_route_plan(request, samples, sample_rate, || {
+                AsrRouteCapabilities::for_native_model(&model, variant, request, effective_context)
+            })?;
             if chunk_plan.requires_chunk_path() {
                 let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
                     &request.id,
+                    &|| request.is_cancelled(),
                     stream_tx.as_ref(),
                     stream_policy,
                     &mut sequence,
@@ -7093,8 +7054,9 @@ impl NativeExecutor {
                     &chunk_plan.config,
                     Self::asr_chunk_stream_options(),
                     |chunk_audio, sr, prefix_text, partial| {
-                        let bounded_prefix_text = matches!(family, ModelFamily::GraniteSpeechAsr)
-                            .then(|| Self::granite_asr_prefix_replay_text(prefix_text));
+                        let bounded_prefix_text = granite_plan
+                            .filter(|plan| plan.prefix_replay)
+                            .map(|_| Self::granite_asr_prefix_replay_text(prefix_text));
                         let prefix_text = bounded_prefix_text
                             .as_deref()
                             .filter(|value| !value.trim().is_empty());
@@ -7104,9 +7066,33 @@ impl NativeExecutor {
                             chunk_audio.len(),
                             sr,
                             &generation_options,
+                            invocation_context,
                         );
-                        let mut details = match family {
-                            ModelFamily::Qwen3Asr => {
+                        let mut details = match route {
+                            PhysicalAsrRoute::Qwen3 => {
+                                if let Some(emit) = partial {
+                                    return with_single_invocation_cache(
+                                        request,
+                                        scheduled,
+                                        |cache| {
+                                            model
+                                                .transcribe_qwen3_with_callback_and_prompt_physical(
+                                                    chunk_audio,
+                                                    sr,
+                                                    language,
+                                                    asr_prompt,
+                                                    emit,
+                                                    cache,
+                                                )
+                                        },
+                                    )
+                                    .map(|text| {
+                                        AsrChunkTranscription {
+                                            text,
+                                            diagnostics: None,
+                                        }
+                                    });
+                                }
                                 with_single_invocation_cache(request, scheduled, |cache| {
                                     model.transcribe_qwen3_with_details_and_prompt_physical(
                                         chunk_audio,
@@ -7117,7 +7103,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::VibeVoiceAsr => {
+                            PhysicalAsrRoute::VibeVoice => {
                                 if let Some(emit) = partial {
                                     return with_vibevoice_invocation_state(
                                         request,
@@ -7150,12 +7136,13 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::GraniteSpeechAsr => {
+                            PhysicalAsrRoute::GraniteSpeech => {
                                 with_single_invocation_cache(request, scheduled, |cache| {
                                     model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
                                         chunk_audio,
                                         sr,
                                         language,
+                                        granite_task,
                                         asr_prompt,
                                         prefix_text,
                                         chunk_generation_options.clone(),
@@ -7163,7 +7150,7 @@ impl NativeExecutor {
                                     )
                                 })?
                             }
-                            ModelFamily::WhisperAsr => {
+                            PhysicalAsrRoute::Whisper => {
                                 if let Some(emit) = partial {
                                     return with_whisper_invocation_state(
                                         request,
@@ -7200,36 +7187,15 @@ impl NativeExecutor {
                                     },
                                 )?
                             }
-                            ModelFamily::ParakeetAsr => {
-                                if let Some(emit) = partial {
-                                    return with_single_invocation_tensor(
-                                        request,
-                                        scheduled,
-                                        |state| {
-                                            model.transcribe_parakeet_with_callback_physical(
-                                                chunk_audio,
-                                                sr,
-                                                language,
-                                                state,
-                                                emit,
-                                            )
-                                        },
-                                    )
-                                    .map(|text| AsrChunkTranscription {
-                                        text,
-                                        diagnostics: None,
-                                    });
-                                }
-                                with_single_invocation_tensor(request, scheduled, |state| {
-                                    model.transcribe_parakeet_with_details_physical(
-                                        chunk_audio,
-                                        sr,
-                                        language,
-                                        state,
-                                    )
-                                })?
+                            // Parakeet's windowed encoder covers any length in
+                            // one pass, so its route plan never chunks.
+                            PhysicalAsrRoute::Parakeet => {
+                                return Err(Error::InferenceError(format!(
+                                    "Parakeet ASR request {} reached the chunk route",
+                                    request.id
+                                )));
                             }
-                            ModelFamily::NemotronAsr => {
+                            PhysicalAsrRoute::Nemotron => {
                                 if let Some(emit) = partial {
                                     return with_nemotron_offline_state(
                                         request,
@@ -7266,27 +7232,21 @@ impl NativeExecutor {
                                     },
                                 )?
                             }
-                            _ => model.transcribe_with_details_prompt_prefix_and_options(
-                                chunk_audio,
-                                sr,
-                                language,
-                                asr_prompt,
-                                prefix_text,
-                                chunk_generation_options.clone(),
-                            )?,
                         };
                         if matches!(family, ModelFamily::GraniteSpeechAsr) {
-                            details = Self::recover_granite_chunk_loop(
+                            details = Self::recover_granite_chunk(
                                 &model,
                                 chunk_audio,
                                 sr,
                                 language,
+                                granite_task,
                                 asr_prompt,
                                 prefix_text,
                                 &chunk_generation_options,
                                 details,
                                 request,
                                 scheduled,
+                                invocation_context,
                             )?;
                         }
                         Ok(AsrChunkTranscription {
@@ -7295,12 +7255,7 @@ impl NativeExecutor {
                         })
                     },
                 )?;
-                return Ok((
-                    chunked.text,
-                    Some(
-                        chunk_plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics),
-                    ),
-                ));
+                return Ok(Self::chunked_asr_result(&chunk_plan, chunked));
             }
 
             // Granite's public auto budget is admitted at its conservative
@@ -7313,6 +7268,7 @@ impl NativeExecutor {
                 samples.len(),
                 sample_rate,
                 &generation_options,
+                invocation_context,
             );
 
             if request.streaming {
@@ -7331,8 +7287,20 @@ impl NativeExecutor {
                             }
                         }
                     };
-                    let text = match family {
-                        ModelFamily::VibeVoiceAsr => {
+                    let text = match route {
+                        PhysicalAsrRoute::Qwen3 => {
+                            with_single_invocation_cache(request, scheduled, |cache| {
+                                model.transcribe_qwen3_with_callback_and_prompt_physical(
+                                    samples,
+                                    sample_rate,
+                                    language,
+                                    asr_prompt,
+                                    &mut emit,
+                                    cache,
+                                )
+                            })?
+                        }
+                        PhysicalAsrRoute::VibeVoice => {
                             with_vibevoice_invocation_state(request, scheduled, |leases| {
                                 model
                                     .transcribe_vibevoice_with_callback_and_prompt_and_options_physical(
@@ -7346,7 +7314,7 @@ impl NativeExecutor {
                                     )
                             })?
                         }
-                        ModelFamily::GraniteSpeechAsr => {
+                        PhysicalAsrRoute::GraniteSpeech => {
                             with_single_invocation_cache(request, scheduled, |cache| {
                                 model
                                     .transcribe_granite_speech_with_callback_and_prompt_and_options_physical(
@@ -7360,7 +7328,7 @@ impl NativeExecutor {
                                     )
                             })?
                         }
-                        ModelFamily::WhisperAsr => with_whisper_invocation_state(
+                        PhysicalAsrRoute::Whisper => with_whisper_invocation_state(
                             request,
                             scheduled,
                             |self_kv, cross_kv| {
@@ -7375,7 +7343,7 @@ impl NativeExecutor {
                                 )
                             },
                         )?,
-                        ModelFamily::ParakeetAsr => {
+                        PhysicalAsrRoute::Parakeet => {
                             with_single_invocation_tensor(request, scheduled, |state| {
                                 model.transcribe_parakeet_with_callback_physical(
                                     samples,
@@ -7386,7 +7354,7 @@ impl NativeExecutor {
                                 )
                             })?
                         }
-                        ModelFamily::NemotronAsr => with_nemotron_offline_state(
+                        PhysicalAsrRoute::Nemotron => with_nemotron_offline_state(
                             request,
                             scheduled,
                             |predictor, acoustic| {
@@ -7401,14 +7369,6 @@ impl NativeExecutor {
                                 )
                             },
                         )?,
-                        _ => model.transcribe_with_callback_and_prompt_and_options(
-                            samples,
-                            sample_rate,
-                            language,
-                            asr_prompt,
-                            segment_generation_options.clone(),
-                            &mut emit,
-                        )?,
                     };
                     if let Some(err) = stream_err {
                         return Err(err);
@@ -7422,8 +7382,8 @@ impl NativeExecutor {
                     return Ok((text, None));
                 }
             }
-            let details = match family {
-                ModelFamily::Qwen3Asr => {
+            let details = match route {
+                PhysicalAsrRoute::Qwen3 => {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model.transcribe_qwen3_with_details_and_prompt_physical(
                             samples,
@@ -7434,7 +7394,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::VibeVoiceAsr => {
+                PhysicalAsrRoute::VibeVoice => {
                     with_vibevoice_invocation_state(request, scheduled, |leases| {
                         model.transcribe_vibevoice_with_details_and_prompt_and_options_physical(
                             samples,
@@ -7446,20 +7406,21 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::GraniteSpeechAsr => {
+                PhysicalAsrRoute::GraniteSpeech => {
                     with_single_invocation_cache(request, scheduled, |cache| {
                         model
                             .transcribe_granite_speech_with_details_and_prompt_and_options_physical(
                                 samples,
                                 sample_rate,
                                 language,
+                                granite_task,
                                 asr_prompt,
                                 segment_generation_options.clone(),
                                 cache,
                             )
                     })?
                 }
-                ModelFamily::WhisperAsr => {
+                PhysicalAsrRoute::Whisper => {
                     with_whisper_invocation_state(request, scheduled, |self_kv, cross_kv| {
                         model.transcribe_whisper_with_details_and_prompt_physical(
                             samples,
@@ -7471,7 +7432,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::ParakeetAsr => {
+                PhysicalAsrRoute::Parakeet => {
                     with_single_invocation_tensor(request, scheduled, |state| {
                         model.transcribe_parakeet_with_details_physical(
                             samples,
@@ -7481,7 +7442,7 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                ModelFamily::NemotronAsr => {
+                PhysicalAsrRoute::Nemotron => {
                     with_nemotron_offline_state(request, scheduled, |predictor, acoustic| {
                         model.transcribe_nemotron_with_details_and_prompt_physical(
                             samples,
@@ -7493,16 +7454,15 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                _ => model.transcribe_with_details_and_prompt_and_options(
-                    samples,
-                    sample_rate,
-                    language,
-                    asr_prompt,
-                    segment_generation_options,
-                )?,
             };
             Ok((details.text, details.diagnostics))
-        })?;
+        });
+        let Some((text, asr_diagnostics)) = settle_atomic_asr_cancellation(request, transcription)?
+        else {
+            return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
+                request.id.clone(),
+            )));
+        };
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
 
         Ok(ModelSessionResult::atomic(ExecutorOutput {
@@ -7523,6 +7483,19 @@ impl NativeExecutor {
             error: None,
             logprobs: Vec::new(),
         }))
+    }
+
+    /// Transcript and diagnostics of a chunked run of `plan`, with the word
+    /// timings of a transcript merged by time as `timestamp_words`.
+    fn chunked_asr_result(
+        plan: &PlannedAsrChunks,
+        chunked: ChunkedAsrTranscription,
+    ) -> (String, Option<serde_json::Value>) {
+        let mut diagnostics = plan.diagnostics_with_chunk_transcriptions(chunked.chunk_diagnostics);
+        if let (Some(words), Some(root)) = (chunked.timestamp_words, diagnostics.as_object_mut()) {
+            root.insert("timestamp_words".to_string(), timestamp_words_json(&words));
+        }
+        (chunked.text, Some(diagnostics))
     }
 
     fn with_audio_decode_timing(
@@ -7574,12 +7547,16 @@ impl NativeExecutor {
             .and_then(|registry| registry.effective_context(variant))
     }
 
+    /// `invocation_context` is the effective context and the family's audio
+    /// token rate, when both are known; Granite's automatic budget is clamped
+    /// to the decode room it leaves after the chunk's prompt.
     fn asr_chunk_generation_options(
         request: &EngineCoreRequest,
         family: ModelFamily,
         chunk_sample_count: usize,
         sample_rate: u32,
         base: &NativeAsrGenerationOptions,
+        invocation_context: Option<(usize, f32)>,
     ) -> NativeAsrGenerationOptions {
         let mut options = base.clone();
         if request.asr_auto_max_tokens
@@ -7587,8 +7564,24 @@ impl NativeExecutor {
             && sample_rate > 0
         {
             let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
-            options.max_new_tokens =
-                granite_auto_asr_max_tokens_for_duration(chunk_seconds).min(base.max_new_tokens);
+            let budget =
+                granite_asr_planned_max_tokens(request, chunk_seconds).min(base.max_new_tokens);
+            options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
+                budget.min(invocation_decode_room(context, rate, chunk_seconds))
+            });
+        }
+        // VibeVoice's automatic budget is admitted at the reference ceiling;
+        // each chunk decodes with its own duration budget.
+        if request.asr_auto_max_tokens
+            && matches!(family, ModelFamily::VibeVoiceAsr)
+            && sample_rate > 0
+        {
+            let chunk_seconds = chunk_sample_count as f32 / sample_rate as f32;
+            let budget = crate::runtime::vibevoice_asr_planned_max_tokens(request, chunk_seconds)
+                .min(base.max_new_tokens);
+            options.max_new_tokens = invocation_context.map_or(budget, |(context, rate)| {
+                budget.min(invocation_decode_room(context, rate, chunk_seconds))
+            });
         }
         options.max_new_tokens = options.max_new_tokens.max(1);
         options
@@ -7604,23 +7597,41 @@ impl NativeExecutor {
         recent_word_suffix(prefix_text, Self::granite_asr_prefix_replay_words())
     }
 
+    /// Recover a Granite chunk that stopped on its decode budget: a repetition
+    /// loop is re-decoded with a shorter budget and trimmed, and a plain
+    /// truncation is re-decoded once with a larger one.
     #[allow(clippy::too_many_arguments)]
-    fn recover_granite_chunk_loop(
+    fn recover_granite_chunk(
         model: &crate::models::registry::NativeAsrModel,
         chunk_audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         asr_prompt: Option<&str>,
         prefix_text: Option<&str>,
         base_options: &NativeAsrGenerationOptions,
         mut details: crate::models::registry::NativeAsrTranscription,
         request: &EngineCoreRequest,
         scheduled: &ScheduledRequest,
+        invocation_context: Option<(usize, f32)>,
     ) -> Result<crate::models::registry::NativeAsrTranscription> {
         let Some(original_loop) =
             granite_chunk_loop_signal(&details.text, details.diagnostics.as_ref())
         else {
-            return Ok(details);
+            return Self::retry_truncated_granite_chunk(
+                model,
+                chunk_audio,
+                sample_rate,
+                language,
+                task,
+                asr_prompt,
+                prefix_text,
+                base_options,
+                details,
+                request,
+                scheduled,
+                invocation_context,
+            );
         };
         let retry_max_tokens = granite_loop_recovery_max_tokens(
             chunk_audio.len(),
@@ -7653,6 +7664,7 @@ impl NativeExecutor {
                 chunk_audio,
                 sample_rate,
                 language,
+                task,
                 asr_prompt,
                 prefix_text,
                 retry_options,
@@ -7705,6 +7717,129 @@ impl NativeExecutor {
             Ok(details)
         }
     }
+
+    /// A chunk that spent its whole automatic budget without looping was cut
+    /// off mid-transcript, and the chunk overlap cannot recover a longer tail
+    /// (GRN-1). Re-decode it once at twice the budget. Greedy decoding replays
+    /// the same prefix, so the retry extends the original unless it
+    /// degenerates into a loop that cannot be trimmed.
+    #[allow(clippy::too_many_arguments)]
+    fn retry_truncated_granite_chunk(
+        model: &crate::models::registry::NativeAsrModel,
+        chunk_audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        task: GraniteSpeechTask,
+        asr_prompt: Option<&str>,
+        prefix_text: Option<&str>,
+        base_options: &NativeAsrGenerationOptions,
+        mut details: crate::models::registry::NativeAsrTranscription,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        invocation_context: Option<(usize, f32)>,
+    ) -> Result<crate::models::registry::NativeAsrTranscription> {
+        if !granite_chunk_truncated(request.asr_auto_max_tokens, details.diagnostics.as_ref()) {
+            return Ok(details);
+        }
+        let original_max_tokens = base_options.max_new_tokens;
+        let chunk_seconds = if sample_rate > 0 {
+            chunk_audio.len() as f32 / sample_rate as f32
+        } else {
+            0.0
+        };
+        let prompt_tokens = details
+            .diagnostics
+            .as_ref()
+            .and_then(|value| value.get("prompt_tokens"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let decode_room = invocation_context.map(|(context, rate)| {
+            let planned = invocation_decode_room(context, rate, chunk_seconds);
+            prompt_tokens.map_or(planned, |prompt| {
+                planned.min(context.saturating_sub(prompt))
+            })
+        });
+        let Some(retry_max_tokens) = granite_truncation_retry_max_tokens(
+            original_max_tokens,
+            request.params.max_tokens,
+            decode_room,
+        ) else {
+            details.diagnostics = with_granite_truncation_retry_diagnostics(
+                details.diagnostics,
+                original_max_tokens,
+                None,
+                None,
+                false,
+                "not_retried_budget_ceiling",
+            );
+            return Ok(details);
+        };
+
+        let mut retry_options = base_options.clone();
+        retry_options.max_new_tokens = retry_max_tokens;
+        let mut retry = with_single_invocation_cache(request, scheduled, |cache| {
+            model.transcribe_granite_speech_with_details_prompt_prefix_and_options_physical(
+                chunk_audio,
+                sample_rate,
+                language,
+                task,
+                asr_prompt,
+                prefix_text,
+                retry_options,
+                cache,
+            )
+        })?;
+        let retry_stop_reason =
+            granite_decode_stop_reason(retry.diagnostics.as_ref()).map(str::to_owned);
+        let retry_loop = granite_chunk_loop_signal(&retry.text, retry.diagnostics.as_ref());
+        let retry_trim = retry_loop
+            .as_ref()
+            .and_then(|loop_signal| trim_granite_looping_chunk_text(&mut retry.text, loop_signal));
+        let use_retry =
+            !retry.text.trim().is_empty() && (retry_loop.is_none() || retry_trim.is_some());
+        if use_retry {
+            retry.diagnostics = with_granite_truncation_retry_diagnostics(
+                retry.diagnostics,
+                original_max_tokens,
+                Some(retry_max_tokens),
+                retry_stop_reason.as_deref(),
+                true,
+                if retry_trim.is_some() {
+                    "retry_selected_trimmed"
+                } else {
+                    "retry_selected"
+                },
+            );
+            Ok(retry)
+        } else {
+            details.diagnostics = with_granite_truncation_retry_diagnostics(
+                details.diagnostics,
+                original_max_tokens,
+                Some(retry_max_tokens),
+                retry_stop_reason.as_deref(),
+                false,
+                "retry_not_better",
+            );
+            Ok(details)
+        }
+    }
+}
+
+/// Decode budget the invocation solver plans an `audio_seconds` chunk with.
+/// Granite plans with the budget its chunks are decoded with (GRN-6); the
+/// other decoder-prompt families keep the shared reserve.
+pub(super) fn asr_planned_decode_tokens(
+    request: &EngineCoreRequest,
+    family: ModelFamily,
+    audio_seconds: f32,
+) -> usize {
+    match family {
+        ModelFamily::GraniteSpeechAsr => granite_asr_planned_max_tokens(request, audio_seconds),
+        ModelFamily::VibeVoiceAsr => {
+            crate::runtime::vibevoice_asr_planned_max_tokens(request, audio_seconds)
+        }
+        _ => MAX_ASR_NEW_TOKENS,
+    }
 }
 
 fn recent_word_suffix(text: &str, max_words: usize) -> String {
@@ -7733,18 +7868,39 @@ impl GranitePhraseLoop {
     }
 }
 
+fn granite_decode_stop_reason(diagnostics: Option<&serde_json::Value>) -> Option<&str> {
+    diagnostics
+        .and_then(|value| value.pointer("/decode/stop_reason"))
+        .and_then(|value| value.as_str())
+}
+
 fn granite_chunk_loop_signal(
     text: &str,
     diagnostics: Option<&serde_json::Value>,
 ) -> Option<GranitePhraseLoop> {
-    if diagnostics
-        .and_then(|value| value.pointer("/decode/stop_reason"))
-        .and_then(|value| value.as_str())
-        != Some("max_tokens")
-    {
+    if granite_decode_stop_reason(diagnostics) != Some("max_tokens") {
         return None;
     }
     repeated_phrase_loop(text)
+}
+
+/// Whether a loop-free Granite chunk was cut off by its automatic budget. A
+/// caller's explicit `max_tokens` is a cap the executor must honour.
+fn granite_chunk_truncated(auto_max_tokens: bool, diagnostics: Option<&serde_json::Value>) -> bool {
+    auto_max_tokens && granite_decode_stop_reason(diagnostics) == Some("max_tokens")
+}
+
+/// Budget for the one re-decode of a truncated Granite chunk: twice the
+/// original, within the request ceiling and the decode room the invocation
+/// context leaves. `None` when no larger budget fits.
+fn granite_truncation_retry_max_tokens(
+    original_max_tokens: usize,
+    ceiling: usize,
+    decode_room: Option<usize>,
+) -> Option<usize> {
+    let doubled = original_max_tokens.saturating_mul(2).min(ceiling);
+    let retry = decode_room.map_or(doubled, |room| doubled.min(room));
+    (retry > original_max_tokens).then_some(retry)
 }
 
 fn repeated_phrase_loop(text: &str) -> Option<GranitePhraseLoop> {
@@ -7941,13 +8097,41 @@ fn with_granite_loop_recovery_diagnostics(
     Some(diagnostics)
 }
 
+fn with_granite_truncation_retry_diagnostics(
+    diagnostics: Option<serde_json::Value>,
+    original_max_tokens: usize,
+    retry_max_tokens: Option<usize>,
+    retry_stop_reason: Option<&str>,
+    selected_retry: bool,
+    decision: &str,
+) -> Option<serde_json::Value> {
+    let mut diagnostics = diagnostics.unwrap_or_else(|| json!({}));
+    if !diagnostics.is_object() {
+        diagnostics = json!({ "model_diagnostics": diagnostics });
+    }
+    if let Some(root) = diagnostics.as_object_mut() {
+        root.insert(
+            "chunk_truncation_retry".to_string(),
+            json!({
+                "triggered": true,
+                "decision": decision,
+                "selected_retry": selected_retry,
+                "original_max_new_tokens": original_max_tokens,
+                "retry_max_new_tokens": retry_max_tokens,
+                "retry_stop_reason": retry_stop_reason,
+            }),
+        );
+    }
+    Some(diagnostics)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    use super::NativeExecutor;
+    use super::{AsrChunkTranscription, AsrRouteCapabilities, NativeExecutor, PlannedAsrChunks};
     use crate::catalog::ModelFamily;
     use crate::engine::request::EngineCoreRequest;
     use crate::engine::scheduler::ScheduledRequest;
@@ -8050,6 +8234,41 @@ mod tests {
             &mut checkpoint,
         ));
         assert_eq!(state, 9);
+    }
+
+    #[test]
+    fn atomic_asr_cancellation_discards_output_and_keeps_real_errors() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]);
+        request.set_cancellation_signal(signal.clone());
+
+        assert_eq!(
+            super::settle_atomic_asr_cancellation(&request, Ok(5_u32)).unwrap(),
+            Some(5)
+        );
+        assert!(matches!(
+            super::settle_atomic_asr_cancellation::<u32>(
+                &request,
+                Err(crate::error::Error::InferenceError("boom".into())),
+            ),
+            Err(crate::error::Error::InferenceError(_))
+        ));
+        // The chunk executor's `Cancelled` settles as a cancelled row.
+        assert_eq!(
+            super::settle_atomic_asr_cancellation::<u32>(
+                &request,
+                Err(crate::error::Error::Cancelled(request.id.clone())),
+            )
+            .unwrap(),
+            None
+        );
+        // A single-window call that finished after the signal flipped
+        // publishes nothing.
+        signal.store(true, Ordering::Release);
+        assert_eq!(
+            super::settle_atomic_asr_cancellation(&request, Ok(5_u32)).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -8314,13 +8533,238 @@ mod tests {
     }
 
     #[test]
+    fn lfm_long_form_asr_routes_to_its_own_executor_not_the_generic_path() {
+        let lfm = ModelVariant::Lfm25Audio15BGguf;
+        let mut long_form = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(lfm);
+        long_form
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
+        assert_eq!(
+            super::atomic_asr_route(&long_form, lfm).unwrap(),
+            super::AtomicAsrRoute::Lfm25AudioLongForm
+        );
+
+        // Native ASR families keep the generic path, long-form or not.
+        for variant in [
+            ModelVariant::Qwen3Asr06BGguf,
+            ModelVariant::VibeVoiceAsr,
+            ModelVariant::ParakeetTdt06BV3,
+        ] {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            assert_eq!(
+                super::atomic_asr_route(&request, variant).unwrap(),
+                super::AtomicAsrRoute::Generic
+            );
+            request
+                .install_prepared_asr_long_form_atomic(
+                    crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+                )
+                .unwrap();
+            assert_eq!(
+                super::atomic_asr_route(&request, variant).unwrap(),
+                super::AtomicAsrRoute::Generic
+            );
+        }
+    }
+
+    /// The generic path executes the plan preparation stored, as stored: a
+    /// fake chunk transcriber sees exactly the stored chunk bounds, which no
+    /// planner would produce for this audio.
+    #[test]
+    fn executor_runs_the_stored_route_plan_without_replanning() {
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let sample_rate = 16_000_u32;
+        // Each sample holds its own index, so a chunk's first sample names
+        // its start.
+        let samples = (0..60 * sample_rate as usize)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let stored_bounds = [(0, 100_000), (90_000, 500_000), (480_000, samples.len())];
+        let mut stored = PlannedAsrChunks::unexecuted_for_tests();
+        stored.input_samples = samples.len();
+        stored.sample_rate = sample_rate;
+        stored.chunks = stored_bounds
+            .iter()
+            .map(|&(start_sample, end_sample)| izwi_asr_toolkit::AudioChunk {
+                start_sample,
+                end_sample,
+            })
+            .collect();
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request
+            .install_prepared_asr_long_form_atomic(stored)
+            .unwrap();
+
+        let plan = super::asr_execution_route_plan(&request, &samples, sample_rate, || {
+            panic!("a stored plan must not be re-planned")
+        })
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut sequence = 0;
+        NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+            &request.id,
+            &|| false,
+            None,
+            request.stream_policy,
+            &mut sequence,
+            &samples,
+            sample_rate,
+            &plan.chunks,
+            &plan.config,
+            Default::default(),
+            |chunk_audio, _sr, _prefix_text, _partial| {
+                let start = chunk_audio[0] as usize;
+                seen.push((start, start + chunk_audio.len()));
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk{}", seen.len()),
+                    diagnostics: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, stored_bounds);
+
+        // A plan made for other audio, or a long-form row without one, fails.
+        assert!(super::asr_execution_route_plan(
+            &request,
+            &samples[1..],
+            sample_rate,
+            || unreachable!()
+        )
+        .is_err());
+        let mut lost = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        lost.install_prepared_asr_long_form_atomic(PlannedAsrChunks::unexecuted_for_tests())
+            .unwrap();
+        lost.prepared_asr_route_plan = None;
+        assert!(
+            super::asr_execution_route_plan(&lost, &samples, sample_rate, || unreachable!())
+                .is_err()
+        );
+
+        // A family without a preparation stage is planned here, by the rule.
+        let nemotron = EngineCoreRequest::asr_bytes(vec![1, 2, 3])
+            .with_model_variant(ModelVariant::Nemotron35AsrStreaming06B);
+        let planned = super::asr_execution_route_plan(&nemotron, &samples, sample_rate, || {
+            Ok(AsrRouteCapabilities::for_family(
+                ModelFamily::NemotronAsr,
+                Some(30.0),
+            ))
+        })
+        .unwrap();
+        assert_eq!(planned.chunks.len(), 3);
+    }
+
+    #[test]
+    fn streaming_qwen_asr_runs_the_same_route_as_non_streaming() {
+        // 60 s of Qwen3 audio once fitted the streaming plan's single pass
+        // while preparation chunked it; both modes now share one plan.
+        let sample_rate = 16_000;
+        let samples = vec![0.0_f32; 60 * sample_rate as usize];
+        let capabilities = AsrRouteCapabilities::for_family(ModelFamily::Qwen3Asr, Some(120.0));
+        let offline = NativeExecutor::asr_route_plan(&samples, sample_rate, &capabilities, false);
+        let streaming = NativeExecutor::asr_route_plan(&samples, sample_rate, &capabilities, true);
+        assert!(offline.requires_chunk_path());
+        assert_eq!(offline.chunks, streaming.chunks);
+
+        assert_eq!(
+            super::physical_asr_route(ModelFamily::Qwen3Asr).unwrap(),
+            super::PhysicalAsrRoute::Qwen3
+        );
+        // Every family loaded as a `NativeAsrModel` has a physical route, so
+        // no ASR request can reach a workspace-less model call.
+        for variant in ModelVariant::all()
+            .iter()
+            .filter(|variant| variant.is_asr())
+        {
+            assert!(
+                super::physical_asr_route(variant.family()).is_ok(),
+                "{variant}"
+            );
+        }
+        for family in [
+            ModelFamily::Voxtral,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::Qwen3ForcedAligner,
+            ModelFamily::Qwen3Chat,
+        ] {
+            assert!(
+                matches!(
+                    super::physical_asr_route(family),
+                    Err(crate::error::Error::InvalidInput(_))
+                ),
+                "{family:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_chat_asr_without_a_long_form_route_fails_closed_before_registry_lookup() {
+        // An empty registry makes any `NativeAsrModel` lookup report the model
+        // as not loaded, which is the failure this guard replaces.
+        let executor = NativeExecutor::new(crate::engine::WorkerConfig {
+            model_registry: Some(Arc::new(crate::models::ModelRegistry::new(
+                std::path::PathBuf::new(),
+                crate::backends::DeviceProfile::cpu(),
+            ))),
+            ..Default::default()
+        });
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        for streaming in [true, false] {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            request.streaming = streaming;
+            let scheduled = ScheduledRequest {
+                plan_id: 1,
+                request_id: request.id.clone(),
+                sequence_id: 1,
+                num_tokens: 1,
+                is_prefill: true,
+                num_computed_tokens: 0,
+                work: WorkUnit::AtomicJob { kind: "asr".into() },
+            };
+
+            let error = executor
+                .transcribe_request_with_managed_cache(&request, &scheduled, None)
+                .expect_err("audio-chat ASR without a long-form route must fail closed");
+
+            assert!(
+                matches!(&error, crate::error::Error::InvalidInput(message)
+                    if message.contains("has no retained or long-form route")),
+                "streaming={streaming}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_long_form_asr_passes_only_a_caller_set_max_tokens() {
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3])
+            .with_model_variant(ModelVariant::Lfm25Audio15BGguf);
+        request.asr_auto_max_tokens = true;
+        assert_eq!(super::lfm25_audio_asr_long_form_max_tokens(&request), None);
+
+        request.asr_auto_max_tokens = false;
+        request.params.max_tokens = 96;
+        assert_eq!(
+            super::lfm25_audio_asr_long_form_max_tokens(&request),
+            Some(96)
+        );
+    }
+
+    #[test]
     fn vibevoice_legacy_execution_reuses_prepared_audio_and_fails_closed_without_it() {
         let variant = ModelVariant::VibeVoiceAsr;
         let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
         request
             .install_prepared_asr_audio(variant, vec![0.25, -0.5, 0.75], 24_000)
             .unwrap();
-        request.install_prepared_asr_long_form_atomic().unwrap();
+        request
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         let decode_calls = Cell::new(0_u32);
 
         let (audio, sample_rate, decode_ms) =
@@ -8397,9 +8841,10 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
-        assert_eq!(options.max_new_tokens, 84);
+        assert_eq!(options.max_new_tokens, 200);
     }
 
     #[test]
@@ -8419,9 +8864,10 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
-        assert_eq!(options.max_new_tokens, 84);
+        assert_eq!(options.max_new_tokens, 200);
         assert!(options.max_new_tokens < request.params.max_tokens);
     }
 
@@ -8442,9 +8888,206 @@ mod tests {
             16_000 * 30,
             16_000,
             &base,
+            None,
         );
 
         assert_eq!(options.max_new_tokens, 2048);
+    }
+
+    #[test]
+    fn granite_auto_chunk_budget_is_clamped_to_the_context_room() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+        let options = |context: Option<(usize, f32)>| {
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::GraniteSpeechAsr,
+                16_000 * 60,
+                16_000,
+                &base,
+                context,
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(options(None), 400);
+        assert_eq!(options(Some((4_096, 10.0))), 400);
+        // 600 - 128 text reserve - 600 audio tokens leaves nothing: one token.
+        assert_eq!(options(Some((600, 10.0))), 1);
+        // 1000 - 128 - 600 leaves 272 decode tokens.
+        assert_eq!(options(Some((1_000, 10.0))), 272);
+    }
+
+    /// Plus's native timestamp task decodes `word [T:N]` for every word, so
+    /// its chunks get the timestamp budget; base keeps the ASR budget.
+    #[test]
+    fn granite_timestamp_requests_budget_tagged_output_on_plus_only() {
+        let base = NativeAsrGenerationOptions {
+            max_new_tokens: 2048,
+            stop_token_ids: Vec::new(),
+            stop_sequences: Vec::new(),
+        };
+        let budget = |variant| {
+            let mut request = EngineCoreRequest::asr("UklGRg==")
+                .with_model_variant(variant)
+                .with_asr_native_word_timestamps(true);
+            request.asr_auto_max_tokens = true;
+            request.params.max_tokens = 2048;
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::GraniteSpeechAsr,
+                16_000 * 30,
+                16_000,
+                &base,
+                Some((4_096, 10.0)),
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(budget(ModelVariant::GraniteSpeech412BPlus), 844);
+        assert_eq!(budget(ModelVariant::GraniteSpeech412B), 200);
+    }
+
+    #[test]
+    fn vibevoice_auto_options_use_the_duration_budget_under_the_ceiling() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 32_768;
+        let base = NativeExecutor::asr_generation_options(&request);
+        let options = |samples: usize, context: Option<(usize, f32)>| {
+            NativeExecutor::asr_chunk_generation_options(
+                &request,
+                ModelFamily::VibeVoiceAsr,
+                samples,
+                16_000,
+                &base,
+                context,
+            )
+            .max_new_tokens
+        };
+
+        assert_eq!(options(16_000 * 60, None), 976);
+        assert_eq!(options(16_000 * 600, None), 7_456);
+        assert_eq!(options(16_000 * 600, Some((131_072, 7.5))), 7_456);
+        // 8192 - 128 text reserve - 4500 audio tokens leaves 3564.
+        assert_eq!(options(16_000 * 600, Some((8_192, 7.5))), 3_564);
+        // The executor solver plans long audio with the same budget.
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::VibeVoiceAsr, 600.0),
+            7_456
+        );
+    }
+
+    #[test]
+    fn vibevoice_explicit_options_preserve_the_caller_budget() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = false;
+        request.params.max_tokens = 200;
+        let base = NativeExecutor::asr_generation_options(&request);
+
+        let options = NativeExecutor::asr_chunk_generation_options(
+            &request,
+            ModelFamily::VibeVoiceAsr,
+            16_000 * 600,
+            16_000,
+            &base,
+            None,
+        );
+
+        assert_eq!(options.max_new_tokens, 200);
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::VibeVoiceAsr, 600.0),
+            200
+        );
+    }
+
+    #[test]
+    fn granite_invocation_solver_plans_with_the_granite_budget() {
+        let mut request = EngineCoreRequest::asr("UklGRg==");
+        request.asr_auto_max_tokens = true;
+        request.params.max_tokens = 2048;
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::GraniteSpeechAsr, 300.0),
+            2_000
+        );
+        assert_eq!(
+            super::asr_planned_decode_tokens(&request, ModelFamily::Qwen3Asr, 300.0),
+            super::MAX_ASR_NEW_TOKENS
+        );
+
+        // A single streaming segment must leave room for the budget it will
+        // be decoded with: 300 s would need 128 + 3,000 + 2,000 tokens.
+        let limit = crate::runtime::compose_invocation_audio_limit(
+            Some(540.0),
+            Some(10.0),
+            Some(4_096),
+            |secs| super::asr_planned_decode_tokens(&request, ModelFamily::GraniteSpeechAsr, secs),
+        )
+        .unwrap()
+        .unwrap();
+        assert!((237.0..=239.0).contains(&limit), "unexpected limit {limit}");
+    }
+
+    #[test]
+    fn granite_truncated_chunk_retries_once_at_double_budget_within_context() {
+        let max_tokens = serde_json::json!({ "decode": { "stop_reason": "max_tokens" } });
+        let stopped = serde_json::json!({ "decode": { "stop_reason": "stop_token" } });
+        assert!(super::granite_chunk_truncated(true, Some(&max_tokens)));
+        assert!(!super::granite_chunk_truncated(false, Some(&max_tokens)));
+        assert!(!super::granite_chunk_truncated(true, Some(&stopped)));
+        assert!(!super::granite_chunk_truncated(true, None));
+
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(3_668)),
+            Some(400)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, None),
+            Some(400)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(250)),
+            Some(250)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 300, None),
+            Some(300)
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(200, 2048, Some(200)),
+            None
+        );
+        assert_eq!(
+            super::granite_truncation_retry_max_tokens(2048, 2048, None),
+            None
+        );
+    }
+
+    #[test]
+    fn granite_truncation_retry_diagnostics_record_the_decision() {
+        let diagnostics = super::with_granite_truncation_retry_diagnostics(
+            Some(serde_json::json!({ "decode": { "stop_reason": "stop_token" } })),
+            200,
+            Some(400),
+            Some("stop_token"),
+            true,
+            "retry_selected",
+        )
+        .unwrap();
+
+        let retry = &diagnostics["chunk_truncation_retry"];
+        assert_eq!(retry["decision"], "retry_selected");
+        assert_eq!(retry["selected_retry"], true);
+        assert_eq!(retry["original_max_new_tokens"], 200);
+        assert_eq!(retry["retry_max_new_tokens"], 400);
+        assert_eq!(retry["retry_stop_reason"], "stop_token");
+        assert_eq!(diagnostics["decode"]["stop_reason"], "stop_token");
     }
 
     #[test]

@@ -414,7 +414,7 @@ impl VibeVoiceTtsModel {
                 VIBEVOICE_TTS_ACOUSTIC_DOMAIN,
                 StateGroupId::new(3),
                 StateClock::CodecFrames,
-                self.acoustic_tokenizer.decoder_state_geometry(),
+                self.acoustic_tokenizer.decoder_state_geometry()?,
             )?,
             VibeVoiceTokenizerStateDomain::new(
                 VIBEVOICE_TTS_SEMANTIC_DOMAIN,
@@ -425,6 +425,7 @@ impl VibeVoiceTtsModel {
         ];
         let contract = vibevoice_invocation_contract(
             &self.language_model,
+            self.dtype,
             self.dtype,
             default_kv_page_size(),
             &[CacheDomainId::new(1), CacheDomainId::new(2)],

@@ -7,16 +7,26 @@ use std::time::{Duration, Instant};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, embedding, layer_norm, linear, linear_no_bias, ops,
-    rotary_emb, BatchNorm, Conv1d, Conv1dConfig, Embedding, LayerNorm, Linear, Module, ModuleT,
-    RmsNorm, VarBuilder,
+    rotary_emb, Conv1dConfig, Embedding, LayerNorm, Linear, Module, RmsNorm, VarBuilder,
 };
 
 use crate::backends::kv::{
     submit_ordered_after_write, KvSlotMap, KvWriteArgs, KvWriteCompletionCollector,
     PagedKvDecodeArgs,
 };
-use crate::backends::DeviceProfile;
+use crate::backends::{parse_dtype_name, DTypeSelection, DeviceProfile, MetalDTypeOverride};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{
+    batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
+};
+use crate::kernels::f16_weight_linear::{
+    load_weight_only_f16, projection_var_builder, PointwiseConv1d, ProjectionLinear,
+    WeightOnlyF16Load, F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, xorshift_values,
+    NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::kernels::{
     try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
     try_fused_silu_mul_with_status,
@@ -31,6 +41,7 @@ use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedP
 use crate::models::shared::telemetry::{
     record_decode_attention_path, record_rope_kernel, record_rope_manual, DecodeAttentionPath,
 };
+use crate::models::shared::weights::staged;
 
 use super::config::{GraniteSpeechConfig, GraniteSpeechEncoderConfig, GraniteTextConfig};
 use super::preprocessor::GraniteSpeechAudioFeatures;
@@ -166,6 +177,11 @@ pub struct GraniteSpeechGeneration {
 pub struct GraniteSpeechRuntime {
     device: Device,
     dtype: DType,
+    /// The encoder and projector activations' dtype: F32 when the encoder
+    /// loads weight-only F16, else `dtype`.
+    audio_dtype: DType,
+    encoder_weight_precision: WeightOnlyF16Load,
+    lm_precision: PrecisionLoad,
     encoder: GraniteSpeechEncoder,
     projector: GraniteSpeechProjector,
     text_model: GraniteLanguageModel,
@@ -405,70 +421,37 @@ fn granite_dense_decode_initial_capacity(
     prompt_tokens.saturating_add(max_new_tokens.max(1))
 }
 
-fn granite_deferred_stop_check_enabled(
-    device: &Device,
-    decode_each_step: bool,
-    max_new_tokens: usize,
-) -> bool {
+fn granite_deferred_stop_check_enabled(decode_each_step: bool) -> bool {
     if decode_each_step {
         return false;
     }
     let override_enabled = std::env::var("IZWI_GRANITE_DEFER_STOP_CHECK")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    let default_max_tokens = std::env::var("IZWI_GRANITE_DEFER_STOP_MAX_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    granite_deferred_stop_check_policy(
-        device.is_metal(),
-        override_enabled,
-        max_new_tokens.max(1),
-        default_max_tokens,
-    )
+    granite_deferred_stop_check_policy(override_enabled)
 }
 
-fn granite_deferred_stop_check_policy(
-    is_metal: bool,
-    override_enabled: Option<bool>,
-    max_new_tokens: usize,
-    default_max_tokens: usize,
-) -> bool {
-    override_enabled.unwrap_or(is_metal && max_new_tokens <= default_max_tokens)
+/// Deferring the stop check to the end of the decode runs the whole budget
+/// even when the transcript ends after a few tokens (GRN-3), so it is opt-in.
+fn granite_deferred_stop_check_policy(override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(false)
 }
 
-fn granite_chunked_stop_check_enabled(
-    device: &Device,
-    decode_each_step: bool,
-    max_new_tokens: usize,
-) -> bool {
+fn granite_chunked_stop_check_enabled(device: &Device, decode_each_step: bool) -> bool {
     if decode_each_step {
         return false;
     }
     let override_enabled = std::env::var("IZWI_GRANITE_CHUNKED_STOP_CHECK")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    let default_max_tokens = std::env::var("IZWI_GRANITE_CHUNKED_STOP_MAX_TOKENS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    granite_chunked_stop_check_policy(
-        device.is_metal(),
-        override_enabled,
-        max_new_tokens.max(1),
-        default_max_tokens,
-    )
+    granite_chunked_stop_check_policy(device.is_metal(), override_enabled)
 }
 
-fn granite_chunked_stop_check_policy(
-    is_metal: bool,
-    override_enabled: Option<bool>,
-    max_new_tokens: usize,
-    default_max_tokens: usize,
-) -> bool {
-    override_enabled.unwrap_or(is_metal && max_new_tokens <= default_max_tokens)
+/// Metal syncs on every token read, so it checks for the stop token once per
+/// interval instead, whatever the budget: a decode runs at most one interval
+/// past its stop token.
+fn granite_chunked_stop_check_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
+    override_enabled.unwrap_or(is_metal)
 }
 
 fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
@@ -480,11 +463,34 @@ fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
     interval.clamp(1, max_new_tokens.max(1))
 }
 
+/// Where the selective F16 LM switches default on: Metal, unless F32 is
+/// pinned by `IZWI_GRANITE_SPEECH_DTYPE=f32` or (with no family override)
+/// `IZWI_METAL_DTYPE=f32`, the escape hatches from every lower-precision
+/// Metal policy. Each `IZWI_GRANITE_F16_*` switch still overrides.
+fn granite_selective_f16_default(device: &Device) -> bool {
+    device.is_metal()
+        && !granite_f32_pinned(
+            std::env::var("IZWI_GRANITE_SPEECH_DTYPE").ok().as_deref(),
+            MetalDTypeOverride::from_env(),
+        )
+}
+
+fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool {
+    match family.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => parse_dtype_name(raw) == Some(DType::F32),
+        None => global == MetalDTypeOverride::F32,
+    }
+}
+
 fn granite_f16_lm_head_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_LM_HEAD")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_lm_head_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_lm_head_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_lm_head_policy(
@@ -536,7 +542,11 @@ fn granite_f16_qkv_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_QKV")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_qkv_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_qkv_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_qkv_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
@@ -548,7 +558,11 @@ fn granite_f16_attention_core_enabled(device: &Device, dtype: DType) -> bool {
         .ok()
         .or_else(|| std::env::var("IZWI_GRANITE_F16_ATTN_CORE").ok())
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_core_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_attention_core_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_attention_core_policy(
@@ -563,7 +577,11 @@ fn granite_f16_mlp_enabled(device: &Device, dtype: DType) -> bool {
     let override_enabled = std::env::var("IZWI_GRANITE_F16_MLP")
         .ok()
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_mlp_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_mlp_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_mlp_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
@@ -575,7 +593,11 @@ fn granite_f16_attention_output_enabled(device: &Device, dtype: DType) -> bool {
         .ok()
         .or_else(|| std::env::var("IZWI_GRANITE_F16_O_PROJ").ok())
         .and_then(|raw| parse_env_bool(&raw));
-    granite_f16_attention_output_policy(device.is_metal(), dtype, override_enabled)
+    granite_f16_attention_output_policy(
+        granite_selective_f16_default(device),
+        dtype,
+        override_enabled,
+    )
 }
 
 fn granite_f16_attention_output_policy(
@@ -596,6 +618,20 @@ struct GraniteTextExecutionPlan {
 }
 
 impl GraniteTextExecutionPlan {
+    /// Every LM projection, the head and the attention core in the base
+    /// dtype: the range probe's fallback.
+    const BASE_DTYPE: Self = Self {
+        selective_f16_lm_head: false,
+        selective_f16_qkv: false,
+        f16_attention_core: false,
+        selective_f16_mlp: false,
+        selective_f16_attention_output: false,
+    };
+
+    fn any_f16(self) -> bool {
+        self != Self::BASE_DTYPE
+    }
+
     fn for_device(device: &Device, dtype: DType) -> Self {
         let selective_f16_qkv = granite_f16_qkv_enabled(device, dtype);
         Self {
@@ -606,6 +642,72 @@ impl GraniteTextExecutionPlan {
             selective_f16_mlp: granite_f16_mlp_enabled(device, dtype),
             selective_f16_attention_output: granite_f16_attention_output_enabled(device, dtype),
         }
+    }
+}
+
+/// Decoder positions the LM range probe runs.
+const GRANITE_LM_PROBE_TOKENS: usize = 16;
+
+/// What the LM runs below F32, for its load-time range probe: F16 when the
+/// selective F16 projections and attention core sit on F32 weights (report
+/// 13's Apple7/8 policy, which Apple9+ shares until BF16 Metal paged
+/// attention exists), else the base dtype.
+fn granite_lm_precision(
+    dtype: DType,
+    plan: GraniteTextExecutionPlan,
+    device: &DeviceProfile,
+) -> DTypeSelection {
+    if dtype == DType::F32 && plan.any_f16() {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: format!(
+                "Metal selective F16 LM projections, head and attention core on F32 weights ({})",
+                device.metal_bf16_checkpoint_lm_tier().reason
+            )
+            .into(),
+        }
+    } else {
+        DTypeSelection {
+            dtype,
+            reason: format!("{dtype:?} LM weights and activations").into(),
+        }
+    }
+}
+
+/// The load-time representation switches `GraniteSpeechRuntime::load`
+/// resolves for weights of `dtype` on `device`. Load admission prices the
+/// checkpoint in this form (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraniteLoadRepresentation {
+    /// A tied LM head gets its own F16 copy of the embedding.
+    pub(crate) f16_lm_head: bool,
+    /// Q/K/V projections load as F16.
+    pub(crate) f16_qkv: bool,
+    /// Gate/up and down projections load as F16.
+    pub(crate) f16_mlp: bool,
+    /// The attention output projection loads as F16.
+    pub(crate) f16_attention_output: bool,
+    /// Q/K/V are concatenated into one projection.
+    pub(crate) qkv_fusion: bool,
+    /// Gate and up are concatenated into one projection.
+    pub(crate) gate_up_fusion: bool,
+    /// o_proj and down_proj are pre-scaled by the residual multiplier.
+    pub(crate) residual_prescale: bool,
+}
+
+pub(crate) fn granite_load_representation(
+    device: &Device,
+    dtype: DType,
+) -> GraniteLoadRepresentation {
+    let plan = GraniteTextExecutionPlan::for_device(device, dtype);
+    GraniteLoadRepresentation {
+        f16_lm_head: plan.selective_f16_lm_head,
+        f16_qkv: plan.selective_f16_qkv,
+        f16_mlp: plan.selective_f16_mlp,
+        f16_attention_output: plan.selective_f16_attention_output,
+        qkv_fusion: granite_projection_fusion_enabled(device),
+        gate_up_fusion: granite_gate_up_projection_fusion_enabled(device),
+        residual_prescale: granite_residual_prescale_enabled(device),
     }
 }
 
@@ -656,6 +758,7 @@ impl GraniteSpeechRuntime {
         config: &GraniteSpeechConfig,
         device: &DeviceProfile,
         dtype: DType,
+        encoder_precision: &DTypeSelection,
     ) -> Result<Self> {
         // Reject malformed text geometry before mapping a potentially large
         // checkpoint and before any head-dimension division occurs.
@@ -663,7 +766,7 @@ impl GraniteSpeechRuntime {
         let load_started = Instant::now();
         let mmap_started = Instant::now();
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(shard_paths, dtype, &device.device).map_err(
+            staged::metal_staged_safetensors(shard_paths, dtype, &device.device).map_err(
                 |err| {
                     Error::ModelLoadError(format!(
                         "Failed to mmap Granite Speech safetensors: {err}"
@@ -671,23 +774,94 @@ impl GraniteSpeechRuntime {
                 },
             )?
         };
+        // A weight-only F16 encoder keeps F32 activations: its norms,
+        // depthwise convolution, biases and the projector read an F32
+        // builder even when the language model loads in a lower dtype.
+        let audio_dtype = if encoder_precision.dtype == DType::F16 {
+            DType::F32
+        } else {
+            dtype
+        };
+        let audio_vb = if audio_dtype == dtype {
+            vb.clone()
+        } else {
+            unsafe {
+                staged::metal_staged_safetensors(shard_paths, audio_dtype, &device.device).map_err(
+                    |err| {
+                        Error::ModelLoadError(format!(
+                            "Failed to mmap Granite Speech safetensors: {err}"
+                        ))
+                    },
+                )?
+            }
+        };
         let mmap_elapsed = mmap_started.elapsed();
 
         let encoder_started = Instant::now();
-        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"))?;
+        let encoder_vb = audio_vb.pp("encoder");
+        let (encoder, encoder_weight_precision) = load_weight_only_f16(
+            "Granite Speech encoder",
+            encoder_precision,
+            &device.device,
+            |f16| GraniteSpeechEncoder::load(&config.encoder_config, encoder_vb.clone(), f16),
+            |encoder| encoder.weight_only_f16_self_check(&config.encoder_config, &encoder_vb),
+        )?;
         let encoder_elapsed = encoder_started.elapsed();
 
         let projector_started = Instant::now();
-        let projector = GraniteSpeechProjector::load(config, vb.pp("projector"))?;
+        let projector = GraniteSpeechProjector::load(config, audio_vb.pp("projector"))?;
         let projector_elapsed = projector_started.elapsed();
 
         let language_model_started = Instant::now();
-        let text_model = GraniteLanguageModel::load(&config.text_config, vb.pp("language_model"))?;
+        let lm_plan = GraniteTextExecutionPlan::for_device(&device.device, dtype);
+        let lm_selection = granite_lm_precision(dtype, lm_plan, device);
+        let load_lm = |loaded: DType| {
+            if loaded == lm_selection.dtype {
+                return GraniteLanguageModel::load_with_execution_plan(
+                    &config.text_config,
+                    config.tie_word_embeddings(),
+                    vb.pp("language_model"),
+                    lm_plan,
+                );
+            }
+            // The range probe's fallback: every LM weight and activation F32.
+            let f32_vb = if dtype == DType::F32 {
+                vb.clone()
+            } else if audio_dtype == DType::F32 {
+                audio_vb.clone()
+            } else {
+                unsafe {
+                    staged::metal_staged_safetensors(shard_paths, DType::F32, &device.device)?
+                }
+            };
+            GraniteLanguageModel::load_with_execution_plan(
+                &config.text_config,
+                config.tie_word_embeddings(),
+                f32_vb.pp("language_model"),
+                GraniteTextExecutionPlan::BASE_DTYPE,
+            )
+        };
+        let (text_model, lm_precision) = load_with_precision_fallback(
+            "Granite Speech LM",
+            &lm_selection,
+            device.kind.is_metal(),
+            DType::F32,
+            load_lm,
+            |lm| {
+                run_numeric_self_check(
+                    format!("Granite Speech LM {:?}", lm_selection.dtype),
+                    F16_SAFE_MAX_ABS,
+                    || lm.numeric_probe(GRANITE_LM_PROBE_TOKENS),
+                )
+            },
+        )?;
         let language_model_elapsed = language_model_started.elapsed();
 
         // Model construction has consumed the VarBuilder, so release the source
         // mappings before waiting for queued device uploads, casts, and fusions.
         drop(vb);
+        drop(audio_vb);
+        drop(encoder_vb);
         let synchronize_started = Instant::now();
         synchronize_granite_load(&device.device)?;
         let synchronize_elapsed = synchronize_started.elapsed();
@@ -708,6 +882,9 @@ impl GraniteSpeechRuntime {
         Ok(Self {
             device: device.device.clone(),
             dtype,
+            audio_dtype,
+            encoder_weight_precision,
+            lm_precision,
             encoder,
             projector,
             text_model,
@@ -720,6 +897,16 @@ impl GraniteSpeechRuntime {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    /// The encoder's projection precision, and why.
+    pub(crate) fn encoder_weight_precision(&self) -> &WeightOnlyF16Load {
+        &self.encoder_weight_precision
+    }
+
+    /// The language model's precision, and why.
+    pub(crate) fn lm_precision(&self) -> &PrecisionLoad {
+        &self.lm_precision
     }
 
     pub(crate) fn kv_dtype(&self) -> DType {
@@ -748,7 +935,8 @@ impl GraniteSpeechRuntime {
             .flat_map(|frame| frame.iter().copied())
             .collect::<Vec<_>>();
         let upload_start = Instant::now();
-        let input = Tensor::from_vec(flat, (1, frames, dim), &self.device)?.to_dtype(self.dtype)?;
+        let input =
+            Tensor::from_vec(flat, (1, frames, dim), &self.device)?.to_dtype(self.audio_dtype)?;
         let upload = upload_start.elapsed();
         let encoder_start = Instant::now();
         let encoded = self.encoder.forward(&input)?;
@@ -820,7 +1008,7 @@ impl GraniteSpeechRuntime {
         }
         let upload_start = Instant::now();
         let input = Tensor::from_vec(flat, (features.len(), max_frames, dim), &self.device)?
-            .to_dtype(self.dtype)?;
+            .to_dtype(self.audio_dtype)?;
         let upload = upload_start.elapsed();
         let encoder_start = Instant::now();
         let encoded = self.encoder.forward_valid_lengths(&input, &valid_lengths)?;
@@ -1008,10 +1196,9 @@ impl GraniteSpeechRuntime {
         let mut stop_token = None;
         let stop_tokens = stop_token_set(special_tokens, extra_stop_token_ids);
         let decode_each_step = emit_deltas || !stop_sequences.is_empty();
-        let deferred_stop_check =
-            granite_deferred_stop_check_enabled(&self.device, decode_each_step, max_steps);
+        let deferred_stop_check = granite_deferred_stop_check_enabled(decode_each_step);
         let chunked_stop_check = !deferred_stop_check
-            && granite_chunked_stop_check_enabled(&self.device, decode_each_step, max_steps);
+            && granite_chunked_stop_check_enabled(&self.device, decode_each_step);
         let stop_check_interval = if chunked_stop_check {
             granite_chunked_stop_check_interval(max_steps)
         } else {
@@ -1347,25 +1534,71 @@ fn argmax_last_token_tensor(logits: &Tensor) -> Result<Tensor> {
 }
 
 struct GraniteSpeechEncoder {
-    input_linear: Linear,
+    input_linear: ProjectionLinear,
     layers: Vec<GraniteConformerBlock>,
-    out: Linear,
-    out_mid: Linear,
+    out: ProjectionLinear,
+    out_mid: ProjectionLinear,
     cat_hidden_layers: Vec<usize>,
 }
 
+/// A linear layer read from `vb`, held dense or, with `f16` set, as
+/// weight-only F16 on that device (read and converted on the host).
+fn encoder_projection(
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    vb: &VarBuilder,
+    f16: Option<&Device>,
+) -> Result<ProjectionLinear> {
+    let vb = projection_var_builder(vb, f16);
+    let linear = if bias {
+        linear(in_dim, out_dim, vb)?
+    } else {
+        linear_no_bias(in_dim, out_dim, vb)?
+    };
+    Ok(ProjectionLinear::new(linear, f16)?)
+}
+
 impl GraniteSpeechEncoder {
-    fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
-        let input_linear = linear(config.input_dim, config.hidden_dim, vb.pp("input_linear"))?;
+    /// With `f16` set, every encoder linear and pointwise convolution loads
+    /// as weight-only F16 on that device (F32 activations), as whisper.cpp
+    /// stores conformer encoders; norms, the depthwise convolution with its
+    /// folded BatchNorm, biases and the relative-position table stay in the
+    /// builder's dtype.
+    fn load(
+        config: &GraniteSpeechEncoderConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
+        let input_linear = encoder_projection(
+            config.input_dim,
+            config.hidden_dim,
+            true,
+            &vb.pp("input_linear"),
+            f16,
+        )?;
         let mut layers = Vec::with_capacity(config.num_layers);
         for idx in 0..config.num_layers {
             layers.push(GraniteConformerBlock::load(
                 config,
                 vb.pp(format!("layers.{idx}")),
+                f16,
             )?);
         }
-        let out = linear(config.hidden_dim, config.output_dim, vb.pp("out"))?;
-        let out_mid = linear(config.output_dim, config.hidden_dim, vb.pp("out_mid"))?;
+        let out = encoder_projection(
+            config.hidden_dim,
+            config.output_dim,
+            true,
+            &vb.pp("out"),
+            f16,
+        )?;
+        let out_mid = encoder_projection(
+            config.output_dim,
+            config.hidden_dim,
+            true,
+            &vb.pp("out_mid"),
+            f16,
+        )?;
         Ok(Self {
             input_linear,
             layers,
@@ -1376,6 +1609,16 @@ impl GraniteSpeechEncoder {
     }
 
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        self.forward_observed(input, &mut |_, _| Ok(()))
+    }
+
+    /// [`Self::forward`], passing each conformer block's output to
+    /// `observe` (the load-time self-check reads the residual stream).
+    fn forward_observed(
+        &self,
+        input: &Tensor,
+        observe: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
+    ) -> Result<Tensor> {
         let mut x = self.input_linear.forward(input)?;
         let mut exported = Vec::with_capacity(self.cat_hidden_layers.len() + 1);
         if self.cat_hidden_layers.contains(&0) {
@@ -1384,6 +1627,7 @@ impl GraniteSpeechEncoder {
         let midpoint = self.layers.len() / 2;
         for (idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x)?;
+            observe(idx, &x)?;
             let layer_idx = idx + 1;
             if self.cat_hidden_layers.contains(&layer_idx) {
                 exported.push(x.clone());
@@ -1457,6 +1701,53 @@ impl GraniteSpeechEncoder {
     fn layer_count(&self) -> usize {
         self.layers.len()
     }
+
+    /// Checks the first FFN projection's F16 conversion against its F32
+    /// weight, then runs the encoder on xorshift features spanning two full
+    /// attention blocks and a padded third, and requires every block output
+    /// and the encoder output to be finite and inside the F16-safe range.
+    fn weight_only_f16_self_check(
+        &self,
+        config: &GraniteSpeechEncoderConfig,
+        vb: &VarBuilder,
+    ) -> NumericSelfCheckReport {
+        run_numeric_self_check(
+            "Granite Speech encoder weight-only F16",
+            F16_SAFE_MAX_ABS,
+            || {
+                let first = self.layers.first().ok_or_else(|| {
+                    Error::ModelLoadError("Granite Speech encoder has no layers".into())
+                })?;
+                if let Some(converted) = first.ff1.up_proj.as_f16() {
+                    let original = linear(
+                        config.hidden_dim,
+                        config.hidden_dim * config.feedforward_mult,
+                        vb.clone()
+                            .set_device(Device::Cpu)
+                            .set_dtype(DType::F32)
+                            .pp("layers.0.ff1.up_proj"),
+                    )?;
+                    let relative =
+                        converted.check_against(original.weight(), original.bias(), 8)?;
+                    if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+                        return Err(Error::ModelLoadError(format!(
+                        "layers.0.ff1.up_proj in F16 differs from its F32 weights by relative L2 {relative:.3e}"
+                    )));
+                    }
+                }
+                let frames = 2 * config.context_size + 3;
+                let features =
+                    xorshift_tensor(&[1, frames, config.input_dim], 0x6A5E, 2.0, vb.device())?;
+                let mut outputs = Vec::new();
+                let encoded = self.forward_observed(&features, &mut |index, x| {
+                    outputs.push((format!("layers.{index}"), x.clone()));
+                    Ok(())
+                })?;
+                outputs.push(("output".to_string(), encoded));
+                Ok::<_, Error>(outputs)
+            },
+        )
+    }
 }
 
 struct GraniteConformerBlock {
@@ -1468,12 +1759,16 @@ struct GraniteConformerBlock {
 }
 
 impl GraniteConformerBlock {
-    fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        config: &GraniteSpeechEncoderConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         Ok(Self {
-            ff1: GraniteConformerFeedForward::load(config, vb.pp("ff1"))?,
-            attn: GraniteConformerAttention::load(config, vb.pp("attn"))?,
-            conv: GraniteConformerConv::load(config, vb.pp("conv"))?,
-            ff2: GraniteConformerFeedForward::load(config, vb.pp("ff2"))?,
+            ff1: GraniteConformerFeedForward::load(config, vb.pp("ff1"), f16)?,
+            attn: GraniteConformerAttention::load(config, vb.pp("attn"), f16)?,
+            conv: GraniteConformerConv::load(config, vb.pp("conv"), f16)?,
+            ff2: GraniteConformerFeedForward::load(config, vb.pp("ff2"), f16)?,
             post_norm: layer_norm(config.hidden_dim, 1e-5, vb.pp("post_norm"))?,
         })
     }
@@ -1517,18 +1812,22 @@ impl GraniteConformerBlock {
 
 struct GraniteConformerFeedForward {
     pre_norm: LayerNorm,
-    up_proj: Linear,
-    down_proj: Linear,
+    up_proj: ProjectionLinear,
+    down_proj: ProjectionLinear,
 }
 
 impl GraniteConformerFeedForward {
-    fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        config: &GraniteSpeechEncoderConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         let hidden = config.hidden_dim;
         let intermediate = hidden * config.feedforward_mult;
         Ok(Self {
             pre_norm: layer_norm(hidden, 1e-5, vb.pp("pre_norm"))?,
-            up_proj: linear(hidden, intermediate, vb.pp("up_proj"))?,
-            down_proj: linear(intermediate, hidden, vb.pp("down_proj"))?,
+            up_proj: encoder_projection(hidden, intermediate, true, &vb.pp("up_proj"), f16)?,
+            down_proj: encoder_projection(intermediate, hidden, true, &vb.pp("down_proj"), f16)?,
         })
     }
 
@@ -1541,9 +1840,9 @@ impl GraniteConformerFeedForward {
 
 struct GraniteConformerAttention {
     pre_norm: LayerNorm,
-    to_q: Linear,
-    to_kv: Linear,
-    to_out: Linear,
+    to_q: ProjectionLinear,
+    to_kv: ProjectionLinear,
+    to_out: ProjectionLinear,
     rel_pos_emb: Embedding,
     attention_dists: Tensor,
     context_size: usize,
@@ -1552,15 +1851,20 @@ struct GraniteConformerAttention {
 }
 
 impl GraniteConformerAttention {
-    fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        config: &GraniteSpeechEncoderConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         let inner = config.dim_head * config.num_heads;
+        let hidden = config.hidden_dim;
         let attention_dists =
             encoder_attention_dists(config.context_size, config.max_pos_emb, vb.device())?;
         Ok(Self {
-            pre_norm: layer_norm(config.hidden_dim, 1e-5, vb.pp("pre_norm"))?,
-            to_q: linear_no_bias(config.hidden_dim, inner, vb.pp("to_q"))?,
-            to_kv: linear_no_bias(config.hidden_dim, inner * 2, vb.pp("to_kv"))?,
-            to_out: linear(inner, config.hidden_dim, vb.pp("to_out"))?,
+            pre_norm: layer_norm(hidden, 1e-5, vb.pp("pre_norm"))?,
+            to_q: encoder_projection(hidden, inner, false, &vb.pp("to_q"), f16)?,
+            to_kv: encoder_projection(hidden, inner * 2, false, &vb.pp("to_kv"), f16)?,
+            to_out: encoder_projection(inner, hidden, true, &vb.pp("to_out"), f16)?,
             rel_pos_emb: embedding(
                 2 * config.max_pos_emb + 1,
                 config.dim_head,
@@ -1711,28 +2015,34 @@ impl GraniteConformerAttention {
     }
 
     fn relative_position_bias(&self, q: &Tensor) -> Result<Tensor> {
-        let out_dtype = q.dtype();
         let rel = self
             .rel_pos_emb
             .forward(&self.attention_dists)?
-            .to_dtype(out_dtype)?;
-        let (batch, blocks, heads, context, dim) = q.dims5()?;
-        let q = q
-            .reshape((batch * blocks * heads, context, dim))?
-            .to_dtype(DType::F32)?;
-        let rel = rel.to_dtype(DType::F32)?;
-        let mut rows = Vec::with_capacity(context);
-        for query_idx in 0..context {
-            let q_row = q.narrow(1, query_idx, 1)?;
-            let rel_row = rel.narrow(0, query_idx, 1)?.squeeze(0)?;
-            rows.push(relative_position_score_row(&q_row, &rel_row)?);
-        }
-        let refs = rows.iter().collect::<Vec<_>>();
-        let out = Tensor::cat(&refs, 1)?.reshape((batch, blocks, heads, context, context))?;
-        (out / (dim as f64).sqrt())?
-            .to_dtype(out_dtype)
-            .map_err(Error::from)
+            .to_dtype(q.dtype())?;
+        relative_position_bias(q, &rel)
     }
+}
+
+/// Shaw-style relative-position scores for every block-local query/key pair,
+/// `bias[.., i, j] = q[.., i, :] · rel[i, j, :] / sqrt(dim)`, as one batched
+/// matmul over the query position (previously one matmul per query row: 200
+/// per layer at Granite's context). `q` is `(batch, blocks, heads, context,
+/// dim)`; `rel` is the gathered `(context, context, dim)` embedding table.
+fn relative_position_bias(q: &Tensor, rel: &Tensor) -> Result<Tensor> {
+    let out_dtype = q.dtype();
+    let (batch, blocks, heads, context, dim) = q.dims5()?;
+    let rows = batch * blocks * heads;
+    // (context, rows, dim) @ (context, dim, context) -> (context, rows, context).
+    let q = q
+        .reshape((rows, context, dim))?
+        .to_dtype(DType::F32)?
+        .transpose(0, 1)?
+        .contiguous()?;
+    let rel = rel.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+    let scores = q.matmul(&rel)?.transpose(0, 1)?.contiguous()?;
+    (scores.reshape((batch, blocks, heads, context, context))? / (dim as f64).sqrt())?
+        .to_dtype(out_dtype)
+        .map_err(Error::from)
 }
 
 fn validate_frame_lengths(batch: usize, sequence: usize, valid_lengths: &[usize]) -> Result<()> {
@@ -1772,7 +2082,9 @@ fn encoder_valid_key_mask(
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let mut data = Vec::with_capacity(valid_lengths.len() * nblocks * context * context);
+    // F32 on the host: an unannotated float literal is F64, which Candle's
+    // Metal backend cannot cast.
+    let mut data = Vec::<f32>::with_capacity(valid_lengths.len() * nblocks * context * context);
     for valid in valid_lengths {
         for block in 0..nblocks {
             for _query in 0..context {
@@ -1838,12 +2150,6 @@ fn encoder_attention_context(attn: &Tensor, v: &Tensor) -> Result<Tensor> {
     attn.matmul(v).map_err(Error::from)
 }
 
-fn relative_position_score_row(q_row: &Tensor, rel_row: &Tensor) -> Result<Tensor> {
-    let q_row = q_row.squeeze(1)?.contiguous()?;
-    let rel_row = rel_row.t()?.contiguous()?;
-    q_row.matmul(&rel_row)?.unsqueeze(1).map_err(Error::from)
-}
-
 fn encoder_attention_dists(context: usize, max_pos_emb: usize, device: &Device) -> Result<Tensor> {
     let mut values = Vec::with_capacity(context * context);
     for i in 0..context {
@@ -1882,45 +2188,86 @@ fn encoder_padding_mask(
 
 struct GraniteConformerConv {
     norm: LayerNorm,
-    up_conv: Conv1d,
-    depth_conv: Conv1d,
-    batch_norm: BatchNorm,
-    down_conv: Conv1d,
+    up_conv: PointwiseConv1d,
+    /// Depthwise kernel `(inner, 1, K)` with the inference BatchNorm folded in.
+    depth_weight: Tensor,
+    depth_bias: Tensor,
+    depth_spec: DepthwiseConv1dSpec,
+    down_conv: PointwiseConv1d,
 }
 
 impl GraniteConformerConv {
-    fn load(config: &GraniteSpeechEncoderConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(
+        config: &GraniteSpeechEncoderConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         let hidden = config.hidden_dim;
         let inner = hidden * config.conv_expansion_factor;
         let depth_cfg = Conv1dConfig {
             groups: inner,
             ..Default::default()
         };
+        let depth_conv = conv1d_no_bias(
+            inner,
+            inner,
+            config.conv_kernel_size,
+            depth_cfg,
+            vb.pp("depth_conv.conv"),
+        )?;
+        let batch_norm = batch_norm(inner, 1e-5, vb.pp("batch_norm"))?;
+        // Candle's grouped conv runs one convolution per channel (2048 here);
+        // the shared shift-and-accumulate op runs 2K + 2 element-wise ops.
+        let (scale, shift) = batch_norm_affine(
+            batch_norm.running_mean(),
+            batch_norm.running_var(),
+            batch_norm.eps(),
+            batch_norm.weight_and_bias(),
+        )?;
+        let (depth_weight, depth_bias) =
+            fold_channel_affine(depth_conv.weight(), None, &scale, &shift)?;
+        // Same-length output: K / 2 on the left, one fewer on the right for
+        // an even kernel.
+        let width = config.conv_kernel_size;
+        let pad = width / 2;
+        let right = pad.saturating_sub((width + 1) % 2);
         Ok(Self {
             norm: layer_norm(hidden, 1e-5, vb.pp("norm"))?,
-            up_conv: conv1d(
-                hidden,
-                inner * 2,
-                1,
-                Conv1dConfig::default(),
-                vb.pp("up_conv"),
+            up_conv: PointwiseConv1d::new(
+                conv1d(
+                    hidden,
+                    inner * 2,
+                    1,
+                    Conv1dConfig::default(),
+                    projection_var_builder(&vb.pp("up_conv"), f16),
+                )?,
+                f16,
             )?,
-            depth_conv: conv1d_no_bias(
-                inner,
-                inner,
-                config.conv_kernel_size,
-                depth_cfg,
-                vb.pp("depth_conv.conv"),
-            )?,
-            batch_norm: batch_norm(inner, 1e-5, vb.pp("batch_norm"))?,
-            down_conv: conv1d(
-                inner,
-                hidden,
-                1,
-                Conv1dConfig::default(),
-                vb.pp("down_conv"),
+            depth_weight,
+            depth_bias,
+            depth_spec: DepthwiseConv1dSpec::padded(pad, right),
+            down_conv: PointwiseConv1d::new(
+                conv1d(
+                    inner,
+                    hidden,
+                    1,
+                    Conv1dConfig::default(),
+                    projection_var_builder(&vb.pp("down_conv"), f16),
+                )?,
+                f16,
             )?,
         })
+    }
+
+    fn depthwise_batch_norm_silu(&self, x: &Tensor) -> Result<Tensor> {
+        depthwise_conv1d(
+            x,
+            &self.depth_weight,
+            Some(&self.depth_bias),
+            self.depth_spec,
+        )?
+        .silu()
+        .map_err(Error::from)
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -1928,11 +2275,7 @@ impl GraniteConformerConv {
         let x = x.transpose(1, 2)?.contiguous()?;
         let x = self.up_conv.forward(&x)?;
         let x = glu_channels(&x)?;
-        let pad = self.depth_conv_weight_width() / 2;
-        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
-        let x = x.pad_with_zeros(2, pad, right)?;
-        let x = self.depth_conv.forward(&x)?;
-        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        let x = self.depthwise_batch_norm_silu(&x)?;
         self.down_conv
             .forward(&x)?
             .transpose(1, 2)?
@@ -1946,21 +2289,13 @@ impl GraniteConformerConv {
         let channel_mask = frame_mask.transpose(1, 2)?.contiguous()?;
         let x = self.up_conv.forward(&x)?;
         let x = glu_channels(&x)?.broadcast_mul(&channel_mask)?;
-        let pad = self.depth_conv_weight_width() / 2;
-        let right = pad.saturating_sub((self.depth_conv_weight_width() + 1) % 2);
-        let x = x.pad_with_zeros(2, pad, right)?;
-        let x = self.depth_conv.forward(&x)?;
-        let x = self.batch_norm.forward_t(&x, false)?.silu()?;
+        let x = self.depthwise_batch_norm_silu(&x)?;
         self.down_conv
             .forward(&x)?
             .broadcast_mul(&channel_mask)?
             .transpose(1, 2)?
             .contiguous()
             .map_err(Error::from)
-    }
-
-    fn depth_conv_weight_width(&self) -> usize {
-        self.depth_conv.weight().dims().get(2).copied().unwrap_or(1)
     }
 }
 
@@ -2305,13 +2640,14 @@ struct GraniteLanguageModel {
 }
 
 impl GraniteLanguageModel {
-    fn load(config: &GraniteTextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(config: &GraniteTextConfig, tie_word_embeddings: bool, vb: VarBuilder) -> Result<Self> {
         let execution_plan = GraniteTextExecutionPlan::for_device(vb.device(), vb.dtype());
-        Self::load_with_execution_plan(config, vb, execution_plan)
+        Self::load_with_execution_plan(config, tie_word_embeddings, vb, execution_plan)
     }
 
     fn load_with_execution_plan(
         config: &GraniteTextConfig,
+        tie_word_embeddings: bool,
         vb: VarBuilder,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
@@ -2332,7 +2668,7 @@ impl GraniteLanguageModel {
         }
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = if config.tie_word_embeddings {
+        let lm_head = if tie_word_embeddings {
             let weight = if execution_plan.selective_f16_lm_head {
                 embed_tokens.embeddings().to_dtype(DType::F16)?
             } else {
@@ -2437,6 +2773,47 @@ impl GraniteLanguageModel {
         let ids = input_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
         let ids = Tensor::from_vec(ids, (1, input_ids.len()), &self.device)?;
         self.embed_tokens.forward(&ids).map_err(Error::from)
+    }
+
+    /// Whether any part of the LM runs below F32: a lower base dtype, or the
+    /// selective F16 projections and attention core on an F32 base.
+    fn runs_below_f32(&self) -> bool {
+        self.embed_tokens.embeddings().dtype() != DType::F32 || self.execution_plan.any_f16()
+    }
+
+    /// The load-time range probe: `tokens` xorshift-chosen token ids through
+    /// every decoder layer and the head, on a private scratch cache in the
+    /// LM's K/V dtype. Returns each layer's output and the logits.
+    fn numeric_probe(&self, tokens: usize) -> Result<Vec<(String, Tensor)>> {
+        let vocab = self.cfg.vocab_size.max(1);
+        let ids = xorshift_values(tokens, 0x9A11, 1.0)
+            .into_iter()
+            .map(|unit| (((unit + 1.0) * 0.5 * vocab as f32) as usize).min(vocab - 1) as u32)
+            .collect::<Vec<_>>();
+        let embeds = self.embeddings(&ids)?;
+        let mut cache = PhysicalPagedKvCache::scratch_for_probe(
+            &self.device,
+            self.kv_dtype(),
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.hidden_size / self.cfg.num_attention_heads,
+            tokens,
+        )?;
+        let mut outputs = Vec::new();
+        let mut observe = |index: usize, x: &Tensor| {
+            outputs.push((format!("layers.{index}"), x.clone()));
+            Ok(())
+        };
+        let logits = self.forward_with_embeds_observed(
+            &embeds,
+            0,
+            &mut cache,
+            None,
+            None,
+            Some(&mut observe),
+        )?;
+        outputs.push(("logits".to_string(), logits));
+        Ok(outputs)
     }
 
     fn forward_profiled(
@@ -2651,7 +3028,21 @@ impl GraniteLanguageModel {
         start_pos: usize,
         cache: &mut PhysicalPagedKvCache,
         rope_cache: Option<&GraniteRopeCache>,
+        profile: Option<&mut GraniteSpeechDecodeProfiler>,
+    ) -> Result<Tensor> {
+        self.forward_with_embeds_observed(embeds, start_pos, cache, rope_cache, profile, None)
+    }
+
+    /// [`Self::forward_with_embeds_profiled`], passing each decoder layer's
+    /// output to `observe` (the load-time range probe).
+    fn forward_with_embeds_observed(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        cache: &mut PhysicalPagedKvCache,
+        rope_cache: Option<&GraniteRopeCache>,
         mut profile: Option<&mut GraniteSpeechDecodeProfiler>,
+        mut observe: Option<&mut dyn FnMut(usize, &Tensor) -> Result<()>>,
     ) -> Result<Tensor> {
         let (batch, sequence_len, hidden_size) = embeds.dims3()?;
         if batch != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
@@ -2718,6 +3109,9 @@ impl GraniteLanguageModel {
                     rope.as_ref(),
                     None,
                 )?;
+            }
+            if let Some(observe) = observe.as_mut() {
+                observe(idx, &x)?;
             }
         }
         let final_norm_start = profile_start(profiling);
@@ -3087,14 +3481,21 @@ impl GraniteTextAttention {
     ) -> Result<Self> {
         let geometry = granite_text_attention_geometry(config)?;
         let head_dim = geometry.key_head_dim();
-        let o_proj = linear_no_bias(geometry.query_width(), config.hidden_size, vb.pp("o_proj"))?;
+        // Read the selective-F16 projection at F16 and pre-scale it there: an
+        // F32 read, an F32 product and an F16 cast would leave two released
+        // full-size F32 buffers per layer for Metal's pool to hold.
+        let o_proj_vb = if execution_plan.selective_f16_attention_output {
+            vb.to_dtype(DType::F16)
+        } else {
+            vb.clone()
+        };
+        let o_proj = linear_no_bias(
+            geometry.query_width(),
+            config.hidden_size,
+            o_proj_vb.pp("o_proj"),
+        )?;
         let o_proj =
             maybe_prescale_residual_linear(o_proj, config.residual_multiplier, prescale_residual)?;
-        let o_proj = if execution_plan.selective_f16_attention_output {
-            Linear::new(o_proj.weight().to_dtype(DType::F16)?, None)
-        } else {
-            o_proj
-        };
         let o_proj = GraniteLinearNoBias::new(o_proj)?;
         let qkv_proj =
             GraniteTextQkvProjection::load(config, head_dim, vb, execution_plan.selective_f16_qkv)?;
@@ -3816,10 +4217,17 @@ impl GraniteTextMlp {
         prescale_residual: bool,
         execution_plan: GraniteTextExecutionPlan,
     ) -> Result<Self> {
+        // As for o_proj: a selective-F16 down projection is read and
+        // pre-scaled at F16.
+        let mlp_vb = if execution_plan.selective_f16_mlp {
+            vb.to_dtype(DType::F16)
+        } else {
+            vb
+        };
         let down_proj = linear_no_bias(
             config.intermediate_size,
             config.hidden_size,
-            vb.pp("down_proj"),
+            mlp_vb.pp("down_proj"),
         )?;
         let down_proj = maybe_prescale_residual_linear(
             down_proj,
@@ -3827,15 +4235,14 @@ impl GraniteTextMlp {
             prescale_residual,
         )?;
         if execution_plan.selective_f16_mlp {
-            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb.to_dtype(DType::F16))?;
-            let down_proj =
-                GraniteLinearNoBias::from_weight(down_proj.weight().to_dtype(DType::F16)?)?;
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, mlp_vb)?;
+            let down_proj = GraniteLinearNoBias::from_weight(down_proj.weight().clone())?;
             Ok(Self::SelectiveF16(GraniteTextF16Mlp {
                 gate_up_proj,
                 down_proj,
             }))
         } else {
-            let gate_up_proj = GraniteTextGateUpProjection::load(config, vb)?;
+            let gate_up_proj = GraniteTextGateUpProjection::load(config, mlp_vb)?;
             Ok(Self::Model {
                 gate_up_proj,
                 down_proj: GraniteLinearNoBias::new(down_proj)?,
@@ -3940,7 +4347,7 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
-    use candle_nn::VarMap;
+    use candle_nn::{Conv1d, VarMap};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3968,7 +4375,7 @@ mod tests {
             residual_multiplier: 0.22,
             rms_norm_eps: 1e-5,
             rope_theta: 10_000.0,
-            tie_word_embeddings: true,
+            tie_word_embeddings: Some(true),
             use_cache: true,
             vocab_size: 16,
         }
@@ -4096,6 +4503,7 @@ mod tests {
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         GraniteLanguageModel::load_with_execution_plan(
             &tiny_granite_text_config(),
+            true,
             vb,
             GraniteTextExecutionPlan {
                 selective_f16_lm_head: false,
@@ -4149,6 +4557,7 @@ mod tests {
                 chunk_size_feed_forward: 0,
             },
             text_config: tiny_granite_text_config(),
+            tie_word_embeddings: None,
             window_size: 2,
             model_type: None,
         }
@@ -4160,7 +4569,8 @@ mod tests {
         let config = tiny_audio_config();
         let vars = VarMap::new();
         let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
-        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let encoder =
+            GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"), None).unwrap();
         let projector = GraniteSpeechProjector::load(&config, vb.pp("projector")).unwrap();
         let row_a =
             Tensor::from_vec(vec![0.1f32, -0.2, 0.3, 0.4, -0.5, 0.6], (1, 3, 2), &device).unwrap();
@@ -4213,7 +4623,8 @@ mod tests {
         let config = tiny_audio_config();
         let vars = VarMap::new();
         let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
-        let encoder = GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder")).unwrap();
+        let encoder =
+            GraniteSpeechEncoder::load(&config.encoder_config, vb.pp("encoder"), None).unwrap();
         let input = Tensor::zeros((1, 3, 2), DType::F32, &device).unwrap();
         assert_tensor_close(
             &encoder.forward(&input).unwrap(),
@@ -4446,6 +4857,54 @@ mod tests {
         assert!(cache_b.take_completed_writes().is_empty());
     }
 
+    /// Base ships `language_model.lm_head.weight`; an untied load must
+    /// project with that tensor, not the token embedding.
+    #[test]
+    fn untied_language_model_projects_with_its_own_head() {
+        let device = Device::Cpu;
+        let mut tensors = tiny_granite_text_tensors(&device);
+        let head = Tensor::from_vec(
+            (0..64).map(|index| index as f32 / 64.0).collect::<Vec<_>>(),
+            (16, 4),
+            &device,
+        )
+        .unwrap();
+        tensors.insert("lm_head.weight".to_string(), head.clone());
+        let plan = GraniteTextExecutionPlan {
+            selective_f16_lm_head: false,
+            selective_f16_qkv: false,
+            f16_attention_core: false,
+            selective_f16_mlp: false,
+            selective_f16_attention_output: false,
+        };
+
+        let untied = GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            false,
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+            plan,
+        )
+        .unwrap();
+        let diff = (untied.lm_head.weight() - &head)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(diff, 0.0);
+
+        tensors.remove("lm_head.weight");
+        assert!(GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            false,
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+            plan,
+        )
+        .is_err());
+    }
+
     #[test]
     fn selective_f16_plan_retains_one_decoder_execution_representation() {
         let device = Device::Cpu;
@@ -4458,9 +4917,13 @@ mod tests {
             selective_f16_attention_output: true,
         };
 
-        let model =
-            GraniteLanguageModel::load_with_execution_plan(&tiny_granite_text_config(), vb, plan)
-                .unwrap();
+        let model = GraniteLanguageModel::load_with_execution_plan(
+            &tiny_granite_text_config(),
+            true,
+            vb,
+            plan,
+        )
+        .unwrap();
         let layer = &model.layers[0];
 
         assert_eq!(model.embed_tokens.embeddings().dtype(), DType::F32);
@@ -4484,6 +4947,137 @@ mod tests {
             GraniteTextMlp::Model { .. } => panic!("expected selective F16 MLP"),
         }
         assert_eq!(model.execution_plan, plan);
+    }
+
+    /// The conformer conv module (shared shift-and-accumulate depthwise op with
+    /// the folded BatchNorm) matches Candle's grouped conv followed by the
+    /// unfolded BatchNorm, for odd and even kernels and with a frame mask.
+    #[test]
+    fn conformer_conv_shared_depthwise_matches_candle_grouped_conv_and_batch_norm() {
+        use candle_nn::ModuleT;
+
+        let device = Device::Cpu;
+        let mut state = 0x6A09_E667_F3BC_C908u64;
+        let mut values = |n: usize, scale: f32, offset: f32| {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    offset + scale * ((state >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                })
+                .collect::<Vec<_>>()
+        };
+        for kernel in [15usize, 4] {
+            let mut config = tiny_audio_config().encoder_config;
+            config.hidden_dim = 16;
+            config.conv_expansion_factor = 2;
+            config.conv_kernel_size = kernel;
+            let (hidden, inner) = (16usize, 32usize);
+            let mut tensors = std::collections::HashMap::new();
+            let mut put = |name: &str, shape: &[usize], scale: f32, offset: f32| {
+                let n = shape.iter().product();
+                let t = Tensor::from_vec(values(n, scale, offset), shape, &device).unwrap();
+                tensors.insert(name.to_string(), t.clone());
+                t
+            };
+            let norm_w = put("norm.weight", &[hidden], 0.1, 1.0);
+            let norm_b = put("norm.bias", &[hidden], 0.1, 0.0);
+            let up_w = put("up_conv.weight", &[2 * inner, hidden, 1], 0.25, 0.0);
+            let up_b = put("up_conv.bias", &[2 * inner], 0.1, 0.0);
+            let dw = put("depth_conv.conv.weight", &[inner, 1, kernel], 0.3, 0.0);
+            let gamma = put("batch_norm.weight", &[inner], 0.2, 1.0);
+            let beta = put("batch_norm.bias", &[inner], 0.1, 0.0);
+            let mean = put("batch_norm.running_mean", &[inner], 0.2, 0.0);
+            let var = put("batch_norm.running_var", &[inner], 0.25, 1.0);
+            let down_w = put("down_conv.weight", &[hidden, inner, 1], 0.2, 0.0);
+            let down_b = put("down_conv.bias", &[hidden], 0.1, 0.0);
+            let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+            let conv = GraniteConformerConv::load(&config, vb, None).unwrap();
+
+            let reference = |x: &Tensor, mask: Option<&Tensor>| {
+                let x = candle_nn::LayerNorm::new(norm_w.clone(), norm_b.clone(), 1e-5)
+                    .forward(x)
+                    .unwrap();
+                let x = x.transpose(1, 2).unwrap().contiguous().unwrap();
+                let channel_mask = mask.map(|m| m.transpose(1, 2).unwrap().contiguous().unwrap());
+                let x = Conv1d::new(up_w.clone(), Some(up_b.clone()), Conv1dConfig::default())
+                    .forward(&x)
+                    .unwrap();
+                let mut x = glu_channels(&x).unwrap();
+                if let Some(m) = &channel_mask {
+                    x = x.broadcast_mul(m).unwrap();
+                }
+                let pad = kernel / 2;
+                let right = pad.saturating_sub((kernel + 1) % 2);
+                let x = x.pad_with_zeros(2, pad, right).unwrap();
+                let depth_cfg = Conv1dConfig {
+                    groups: inner,
+                    ..Default::default()
+                };
+                let x = Conv1d::new(dw.clone(), None, depth_cfg)
+                    .forward(&x)
+                    .unwrap();
+                let bn = candle_nn::BatchNorm::new(
+                    inner,
+                    mean.clone(),
+                    var.clone(),
+                    gamma.clone(),
+                    beta.clone(),
+                    1e-5,
+                )
+                .unwrap();
+                let x = bn.forward_t(&x, false).unwrap().silu().unwrap();
+                let mut y = Conv1d::new(
+                    down_w.clone(),
+                    Some(down_b.clone()),
+                    Conv1dConfig::default(),
+                )
+                .forward(&x)
+                .unwrap();
+                if let Some(m) = &channel_mask {
+                    y = y.broadcast_mul(m).unwrap();
+                }
+                y.transpose(1, 2).unwrap().contiguous().unwrap()
+            };
+
+            let x = Tensor::from_vec(values(2 * 29 * hidden, 1.0, 0.0), (2, 29, hidden), &device)
+                .unwrap();
+            let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+            assert_close_1e5(&reference(&x, None), &conv.forward(&x).unwrap());
+            assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+
+            let mask_values = (0..2 * 29)
+                .map(|i| {
+                    if i % 29 < [29, 17][i / 29] {
+                        1.0f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mask = Tensor::from_vec(mask_values, (2, 29, 1), &device).unwrap();
+            assert_close_1e5(
+                &reference(&x, Some(&mask)),
+                &conv.forward_valid_lengths(&x, &mask).unwrap(),
+            );
+        }
+    }
+
+    fn assert_close_1e5(expected: &Tensor, actual: &Tensor) {
+        assert_eq!(expected.dims(), actual.dims());
+        let diff = (expected - actual)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|d| if d.is_finite() { d } else { f32::INFINITY })
+            .fold(0.0f32, f32::max);
+        assert!(diff <= 1e-5, "max |diff| {diff}");
     }
 
     fn assert_tensor_close(lhs: &Tensor, rhs: &Tensor) {
@@ -4805,17 +5399,48 @@ mod tests {
         assert!(format!("{err}").contains("exactly one audio placeholder"));
     }
 
+    /// The batched relative-position bias matches the per-query-row matmul
+    /// loop it replaced, on unstructured inputs at Granite's head geometry.
     #[test]
-    fn relative_position_score_row_handles_head_batched_query_rows() {
+    fn batched_relative_position_bias_matches_per_row_matmuls() {
         let device = Device::Cpu;
-        let q = Tensor::zeros((8, 200, 128), DType::F32, &device).unwrap();
-        let q_row = q.narrow(1, 17, 1).unwrap();
-        let rel_row = Tensor::zeros((200, 128), DType::F32, &device).unwrap();
+        let mut state = 0x1F83_D9AB_FB41_BD6Bu64;
+        let mut tensor = |shape: &[usize]| {
+            let n = shape.iter().product::<usize>();
+            let values = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let (batch, blocks, heads, context, dim) = (2, 3, 8, 37, 128);
+        let q = tensor(&[batch, blocks, heads, context, dim]);
+        let rel = tensor(&[context, context, dim]);
 
-        assert!(!q_row.squeeze(1).unwrap().is_contiguous());
-        let scores = relative_position_score_row(&q_row, &rel_row).unwrap();
+        // Pre-change formulation: one (rows, dim) x (dim, context) matmul per
+        // query row, concatenated.
+        let rows = batch * blocks * heads;
+        let q_flat = q.reshape((rows, context, dim)).unwrap();
+        let per_row = (0..context)
+            .map(|i| {
+                let q_row = q_flat.narrow(1, i, 1).unwrap().squeeze(1).unwrap();
+                let rel_row = rel.get(i).unwrap().t().unwrap();
+                q_row.matmul(&rel_row).unwrap().unsqueeze(1).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let expected = (Tensor::cat(&per_row, 1)
+            .unwrap()
+            .reshape((batch, blocks, heads, context, context))
+            .unwrap()
+            / (dim as f64).sqrt())
+        .unwrap();
 
-        assert_eq!(scores.dims(), &[8, 1, 200]);
+        let actual = relative_position_bias(&q, &rel).unwrap();
+        assert_close_1e5(&expected, &actual);
     }
 
     #[test]
@@ -5227,42 +5852,18 @@ mod tests {
     }
 
     #[test]
-    fn deferred_stop_check_policy_defaults_to_short_metal_decodes() {
-        assert!(granite_deferred_stop_check_policy(true, None, 76, 128));
-        assert!(!granite_deferred_stop_check_policy(true, None, 129, 128));
-        assert!(!granite_deferred_stop_check_policy(false, None, 76, 128));
-        assert!(granite_deferred_stop_check_policy(
-            false,
-            Some(true),
-            4096,
-            128
-        ));
-        assert!(!granite_deferred_stop_check_policy(
-            true,
-            Some(false),
-            76,
-            128
-        ));
+    fn deferred_stop_check_is_opt_in_only() {
+        assert!(!granite_deferred_stop_check_policy(None));
+        assert!(!granite_deferred_stop_check_policy(Some(false)));
+        assert!(granite_deferred_stop_check_policy(Some(true)));
     }
 
     #[test]
-    fn chunked_stop_check_policy_defaults_to_short_metal_decodes() {
-        assert!(granite_chunked_stop_check_policy(true, None, 76, 128));
-        assert!(granite_chunked_stop_check_policy(true, None, 128, 128));
-        assert!(!granite_chunked_stop_check_policy(true, None, 129, 128));
-        assert!(!granite_chunked_stop_check_policy(false, None, 76, 128));
-        assert!(granite_chunked_stop_check_policy(
-            false,
-            Some(true),
-            4096,
-            128
-        ));
-        assert!(!granite_chunked_stop_check_policy(
-            true,
-            Some(false),
-            76,
-            128
-        ));
+    fn chunked_stop_check_is_the_metal_default_for_every_budget() {
+        assert!(granite_chunked_stop_check_policy(true, None));
+        assert!(!granite_chunked_stop_check_policy(false, None));
+        assert!(granite_chunked_stop_check_policy(false, Some(true)));
+        assert!(!granite_chunked_stop_check_policy(true, Some(false)));
     }
 
     #[test]
@@ -5301,5 +5902,363 @@ mod tests {
             &["<stop>".to_string()]
         ));
         assert_eq!(text, "hello");
+    }
+
+    /// A small conformer whose projections take ggml's F16 kernel on Metal
+    /// (reduction dims multiples of 32) except `out_mid` (40 wide), which
+    /// takes the dense F16 fallback.
+    fn weight_only_f16_encoder_config() -> GraniteSpeechEncoderConfig {
+        GraniteSpeechEncoderConfig {
+            cat_hidden_layers: vec![],
+            context_size: 8,
+            conv_expansion_factor: 2,
+            conv_kernel_size: 5,
+            dim_head: 16,
+            dropout: 0.0,
+            feedforward_mult: 4,
+            hidden_dim: 64,
+            input_dim: 32,
+            max_pos_emb: 8,
+            model_type: None,
+            num_heads: 4,
+            num_layers: 2,
+            output_dim: 40,
+        }
+    }
+
+    /// Random encoder weights, as host tensors keyed by checkpoint name.
+    fn weight_only_f16_encoder_tensors(
+        config: &GraniteSpeechEncoderConfig,
+    ) -> HashMap<String, Tensor> {
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        GraniteSpeechEncoder::load(config, vb.pp("encoder"), None).unwrap();
+        let data = vars.data().lock().unwrap();
+        data.iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect()
+    }
+
+    fn encoder_on(
+        config: &GraniteSpeechEncoderConfig,
+        tensors: &HashMap<String, Tensor>,
+        device: &Device,
+        f16: bool,
+    ) -> (GraniteSpeechEncoder, VarBuilder<'static>) {
+        let tensors = tensors
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.to_device(device).unwrap()))
+            .collect();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device).pp("encoder");
+        let encoder =
+            GraniteSpeechEncoder::load(config, vb.clone(), f16.then_some(device)).unwrap();
+        (encoder, vb)
+    }
+
+    fn relative_l2_of(lhs: &Tensor, rhs: &Tensor) -> f64 {
+        use crate::kernels::numeric_check::{host_f32, relative_l2};
+        assert_eq!(lhs.dims(), rhs.dims());
+        relative_l2(&host_f32(lhs).unwrap(), &host_f32(rhs).unwrap())
+    }
+
+    /// Weight-only F16 projections against the dense F32 encoder on the same
+    /// weights: F32 activations and output, within F16 weight rounding, on
+    /// the scalar and the valid-length batch paths.
+    fn assert_weight_only_f16_encoder_tracks_f32(device: &Device) {
+        let config = weight_only_f16_encoder_config();
+        let tensors = weight_only_f16_encoder_tensors(&config);
+        let (dense, _) = encoder_on(&config, &tensors, &Device::Cpu, false);
+        let (f16, vb) = encoder_on(&config, &tensors, device, true);
+        let layer = &f16.layers[0];
+        for projection in [
+            &f16.input_linear,
+            &f16.out,
+            &f16.out_mid,
+            &layer.ff1.up_proj,
+            &layer.ff2.down_proj,
+            &layer.attn.to_q,
+            &layer.attn.to_kv,
+            &layer.attn.to_out,
+        ] {
+            assert!(projection.as_f16().is_some());
+        }
+        assert!(layer.conv.up_conv.as_f16().is_some() && layer.conv.down_conv.as_f16().is_some());
+
+        let input = xorshift_tensor(&[2, 19, config.input_dim], 5, 2.0, &Device::Cpu).unwrap();
+        let reference = dense.forward(&input.i(0..1).unwrap()).unwrap();
+        let output = f16
+            .forward(&input.i(0..1).unwrap().to_device(device).unwrap())
+            .unwrap();
+        assert_eq!(output.dtype(), DType::F32);
+        let rel = relative_l2_of(&output, &reference);
+        assert!(
+            rel > 0.0 && rel < 1e-2,
+            "scalar F16 vs F32 relative L2 {rel:e}"
+        );
+
+        let reference = dense.forward_valid_lengths(&input, &[13, 19]).unwrap();
+        let output = f16
+            .forward_valid_lengths(&input.to_device(device).unwrap(), &[13, 19])
+            .unwrap();
+        let rel = relative_l2_of(&output, &reference);
+        assert!(
+            rel > 0.0 && rel < 1e-2,
+            "batch F16 vs F32 relative L2 {rel:e}"
+        );
+
+        let report = f16.weight_only_f16_self_check(&config, &vb);
+        assert!(report.passed, "{}", report.reason);
+        assert_eq!(report.tensors.len(), config.num_layers + 1);
+    }
+
+    #[test]
+    fn weight_only_f16_encoder_tracks_f32_on_cpu() {
+        assert_weight_only_f16_encoder_tracks_f32(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_weight_only_f16_encoder_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_weight_only_f16_encoder_tracks_f32(&device);
+    }
+
+    /// An encoder whose activations overflow the F16-safe range fails its
+    /// self-check and reloads dense, with the failure recorded.
+    #[test]
+    fn weight_only_f16_encoder_falls_back_to_f32_when_the_self_check_fails() {
+        let config = weight_only_f16_encoder_config();
+        let mut tensors = weight_only_f16_encoder_tensors(&config);
+        let name = "encoder.layers.0.ff1.down_proj.bias".to_string();
+        let bias = (tensors[&name].clone() + 1.0e5).unwrap();
+        tensors.insert(name, bias);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu).pp("encoder");
+        let precision = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test".into(),
+        };
+        let mut loads = Vec::new();
+        let (encoder, outcome) = load_weight_only_f16(
+            "test encoder",
+            &precision,
+            &Device::Cpu,
+            |f16| {
+                loads.push(f16.is_some());
+                GraniteSpeechEncoder::load(&config, vb.clone(), f16)
+            },
+            |encoder| encoder.weight_only_f16_self_check(&config, &vb),
+        )
+        .unwrap();
+        assert_eq!(loads, [true, false]);
+        assert!(!outcome.projections_f16 && encoder.input_linear.as_f16().is_none());
+        assert!(
+            outcome.reason.contains("self-check") && outcome.reason.ends_with("fell back to F32"),
+            "{}",
+            outcome.reason
+        );
+        assert_eq!(outcome.diagnostics()["projection_weights"], "F32");
+    }
+
+    /// The batched encoder's key mask is built in F32: an F64 host buffer
+    /// cannot be cast on Metal, which failed every multi-row Metal batch.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_encoder_valid_key_mask_builds_on_the_gpu() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let mask = encoder_valid_key_mask(&[1, 3], 2, 2, &device, DType::F32).unwrap();
+        assert_eq!(mask.dims(), &[2, 2, 1, 2, 2]);
+        let values = mask.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Row 0 keeps key 0 of block 0; row 1 keeps keys 0..3.
+        assert_eq!(&values[..4], &[0.0, -1e4, 0.0, -1e4]);
+        assert_eq!(&values[8..12], &[0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&values[12..], &[0.0, -1e4, 0.0, -1e4]);
+    }
+
+    fn probe_text_config() -> GraniteTextConfig {
+        GraniteTextConfig {
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_attention_heads: 4,
+            num_hidden_layers: 2,
+            num_key_value_heads: 2,
+            vocab_size: 96,
+            embedding_multiplier: 12.0,
+            logits_scaling: 8.0,
+            ..tiny_granite_text_config()
+        }
+    }
+
+    /// Random LM weights; `down_scale` multiplies every MLP down projection.
+    fn probe_text_tensors(config: &GraniteTextConfig, down_scale: f32) -> HashMap<String, Tensor> {
+        let (hidden, inter) = (config.hidden_size, config.intermediate_size);
+        let kv = hidden / config.num_attention_heads * config.num_key_value_heads;
+        let mut tensors = HashMap::new();
+        let mut seed = 40;
+        let mut put = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            seed += 1;
+            let tensor = (xorshift_tensor(shape, seed, scale, &Device::Cpu).unwrap()
+                + f64::from(offset))
+            .unwrap();
+            tensors.insert(name, tensor);
+        };
+        put(
+            "model.embed_tokens.weight".into(),
+            &[config.vocab_size, hidden],
+            0.1,
+            0.0,
+        );
+        put("model.norm.weight".into(), &[hidden], 0.1, 1.0);
+        for layer in 0..config.num_hidden_layers {
+            let at = |name: &str| format!("model.layers.{layer}.{name}");
+            put(at("input_layernorm.weight"), &[hidden], 0.1, 1.0);
+            put(at("post_attention_layernorm.weight"), &[hidden], 0.1, 1.0);
+            put(at("self_attn.q_proj.weight"), &[hidden, hidden], 0.2, 0.0);
+            put(at("self_attn.k_proj.weight"), &[kv, hidden], 0.2, 0.0);
+            put(at("self_attn.v_proj.weight"), &[kv, hidden], 0.2, 0.0);
+            put(at("self_attn.o_proj.weight"), &[hidden, hidden], 0.2, 0.0);
+            put(at("mlp.gate_proj.weight"), &[inter, hidden], 0.2, 0.0);
+            put(at("mlp.up_proj.weight"), &[inter, hidden], 0.2, 0.0);
+            put(
+                at("mlp.down_proj.weight"),
+                &[hidden, inter],
+                0.2 * down_scale,
+                0.0,
+            );
+        }
+        tensors
+    }
+
+    const SELECTIVE_F16: GraniteTextExecutionPlan = GraniteTextExecutionPlan {
+        selective_f16_lm_head: true,
+        selective_f16_qkv: true,
+        f16_attention_core: true,
+        selective_f16_mlp: true,
+        selective_f16_attention_output: true,
+    };
+
+    fn probe_language_model(
+        device: &Device,
+        plan: GraniteTextExecutionPlan,
+        down_scale: f32,
+    ) -> GraniteLanguageModel {
+        let config = probe_text_config();
+        let tensors = probe_text_tensors(&config, down_scale)
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.to_device(device).unwrap()))
+            .collect();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        GraniteLanguageModel::load_with_execution_plan(&config, true, vb, plan).unwrap()
+    }
+
+    fn probe_values(lm: &GraniteLanguageModel) -> Vec<(String, Vec<f32>)> {
+        use crate::kernels::numeric_check::host_f32;
+        lm.numeric_probe(GRANITE_LM_PROBE_TOKENS)
+            .unwrap()
+            .into_iter()
+            .map(|(name, tensor)| (name, host_f32(&tensor).unwrap()))
+            .collect()
+    }
+
+    /// The selective F16 LM against its F32 base on the same weights:
+    /// every layer output and the logits within F16 rounding, same top-1.
+    fn assert_selective_f16_lm_tracks_f32(device: &Device) {
+        use crate::kernels::numeric_check::relative_l2;
+        let f16 = probe_language_model(device, SELECTIVE_F16, 1.0);
+        assert!(f16.runs_below_f32() && f16.kv_dtype() == DType::F16);
+        let f32 = probe_language_model(&Device::Cpu, GraniteTextExecutionPlan::BASE_DTYPE, 1.0);
+        assert!(!f32.runs_below_f32());
+        let (low, reference) = (probe_values(&f16), probe_values(&f32));
+        assert_eq!(low.len(), 3);
+        for ((name, low), (_, reference)) in low.iter().zip(&reference) {
+            assert!(low.iter().all(|value| value.is_finite()), "{name}");
+            let rel = relative_l2(low, reference);
+            assert!(
+                rel < 2e-2,
+                "{name}: selective F16 vs F32 relative L2 {rel:e}"
+            );
+        }
+        let argmax = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0
+        };
+        assert_eq!(argmax(&low[2].1), argmax(&reference[2].1));
+    }
+
+    #[test]
+    fn selective_f16_lm_probe_tracks_f32_on_cpu() {
+        assert_selective_f16_lm_tracks_f32(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_selective_f16_lm_probe_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_selective_f16_lm_tracks_f32(&device);
+    }
+
+    /// MLP outputs past F16's range turn the selective F16 LM non-finite or
+    /// out of range; the probe fails and the LM reloads with every
+    /// projection in F32, which stays finite.
+    #[test]
+    fn selective_f16_lm_falls_back_to_f32_when_the_range_probe_fails() {
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test".into(),
+        };
+        let mut loads = Vec::new();
+        let (lm, outcome) = load_with_precision_fallback(
+            "test LM",
+            &selection,
+            true,
+            DType::F32,
+            |dtype| {
+                loads.push(dtype);
+                let plan = if dtype == DType::F16 {
+                    SELECTIVE_F16
+                } else {
+                    GraniteTextExecutionPlan::BASE_DTYPE
+                };
+                Ok::<_, Error>(probe_language_model(&Device::Cpu, plan, 1.0e5))
+            },
+            |lm| {
+                run_numeric_self_check("test LM", F16_SAFE_MAX_ABS, || {
+                    lm.numeric_probe(GRANITE_LM_PROBE_TOKENS)
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(loads, [DType::F16, DType::F32]);
+        assert!(outcome.fell_back() && !lm.runs_below_f32());
+        assert!(
+            outcome.reason.ends_with("fell back to F32"),
+            "{}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn granite_selective_f16_honours_the_f32_escape_hatches() {
+        use MetalDTypeOverride::{Auto, F16, F32};
+        assert!(!granite_f32_pinned(None, Auto));
+        assert!(granite_f32_pinned(None, F32));
+        assert!(granite_f32_pinned(Some("fp32"), Auto));
+        // The family override is more specific than the global one.
+        assert!(!granite_f32_pinned(Some("f16"), F32));
+        assert!(granite_f32_pinned(Some("f32"), F16));
+        assert!(granite_f32_pinned(Some(" "), F32));
+        assert!(!granite_selective_f16_default(&Device::Cpu));
     }
 }

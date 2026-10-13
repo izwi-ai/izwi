@@ -40,6 +40,10 @@ fn conv_stack_output_len(input_len: usize) -> usize {
     conv_output_len(conv_output_len(conv_output_len(input_len)))
 }
 
+/// Rows of the F32 sinusoidal position table the audio tower builds on the
+/// host and uploads at load (priced by `runtime/lifecycle/asr_memory.rs`).
+pub(crate) const QWEN3_ASR_AUDIO_POSITIONS: usize = 1500;
+
 struct SinusoidalPositionEmbedding {
     embedding: Tensor,
 }
@@ -518,7 +522,8 @@ impl AudioTower {
         let ln_post = layer_norm(cfg.d_model, 1e-5, vb.pp("ln_post"))?;
         let proj1 = mlx::load_linear(cfg.d_model, cfg.d_model, vb.pp("proj1"))?;
         let proj2 = mlx::load_linear(cfg.d_model, cfg.output_dim, vb.pp("proj2"))?;
-        let pos_embed = SinusoidalPositionEmbedding::new(1500, cfg.d_model, vb.device())?;
+        let pos_embed =
+            SinusoidalPositionEmbedding::new(QWEN3_ASR_AUDIO_POSITIONS, cfg.d_model, vb.device())?;
 
         Ok(Self {
             conv2d1,
@@ -532,6 +537,11 @@ impl AudioTower {
             pos_embed,
             cfg,
         })
+    }
+
+    /// Mel bins per input feature frame.
+    pub(crate) fn mel_bins(&self) -> usize {
+        self.cfg.num_mel_bins
     }
 
     pub fn forward(&self, mel: &Tensor, feature_lens: Option<&[usize]>) -> Result<Tensor> {
@@ -940,8 +950,15 @@ impl AudioTower {
     }
 }
 
+/// Exact (erf) GELU: the reference audio tower uses `F.gelu` and
+/// `ACT2FN["gelu"]` (`modeling_qwen3_asr.py`), not the tanh approximation.
 fn gelu(x: &Tensor) -> Result<Tensor> {
-    x.gelu().map_err(Error::from)
+    x.gelu_erf().map_err(Error::from)
+}
+
+#[cfg(test)]
+pub(crate) fn tiny_audio_tower_for_test(device: &candle_core::Device) -> AudioTower {
+    tests::tiny_audio_tower(device)
 }
 
 #[cfg(test)]
@@ -949,6 +966,17 @@ mod tests {
     use super::*;
     use candle_core::shape::ShapeWithOneHole;
     use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn audio_tower_gelu_is_exact_erf() {
+        let x = Tensor::new(&[1.0f32, -1.0, 3.0], &Device::Cpu).unwrap();
+        let y = gelu(&x).unwrap().to_vec1::<f32>().unwrap();
+        // torch.nn.functional.gelu(torch.tensor([1., -1., 3.])), approximate="none".
+        let expected = [0.841_344_7f32, -0.158_655_26, 2.995_950_2];
+        for (got, want) in y.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "gelu {got} != {want}");
+        }
+    }
 
     fn deterministic_tensor(
         elements: usize,
@@ -984,7 +1012,7 @@ mod tests {
         )
     }
 
-    fn tiny_audio_tower(device: &Device) -> AudioTower {
+    pub(super) fn tiny_audio_tower(device: &Device) -> AudioTower {
         let cfg = AudioConfig {
             d_model: 4,
             encoder_attention_heads: 1,

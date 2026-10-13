@@ -1,13 +1,17 @@
 use izwi_asr_toolkit::{
-    plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig, AsrSpeechChunkConfig,
-    AudioChunk, SpeechChunkPlan, TranscriptAssembler,
+    chunk_seam_secs, plan_audio_chunks, plan_speech_audio_chunks, AsrLongFormConfig,
+    AsrSpeechChunkConfig, AudioChunk, SettledChunkOverlap, SpeechChunkPlan, TimedWord,
+    TranscriptAssembler,
 };
 use serde_json::json;
 use std::time::Instant;
 use tracing::debug;
 
+use crate::catalog::ModelFamily;
 use crate::engine::EngineCoreRequest;
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
+use crate::models::registry::NativeAsrModel;
 use crate::runtime::audio_io::{base64_decode, decode_audio_bytes_canonical};
 
 use super::super::output::{AsrProgress, AsrProgressPhase};
@@ -45,6 +49,22 @@ pub(crate) struct PlannedAsrChunks {
     pub(crate) planning_ms: f64,
 }
 
+#[cfg(test)]
+impl PlannedAsrChunks {
+    /// A long-form plan for routing tests that never execute it.
+    pub(crate) fn unexecuted_for_tests() -> Self {
+        Self {
+            config: AsrLongFormConfig::default(),
+            chunks: Vec::new(),
+            planner: AsrChunkPlannerKind::Duration,
+            speech_plan: None,
+            input_samples: 0,
+            sample_rate: 0,
+            planning_ms: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct AsrChunkTranscription {
     pub(super) text: String,
@@ -55,6 +75,8 @@ pub(super) struct AsrChunkTranscription {
 pub(super) struct ChunkedAsrTranscription {
     pub(super) text: String,
     pub(super) chunk_diagnostics: Vec<serde_json::Value>,
+    /// The transcript's word timings, when every chunk was merged by time.
+    pub(super) timestamp_words: Option<Vec<TimedWord>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -181,13 +203,109 @@ impl PlannedAsrChunks {
     }
 }
 
-pub(super) fn qwen3_asr_requires_long_form(
-    samples: &[f32],
-    sample_rate: u32,
-    model_max_chunk_secs: Option<f32>,
-) -> bool {
-    NativeExecutor::asr_chunk_plan(samples, sample_rate, model_max_chunk_secs, false, false)
-        .requires_chunk_path()
+/// What the ASR route planner knows about a loaded model. The route plan is a
+/// function of these, the audio and whether the request streams.
+#[derive(Debug, Clone)]
+pub(crate) struct AsrRouteCapabilities {
+    /// Longest audio one invocation may cover: the model window composed with
+    /// the effective context and decode budget. `None` means unbounded.
+    pub(crate) invocation_limit_secs: Option<f32>,
+    /// One pass covers the whole model window rather than one long-form
+    /// chunk.
+    pub(crate) single_pass_spans_model_window: bool,
+    /// Every chunk costs the encoder's full fixed window.
+    pub(crate) fixed_encoder_window: bool,
+    /// Long audio is chunked on detected speech islands.
+    pub(crate) prefers_vad_planner: bool,
+    /// The chunk route streams this model's tokens while a chunk decodes.
+    pub(crate) streams_within_chunk: bool,
+    /// Chunking for audio that needs more than one pass.
+    pub(crate) chunk_config: AsrLongFormConfig,
+}
+
+impl AsrRouteCapabilities {
+    pub(crate) fn for_family(family: ModelFamily, invocation_limit_secs: Option<f32>) -> Self {
+        let fixed_encoder_window = family.asr_fixed_encoder_window();
+        Self {
+            invocation_limit_secs,
+            single_pass_spans_model_window: family.asr_single_pass_spans_model_window(),
+            fixed_encoder_window,
+            // A fixed-window encoder pads a mostly silent chunk with a full
+            // window of silence, which a decoder that hallucinates on
+            // non-speech turns into text. Speech islands avoid such chunks.
+            prefers_vad_planner: fixed_encoder_window && family.hallucinates_on_non_speech(),
+            streams_within_chunk: family.asr_streams_within_chunk(),
+            chunk_config: NativeExecutor::asr_long_form_config(),
+        }
+    }
+
+    /// Capabilities of a loaded `NativeAsrModel` for one request: its
+    /// invocation window fitted to the effective context with the decode
+    /// budget the model plans for that much audio.
+    pub(crate) fn for_native_model(
+        model: &NativeAsrModel,
+        variant: ModelVariant,
+        request: &EngineCoreRequest,
+        effective_context: Option<usize>,
+    ) -> Result<Self> {
+        let window = model.asr_invocation_window(variant, request.asr_native_word_timestamps);
+        let limit = crate::runtime::compose_invocation_audio_limit(
+            window.max_audio_seconds,
+            model.audio_token_rate(),
+            effective_context,
+            |secs| super::handler_asr::asr_planned_decode_tokens(request, variant.family(), secs),
+        )?;
+        let limit = match window.max_chunk_seconds {
+            Some(cap) => Some(limit.map_or(cap, |limit| limit.min(cap))),
+            None => limit,
+        };
+        Ok(Self::for_family(variant.family(), limit))
+    }
+
+    pub(crate) fn with_chunk_config(mut self, chunk_config: AsrLongFormConfig) -> Self {
+        self.chunk_config = chunk_config;
+        self
+    }
+
+    /// Audio one invocation fits, with a 5% margin.
+    fn fit_limit_secs(&self) -> Option<f32> {
+        self.invocation_limit_secs
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v * 0.95)
+    }
+
+    /// Cap the chunk planner applies on top of `config`'s own chunk length.
+    fn tuned_chunk_limit_secs(&self, config: &AsrLongFormConfig) -> Option<f32> {
+        self.fit_limit_secs()
+            .map(|v| v.max(config.min_chunk_secs.max(1.0)))
+    }
+
+    /// Longest audio this model transcribes in one pass, streaming or not;
+    /// `None` when any length runs in one pass.
+    pub(crate) fn single_pass_limit_secs(&self) -> Option<f32> {
+        if self.single_pass_spans_model_window {
+            return self.fit_limit_secs();
+        }
+        // The chunk planner's own single-chunk bound.
+        let floor = self.chunk_config.min_chunk_secs.max(0.1);
+        let chunk = self.chunk_config.hard_max_chunk_secs.max(floor);
+        Some(match self.tuned_chunk_limit_secs(&self.chunk_config) {
+            Some(limit) => chunk.min(limit.max(floor)),
+            None => chunk,
+        })
+    }
+
+    pub(crate) fn supports_single_pass_up_to(&self, audio_secs: f32) -> bool {
+        self.single_pass_limit_secs()
+            .is_none_or(|limit| audio_secs <= limit)
+    }
+
+    /// Short latency chunks replace the accuracy plan for a streaming request
+    /// only when the model would otherwise emit text a whole chunk at a time,
+    /// and only when a short chunk is actually cheaper to decode.
+    fn latency_chunks_when_streaming(&self) -> bool {
+        !self.streams_within_chunk && !self.fixed_encoder_window
+    }
 }
 
 fn samples_to_seconds(samples: usize, sample_rate: u32) -> f32 {
@@ -338,142 +456,82 @@ impl NativeExecutor {
         .any(|key| std::env::var(key).is_ok())
     }
 
-    pub(super) fn asr_chunk_plan(
+    /// The ASR route plan: how a request's audio is segmented, decided once
+    /// from the model's capabilities, the audio and whether the request
+    /// streams. Preparation stores it on the request and the executor runs it
+    /// as stored.
+    ///
+    /// - Audio that fits one pass runs single pass in both modes. One pass is
+    ///   the whole model window for models built to cover it, otherwise one
+    ///   long-form chunk, and never more than 95% of the invocation limit.
+    /// - Longer audio is chunked the same way whether or not the request
+    ///   streams: the chunk route streams each chunk's tokens as they decode.
+    ///   The one exception is a streaming request for a model that cannot
+    ///   stream within a chunk and has no fixed encoder window; it gets short
+    ///   latency chunks, since its text otherwise arrives a full chunk at a
+    ///   time.
+    /// - A model that prefers the VAD planner chunks long audio on speech
+    ///   islands, in both modes.
+    pub(crate) fn asr_route_plan(
         samples: &[f32],
         sample_rate: u32,
-        model_max_chunk_secs: Option<f32>,
-        streaming_low_latency: bool,
-        allow_speech_planner: bool,
-    ) -> PlannedAsrChunks {
-        Self::asr_chunk_plan_with_options(
-            samples,
-            sample_rate,
-            model_max_chunk_secs,
-            streaming_low_latency,
-            allow_speech_planner,
-        )
-    }
-
-    /// Chunk-planner flags for an ASR request. A streaming request always plans
-    /// for latency; the VAD speech planner is a non-streaming accuracy feature
-    /// and must never override a streaming request's plan, for any family.
-    pub(super) fn asr_chunk_plan_streaming_args(
-        request_streaming: bool,
-        family_accuracy_planner: bool,
-    ) -> (bool, bool) {
-        (
-            request_streaming,
-            !request_streaming && family_accuracy_planner,
-        )
-    }
-
-    fn asr_chunk_plan_with_options(
-        samples: &[f32],
-        sample_rate: u32,
-        model_max_chunk_secs: Option<f32>,
-        mut streaming_low_latency: bool,
-        allow_speech_planner: bool,
+        capabilities: &AsrRouteCapabilities,
+        streaming: bool,
     ) -> PlannedAsrChunks {
         let planning_started = Instant::now();
-        if allow_speech_planner {
-            streaming_low_latency = false;
-        }
-        let audio_secs = if sample_rate > 0 {
-            samples.len() as f32 / sample_rate as f32
-        } else {
-            0.0
+        let audio_secs = samples_to_seconds(samples.len(), sample_rate);
+        let finish = |config: AsrLongFormConfig,
+                      chunks: Vec<AudioChunk>,
+                      planner: AsrChunkPlannerKind,
+                      speech_plan: Option<SpeechChunkPlan>| PlannedAsrChunks {
+            config,
+            chunks,
+            planner,
+            speech_plan,
+            input_samples: samples.len(),
+            sample_rate,
+            planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
         };
-        let model_fit_limit_secs = model_max_chunk_secs
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| v * 0.95);
-        if streaming_low_latency
-            && !Self::stream_chunk_overrides_present()
-            && model_fit_limit_secs
-                .map(|limit| audio_secs <= limit)
-                .unwrap_or(false)
-        {
-            let mut single_chunk_cfg = Self::asr_long_form_config();
-            let single_chunk_secs = audio_secs.max(single_chunk_cfg.min_chunk_secs.max(0.5));
-            single_chunk_cfg.target_chunk_secs = single_chunk_secs;
-            single_chunk_cfg.hard_max_chunk_secs = single_chunk_secs;
-            single_chunk_cfg.overlap_secs =
-                single_chunk_cfg.overlap_secs.min(single_chunk_secs * 0.1);
-            single_chunk_cfg.silence_search_secs = single_chunk_cfg
-                .silence_search_secs
-                .min(single_chunk_secs * 0.25);
+        let cfg = capabilities.chunk_config.clone();
+        if capabilities.supports_single_pass_up_to(audio_secs) {
+            let chunks = if samples.is_empty() || sample_rate == 0 {
+                Vec::new()
+            } else {
+                vec![AudioChunk {
+                    start_sample: 0,
+                    end_sample: samples.len(),
+                }]
+            };
+            return finish(cfg, chunks, AsrChunkPlannerKind::Duration, None);
+        }
+
+        if streaming && capabilities.latency_chunks_when_streaming() {
+            let latency_cfg = Self::asr_streaming_low_latency_config(audio_secs);
             let chunks = plan_audio_chunks(
                 samples,
                 sample_rate,
-                &single_chunk_cfg,
-                model_fit_limit_secs.map(|v| v.max(single_chunk_cfg.min_chunk_secs.max(1.0))),
+                &latency_cfg,
+                capabilities.tuned_chunk_limit_secs(&latency_cfg),
             );
-            return PlannedAsrChunks {
-                config: single_chunk_cfg,
-                chunks,
-                planner: AsrChunkPlannerKind::Duration,
-                speech_plan: None,
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
-        }
-
-        let cfg = if streaming_low_latency {
-            Self::asr_streaming_low_latency_config(audio_secs)
-        } else {
-            Self::asr_long_form_config()
-        };
-        let tuned_limit = model_max_chunk_secs
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|v| (v * 0.95).max(cfg.min_chunk_secs.max(1.0)));
-
-        if allow_speech_planner {
-            let speech_cfg = AsrSpeechChunkConfig::default();
-            let speech_plan =
-                plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
-            return PlannedAsrChunks {
-                chunks: speech_plan.chunks.clone(),
-                config: cfg,
-                planner: AsrChunkPlannerKind::Speech,
-                speech_plan: Some(speech_plan),
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
-        }
-
-        let mut chunks = plan_audio_chunks(samples, sample_rate, &cfg, tuned_limit);
-
-        if streaming_low_latency && chunks.len() > MAX_STREAMING_LOW_LATENCY_CHUNKS {
+            if chunks.len() <= MAX_STREAMING_LOW_LATENCY_CHUNKS {
+                return finish(latency_cfg, chunks, AsrChunkPlannerKind::Duration, None);
+            }
             debug!(
                 "ASR streaming chunk plan too fragmented ({} chunks), relaxing to long-form defaults",
                 chunks.len()
             );
-            let fallback_cfg = Self::asr_long_form_config();
-            let fallback_limit = model_max_chunk_secs
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .map(|v| (v * 0.95).max(fallback_cfg.min_chunk_secs.max(1.0)));
-            chunks = plan_audio_chunks(samples, sample_rate, &fallback_cfg, fallback_limit);
-            return PlannedAsrChunks {
-                config: fallback_cfg,
-                chunks,
-                planner: AsrChunkPlannerKind::Duration,
-                speech_plan: None,
-                input_samples: samples.len(),
-                sample_rate,
-                planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
-            };
         }
 
-        PlannedAsrChunks {
-            config: cfg,
-            chunks,
-            planner: AsrChunkPlannerKind::Duration,
-            speech_plan: None,
-            input_samples: samples.len(),
-            sample_rate,
-            planning_ms: planning_started.elapsed().as_secs_f64() * 1000.0,
+        let tuned_limit = capabilities.tuned_chunk_limit_secs(&cfg);
+        if capabilities.prefers_vad_planner {
+            let speech_cfg = AsrSpeechChunkConfig::default();
+            let speech_plan =
+                plan_speech_audio_chunks(samples, sample_rate, &cfg, &speech_cfg, tuned_limit);
+            let chunks = speech_plan.chunks.clone();
+            return finish(cfg, chunks, AsrChunkPlannerKind::Speech, Some(speech_plan));
         }
+        let chunks = plan_audio_chunks(samples, sample_rate, &cfg, tuned_limit);
+        finish(cfg, chunks, AsrChunkPlannerKind::Duration, None)
     }
 
     pub(super) fn transcribe_with_chunk_plan<F>(
@@ -492,6 +550,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_details(
             request_id,
+            &|| false,
             stream_tx,
             stream_policy,
             sequence,
@@ -511,6 +570,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -523,8 +583,9 @@ impl NativeExecutor {
     where
         F: FnMut(&[f32], u32) -> Result<AsrChunkTranscription>,
     {
-        Self::transcribe_with_chunk_plan_with_context_and_details(
+        Self::transcribe_with_chunk_plan_with_details_and_options(
             request_id,
+            is_cancelled,
             stream_tx,
             stream_policy,
             sequence,
@@ -532,6 +593,7 @@ impl NativeExecutor {
             sample_rate,
             chunk_plan,
             chunk_cfg,
+            AsrChunkStreamOptions::default(),
             |chunk_audio, sr, _prefix_text| transcribe_chunk(chunk_audio, sr),
         )
     }
@@ -552,6 +614,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_details_and_options(
             request_id,
+            &|| false,
             stream_tx,
             stream_policy,
             sequence,
@@ -566,6 +629,7 @@ impl NativeExecutor {
 
     pub(super) fn transcribe_with_chunk_plan_with_details_and_options<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -581,6 +645,7 @@ impl NativeExecutor {
     {
         Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
             request_id,
+            is_cancelled,
             stream_tx,
             stream_policy,
             sequence,
@@ -600,8 +665,15 @@ impl NativeExecutor {
     /// rules) and reconciles the accounting once the chunk text commits.
     /// Families that ignore the emitter keep the plain per-chunk delta
     /// behavior.
+    ///
+    /// `is_cancelled` is polled before every chunk, inside the partial
+    /// emitter and before a finished chunk commits; once it reports true the
+    /// executor stops streaming and returns `Error::Cancelled`. A model call
+    /// already running is not preempted, so an abandoned long-form request
+    /// releases its slot within one chunk instead of after the whole file.
     pub(super) fn transcribe_with_chunk_plan_with_streaming_details_and_options<F>(
         request_id: &str,
+        is_cancelled: &dyn Fn() -> bool,
         stream_tx: Option<&StreamStagingBuffer>,
         stream_policy: EngineStreamPolicy,
         sequence: &mut usize,
@@ -622,6 +694,7 @@ impl NativeExecutor {
             return Ok(ChunkedAsrTranscription {
                 text: String::new(),
                 chunk_diagnostics: Vec::new(),
+                timestamp_words: None,
             });
         }
 
@@ -643,13 +716,20 @@ impl NativeExecutor {
         }
 
         let mut assembler = TranscriptAssembler::new(chunk_cfg.clone());
-        let mut deferred_boundary_delta = String::new();
-        let mut emitted_stream_chars = 0usize;
-        let stable_text_streaming =
-            stream_tx.is_some() && stream_options.stable_text_holdback_chars > 0;
-        let mut partial_streamed_any = false;
+        let mut cursor = TranscriptStreamCursor::default();
+        let holdback_chars = stream_options.stable_text_holdback_chars;
+        let stable_text_streaming = stream_tx.is_some() && holdback_chars > 0;
+        let mut previous_chunk_end: Option<usize> = None;
         let mut chunk_diagnostics = Vec::new();
+        // Word timings of the transcript so far, while every committed chunk
+        // was merged by time.
+        let mut timestamp_words: Option<Vec<TimedWord>> = Some(Vec::new());
+        let mut timed_chunks = 0usize;
+        let cancelled = || Error::Cancelled(request_id.to_string());
         for (idx, chunk) in chunk_plan.iter().enumerate() {
+            if is_cancelled() {
+                return Err(cancelled());
+            }
             if chunk.end_sample <= chunk.start_sample || chunk.end_sample > samples.len() {
                 chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
                     idx,
@@ -666,6 +746,23 @@ impl NativeExecutor {
                 continue;
             }
             let chunk_audio = &samples[chunk.start_sample..chunk.end_sample];
+            // Audio this chunk shares with the previous one. Chunks that do not
+            // overlap (speech-island plans) are merged without boundary dedup.
+            let overlap_secs = previous_chunk_end.map_or(0.0, |end| {
+                samples_to_seconds(end.saturating_sub(chunk.start_sample), sample_rate)
+            });
+            // Seams with the neighbouring chunks, for chunks merged by time.
+            let chunk_start_secs = samples_to_seconds(chunk.start_sample, sample_rate);
+            let chunk_end_secs = samples_to_seconds(chunk.end_sample, sample_rate);
+            let seam_after = previous_chunk_end
+                .map(|end| chunk_seam_secs(samples_to_seconds(end, sample_rate), chunk_start_secs));
+            let seam_until = chunk_plan.get(idx + 1).map(|next| {
+                chunk_seam_secs(
+                    chunk_end_secs,
+                    samples_to_seconds(next.start_sample, sample_rate),
+                )
+            });
+            previous_chunk_end = Some(chunk.end_sample);
             let prefix_text = assembler.text().to_string();
             if let Some(tx) = stream_tx {
                 Self::stream_asr_progress_with_policy(
@@ -683,7 +780,8 @@ impl NativeExecutor {
                 )?;
             }
             let chunk_started = Instant::now();
-            let mut partial_pending = String::new();
+            let mut partial_text = String::new();
+            let mut settled: Option<SettledChunkOverlap> = None;
             let mut partial_error: Option<Error> = None;
             let mut partial_streamed = false;
             let chunk_result = {
@@ -692,14 +790,23 @@ impl NativeExecutor {
                     if partial_error.is_some() || delta.is_empty() {
                         return;
                     }
-                    partial_pending.push_str(delta);
-                    let visible = assembler.preview_merged_text(&partial_pending);
-                    let stable_delta = Self::next_text_delta_stable(
-                        &visible,
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        false,
-                    );
+                    if is_cancelled() {
+                        partial_error = Some(cancelled());
+                        return;
+                    }
+                    partial_text.push_str(delta);
+                    // Stream nothing from this chunk until its text covers the
+                    // overlap with the previous chunk; after that its deltas
+                    // only append, and the commit reuses the same decision.
+                    if settled.is_none() {
+                        settled = assembler.settle_chunk_overlap(&partial_text, overlap_secs);
+                    }
+                    let Some(overlap) = settled.as_ref() else {
+                        return;
+                    };
+                    let provisional = assembler.provisional_chunk_text(&partial_text, overlap);
+                    let stable_delta =
+                        cursor.advance(assembler.text(), &provisional, holdback_chars, false);
                     if stable_delta.is_empty() {
                         return;
                     }
@@ -725,7 +832,13 @@ impl NativeExecutor {
             if let Some(err) = partial_error {
                 return Err(err);
             }
+            if is_cancelled() {
+                return Err(cancelled());
+            }
             let chunk_text = chunk_result.text.clone();
+            let chunk_words = chunk_result.diagnostics.as_ref().and_then(|diagnostics| {
+                chunk_timed_words(diagnostics, &chunk_text, chunk_start_secs)
+            });
             let transcribe_ms = chunk_started.elapsed().as_secs_f64() * 1000.0;
             chunk_diagnostics.push(Self::chunk_transcription_diagnostics(
                 idx,
@@ -751,103 +864,86 @@ impl NativeExecutor {
                     ),
                 )?;
             }
-            let mut delta = assembler.push_chunk_text(&chunk_text);
-            let is_last_chunk = idx + 1 == chunk_plan.len();
-
-            if partial_streamed {
-                partial_streamed_any = true;
-                if let Some(tx) = stream_tx {
-                    let stable_delta = Self::next_text_delta_stable(
-                        assembler.text(),
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        is_last_chunk,
-                    );
-                    if !stable_delta.is_empty() {
-                        Self::stream_text_with_policy(
-                            tx,
-                            stream_policy,
-                            request_id,
-                            sequence,
-                            stable_delta,
-                        )?;
+            let committed_len = assembler.text().len();
+            let provisional = settled
+                .as_ref()
+                .map(|overlap| assembler.provisional_chunk_text(&partial_text, overlap));
+            // A chunk with word timings is merged by time while every chunk
+            // before it was; otherwise by text, which ends timing for the rest
+            // of the transcript.
+            match (chunk_words, timestamp_words.as_mut()) {
+                (Some(words), Some(merged_words)) => {
+                    merged_words
+                        .extend(assembler.push_timed_chunk_words(&words, seam_after, seam_until));
+                    timed_chunks += 1;
+                }
+                _ => {
+                    timestamp_words = None;
+                    match settled.as_ref() {
+                        Some(overlap) => {
+                            assembler.push_settled_chunk_text(&chunk_text, overlap);
+                        }
+                        None => {
+                            assembler.push_chunk_text_with_overlap(&chunk_text, overlap_secs);
+                        }
                     }
                 }
-                continue;
             }
-
-            if stable_text_streaming {
-                if let Some(tx) = stream_tx {
-                    let stable_delta = Self::next_text_delta_stable(
-                        assembler.text(),
-                        &mut emitted_stream_chars,
-                        stream_options.stable_text_holdback_chars,
-                        is_last_chunk,
-                    );
-                    if !stable_delta.is_empty() {
-                        Self::stream_text_with_policy(
-                            tx,
-                            stream_policy,
-                            request_id,
-                            sequence,
-                            stable_delta,
-                        )?;
-                    }
-                }
-                continue;
-            }
-
-            if !deferred_boundary_delta.is_empty() {
-                deferred_boundary_delta.push_str(&delta);
-                delta = std::mem::take(&mut deferred_boundary_delta);
-            }
-
-            if !is_last_chunk && is_boundary_noise_delta(&delta) {
-                deferred_boundary_delta.push_str(&delta);
-                continue;
-            }
-
-            if !delta.is_empty() {
-                if let Some(tx) = stream_tx {
-                    let streamed_chars = delta.chars().count();
-                    Self::stream_text_with_policy(tx, stream_policy, request_id, sequence, delta)?;
-                    // Keep the partial-emitter accounting coherent: any
-                    // committed text streamed outside next_text_delta_stable
-                    // still counts as visible, or a later partial-emitting
-                    // chunk would re-stream it.
-                    emitted_stream_chars = emitted_stream_chars.saturating_add(streamed_chars);
-                }
-            }
-        }
-
-        if stable_text_streaming || partial_streamed_any {
-            if let Some(tx) = stream_tx {
-                let final_delta = Self::next_text_delta_stable(
-                    assembler.text(),
-                    &mut emitted_stream_chars,
-                    0,
-                    true,
+            if provisional.is_some_and(|provisional| {
+                !assembler.text()[committed_len..].starts_with(&provisional)
+            }) {
+                debug!(
+                    "ASR chunk {idx} of request {request_id} committed text that differs from its streamed partials"
                 );
-                if !final_delta.is_empty() {
-                    Self::stream_text_with_policy(
-                        tx,
-                        stream_policy,
-                        request_id,
-                        sequence,
-                        final_delta,
-                    )?;
-                }
             }
-        }
+            // What this chunk added after overlap dedup. The chunk texts
+            // concatenate to the transcript, so with the chunk's time range
+            // they form the response's default segments.
+            if let Some(entry) = chunk_diagnostics
+                .last_mut()
+                .and_then(|value| value.as_object_mut())
+            {
+                entry.insert(
+                    "committed_text".to_string(),
+                    json!(assembler.text()[committed_len..].trim_start()),
+                );
+            }
+            cursor.align(assembler.text(), "");
 
-        if !deferred_boundary_delta.is_empty() {
-            if let Some(tx) = stream_tx {
+            let Some(tx) = stream_tx else {
+                continue;
+            };
+            let is_last_chunk = idx + 1 == chunk_plan.len();
+            // Without partials or a holdback, a delta that is only boundary
+            // punctuation waits to be streamed with the next chunk's text.
+            if !partial_streamed
+                && !stable_text_streaming
+                && !is_last_chunk
+                && is_boundary_noise_delta(cursor.pending(assembler.text()))
+            {
+                continue;
+            }
+            let stable_delta = cursor.advance(assembler.text(), "", holdback_chars, is_last_chunk);
+            if !stable_delta.is_empty() {
                 Self::stream_text_with_policy(
                     tx,
                     stream_policy,
                     request_id,
                     sequence,
-                    deferred_boundary_delta,
+                    stable_delta,
+                )?;
+            }
+        }
+
+        if let Some(tx) = stream_tx {
+            let final_delta = cursor.advance(assembler.text(), "", 0, true);
+            if !final_delta.is_empty() {
+                Self::stream_text_with_policy(
+                    tx,
+                    stream_policy,
+                    request_id,
+                    sequence,
+                    final_delta,
                 )?;
             }
         }
@@ -866,6 +962,7 @@ impl NativeExecutor {
         Ok(ChunkedAsrTranscription {
             text: assembler.finish(),
             chunk_diagnostics,
+            timestamp_words: timestamp_words.filter(|_| timed_chunks > 0),
         })
     }
 
@@ -987,39 +1084,133 @@ impl NativeExecutor {
         *emitted_samples = stable_end;
         delta
     }
+}
 
-    pub(super) fn next_text_delta_stable(
-        all_text: &str,
-        emitted_chars: &mut usize,
+/// Append-only cursor over streamed transcript text: the committed transcript
+/// followed by the current chunk's provisional text. `emitted` is a byte
+/// offset into that text. Committed text extends the provisional text it
+/// replaces, so the offset stays valid across commits.
+#[derive(Debug, Default)]
+struct TranscriptStreamCursor {
+    emitted: usize,
+}
+
+impl TranscriptStreamCursor {
+    /// Text past the cursor, minus a tail of `holdback_chars` characters until
+    /// `is_final`. Work is bounded by the delta and the holdback, not by the
+    /// transcript length.
+    fn advance(
+        &mut self,
+        committed: &str,
+        provisional: &str,
         holdback_chars: usize,
         is_final: bool,
     ) -> String {
-        let total_chars = all_text.chars().count();
-        let stable_end = if is_final {
-            total_chars
+        self.align(committed, provisional);
+        let end = if is_final {
+            committed.len() + provisional.len()
         } else {
-            total_chars.saturating_sub(holdback_chars)
+            holdback_start(committed, provisional, holdback_chars)
         };
-        let start = (*emitted_chars).min(stable_end);
-        if start >= stable_end {
+        if end <= self.emitted {
             return String::new();
         }
+        let split = committed.len();
+        let mut delta = String::with_capacity(end - self.emitted);
+        if self.emitted < split {
+            delta.push_str(&committed[self.emitted..end.min(split)]);
+        }
+        if end > split {
+            delta.push_str(&provisional[self.emitted.max(split) - split..end - split]);
+        }
+        self.emitted = end;
+        delta
+    }
 
-        let start_byte = char_to_byte_index(all_text, start);
-        let end_byte = char_to_byte_index(all_text, stable_end);
-        *emitted_chars = stable_end;
-        all_text[start_byte..end_byte].to_string()
+    /// Committed text not yet streamed.
+    fn pending<'a>(&self, committed: &'a str) -> &'a str {
+        committed.get(self.emitted..).unwrap_or("")
+    }
+
+    /// Keep the cursor within `committed` followed by `provisional` and on a
+    /// character boundary. It only moves when model text contradicted text
+    /// that was already streamed.
+    fn align(&mut self, committed: &str, provisional: &str) {
+        let split = committed.len();
+        let mut emitted = self.emitted.min(split + provisional.len());
+        while !(if emitted <= split {
+            committed.is_char_boundary(emitted)
+        } else {
+            provisional.is_char_boundary(emitted - split)
+        }) {
+            emitted += 1;
+        }
+        self.emitted = emitted;
     }
 }
 
-fn char_to_byte_index(text: &str, char_idx: usize) -> usize {
-    if char_idx == 0 {
-        return 0;
+/// Byte offset, in `committed` followed by `provisional`, where the last
+/// `holdback_chars` characters begin.
+fn holdback_start(committed: &str, provisional: &str, holdback_chars: usize) -> usize {
+    let total = committed.len() + provisional.len();
+    if holdback_chars == 0 {
+        return total;
     }
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len())
+    let mut remaining = holdback_chars;
+    for (idx, _) in provisional.char_indices().rev() {
+        remaining -= 1;
+        if remaining == 0 {
+            return committed.len() + idx;
+        }
+    }
+    for (idx, _) in committed.char_indices().rev() {
+        remaining -= 1;
+        if remaining == 0 {
+            return idx;
+        }
+    }
+    0
+}
+
+/// A chunk's word timings from its model diagnostics (`timestamp_words`,
+/// timed from the chunk's start), placed on the input timeline. `None` when
+/// the model reported no word timings for the chunk's text: a model may
+/// report an empty list for a task that does not time words.
+fn chunk_timed_words(
+    diagnostics: &serde_json::Value,
+    chunk_text: &str,
+    chunk_start_secs: f32,
+) -> Option<Vec<TimedWord>> {
+    let words = diagnostics.get("timestamp_words")?.as_array()?;
+    if words.is_empty() && !chunk_text.trim().is_empty() {
+        return None;
+    }
+    words
+        .iter()
+        .map(|word| {
+            Some(TimedWord {
+                text: word.get("word")?.as_str()?.to_string(),
+                start_secs: chunk_start_secs + word.get("start_time_seconds")?.as_f64()? as f32,
+                end_secs: chunk_start_secs + word.get("end_time_seconds")?.as_f64()? as f32,
+            })
+        })
+        .collect()
+}
+
+/// `timestamp_words` diagnostics for a transcript's word timings.
+pub(super) fn timestamp_words_json(words: &[TimedWord]) -> serde_json::Value {
+    serde_json::Value::Array(
+        words
+            .iter()
+            .map(|word| {
+                json!({
+                    "word": word.text,
+                    "start_time_seconds": word.start_secs,
+                    "end_time_seconds": word.end_secs,
+                })
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
@@ -1058,8 +1249,10 @@ mod tests {
     use crate::engine::EngineStreamPolicy;
 
     use super::{
-        AsrChunkPlannerKind, AsrChunkStreamOptions, AsrChunkTranscription, NativeExecutor,
+        AsrChunkPlannerKind, AsrChunkStreamOptions, AsrChunkTranscription, AsrRouteCapabilities,
+        NativeExecutor, PlannedAsrChunks, TranscriptStreamCursor,
     };
+    use crate::catalog::ModelFamily;
 
     #[test]
     fn next_audio_delta_emits_only_new_tail_samples() {
@@ -1107,264 +1300,228 @@ mod tests {
     }
 
     #[test]
-    fn next_text_delta_stable_holds_back_unstable_tail() {
-        let mut emitted = 0usize;
+    fn stream_cursor_holds_back_unstable_tail() {
+        let mut cursor = TranscriptStreamCursor::default();
 
-        let first = NativeExecutor::next_text_delta_stable("hello world", &mut emitted, 5, false);
-        assert_eq!(first, "hello ");
-        assert_eq!(emitted, 6);
-
-        let second =
-            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, false);
-        assert_eq!(second, "world ");
-        assert_eq!(emitted, 12);
-
-        let final_delta =
-            NativeExecutor::next_text_delta_stable("hello world again", &mut emitted, 5, true);
-        assert_eq!(final_delta, "again");
-        assert_eq!(emitted, 17);
+        assert_eq!(cursor.advance("hello world", "", 5, false), "hello ");
+        assert_eq!(cursor.advance("hello world again", "", 5, false), "world ");
+        assert_eq!(cursor.advance("hello world again", "", 5, true), "again");
+        assert_eq!(cursor.advance("hello world again", "", 5, true), "");
     }
 
     #[test]
-    fn next_text_delta_stable_respects_utf8_boundaries() {
-        let mut emitted = 0usize;
-        let first = NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, false);
-        assert_eq!(first, "héllo ");
-        assert_eq!(emitted, 6);
+    fn stream_cursor_respects_utf8_boundaries() {
+        let mut cursor = TranscriptStreamCursor::default();
 
-        let final_delta =
-            NativeExecutor::next_text_delta_stable("héllo 世界", &mut emitted, 2, true);
-        assert_eq!(final_delta, "世界");
-        assert_eq!(emitted, 8);
+        assert_eq!(cursor.advance("héllo 世界", "", 2, false), "héllo ");
+        assert_eq!(cursor.advance("héllo 世界", "", 2, true), "世界");
     }
 
     #[test]
-    fn asr_chunk_plan_streaming_args_request_drives_the_plan() {
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(true, true);
-        assert!(low_latency, "streaming requests always plan for latency");
-        assert!(
-            !speech_planner,
-            "the VAD speech planner is a non-streaming accuracy feature"
-        );
+    fn stream_cursor_spans_committed_and_provisional_text() {
+        let mut cursor = TranscriptStreamCursor::default();
 
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(false, true);
-        assert!(!low_latency);
-        assert!(speech_planner, "non-streaming keeps family accuracy policy");
-
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(true, false);
-        assert!(low_latency);
-        assert!(!speech_planner);
-
-        let (low_latency, speech_planner) =
-            NativeExecutor::asr_chunk_plan_streaming_args(false, false);
-        assert!(!low_latency);
-        assert!(!speech_planner);
-    }
-
-    #[test]
-    fn speech_planner_still_overrides_streaming_if_both_requested() {
-        // Internal invariant of the planner: the speech planner wins if a caller
-        // ever requests both. Call-site policy (asr_chunk_plan_streaming_args)
-        // keeps the two mutually exclusive.
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 30];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
-    }
-
-    #[test]
-    fn streaming_plan_sizes_long_audio_for_latency_not_accuracy() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 60];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.config.target_chunk_secs <= super::DEFAULT_STREAM_LONG_TARGET_CHUNK_SECS,
-            "expected latency-sized streaming chunks, got target {}s",
-            plan.config.target_chunk_secs
-        );
-        assert!(
-            plan.chunks.len() > 1,
-            "expected 60s audio to split into streaming chunks, got {}",
-            plan.chunks.len()
-        );
-    }
-
-    #[test]
-    fn streaming_low_latency_chunk_plan_keeps_very_short_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected a single chunk, got {}",
-            plan.chunks.len()
+            cursor.advance("alpha", " beta gam", 3, false),
+            "alpha beta "
         );
-    }
-
-    #[test]
-    fn streaming_low_latency_chunk_plan_splits_medium_audio() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 8];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, None, true, false);
-        assert!(
-            plan.chunks.len() > 1,
-            "expected multiple chunks, got {}",
-            plan.chunks.len()
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_keeps_model_fit_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 20];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
         assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected a single chunk for model-fit audio, got {}",
-            plan.chunks.len()
+            cursor.advance("alpha", " beta gamma delta", 3, false),
+            "gamma de"
+        );
+        // The commit extends the provisional text, so the cursor carries over.
+        assert_eq!(
+            cursor.advance("alpha beta gamma delta epsilon", "", 0, true),
+            "lta epsilon"
         );
     }
 
+    fn caps(family: ModelFamily, limit: Option<f32>) -> AsrRouteCapabilities {
+        AsrRouteCapabilities::for_family(family, limit)
+    }
+
+    fn plan(
+        family: ModelFamily,
+        limit: Option<f32>,
+        samples: &[f32],
+        sr: u32,
+        streaming: bool,
+    ) -> PlannedAsrChunks {
+        NativeExecutor::asr_route_plan(samples, sr, &caps(family, limit), streaming)
+    }
+
+    /// Representative invocation limits: Qwen3 off CUDA (1500 encoder
+    /// positions), Whisper's and Nemotron's 30 s window, Granite's 9 min ASR
+    /// task, VibeVoice's hour; Parakeet, Voxtral and LFM2.5 set none.
+    const ROUTE_FAMILIES: [(ModelFamily, Option<f32>); 8] = [
+        (ModelFamily::Qwen3Asr, Some(120.0)),
+        (ModelFamily::WhisperAsr, Some(30.0)),
+        (ModelFamily::GraniteSpeechAsr, Some(540.0)),
+        (ModelFamily::VibeVoiceAsr, Some(3600.0)),
+        (ModelFamily::NemotronAsr, Some(30.0)),
+        (ModelFamily::ParakeetAsr, None),
+        (ModelFamily::Voxtral, None),
+        (ModelFamily::Lfm25Audio, None),
+    ];
+
+    #[derive(Debug, PartialEq)]
+    enum Route {
+        SinglePass,
+        /// Long-form chunks on the given planner, identical in both modes.
+        Chunked(AsrChunkPlannerKind),
+        /// Streaming only: short chunks for latency.
+        LatencyChunks,
+    }
+
+    fn route_of(plan: &PlannedAsrChunks, accuracy: &PlannedAsrChunks) -> Route {
+        if !plan.requires_chunk_path() {
+            return Route::SinglePass;
+        }
+        if plan.chunks == accuracy.chunks
+            && plan.config.target_chunk_secs == accuracy.config.target_chunk_secs
+            && plan.planner == accuracy.planner
+        {
+            return Route::Chunked(plan.planner);
+        }
+        assert!(plan.config.target_chunk_secs <= super::DEFAULT_STREAM_LONG_TARGET_CHUNK_SECS);
+        Route::LatencyChunks
+    }
+
+    /// The route decision table: family x duration x mode.
     #[test]
-    fn streaming_chunk_plan_splits_audio_when_model_hint_is_exceeded() {
+    fn route_plan_decision_table() {
+        use AsrChunkPlannerKind::{Duration, Speech};
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 40];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.chunks.len() > 1,
-            "expected chunking beyond model hint, got {}",
-            plan.chunks.len()
-        );
+        let expected = |family: ModelFamily, secs: usize, streaming: bool| -> Route {
+            if secs <= 20 {
+                return Route::SinglePass;
+            }
+            match family {
+                ModelFamily::VibeVoiceAsr | ModelFamily::ParakeetAsr => Route::SinglePass,
+                ModelFamily::WhisperAsr => Route::Chunked(Speech),
+                // Granite cannot stream within a chunk; 600 s of latency
+                // chunks is too fragmented and relaxes to the accuracy plan.
+                ModelFamily::GraniteSpeechAsr if streaming && secs < 600 => Route::LatencyChunks,
+                _ => Route::Chunked(Duration),
+            }
+        };
+        for secs in [20usize, 60, 116, 600] {
+            let samples = vec![0.0f32; sr as usize * secs];
+            for (family, limit) in ROUTE_FAMILIES {
+                let accuracy = plan(family, limit, &samples, sr, false);
+                for streaming in [false, true] {
+                    let planned = plan(family, limit, &samples, sr, streaming);
+                    assert_eq!(
+                        route_of(&planned, &accuracy),
+                        expected(family, secs, streaming),
+                        "{family:?} {secs}s streaming={streaming}"
+                    );
+                    if planned.requires_chunk_path() {
+                        let fit = limit.map_or(f32::INFINITY, |limit| limit * 0.95);
+                        for chunk in &planned.chunks {
+                            let chunk_secs = chunk.len_samples() as f32 / sr as f32;
+                            assert!(chunk_secs <= fit.min(30.0) + 1e-3, "{family:?} {secs}s");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn streaming_chunk_plan_keeps_long_audio_single_chunk_when_model_hint_fits() {
+    fn single_pass_limit_agrees_with_the_chunk_planner() {
+        let sr = 1_000u32;
+        for (family, limit) in ROUTE_FAMILIES {
+            let capabilities = caps(family, limit);
+            let Some(limit_secs) = capabilities.single_pass_limit_secs() else {
+                assert!(capabilities.supports_single_pass_up_to(1e6));
+                continue;
+            };
+            let at_limit = vec![0.0f32; (limit_secs * sr as f32).floor() as usize];
+            let past_limit = vec![0.0f32; at_limit.len() + 2];
+            assert!(
+                !NativeExecutor::asr_route_plan(&at_limit, sr, &capabilities, false)
+                    .requires_chunk_path(),
+                "{family:?}"
+            );
+            assert!(
+                NativeExecutor::asr_route_plan(&past_limit, sr, &capabilities, false)
+                    .requires_chunk_path(),
+                "{family:?}"
+            );
+            if !capabilities.single_pass_spans_model_window {
+                let chunks = izwi_asr_toolkit::plan_audio_chunks(
+                    &at_limit,
+                    sr,
+                    &capabilities.chunk_config,
+                    capabilities.tuned_chunk_limit_secs(&capabilities.chunk_config),
+                );
+                assert_eq!(chunks.len(), 1, "{family:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn capability_flags_come_from_the_family() {
+        let whisper = caps(ModelFamily::WhisperAsr, Some(30.0));
+        assert!(whisper.fixed_encoder_window && whisper.prefers_vad_planner);
+        let qwen = caps(ModelFamily::Qwen3Asr, Some(120.0));
+        assert!(!qwen.fixed_encoder_window && !qwen.prefers_vad_planner);
+        assert!(qwen.streams_within_chunk);
+        assert!(!caps(ModelFamily::GraniteSpeechAsr, None).streams_within_chunk);
+        assert!(caps(ModelFamily::VibeVoiceAsr, None).single_pass_spans_model_window);
+    }
+
+    #[test]
+    fn whole_window_model_chunks_past_its_window() {
         let sr = 10u32;
-        let audio_secs = 50 * 60;
-        let samples = vec![0.0f32; sr as usize * audio_secs];
-
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(60.0 * 60.0), true, false);
-
-        assert_eq!(
-            plan.chunks.len(),
-            1,
-            "expected model-fit 50-minute audio to stay single chunk"
-        );
-        assert!(
-            !plan.requires_chunk_path(),
-            "model-fit single chunk should bypass chunked transcription"
-        );
-    }
-
-    #[test]
-    fn streaming_chunk_plan_forces_long_audio_chunk_path_before_model_prefill() {
-        let sr = 10u32;
-        let audio_secs = 50 * 60;
-        let model_hint_secs = 120.0f32;
-        let model_fit_limit_secs = model_hint_secs * 0.95;
-        let samples = vec![0.0f32; sr as usize * audio_secs];
-
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(model_hint_secs), true, false);
-
-        assert!(
-            plan.requires_chunk_path(),
-            "expected 50-minute model-limited audio to use chunked transcription"
-        );
-        assert!(
-            plan.chunks.len() > 1,
-            "expected multiple chunks, got {}",
-            plan.chunks.len()
-        );
-        let max_chunk_secs = plan
+        let samples = vec![0.0f32; sr as usize * 50 * 60];
+        let fits = plan(ModelFamily::VibeVoiceAsr, Some(3600.0), &samples, sr, false);
+        assert!(!fits.requires_chunk_path());
+        let limited = plan(ModelFamily::VibeVoiceAsr, Some(120.0), &samples, sr, true);
+        assert!(limited.requires_chunk_path());
+        let max_chunk_secs = limited
             .chunks
             .iter()
             .map(|chunk| chunk.len_samples() as f32 / sr as f32)
             .fold(0.0f32, f32::max);
-        assert!(
-            max_chunk_secs <= model_fit_limit_secs + 1.0 / sr as f32,
-            "expected chunk duration <= {model_fit_limit_secs}s, got {max_chunk_secs}s"
-        );
+        assert!(max_chunk_secs <= 30.0 + 1.0 / sr as f32);
     }
 
     #[test]
-    fn speech_planner_plan_is_identical_for_streaming_and_standard_requests() {
-        // Documents planner dominance inside asr_chunk_plan: when the speech
-        // planner runs it produces the same plan regardless of the streaming
-        // flag. Call-site policy keeps the planner out of streaming requests
-        // entirely (asr_chunk_plan_streaming_args).
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 40];
-        let streaming = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, true);
-        let standard = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
-
-        assert_eq!(
-            streaming.config.target_chunk_secs,
-            standard.config.target_chunk_secs
-        );
-        assert_eq!(
-            streaming.config.hard_max_chunk_secs,
-            standard.config.hard_max_chunk_secs
-        );
-        assert_eq!(streaming.config.overlap_secs, standard.config.overlap_secs);
-        assert_eq!(streaming.chunks, standard.chunks);
-    }
-
-    #[test]
-    fn standard_chunk_plan_keeps_short_audio_single_chunk() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, false);
-        assert_eq!(plan.chunks.len(), 1);
-    }
-
-    #[test]
-    fn streaming_chunk_plan_relaxes_when_chunk_count_is_too_high() {
+    fn latency_plan_relaxes_when_chunk_count_is_too_high() {
         let sr = 16_000u32;
         let samples = vec![0.0f32; (sr as usize) * 180];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), true, false);
-        assert!(
-            plan.chunks.len() <= 24,
-            "expected guarded chunk count, got {}",
-            plan.chunks.len()
+        let planned = plan(
+            ModelFamily::GraniteSpeechAsr,
+            Some(540.0),
+            &samples,
+            sr,
+            true,
         );
+        assert!(planned.chunks.len() <= 24, "got {}", planned.chunks.len());
     }
 
     #[test]
-    fn speech_chunk_plan_is_default_for_allowed_models() {
+    fn vad_route_plan_can_return_no_speech() {
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(30.0), false, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
-        assert!(plan.requires_chunk_path());
-        assert!(plan.chunks.is_empty());
-        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
-    }
-
-    #[test]
-    fn vad_chunk_plan_can_return_no_speech() {
-        let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan =
-            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
-        assert_eq!(plan.planner, AsrChunkPlannerKind::Speech);
-        assert!(plan.requires_chunk_path());
-        assert!(plan.chunks.is_empty());
-        assert!(plan.speech_plan.as_ref().expect("speech plan").no_speech);
+        let samples = vec![0.0f32; (sr as usize) * 60];
+        for streaming in [false, true] {
+            let planned = plan(ModelFamily::WhisperAsr, Some(30.0), &samples, sr, streaming);
+            assert_eq!(planned.planner, AsrChunkPlannerKind::Speech);
+            assert!(planned.requires_chunk_path());
+            assert!(planned.chunks.is_empty());
+            assert!(planned.speech_plan.as_ref().expect("speech plan").no_speech);
+        }
     }
 
     #[test]
     fn chunk_plan_diagnostics_include_timing_and_seconds() {
         let sr = 16_000u32;
-        let samples = vec![0.0f32; (sr as usize) * 4];
-        let plan =
-            NativeExecutor::asr_chunk_plan_with_options(&samples, sr, Some(30.0), false, true);
+        let samples = vec![0.0f32; (sr as usize) * 60];
+        let planned = plan(ModelFamily::WhisperAsr, Some(30.0), &samples, sr, false);
 
-        let diagnostics = plan.diagnostics();
+        let diagnostics = planned.diagnostics();
         let chunking = diagnostics
             .get("chunking")
             .and_then(|value| value.as_object())
@@ -1390,7 +1547,7 @@ mod tests {
             .expect("speech diagnostics");
         assert_eq!(
             speech.get("skipped_seconds").and_then(|v| v.as_f64()),
-            Some(4.0)
+            Some(60.0)
         );
     }
 
@@ -1444,6 +1601,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-partial",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1497,6 +1655,159 @@ mod tests {
         );
     }
 
+    fn three_one_second_chunks(sr: u32) -> (Vec<f32>, Vec<AudioChunk>) {
+        let samples = vec![0.0f32; sr as usize * 3];
+        let chunk_plan = (0..3)
+            .map(|idx| AudioChunk {
+                start_sample: idx * sr as usize,
+                end_sample: (idx + 1) * sr as usize,
+            })
+            .collect();
+        (samples, chunk_plan)
+    }
+
+    #[test]
+    fn chunk_diagnostics_record_the_text_each_chunk_committed() {
+        let sr = 10u32;
+        let samples = vec![0.0f32; sr as usize * 5];
+        // The second chunk overlaps the first by one second; the third
+        // follows a gap.
+        let chunk_plan = vec![
+            AudioChunk {
+                start_sample: 0,
+                end_sample: 30,
+            },
+            AudioChunk {
+                start_sample: 20,
+                end_sample: 40,
+            },
+            AudioChunk {
+                start_sample: 42,
+                end_sample: 50,
+            },
+        ];
+        let texts = ["one two three", "three four", "five"];
+        let mut sequence = 0usize;
+        let mut idx = 0usize;
+        let chunked = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-committed",
+            &|| false,
+            None,
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                idx += 1;
+                Ok(AsrChunkTranscription {
+                    text: texts[idx - 1].to_string(),
+                    diagnostics: None,
+                })
+            },
+        )
+        .expect("chunk plan should complete");
+
+        let committed: Vec<&str> = chunked
+            .chunk_diagnostics
+            .iter()
+            .map(|entry| entry["committed_text"].as_str().expect("committed text"))
+            .collect();
+        assert_eq!(chunked.text, "one two three four five");
+        assert_eq!(committed, ["one two three", "four", "five"]);
+    }
+
+    #[test]
+    fn chunk_plan_stops_at_the_next_chunk_boundary_after_cancellation() {
+        let sr = 10u32;
+        let (samples, chunk_plan) = three_one_second_chunks(sr);
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let cancelled = std::cell::Cell::new(false);
+        let mut calls = 0usize;
+
+        let result = NativeExecutor::transcribe_with_chunk_plan_with_details(
+            "req-cancel",
+            &|| cancelled.get(),
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            |_chunk_audio, _sr| {
+                calls += 1;
+                // The client goes away while the first chunk is running.
+                cancelled.set(true);
+                Ok(AsrChunkTranscription {
+                    text: format!("chunk {calls}"),
+                    diagnostics: None,
+                })
+            },
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::Error::Cancelled(ref id)) if id == "req-cancel"),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1, "no chunk may start after cancellation");
+        let events = tx.take().expect("staged events");
+        assert!(events.iter().all(|event| event.text.is_none()));
+        assert!(events.iter().all(|event| !event.is_final));
+    }
+
+    #[test]
+    fn chunk_partial_emitter_stops_streaming_once_cancelled() {
+        let sr = 10u32;
+        let (samples, chunk_plan) = three_one_second_chunks(sr);
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let cancelled = std::cell::Cell::new(false);
+        let mut calls = 0usize;
+
+        let result = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+            "req-cancel-partial",
+            &|| cancelled.get(),
+            Some(&tx),
+            EngineStreamPolicy::FailOnFull,
+            &mut sequence,
+            &samples,
+            sr,
+            &chunk_plan,
+            &NativeExecutor::asr_long_form_config(),
+            AsrChunkStreamOptions {
+                stable_text_holdback_chars: 0,
+            },
+            |_chunk_audio, _sr, _prefix, partial| {
+                calls += 1;
+                let emit = partial.expect("streaming chunk plans pass an emitter");
+                emit("alpha ");
+                cancelled.set(true);
+                emit("beta ");
+                emit("gamma");
+                Ok(AsrChunkTranscription {
+                    text: "alpha beta gamma".to_string(),
+                    diagnostics: None,
+                })
+            },
+        );
+
+        assert!(
+            matches!(result, Err(crate::error::Error::Cancelled(_))),
+            "{result:?}"
+        );
+        assert_eq!(calls, 1);
+        let streamed: String = tx
+            .take()
+            .expect("staged events")
+            .iter()
+            .filter_map(|event| event.text.clone())
+            .collect();
+        assert_eq!(streamed, "alpha");
+    }
+
     #[test]
     fn chunk_plan_streaming_without_partials_keeps_chunk_level_deltas() {
         let sr = 10u32;
@@ -1517,6 +1828,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-no-partial",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1557,13 +1869,14 @@ mod tests {
     fn chunk_plan_streaming_partial_deltas_dedup_overlap_words() {
         let sr = 10u32;
         let samples = vec![0.0f32; sr as usize * 2];
+        // The chunks share one second of audio.
         let chunk_plan = vec![
             AudioChunk {
                 start_sample: 0,
-                end_sample: sr as usize,
+                end_sample: sr as usize * 3 / 2,
             },
             AudioChunk {
-                start_sample: sr as usize,
+                start_sample: sr as usize / 2,
                 end_sample: sr as usize * 2,
             },
         ];
@@ -1573,6 +1886,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-overlap",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1642,6 +1956,7 @@ mod tests {
         let mut chunk_idx = 0usize;
         let chunked = NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
             "req-holdback",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1692,6 +2007,294 @@ mod tests {
         assert_eq!(streamed, "one two three four five six seven eight");
     }
 
+    /// Stream `chunk_texts` through the chunk executor (as word partials when
+    /// `emit_partials`) and return the final transcript and the concatenated
+    /// stream deltas.
+    fn stream_chunks(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunk_texts: &[&str],
+        holdback_chars: usize,
+        emit_partials: bool,
+    ) -> (String, String) {
+        let samples = vec![0.0f32; chunk_plan.last().expect("chunks").end_sample];
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let mut chunk_idx = 0usize;
+        let chunked =
+            NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                "req-stream",
+                &|| false,
+                Some(&tx),
+                EngineStreamPolicy::FailOnFull,
+                &mut sequence,
+                &samples,
+                sr,
+                chunk_plan,
+                &NativeExecutor::asr_long_form_config(),
+                AsrChunkStreamOptions {
+                    stable_text_holdback_chars: holdback_chars,
+                },
+                |_chunk_audio, _sr, _prefix, partial| {
+                    let text = chunk_texts[chunk_idx];
+                    chunk_idx += 1;
+                    if let (true, Some(emit)) = (emit_partials, partial) {
+                        for word in text.split_inclusive(' ') {
+                            emit(word);
+                        }
+                    }
+                    Ok(AsrChunkTranscription {
+                        text: text.to_string(),
+                        diagnostics: None,
+                    })
+                },
+            )
+            .expect("streaming chunk plan should complete");
+        let streamed = tx
+            .take()
+            .expect("staged events")
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect::<String>();
+        (chunked.text, streamed)
+    }
+
+    fn assert_stream_matches_final(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunk_texts: &[&str],
+        expected: &str,
+    ) {
+        for holdback_chars in [0, 20] {
+            for emit_partials in [true, false] {
+                let (text, streamed) =
+                    stream_chunks(chunk_plan, sr, chunk_texts, holdback_chars, emit_partials);
+                assert_eq!(
+                    text, expected,
+                    "holdback {holdback_chars}, partials {emit_partials}"
+                );
+                assert_eq!(
+                    streamed, text,
+                    "holdback {holdback_chars}, partials {emit_partials}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_stream_matches_the_final_transcript_with_one_second_overlaps() {
+        // Six-second chunks at 10 Hz sharing one second of audio each.
+        let chunk_plan = [(0, 60), (50, 110), (100, 160)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &[
+                "one two three four five six seven",
+                "seven eight nine ten eleven twelve thirteen",
+                "thirteen fourteen fifteen sixteen seventeen",
+            ],
+            "one two three four five six seven eight nine ten eleven twelve thirteen \
+             fourteen fifteen sixteen seventeen",
+        );
+    }
+
+    #[test]
+    fn chunk_stream_matches_the_final_transcript_with_three_second_overlaps() {
+        // The partials of each later chunk start inside a three-second overlap
+        // and never stream duplicated words that the commit then drops.
+        let chunk_plan = [(0, 240), (210, 480), (450, 600)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &[
+                "we walked along the river past the old mill",
+                "past the old mill and on toward the harbor where boats",
+                "harbor where boats rocked gently in the evening light",
+            ],
+            "we walked along the river past the old mill and on toward the harbor where \
+             boats rocked gently in the evening light",
+        );
+    }
+
+    #[test]
+    fn chunk_stream_keeps_genuine_repeats_across_chunks_that_do_not_overlap() {
+        // Speech-island plans leave a gap between chunks.
+        let chunk_plan = [(0, 20), (30, 50)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        assert_stream_matches_final(
+            &chunk_plan,
+            10,
+            &["I don't know.", "I don't know why."],
+            "I don't know. I don't know why.",
+        );
+    }
+
+    /// Run `chunks` (text and `timestamp_words` diagnostics, timed from each
+    /// chunk's start) through the chunk executor, streaming.
+    fn run_timed_chunks(
+        chunk_plan: &[AudioChunk],
+        sr: u32,
+        chunks: &[(&str, Option<serde_json::Value>)],
+    ) -> (super::ChunkedAsrTranscription, String) {
+        let samples = vec![0.0f32; chunk_plan.last().expect("chunks").end_sample];
+        let tx = StreamStagingBuffer::default();
+        let mut sequence = 0usize;
+        let mut chunk_idx = 0usize;
+        let chunked =
+            NativeExecutor::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                "req-timed",
+                &|| false,
+                Some(&tx),
+                EngineStreamPolicy::FailOnFull,
+                &mut sequence,
+                &samples,
+                sr,
+                chunk_plan,
+                &NativeExecutor::asr_long_form_config(),
+                AsrChunkStreamOptions::default(),
+                |_chunk_audio, _sr, _prefix, _partial| {
+                    let (text, words) = &chunks[chunk_idx];
+                    chunk_idx += 1;
+                    Ok(AsrChunkTranscription {
+                        text: text.to_string(),
+                        diagnostics: words
+                            .clone()
+                            .map(|words| serde_json::json!({ "timestamp_words": words })),
+                    })
+                },
+            )
+            .expect("timed chunk plan should complete");
+        let streamed = tx
+            .take()
+            .expect("staged events")
+            .into_iter()
+            .filter_map(|event| event.text)
+            .collect::<String>();
+        (chunked, streamed)
+    }
+
+    fn words_json(words: &[(&str, f32, f32)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            words
+                .iter()
+                .map(|(word, start, end)| {
+                    serde_json::json!({
+                        "word": word,
+                        "start_time_seconds": start,
+                        "end_time_seconds": end,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Chunks that time their words merge by time: the one-word overlap
+    /// ("fox.") that text dedup cannot see is kept once, the transcript's
+    /// word timings come back on the input timeline, and the stream matches
+    /// the final text.
+    #[test]
+    fn timed_chunks_merge_by_word_time() {
+        // 10 Hz: chunk 0 covers 0-8 s, chunk 1 7-15 s; they hand over at 7.5 s.
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        let (chunked, streamed) = run_timed_chunks(
+            &chunk_plan,
+            10,
+            &[
+                (
+                    "the quick fox.",
+                    Some(words_json(&[
+                        ("the", 5.0, 5.4),
+                        ("quick", 5.5, 6.5),
+                        ("fox.", 7.0, 7.6),
+                    ])),
+                ),
+                (
+                    "fox. It ran.",
+                    Some(words_json(&[
+                        ("fox.", 0.0, 0.6),
+                        ("It", 1.0, 1.3),
+                        ("ran.", 1.4, 2.0),
+                    ])),
+                ),
+            ],
+        );
+        assert_eq!(chunked.text, "the quick fox. It ran.");
+        assert_eq!(streamed, chunked.text);
+        let words = chunked.timestamp_words.expect("timed transcript");
+        let texts = words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["the", "quick", "fox.", "It", "ran."]);
+        assert_eq!((words[3].start_secs, words[3].end_secs), (8.0, 8.3));
+    }
+
+    /// A phrase repeated just after the overlap looks like overlap text to the
+    /// text merge, which drops it; by time it lies past the seam and stays.
+    #[test]
+    fn timed_chunks_keep_a_repeat_the_text_merge_would_drop() {
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        let first = (
+            "you say I know",
+            Some(words_json(&[
+                ("you", 4.0, 4.3),
+                ("say", 4.4, 4.8),
+                ("I", 6.0, 6.2),
+                ("know", 6.2, 6.6),
+            ])),
+        );
+        let second = (
+            "I know that",
+            Some(words_json(&[
+                ("I", 0.6, 0.8),
+                ("know", 0.8, 1.2),
+                ("that", 1.3, 1.6),
+            ])),
+        );
+        let (timed, _) = run_timed_chunks(&chunk_plan, 10, &[first.clone(), second.clone()]);
+        assert_eq!(timed.text, "you say I know I know that");
+        let (by_text, _) = run_timed_chunks(&chunk_plan, 10, &[(first.0, None), (second.0, None)]);
+        assert_eq!(by_text.text, "you say I know that");
+    }
+
+    /// A chunk without word timings for its text (no list, or an empty list
+    /// beside non-empty text) is merged by text, and the transcript then
+    /// reports no word timings.
+    #[test]
+    fn untimed_chunk_falls_back_to_the_text_merge() {
+        let chunk_plan = [(0, 80), (70, 150)].map(|(start, end)| AudioChunk {
+            start_sample: start,
+            end_sample: end,
+        });
+        for untimed in [None, Some(serde_json::json!([]))] {
+            let (chunked, streamed) = run_timed_chunks(
+                &chunk_plan,
+                10,
+                &[
+                    ("one two three four", untimed.clone()),
+                    ("two three four five", untimed),
+                ],
+            );
+            assert_eq!(chunked.text, "one two three four five");
+            assert_eq!(streamed, chunked.text);
+            assert!(chunked.timestamp_words.is_none());
+        }
+    }
+
     #[test]
     fn chunk_plan_details_collects_per_chunk_diagnostics() {
         let sr = 10u32;
@@ -1711,6 +2314,7 @@ mod tests {
         let mut sequence = 0usize;
         let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
             "req-details",
+            &|| false,
             None,
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1783,6 +2387,7 @@ mod tests {
 
         let merged = NativeExecutor::transcribe_with_chunk_plan_with_details(
             "req-progress",
+            &|| false,
             Some(&tx),
             EngineStreamPolicy::FailOnFull,
             &mut sequence,
@@ -1890,7 +2495,12 @@ mod tests {
     fn chunk_plan_diagnostics_can_embed_transcription_details() {
         let sr = 10u32;
         let samples = vec![0.0f32; sr as usize * 2];
-        let plan = NativeExecutor::asr_chunk_plan(&samples, sr, Some(1.0), false, false);
+        let plan = NativeExecutor::asr_route_plan(
+            &samples,
+            sr,
+            &caps(ModelFamily::Qwen3Asr, Some(1.0)),
+            false,
+        );
 
         let diagnostics = plan.diagnostics_with_chunk_transcriptions(vec![
             serde_json::json!({ "index": 0, "text_chars": 5 }),

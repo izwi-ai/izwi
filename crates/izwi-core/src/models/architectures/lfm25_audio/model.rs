@@ -166,6 +166,9 @@ pub(crate) struct Lfm25AudioAsrPreparationStageCeiling {
     pub(crate) max_device_workspace_bytes: u64,
     pub(crate) max_unified_workspace_bytes: u64,
     pub(crate) max_workspace_bytes: u64,
+    /// One decode step's workspace at the last position the context allows:
+    /// the model-derived per-row decode budget (LFA-2).
+    pub(crate) max_decode_workspace_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,6 +1078,9 @@ impl Lfm25AudioModel {
             max_device_workspace_bytes,
             max_unified_workspace_bytes,
             max_workspace_bytes,
+            max_decode_workspace_bytes: self
+                .asr_decode_resource_envelope(max_prompt_tokens)?
+                .workspace_bytes,
         })
     }
 
@@ -1116,11 +1122,12 @@ impl Lfm25AudioModel {
         visible_tokens: usize,
         include_logits: bool,
     ) -> Result<Lfm25AudioAsrStepResourceEnvelope> {
+        // ASR samples the next token from the last position only.
         let tensor_workspace = checked_asr_main_step_workspace(
             query_tokens,
             visible_tokens,
             self.tokenizer.vocab_size(),
-            include_logits,
+            usize::from(include_logits),
             &self.main_config,
         )?;
         let backend = BackendKind::from(self.device.kind);
@@ -1216,7 +1223,7 @@ impl Lfm25AudioModel {
             query_tokens,
             visible_tokens,
             self.tokenizer.vocab_size(),
-            include_logits,
+            if include_logits { query_tokens } else { 0 },
             &self.main_config,
         )?;
         let depth = if include_depthformer {
@@ -2483,18 +2490,63 @@ struct NormalizedTextWord {
     end: usize,
 }
 
+const MIN_REPEAT_COUNT: usize = 4;
+const MIN_PHRASE_WORDS: usize = 2;
+const MAX_PHRASE_WORDS: usize = 8;
+/// Raw words of the tail that [`trim_repeated_phrase_tail`] scans first.
+const REPEAT_SCAN_TAIL_WORDS: usize = 128;
+
+/// `input` without the repeats of a phrase that ends it four or more times,
+/// keeping one occurrence. Only the last few dozen words can decide this, so
+/// a decode loop that checks every token scans a bounded tail; the whole text
+/// is scanned only when a run reaches the start of that tail.
 pub(super) fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
-    let words = normalized_text_words(input);
-    const MIN_REPEAT_COUNT: usize = 4;
-    const MIN_PHRASE_WORDS: usize = 2;
-    const MAX_PHRASE_WORDS: usize = 8;
+    let tail_start = tail_start_of_last_words(input, REPEAT_SCAN_TAIL_WORDS);
+    let (start, scan) = match tail_start {
+        Some(start) => {
+            let words = normalized_text_words(&input[start..]);
+            // With this many words every phrase length's count either stops
+            // at a mismatch inside the tail or reaches the threshold, so the
+            // tail decides unless the winning run reaches its first word.
+            let decisive = words.len() >= MIN_REPEAT_COUNT * MAX_PHRASE_WORDS * 2;
+            match repeated_phrase_tail_end(&words) {
+                RepeatedTail::Found { end, bounded: true } if decisive => (start, Some(end)),
+                RepeatedTail::None if decisive => return None,
+                _ => (0, scan_whole_text(input)),
+            }
+        }
+        None => (0, scan_whole_text(input)),
+    };
+    scan.map(|end| input[..start + end].trim_end().to_string())
+}
+
+fn scan_whole_text(input: &str) -> Option<usize> {
+    match repeated_phrase_tail_end(&normalized_text_words(input)) {
+        RepeatedTail::Found { end, .. } => Some(end),
+        RepeatedTail::None => None,
+    }
+}
+
+enum RepeatedTail {
+    None,
+    /// Keep `input[..end]`. `bounded` is false when the repeats ran back to
+    /// the first scanned word, so earlier words might extend the run.
+    Found {
+        end: usize,
+        bounded: bool,
+    },
+}
+
+fn repeated_phrase_tail_end(words: &[NormalizedTextWord]) -> RepeatedTail {
     let max_phrase_words = MAX_PHRASE_WORDS.min(words.len() / MIN_REPEAT_COUNT);
     for phrase_words in MIN_PHRASE_WORDS..=max_phrase_words {
         let mut repeat_count = 1usize;
+        let mut bounded = false;
         while words.len() >= phrase_words.saturating_mul(repeat_count + 1) {
             let right_start = words.len() - phrase_words * repeat_count;
             let left_start = right_start.saturating_sub(phrase_words);
-            if !normalized_word_ranges_equal(&words, left_start, right_start, phrase_words) {
+            if !normalized_word_ranges_equal(words, left_start, right_start, phrase_words) {
+                bounded = true;
                 break;
             }
             repeat_count += 1;
@@ -2502,8 +2554,31 @@ pub(super) fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
 
         if repeat_count >= MIN_REPEAT_COUNT {
             let keep_words = words.len() - phrase_words * (repeat_count - 1);
-            let end = words[keep_words - 1].end;
-            return Some(input[..end].trim_end().to_string());
+            return RepeatedTail::Found {
+                end: words[keep_words - 1].end,
+                bounded,
+            };
+        }
+    }
+    RepeatedTail::None
+}
+
+/// Byte offset where the last `count` whitespace-separated words of `input`
+/// begin, or `None` when `input` has no more than `count` words.
+fn tail_start_of_last_words(input: &str, count: usize) -> Option<usize> {
+    let mut words = 0usize;
+    let mut in_word = false;
+    for (idx, ch) in input.char_indices().rev() {
+        if ch.is_whitespace() {
+            if in_word {
+                words += 1;
+                if words == count {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            in_word = false;
+        } else {
+            in_word = true;
         }
     }
     None
@@ -2747,7 +2822,7 @@ fn checked_asr_main_step_workspace(
     query_tokens: usize,
     visible_tokens: usize,
     vocab_size: usize,
-    include_logits: bool,
+    logits_rows: usize,
     config: &Lfm2BackboneConfig,
 ) -> Result<u64> {
     let u = |value: usize| {
@@ -2770,21 +2845,33 @@ fn checked_asr_main_step_workspace(
         .unwrap_or(config.embedding_length))?;
     let heads = u(config.attention_head_count)?;
     let layers = u(config.block_count)?;
+    // A layer with KV heads is attention; the others are ShortConv (LFA-2).
+    let attention_layers = u(config
+        .attention_head_count_kv
+        .iter()
+        .take(config.block_count)
+        .filter(|kv_heads| **kv_heads > 0)
+        .count())?;
+    let shortconv_layers = layers.saturating_sub(attention_layers);
     let ring = u(config.shortconv_l_cache)?;
 
-    // Conservative logical ceiling. Every model block is priced as if it
-    // simultaneously owns residual/norm/QKV/output tensors, both FFN arms,
-    // dense attention through the full visible prefix, and a cloned ShortConv
-    // ring. Actual mixed attention/ShortConv layouts allocate a strict subset.
+    // Conservative logical ceiling. Every block is priced as if it owned its
+    // residual/norm/QKV/output tensors and both FFN arms at once; only the
+    // attention layers add scores through the full visible prefix, only the
+    // ShortConv layers clone their ring, and logits are produced for
+    // `logits_rows` positions (one when sampling the next token).
     let hidden_planes = mul(mul(q, hidden)?, 12)?;
     let ffn_planes = mul(mul(q, ffn)?, 4)?;
     let attention_planes = mul(mul(mul(heads, q)?, visible)?, 4)?;
-    let ring_clone = mul(mul(ring, hidden)?, layers)?;
-    let per_layer = add(add(hidden_planes, ffn_planes)?, attention_planes)?;
-    let mut elements = add(mul(per_layer, layers)?, ring_clone)?;
-    if include_logits {
-        elements = add(elements, mul(q, u(vocab_size)?)?)?;
-    }
+    let ring_clone = mul(mul(ring, hidden)?, shortconv_layers)?;
+    let mut elements = add(
+        add(
+            mul(add(hidden_planes, ffn_planes)?, layers)?,
+            mul(attention_planes, attention_layers)?,
+        )?,
+        ring_clone,
+    )?;
+    elements = add(elements, mul(u(logits_rows)?, u(vocab_size)?)?)?;
     mul(elements, 4)
 }
 
@@ -2939,6 +3026,42 @@ mod tests {
     }
 
     #[test]
+    fn repeated_phrase_tail_scan_of_the_tail_matches_the_whole_text() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let whole =
+            |input: &str| scan_whole_text(input).map(|end| input[..end].trim_end().to_string());
+        let vocabulary = [
+            "very",
+            "expensive.",
+            "It's",
+            "a",
+            "b",
+            "—",
+            "Yes,",
+            "你好",
+            "!",
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_6);
+        for _ in 0..400 {
+            // A random prefix, then a phrase repeated 0–40 times: runs that
+            // stay inside the scanned tail and runs that cross its start.
+            let mut words = (0..rng.gen_range(0..300))
+                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+                .collect::<Vec<_>>();
+            let phrase = (0..rng.gen_range(1..=9))
+                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+                .collect::<Vec<_>>();
+            for _ in 0..rng.gen_range(0..40) {
+                words.extend(&phrase);
+            }
+            let text = words.join(" ");
+            assert_eq!(trim_repeated_phrase_tail(&text), whole(&text), "{text}");
+        }
+    }
+
+    #[test]
     fn repeated_phrase_tail_trim_ignores_short_repeats() {
         assert!(trim_repeated_phrase_tail(
             "This is very expensive. It is very expensive, but it may be worth it."
@@ -3036,13 +3159,48 @@ mod tests {
             rope_freq_base: 10_000.0,
             shortconv_l_cache: 3,
         };
-        let without_logits = checked_asr_main_step_workspace(2, 11, 101, false, &config).unwrap();
-        let with_logits = checked_asr_main_step_workspace(2, 11, 101, true, &config).unwrap();
+        let without_logits = checked_asr_main_step_workspace(2, 11, 101, 0, &config).unwrap();
+        let with_logits = checked_asr_main_step_workspace(2, 11, 101, 2, &config).unwrap();
         assert_eq!(with_logits - without_logits, 2 * 101 * 4);
-        assert!(
-            checked_asr_main_step_workspace(2, 12, 101, false, &config).unwrap() > without_logits
-        );
-        assert!(checked_asr_main_step_workspace(usize::MAX, 2, 3, true, &config).is_err());
+        assert!(checked_asr_main_step_workspace(2, 12, 101, 0, &config).unwrap() > without_logits);
+        assert!(checked_asr_main_step_workspace(usize::MAX, 2, 3, 1, &config).is_err());
+    }
+
+    /// The published LFM2.5-Audio backbone: 16 blocks, 6 of them attention
+    /// (8 KV heads), 32 query heads, hidden 2048, FFN 8192, vocab 65,536.
+    /// Only attention layers price scores, only ShortConv layers clone their
+    /// ring, and decode prices one logits row, so a default request's decode
+    /// (a 30 s prompt of about 400 tokens and 2,048 new tokens) costs about
+    /// 11.6 MiB, not the 23 MiB the all-attention pricing gave (LFA-2).
+    #[test]
+    fn main_step_workspace_prices_the_real_lfm25_audio_geometry() {
+        let mut kv = vec![0; 16];
+        for layer in [2, 5, 8, 10, 12, 14] {
+            kv[layer] = 8;
+        }
+        let config = Lfm2BackboneConfig {
+            architecture: "lfm2".into(),
+            block_count: 16,
+            context_length: 32_768,
+            embedding_length: 2048,
+            embedding_length_out: None,
+            feed_forward_length: Some(8192),
+            attention_head_count: 32,
+            attention_head_count_kv: kv,
+            attention_layer_norm_rms_epsilon: 1e-5,
+            attention_sliding_window: None,
+            rope_freq_base: 1_000_000.0,
+            shortconv_l_cache: 3,
+        };
+        let visible = 400 + 2_048;
+        let decode = checked_asr_main_step_workspace(1, visible, 65_536, 1, &config).unwrap();
+        let per_layer = 2048 * 12 + 8192 * 4;
+        let expected = (16 * per_layer + 6 * 32 * visible * 4 + 3 * 2048 * 10 + 65_536) * 4;
+        assert_eq!(decode, expected as u64);
+        assert!(decode < 12 * 1024 * 1024, "{decode}");
+        // Each extra visible token costs the 6 attention layers' scores only.
+        let next = checked_asr_main_step_workspace(1, visible + 1, 65_536, 1, &config).unwrap();
+        assert_eq!(next - decode, 6 * 32 * 4 * 4);
     }
 
     #[test]

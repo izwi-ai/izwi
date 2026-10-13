@@ -3436,6 +3436,7 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
                 max_device_workspace_bytes: 64 * 1024 * 1024,
                 max_unified_workspace_bytes: 0,
                 max_workspace_bytes: 96 * 1024 * 1024,
+                max_decode_workspace_bytes: 16 * 1024 * 1024,
             },
         )
     }
@@ -3501,6 +3502,7 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
             || seal.max_materialized_tensor_elements == 0
             || seal.max_retained_resident_bytes == 0
             || seal.max_workspace_bytes == 0
+            || seal.max_decode_workspace_bytes == 0
         {
             return Err(Error::ModelLoadError(
                 "LFM2.5 Audio ASR preparation seal does not match its loaded adapter".into(),
@@ -3585,7 +3587,15 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
         decode.max_work_units = u64::try_from(self.max_batch_size).map_err(|_| {
             Error::Overloaded("LFM2.5 Audio ASR batch width exceeds work accounting".into())
         })?;
-        decode.max_workspace_bytes = CONTINUOUS_ASR_MAX_BATCH_WORKSPACE_BYTES;
+        // One decode step per row at the last position the context allows: a
+        // budget derived from the model, so a default request (2,048 new
+        // tokens) is admitted, instead of the shared 16 MiB (LFA-2).
+        decode.max_workspace_bytes = seal
+            .max_decode_workspace_bytes
+            .checked_mul(decode.max_work_units)
+            .ok_or_else(|| {
+                Error::Overloaded("LFM2.5 Audio ASR decode workspace overflow".into())
+            })?;
         decode.output_visibility = OutputVisibility::AfterQuantumCommit;
 
         preparation.validate()?;
@@ -6416,6 +6426,48 @@ mod tests {
     }
 
     #[test]
+    fn every_asr_stream_route_binds_to_its_loaded_contract() {
+        let registry = RuntimeAdapterRegistry::built_in();
+        let mut offline_only = Vec::new();
+        for &variant in ModelVariant::all() {
+            let Ok(metadata) = registry.require(CapabilityKind::Asr, variant) else {
+                continue;
+            };
+            if metadata.execution_target != ExecutionTargetKind::TokenEngine {
+                continue;
+            }
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(7),
+                ModelInstanceId::new(1),
+                variant,
+                BackendKind::Cpu,
+            )
+            .unwrap();
+            install_test_preparation_seals(&draft, BackendKind::Cpu, 1);
+            let execution = draft.capabilities.get(&CapabilityKind::Asr).unwrap();
+            // The requirements the runtime binds for a stream=true request.
+            let native = crate::runtime::asr::asr_streams_natively(&registry, variant);
+            let streaming = if native {
+                StreamingRequirements::native(true)
+            } else {
+                offline_only.push(variant);
+                StreamingRequirements::transport_only()
+            };
+            for asr_long_form in [false, true] {
+                let result = execution.contract(streaming.with_asr_long_form(asr_long_form));
+                assert!(
+                    result.is_ok(),
+                    "{variant} stream (native {native}, long-form {asr_long_form}): {:?}",
+                    result.err()
+                );
+            }
+        }
+        assert!(offline_only.contains(&ModelVariant::ParakeetTdt06BV3));
+        assert!(offline_only.contains(&ModelVariant::Nemotron35AsrStreaming06B));
+    }
+
+    #[test]
     fn lfm2_sequence_chat_remains_quantum_committed_when_streaming() {
         let draft = LoadedModelBundleDraft::build(
             &RuntimeAdapterRegistry::built_in(),
@@ -7352,6 +7404,8 @@ mod tests {
             assert_eq!(decode.max_batch_size, 8);
             assert_eq!(decode.concurrency, ConcurrencyClass::Batchable);
             assert_eq!(decode.shape_policy, StageShapePolicy::Ragged);
+            // The model-derived per-row decode budget, for every row.
+            assert_eq!(decode.max_workspace_bytes, 8 * 16 * 1024 * 1024);
             assert!(contract
                 .stages
                 .iter()

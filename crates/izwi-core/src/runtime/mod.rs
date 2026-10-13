@@ -6,6 +6,7 @@
 
 mod adapters;
 mod asr;
+mod asr_no_speech;
 pub(crate) mod audio_io;
 mod broker;
 mod capabilities;
@@ -28,10 +29,17 @@ mod types;
 mod voice_metrics;
 mod voice_session;
 
-pub(crate) use asr::compose_invocation_audio_limit;
+pub(crate) use asr::vibevoice_asr_planned_max_tokens;
+pub(crate) use asr::{
+    asr_automatic_context, asr_sequence_ceiling, compose_invocation_audio_limit,
+    ASR_TEXT_PROMPT_TOKEN_RESERVE,
+};
 
-pub(crate) use asr::granite_auto_asr_max_tokens_for_duration;
-pub use asr::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
+pub(crate) use asr::{
+    granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
+    invocation_decode_room,
+};
+pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,

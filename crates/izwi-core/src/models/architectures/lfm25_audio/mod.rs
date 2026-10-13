@@ -23,6 +23,38 @@ pub use model::{
     Lfm25AudioGenerationOutput, Lfm25AudioModel, Lfm25AudioStreamConfig, Lfm25AudioTextOutput,
 };
 pub use sampling::{Lfm25AudioGenerationConfig, Lfm25SamplingConfig};
+
+/// What `Lfm25AudioModel::load` reads besides tensor payloads, for load
+/// admission (`runtime/lifecycle/asr_memory.rs`): the four GGUF files and the
+/// RoPE table geometry of the main and detokenizer backbones.
+pub(crate) struct Lfm25AudioLoadLayout {
+    pub(crate) main: std::path::PathBuf,
+    pub(crate) mmproj: std::path::PathBuf,
+    pub(crate) tokenizer: std::path::PathBuf,
+    pub(crate) vocoder: std::path::PathBuf,
+    /// (positions, head dim) of each backbone's precomputed RoPE tables.
+    pub(crate) rope_tables: [(usize, usize); 2],
+}
+
+pub(crate) fn lfm25_audio_load_layout(
+    model_dir: &std::path::Path,
+) -> crate::error::Result<Lfm25AudioLoadLayout> {
+    use crate::models::shared::weights::gguf::GgufLoader;
+    let paths = bundle::Lfm25AudioBundlePaths::from_model_dir(model_dir)?;
+    let main = config::parse_main_backbone_config(&GgufLoader::from_path(&paths.main)?)?;
+    let detokenizer =
+        config::parse_detokenizer_config(&GgufLoader::from_path(&paths.tokenizer)?)?;
+    Ok(Lfm25AudioLoadLayout {
+        rope_tables: [
+            crate::models::architectures::lfm2::backbone::rope_table_geometry(&main)?,
+            crate::models::architectures::lfm2::backbone::rope_table_geometry(&detokenizer)?,
+        ],
+        main: paths.main,
+        mmproj: paths.mmproj,
+        tokenizer: paths.tokenizer,
+        vocoder: paths.vocoder,
+    })
+}
 fn normalize_speaker_key(speaker: Option<&str>) -> String {
     speaker
         .unwrap_or("")

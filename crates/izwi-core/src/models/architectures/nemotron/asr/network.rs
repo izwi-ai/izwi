@@ -17,6 +17,12 @@ use super::physical::{NEMOTRON_OFFLINE_ACOUSTIC_DOMAIN, NEMOTRON_OFFLINE_PREDICT
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
 use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{
+    PointwiseConv1d, ProjectionLinear, F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -38,6 +44,10 @@ const PROMPT_HIDDEN: usize = 2048;
 const CONV_SUB_CHANNELS: usize = 256;
 const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
+/// Stride cells (of `SUBSAMPLING_FACTOR` feature frames) the streaming
+/// subsampler keeps before its next output: the 14-frame causal receptive
+/// field spans two.
+const SUBSAMPLING_CARRY_CELLS: usize = 2;
 const N_FFT: usize = 512;
 const WIN_LENGTH: usize = 400;
 const HOP_LENGTH: usize = 160;
@@ -217,6 +227,7 @@ struct StreamingMaskCacheKey {
     q_len: usize,
     key_len: usize,
     query_offset: usize,
+    query_phase: usize,
     left_context: usize,
     right_context: usize,
     dtype: DType,
@@ -264,17 +275,34 @@ fn insert_bounded_tensor_cache<K>(
     cache.insert(key, tensor);
 }
 
+/// The host-side builder for weights that load in F16: they are read on the
+/// CPU and converted there, so their F32 form never reaches the GPU.
+fn projection_vb<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
+    match f16 {
+        Some(_) => vb.clone().set_device(Device::Cpu),
+        None => vb.clone(),
+    }
+}
+
 impl NemotronNetwork {
-    pub(super) fn load(vb: &VarBuilder, inventory: &NemotronConfigInventory) -> Result<Self> {
+    /// Loads the network with its encoder projections (subsampling output,
+    /// FFN, attention q/k/v/out/pos and pointwise convs) in F16 on `f16` when
+    /// given; see `resolve_nemotron_projection_precision`.
+    pub(super) fn load(
+        vb: &VarBuilder,
+        inventory: &NemotronConfigInventory,
+        f16: Option<&Device>,
+    ) -> Result<Self> {
         validate_inventory_for_forward(inventory)?;
 
         let preprocessor = NemotronPreprocessor::load(vb, inventory)?;
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"))?;
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"), f16)?;
 
         let mut layers = Vec::with_capacity(ENCODER_LAYERS);
         for idx in 0..ENCODER_LAYERS {
             layers.push(ConformerLayer::load(
                 vb.pp(format!("encoder.layers.{idx}")),
+                f16,
             )?);
         }
 
@@ -324,6 +352,57 @@ impl NemotronNetwork {
             stream_rel_pos_cache: Mutex::new(HashMap::new()),
             stream_att_mask_cache: Mutex::new(HashMap::new()),
             dtype: vb.dtype(),
+        })
+    }
+
+    /// Checks the F16 conversion against the original F32 weight of the first
+    /// FFN projection, then runs the encoder on xorshift log-mel features and
+    /// requires the subsampling output, every layer output and the prompt
+    /// kernel output to be finite and inside the F16-safe range.
+    pub(super) fn weight_only_f16_self_check(&self, vb: &VarBuilder) -> NumericSelfCheckReport {
+        run_numeric_self_check("Nemotron weight-only F16", F16_SAFE_MAX_ABS, || {
+            let layer0 = self
+                .layers
+                .first()
+                .ok_or_else(|| Error::ModelLoadError("Nemotron encoder has no layers".into()))?;
+            if let Some(converted) = layer0.ff1.linear1.as_f16() {
+                let original = mlx::load_linear_no_bias(
+                    ENCODER_DIM,
+                    FF_DIM,
+                    projection_vb(vb, Some(&Device::Cpu))
+                        .pp("encoder.layers.0.feed_forward1.linear1"),
+                )?;
+                let relative = converted.check_against(original.weight(), None, 8)?;
+                if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+                    return Err(Error::ModelLoadError(format!(
+                        "encoder.layers.0.feed_forward1.linear1 in F16 differs from its F32 weights by relative L2 {relative:.3e}"
+                    )));
+                }
+            }
+            let device = vb.device();
+            let frames = 64;
+            let features =
+                xorshift_tensor(&[1, N_MELS, frames], 0xA5A5, 2.0, device)?.to_dtype(self.dtype)?;
+            let (mut x, encoded_len) = self.pre_encode.forward(&features, frames)?;
+            let mut outputs = vec![("pre_encode".to_string(), x.clone())];
+            let pos_emb = self.rel_positional_embedding(encoded_len, x.dtype(), device)?;
+            let att_mask = self.limited_context_mask(
+                encoded_len,
+                self.left_context_frames,
+                self.right_context_frames,
+                x.dtype(),
+                device,
+            )?;
+            for (index, layer) in self.layers.iter().enumerate() {
+                x = layer.forward(&x, &pos_emb, &att_mask)?;
+                outputs.push((format!("layers.{index}"), x.clone()));
+            }
+            let prompt_id = self.prompt_dictionary.values().copied().min().unwrap_or(0);
+            outputs.push((
+                "prompt_kernel".to_string(),
+                self.prompt_kernel.forward(&x, prompt_id)?,
+            ));
+            Ok::<_, Error>(outputs)
         })
     }
 
@@ -473,6 +552,7 @@ impl NemotronNetwork {
             frames,
             key_len,
             cache_len,
+            state.last_chunk_start_frame % state.chunk_frames,
             state.left_context_frames,
             state.right_context_frames,
             x.dtype(),
@@ -1223,6 +1303,7 @@ impl NemotronNetwork {
         q_len: usize,
         key_len: usize,
         query_offset: usize,
+        query_phase: usize,
         left_context: usize,
         right_context: usize,
         dtype: DType,
@@ -1232,6 +1313,7 @@ impl NemotronNetwork {
             q_len,
             key_len,
             query_offset,
+            query_phase,
             left_context,
             right_context,
             dtype,
@@ -1250,6 +1332,7 @@ impl NemotronNetwork {
             q_len,
             key_len,
             query_offset,
+            query_phase,
             left_context,
             right_context,
             device,
@@ -1346,7 +1429,10 @@ struct NemotronPreprocessor {
 
 #[derive(Clone)]
 pub(super) struct NemotronStreamingFeatureState {
+    /// Preemphasized samples from `preemphasized_base` on: the STFT context
+    /// of the next frame (under `N_FFT` samples) plus anything newer.
     preemphasized: Vec<f32>,
+    preemphasized_base: usize,
     last_raw_sample: Option<f32>,
     next_frame: usize,
     input_finished: bool,
@@ -1611,6 +1697,7 @@ impl NemotronStreamingFeatureState {
     pub(super) fn new() -> Self {
         Self {
             preemphasized: Vec::new(),
+            preemphasized_base: 0,
             last_raw_sample: None,
             next_frame: 0,
             input_finished: false,
@@ -1651,19 +1738,40 @@ impl NemotronStreamingFeatureState {
         self.input_finished = true;
     }
 
+    pub(super) fn retained_samples(&self) -> usize {
+        self.preemphasized.len()
+    }
+
+    /// Preemphasized samples pushed since the stream began.
+    fn total_samples(&self) -> usize {
+        self.preemphasized_base + self.preemphasized.len()
+    }
+
     fn ready_frames(&self) -> usize {
-        if self.preemphasized.is_empty() {
+        let total = self.total_samples();
+        if total == 0 {
             return 0;
         }
         if self.input_finished {
-            return self.preemphasized.len().div_ceil(HOP_LENGTH).max(1);
+            return (total / HOP_LENGTH).max(1);
         }
 
         let center_pad = N_FFT / 2;
-        if self.preemphasized.len() < center_pad {
+        if total < center_pad {
             return 0;
         }
-        ((self.preemphasized.len() - center_pad) / HOP_LENGTH) + 1
+        ((total - center_pad) / HOP_LENGTH) + 1
+    }
+
+    /// Drop samples no frame from `next_frame` on can read: frame `f` reads
+    /// from `f * HOP_LENGTH - N_FFT / 2`.
+    fn retire_samples_before_frame(&mut self, next_frame: usize) {
+        let keep_from = (next_frame * HOP_LENGTH).saturating_sub(N_FFT / 2);
+        let retire = keep_from
+            .saturating_sub(self.preemphasized_base)
+            .min(self.preemphasized.len());
+        self.preemphasized.drain(..retire);
+        self.preemphasized_base += retire;
     }
 }
 
@@ -2135,7 +2243,9 @@ impl NemotronPreprocessor {
             }
         }
 
-        let valid_frames = audio.len().div_ceil(HOP_LENGTH).max(1).min(frame_count);
+        // NeMo `get_seq_len`: floor(len / hop). The trailing centered frame is
+        // padding and is zeroed below.
+        let valid_frames = (audio.len() / HOP_LENGTH).max(1).min(frame_count);
         if self.normalize == FeatureNormalize::PerFeature {
             normalize_per_feature(&mut mel, N_MELS, frame_count, valid_frames);
         }
@@ -2182,12 +2292,14 @@ impl NemotronPreprocessor {
         let frames = ready_frames - start_frame;
         let mel = self.compute_mel_frames(
             &state.preemphasized,
+            state.preemphasized_base,
             start_frame,
             frames,
             state.input_finished,
         )?;
         let features = Tensor::from_vec(mel, (1, N_MELS, frames), &self.device)?;
         state.next_frame = ready_frames;
+        state.retire_samples_before_frame(ready_frames);
 
         Ok(Some(NemotronStreamingFeatureChunk {
             features,
@@ -2198,9 +2310,12 @@ impl NemotronPreprocessor {
         }))
     }
 
+    /// Mel frames `start_frame..start_frame + frames` from `preemphasized`,
+    /// whose first element is stream sample `base`.
     fn compute_mel_frames(
         &self,
         preemphasized: &[f32],
+        base: usize,
         start_frame: usize,
         frames: usize,
         allow_right_padding: bool,
@@ -2222,12 +2337,19 @@ impl NemotronPreprocessor {
                     .checked_add(i)
                     .and_then(|v| v.checked_sub(center_pad))
                 {
-                    Some(src_idx) if src_idx < preemphasized.len() => preemphasized[src_idx],
+                    Some(src_idx) if src_idx < base => {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron streaming frontend frame {frame_idx} requires retired sample {src_idx}; samples from {base} are retained"
+                        )));
+                    }
+                    Some(src_idx) if src_idx - base < preemphasized.len() => {
+                        preemphasized[src_idx - base]
+                    }
                     Some(_) if allow_right_padding => 0.0,
                     Some(src_idx) => {
                         return Err(Error::InferenceError(format!(
                             "Nemotron streaming frontend frame {frame_idx} requires sample {src_idx}, but only {} samples are available",
-                            preemphasized.len()
+                            base + preemphasized.len()
                         )));
                     }
                     None => 0.0,
@@ -2267,17 +2389,13 @@ struct ConvSubsamplingDw {
     conv3: Conv2d,
     conv5: Conv2d,
     conv6: Conv2d,
-    out: Linear,
+    out: ProjectionLinear,
     out_feature_bins: usize,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let stride_cfg = Conv2dConfig {
-            stride: 2,
-            padding: 1,
-            ..Default::default()
-        };
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let stride_cfg = causal_stride2_conv_config();
         let point_cfg = Conv2dConfig {
             stride: 1,
             padding: 0,
@@ -2304,7 +2422,9 @@ impl ConvSubsamplingDw {
             point_cfg,
             vb.pp("conv.6"),
         )?;
-        let (out, out_feature_bins) = load_subsampling_out_projection(vb.pp("out"))?;
+        let (out, out_feature_bins) =
+            load_subsampling_out_projection(projection_vb(&vb, f16).pp("out"))?;
+        let out = ProjectionLinear::new(out, f16)?;
 
         Ok(Self {
             conv0,
@@ -2317,34 +2437,58 @@ impl ConvSubsamplingDw {
         })
     }
 
+    /// NeMo `ConvSubsampling(dw_striding, is_causal=True)`: every stride-2
+    /// convolution is a `CausalConv2D` that pads (2, 1) on time and
+    /// frequency, and `MaskedConvSequential` zeroes each stage past its valid
+    /// length. Only the `feature_frames` valid input frames are convolved, so
+    /// that zeroing is the causal right pad and every stage keeps exactly
+    /// `len / 2 + 1` frames (128 -> 65 -> 33 -> 17 frequency bins).
     fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
+        let features = if features.dim(2)? > feature_frames {
+            features.narrow(2, 0, feature_frames)?
+        } else {
+            features.clone()
+        };
         let mut x = features.transpose(1, 2)?.unsqueeze(1)?;
 
-        x = self.conv0.forward(&x)?.relu()?;
-        x = self.depthwise_conv2d_forward(&self.conv2, &x)?;
+        x = self.causal_stride2_conv(&self.conv0, &x, false)?.relu()?;
+        x = self.causal_stride2_conv(&self.conv2, &x, true)?;
         x = self.conv3.forward(&x)?.relu()?;
-        x = self.depthwise_conv2d_forward(&self.conv5, &x)?;
+        x = self.causal_stride2_conv(&self.conv5, &x, true)?;
         x = self.conv6.forward(&x)?.relu()?;
 
-        let (b, c, t, mut f) = x.dims4()?;
-        if c != CONV_SUB_CHANNELS {
+        let (b, c, t, f) = x.dims4()?;
+        if c != CONV_SUB_CHANNELS || f != self.out_feature_bins {
             return Err(Error::InferenceError(format!(
-                "Nemotron subsampling channel mismatch: expected {CONV_SUB_CHANNELS}, got {c}"
+                "Nemotron subsampling produced {c} channels x {f} bins; the projection expects \
+                 {CONV_SUB_CHANNELS} x {}",
+                self.out_feature_bins
             )));
-        }
-        if f < self.out_feature_bins {
-            x = x.pad_with_zeros(3, 0, self.out_feature_bins - f)?;
-            f = self.out_feature_bins;
-        } else if f > self.out_feature_bins {
-            x = x.narrow(3, 0, self.out_feature_bins)?;
-            f = self.out_feature_bins;
         }
         let x = x
             .transpose(1, 2)?
             .reshape((b, t, c * f))?
             .apply(&self.out)?;
-        let encoded_len = subsampled_len_3x(feature_frames).min(t).max(1);
-        Ok((x, encoded_len))
+        Ok((x, t))
+    }
+
+    /// A stride-2 `CausalConv2D`. Candle only pads symmetrically, so the
+    /// convolution pads 2 on both sides: output `t` still reads inputs
+    /// `2t - 2..=2t`, and the second trailing pad only feeds one extra output
+    /// on odd lengths, which is dropped.
+    fn causal_stride2_conv(&self, conv: &Conv2d, x: &Tensor, depthwise: bool) -> Result<Tensor> {
+        let (_, _, time, freq) = x.dims4()?;
+        let y = if depthwise {
+            self.depthwise_conv2d_forward(conv, x)?
+        } else {
+            conv.forward(x)?
+        };
+        let (_, _, y_time, y_freq) = y.dims4()?;
+        let (time, freq) = (causal_stride2_len(time), causal_stride2_len(freq));
+        if y_time == time && y_freq == freq {
+            return Ok(y);
+        }
+        Ok(y.narrow(2, 0, time)?.narrow(3, 0, freq)?.contiguous()?)
     }
 
     pub(super) fn forward_streaming_chunk(
@@ -2393,16 +2537,16 @@ impl ConvSubsamplingDw {
         })?;
         let encoded = encoded.narrow(1, local_start, frames)?.contiguous()?;
 
-        // One preceding stride cell (8 input frames for the current three
-        // stride-2 convolutions) is sufficient to reproduce the next global
-        // output exactly, including its seven-frame left receptive field.
-        // Build the compacted tensor before publishing cursor mutations so a
-        // failed allocation leaves the retained state unchanged.
+        // Encoded frame t reads feature frames 8t - 14..=8t through the three
+        // causal stride-2 convolutions, so two preceding stride cells (16
+        // input frames) reproduce the next global output exactly. Build the
+        // compacted tensor before publishing cursor mutations so a failed
+        // allocation leaves the retained state unchanged.
         let (next_features, next_base_frame) = if state.input_finished {
             (None, state.feature_frames)
         } else {
             let next_base_frame = stable_frames
-                .saturating_sub(1)
+                .saturating_sub(SUBSAMPLING_CARRY_CELLS)
                 .checked_mul(SUBSAMPLING_FACTOR)
                 .ok_or_else(|| {
                     Error::InferenceError("Nemotron subsampling carry cursor overflowed".into())
@@ -2470,18 +2614,39 @@ fn load_subsampling_out_projection(vb: VarBuilder) -> Result<(Linear, usize)> {
     Ok((Linear::new(ws, bias), in_dim / CONV_SUB_CHANNELS))
 }
 
-fn subsampled_len_3x(mut len: usize) -> usize {
-    for _ in 0..3 {
-        len = len.div_ceil(2);
+fn causal_stride2_conv_config() -> Conv2dConfig {
+    Conv2dConfig {
+        stride: 2,
+        padding: 2,
+        ..Default::default()
+    }
+}
+
+/// NeMo `calc_length` for one causal stride-2 stage (all paddings 3, kernel
+/// 3, floor): `floor((len + 3 - 3) / 2) + 1`.
+fn causal_stride2_len(len: usize) -> usize {
+    len / 2 + 1
+}
+
+/// Encoder frames for `len` valid feature frames under a causal subsampling
+/// factor (three stride-2 stages for 8).
+pub(super) fn causal_subsampled_len(mut len: usize, factor: usize) -> usize {
+    let mut factor = factor.max(1);
+    while factor > 1 {
+        len = causal_stride2_len(len);
+        factor /= 2;
     }
     len
 }
 
+fn subsampled_len_3x(len: usize) -> usize {
+    causal_subsampled_len(len, SUBSAMPLING_FACTOR)
+}
+
+/// Encoder frames that no later feature frame can change: frame t reads
+/// feature frames up to 8t, so it is final once frame 8t has arrived.
 fn stable_subsampled_len_3x(feature_frames: usize) -> usize {
-    if feature_frames < SUBSAMPLING_FACTOR {
-        return 0;
-    }
-    ((feature_frames - SUBSAMPLING_FACTOR) / SUBSAMPLING_FACTOR) + 1
+    feature_frames.div_ceil(SUBSAMPLING_FACTOR)
 }
 
 struct ConformerLayer {
@@ -2497,16 +2662,16 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
         Ok(Self {
             norm_ff1: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward1"))?,
-            ff1: FeedForward::load(vb.pp("feed_forward1"))?,
+            ff1: FeedForward::load(vb.pp("feed_forward1"), f16)?,
             norm_self_att: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_self_att"))?,
-            self_attn: RelPosSelfAttention::load(vb.pp("self_attn"))?,
+            self_attn: RelPosSelfAttention::load(vb.pp("self_attn"), f16)?,
             norm_conv: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_conv"))?,
-            conv: ConformerConv::load(vb.pp("conv"))?,
+            conv: ConformerConv::load(vb.pp("conv"), f16)?,
             norm_ff2: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward2"))?,
-            ff2: FeedForward::load(vb.pp("feed_forward2"))?,
+            ff2: FeedForward::load(vb.pp("feed_forward2"), f16)?,
             norm_out: layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_out"))?,
         })
     }
@@ -2595,15 +2760,22 @@ impl ConformerLayer {
 }
 
 struct FeedForward {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ProjectionLinear,
+    linear2: ProjectionLinear,
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let vb = projection_vb(&vb, f16);
         Ok(Self {
-            linear1: mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?,
-            linear2: mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?,
+            linear1: ProjectionLinear::new(
+                mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?,
+                f16,
+            )?,
+            linear2: ProjectionLinear::new(
+                mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?,
+                f16,
+            )?,
         })
     }
 
@@ -2617,20 +2789,24 @@ impl FeedForward {
 }
 
 struct ConformerConv {
-    pointwise_conv1: Conv1d,
+    pointwise_conv1: PointwiseConv1d,
     depthwise_conv: Conv1d,
     conv_norm: LayerNorm,
-    pointwise_conv2: Conv1d,
+    pointwise_conv2: PointwiseConv1d,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let pointwise_conv1 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM * 2,
-            1,
-            Conv1dConfig::default(),
-            vb.pp("pointwise_conv1"),
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let pointwise_vb = projection_vb(&vb, f16);
+        let pointwise_conv1 = PointwiseConv1d::new(
+            mlx::load_conv1d_no_bias(
+                ENCODER_DIM,
+                ENCODER_DIM * 2,
+                1,
+                Conv1dConfig::default(),
+                pointwise_vb.pp("pointwise_conv1"),
+            )?,
+            f16,
         )?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
@@ -2649,12 +2825,15 @@ impl ConformerConv {
             pointwise_conv1,
             depthwise_conv,
             conv_norm: load_conv_channel_layer_norm(vb.pp("batch_norm"))?,
-            pointwise_conv2: mlx::load_conv1d_no_bias(
-                ENCODER_DIM,
-                ENCODER_DIM,
-                1,
-                Conv1dConfig::default(),
-                vb.pp("pointwise_conv2"),
+            pointwise_conv2: PointwiseConv1d::new(
+                mlx::load_conv1d_no_bias(
+                    ENCODER_DIM,
+                    ENCODER_DIM,
+                    1,
+                    Conv1dConfig::default(),
+                    pointwise_vb.pp("pointwise_conv2"),
+                )?,
+                f16,
             )?,
         })
     }
@@ -2724,9 +2903,16 @@ impl ConformerConv {
             return Ok(y);
         }
 
-        self.depthwise_conv
-            .forward(x)
-            .map_err(|e| Error::InferenceError(e.to_string()))
+        // CPU/CUDA: shared shift-and-accumulate op instead of Candle's
+        // per-channel grouped conv. Inputs arrive causally pre-padded.
+        crate::kernels::depthwise_conv::depthwise_conv1d(
+            x,
+            self.depthwise_conv.weight(),
+            None,
+            crate::kernels::depthwise_conv::DepthwiseConv1dSpec::symmetric(cfg.padding)
+                .with_dilation(cfg.dilation),
+        )
+        .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
 
@@ -2737,23 +2923,30 @@ fn load_conv_channel_layer_norm(vb: VarBuilder) -> Result<LayerNorm> {
 }
 
 struct RelPosSelfAttention {
-    linear_q: Linear,
-    linear_k: Linear,
-    linear_v: Linear,
-    linear_out: Linear,
-    linear_pos: Linear,
+    linear_q: ProjectionLinear,
+    linear_k: ProjectionLinear,
+    linear_v: ProjectionLinear,
+    linear_out: ProjectionLinear,
+    linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+        let projection_vb = projection_vb(&vb, f16);
+        let projection = |name: &str| -> Result<ProjectionLinear> {
+            Ok(ProjectionLinear::new(
+                mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, projection_vb.pp(name))?,
+                f16,
+            )?)
+        };
         Ok(Self {
-            linear_q: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_q"))?,
-            linear_k: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_k"))?,
-            linear_v: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_v"))?,
-            linear_out: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_out"))?,
-            linear_pos: mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_pos"))?,
+            linear_q: projection("linear_q")?,
+            linear_k: projection("linear_k")?,
+            linear_v: projection("linear_v")?,
+            linear_out: projection("linear_out")?,
+            linear_pos: projection("linear_pos")?,
             pos_bias_u: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?,
             pos_bias_v: vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?,
         })
@@ -3518,6 +3711,17 @@ fn build_streaming_rel_positional_embedding_for_dtype(
         .map_err(Error::from)
 }
 
+/// NeMo `ConformerEncoder._create_masks` for `att_context_style:
+/// chunked_limited`: frames form chunks of `right + 1`, and a query sees
+/// every frame of its own chunk and of the `left / (right + 1)` chunks before
+/// it. Positions may be negative (streaming cache frames before the phase
+/// origin); chunk indices use floor division.
+fn chunked_limited_visible(query: isize, key: isize, left: usize, right: usize) -> bool {
+    let chunk = right as isize + 1;
+    let diff = query.div_euclid(chunk) - key.div_euclid(chunk);
+    diff >= 0 && diff <= (left as isize) / chunk
+}
+
 fn build_limited_context_mask(
     len: usize,
     left_context: usize,
@@ -3527,7 +3731,7 @@ fn build_limited_context_mask(
     let mut mask = vec![0f32; len * len];
     for q in 0..len {
         for k in 0..len {
-            if k + left_context < q || k > q.saturating_add(right_context) {
+            if !chunked_limited_visible(q as isize, k as isize, left_context, right_context) {
                 mask[q * len + k] = -1.0e9;
             }
         }
@@ -3551,6 +3755,7 @@ fn build_streaming_limited_context_mask(
     q_len: usize,
     key_len: usize,
     query_offset: usize,
+    query_phase: usize,
     left_context: usize,
     right_context: usize,
     device: &Device,
@@ -3566,11 +3771,16 @@ fn build_streaming_limited_context_mask(
         )));
     }
 
+    // Keys are the attention cache followed by the chunk; query 0 is the
+    // chunk's first frame, at `query_phase` within its NeMo chunk. Every
+    // cached frame is visible because the cache holds whole chunks of left
+    // context, exactly the frames the offline mask lets this chunk see.
     let mut mask = vec![0f32; q_len * key_len];
     for q in 0..q_len {
-        let query_pos = query_offset + q;
+        let query_pos = (query_phase + q) as isize;
         for k in 0..key_len {
-            if k + left_context < query_pos || k > query_pos.saturating_add(right_context) {
+            let key_pos = (query_phase + k) as isize - query_offset as isize;
+            if !chunked_limited_visible(query_pos, key_pos, left_context, right_context) {
                 mask[q * key_len + k] = -1.0e9;
             }
         }
@@ -3582,6 +3792,7 @@ fn build_streaming_limited_context_mask_for_dtype(
     q_len: usize,
     key_len: usize,
     query_offset: usize,
+    query_phase: usize,
     left_context: usize,
     right_context: usize,
     device: &Device,
@@ -3591,6 +3802,7 @@ fn build_streaming_limited_context_mask_for_dtype(
         q_len,
         key_len,
         query_offset,
+        query_phase,
         left_context,
         right_context,
         device,
@@ -3674,8 +3886,11 @@ fn argmax_1d(x: &Tensor) -> Result<usize> {
     argmax_1d_host(x)
 }
 
+/// Select on the device (a 4-byte index readback) on CUDA and Metal instead
+/// of reading every logit back (13,088 F32 per joint step). Candle's device
+/// argmax breaks ties toward the lowest index, as the host loop does.
 fn argmax_uses_device(x: &Tensor) -> bool {
-    x.device().is_cuda()
+    x.device().is_cuda() || x.device().is_metal()
 }
 
 fn use_rnnt_cached_projection(device: &Device) -> bool {
@@ -3782,6 +3997,98 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// The CPU/CUDA conformer depthwise conv (shared shift-and-accumulate op)
+    /// matches Candle's per-channel grouped conv on causally padded input.
+    #[test]
+    fn conformer_depthwise_conv_shared_op_matches_candle_grouped_conv() {
+        let device = Device::Cpu;
+        let mut state = 0x8F1B_3C27_D4E5_A609u64;
+        let mut tensor = |shape: &[usize]| {
+            let n = shape.iter().product::<usize>();
+            let values = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let pointwise = |t: Tensor| Conv1d::new(t, None, Conv1dConfig::default());
+        let conv = ConformerConv {
+            pointwise_conv1: crate::kernels::f16_weight_linear::PointwiseConv1d::Dense(pointwise(
+                tensor(&[2 * ENCODER_DIM, ENCODER_DIM, 1]),
+            )),
+            depthwise_conv: Conv1d::new(
+                tensor(&[ENCODER_DIM, 1, CONV_KERNEL_1D]),
+                None,
+                Conv1dConfig {
+                    padding: 0,
+                    groups: ENCODER_DIM,
+                    ..Default::default()
+                },
+            ),
+            conv_norm: LayerNorm::new(tensor(&[ENCODER_DIM]), tensor(&[ENCODER_DIM]), 1e-5),
+            pointwise_conv2: crate::kernels::f16_weight_linear::PointwiseConv1d::Dense(pointwise(
+                tensor(&[ENCODER_DIM, ENCODER_DIM, 1]),
+            )),
+        };
+        let x = tensor(&[2, ENCODER_DIM, 23])
+            .pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)
+            .unwrap();
+        let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        let actual = conv.depthwise_conv_forward(&x).unwrap();
+        assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+        let expected = conv.depthwise_conv.forward(&x).unwrap();
+        assert_eq!(actual.dims(), expected.dims());
+        let diff = (actual - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|d| if d.is_finite() { d } else { f32::INFINITY })
+            .fold(0.0f32, f32::max);
+        assert!(diff <= 1e-5, "max |diff| {diff}");
+    }
+
+    /// The device argmax now used on Metal selects the same index as the
+    /// host scan it replaces, including the first index among equal maxima.
+    #[test]
+    fn device_argmax_matches_host_scan_on_unstructured_and_tied_logits() {
+        let device = Device::Cpu;
+        let mut state = 0x3C6E_F372_FE94_F82Bu64;
+        let mut logits = (0..13_088)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 20) as f32 - 8.0
+            })
+            .collect::<Vec<_>>();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let x = Tensor::from_vec(logits.clone(), logits.len(), &device)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            assert_eq!(
+                argmax_1d_device(&x).unwrap(),
+                argmax_1d_host(&x).unwrap(),
+                "{dtype:?}"
+            );
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        logits[17] = max + 1.0;
+        logits[9_001] = max + 1.0;
+        let x = Tensor::from_vec(logits.clone(), logits.len(), &device).unwrap();
+        assert_eq!(argmax_1d_host(&x).unwrap(), 17);
+        assert_eq!(argmax_1d_device(&x).unwrap(), 17);
+    }
+
     fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
         let device = Device::Cpu;
         let mut planner = FftPlanner::<f32>::new();
@@ -3803,11 +4110,7 @@ mod tests {
 
     fn zero_subsampling() -> ConvSubsamplingDw {
         let device = Device::Cpu;
-        let stride_cfg = Conv2dConfig {
-            stride: 2,
-            padding: 1,
-            ..Default::default()
-        };
+        let stride_cfg = causal_stride2_conv_config();
         let mut dw_stride_cfg = stride_cfg;
         dw_stride_cfg.groups = CONV_SUB_CHANNELS;
         let point_cfg = Conv2dConfig {
@@ -3850,7 +4153,7 @@ mod tests {
             None,
             point_cfg,
         );
-        let out_feature_bins = 16;
+        let out_feature_bins = 17;
         let out = Linear::new(
             Tensor::zeros(
                 (ENCODER_DIM, CONV_SUB_CHANNELS * out_feature_bins),
@@ -3859,7 +4162,8 @@ mod tests {
             )
             .unwrap(),
             Some(Tensor::zeros(ENCODER_DIM, DType::F32, &device).unwrap()),
-        );
+        )
+        .into();
 
         ConvSubsamplingDw {
             conv0,
@@ -3894,7 +4198,11 @@ mod tests {
     }
 
     fn zero_prompt_kernel() -> PromptKernel {
-        let device = Device::Cpu;
+        zero_prompt_kernel_on(&Device::Cpu)
+    }
+
+    fn zero_prompt_kernel_on(device: &Device) -> PromptKernel {
+        let device = device.clone();
         PromptKernel {
             linear0: Linear::new(
                 Tensor::zeros(
@@ -3991,6 +4299,611 @@ mod tests {
         }
     }
 
+    /// Counter-hash values in [-scale, scale); bit-identical to `hashed()` in
+    /// `tests/fixtures/nemotron-causal-reference.py`.
+    fn hashed_values(seed: u32, count: usize, scale: f32) -> Vec<f32> {
+        (0..count as u32)
+            .map(|idx| {
+                let mut h = idx
+                    .wrapping_mul(0x9E37_79B1)
+                    .wrapping_add(seed.wrapping_mul(0x85EB_CA77));
+                h ^= h >> 16;
+                h = h.wrapping_mul(0x85EB_CA6B);
+                h ^= h >> 13;
+                h = h.wrapping_mul(0xC2B2_AE35);
+                h ^= h >> 16;
+                ((h >> 8) as f32 * (2.0 / 16_777_216.0) - 1.0) * scale
+            })
+            .collect()
+    }
+
+    fn hashed_tensor<S: Into<candle_core::Shape>>(seed: u32, shape: S, scale: f32) -> Tensor {
+        let shape = shape.into();
+        let values = hashed_values(seed, shape.elem_count(), scale);
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    }
+
+    /// The real-shape subsampler (256 channels, out [1024, 4352]) with the
+    /// reference generator's hashed weights, loaded through production code.
+    fn hashed_subsampling() -> ConvSubsamplingDw {
+        let c = CONV_SUB_CHANNELS;
+        let specs: [(&str, u32, Vec<usize>, f32); 12] = [
+            ("conv.0.weight", 1, vec![c, 1, 3, 3], 0.5),
+            ("conv.0.bias", 2, vec![c], 0.125),
+            ("conv.2.weight", 3, vec![c, 1, 3, 3], 0.5),
+            ("conv.2.bias", 4, vec![c], 0.125),
+            ("conv.3.weight", 5, vec![c, c, 1, 1], 1.0 / 16.0),
+            ("conv.3.bias", 6, vec![c], 0.125),
+            ("conv.5.weight", 7, vec![c, 1, 3, 3], 0.5),
+            ("conv.5.bias", 8, vec![c], 0.125),
+            ("conv.6.weight", 9, vec![c, c, 1, 1], 1.0 / 16.0),
+            ("conv.6.bias", 10, vec![c], 0.125),
+            ("out.weight", 11, vec![ENCODER_DIM, c * 17], 1.0 / 64.0),
+            ("out.bias", 12, vec![ENCODER_DIM], 0.125),
+        ];
+        let tensors = specs
+            .into_iter()
+            .map(|(name, seed, shape, scale)| (name.to_string(), hashed_tensor(seed, shape, scale)))
+            .collect::<HashMap<_, _>>();
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        ConvSubsamplingDw::load(vb, None).unwrap()
+    }
+
+    /// A one-layer F32 network with the hashed subsampler and layer, loaded
+    /// with weight-only F16 projections on `device` when `f16`, and the
+    /// checkpoint it came from (under the production tensor names).
+    fn hashed_encoder_network(
+        device: &Device,
+        f16: bool,
+        layer_tensors: HashMap<String, Tensor>,
+    ) -> (NemotronNetwork, VarBuilder<'static>) {
+        let mut tensors = HashMap::new();
+        let subsampling = hashed_subsampling();
+        for (name, tensor) in [
+            ("conv.0.weight", subsampling.conv0.weight()),
+            ("conv.2.weight", subsampling.conv2.weight()),
+            ("conv.3.weight", subsampling.conv3.weight()),
+            ("conv.5.weight", subsampling.conv5.weight()),
+            ("conv.6.weight", subsampling.conv6.weight()),
+        ] {
+            tensors.insert(format!("encoder.pre_encode.{name}"), tensor.clone());
+        }
+        for (name, conv) in [
+            ("conv.0", &subsampling.conv0),
+            ("conv.2", &subsampling.conv2),
+            ("conv.3", &subsampling.conv3),
+            ("conv.5", &subsampling.conv5),
+            ("conv.6", &subsampling.conv6),
+        ] {
+            tensors.insert(
+                format!("encoder.pre_encode.{name}.bias"),
+                conv.bias().unwrap().clone(),
+            );
+        }
+        let ProjectionLinear::Dense(out) = &subsampling.out else {
+            unreachable!("loaded dense");
+        };
+        tensors.insert("encoder.pre_encode.out.weight".into(), out.weight().clone());
+        tensors.insert(
+            "encoder.pre_encode.out.bias".into(),
+            out.bias().unwrap().clone(),
+        );
+        for (name, tensor) in layer_tensors {
+            tensors.insert(format!("encoder.layers.0.{name}"), tensor);
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        let f16 = f16.then_some(device);
+        let mut network = rnnt_test_network(vec![0.0; 4], 1);
+        network.pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"), f16).unwrap();
+        network.layers = vec![ConformerLayer::load(vb.pp("encoder.layers.0"), f16).unwrap()];
+        network.prompt_kernel = zero_prompt_kernel_on(device);
+        network.left_context_frames = 56;
+        network.right_context_frames = 13;
+        (network, vb)
+    }
+
+    fn nemo_reference() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/nemotron-causal-reference.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn causal_subsampling_matches_nemo_at_real_shapes() {
+        let golden = nemo_reference();
+        let golden = &golden["subsampling"];
+        let as_usize = |value: &serde_json::Value| value.as_u64().unwrap() as usize;
+        let (frames, valid) = (
+            as_usize(&golden["feature_frames"]),
+            as_usize(&golden["valid_frames"]),
+        );
+        let subsampling = hashed_subsampling();
+        assert_eq!(subsampling.out_feature_bins, 17, "4352 = 256 x 17 bins");
+
+        // The reference input is (batch, time, mels); frames past `valid`
+        // hold values NeMo's MaskedConvSequential must hide.
+        let features = hashed_tensor(13, (1, frames, N_MELS), 2.0)
+            .transpose(1, 2)
+            .unwrap();
+        let (encoded, encoded_len) = subsampling.forward(&features, valid).unwrap();
+        assert_eq!(encoded_len, as_usize(&golden["encoded_frames"]));
+        assert_eq!(encoded.dims(), &[1, encoded_len, ENCODER_DIM]);
+
+        let rows = encoded.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let columns = golden["columns"].as_array().unwrap();
+        let mut worst = 0f32;
+        for (row, want_row) in rows.iter().zip(golden["rows"].as_array().unwrap()) {
+            for (column, want) in columns.iter().zip(want_row.as_array().unwrap()) {
+                let got = row[as_usize(column)];
+                let diff = (got - want.as_f64().unwrap() as f32).abs();
+                assert!(diff <= 1e-4, "pre_encode value {got} vs NeMo {want}");
+                worst = worst.max(diff);
+            }
+        }
+        let sums = golden["row_sums"].as_array().unwrap();
+        let squares = golden["row_sq_sums"].as_array().unwrap();
+        for ((row, sum), square) in rows.iter().zip(sums).zip(squares) {
+            let got_sum = row.iter().map(|v| *v as f64).sum::<f64>();
+            let got_square = row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            assert!(
+                (got_sum - sum.as_f64().unwrap()).abs() <= 1e-3,
+                "row sum {got_sum}"
+            );
+            assert!(
+                (got_square - square.as_f64().unwrap()).abs() <= 1e-3,
+                "row square {got_square}"
+            );
+        }
+        eprintln!("causal pre_encode max abs diff vs NeMo {worst:.2e}");
+    }
+
+    fn visible_keys(mask: &Tensor) -> Vec<Vec<bool>> {
+        let rows = mask
+            .squeeze(0)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        rows.into_iter()
+            .map(|row| row.into_iter().map(|value| value == 0.0).collect())
+            .collect()
+    }
+
+    #[test]
+    fn offline_mask_matches_nemo_chunked_limited_masks() {
+        let golden = nemo_reference();
+        let len = golden["mask_len"].as_u64().unwrap() as usize;
+        for (profile, rows) in golden["masks"].as_object().unwrap() {
+            let (left, right) = profile.split_once(',').unwrap();
+            let (left, right) = (left.parse().unwrap(), right.parse().unwrap());
+            let mask = build_limited_context_mask(len, left, right, &Device::Cpu).unwrap();
+            for (query, (visible, bounds)) in visible_keys(&mask)
+                .iter()
+                .zip(rows.as_array().unwrap())
+                .enumerate()
+            {
+                let lo = bounds[0].as_u64().unwrap() as usize;
+                let hi = bounds[1].as_u64().unwrap() as usize;
+                for (key, seen) in visible.iter().enumerate() {
+                    assert_eq!(
+                        *seen,
+                        (lo..=hi).contains(&key),
+                        "[{profile}] q={query} k={key}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The chunks `NemotronStreamingEncoderState` cuts for one right context.
+    fn streaming_chunks(len: usize, right: usize) -> Vec<(usize, usize)> {
+        (0..len)
+            .step_by(right + 1)
+            .map(|start| (start, (right + 1).min(len - start)))
+            .collect()
+    }
+
+    #[test]
+    fn streaming_masks_equal_the_offline_mask_over_cache_and_chunk() {
+        let (len, left) = (150, 56);
+        for right in [13, 6, 3, 1, 0] {
+            let offline =
+                visible_keys(&build_limited_context_mask(len, left, right, &Device::Cpu).unwrap());
+            for (start, q_len) in streaming_chunks(len, right) {
+                let cache_len = start.min(left);
+                let key_start = start - cache_len;
+                let mask = build_streaming_limited_context_mask(
+                    q_len,
+                    cache_len + q_len,
+                    cache_len,
+                    start % (right + 1),
+                    left,
+                    right,
+                    &Device::Cpu,
+                )
+                .unwrap();
+                for (q, streamed) in visible_keys(&mask).iter().enumerate() {
+                    let row = &offline[start + q];
+                    assert!(
+                        !row[..key_start].iter().any(|seen| *seen),
+                        "offline query {} sees past the {left}-frame cache",
+                        start + q
+                    );
+                    assert_eq!(
+                        streamed[..],
+                        row[key_start..start + q_len],
+                        "right={right} q={}",
+                        start + q
+                    );
+                }
+            }
+        }
+    }
+
+    /// One real-dimension Conformer layer with hashed weights, loaded through
+    /// production code.
+    fn hashed_conformer_layer() -> ConformerLayer {
+        let vb = VarBuilder::from_tensors(hashed_conformer_tensors(), DType::F32, &Device::Cpu);
+        ConformerLayer::load(vb, None).unwrap()
+    }
+
+    /// The hashed layer's checkpoint tensors, named as under
+    /// `encoder.layers.{i}`.
+    fn hashed_conformer_tensors() -> HashMap<String, Tensor> {
+        let d = ENCODER_DIM;
+        let mut seed = 100u32;
+        let mut tensors = HashMap::new();
+        let mut put = |name: &str, shape: Vec<usize>, scale: f32, offset: f32| {
+            seed += 1;
+            let tensor = (hashed_tensor(seed, shape, scale) + offset as f64).unwrap();
+            tensors.insert(name.to_string(), tensor);
+        };
+        for norm in [
+            "norm_feed_forward1",
+            "norm_self_att",
+            "norm_conv",
+            "norm_feed_forward2",
+            "norm_out",
+            "conv.batch_norm",
+        ] {
+            put(&format!("{norm}.weight"), vec![d], 0.1, 1.0);
+            put(&format!("{norm}.bias"), vec![d], 0.1, 0.0);
+        }
+        for ff in ["feed_forward1", "feed_forward2"] {
+            put(
+                &format!("{ff}.linear1.weight"),
+                vec![FF_DIM, d],
+                1.0 / 32.0,
+                0.0,
+            );
+            put(
+                &format!("{ff}.linear2.weight"),
+                vec![d, FF_DIM],
+                1.0 / 64.0,
+                0.0,
+            );
+        }
+        for linear in [
+            "linear_q",
+            "linear_k",
+            "linear_v",
+            "linear_out",
+            "linear_pos",
+        ] {
+            put(
+                &format!("self_attn.{linear}.weight"),
+                vec![d, d],
+                1.0 / 32.0,
+                0.0,
+            );
+        }
+        put(
+            "self_attn.pos_bias_u",
+            vec![ENCODER_HEADS, ENCODER_HEAD_DIM],
+            0.1,
+            0.0,
+        );
+        put(
+            "self_attn.pos_bias_v",
+            vec![ENCODER_HEADS, ENCODER_HEAD_DIM],
+            0.1,
+            0.0,
+        );
+        put(
+            "conv.pointwise_conv1.weight",
+            vec![2 * d, d, 1],
+            1.0 / 32.0,
+            0.0,
+        );
+        put(
+            "conv.depthwise_conv.weight",
+            vec![d, 1, CONV_KERNEL_1D],
+            0.25,
+            0.0,
+        );
+        put(
+            "conv.pointwise_conv2.weight",
+            vec![d, d, 1],
+            1.0 / 32.0,
+            0.0,
+        );
+        tensors
+    }
+
+    #[test]
+    fn conformer_layer_streaming_matches_offline_chunked_limited() {
+        let layer = hashed_conformer_layer();
+        let left = 56;
+        // Six full 14-frame chunks and a partial one: the cache fills and slides.
+        let len = 6 * 14 + 5;
+        let x = hashed_tensor(31, (1, len, ENCODER_DIM), 1.0);
+        for right in [13, 3] {
+            let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
+            let mask = build_limited_context_mask(len, left, right, &Device::Cpu).unwrap();
+            let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
+
+            let mut state = ConformerLayerStreamState::new();
+            let mut streamed = Vec::new();
+            for (start, q_len) in streaming_chunks(len, right) {
+                let cache_len = state
+                    .attn_cache
+                    .as_ref()
+                    .map_or(0, |cache| cache.dim(1).unwrap());
+                let key_len = cache_len + q_len;
+                let pos_pair = build_streaming_rel_positional_embedding(
+                    q_len,
+                    key_len,
+                    cache_len,
+                    ENCODER_DIM,
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let mask = build_streaming_limited_context_mask(
+                    q_len,
+                    key_len,
+                    cache_len,
+                    start % (right + 1),
+                    left,
+                    right,
+                    &Device::Cpu,
+                )
+                .unwrap();
+                let chunk = x.narrow(1, start, q_len).unwrap();
+                streamed.push(
+                    layer
+                        .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                        .unwrap(),
+                );
+            }
+            let refs = streamed.iter().collect::<Vec<_>>();
+            let streamed = Tensor::cat(&refs, 1).unwrap();
+            let diff = (streamed - &offline)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff <= 1e-4,
+                "right={right}: streaming differs from offline by {diff}"
+            );
+            eprintln!("right={right}: streaming vs offline max abs diff {diff:.2e}");
+        }
+    }
+
+    fn relative_l2_of(values: &Tensor, reference: &Tensor) -> f64 {
+        use crate::kernels::numeric_check::{host_f32, relative_l2};
+        relative_l2(&host_f32(values).unwrap(), &host_f32(reference).unwrap())
+    }
+
+    /// The weight-only F16 layer tracks the F32 layer offline and streams
+    /// exactly like its own offline pass.
+    #[test]
+    fn weight_only_f16_conformer_layer_matches_f32_offline_and_streaming() {
+        let device = Device::Cpu;
+        let reference = hashed_conformer_layer();
+        let vb = VarBuilder::from_tensors(hashed_conformer_tensors(), DType::F32, &device);
+        let layer = ConformerLayer::load(vb, Some(&device)).unwrap();
+        assert!(layer.ff1.linear1.as_f16().is_some());
+        assert!(layer.self_attn.linear_pos.as_f16().is_some());
+        assert!(layer.conv.pointwise_conv2.as_f16().is_some());
+        assert_eq!(layer.conv.depthwise_conv.weight().dtype(), DType::F32);
+
+        let (len, left, right) = (2 * 14 + 3, 56, 13);
+        let x = hashed_tensor(41, (1, len, ENCODER_DIM), 1.0);
+        let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &device).unwrap();
+        let mask = build_limited_context_mask(len, left, right, &device).unwrap();
+        let offline = layer.forward(&x, &pos_emb, &mask).unwrap();
+        let rel = relative_l2_of(&offline, &reference.forward(&x, &pos_emb, &mask).unwrap());
+        assert!(rel > 0.0 && rel < 1e-2, "offline relative L2 {rel:e}");
+
+        let mut state = ConformerLayerStreamState::new();
+        let mut streamed = Vec::new();
+        for (start, q_len) in streaming_chunks(len, right) {
+            let cache_len = state
+                .attn_cache
+                .as_ref()
+                .map_or(0, |cache| cache.dim(1).unwrap());
+            let key_len = cache_len + q_len;
+            let pos_pair = build_streaming_rel_positional_embedding(
+                q_len,
+                key_len,
+                cache_len,
+                ENCODER_DIM,
+                &device,
+            )
+            .unwrap();
+            let mask = build_streaming_limited_context_mask(
+                q_len,
+                key_len,
+                cache_len,
+                start % (right + 1),
+                left,
+                right,
+                &device,
+            )
+            .unwrap();
+            let chunk = x.narrow(1, start, q_len).unwrap();
+            streamed.push(
+                layer
+                    .forward_streaming(&chunk, &mut state, &pos_pair, &mask, left)
+                    .unwrap(),
+            );
+        }
+        let refs = streamed.iter().collect::<Vec<_>>();
+        let rel = relative_l2_of(&Tensor::cat(&refs, 1).unwrap(), &offline);
+        assert!(rel < 1e-5, "streaming vs offline relative L2 {rel:e}");
+    }
+
+    /// Admission's F16 tensor set is exactly the set the loader converts.
+    #[test]
+    fn f16_projection_names_match_the_loader() {
+        use super::super::nemotron_tensor_is_f16_projection;
+
+        let (network, vb) = hashed_encoder_network(&Device::Cpu, true, hashed_conformer_tensors());
+        drop(vb);
+        let layer = &network.layers[0];
+        let converted = [
+            &network.pre_encode.out,
+            &layer.ff1.linear1,
+            &layer.ff1.linear2,
+            &layer.ff2.linear1,
+            &layer.ff2.linear2,
+            &layer.self_attn.linear_q,
+            &layer.self_attn.linear_k,
+            &layer.self_attn.linear_v,
+            &layer.self_attn.linear_out,
+            &layer.self_attn.linear_pos,
+        ]
+        .into_iter()
+        .map(|projection| projection.as_f16().unwrap())
+        .chain([
+            layer.conv.pointwise_conv1.as_f16().unwrap(),
+            layer.conv.pointwise_conv2.as_f16().unwrap(),
+        ])
+        .map(|linear| linear.out_features() * linear.in_features())
+        .sum::<usize>();
+        let named = hashed_conformer_tensors()
+            .iter()
+            .map(|(name, tensor)| (format!("encoder.layers.0.{name}"), tensor.elem_count()))
+            .chain([(
+                "encoder.pre_encode.out.weight".to_string(),
+                ENCODER_DIM * CONV_SUB_CHANNELS * 17,
+            )])
+            .filter(|(name, _)| nemotron_tensor_is_f16_projection(name))
+            .map(|(_, elements)| elements)
+            .sum::<usize>();
+        assert_eq!(named, converted);
+        for name in [
+            "encoder.pre_encode.out.bias",
+            "encoder.layers.0.conv.depthwise_conv.weight",
+            "encoder.layers.0.conv.batch_norm.weight",
+            "prompt_kernel.0.weight",
+            "joint.joint_net.2.weight",
+        ] {
+            assert!(!nemotron_tensor_is_f16_projection(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn weight_only_f16_self_check_passes_and_catches_overflow_and_bad_conversions() {
+        let device = Device::Cpu;
+        let (network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        assert!(network.pre_encode.out.as_f16().is_some());
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(report.passed, "{}", report.reason);
+        // pre_encode, one layer and the prompt kernel.
+        assert_eq!(report.tensors.len(), 3);
+
+        // A weight F16 cannot hold makes the layer output non-finite.
+        let mut tensors = hashed_conformer_tensors();
+        let name = "feed_forward2.linear2.weight";
+        let mut values = tensors[name]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        values[0] = 1.0e5;
+        let shape = tensors[name].dims().to_vec();
+        tensors.insert(
+            name.into(),
+            Tensor::from_vec(values, shape, &device).unwrap(),
+        );
+        let (network, vb) = hashed_encoder_network(&device, true, tensors);
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(!report.passed);
+        assert!(report.reason.contains("layers.0"), "{}", report.reason);
+
+        // A conversion that does not match the checkpoint fails the transform
+        // check even though every output stays finite.
+        let (mut network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        let swapped = network.layers[0].ff2.linear1.clone();
+        network.layers[0].ff1.linear1 = swapped;
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(!report.passed);
+        assert!(
+            report.reason.contains("feed_forward1.linear1"),
+            "{}",
+            report.reason
+        );
+    }
+
+    /// Production loading on Metal: the projections take ggml's f16 x f32
+    /// kernel, the self-check passes on the device, and the layer matches
+    /// the CPU F32 layer.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_weight_only_f16_engages_ggml_and_matches_cpu_f32() {
+        use crate::kernels::f16_weight_linear::F16WeightLinearPath;
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let (network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());
+        let report = network.weight_only_f16_self_check(&vb);
+        assert!(report.passed, "{}", report.reason);
+        let layer = &network.layers[0];
+        for projection in [
+            &network.pre_encode.out,
+            &layer.ff1.linear1,
+            &layer.ff2.linear2,
+            &layer.self_attn.linear_q,
+            &layer.self_attn.linear_pos,
+        ] {
+            assert_eq!(
+                projection.as_f16().unwrap().path(),
+                F16WeightLinearPath::GgmlF16F32
+            );
+        }
+        assert_eq!(
+            layer.conv.pointwise_conv1.as_f16().unwrap().path(),
+            F16WeightLinearPath::GgmlF16F32
+        );
+
+        let len = 31;
+        let x = hashed_tensor(43, (1, len, ENCODER_DIM), 1.0);
+        let pos_emb = build_rel_positional_embedding(len, ENCODER_DIM, &Device::Cpu).unwrap();
+        let mask = build_limited_context_mask(len, 56, 13, &Device::Cpu).unwrap();
+        let reference = hashed_conformer_layer()
+            .forward(&x, &pos_emb, &mask)
+            .unwrap();
+        let on_metal = layer
+            .forward(
+                &x.to_device(&device).unwrap(),
+                &pos_emb.to_device(&device).unwrap(),
+                &mask.to_device(&device).unwrap(),
+            )
+            .unwrap();
+        let rel = relative_l2_of(&on_metal, &reference);
+        assert!(rel < 1e-2, "relative L2 {rel:e}");
+    }
+
     #[test]
     fn resample_linear_downsamples_24khz_to_16khz_length() {
         let audio = vec![0.0f32; 24_000];
@@ -4000,40 +4913,26 @@ mod tests {
     }
 
     #[test]
-    fn subsampled_length_matches_three_stride_two_layers() {
+    fn subsampled_length_matches_nemo_causal_calc_length() {
+        // NeMo calc_length(all_paddings=3, kernel 3, stride 2, floor) x3.
         assert_eq!(subsampled_len_3x(1), 1);
-        assert_eq!(subsampled_len_3x(8), 1);
+        assert_eq!(subsampled_len_3x(8), 2);
         assert_eq!(subsampled_len_3x(9), 2);
-        assert_eq!(subsampled_len_3x(100), 13);
+        assert_eq!(subsampled_len_3x(35), 6);
+        assert_eq!(subsampled_len_3x(100), 14);
+        assert_eq!(subsampled_len_3x(3000), 376);
+        assert_eq!(causal_subsampled_len(30_000, SUBSAMPLING_FACTOR), 3_751);
     }
 
     #[test]
-    fn stable_subsampled_length_waits_for_full_stride_receptive_field() {
+    fn stable_subsampled_length_waits_for_the_causal_receptive_field() {
+        // Encoded frame t reads feature frames up to 8t.
         assert_eq!(stable_subsampled_len_3x(0), 0);
-        assert_eq!(stable_subsampled_len_3x(7), 0);
+        assert_eq!(stable_subsampled_len_3x(1), 1);
         assert_eq!(stable_subsampled_len_3x(8), 1);
-        assert_eq!(stable_subsampled_len_3x(15), 1);
+        assert_eq!(stable_subsampled_len_3x(9), 2);
         assert_eq!(stable_subsampled_len_3x(16), 2);
-        assert_eq!(stable_subsampled_len_3x(41), 5);
-    }
-
-    #[test]
-    fn limited_context_mask_blocks_out_of_window_positions() {
-        let mask = build_limited_context_mask(4, 1, 1, &Device::Cpu).unwrap();
-        let values = mask
-            .squeeze(0)
-            .unwrap()
-            .squeeze(0)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap();
-
-        assert_eq!(values[0][0], 0.0);
-        assert_eq!(values[0][1], 0.0);
-        assert!(values[0][2] < -1.0e8);
-        assert_eq!(values[2][1], 0.0);
-        assert_eq!(values[2][3], 0.0);
-        assert!(values[3][1] < -1.0e8);
+        assert_eq!(stable_subsampled_len_3x(41), 6);
     }
 
     #[test]
@@ -4048,8 +4947,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(mask.dtype(), DType::F32);
-        assert_eq!(values[0][0], 0.0);
-        assert!(values[0][2] < -1.0e8);
+        // Chunks of two with no whole left chunk: {0, 1} and {2, 3}.
+        assert_eq!(values[0][1], 0.0);
+        assert!(values[2][1] < -1.0e8);
+        assert_eq!(values[2][3], 0.0);
     }
 
     #[test]
@@ -4061,8 +4962,10 @@ mod tests {
     }
 
     #[test]
-    fn streaming_limited_context_mask_uses_bounded_key_window() {
-        let mask = build_streaming_limited_context_mask(2, 5, 3, 2, 1, &Device::Cpu).unwrap();
+    fn streaming_limited_context_mask_sees_whole_cached_chunks() {
+        // left 2, right 1: chunks of two, one left chunk. Three cached
+        // frames hold one and a half chunks, so the oldest is out of reach.
+        let mask = build_streaming_limited_context_mask(2, 5, 3, 0, 2, 1, &Device::Cpu).unwrap();
         let values = mask
             .squeeze(0)
             .unwrap()
@@ -4072,13 +4975,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(mask.dims(), &[1, 1, 2, 5]);
-        assert!(
-            values[0][0] < -1.0e8,
-            "query 3 cannot attend before left context"
-        );
-        assert_eq!(values[0][1], 0.0);
-        assert_eq!(values[0][4], 0.0, "query 3 can attend one frame right");
-        assert_eq!(values[1][2], 0.0);
+        for row in &values {
+            assert!(row[0] < -1.0e8, "frame two chunks back is masked");
+            assert!(row[1..].iter().all(|value| *value == 0.0));
+        }
     }
 
     #[test]
@@ -4166,6 +5066,9 @@ mod tests {
             .map(|idx| ((idx as f32) * 0.017).sin() * 0.3)
             .collect::<Vec<_>>();
         let (full, valid_frames) = preprocessor.compute_features(&audio).unwrap();
+        // NeMo get_seq_len: floor(len / hop), one less than the STFT frames.
+        assert_eq!(valid_frames, audio.len() / HOP_LENGTH);
+        assert_eq!(full.dim(2).unwrap(), valid_frames + 1);
         let full = full.narrow(2, 0, valid_frames).unwrap();
 
         let mut state = NemotronStreamingFeatureState::new();
@@ -4200,6 +5103,34 @@ mod tests {
     }
 
     #[test]
+    fn streaming_feature_state_keeps_only_the_next_frames_context_over_a_long_stream() {
+        let preprocessor = test_preprocessor(FeatureNormalize::None);
+        let mut state = NemotronStreamingFeatureState::new();
+        // Ten minutes of audio in 80 ms packets.
+        let packet = (0..1_280)
+            .map(|idx| ((idx as f32) * 0.021).sin() * 0.3)
+            .collect::<Vec<_>>();
+        let mut frames = 0;
+        let mut peak = 0;
+        for _ in 0..7_500 {
+            state.push_samples(&packet).unwrap();
+            if let Some(chunk) = preprocessor.compute_streaming_features(&mut state).unwrap() {
+                assert_eq!(chunk.start_frame, frames);
+                frames += chunk.frames;
+            }
+            peak = peak.max(state.retained_samples());
+        }
+        assert_eq!(state.total_samples(), 7_500 * 1_280);
+        // The next frame's STFT context plus one packet: under N_FFT + packet.
+        assert!(peak < N_FFT + packet.len(), "retained {peak} samples");
+        assert!(state.retained_samples() < N_FFT);
+        state.finish_input();
+        let tail = preprocessor.compute_streaming_features(&mut state).unwrap();
+        frames += tail.map_or(0, |chunk| chunk.frames);
+        assert_eq!(frames, 7_500 * 1_280 / HOP_LENGTH);
+    }
+
+    #[test]
     fn streaming_feature_state_rejects_push_after_finish() {
         let mut state = NemotronStreamingFeatureState::new();
         state.finish_input();
@@ -4210,48 +5141,55 @@ mod tests {
 
     #[test]
     fn streaming_pre_encode_delays_tail_and_matches_full_output() {
-        let subsampling = zero_subsampling();
-        let device = Device::Cpu;
-        let feature_frames = 41usize;
-        let values = (0..(N_MELS * feature_frames))
-            .map(|idx| (idx as f32) / 1000.0)
-            .collect::<Vec<_>>();
-        let features = Tensor::from_vec(values, (1, N_MELS, feature_frames), &device).unwrap();
+        let subsampling = hashed_subsampling();
+        let feature_frames = 57usize;
+        let features = hashed_tensor(21, (1, N_MELS, feature_frames), 2.0);
         let (full, encoded_len) = subsampling.forward(&features, feature_frames).unwrap();
+        assert_eq!(encoded_len, subsampled_len_3x(feature_frames));
 
         let mut state = NemotronStreamingPreEncodeState::new();
+        let mut pieces = Vec::new();
         state
-            .push_features(feature_chunk(&features, 0, 7, false))
+            .push_features(feature_chunk(&features, 0, 1, false))
+            .unwrap();
+        let first = subsampling
+            .forward_streaming_chunk(&mut state)
+            .unwrap()
+            .expect("causal frame 0 needs only feature frame 0");
+        assert_eq!((first.start_frame, first.frames), (0, 1));
+        assert!(!first.is_final);
+        pieces.push(first.encoded);
+
+        state
+            .push_features(feature_chunk(&features, 1, 7, false))
             .unwrap();
         assert!(subsampling
             .forward_streaming_chunk(&mut state)
             .unwrap()
             .is_none());
 
+        // Uneven pushes move the retained window across several stride cells.
+        let mut start = 8;
+        for size in [3usize, 21, 1, 16] {
+            state
+                .push_features(feature_chunk(&features, start, size, false))
+                .unwrap();
+            start += size;
+            if let Some(chunk) = subsampling.forward_streaming_chunk(&mut state).unwrap() {
+                assert_eq!(
+                    chunk.total_stable_frames,
+                    start.div_ceil(SUBSAMPLING_FACTOR)
+                );
+                pieces.push(chunk.encoded);
+            }
+        }
         state
-            .push_features(feature_chunk(&features, 7, 1, false))
-            .unwrap();
-        let first = subsampling
-            .forward_streaming_chunk(&mut state)
-            .unwrap()
-            .expect("first stable encoded frame");
-        assert_eq!(first.start_frame, 0);
-        assert_eq!(first.frames, 1);
-        assert_eq!(first.total_stable_frames, 1);
-        assert!(!first.is_final);
-
-        state
-            .push_features(feature_chunk(&features, 8, 24, false))
-            .unwrap();
-        let middle = subsampling
-            .forward_streaming_chunk(&mut state)
-            .unwrap()
-            .expect("middle stable frames");
-        assert_eq!(middle.start_frame, 1);
-        assert_eq!(middle.total_stable_frames, 4);
-
-        state
-            .push_features(feature_chunk(&features, 32, 9, false))
+            .push_features(feature_chunk(
+                &features,
+                start,
+                feature_frames - start,
+                false,
+            ))
             .unwrap();
         state.finish_input();
         let tail = subsampling
@@ -4260,10 +5198,11 @@ mod tests {
             .expect("final tail frames");
         assert!(tail.is_final);
         assert_eq!(tail.total_stable_frames, encoded_len);
+        pieces.push(tail.encoded);
 
-        let streamed = Tensor::cat(&[&first.encoded, &middle.encoded, &tail.encoded], 1).unwrap();
-        let full = full.narrow(1, 0, encoded_len).unwrap();
-        assert_tensor_close(&streamed, &full, 0.0);
+        let refs = pieces.iter().collect::<Vec<_>>();
+        let streamed = Tensor::cat(&refs, 1).unwrap();
+        assert_tensor_close(&streamed, &full, 1e-5);
     }
 
     #[test]
@@ -4294,7 +5233,10 @@ mod tests {
                 .unwrap()
                 .expect("each stride-sized input must stabilize one output");
             assert_eq!(chunk.frames, 1);
-            assert_eq!(state.retained_feature_frames(), 8);
+            assert_eq!(
+                state.retained_feature_frames(),
+                8 * SUBSAMPLING_CARRY_CELLS.min(start / 8 + 1)
+            );
         }
         assert_eq!(state.feature_frames, feature_frames);
         assert_eq!(state.emitted_encoded_frames, feature_frames / 8);

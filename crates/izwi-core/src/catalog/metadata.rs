@@ -141,7 +141,17 @@ pub enum ModelVariant {
         alias = "Nemotron 3.5 ASR Streaming 0.6B"
     )]
     Nemotron35AsrStreaming06B,
-    /// IBM Granite Speech 4.1 2B Plus rich transcription model.
+    /// IBM Granite Speech 4.1 2B: punctuated, capitalised ASR and speech
+    /// translation; IBM's default Granite Speech model.
+    #[serde(
+        rename = "Granite-Speech-4.1-2B",
+        alias = "ibm-granite/granite-speech-4.1-2b",
+        alias = "granite-speech-4.1-2b",
+        alias = "Granite Speech 4.1 2B"
+    )]
+    GraniteSpeech412B,
+    /// IBM Granite Speech 4.1 2B Plus rich transcription model: speaker
+    /// turns and word timestamps, without punctuation by design.
     #[serde(
         rename = "Granite-Speech-4.1-2B-Plus",
         alias = "ibm-granite/granite-speech-4.1-2b-plus",
@@ -378,6 +388,7 @@ impl ModelVariant {
             Self::Qwen3Asr06BGguf | Self::Qwen3Asr17BGguf => "Alkd/qwen3-asr-gguf",
             Self::VibeVoiceAsr => "microsoft/VibeVoice-ASR",
             Self::Nemotron35AsrStreaming06B => "nvidia/nemotron-3.5-asr-streaming-0.6b",
+            Self::GraniteSpeech412B => "ibm-granite/granite-speech-4.1-2b",
             Self::GraniteSpeech412BPlus => "ibm-granite/granite-speech-4.1-2b-plus",
             Self::DiarStreamingSortformer4SpkV21 => "nvidia/diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "nvidia/Nemotron-3-Diarization",
@@ -433,6 +444,7 @@ impl ModelVariant {
             Self::Qwen3Asr17BGguf => "Qwen3 ASR 1.7B GGUF",
             Self::VibeVoiceAsr => "VibeVoice ASR",
             Self::Nemotron35AsrStreaming06B => "Nemotron 3.5 ASR Streaming 0.6B",
+            Self::GraniteSpeech412B => "Granite Speech 4.1 2B",
             Self::GraniteSpeech412BPlus => "Granite Speech 4.1 2B Plus",
             Self::DiarStreamingSortformer4SpkV21 => "Streaming Sortformer 4spk v2.1",
             Self::Nemotron3Diarization => "Nemotron 3 Diarization",
@@ -488,6 +500,7 @@ impl ModelVariant {
             Self::Qwen3Asr17BGguf => "Qwen3-ASR-1.7B-GGUF",
             Self::VibeVoiceAsr => "VibeVoice-ASR",
             Self::Nemotron35AsrStreaming06B => "Nemotron-3.5-ASR-Streaming-0.6B",
+            Self::GraniteSpeech412B => "Granite-Speech-4.1-2B",
             Self::GraniteSpeech412BPlus => "Granite-Speech-4.1-2B-Plus",
             Self::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1",
             Self::Nemotron3Diarization => "Nemotron-3-Diarization",
@@ -537,12 +550,13 @@ impl ModelVariant {
             Self::Lfm2512BThinkingGguf => 730_895_360,  // ~0.68 GB (GGUF Q4_K_M, HF tree)
             Self::Lfm25Audio15BGguf => 1_220_000_000,   // ~1.14 GB (four-file GGUF bundle, est)
             Self::Kokoro82M => 363_323_757,             // ~346 MB (HF tree total, Apr 2025)
-            Self::ParakeetTdt06BV3 => 10_036_761_167,   // ~9.35 GB
+            Self::ParakeetTdt06BV3 => 2_509_332_480,    // .nemo 2,509,332,480 B (HF tree, Oct 2026)
             Self::WhisperLargeV3Turbo => 1_617_824_864, // ~1.51 GB (HF x-linked-size)
             Self::Qwen3Asr06BGguf => 1_012_824_608,     // HF x-linked-size, Mar 2026
             Self::Qwen3Asr17BGguf => 2_512_740_320,     // HF x-linked-size, Mar 2026
             Self::VibeVoiceAsr => 17_348_198_410,       // safetensors index metadata total_size
-            Self::Nemotron35AsrStreaming06B => 2_370_000_000, // ~2.37 GB .nemo, HF tree, Jun 2026
+            Self::Nemotron35AsrStreaming06B => 2_368_284_501, // .nemo bytes, HF tree, Oct 2026
+            Self::GraniteSpeech412B => 4_626_414_392,   // safetensors index metadata total_size
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
             Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
             Self::Nemotron3Diarization => 200_000_000,          // ~0.19 GB .nemo, HF, Sep 2026
@@ -561,7 +575,7 @@ impl ModelVariant {
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
             Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
-            Self::VoxtralMini4BRealtime2602 => 8_000_000_000, // ~7.45 GB (est)
+            Self::VoxtralMini4BRealtime2602 => 8_874_376_007, // resolved download total, Oct 2026
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
             Self::FishAudioS2Pro => 11_520_000_000, // ~10.7 GiB current HF bundle, including codec.pth
@@ -597,7 +611,8 @@ impl ModelVariant {
             Self::Qwen3Asr17BGguf => 8.0,
             Self::VibeVoiceAsr => 36.0,
             Self::Nemotron35AsrStreaming06B => 6.0,
-            Self::GraniteSpeech412BPlus => 10.0,
+            // Same architecture as plus; base's untied head adds 0.4 GB BF16.
+            Self::GraniteSpeech412B | Self::GraniteSpeech412BPlus => 10.0,
             Self::DiarStreamingSortformer4SpkV21 => 3.0,
             Self::Nemotron3Diarization => 2.0,
             Self::Qwen306B => 3.0,
@@ -717,9 +732,10 @@ impl ModelVariant {
             Self::VibeVoiceAsr | Self::VibeVoice15BTts => Some("MIT"),
             Self::FishAudioS2Pro => Some("Fish Audio Research License"),
             Self::Nemotron35AsrStreaming06B | Self::Nemotron3Diarization => Some("OpenMDW-1.1"),
-            Self::GraniteSpeech412BPlus | Self::Qwen3827BFp8 | Self::Qwen36Moe35BA3BFp8 => {
-                Some("Apache-2.0")
-            }
+            Self::GraniteSpeech412B
+            | Self::GraniteSpeech412BPlus
+            | Self::Qwen3827BFp8
+            | Self::Qwen36Moe35BA3BFp8 => Some("Apache-2.0"),
             _ => None,
         }
     }
@@ -1096,6 +1112,7 @@ impl ModelVariant {
             Self::Qwen3Asr17BGguf,
             Self::VibeVoiceAsr,
             Self::Nemotron35AsrStreaming06B,
+            Self::GraniteSpeech412B,
             Self::GraniteSpeech412BPlus,
             Self::DiarStreamingSortformer4SpkV21,
             Self::Nemotron3Diarization,
@@ -1579,6 +1596,31 @@ mod tests {
         assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
         assert!(!variant.is_quantized());
         assert_eq!(variant.memory_required_gb(), 6.0);
+    }
+
+    #[test]
+    fn granite_speech_base_variant_is_enabled_punctuating_asr_metadata() {
+        let variant = ModelVariant::GraniteSpeech412B;
+        assert!(variant.is_asr());
+        assert!(variant.is_enabled());
+        assert_eq!(
+            variant.family(),
+            crate::catalog::ModelFamily::GraniteSpeechAsr
+        );
+        assert_eq!(variant.primary_task(), ModelTask::Asr);
+        assert_eq!(variant.repo_id(), "ibm-granite/granite-speech-4.1-2b");
+        assert_eq!(variant.dir_name(), "Granite-Speech-4.1-2B");
+        assert_eq!(variant.estimated_size(), 4_626_414_392);
+        assert_eq!(
+            variant.memory_required_gb(),
+            ModelVariant::GraniteSpeech412BPlus.memory_required_gb()
+        );
+        assert_eq!(variant.license_label(), Some("Apache-2.0"));
+        // Speaker turns are a plus-only capability.
+        assert!(!variant.supports_speaker_attributed_asr());
+        assert!(ModelVariant::GraniteSpeech412BPlus.supports_speaker_attributed_asr());
+        assert!(!variant.is_quantized());
+        assert!(!variant.is_gguf());
     }
 
     #[test]

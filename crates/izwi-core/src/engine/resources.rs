@@ -350,6 +350,15 @@ pub trait PhysicalCapacityProvider: std::fmt::Debug + Send + Sync {
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         self.snapshot()
     }
+
+    /// Bytes this process has allocated on the inference device right now,
+    /// sampled fresh: Metal's `currentAllocatedSize`, or CUDA's used device
+    /// memory (total less free, read from the driver without touching
+    /// cudarc's shared error state). `None` when the backend has no device
+    /// observer (CPU), which skips observed reconciliation.
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,19 +734,81 @@ impl ResourceAuthority {
         })
     }
 
-    /// Probed live headroom for one Metal pre-load admission decision. Unlike
-    /// planning headroom this deliberately reads the volatile live-available
-    /// sample: a Metal model load allocates its full physical working set at
-    /// the load fence, so starting one while the device has less free memory
-    /// than the new model's static estimate turns an admission question into
-    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
-    /// exists (probe unavailable); callers must treat that as "fall back to
-    /// planning headroom", never as unlimited. CPU keeps planning headroom
-    /// only: host availability is compressed/swapped and must not gate loads.
-    pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
-        if backend != BackendKind::Metal {
-            return Ok(None);
+    /// Headroom a load-time ASR state fit may spend, in the backend's domain:
+    /// planning headroom, clamped on CPU and Metal to the live sample (less
+    /// pending claims) when the provider has one (ADM-7). Planning headroom
+    /// alone is a ledger figure: on a machine whose memory is already in use
+    /// it lets a fit allocate state that the next request then cannot run
+    /// beside. Everything reserved before the fit, such as the model's own
+    /// lease and a deferred request envelope, is charged to both figures, so
+    /// a fit can never spend it. CUDA's planning headroom already takes the
+    /// live minimum.
+    pub(crate) fn state_fit_headroom_bytes(&self, backend: BackendKind) -> Result<ResourceAmount> {
+        let planning = self.planning_headroom_bytes(backend)?;
+        if backend == BackendKind::Cuda {
+            return Ok(planning);
         }
+        Ok(match (planning, self.live_headroom_in_domain(backend)?) {
+            (ResourceAmount::Known(planning), Some(live)) => {
+                ResourceAmount::Known(planning.min(live))
+            }
+            (planning, _) => planning,
+        })
+    }
+
+    /// Fresh device usage from the provider's observer; see
+    /// [`PhysicalCapacityProvider::observed_device_usage_bytes`].
+    pub(crate) fn observed_device_usage_bytes(&self) -> Option<u64> {
+        self.provider.observed_device_usage_bytes()
+    }
+
+    /// Reserved bytes in `backend`'s canonical domain (every lease).
+    pub(crate) fn reserved_bytes_in_domain(&self, backend: BackendKind) -> u64 {
+        let reserved = self.snapshot().reserved;
+        known_bytes(self.domain_amount(reserved, backend))
+    }
+
+    /// Device memory the process holds outside every lease's materialized
+    /// usage, in `backend`'s domain: observed device usage less what the
+    /// ledger records as allocated (Candle pool slack, power-of-two rounding
+    /// of activations, command buffers, lazily grown backend contexts).
+    /// `None` without a device observer.
+    pub(crate) fn untracked_device_bytes(&self, backend: BackendKind) -> Option<u64> {
+        let observed = self.observed_device_usage_bytes()?;
+        let materialized = self.snapshot().materialized;
+        Some(observed.saturating_sub(known_bytes(self.domain_amount(materialized, backend))))
+    }
+
+    /// The one safety reserve ASR state fits leave free: the operator's
+    /// configured floor, or the measured untracked device memory when that is
+    /// larger. Untracked memory is what this process allocated outside any
+    /// lease so far; leaving at least as much beside the fitted state lets the
+    /// same growth recur without crowding the requests the state serves.
+    pub(crate) fn state_safety_reserve_bytes(
+        &self,
+        backend: BackendKind,
+        configured_floor_bytes: u64,
+    ) -> u64 {
+        self.untracked_device_bytes(backend)
+            .map_or(configured_floor_bytes, |untracked| {
+                untracked.max(configured_floor_bytes)
+            })
+    }
+
+    fn domain_amount(&self, resources: ResourceVector, backend: BackendKind) -> ResourceAmount {
+        match (self.domain_policy, backend) {
+            (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
+                resources.unified_bytes
+            }
+            (_, BackendKind::Cpu) => resources.host_bytes,
+            (_, BackendKind::Metal) => resources.unified_bytes,
+            (_, BackendKind::Cuda) => resources.device_bytes,
+        }
+    }
+
+    /// The live sample less pending claims, in `backend`'s canonical domain,
+    /// or `None` when the provider has no trustworthy sample.
+    fn live_headroom_in_domain(&self, backend: BackendKind) -> Result<Option<u64>> {
         let state = self
             .state
             .lock()
@@ -754,10 +825,34 @@ impl ResourceAuthority {
         let live = physical
             .available
             .positive_growth_over(state.pending_resources()?)?;
-        Ok(match live.unified_bytes {
+        let amount = match (self.domain_policy, backend) {
+            (ResourceDomainPolicy::SharedHostUnified, BackendKind::Cpu | BackendKind::Metal) => {
+                live.unified_bytes
+            }
+            (_, BackendKind::Cpu) => live.host_bytes,
+            (_, BackendKind::Metal) => live.unified_bytes,
+            (_, BackendKind::Cuda) => live.device_bytes,
+        };
+        Ok(match amount {
             ResourceAmount::Known(bytes) => Some(bytes),
             ResourceAmount::Unknown => None,
         })
+    }
+
+    /// Probed live headroom for one Metal pre-load admission decision. Unlike
+    /// planning headroom this deliberately reads the volatile live-available
+    /// sample: a Metal model load allocates its full physical working set at
+    /// the load fence, so starting one while the device has less free memory
+    /// than the new model's static estimate turns an admission question into
+    /// a command-buffer OOM. Returns `None` when no trustworthy live sample
+    /// exists (probe unavailable); callers must treat that as "fall back to
+    /// planning headroom", never as unlimited. CPU keeps planning headroom
+    /// only: host availability is compressed/swapped and must not gate loads.
+    pub(crate) fn live_preload_headroom_bytes(&self, backend: BackendKind) -> Result<Option<u64>> {
+        if backend != BackendKind::Metal {
+            return Ok(None);
+        }
+        self.live_headroom_in_domain(backend)
     }
 
     /// Publish a post-release physical observation before another guarded
@@ -893,6 +988,39 @@ impl ResourceAuthority {
                     self.provider.configured_budget(),
                     self.domain_policy,
                 ));
+                if owner.class == ReservationClass::Request {
+                    // A request's working set must exist when it runs, so it
+                    // is also checked against the operating system's live
+                    // sample (Metal working set, CPU MemAvailable or cgroup),
+                    // less every unallocated claim, not only the ledger:
+                    // otherwise memory used elsewhere surfaces as a Metal OOM
+                    // or swap in the middle of the request (ADM-4).
+                    let physical = self.normalized_physical_snapshot();
+                    if matches!(
+                        physical.source,
+                        CapacitySource::OperatingSystem | CapacitySource::MetalWorkingSet
+                    ) {
+                        let pending = resources.positive_growth_over(materialized)?;
+                        let existing_pending = state.pending_resources()?;
+                        let live_claim = existing_pending.checked_add(pending)?;
+                        let live = physical.available;
+                        let exceeds = |claim: ResourceAmount, available: ResourceAmount| {
+                            matches!(
+                                (claim, available),
+                                (ResourceAmount::Known(claim), ResourceAmount::Known(available))
+                                    if claim > available
+                            )
+                        };
+                        if exceeds(live_claim.host_bytes, live.host_bytes)
+                            || exceeds(live_claim.unified_bytes, live.unified_bytes)
+                        {
+                            return Err(Error::Overloaded(format!(
+                                "insufficient live memory for a request: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={live:?}, live_by_class={:?}",
+                                state.pending_by_class(None)?
+                            )));
+                        }
+                    }
+                }
                 state.ledger.reserve(resources)?
             }
         };
@@ -1070,6 +1198,13 @@ impl ResourceAuthority {
             available: normalize_physical_resource_domains(physical.available, self.domain_policy),
             source: physical.source,
         }
+    }
+}
+
+fn known_bytes(amount: ResourceAmount) -> u64 {
+    match amount {
+        ResourceAmount::Known(bytes) => bytes,
+        ResourceAmount::Unknown => 0,
     }
 }
 
@@ -1809,6 +1944,167 @@ mod tests {
     }
 
     #[test]
+    fn asr_state_fit_headroom_takes_live_memory_below_the_ledger() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 40,
+                source: CapacitySource::Test,
+            }),
+        ));
+        let _model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(30),
+            )
+            .unwrap();
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            // Planning: 100 - 30 reserved. Live: 40 available - 30 pending.
+            assert_eq!(
+                authority.planning_headroom_bytes(backend).unwrap(),
+                ResourceAmount::Known(70)
+            );
+            assert_eq!(
+                authority.state_fit_headroom_bytes(backend).unwrap(),
+                ResourceAmount::Known(10)
+            );
+        }
+
+        // Without a trustworthy live sample the ledger figure stands.
+        let unprobed = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(UnifiedProvider {
+                capacity: 100,
+                available: 0,
+                source: CapacitySource::Unavailable,
+            }),
+        ));
+        assert_eq!(
+            unprobed.state_fit_headroom_bytes(BackendKind::Metal).unwrap(),
+            ResourceAmount::Known(100)
+        );
+        authority.poison("simulated backend failure");
+        assert!(authority.state_fit_headroom_bytes(BackendKind::Cpu).is_err());
+    }
+
+    /// Advisory authorities still check a request against the operating
+    /// system's live sample (less every unallocated claim); model and state
+    /// reservations, and test-source samples, keep the ledger-only contract.
+    #[test]
+    fn advisory_request_reservations_check_live_memory() {
+        let live = |source| {
+            Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                Arc::new(UnifiedProvider {
+                    capacity: 1_000,
+                    available: 100,
+                    source,
+                }),
+            ))
+        };
+        for source in [
+            CapacitySource::OperatingSystem,
+            CapacitySource::MetalWorkingSet,
+        ] {
+            let authority = live(source);
+            let request = |bytes| {
+                authority.reserve(
+                    ReservationOwner::new(ReservationClass::Request, "request"),
+                    unified_bytes(bytes),
+                )
+            };
+            assert!(matches!(request(150), Err(Error::Overloaded(_))));
+            let first = request(60).unwrap();
+            // 60 pending + 50 > 100 live.
+            assert!(matches!(request(50), Err(Error::Overloaded(_))));
+            // Bytes already allocated (the decoded input) are not pending.
+            let observed = authority
+                .reserve_with_initial_materialized(
+                    ReservationOwner::new(ReservationClass::Request, "observed"),
+                    unified_bytes(90),
+                    unified_bytes(60),
+                )
+                .unwrap();
+            drop((first, observed));
+            let model = authority.reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(500),
+            );
+            assert!(model.is_ok(), "{source:?}");
+        }
+        let test_source = live(CapacitySource::Test);
+        assert!(test_source
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "request"),
+                unified_bytes(150),
+            )
+            .is_ok());
+    }
+
+    #[derive(Debug)]
+    struct ObservedProvider {
+        observed: Option<u64>,
+    }
+
+    impl PhysicalCapacityProvider for ObservedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            PhysicalCapacitySnapshot {
+                capacity: unified_bytes(10_000),
+                available: unified_bytes(10_000),
+                source: CapacitySource::Test,
+            }
+        }
+
+        fn observed_device_usage_bytes(&self) -> Option<u64> {
+            self.observed
+        }
+    }
+
+    /// The untracked gauge is the observed device usage less the ledger's
+    /// materialized bytes, and the one ASR safety reserve is the larger of it
+    /// and the configured floor; without an observer the floor stands.
+    #[test]
+    fn untracked_device_memory_sizes_the_state_safety_reserve() {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedProvider {
+                observed: Some(900),
+            }),
+        ));
+        let model = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "model"),
+                unified_bytes(600),
+            )
+            .unwrap();
+        // Reserved but not yet allocated: everything observed is untracked.
+        assert_eq!(
+            authority.untracked_device_bytes(BackendKind::Metal),
+            Some(900)
+        );
+        model.reconcile_materialized(unified_bytes(500)).unwrap();
+        assert_eq!(
+            authority.untracked_device_bytes(BackendKind::Metal),
+            Some(400)
+        );
+        assert_eq!(authority.reserved_bytes_in_domain(BackendKind::Metal), 600);
+        assert_eq!(
+            authority.state_safety_reserve_bytes(BackendKind::Metal, 100),
+            400
+        );
+        assert_eq!(
+            authority.state_safety_reserve_bytes(BackendKind::Metal, 1_000),
+            1_000
+        );
+
+        let unobserved = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedProvider { observed: None }),
+        ));
+        assert_eq!(unobserved.untracked_device_bytes(BackendKind::Cpu), None);
+        assert_eq!(
+            unobserved.state_safety_reserve_bytes(BackendKind::Cpu, 1_000),
+            1_000
+        );
+    }
+
+    #[test]
     fn live_preload_headroom_skips_cpu_and_unavailable_probes() {
         let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
             Arc::new(UnifiedProvider {
@@ -2346,9 +2642,12 @@ pub(crate) mod test_support {
     /// variant's full residency estimate (multi-GiB for GGUF families), and
     /// the injected-OOM ladder tests temporarily poison the authority. Two
     /// such tests overlapping can reject an unrelated concurrent admission
-    /// with `Overloaded` on capacity-constrained runners. Tests whose
-    /// admission or load path consults the global authority must hold this
-    /// lock for their whole body.
+    /// with `Overloaded` on capacity-constrained runners. Conversely, any
+    /// `RuntimeService` unload that leaves its own runtime drained clears
+    /// the shared poison, so an unserialized unload test can erase another
+    /// test's poison mid-assertion. Tests whose admission, load, or unload
+    /// path consults the global authority must hold this lock for their
+    /// whole body.
     pub(crate) fn authority_test_lock() -> &'static StdMutex<()> {
         static LOCK: StdMutex<()> = StdMutex::new(());
         &LOCK

@@ -47,7 +47,8 @@ impl Lfm25AudioDetokenizer {
     ) -> Result<Self> {
         let fused_embedding =
             load_embedding_any(decoder_loader, device, &["emb.emb.weight".to_string()])?;
-        let backbone = QuantizedLfm2Backbone::load(backbone_loader, backbone_config, device)?;
+        let backbone =
+            QuantizedLfm2Backbone::load_for_embeds(backbone_loader, backbone_config, device)?;
         let istft_window = load_vector_any(
             decoder_loader,
             device,

@@ -22,11 +22,18 @@ use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
-use crate::backends::{backend_kind_for_device, DTypeSelectionRequest, DeviceKind, DeviceProfile};
+use crate::backends::{
+    backend_kind_for_device, DTypeSelection, DTypeSelectionRequest, DeviceKind, DeviceProfile,
+    MetalDTypeOverride,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector, WorkCost};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
     InvocationLeaseScope, InvocationStageWorkspace, InvocationStateCapacity,
@@ -53,7 +60,9 @@ use crate::models::shared::memory::accounting::{
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
+use crate::runtime::asr_automatic_context as qwen3_asr_automatic_context;
 
+pub(crate) use audio::QWEN3_ASR_AUDIO_POSITIONS;
 use audio::AudioTower;
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
@@ -92,14 +101,56 @@ pub struct Qwen3AsrModel {
     text_context_tokens: Option<usize>,
     mel: MelSpectrogram,
     preprocessor: PreprocessorConfig,
+    /// The audio tower's and the text model's loaded dtype, why, and their
+    /// load-time probes.
+    audio_precision: PrecisionLoad,
+    text_precision: PrecisionLoad,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen3AsrPhysicalStateSpec {
     pub(crate) retained: crate::kv::v2::InferenceStateContract,
     pub(crate) retained_max_tokens: usize,
+    /// Context one sequence or invocation may occupy. It bounds the prepared
+    /// inputs and the invocation KV, so load publishes no larger context.
+    pub(crate) sequence_tokens: usize,
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     pub(crate) invocation: crate::kv::v2::InferenceStateContract,
+}
+
+/// How load bounds Qwen3-ASR decoder state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen3AsrContextBound {
+    /// The operator configured the context: state keeps the model's native
+    /// bound and the shared fitter applies the configured value.
+    Configured,
+    /// The automatic ASR ceiling, with retained KV for this many concurrent
+    /// sequences.
+    Automatic { retained_rows: usize },
+}
+
+/// Chunk planners cut audio at 95% of the solved invocation limit
+/// (`NativeExecutor::asr_chunk_plan`), so a full chunk needs a limit of
+/// `chunk / 0.95` seconds.
+const QWEN3_ASR_PLANNED_CHUNK_FRACTION: f32 = 0.95;
+
+/// Tokens one Qwen3-ASR invocation is planned with (QASR-1). No request
+/// decodes more than one chunk at a time: input longer than the long-form
+/// chunk is split, and the planners fit each chunk with a text-prompt
+/// reserve, its audio tokens and a decode reserve. This is the smallest
+/// context at which every planner still admits a full chunk.
+fn qwen3_asr_sequence_ceiling(audio_token_rate: f32, max_chunk_secs: f32) -> usize {
+    // Preparation plans single-pass input with the default generation budget;
+    // chunk execution decodes at most the transcription cap.
+    let decode_reserve = crate::models::registry::NativeAsrGenerationOptions::default()
+        .max_new_tokens
+        .max(DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS);
+    crate::runtime::asr_sequence_ceiling(
+        crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE,
+        audio_token_rate,
+        max_chunk_secs / QWEN3_ASR_PLANNED_CHUNK_FRACTION,
+        decode_reserve,
+    )
 }
 
 fn qwen3_asr_state_dtype(dtype: DType) -> Result<StateDType> {
@@ -522,6 +573,19 @@ impl Qwen3AsrModel {
     pub(crate) fn managed_inference_state_contract(
         &self,
     ) -> Result<crate::kv::v2::InferenceStateContract> {
+        let max_sequence = self.text_context_tokens.ok_or_else(|| {
+            Error::ModelLoadError(
+                "Qwen3 ASR text config is missing max_position_embeddings; prepared decoder inputs cannot be bounded"
+                    .to_string(),
+            )
+        })?;
+        self.managed_inference_state_contract_for_sequence(max_sequence)
+    }
+
+    fn managed_inference_state_contract_for_sequence(
+        &self,
+        max_sequence: usize,
+    ) -> Result<crate::kv::v2::InferenceStateContract> {
         let contract = self.text_model.managed_inference_state_contract(
             crate::kv::v2::StateDomainId::new(1),
             self.text_dtype,
@@ -529,18 +593,22 @@ impl Qwen3AsrModel {
             // Managed prefix reuse is chat-task-gated; ASR never shares.
             false,
         )?;
-        let max_sequence = self.text_context_tokens.ok_or_else(|| {
-            Error::ModelLoadError(
-                "Qwen3 ASR text config is missing max_position_embeddings; prepared decoder inputs cannot be bounded"
-                    .to_string(),
-            )
-        })?;
         qwen3_asr_retained_state_contract(
             contract,
             max_sequence,
             self.text_model.hidden_size(),
             self.text_dtype,
         )
+    }
+
+    /// Automatic per-sequence context: one planned long-form chunk, which
+    /// also bounds the single-pass route because longer input is chunked.
+    fn automatic_asr_sequence_tokens(&self) -> usize {
+        let long_form_secs = izwi_asr_toolkit::AsrLongFormConfig::default().hard_max_chunk_secs;
+        let max_chunk_secs = self
+            .max_audio_seconds_hint()
+            .map_or(long_form_secs, |hint| hint.min(long_form_secs));
+        qwen3_asr_sequence_ceiling(self.audio_token_rate(), max_chunk_secs)
     }
 
     /// Author the retained streaming state and invocation-only offline state
@@ -550,24 +618,39 @@ impl Qwen3AsrModel {
     /// physical row of an atomic graph. Native streaming continues to use the
     /// scheduler-owned retained cache. Qwen3-ForcedAligner uses its cacheless
     /// NAR head and therefore seals an explicitly stateless descriptor.
+    ///
+    /// The model's native context (65,536 tokens) would size both KV arenas
+    /// and every prepared-input row for requests that need about 1K tokens,
+    /// so the automatic bound is one planned chunk per sequence (QASR-1,
+    /// ADM-6). A configured context keeps the native bound.
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
+        bound: Qwen3AsrContextBound,
     ) -> Result<Qwen3AsrPhysicalStateSpec> {
         if self.is_forced_aligner {
             return Err(Error::ModelLoadError(
                 "Qwen3-ForcedAligner does not own autoregressive ASR state".to_string(),
             ));
         }
-        let max_tokens = self.text_context_tokens.ok_or_else(|| {
+        let native_tokens = self.text_context_tokens.ok_or_else(|| {
             Error::ModelLoadError(
                 "Qwen3 ASR text config is missing max_position_embeddings; an exact invocation KV capacity cannot be sealed"
                     .to_string(),
             )
         })?;
+        let (sequence_tokens, retained_max_tokens) = match bound {
+            Qwen3AsrContextBound::Configured => (native_tokens, native_tokens),
+            Qwen3AsrContextBound::Automatic { retained_rows } => qwen3_asr_automatic_context(
+                native_tokens,
+                self.automatic_asr_sequence_tokens(),
+                retained_rows,
+            ),
+        };
         qwen3_asr_physical_state_spec(
-            &self.managed_inference_state_contract()?,
-            max_tokens,
+            &self.managed_inference_state_contract_for_sequence(sequence_tokens)?,
+            sequence_tokens,
+            retained_max_tokens,
             stage_graphs,
         )
     }
@@ -576,6 +659,7 @@ impl Qwen3AsrModel {
 fn qwen3_asr_physical_state_spec(
     retained: &crate::kv::v2::InferenceStateContract,
     max_tokens: usize,
+    retained_max_tokens: usize,
     stage_graphs: &[&[StageDescriptor]],
 ) -> Result<Qwen3AsrPhysicalStateSpec> {
     if stage_graphs.is_empty() {
@@ -697,8 +781,9 @@ fn qwen3_asr_physical_state_spec(
     }
     Ok(Qwen3AsrPhysicalStateSpec {
         retained: retained.clone(),
-        retained_max_tokens: usize::try_from(max_tokens).map_err(|_| {
-            Error::ModelLoadError("Qwen3 ASR retained context exceeds usize".to_string())
+        retained_max_tokens,
+        sequence_tokens: usize::try_from(max_tokens).map_err(|_| {
+            Error::ModelLoadError("Qwen3 ASR sequence context exceeds usize".to_string())
         })?,
         descriptor,
         invocation: invocation_contract,
@@ -1138,6 +1223,8 @@ struct Qwen3AsrExecutionDiagnostics {
     qmatmul_projection_count: usize,
     dense_projection_count: usize,
     dense_bias_projection_count: usize,
+    audio_precision: serde_json::Value,
+    text_precision: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1211,6 +1298,10 @@ impl Qwen3AsrDiagnostics {
                 "qmatmul_projection_count": self.execution.qmatmul_projection_count,
                 "dense_projection_count": self.execution.dense_projection_count,
                 "dense_bias_projection_count": self.execution.dense_bias_projection_count,
+                "audio_precision": &self.execution.audio_precision,
+                "text_precision": &self.execution.text_precision,
+                "mrope_position_readbacks_total": super::core::qwen3_mrope_position_readbacks(),
+                "sequential_rope_host_tables_total": super::core::qwen3_sequential_rope_host_tables(),
             },
             "timings_ms": {
                 "resample": self.timings.resample_ms,
@@ -1535,58 +1626,13 @@ impl Qwen3AsrModel {
         if !is_gguf && is_quantized {
             validate_quantization_config(&config)?;
         }
-        let text_dtype_override = std::env::var("IZWI_QWEN_ASR_TEXT_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok())
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(str::to_string);
-        let text_dtype = if let Some(raw) = text_dtype_override.as_deref() {
-            device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR text")?
-        } else if is_quantized {
-            let requested =
-                parse_asr_dtype(config.thinker_config.dtype.as_deref()).unwrap_or(DType::BF16);
-            let selected = select_quantized_text_dtype(&device, model_family, requested);
-            debug!(
-                "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
-                requested, selected, device.kind
-            );
-            selected
-        } else if device.kind.is_metal() {
-            // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
-            // utterances. Prefer f32 unless the user explicitly overrides it.
-            DType::F32
-        } else {
-            device.select_model_dtype(model_family, None)
-        };
-        let audio_dtype_override = std::env::var("IZWI_QWEN_ASR_AUDIO_DTYPE").ok();
-        let audio_dtype = if is_gguf {
-            match audio_dtype_override.as_deref().map(str::trim) {
-                Some(raw) if !raw.is_empty() => {
-                    let requested = device.select_model_dtype_checked(
-                        model_family,
-                        Some(raw),
-                        "Qwen ASR audio",
-                    )?;
-                    if requested != text_dtype {
-                        warn!(
-                            "Qwen ASR GGUF requested audio dtype {:?} differs from text dtype {:?}; loading a second GGUF VarBuilder",
-                            requested, text_dtype
-                        );
-                    }
-                    requested
-                }
-                _ => qwen3_asr_default_audio_dtype(device.kind, true, text_dtype),
-            }
-        } else {
-            match audio_dtype_override.as_deref().map(str::trim) {
-                Some(raw) if !raw.is_empty() => {
-                    device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?
-                }
-                _ => qwen3_asr_default_audio_dtype(device.kind, false, text_dtype),
-            }
-        };
+        let (text_selection, audio_selection) = qwen3_asr_weight_precisions(
+            &device,
+            model_family,
+            is_gguf,
+            is_quantized,
+            config.thinker_config.dtype.as_deref(),
+        )?;
 
         // Pre-initialize shared scratch pools up front to keep first-use
         // allocation costs out of ASR prefill/decode hot loops.
@@ -1596,47 +1642,75 @@ impl Qwen3AsrModel {
         let audio_cfg = config.thinker_config.audio_config.clone();
         let text_context_tokens = text_cfg.context_length();
         let gguf_qmatmul_text_enabled = is_gguf && qwen3_asr_use_gguf_qmatmul_text(&device.device);
-        let (audio_tower, text_model) = if let Some(gguf_path) = gguf_path.as_ref() {
+        // On Metal a lowered audio or text dtype must pass its own load-time
+        // probe, or that component alone reloads in F32 (report 13).
+        let check = device.kind.is_metal();
+        let (audio_tower, audio_precision, text_model, text_precision) = if let Some(gguf_path) =
+            gguf_path.as_ref()
+        {
             let loader = gguf_loader.as_ref().ok_or_else(|| {
                 Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
             })?;
             let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
-            let vb_audio =
-                var_builder_from_gguf_filtered(gguf_path, audio_dtype, &device.device, |name| {
-                    qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix)
-                })?;
-            let vb_audio = if tensor_prefix.is_empty() {
-                vb_audio
-            } else {
-                vb_audio.pp(tensor_prefix)
-            };
-            let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-            let text_model = if gguf_qmatmul_text_enabled {
-                Qwen3Model::load_gguf_text(
-                    text_cfg,
-                    loader,
-                    &device.device,
-                    text_dtype,
-                    tensor_prefix,
-                )?
-            } else {
-                let vb_text = var_builder_from_gguf_filtered(
-                    gguf_path,
-                    text_dtype,
-                    &device.device,
-                    |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
-                )?;
-                let vb_text = if tensor_prefix.is_empty() {
-                    vb_text
-                } else {
-                    vb_text.pp(tensor_prefix)
-                };
-                Qwen3Model::load(text_cfg, vb_text)?
-            };
-            (audio_tower, text_model)
+            let (audio_tower, audio_precision) = load_with_precision_fallback(
+                "Qwen3-ASR audio tower",
+                &audio_selection,
+                check,
+                DType::F32,
+                |audio_dtype| {
+                    let vb_audio = var_builder_from_gguf_filtered(
+                        gguf_path,
+                        audio_dtype,
+                        &device.device,
+                        |name| qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix),
+                    )?;
+                    let vb_audio = if tensor_prefix.is_empty() {
+                        vb_audio
+                    } else {
+                        vb_audio.pp(tensor_prefix)
+                    };
+                    AudioTower::load(audio_cfg.clone(), vb_audio.pp("audio_tower"))
+                },
+                |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, &device.device),
+            )?;
+            let (text_model, text_precision) = load_with_precision_fallback(
+                "Qwen3-ASR text",
+                &text_selection,
+                check,
+                DType::F32,
+                |text_dtype| {
+                    if gguf_qmatmul_text_enabled {
+                        return Qwen3Model::load_gguf_text(
+                            text_cfg.clone(),
+                            loader,
+                            &device.device,
+                            text_dtype,
+                            tensor_prefix,
+                        );
+                    }
+                    let vb_text = var_builder_from_gguf_filtered(
+                        gguf_path,
+                        text_dtype,
+                        &device.device,
+                        |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
+                    )?;
+                    let vb_text = if tensor_prefix.is_empty() {
+                        vb_text
+                    } else {
+                        vb_text.pp(tensor_prefix)
+                    };
+                    Qwen3Model::load(text_cfg.clone(), vb_text)
+                },
+                qwen3_asr_text_self_check,
+            )?;
+            (audio_tower, audio_precision, text_model, text_precision)
         } else {
-            let (vb_text, vb_audio) =
-                load_safetensors_var_builders(model_dir, &device, text_dtype, audio_dtype)?;
+            let (vb_text, vb_audio) = load_safetensors_var_builders(
+                model_dir,
+                &device,
+                text_selection.dtype,
+                audio_selection.dtype,
+            )?;
             let has_thinker_prefix = vb_text.contains_tensor("thinker.audio_tower.conv2d1.weight");
             let vb_text = if has_thinker_prefix {
                 vb_text.pp("thinker")
@@ -1650,12 +1724,18 @@ impl Qwen3AsrModel {
             };
             let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
             let text_model = Qwen3Model::load(text_cfg, vb_text)?;
-            (audio_tower, text_model)
+            (
+                audio_tower,
+                PrecisionLoad::unchecked(&audio_selection),
+                text_model,
+                PrecisionLoad::unchecked(&text_selection),
+            )
         };
+        let (audio_dtype, text_dtype) = (audio_precision.loaded, text_precision.loaded);
 
         info!(
-            "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}, text_dtype={:?})",
-            device.kind, audio_dtype, text_dtype
+            "Loaded Qwen speech-family model on {:?} (audio_dtype={:?}: {}; text_dtype={:?}: {})",
+            device.kind, audio_dtype, audio_precision.reason, text_dtype, text_precision.reason
         );
 
         Ok(Self {
@@ -1676,6 +1756,8 @@ impl Qwen3AsrModel {
             text_context_tokens,
             mel,
             preprocessor,
+            audio_precision,
+            text_precision,
         })
     }
 
@@ -1718,6 +1800,8 @@ impl Qwen3AsrModel {
             qmatmul_projection_count: projection_diagnostics.quantized_projection_count,
             dense_projection_count: projection_diagnostics.dense_projection_count,
             dense_bias_projection_count: projection_diagnostics.dense_bias_projection_count,
+            audio_precision: self.audio_precision.diagnostics(),
+            text_precision: self.text_precision.diagnostics(),
         }
     }
 
@@ -1956,7 +2040,10 @@ impl Qwen3AsrModel {
                         qwen3_runtime_profile_delta(state.profile_start),
                     );
                 }
-                let (detected_language, text) = parse_asr_output(&step.text, language);
+                // `step.text` is already parsed; parse the raw output once so
+                // the detected language survives and a transcript that starts
+                // with "language ..." is not stripped twice.
+                let (detected_language, text) = parse_asr_output(&state.assembled, language);
                 return Ok(AsrTranscriptionOutput {
                     text,
                     language: detected_language,
@@ -2810,14 +2897,11 @@ impl Qwen3AsrModel {
         })
     }
 
+    /// Raw output for [`parse_asr_output`]. Like upstream's
+    /// `batch_decode(skip_special_tokens=True)`, it keeps the non-special
+    /// `<asr_text>` marker that separates `language X` from the transcript.
     fn decode_generated_untrimmed(&self, tokens: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = tokens
-            .iter()
-            .copied()
-            .filter(|id| !is_special_generation_token(&self.specials, *id))
-            .collect();
-        let text = self.tokenizer.decode_text(&filtered)?;
-        Ok(text)
+        decode_raw_asr_output(&self.tokenizer, &self.specials, tokens)
     }
 
     fn forward_with_audio(
@@ -2979,7 +3063,7 @@ fn continue_asr_resumable_prefill(
     let output = {
         let cache = state.cache.as_mut().expect("validated retained ASR cache");
         if complete {
-            Some(text_model.forward_managed_with_embeds(
+            Some(text_model.forward_managed_last_logits_with_embeds(
                 &span_embeddings,
                 span_start,
                 cache,
@@ -3040,7 +3124,8 @@ fn complete_asr_invocation_prefill(
     })?;
     let position_ids = state.prepared_position_ids.as_ref();
     let prefill_started = Instant::now();
-    let output = text_model.forward_managed_with_embeds(prepared, 0, cache, position_ids)?;
+    let output =
+        text_model.forward_managed_last_logits_with_embeds(prepared, 0, cache, position_ids)?;
     if cache.context_len() != prompt_tokens {
         return Err(Error::InferenceError(format!(
             "Qwen3 ASR invocation prefill committed physical cursor {} instead of {prompt_tokens}",
@@ -3284,7 +3369,14 @@ fn alignment_distribution_is_degenerate(
         || span <= (audio_duration_ms / 20).max(1)
 }
 
-fn resolve_qwen_asr_gguf_path(model_dir: &Path, variant: ModelVariant) -> Option<PathBuf> {
+/// The thinker dtype hint a GGUF checkpoint implies: the published GGUFs are
+/// converted from BF16 weights and carry no dtype of their own.
+pub(crate) const QWEN3_ASR_GGUF_CHECKPOINT_DTYPE: &str = "bf16";
+
+pub(crate) fn resolve_qwen_asr_gguf_path(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Option<PathBuf> {
     if let Some(filename) = qwen_asr_gguf_filename(variant) {
         let candidate = model_dir.join(filename);
         if candidate.exists() {
@@ -3379,7 +3471,7 @@ fn parse_qwen3_asr_config_from_gguf(
             audio_start_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_start_token_id"),
             audio_end_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_end_token_id"),
             audio_token_id: optional_u32_metadata(loader, "qwen3_asr.audio_token_id"),
-            dtype: Some("bf16".to_string()),
+            dtype: Some(QWEN3_ASR_GGUF_CHECKPOINT_DTYPE.to_string()),
         },
         support_languages: Vec::new(),
         timestamp_token_id: None,
@@ -3480,7 +3572,7 @@ fn qwen3_asr_gguf_qmatmul_text_policy(override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(true)
 }
 
-fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
+pub(crate) fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
     let override_enabled = env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
     qwen3_asr_gguf_qmatmul_text_policy(override_enabled)
 }
@@ -3574,25 +3666,167 @@ fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![weights_path])
 }
 
+/// The text and audio-tower weight dtypes the Qwen3-ASR loader selects on
+/// `device`, honouring `IZWI_QWEN_ASR_TEXT_DTYPE` (or `IZWI_QWEN_DTYPE`) and
+/// `IZWI_QWEN_ASR_AUDIO_DTYPE`. `checkpoint_dtype` is the thinker config's dtype
+/// hint. Load admission prices the checkpoint with the same selection
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn qwen3_asr_weight_dtypes(
+    device: &DeviceProfile,
+    model_family: ModelFamily,
+    is_gguf: bool,
+    is_quantized: bool,
+    checkpoint_dtype: Option<&str>,
+) -> Result<(DType, DType)> {
+    qwen3_asr_weight_precisions(
+        device,
+        model_family,
+        is_gguf,
+        is_quantized,
+        checkpoint_dtype,
+    )
+    .map(|(text, audio)| (text.dtype, audio.dtype))
+}
+
+/// [`qwen3_asr_weight_dtypes`] with the reason for each choice.
+fn qwen3_asr_weight_precisions(
+    device: &DeviceProfile,
+    model_family: ModelFamily,
+    is_gguf: bool,
+    is_quantized: bool,
+    checkpoint_dtype: Option<&str>,
+) -> Result<(DTypeSelection, DTypeSelection)> {
+    let text_dtype_override = std::env::var("IZWI_QWEN_ASR_TEXT_DTYPE")
+        .ok()
+        .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok())
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+    let text = if let Some(raw) = text_dtype_override.as_deref() {
+        DTypeSelection {
+            dtype: device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR text")?,
+            reason: format!("text dtype override {raw:?}").into(),
+        }
+    } else if is_quantized {
+        let requested = parse_asr_dtype(checkpoint_dtype).unwrap_or(DType::BF16);
+        let selected = select_quantized_text_dtype(device, model_family, requested);
+        debug!(
+            "Qwen speech-family quantized dtype selection: requested={:?}, selected={:?} on {:?}",
+            requested, selected.dtype, device.kind
+        );
+        selected
+    } else if device.kind.is_metal() {
+        // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
+        // utterances. Prefer f32 unless the user explicitly overrides it.
+        DTypeSelection {
+            dtype: DType::F32,
+            reason: "Metal keeps dense Qwen ASR text in F32".into(),
+        }
+    } else {
+        DTypeSelection {
+            dtype: device.select_model_dtype(model_family, None),
+            reason: format!("{:?} default text dtype", device.kind).into(),
+        }
+    };
+    let text_dtype = text.dtype;
+    let audio_dtype_override = std::env::var("IZWI_QWEN_ASR_AUDIO_DTYPE").ok();
+    let audio = match audio_dtype_override.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => {
+            let requested =
+                device.select_model_dtype_checked(model_family, Some(raw), "Qwen ASR audio")?;
+            if is_gguf && requested != text_dtype {
+                warn!(
+                    "Qwen ASR GGUF requested audio dtype {:?} differs from text dtype {:?}; loading a second GGUF VarBuilder",
+                    requested, text_dtype
+                );
+            }
+            DTypeSelection {
+                dtype: requested,
+                reason: format!("audio dtype override {raw:?}").into(),
+            }
+        }
+        _ => DTypeSelection {
+            dtype: qwen3_asr_default_audio_dtype(device.kind, is_gguf, text_dtype),
+            reason: if is_gguf && !device.kind.is_cuda() {
+                "the GGUF audio tower runs at the text dtype; it falls back to F32 alone if its probe fails".into()
+            } else {
+                format!("{:?} default audio dtype", device.kind).into()
+            },
+        },
+    };
+    Ok((text, audio))
+}
+
+/// Activations for quantized Qwen ASR text weights. Metal takes the
+/// BF16-checkpoint LM tier (F16 behind the load-time probe; BF16 on Apple9+
+/// once Metal paged attention takes BF16) unless `IZWI_METAL_DTYPE=f32`.
 fn select_quantized_text_dtype(
     device: &DeviceProfile,
     model_family: ModelFamily,
     requested: DType,
-) -> DType {
+) -> DTypeSelection {
     match device.kind {
-        DeviceKind::Metal => DType::F16,
-        DeviceKind::Cpu => DType::F32,
-        DeviceKind::Cuda => {
-            device
-                .resolve_dtype(
-                    DTypeSelectionRequest::new(None)
-                        .with_model_family(model_family)
-                        .with_checkpoint_dtype(requested)
-                        .with_quantized(true),
-                )
-                .dtype
+        DeviceKind::Metal if MetalDTypeOverride::from_env() == MetalDTypeOverride::F32 => {
+            DTypeSelection {
+                dtype: DType::F32,
+                reason: "IZWI_METAL_DTYPE=f32 keeps quantized-weight activations in F32".into(),
+            }
         }
+        DeviceKind::Metal => device.metal_bf16_checkpoint_lm_tier(),
+        DeviceKind::Cpu => DTypeSelection {
+            dtype: DType::F32,
+            reason: "CPU runs quantized-weight activations in F32".into(),
+        },
+        DeviceKind::Cuda => device.resolve_dtype(
+            DTypeSelectionRequest::new(None)
+                .with_model_family(model_family)
+                .with_checkpoint_dtype(requested)
+                .with_quantized(true),
+        ),
     }
+}
+
+/// Feature frames the audio tower's load-time probe runs (two of its CNN
+/// chunks at the default window).
+const QWEN3_ASR_AUDIO_PROBE_FRAMES: usize = 200;
+/// Token positions the text model's load-time probe runs.
+const QWEN3_ASR_TEXT_PROBE_TOKENS: usize = 16;
+
+/// The audio tower's load-time probe: xorshift log-mel features through the
+/// tower in its dtype; the output must be finite and in the F16-safe range.
+fn qwen3_asr_audio_self_check(
+    tower: &AudioTower,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check(
+        format!("Qwen3-ASR audio tower {dtype:?}"),
+        F16_SAFE_MAX_ABS,
+        || {
+            let n_mels = tower.mel_bins();
+            let features = xorshift_tensor(
+                &[1, QWEN3_ASR_AUDIO_PROBE_FRAMES, n_mels],
+                0x0A5D,
+                1.5,
+                device,
+            )?
+            .to_dtype(dtype)?;
+            let output = tower
+                .forward_feature_batch(&features, &[QWEN3_ASR_AUDIO_PROBE_FRAMES])?
+                .into_padded();
+            Ok::<_, Error>(vec![("audio_tower".to_string(), output)])
+        },
+    )
+}
+
+/// The text model's load-time probe: xorshift-chosen token ids through every
+/// layer and the head (stateless attention); the logits must be finite and in
+/// the F16-safe range.
+fn qwen3_asr_text_self_check(model: &Qwen3Model) -> NumericSelfCheckReport {
+    run_numeric_self_check("Qwen3-ASR text", F16_SAFE_MAX_ABS, || {
+        model.stateless_numeric_probe(QWEN3_ASR_TEXT_PROBE_TOKENS, 0x7E47)
+    })
 }
 
 fn qwen3_asr_default_audio_dtype(
@@ -4249,6 +4483,22 @@ fn build_mrope_positions(
     }
 }
 
+/// Raw output for [`parse_asr_output`]. Like upstream's
+/// `batch_decode(skip_special_tokens=True)`, it keeps the non-special
+/// `<asr_text>` marker that separates `language X` from the transcript.
+fn decode_raw_asr_output(
+    tokenizer: &AsrTokenizer,
+    specials: &SpecialTokenIds,
+    tokens: &[u32],
+) -> Result<String> {
+    let filtered: Vec<u32> = tokens
+        .iter()
+        .copied()
+        .filter(|id| specials.asr_text == Some(*id) || !is_special_generation_token(specials, *id))
+        .collect();
+    tokenizer.decode_text(&filtered)
+}
+
 fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
     if id == specials.im_start
         || id == specials.im_end
@@ -4842,8 +5092,8 @@ mod tests {
         let retained =
             qwen3_asr_retained_state_contract(crate::kv::test_contract(), 4096, 256, DType::F32)
                 .expect("retained ASR state");
-        let spec =
-            qwen3_asr_physical_state_spec(&retained, 4096, &graphs).expect("physical ASR spec");
+        let spec = qwen3_asr_physical_state_spec(&retained, 4096, 4096, &graphs)
+            .expect("physical ASR spec");
 
         assert!(matches!(
             spec.descriptor.retained,
@@ -4898,6 +5148,169 @@ mod tests {
                     .count()
             );
         }
+    }
+
+    #[test]
+    fn qwen_asr_automatic_context_is_one_planned_chunk_per_sequence() {
+        // 128-token text reserve, ceil(30 s / 0.95 * 13) audio tokens and the
+        // 768-token planning decode reserve.
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        assert_eq!(ceiling, 128 + 411 + 768);
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 8),
+            (ceiling, 8 * ceiling)
+        );
+        // Many CUDA rows or a small native context never exceed the native bound.
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 96),
+            (ceiling, 65_536)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(1_024, ceiling, 8),
+            (1_024, 1_024)
+        );
+        assert_eq!(
+            qwen3_asr_automatic_context(65_536, ceiling, 0),
+            (ceiling, ceiling)
+        );
+    }
+
+    #[test]
+    fn qwen_asr_ceiling_admits_a_full_chunk_on_every_planner() {
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        let chunk = vec![0.0_f32; 30 * 16_000];
+        // Preparation plans with the default generation budget, execution
+        // with the transcription cap; both must keep a 30 s input whole.
+        for decode_budget in [
+            crate::models::registry::NativeAsrGenerationOptions::default().max_new_tokens,
+            DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS,
+        ] {
+            let limit = crate::runtime::compose_invocation_audio_limit(
+                Some(120.0),
+                Some(13.0),
+                Some(ceiling),
+                |_| decode_budget,
+            )
+            .expect("the ceiling admits a planned chunk");
+            assert!(
+                !crate::engine::qwen3_asr_requires_long_form(&chunk, 16_000, limit),
+                "a 30 s input must stay one chunk with a {decode_budget}-token budget"
+            );
+        }
+
+        // The exact 30 s prompt plus the 512-token decode cap fits a sequence.
+        let frontend = qwen3_asr_frontend_geometry(
+            30 * 16_000,
+            16_000,
+            16_000,
+            400,
+            160,
+            false,
+            false,
+            12_000,
+        )
+        .unwrap();
+        let audio_tokens = audio::get_cnn_output_lengths(&[frontend.mel_frames])[0];
+        assert_eq!(audio_tokens, 391);
+        let prompt = build_qwen_asr_prompt_tokens(
+            &test_specials(Some(7)),
+            audio_tokens,
+            Some("english"),
+            None,
+            encode_prompt_piece_for_test,
+        )
+        .unwrap();
+        assert!(prompt.ids.len() + DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS <= ceiling);
+    }
+
+    #[test]
+    fn qwen_asr_automatic_ceiling_shrinks_state_for_shipped_geometry() {
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        // Qwen3-ASR 0.6B and 1.7B share the decoder KV geometry: 28 layers
+        // of 8 KV heads at head_dim 128, stored as F16 on Metal.
+        let domain = StateDomainSpec::PagedAttention(
+            crate::models::architectures::qwen3::core::qwen3_decoder_cache_domain(
+                crate::models::architectures::qwen3::core::Qwen3DecoderCacheGeometry {
+                    domain: StateDomainId::new(1),
+                    clock: StateClock::DecoderTokens,
+                    num_layers: 28,
+                    num_query_heads: 16,
+                    num_kv_heads: 8,
+                    key_head_dim: 128,
+                    value_head_dim: 128,
+                    sliding_window: None,
+                    storage_dtype: DType::F16,
+                    preferred_page_tokens: 64,
+                    prefix: PrefixPolicy::Disabled,
+                },
+            )
+            .unwrap(),
+        );
+        let token_bytes = 28 * 8 * (128 + 128) * 2;
+        let kv_bytes =
+            |tokens: usize| qwen3_asr_invocation_workspace_bytes(&domain, tokens as u64).unwrap();
+        // 7 GiB at the native context; 1,344 page-rounded tokens at the ceiling.
+        assert_eq!(kv_bytes(65_536), 65_536 * token_bytes);
+        assert_eq!(kv_bytes(ceiling), 1_344 * token_bytes);
+        assert!(kv_bytes(ceiling) * 48 < kv_bytes(65_536));
+        // Eight retained rows still need under a sixth of the native pool.
+        let (_, retained) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        assert!(kv_bytes(retained) * 6 < kv_bytes(65_536));
+
+        // Prepared-input rows: F16 embeddings plus I64 MRoPE positions, for
+        // the 0.6B (hidden 1024) and 1.7B (hidden 2048) decoders.
+        for hidden in [1_024_usize, 2_048] {
+            let row_bytes = |max_sequence: usize| {
+                let contract = qwen3_asr_retained_state_contract(
+                    crate::kv::test_contract(),
+                    max_sequence,
+                    hidden,
+                    DType::F16,
+                )
+                .unwrap();
+                negotiate_state_plan(
+                    &contract,
+                    &StateBackendPlanRequest {
+                        backend: BackendKind::Cpu,
+                        device_ordinal: None,
+                        page_tokens_hint: Some(16),
+                        storage_dtype_hint: Some(StateDType::F16),
+                    },
+                )
+                .unwrap()
+                .non_paged[0]
+                    .maximum_bytes()
+            };
+            let expected = |tokens: usize| (tokens * (hidden * 2 + 3 * 8)) as u64;
+            assert_eq!(row_bytes(ceiling), expected(ceiling));
+            assert_eq!(row_bytes(65_536), expected(65_536));
+            assert!(row_bytes(ceiling) * 50 < row_bytes(65_536));
+        }
+    }
+
+    #[test]
+    fn qwen_asr_physical_spec_bounds_invocation_by_the_sequence_context() {
+        let offline = [physical_spec_stage(1, StageProgressKind::Atomic)];
+        let graphs = vec![offline.as_slice()];
+        let ceiling = qwen3_asr_sequence_ceiling(13.0, 30.0);
+        let (sequence, retained_max) = qwen3_asr_automatic_context(65_536, ceiling, 8);
+        let retained = qwen3_asr_retained_state_contract(
+            crate::kv::test_contract(),
+            sequence,
+            256,
+            DType::F32,
+        )
+        .expect("retained ASR state");
+        let spec = qwen3_asr_physical_state_spec(&retained, sequence, retained_max, &graphs)
+            .expect("physical ASR spec");
+
+        assert_eq!(spec.sequence_tokens, ceiling);
+        assert_eq!(spec.retained_max_tokens, 8 * ceiling);
+        assert_eq!(
+            spec.descriptor
+                .capacity_axis_bounds(crate::kv::v2::StateCapacityAxis::DecoderContext),
+            Some((1, ceiling as u64))
+        );
     }
 
     #[test]
@@ -5060,10 +5473,10 @@ mod tests {
         assert!(chunked.prepared_position_ids.is_none());
         let full_output = full.unconsumed_output.as_ref().unwrap();
         let chunked_output = chunked.unconsumed_output.as_ref().unwrap();
-        assert_tensor_close(
-            &full_output.narrow(1, 3, 1).unwrap(),
-            &chunked_output.narrow(1, 1, 1).unwrap(),
-        );
+        // Prefill projects only the last prompt row.
+        assert_eq!(full_output.dim(1).unwrap(), 1);
+        assert_eq!(chunked_output.dim(1).unwrap(), 1);
+        assert_tensor_close(full_output, chunked_output);
         assert_eq!(
             full.cache.as_mut().unwrap().take_completed_writes().len(),
             1
@@ -5536,6 +5949,8 @@ mod tests {
                 qmatmul_projection_count: 197,
                 dense_projection_count: 0,
                 dense_bias_projection_count: 0,
+                audio_precision: serde_json::json!({ "loaded_dtype": "F16" }),
+                text_precision: serde_json::json!({ "loaded_dtype": "F16" }),
             },
             profile: Qwen3AsrProfileDiagnostics {
                 qwen3_profile_enabled: true,
@@ -5599,6 +6014,41 @@ mod tests {
             forced_language_name(Some("en")),
             Some("English".to_string())
         );
+    }
+
+    #[test]
+    fn gguf_output_splits_on_the_asr_text_marker_like_upstream() {
+        let tokenizer = super::tokenizer::gguf_shaped_test_tokenizer(Some("qwen3_asr")).unwrap();
+        let specials = tokenizer.specials().clone();
+        let marker = specials.asr_text.expect("<asr_text> resolved");
+        let generate = |meta: &str, text: &str| {
+            let mut ids = tokenizer.encode_text(meta).unwrap();
+            ids.push(marker);
+            ids.extend(tokenizer.encode_text(text).unwrap());
+            ids.push(specials.eos);
+            decode_raw_asr_output(&tokenizer, &specials, &ids).unwrap()
+        };
+        // Expected values follow qwen_asr.inference.utils.parse_asr_output.
+        let cases = [
+            ("language Chinese", "你好", Some("Chinese"), "你好"),
+            ("language English", "and then", Some("English"), "and then"),
+            ("language English", "123", Some("English"), "123"),
+            ("language None", "", None, ""),
+        ];
+        for (meta, text, language, expected) in cases {
+            let raw = generate(meta, text);
+            let (parsed_language, parsed) = parse_asr_output(&raw, None);
+            assert_eq!(parsed_language.as_deref(), language, "{raw}");
+            assert_eq!(parsed, expected, "{raw}");
+        }
+        // Forced language: the prompt ends in "language German<asr_text>", so
+        // the model emits text only and it is returned as-is.
+        let mut ids = tokenizer.encode_text("Hallo Welt").unwrap();
+        ids.push(specials.eos);
+        let raw = decode_raw_asr_output(&tokenizer, &specials, &ids).unwrap();
+        let (language, text) = parse_asr_output(&raw, Some("german"));
+        assert_eq!(language.as_deref(), Some("German"));
+        assert_eq!(text, "Hallo Welt");
     }
 
     #[test]
@@ -6121,5 +6571,59 @@ mod tests {
             !alignment.is_empty(),
             "forced aligner should return timestamps"
         );
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use candle_core::{DType, Device};
+
+    use super::{
+        qwen3_asr_audio_self_check, qwen3_asr_text_self_check, select_quantized_text_dtype,
+    };
+    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::catalog::ModelFamily;
+
+    #[test]
+    fn quantized_text_on_metal_takes_the_lm_tier_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metal = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let tier = select_quantized_text_dtype(&metal, ModelFamily::Qwen3Asr, DType::BF16);
+        assert_eq!(tier.dtype, DType::F16);
+        assert!(tier.reason.contains("LM tier"), "{}", tier.reason);
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        let pinned = select_quantized_text_dtype(&metal, ModelFamily::Qwen3Asr, DType::BF16);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(
+            select_quantized_text_dtype(&DeviceProfile::cpu(), ModelFamily::Qwen3Asr, DType::BF16)
+                .dtype,
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn audio_and_text_probes_run_the_real_forward_paths() {
+        let device = Device::Cpu;
+        let tower = super::audio::tiny_audio_tower_for_test(&device);
+        let report = qwen3_asr_audio_self_check(&tower, DType::F32, &device);
+        assert!(report.passed, "{}", report.reason);
+        assert_eq!(report.tensors[0].name, "audio_tower");
+
+        let model = crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test(&device);
+        let report = qwen3_asr_text_self_check(&model);
+        assert!(report.passed, "{}", report.reason);
+        assert_eq!(report.tensors[0].name, "logits");
     }
 }

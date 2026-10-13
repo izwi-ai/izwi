@@ -8,6 +8,7 @@ use crate::backends::state::TensorStateArena;
 use crate::error::{Error, Result};
 use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 
 use super::model::{
     has_token_repetition_loop, is_asr_stop_token as is_stop_token, text_delta,
@@ -62,6 +63,7 @@ struct Lfm25AudioAsrHostCheckpoint {
     decode_tokens_appended: usize,
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     token_repetition_loop: bool,
     text_repetition_loop: bool,
@@ -84,6 +86,7 @@ pub(crate) struct Lfm25AudioAsrRetainedState {
     decode_tokens_appended: usize,
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     token_repetition_loop: bool,
     text_repetition_loop: bool,
@@ -237,15 +240,15 @@ impl Lfm25AudioAsrRetainedState {
             let token = states[row].pending_token.expect("append row has a token");
             let mut ids = states[row].generated_ids.clone();
             ids.push(token);
-            let mut assembled = tokenizer.decode_text(&ids)?;
             let token_repetition = has_token_repetition_loop(&ids);
-            let text_repetition = if let Some(trimmed) = trim_repeated_phrase_tail(&assembled) {
-                assembled = trimmed;
-                true
-            } else {
-                false
-            };
-            let delta = text_delta(&states[row].assembled, &assembled);
+            let text = advance_retained_text(
+                &states[row].detokenizer,
+                &states[row].assembled,
+                &ids,
+                token_repetition || ids.len() >= states[row].max_new_tokens,
+                |ids| tokenizer.decode_text(ids),
+            )?;
+            let text_repetition = text.text_repetition;
             let repetition_stop = if text_repetition {
                 Some(Lfm25AudioAsrStopReason::TextRepetition)
             } else if token_repetition {
@@ -255,7 +258,7 @@ impl Lfm25AudioAsrRetainedState {
             };
             tokens.push(token);
             positions.push(states[row].main_position()?);
-            next_host.push((ids, assembled, delta, repetition_stop));
+            next_host.push((ids, text, repetition_stop));
         }
         let mut shortconv = states
             .iter_mut()
@@ -279,7 +282,7 @@ impl Lfm25AudioAsrRetainedState {
         let mut post_kernel = Vec::with_capacity(states.len());
         for (row, state) in states.iter().enumerate() {
             let reached_budget = next_host[row].0.len() >= state.max_new_tokens;
-            let repetition_stop = next_host[row].3;
+            let repetition_stop = next_host[row].2;
             let sampled = if reached_budget || repetition_stop.is_some() {
                 None
             } else {
@@ -295,15 +298,26 @@ impl Lfm25AudioAsrRetainedState {
             } else {
                 repetition_stop.or(terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken))
             };
+            if terminal_stop {
+                let (ids, text, _) = &mut next_host[row];
+                text.flush(ids, |ids| tokenizer.decode_text(ids))?;
+            }
             post_kernel.push((stop_reason, next_pending, appended_count));
         }
         let mut outcomes = Vec::with_capacity(states.len());
         for (row, state) in states.iter_mut().enumerate() {
-            let (ids, assembled, delta, repetition_stop) = std::mem::take(&mut next_host[row]);
+            let (ids, text, repetition_stop) = std::mem::take(&mut next_host[row]);
             let (stop_reason, next_pending, appended_count) = post_kernel[row];
+            let RetainedTextAdvance {
+                detokenizer,
+                assembled,
+                delta,
+                ..
+            } = text;
             state.decode_tokens_appended = appended_count;
             state.pending_token = next_pending;
             state.generated_ids = ids;
+            state.detokenizer = detokenizer;
             state.assembled = assembled;
             state.token_repetition_loop |=
                 repetition_stop == Some(Lfm25AudioAsrStopReason::TokenRepetition);
@@ -355,6 +369,7 @@ impl Lfm25AudioAsrRetainedState {
             decode_tokens_appended: 0,
             pending_token: None,
             generated_ids: Vec::new(),
+            detokenizer: IncrementalDetokenizer::new(),
             assembled: String::new(),
             token_repetition_loop: false,
             text_repetition_loop: false,
@@ -506,22 +521,26 @@ impl Lfm25AudioAsrRetainedState {
             Error::InferenceError("LFM2.5 Audio ASR decode has no staged token".into())
         })?;
         if is_stop_token(appended, &self.specials) {
+            let held_back = self
+                .detokenizer
+                .finish(&self.generated_ids, |ids| tokenizer.decode_text(ids))?;
+            self.assembled.push_str(&held_back);
             self.pending_token = None;
             self.finished = true;
             self.stop_reason = Some(Lfm25AudioAsrStopReason::StopToken);
-            return Ok(self.decode_outcome(None, None, String::new()));
+            return Ok(self.decode_outcome(None, None, held_back));
         }
         let mut generated_ids = self.generated_ids.clone();
         generated_ids.push(appended);
-        let mut assembled = tokenizer.decode_text(&generated_ids)?;
         let token_repetition_loop = has_token_repetition_loop(&generated_ids);
-        let text_repetition_loop = if let Some(trimmed) = trim_repeated_phrase_tail(&assembled) {
-            assembled = trimmed;
-            true
-        } else {
-            false
-        };
-        let delta = text_delta(&self.assembled, &assembled);
+        let mut text = advance_retained_text(
+            &self.detokenizer,
+            &self.assembled,
+            &generated_ids,
+            token_repetition_loop || generated_ids.len() >= self.max_new_tokens,
+            |ids| tokenizer.decode_text(ids),
+        )?;
+        let text_repetition_loop = text.text_repetition;
         let repetition_stop = if text_repetition_loop {
             Some(Lfm25AudioAsrStopReason::TextRepetition)
         } else if token_repetition_loop {
@@ -555,10 +574,20 @@ impl Lfm25AudioAsrRetainedState {
             repetition_stop.or(terminal_stop.then_some(Lfm25AudioAsrStopReason::StopToken))
         };
         let next_pending = (!terminal_stop).then_some(sampled).flatten();
+        if terminal_stop {
+            text.flush(&generated_ids, |ids| tokenizer.decode_text(ids))?;
+        }
+        let RetainedTextAdvance {
+            detokenizer,
+            assembled,
+            delta,
+            ..
+        } = text;
 
         self.decode_tokens_appended = next_appended;
         self.pending_token = next_pending;
         self.generated_ids = generated_ids;
+        self.detokenizer = detokenizer;
         self.assembled = assembled;
         self.token_repetition_loop |= token_repetition_loop;
         self.text_repetition_loop |= text_repetition_loop;
@@ -603,6 +632,7 @@ impl Lfm25AudioAsrRetainedState {
             decode_tokens_appended: self.decode_tokens_appended,
             pending_token: self.pending_token,
             generated_ids: self.generated_ids.clone(),
+            detokenizer: self.detokenizer.clone(),
             assembled: self.assembled.clone(),
             token_repetition_loop: self.token_repetition_loop,
             text_repetition_loop: self.text_repetition_loop,
@@ -623,6 +653,7 @@ impl Lfm25AudioAsrRetainedState {
             || self.decode_tokens_appended != host.decode_tokens_appended
             || self.pending_token != host.pending_token
             || self.generated_ids != host.generated_ids
+            || self.detokenizer != host.detokenizer
             || self.assembled != host.assembled
             || self.token_repetition_loop != host.token_repetition_loop
             || self.text_repetition_loop != host.text_repetition_loop
@@ -641,6 +672,7 @@ impl Lfm25AudioAsrRetainedState {
         self.decode_tokens_appended = checkpoint.decode_tokens_appended;
         self.pending_token = checkpoint.pending_token;
         self.generated_ids.clone_from(&checkpoint.generated_ids);
+        self.detokenizer.clone_from(&checkpoint.detokenizer);
         self.assembled.clone_from(&checkpoint.assembled);
         self.token_repetition_loop = checkpoint.token_repetition_loop;
         self.text_repetition_loop = checkpoint.text_repetition_loop;
@@ -665,6 +697,64 @@ impl Lfm25AudioAsrRetainedState {
             pending_token: self.pending_token,
         }
     }
+}
+
+/// Host text after the newest token of `ids`, staged so a failed quantum
+/// publishes nothing.
+#[derive(Default)]
+struct RetainedTextAdvance {
+    detokenizer: IncrementalDetokenizer,
+    assembled: String,
+    delta: String,
+    text_repetition: bool,
+}
+
+impl RetainedTextAdvance {
+    /// Append the text still held back because the decode ends here.
+    fn flush(&mut self, ids: &[u32], decode: impl FnMut(&[u32]) -> Result<String>) -> Result<()> {
+        if self.text_repetition {
+            // The trimmed text already ends before the held-back tail.
+            return Ok(());
+        }
+        let held_back = self.detokenizer.finish(ids, decode)?;
+        self.assembled.push_str(&held_back);
+        self.delta.push_str(&held_back);
+        Ok(())
+    }
+}
+
+/// Detokenize only the tokens since the last emission and check the
+/// repeated-phrase tail. `flush` ends the decode at this token. Re-decoding
+/// the whole transcript here made every token O(n).
+fn advance_retained_text(
+    detokenizer: &IncrementalDetokenizer,
+    assembled: &str,
+    ids: &[u32],
+    flush: bool,
+    mut decode: impl FnMut(&[u32]) -> Result<String>,
+) -> Result<RetainedTextAdvance> {
+    let mut detokenizer = detokenizer.clone();
+    let mut delta = detokenizer.step(ids, &mut decode)?;
+    if flush {
+        delta.push_str(&detokenizer.finish(ids, &mut decode)?);
+    }
+    let mut candidate = String::with_capacity(assembled.len() + delta.len());
+    candidate.push_str(assembled);
+    candidate.push_str(&delta);
+    if let Some(trimmed) = trim_repeated_phrase_tail(&candidate) {
+        return Ok(RetainedTextAdvance {
+            detokenizer,
+            delta: text_delta(assembled, &trimmed),
+            assembled: trimmed,
+            text_repetition: true,
+        });
+    }
+    Ok(RetainedTextAdvance {
+        detokenizer,
+        assembled: candidate,
+        delta,
+        text_repetition: false,
+    })
 }
 
 fn valid_commit_progress(
@@ -699,6 +789,93 @@ mod tests {
             trim_repeated_phrase_tail("hello world hello world hello world hello world"),
             Some("hello world".into())
         );
+    }
+
+    fn byte_decode(ids: &[u32]) -> crate::error::Result<String> {
+        let bytes = ids.iter().map(|&id| id as u8).collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Feed byte tokens through the retained text advance, flushing at the
+    /// last one when `flush_last`.
+    fn stream(ids: &[u32], flush_last: bool) -> (Vec<String>, super::RetainedTextAdvance) {
+        let mut state = super::RetainedTextAdvance::default();
+        let mut deltas = Vec::new();
+        for end in 1..=ids.len() {
+            let flush = flush_last && end == ids.len();
+            state = super::advance_retained_text(
+                &state.detokenizer,
+                &state.assembled,
+                &ids[..end],
+                flush,
+                byte_decode,
+            )
+            .unwrap();
+            deltas.push(state.delta.clone());
+            if state.text_repetition {
+                break;
+            }
+        }
+        (deltas, state)
+    }
+
+    fn bytes(text: &str) -> Vec<u32> {
+        text.bytes().map(u32::from).collect()
+    }
+
+    #[test]
+    fn retained_text_streams_whole_characters_with_linear_detokenize_work() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let words = [
+            "Größe",
+            "你好",
+            "😀",
+            "—",
+            "naïve",
+            "text.",
+            "über",
+            "日本語",
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_7);
+        let text = (0..2_000)
+            .map(|_| words[rng.gen_range(0..words.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (deltas, state) = stream(&bytes(&text), true);
+        assert!(!state.text_repetition);
+        assert_eq!(deltas.concat(), text);
+        assert_eq!(state.assembled, text);
+        assert!(deltas.iter().all(|delta| !delta.contains('\u{FFFD}')));
+        let n = text.len() as u64;
+        assert!(
+            state.detokenizer.decoded_tokens() <= 8 * n,
+            "decoded {} tokens for {n}; re-decoding is {}",
+            state.detokenizer.decoded_tokens(),
+            n * (n + 1) / 2
+        );
+    }
+
+    #[test]
+    fn retained_text_flushes_a_partial_character_and_trims_repeats() {
+        // The decode ends two bytes into a 4-byte emoji.
+        let ids = &bytes("ok 😀")[..5];
+        let (deltas, held) = stream(ids, false);
+        assert_eq!(deltas.concat(), "ok ");
+        let (deltas, flushed) = stream(ids, true);
+        assert_eq!(deltas.concat(), byte_decode(ids).unwrap());
+        assert_eq!(flushed.assembled, "ok \u{FFFD}");
+        let mut late = held;
+        late.flush(ids, byte_decode).unwrap();
+        assert_eq!(late.assembled, flushed.assembled);
+
+        let (_, state) = stream(
+            &bytes("so it goes so it goes so it goes so it goes so it goes"),
+            false,
+        );
+        assert!(state.text_repetition);
+        assert_eq!(state.assembled, "so it goes");
     }
 
     #[test]

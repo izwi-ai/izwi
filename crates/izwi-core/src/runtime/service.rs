@@ -86,6 +86,7 @@ use crate::runtime::adapters::{
     LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
+use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
 use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::broker::{
     InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
@@ -157,10 +158,31 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
         return Err(if err == REQUEST_DEADLINE_EXCEEDED {
             Error::Timeout(output.request_id)
         } else {
-            Error::InferenceError(err)
+            engine_output_error(err)
         });
     }
     Ok(output)
+}
+
+/// The typed error an engine output carries as its display text. Outputs
+/// keep errors as strings, so every failure used to surface as an
+/// `InferenceError` (500), even an input error (400) or a capacity refusal
+/// (503) such as a request beyond its fitted state.
+fn engine_output_error(message: String) -> Error {
+    let typed = |prefix: &str| message.strip_prefix(prefix).map(str::to_owned);
+    if let Some(detail) = typed("Inference capacity unavailable: ") {
+        Error::Overloaded(detail)
+    } else if let Some(detail) = typed("Invalid input: ") {
+        Error::InvalidInput(detail)
+    } else if let Some(detail) = typed("Streaming backpressure: ") {
+        Error::Backpressure(detail)
+    } else if let Some(detail) = typed("Request timed out: ") {
+        Error::Timeout(detail)
+    } else if let Some(detail) = typed("Request cancelled: ") {
+        Error::Cancelled(detail)
+    } else {
+        Error::InferenceError(message)
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +376,69 @@ fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVect
         }
     }
     resources
+}
+
+/// The working set of one ASR request for `variant` (PIPE-15), replacing the
+/// generic "64 MiB + 8 × input" price: the request's retained input plus the
+/// model's request envelope over `audio_secs` (one full chunk while the
+/// length is still unknown, which bounds any length because longer audio is
+/// chunked). The envelope's accelerator part is charged here only for the
+/// families whose encoder workspace no preparation stage prices (Nemotron,
+/// Voxtral); the others reserve it per physical batch when they dispatch.
+/// `None` for a variant without an envelope, which keeps the generic price.
+fn asr_transient_resources(
+    backend: BackendKind,
+    variant: ModelVariant,
+    input_bytes: usize,
+    audio_secs: Option<f32>,
+) -> Result<Option<ResourceVector>> {
+    use super::lifecycle::asr_envelope;
+    const CUDA_DEVICE_BASE_BYTES: u64 = 64 * 1024 * 1024;
+    let Some(secs) = audio_secs.or_else(|| asr_envelope::max_chunk_secs(variant)) else {
+        return Ok(None);
+    };
+    let Some(envelope) = asr_envelope::request_envelope(variant, secs, backend)? else {
+        return Ok(None);
+    };
+    let unpriced_encoder = matches!(
+        variant.family(),
+        ModelFamily::NemotronAsr | ModelFamily::Voxtral
+    );
+    let accelerator_bytes = if unpriced_encoder {
+        envelope.accelerator_bytes
+    } else {
+        0
+    };
+    let host_bytes = (input_bytes as u64)
+        .checked_add(envelope.host_bytes)
+        .ok_or_else(|| Error::Overloaded("ASR request envelope overflow".into()))?;
+    let overflow = || Error::Overloaded("ASR request envelope overflow".into());
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(
+                host_bytes
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            )
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(
+                host_bytes
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            )
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(host_bytes);
+            resources.device_bytes = ResourceAmount::Known(
+                CUDA_DEVICE_BASE_BYTES
+                    .checked_add(accelerator_bytes)
+                    .ok_or_else(overflow)?,
+            );
+        }
+    }
+    Ok(Some(resources))
 }
 
 const AUDIO_DECODE_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
@@ -718,6 +803,23 @@ fn asr_encoder_retained_resources(
     accelerator_bytes: u64,
 ) -> Result<ResourceVector> {
     retained_artifact_resources(backend, host_bytes, accelerator_bytes)
+}
+
+/// Parakeet's decode budget is the input's emittable-label bound, not the
+/// portable token context: its recurrent predictor keeps no per-token state,
+/// so the context limits nothing, while long dense audio exceeds 4096 labels.
+/// A caller's `max_tokens` is kept below the bound by the sequence clamp.
+fn install_parakeet_decode_budget(
+    request: &mut EngineCoreRequest,
+    max_emittable_tokens: usize,
+) -> Result<()> {
+    if request.asr_auto_max_tokens {
+        request.params.max_tokens = max_emittable_tokens;
+    }
+    let sequence_tokens = max_emittable_tokens
+        .checked_add(1)
+        .ok_or_else(|| Error::Overloaded("Parakeet decode budget overflowed".into()))?;
+    request.install_prepared_sequence_input_tokens(1, sequence_tokens)
 }
 
 /// Fish's request lease owns host preparation buffers and the eventual artifact.
@@ -3844,6 +3946,18 @@ impl RuntimeService {
             effective_context,
             input_bytes,
         );
+        if task_type == TaskType::ASR {
+            // The audio length is unknown before decoding; one full chunk
+            // bounds the request whatever its length.
+            if let Some(resources) = asr_transient_resources(
+                self.backend_router.context().backend_kind,
+                variant,
+                input_bytes,
+                None,
+            )? {
+                spec.resources = resources;
+            }
+        }
         spec.resources = spec.resources.checked_add(additional_resources)?;
         if task_decodes_audio(task_type) {
             spec.resources = spec.resources.checked_add(audio_decode_resources(
@@ -3923,6 +4037,18 @@ impl RuntimeService {
             },
             input_bytes,
         );
+        if request.task_type == TaskType::ASR {
+            if let Some(variant) = request.model_variant {
+                if let Some(resources) = asr_transient_resources(
+                    self.backend_router.context().backend_kind,
+                    variant,
+                    input_bytes,
+                    request.prepared_asr_input_duration_secs(),
+                )? {
+                    spec.resources = resources;
+                }
+            }
+        }
         // Price the durable prompt/position/token journal and overlapping
         // suspension/restoration copies in the request's existing host lease.
         // This is separate from the generic request/text/workspace allowance.
@@ -4403,20 +4529,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 let geometry = (!long_form)
                     .then(|| {
                         model_for_shape.audio_preparation_row_geometry(samples.len(), sample_rate)
@@ -4434,7 +4559,7 @@ impl RuntimeService {
                     .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                 } else {
                     request.install_prepared_sequence_input_tokens(
                         input_tokens.expect("normal Qwen3 ASR shape"),
@@ -4635,20 +4760,19 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 let geometry = (!long_form)
                     .then(|| {
                         model_for_shape.whisper_window_preparation_geometry(&samples, sample_rate)
@@ -4656,7 +4780,7 @@ impl RuntimeService {
                     .transpose()?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 if long_form {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                 }
                 Ok((request, geometry))
             })
@@ -4886,9 +5010,17 @@ impl RuntimeService {
                     request.asr_language_for_execution(),
                     request.asr_prompt_for_execution(),
                 )?;
+                let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
                 match decision {
                     VibeVoiceAsrPreparationDecision::Retained(geometry) => {
+                        // Admission prices `max_tokens`: narrow an omitted
+                        // budget to this audio's duration first.
+                        request.params.max_tokens =
+                            crate::runtime::asr::vibevoice_asr_planned_max_tokens(
+                                &request,
+                                audio_seconds,
+                            );
                         request.install_prepared_sequence_input_tokens(
                             geometry.prompt_tokens,
                             context_limit,
@@ -4896,7 +5028,25 @@ impl RuntimeService {
                         Ok((request, Some(geometry)))
                     }
                     VibeVoiceAsrPreparationDecision::LegacyInvocation => {
-                        request.install_prepared_asr_long_form_atomic()?;
+                        let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let (samples, sample_rate) =
+                            request.prepared_asr_audio_for_executor()?.ok_or_else(|| {
+                                Error::InferenceError(
+                                    "VibeVoice ASR preparation lost its decoded audio".into(),
+                                )
+                            })?;
+                        let plan = crate::engine::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &capabilities,
+                            request.streaming,
+                        );
+                        request.install_prepared_asr_long_form_atomic(plan)?;
                         Ok((request, None))
                     }
                 }
@@ -5090,27 +5240,31 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let audio_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-                    model_for_shape.max_audio_seconds_hint(),
-                    model_for_shape.audio_token_rate(),
+                let capabilities = crate::engine::AsrRouteCapabilities::for_native_model(
+                    &model_for_shape,
+                    variant,
+                    &request,
                     Some(context_limit),
-                    |_| {
-                        crate::models::registry::NativeAsrGenerationOptions::default()
-                            .max_new_tokens
-                    },
                 )?;
-                let long_form = crate::engine::qwen3_asr_requires_long_form(
+                let plan = crate::engine::asr_route_plan(
                     &samples,
                     sample_rate,
-                    audio_limit_secs,
+                    &capabilities,
+                    request.streaming,
                 );
+                let long_form = plan.requires_chunk_path();
                 // Granite's retained decoder is not quality-certified: the
                 // real model can collapse to tokenizer id 0 for every output
                 // step while its invocation-scoped physical route produces
                 // the expected transcript. Keep retained preparation behind
                 // the model's truthful capability declaration so production
                 // requests use the correctness-proven atomic route.
-                let geometry = (!long_form && model_for_shape.supports_resumable_prefill())
+                // A native-timestamp request needs the atomic route, which
+                // selects the timestamp task; retained preparation is ASR-only.
+                let retained = !long_form
+                    && !request.asr_native_word_timestamps
+                    && model_for_shape.supports_resumable_prefill();
+                let geometry = retained
                     .then(|| {
                         model_for_shape.granite_speech_retained_preparation_geometry(
                             &samples,
@@ -5128,7 +5282,7 @@ impl RuntimeService {
                     )?;
                     Ok((request, Some(geometry)))
                 } else {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
                 }
             })
@@ -5313,7 +5467,13 @@ impl RuntimeService {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
-                let long_form = model_for_shape.asr_requires_long_form(&samples, sample_rate);
+                let plan = crate::engine::asr_route_plan(
+                    &samples,
+                    sample_rate,
+                    &model_for_shape.asr_route_capabilities(),
+                    request.streaming,
+                );
+                let long_form = plan.requires_chunk_path();
                 let envelope = (!long_form)
                     .then(|| {
                         model_for_shape.lfm25_audio_asr_preparation_resource_envelope(
@@ -5330,7 +5490,7 @@ impl RuntimeService {
                     )?;
                     Ok((request, Some(envelope)))
                 } else {
-                    request.install_prepared_asr_long_form_atomic()?;
+                    request.install_prepared_asr_long_form_atomic(plan)?;
                     Ok((request, None))
                 }
             })
@@ -5538,11 +5698,12 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::ModelNotFound(format!("ASR model {variant} is not loaded")))?;
         let model_arc = model.model_arc();
-        let crate::models::registry::NativeAsrModel::Parakeet(_) = model_arc.as_ref() else {
+        let crate::models::registry::NativeAsrModel::Parakeet(parakeet) = model_arc.as_ref() else {
             return Err(Error::ModelLoadError(
                 "Parakeet registry lease crossed model family".into(),
             ));
         };
+        let max_symbols = parakeet.max_symbols_per_frame();
         let residency = residency_lease.ok_or_else(|| {
             Error::InferenceError("Parakeet preparation requires model residency".into())
         })?;
@@ -5559,20 +5720,20 @@ impl RuntimeService {
             self.backend_router.context().backend_kind,
             Some(ExecutionTargetKind::TokenEngine),
         )?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .ok_or_else(|| {
-                Error::ModelLoadError(format!("Parakeet model {variant} has no effective context"))
-            })?;
         let prepared = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let mut request = request;
                 let (samples, sample_rate) =
                     crate::engine::decode_request_audio_with_rate(&request)?;
+                let max_emittable_tokens =
+                    crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
+                        samples.len(),
+                        sample_rate,
+                        max_symbols,
+                    )?;
                 request.install_prepared_asr_audio(variant, samples, sample_rate)?;
-                request.install_prepared_sequence_input_tokens(1, context_limit)?;
+                install_parakeet_decode_budget(&mut request, max_emittable_tokens)?;
                 Ok(request)
             })
             .await?;
@@ -5605,9 +5766,13 @@ impl RuntimeService {
             .ok()
             .and_then(|frames| frames.checked_mul(1024 * 16))
             .ok_or_else(|| Error::Overloaded("Parakeet preparation geometry overflowed".into()))?;
-        let workspace_bytes = materialized_elements
-            .checked_mul(4)
-            .ok_or_else(|| Error::Overloaded("Parakeet preparation workspace overflowed".into()))?;
+        // Windowed encoding caps the quadratic attention terms at one window;
+        // only the host features and the stitched output grow with length.
+        let preparation_bytes =
+            crate::models::architectures::parakeet::asr::parakeet_preparation_bytes(
+                resampled,
+                self.backend_router.context().backend_kind,
+            )?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
         let prep_spec = JobSpec {
             request_id: prepared.id.clone(),
@@ -5642,8 +5807,8 @@ impl RuntimeService {
             materialized_elements,
             retained_artifact_resources(
                 self.backend_router.context().backend_kind,
-                0,
-                workspace_bytes,
+                preparation_bytes.host_bytes,
+                preparation_bytes.device_bytes()?,
             )?,
         );
         let cancellation = PreparationCancellation::default();
@@ -5657,6 +5822,9 @@ impl RuntimeService {
         )?;
         let language = prepared.asr_language_for_execution().map(str::to_owned);
         let model_for_preparation = model.clone();
+        let encoder_cancellation = cancellation.clone();
+        let encoder_request_id = prepared.id.clone();
+        let encoder_deadline = prepared.deadline;
         let mut guard = PreparationCancellationGuard {
             cancellation,
             armed: true,
@@ -5676,11 +5844,31 @@ impl RuntimeService {
                         "Parakeet preparation crossed model family".into(),
                     ));
                 };
-                let artifact = Arc::new(model.prepare_retained_encoder(
+                // Checked between encoder windows, so a disconnected or
+                // expired request releases the device within one window.
+                let checkpoint = || {
+                    if encoder_cancellation.is_cancelled() {
+                        return Err(Error::Cancelled(encoder_request_id.clone()));
+                    }
+                    if encoder_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err(Error::Timeout(encoder_request_id.clone()));
+                    }
+                    Ok(())
+                };
+                let artifact = match model.prepare_retained_encoder(
                     samples.as_ref(),
                     sample_rate,
                     language.as_deref(),
-                )?);
+                    &checkpoint,
+                ) {
+                    Ok(artifact) => Arc::new(artifact),
+                    // A row error keeps its kind; a batch error is reported
+                    // as an inference failure.
+                    Err(error @ (Error::Cancelled(_) | Error::Timeout(_))) => {
+                        return Ok(vec![Err(error)]);
+                    }
+                    Err(error) => return Err(error),
+                };
                 let accelerator_bytes = artifact.resident_tensor_bytes()?;
                 if accelerator_bytes > retained_device_ceiling {
                     return Err(Error::InferenceError(format!(
@@ -6760,12 +6948,41 @@ impl RuntimeService {
         Ok((request, job))
     }
 
+    /// Decide from the canonical decoded audio, before the request's route is
+    /// prepared, whether the whole input holds no speech for a model family
+    /// that hallucinates on non-speech (PIPE-18). The decode is transient:
+    /// route preparation decodes its own copy, because families without a
+    /// preparer must not carry prepared audio.
+    async fn asr_no_speech_gate(
+        &self,
+        request: EngineCoreRequest,
+        job: &JobLease,
+    ) -> Result<(EngineCoreRequest, Option<AsrNoSpeechGate>)> {
+        if !asr_no_speech_gate_applies(&request) {
+            return Ok((request, None));
+        }
+        self.coordinator
+            .run_host_blocking_stage(job, move || {
+                let (samples, sample_rate) =
+                    crate::engine::decode_request_audio_with_rate(&request)?;
+                let gate = AsrNoSpeechGate::evaluate(&samples, sample_rate);
+                Ok((request, gate))
+            })
+            .await
+    }
+
     async fn run_request_after_admission(
         &self,
         request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<ModelResidencyLease>,
     ) -> Result<EngineOutput> {
+        let (request, no_speech) = self.asr_no_speech_gate(request, &job).await?;
+        if let Some(gate) = no_speech {
+            let output = gate.engine_output(&request.id);
+            self.record_engine_output_observation(&request, &output, false);
+            return Ok(output);
+        }
         let (mut request, job) = self
             .prepare_request_for_binding(request, job, residency_lease.as_ref())
             .await?;
@@ -7053,6 +7270,14 @@ impl RuntimeService {
         F: FnMut(StreamingOutput) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        let (request, no_speech) = self.asr_no_speech_gate(request, &job).await?;
+        if let Some(gate) = no_speech {
+            // Close the stream as the engine does: a terminal marker, no text.
+            on_chunk(AsrNoSpeechGate::final_stream_chunk(&request.id)).await?;
+            let output = gate.engine_output(&request.id);
+            self.record_engine_output_observation(&request, &output, true);
+            return Ok(output);
+        }
         let (mut request, job) = self
             .prepare_request_for_binding(request, job, residency_lease.as_ref())
             .await?;
@@ -8491,8 +8716,12 @@ mod tests {
         assert!(receiver.await.is_err());
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_pending_guard_reclaims_admitted_session_and_job() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         runtime.ensure_step_driver_started().await;
         let mut request = EngineCoreRequest::tts("cancel between admission and waiter binding")
@@ -8579,8 +8808,12 @@ mod tests {
         runtime.core_engine.abort_all_requests().await;
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_pending_guard_retains_ownership_while_exact_abort_waits_for_core_step_lock() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut request = EngineCoreRequest::tts("cancel during an in-flight engine step");
         request.id = "cancel-during-engine-step".to_string();
@@ -8662,8 +8895,12 @@ mod tests {
         runtime.core_engine.abort_all_requests().await;
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nonstreaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let (step_entered_tx, step_entered_rx) = oneshot::channel();
         let (release_step_tx, release_step_rx) = oneshot::channel();
@@ -8724,8 +8961,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_engine_admission_returns_at_deadline_while_core_lock_is_held() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let (step_entered_tx, step_entered_rx) = oneshot::channel();
         let (release_step_tx, release_step_rx) = oneshot::channel();
@@ -8817,8 +9058,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn fish_streaming_runs_model_preparation_before_engine_admission() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         for model_streaming_required in [true, false] {
             let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
             let mut request = EngineCoreRequest::tts("prepare streaming Fish")
@@ -8871,8 +9116,12 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn shared_preparation_preserves_fish_model_artifact_and_streaming_budget() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         use crate::models::architectures::fish_s2::{FishS2PreparedArtifact, FishS2TtsModel};
         use crate::models::registry::FishS2TtsModelLease;
 
@@ -8939,8 +9188,12 @@ mod tests {
         assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_streaming_deadline_does_not_invoke_callback() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "expired-streaming-callback";
         let deadline = Instant::now() + Duration::from_millis(50);
@@ -8993,8 +9246,12 @@ mod tests {
         .expect("deadline cleanup did not release request ownership");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hung_streaming_callback_is_bounded_by_absolute_request_deadline() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "hung-streaming-callback-deadline";
         let deadline = Instant::now() + Duration::from_millis(25);
@@ -9039,8 +9296,12 @@ mod tests {
         .expect("deadline cleanup did not release request ownership");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_callback_failure_returns_while_exact_abort_waits_for_core_step_lock() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let request_id = "streaming-callback-failure-during-step";
         let (observation_request, mut guard, receiver, residency_variant) =
@@ -9108,8 +9369,12 @@ mod tests {
         .expect("exact abort did not release ownership after the core lock became safe");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_detached_cleanup_retains_request_ownership_fail_closed() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut request = EngineCoreRequest::tts("abort detached cancellation cleanup");
         request.id = "abort-detached-cleanup".to_string();
@@ -9412,8 +9677,12 @@ mod tests {
         ));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_pending_guard_cleanup_cannot_abort_reused_session() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let mut old_request =
             EngineCoreRequest::tts("old exact session").with_model_variant(ModelVariant::Kokoro82M);
@@ -9648,8 +9917,12 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn runtime_prometheus_includes_engine_metric_values() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
 
         let payload = runtime.telemetry_prometheus().await;
@@ -9907,8 +10180,149 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parakeet_decode_budget_tracks_emittable_labels() {
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        // 29.7 s at 16 kHz: 372 encoder frames × 10 labels.
+        let max_emittable =
+            crate::models::architectures::parakeet::asr::parakeet_max_emittable_tokens(
+                475_200, 16_000, 10,
+            )
+            .unwrap();
+        assert_eq!(max_emittable, 3_720);
+        let request = |max_tokens: usize, auto: bool| {
+            let mut request = EngineCoreRequest::asr("audio").with_model_variant(variant);
+            request.params.max_tokens = max_tokens;
+            request.asr_auto_max_tokens = auto;
+            install_parakeet_decode_budget(&mut request, max_emittable).unwrap();
+            request.params.max_tokens
+        };
+
+        assert_eq!(request(2048, true), max_emittable);
+        assert_eq!(request(5, false), 5);
+        assert_eq!(request(50_000, false), max_emittable);
+    }
+
+    async fn admitted_asr_job(runtime: &RuntimeService, request: &EngineCoreRequest) -> JobLease {
+        let (spec, observation) = runtime
+            .coordinator_job_for_request(request)
+            .expect("ASR job");
+        runtime
+            .coordinator
+            .admit_observed(spec, observation)
+            .await
+            .expect("ASR admission")
+    }
+
+    fn ten_second_wav(samples: impl FnOnce(usize) -> Vec<f32>) -> Vec<u8> {
+        use crate::runtime::asr_no_speech::tests::{wav_bytes, SAMPLE_RATE};
+        wav_bytes(&samples(SAMPLE_RATE as usize * 10), SAMPLE_RATE)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn silent_asr_request_is_answered_before_route_preparation() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
+            .with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+        let job = admitted_asr_job(&runtime, &request).await;
+
+        // No model is loaded, so route preparation would fail: the gate must
+        // answer before it.
+        let output = runtime
+            .run_request_after_admission(request, job, None)
+            .await
+            .expect("gated transcript");
+
+        assert_eq!(output.text.as_deref(), Some(""));
+        assert!(output.is_finished);
+        assert_eq!(output.input_audio_duration_secs, Some(10.0));
+        let diagnostics = output.asr_diagnostics.expect("gate diagnostics");
+        assert_eq!(diagnostics["no_speech_gate"]["gated"], true);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn noise_only_streaming_asr_request_emits_a_terminal_empty_final() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        use crate::runtime::asr_no_speech::tests::pink_noise;
+
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let mut request =
+            EngineCoreRequest::asr_bytes(ten_second_wav(|len| pink_noise(len, 0.02, 4)))
+                .with_model_variant(ModelVariant::Qwen3Asr17BGguf);
+        request.streaming = true;
+        let job = admitted_asr_job(&runtime, &request).await;
+
+        let mut chunks = Vec::new();
+        let output = runtime
+            .run_streaming_request_after_admission(
+                request,
+                |chunk| {
+                    chunks.push(chunk);
+                    std::future::ready(Ok(()))
+                },
+                job,
+                None,
+                true,
+            )
+            .await
+            .expect("gated stream");
+
+        assert_eq!(chunks.len(), 1, "exactly one terminal marker");
+        assert!(chunks[0].is_final);
+        assert!(chunks[0].text.is_none());
+        assert_eq!(output.text.as_deref(), Some(""));
+        assert_eq!(output.input_audio_duration_secs, Some(10.0));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn no_speech_gate_passes_speech_and_transducer_requests_through() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+
+        let parakeet = EngineCoreRequest::asr_bytes(ten_second_wav(|len| vec![0.0; len]))
+            .with_model_variant(ModelVariant::ParakeetTdt06BV3);
+        let job = admitted_asr_job(&runtime, &parakeet).await;
+        let (parakeet, gate) = runtime
+            .asr_no_speech_gate(parakeet, &job)
+            .await
+            .expect("transducer gate decision");
+        assert!(gate.is_none(), "transducers transcribe silence as empty");
+        assert!(parakeet.prepared_asr_audio_for_executor().unwrap().is_none());
+
+        let fox = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav"),
+        )
+        .expect("speech fixture");
+        let whisper =
+            EngineCoreRequest::asr_bytes(fox).with_model_variant(ModelVariant::WhisperLargeV3Turbo);
+        let job = admitted_asr_job(&runtime, &whisper).await;
+        let (whisper, gate) = runtime
+            .asr_no_speech_gate(whisper, &job)
+            .await
+            .expect("speech gate decision");
+        assert!(gate.is_none(), "speech must reach the model");
+        assert!(
+            whisper.prepared_asr_audio_for_executor().unwrap().is_none(),
+            "the gate's decode is transient; route preparation owns prepared audio"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn whisper_transport_streaming_preserves_normal_and_long_form_routes() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         runtime.inference_broker = InferenceBroker::with_mode(InferenceBrokerMode::Shadow);
         let variant = ModelVariant::WhisperLargeV3Turbo;
@@ -9958,7 +10372,11 @@ mod tests {
         long_form
             .install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
             .unwrap();
-        long_form.install_prepared_asr_long_form_atomic().unwrap();
+        long_form
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         let (long_spec, long_observation) = runtime
             .coordinator_job_for_request(&long_form)
             .expect("long-form streaming job");
@@ -10183,8 +10601,12 @@ mod tests {
         assert_eq!(spec.resources, expected);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_copy_yields_between_bounded_quanta() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         use std::sync::atomic::AtomicBool;
 
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
@@ -10222,8 +10644,12 @@ mod tests {
         peer.await.expect("peer task");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_copy_stops_at_absolute_deadline() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
         let deadline = Instant::now() + Duration::from_millis(50);
         let context = RuntimeRequestContext::default().with_deadline(deadline);
@@ -10403,7 +10829,76 @@ mod tests {
             .coordinator_job_for_request(&request)
             .expect("prepared Qwen ASR coordinator job");
         assert_eq!(observation.host_bytes, after as u64);
-        assert_eq!(spec.resources, transient_resources(backend, after));
+        assert_eq!(
+            Some(spec.resources),
+            asr_transient_resources(backend, variant, after, Some(257.0 / 16_000.0)).unwrap()
+        );
+    }
+
+    /// Engine output errors keep their kind: a request beyond its fitted
+    /// state is a capacity refusal (503), a malformed one an input error
+    /// (400); only untyped failures stay inference errors (500).
+    #[test]
+    fn engine_output_errors_keep_their_kind() {
+        let capacity =
+            Error::Overloaded("physical paged append ends at 324, beyond capacity 320".into());
+        assert!(matches!(
+            engine_output_error(capacity.to_string()),
+            Error::Overloaded(detail) if detail.ends_with("beyond capacity 320")
+        ));
+        assert!(matches!(
+            engine_output_error(Error::InvalidInput("bad audio".into()).to_string()),
+            Error::InvalidInput(detail) if detail == "bad audio"
+        ));
+        assert!(matches!(
+            engine_output_error(Error::Backpressure("slow".into()).to_string()),
+            Error::Backpressure(_)
+        ));
+        assert!(matches!(
+            engine_output_error("kernel failed".into()),
+            Error::InferenceError(detail) if detail == "kernel failed"
+        ));
+    }
+
+    /// ASR requests are priced by the model's envelope over their audio, not
+    /// by a multiple of their input: an hour of decoded audio costs one
+    /// chunk's working set beside the retained samples (PIPE-15).
+    #[test]
+    fn asr_requests_price_the_model_envelope_instead_of_an_input_multiple() {
+        const HOUR_SAMPLES: usize = 3_600 * 16_000;
+        let input = HOUR_SAMPLES * std::mem::size_of::<f32>();
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let generic = transient_resources(backend, input);
+            for variant in [
+                ModelVariant::Qwen3Asr06BGguf,
+                ModelVariant::WhisperLargeV3Turbo,
+                ModelVariant::Nemotron35AsrStreaming06B,
+            ] {
+                let hour = asr_transient_resources(backend, variant, input, Some(3_600.0))
+                    .unwrap()
+                    .unwrap();
+                let chunk = asr_transient_resources(backend, variant, input, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(hour, chunk, "{variant} {backend:?}");
+                assert!(
+                    hour.workspace_bytes().unwrap() < generic.workspace_bytes().unwrap(),
+                    "{variant} {backend:?}"
+                );
+                let bytes = |resources: ResourceVector| match backend {
+                    BackendKind::Cpu => resources.host_bytes,
+                    BackendKind::Metal => resources.unified_bytes,
+                    BackendKind::Cuda => resources.host_bytes,
+                };
+                assert!(
+                    matches!(bytes(hour), ResourceAmount::Known(value) if value > input as u64)
+                );
+            }
+        }
+        assert_eq!(
+            asr_transient_resources(BackendKind::Cpu, ModelVariant::Kokoro82M, 1, None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -10428,9 +10923,12 @@ mod tests {
             .unwrap();
 
         let host_bytes = retained_engine_request_input_bytes(&request).unwrap();
-        let expected = transient_resources(backend, host_bytes)
-            .checked_add(asr_encoder_retained_resources(backend, 0, encoder_bytes).unwrap())
-            .unwrap();
+        let expected =
+            asr_transient_resources(backend, variant, host_bytes, Some(257.0 / 16_000.0))
+                .unwrap()
+                .unwrap()
+                .checked_add(asr_encoder_retained_resources(backend, 0, encoder_bytes).unwrap())
+                .unwrap();
         let (spec, observation) = runtime
             .coordinator_job_for_request(&request)
             .expect("prepared Whisper ASR coordinator job");
@@ -10462,7 +10960,11 @@ mod tests {
         offline_asr
             .install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 16_000], 16_000)
             .unwrap();
-        offline_asr.install_prepared_asr_long_form_atomic().unwrap();
+        offline_asr
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&offline_asr),
             CoordinatorLane::Atomic
@@ -10488,7 +10990,9 @@ mod tests {
         );
         let mut whisper_long = EngineCoreRequest::asr("audio").with_model_variant(whisper_variant);
         whisper_long
-            .install_prepared_asr_long_form_atomic()
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
             .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&whisper_long),
@@ -10505,7 +11009,11 @@ mod tests {
             CoordinatorLane::Resumable
         );
         let mut vibe_long = EngineCoreRequest::asr("audio").with_model_variant(vibe_variant);
-        vibe_long.install_prepared_asr_long_form_atomic().unwrap();
+        vibe_long
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&vibe_long),
             CoordinatorLane::Atomic
@@ -10521,7 +11029,11 @@ mod tests {
             CoordinatorLane::Resumable
         );
         let mut lfm_long = EngineCoreRequest::asr("audio").with_model_variant(lfm_variant);
-        lfm_long.install_prepared_asr_long_form_atomic().unwrap();
+        lfm_long
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+            )
+            .unwrap();
         assert_eq!(
             coordinator_lane_for_request(&lfm_long),
             CoordinatorLane::Atomic

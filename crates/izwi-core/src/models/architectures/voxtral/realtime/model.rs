@@ -1,7 +1,8 @@
 //! Main Voxtral Realtime model implementation.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,13 +12,17 @@ use candle_nn::{Module, VarBuilder};
 use tracing::info;
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
-use crate::backends::{BackendKind, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::qwen3::core::build_rope_cache;
-use crate::models::architectures::voxtral::lm::VoxtralLM;
+use crate::models::architectures::voxtral::lm::{VoxtralAdaScales, VoxtralLM};
 use crate::models::architectures::voxtral::{
     voxtral_invocation_contract, voxtral_physical_state_spec, voxtral_realtime_physical_state_spec,
     voxtral_retained_contract, VoxtralPhysicalStateSpec, VoxtralRealtimePhysicalStateSpec,
@@ -30,7 +35,9 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::attention::physical::PhysicalPagedKvCheckpoint;
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
+use crate::models::shared::weights::staged;
 
+use super::super::layers::exact_gelu;
 use super::audio::{AudioLanguageAdapter, TimeEmbedding};
 use super::config::VoxtralConfig;
 use super::streaming::{
@@ -125,18 +132,67 @@ pub struct VoxtralRealtimeModel {
     whisper_encoder: WhisperEncoder,
     audio_adapter: AudioLanguageAdapter,
     language_model: VoxtralLM,
-    time_embedding: TimeEmbedding,
+    /// Per-layer Ada RMSNorm gains for the model's fixed delay condition.
+    ada_scales: VoxtralAdaScales,
     mel: MelSpectrogram,
     global_log_mel_max: Option<f32>,
     num_delay_tokens: usize,
     streaming_left_pad_tokens: usize,
-    offline_left_pad_tokens: usize,
-    streaming_right_pad_tokens: usize,
-    raw_audio_length_per_tok: usize,
-    block_pool_size: usize,
     audio_length_per_tok: usize,
-    realtime_max_source_samples: Option<usize>,
+    layout: VoxtralRealtimeLayout,
+    realtime_max_source_samples: usize,
     max_decoded_token_bytes: usize,
+    /// The dtype this model loaded with, why, and its self-check.
+    precision: PrecisionLoad,
+}
+
+/// LM positions the load-time self-check runs.
+const VOXTRAL_PROBE_LM_TOKENS: usize = 16;
+
+/// The components [`voxtral_numeric_probe`] runs.
+struct VoxtralProbeParts<'a> {
+    encoder: &'a WhisperEncoder,
+    adapter: &'a AudioLanguageAdapter,
+    pool_size: usize,
+    language_model: &'a VoxtralLM,
+    ada: &'a VoxtralAdaScales,
+    n_mels: usize,
+}
+
+/// Xorshift log-mel (the normalized log-mel lies in about [-1.5, 1.5]) for
+/// [`VOXTRAL_PROBE_LM_TOKENS`] LM positions through the encoder, the pooling
+/// adapter and every LM layer and the head, on a scratch cache with K/V in
+/// `dtype`. Returns the encoder output, the adapter output and the logits.
+fn voxtral_numeric_probe(
+    parts: VoxtralProbeParts<'_>,
+    dtype: DType,
+    device: &candle_core::Device,
+) -> Result<Vec<(String, Tensor)>> {
+    let frames = VOXTRAL_PROBE_LM_TOKENS
+        .checked_mul(2 * parts.pool_size.max(1))
+        .ok_or_else(|| Error::ModelLoadError("Voxtral probe overflow".into()))?;
+    let mel = xorshift_tensor(&[1, frames, parts.n_mels], 0x7A11, 1.5, device)?.to_dtype(dtype)?;
+    let encoded = parts.encoder.forward(&mel)?;
+    let pooled = pool_audio_embeddings_by_block(&encoded, parts.pool_size)?;
+    let embeds = parts
+        .adapter
+        .forward(&pooled)?
+        .to_dtype(parts.language_model.embedding_dtype())?;
+    let mut cache = parts
+        .language_model
+        .scratch_probe_cache(dtype, embeds.dim(1)?)?;
+    let logits = parts.language_model.forward_managed_with_embeds(
+        &embeds,
+        0,
+        &mut cache,
+        None,
+        Some(parts.ada),
+    )?;
+    Ok(vec![
+        ("encoder".to_string(), encoded),
+        ("adapter".to_string(), embeds),
+        ("logits".to_string(), logits),
+    ])
 }
 
 #[derive(Debug, Clone)]
@@ -189,57 +245,92 @@ struct VoxtralRuntimeConfig {
     checkpoint_dtype: Option<DType>,
 }
 
+/// CPU and Metal encode a whole offline request with dense encoder
+/// attention, so they cap it at 1024 audio tokens: 975 after the 49 padding
+/// tokens, or 78 s of audio.
 const PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT: usize = 1024;
 
+/// Longest audio a pipeline should send in one offline invocation, such as
+/// one diarization chunk. 30 s is 424 audio tokens, well inside the portable
+/// cap, and matches the offline route's 30 s chunks.
+pub(crate) const VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT: f32 = 30.0;
+
+/// Longest realtime session when the checkpoint sets no `chunk_length_s`.
+/// The published streaming checkpoint leaves it null, as mistral_common
+/// requires in streaming mode, so the session length is an izwi policy.
+/// Every push re-encodes the whole stream with dense encoder attention and
+/// the preparation seal charges that quadratic workspace, so raise this only
+/// once the encoder runs incrementally.
+const VOXTRAL_REALTIME_DEFAULT_MAX_SESSION_SECONDS: f32 = 30.0;
+
+/// Audio tokens one offline request may decode. Audio past the limit is an
+/// error, never a silently truncated transcript.
 fn voxtral_realtime_offline_frame_limit(
     backend: BackendKind,
     audio_frames: usize,
     model_context_limit: usize,
 ) -> Result<usize> {
-    if backend != BackendKind::Cuda {
-        return Ok(audio_frames.min(PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT));
-    }
-    if model_context_limit == 0 {
-        return Err(Error::ModelLoadError(
-            "Voxtral Realtime reported a zero physical context".into(),
-        ));
-    }
-    if audio_frames > model_context_limit {
+    let (limit, bound) = if backend == BackendKind::Cuda {
+        if model_context_limit == 0 {
+            return Err(Error::ModelLoadError(
+                "Voxtral Realtime reported a zero physical context".into(),
+            ));
+        }
+        (model_context_limit, "loaded model context")
+    } else {
+        (
+            PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT,
+            "CPU/Metal offline limit",
+        )
+    };
+    if audio_frames > limit {
         return Err(Error::InvalidInput(format!(
-            "Voxtral Realtime produced {audio_frames} audio tokens, exceeding its {model_context_limit}-token loaded model context"
+            "Voxtral Realtime needs {audio_frames} audio tokens for this audio, exceeding its {limit}-token {bound}; split the audio into chunks of at most {VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT} s"
         )));
     }
     Ok(audio_frames)
 }
 
 impl VoxtralRealtimeModel {
-    /// Load model from directory
+    /// Load model from directory. On Metal a dtype below F32 must pass
+    /// [`Self::numeric_self_check`], or the model reloads in F32.
     pub fn load(model_dir: &Path, device: DeviceProfile, prefix_reuse: bool) -> Result<Self> {
-        // Try params.json (Voxtral format) first, then config.json (standard)
-        let config_path = if model_dir.join("params.json").exists() {
-            model_dir.join("params.json")
-        } else {
-            model_dir.join("config.json")
-        };
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))?;
+        let config_str = read_voxtral_config(model_dir)?;
+        let runtime_config = load_voxtral_runtime_config(model_dir)?;
+        let selection = voxtral_precision(
+            &device,
+            voxtral_checkpoint_dtype(&config_str, &runtime_config),
+        );
+        let check = device.kind.is_metal();
+        let (mut model, precision) = load_with_precision_fallback(
+            "Voxtral",
+            &selection,
+            check,
+            DType::F32,
+            |dtype| Self::load_with_dtype(model_dir, device.clone(), prefix_reuse, dtype),
+            Self::numeric_self_check,
+        )?;
+        info!(
+            "Voxtral Realtime precision: {:?} ({})",
+            precision.loaded, precision.reason
+        );
+        model.precision = precision;
+        Ok(model)
+    }
+
+    fn load_with_dtype(
+        model_dir: &Path,
+        device: DeviceProfile,
+        prefix_reuse: bool,
+        dtype: DType,
+    ) -> Result<Self> {
+        let config_str = read_voxtral_config(model_dir)?;
         let config: VoxtralConfig = serde_json::from_str(&config_str)
             .map_err(|e| Error::ModelLoadError(format!("Failed to parse config: {}", e)))?;
         let runtime_config = load_voxtral_runtime_config(model_dir)?;
-        let checkpoint_dtype =
-            checkpoint_dtype_from_config_json(&config_str).or(runtime_config.checkpoint_dtype);
-        let num_delay_tokens = runtime_config
-            .default_num_delay_tokens
-            .unwrap_or_else(|| config.num_delay_tokens())
-            .max(1);
-        let block_pool_size = runtime_config
-            .downsample_factor
-            .unwrap_or_else(|| config.block_pool_size())
-            .max(1);
-        let audio_length_per_tok = runtime_config
-            .audio_length_per_tok
-            .unwrap_or(block_pool_size.saturating_mul(2))
-            .max(1);
+        let checkpoint_dtype = voxtral_checkpoint_dtype(&config_str, &runtime_config);
+        let geometry = realtime_audio_geometry(&config, &runtime_config);
+        let audio_length_per_tok = geometry.audio_length_per_tok;
 
         // Setup audio processing
         let audio_cfg = config.audio_config();
@@ -258,31 +349,17 @@ impl VoxtralRealtimeModel {
         let mel = MelSpectrogram::new(mel_cfg)?;
 
         // Setup tokenizer
-        let audio_config = AudioConfig {
-            sampling_rate: audio_cfg.sampling_rate,
-            frame_rate: config.frame_rate(),
-            window_size: audio_cfg.window_size,
-            hop_length: audio_cfg.hop_length,
-            num_mel_bins: audio_cfg.num_mel_bins,
-            n_delay_tokens: num_delay_tokens,
-            ..AudioConfig::default()
-        };
-        let tokenizer = VoxtralTokenizer::load(model_dir, audio_config)?;
+        let tokenizer = VoxtralTokenizer::load(model_dir, geometry.audio)?;
+        let num_delay_tokens = checked_delay_tokens(tokenizer.audio_config(), &runtime_config)?;
         let max_decoded_token_bytes = tokenizer.max_decoded_token_bytes()?;
         let streaming_left_pad_tokens = tokenizer.audio_config().streaming_left_pad_tokens;
-        let offline_left_pad_tokens =
-            offline_left_pad_tokens_for_generation(streaming_left_pad_tokens, num_delay_tokens);
-        let streaming_right_pad_tokens = tokenizer.audio_config().offline_right_pad_tokens();
-        let raw_audio_length_per_tok = tokenizer.audio_config().raw_audio_length_per_tok();
-        let realtime_max_source_samples = realtime_source_sample_ceiling(
+        let layout = VoxtralRealtimeLayout::new(
             &config,
-            &audio_cfg,
-            raw_audio_length_per_tok,
-            offline_left_pad_tokens,
-            streaming_right_pad_tokens,
+            tokenizer.audio_config(),
+            geometry.block_pool_size,
+            geometry.audio_length_per_tok,
         )?;
-
-        let dtype = select_voxtral_dtype(&device, checkpoint_dtype);
+        let realtime_max_source_samples = realtime_source_sample_ceiling(&config, &layout)?;
 
         // Load weights - clone device to a local binding for lifetime
         let device_clone = device.clone();
@@ -293,7 +370,7 @@ impl VoxtralRealtimeModel {
         let whisper_prefix = "mm_streams_embeddings.embedding_module.whisper_encoder";
         let whisper_encoder = WhisperEncoder::load_voxtral(&audio_cfg, vb.pp(whisper_prefix))?;
 
-        let hidden_size = audio_cfg.d_model * block_pool_size;
+        let hidden_size = audio_cfg.d_model * layout.pool_size;
         let audio_adapter = AudioLanguageAdapter::load(
             hidden_size,
             config.text_config().hidden_size,
@@ -306,6 +383,14 @@ impl VoxtralRealtimeModel {
 
         let time_embedding =
             TimeEmbedding::new(config.text_config().hidden_size, 10000.0, &device.device)?;
+        // The delay condition is fixed for the loaded model: compute the LM's
+        // Ada RMSNorm gains once instead of in every layer of every step.
+        let time = Tensor::from_vec(vec![num_delay_tokens as f32], (1,), &device.device)?
+            .to_dtype(dtype)?;
+        let t_cond = time_embedding
+            .forward(&time)?
+            .to_dtype(language_model.embedding_dtype())?;
+        let ada_scales = language_model.ada_scales(&t_cond)?;
 
         info!(
             "Loaded Voxtral Realtime model on {:?} with dtype {:?} (checkpoint_dtype={:?})",
@@ -321,19 +406,46 @@ impl VoxtralRealtimeModel {
             whisper_encoder,
             audio_adapter,
             language_model,
-            time_embedding,
+            ada_scales,
             mel,
             global_log_mel_max: audio_cfg.global_log_mel_max,
             num_delay_tokens,
             streaming_left_pad_tokens,
-            offline_left_pad_tokens,
-            streaming_right_pad_tokens,
-            raw_audio_length_per_tok,
-            block_pool_size,
             audio_length_per_tok,
+            layout,
             realtime_max_source_samples,
             max_decoded_token_bytes,
+            precision: PrecisionLoad::unchecked(&DTypeSelection {
+                dtype,
+                reason: "set by VoxtralRealtimeModel::load".into(),
+            }),
         })
+    }
+
+    /// The load-time self-check: xorshift log-mel for
+    /// [`VOXTRAL_PROBE_LM_TOKENS`] LM positions through the encoder, the
+    /// pooling adapter and every LM layer and the head (on a scratch cache in
+    /// the model's K/V dtype). Encoder, adapter and logits must be finite
+    /// and below the F16-safe range.
+    fn numeric_self_check(&self) -> NumericSelfCheckReport {
+        run_numeric_self_check(
+            format!("Voxtral {:?}", self.dtype),
+            F16_SAFE_MAX_ABS,
+            || {
+                voxtral_numeric_probe(
+                    VoxtralProbeParts {
+                        encoder: &self.whisper_encoder,
+                        adapter: &self.audio_adapter,
+                        pool_size: self.layout.pool_size,
+                        language_model: &self.language_model,
+                        ada: &self.ada_scales,
+                        n_mels: self.mel.config().n_mels,
+                    },
+                    self.dtype,
+                    &self.device.device,
+                )
+            },
+        )
     }
 
     pub(crate) fn physical_state_spec(
@@ -712,8 +824,7 @@ impl VoxtralRealtimeModel {
                 "Voxtral realtime prompt requires an empty retained cache".into(),
             ));
         }
-        let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
-        prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
+        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         let prompt_len = prompt_tokens.len();
         if state.prepared_audio_frames < prompt_len {
             return Ok(None);
@@ -728,13 +839,12 @@ impl VoxtralRealtimeModel {
             audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
         }
         let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
-        let t_cond = self.realtime_time_condition(&prompt_embeds)?;
         let logits = self.language_model.forward_managed_with_embeds(
             &prompt_embeds,
             0,
             cache,
             None,
-            Some(&t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         state.prompt_initialized = true;
@@ -750,8 +860,7 @@ impl VoxtralRealtimeModel {
         if state.prompt_initialized || state.finished {
             return Ok(None);
         }
-        let prompt_len =
-            voxtral_generation_prefix_len(self.tokenizer.build_transcription_prompt()?.len());
+        let prompt_len = self.tokenizer.build_transcription_prompt()?.len();
         Ok((state.prepared_audio_frames >= prompt_len).then_some(prompt_len))
     }
 
@@ -787,8 +896,7 @@ impl VoxtralRealtimeModel {
                 "Voxtral realtime completion requires closed, exhausted input".into(),
             ));
         }
-        state.finished = true;
-        Ok(self.realtime_step(state, String::new()))
+        self.finish_realtime_text(state)
     }
 
     /// Advance one retained decoder token against one prepared audio frame.
@@ -852,7 +960,6 @@ impl VoxtralRealtimeModel {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Vec<VoxtralRealtimeStep>> {
             let mut embed_rows = Vec::with_capacity(rows.len());
-            let mut condition_rows = Vec::with_capacity(rows.len());
             let mut positions = Vec::with_capacity(rows.len());
             for row in rows.iter() {
                 let input_token = row
@@ -871,12 +978,10 @@ impl VoxtralRealtimeModel {
                     audio_step = audio_step.to_dtype(text_embed.dtype())?;
                 }
                 let step_embeds = audio_step.broadcast_add(&text_embed)?;
-                condition_rows.push(self.realtime_time_condition(&step_embeds)?);
                 embed_rows.push(step_embeds);
                 positions.push(row.state.next_audio_frame);
             }
             let embeds = Tensor::cat(&embed_rows.iter().collect::<Vec<_>>(), 0)?;
-            let conditions = Tensor::stack(&condition_rows.iter().collect::<Vec<_>>(), 0)?;
             let output = {
                 let mut caches = rows
                     .iter_mut()
@@ -887,7 +992,7 @@ impl VoxtralRealtimeModel {
                         &embeds,
                         &positions,
                         &mut caches,
-                        Some(&conditions),
+                        Some(&self.ada_scales),
                     )?
             };
             let (batch, sequence, _) = output.dims3()?;
@@ -948,8 +1053,7 @@ impl VoxtralRealtimeModel {
         }
         if state.next_audio_frame >= state.prepared_audio_frames {
             if state.input_closed {
-                state.finished = true;
-                return Ok(Some(self.realtime_step(state, String::new())));
+                return self.finish_realtime_text(state).map(Some);
             }
             return Ok(None);
         }
@@ -973,13 +1077,12 @@ impl VoxtralRealtimeModel {
             audio_step = audio_step.to_dtype(text_embed.dtype())?;
         }
         let step_embeds = audio_step.broadcast_add(&text_embed)?;
-        let t_cond = self.realtime_time_condition(&step_embeds)?;
         let logits = self.language_model.forward_managed_with_embeds(
             &step_embeds,
             state.next_audio_frame,
             cache,
             None,
-            Some(&t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         state.next_audio_frame = state
@@ -1084,24 +1187,19 @@ impl VoxtralRealtimeModel {
             .language_model
             .physical_context_limit()
             .ok_or_else(|| Error::ModelLoadError("Voxtral has no attention window".into()))?;
-        if backend == BackendKind::Cuda {
-            let (left_pad, right_pad) = offline_streaming_padding_samples(
-                audio.len(),
-                self.raw_audio_length_per_tok,
-                self.offline_left_pad_tokens,
-                self.streaming_right_pad_tokens,
-            );
-            let predicted_audio_frames = left_pad
-                .checked_add(audio.len())
-                .and_then(|samples| samples.checked_add(right_pad))
-                .ok_or_else(|| Error::InvalidInput("Voxtral audio length overflow".into()))?
-                / self.raw_audio_length_per_tok.max(1);
-            voxtral_realtime_offline_frame_limit(
-                backend,
-                predicted_audio_frames,
-                model_context_limit,
-            )?;
-        }
+        // Reject over-long audio before the encoder runs over all of it.
+        let (left_pad, right_pad) = offline_streaming_padding_samples(
+            audio.len(),
+            self.layout.raw_audio_length_per_tok,
+            self.layout.left_pad_tokens,
+            self.layout.right_pad_tokens,
+        );
+        let predicted_audio_frames = left_pad
+            .checked_add(audio.len())
+            .and_then(|samples| samples.checked_add(right_pad))
+            .ok_or_else(|| Error::InvalidInput("Voxtral audio length overflow".into()))?
+            / self.layout.raw_audio_length_per_tok.max(1);
+        voxtral_realtime_offline_frame_limit(backend, predicted_audio_frames, model_context_limit)?;
 
         let padded_audio = self.pad_offline_streaming_audio(&audio);
 
@@ -1155,18 +1253,8 @@ impl VoxtralRealtimeModel {
             });
         }
 
-        // Apply time conditioning
-        let time_tensor = Tensor::from_vec(
-            vec![self.num_delay_tokens as f32],
-            (1,),
-            &self.device.device,
-        )?
-        .to_dtype(self.dtype)?;
-        let t_cond = self.time_embedding.forward(&time_tensor)?;
-
         // Generate
-        let mut prompt_tokens = self.tokenizer.build_transcription_prompt()?;
-        prompt_tokens.truncate(voxtral_generation_prefix_len(prompt_tokens.len()));
+        let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         let prompt_len = prompt_tokens.len();
         let max_frames =
             voxtral_realtime_offline_frame_limit(backend, audio_frames, model_context_limit)?;
@@ -1200,17 +1288,12 @@ impl VoxtralRealtimeModel {
             audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
         }
         let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
-        let prompt_t_cond = if t_cond.dtype() == prompt_embeds.dtype() {
-            t_cond.clone()
-        } else {
-            t_cond.to_dtype(prompt_embeds.dtype())?
-        };
         let logits = self.language_model.forward_managed_with_embeds(
             &prompt_embeds,
             0,
             cache,
             None,
-            Some(&prompt_t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         let mut next = argmax(&next_logits)?;
@@ -1242,23 +1325,19 @@ impl VoxtralRealtimeModel {
                 audio_step = audio_step.to_dtype(text_embed.dtype())?;
             }
             let step_embeds = audio_step.broadcast_add(&text_embed)?;
-            let step_t_cond = if t_cond.dtype() == step_embeds.dtype() {
-                t_cond.clone()
-            } else {
-                t_cond.to_dtype(step_embeds.dtype())?
-            };
 
             let logits = self.language_model.forward_managed_with_embeds(
                 &step_embeds,
                 frame_idx,
                 cache,
                 None,
-                Some(&step_t_cond),
+                Some(&self.ada_scales),
             )?;
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             next = argmax(&next_logits)?;
             frame_idx += 1;
         }
+        flush_generated_text(&self.tokenizer, &generated, &mut assembled, &mut on_delta)?;
         let token_decode_duration = decode_start.elapsed();
         let timings = VoxtralRealtimeTimings {
             preprocess: preprocess_duration,
@@ -1290,9 +1369,9 @@ impl VoxtralRealtimeModel {
     fn pad_offline_streaming_audio(&self, audio: &[f32]) -> Vec<f32> {
         let (left_pad, right_pad) = offline_streaming_padding_samples(
             audio.len(),
-            self.raw_audio_length_per_tok,
-            self.offline_left_pad_tokens,
-            self.streaming_right_pad_tokens,
+            self.layout.raw_audio_length_per_tok,
+            self.layout.left_pad_tokens,
+            self.layout.right_pad_tokens,
         );
         let mut padded = Vec::with_capacity(left_pad + audio.len() + right_pad);
         padded.extend(std::iter::repeat_n(0.0, left_pad));
@@ -1314,21 +1393,7 @@ impl VoxtralRealtimeModel {
             .len()
             .checked_add(appended_samples)
             .ok_or_else(|| Error::InvalidInput("Voxtral realtime audio length overflow".into()))?;
-        realtime_preparation_geometry_for(
-            source_samples,
-            sample_rate,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().hop_length,
-            self.mel.config().n_mels,
-            self.raw_audio_length_per_tok,
-            self.offline_left_pad_tokens,
-            self.streaming_right_pad_tokens,
-            self.block_pool_size,
-            self.config.text_dim,
-            self.whisper_encoder.conv1_spec,
-            self.whisper_encoder.conv2_spec,
-            mode,
-        )
+        realtime_preparation_geometry_for(source_samples, sample_rate, &self.layout, mode)
     }
 
     pub(crate) fn realtime_preparation_batch_geometry(
@@ -1348,10 +1413,17 @@ impl VoxtralRealtimeModel {
                 "Voxtral preparation rows must produce non-empty encoder inputs".into(),
             ));
         }
-        let materialized_tensor_elements_per_row =
-            self.realtime_materialized_elements(padded_mel_frames, padded_conv_frames)?;
-        let workspace_per_row_bytes =
-            self.realtime_workspace_bytes(padded_mel_frames, padded_conv_frames)?;
+        let materialized_tensor_elements_per_row = realtime_materialized_elements_for(
+            &self.layout,
+            padded_mel_frames,
+            padded_conv_frames,
+        )?;
+        let workspace_per_row_bytes = realtime_workspace_bytes_for(
+            &self.layout,
+            padded_mel_frames,
+            padded_conv_frames,
+            self.dtype.size_in_bytes(),
+        )?;
         Ok(VoxtralRealtimePreparationBatchGeometry {
             width,
             padded_mel_frames,
@@ -1364,35 +1436,11 @@ impl VoxtralRealtimeModel {
     pub(crate) fn realtime_preparation_stage_seal(
         &self,
     ) -> Result<VoxtralRealtimePreparationStageSeal> {
-        let max_source_samples = self.realtime_max_source_samples.ok_or_else(|| {
-            Error::ModelLoadError(
-                "Voxtral realtime preparation is disabled because chunk_length_s is absent".into(),
-            )
-        })?;
-        let max = realtime_preparation_geometry_for(
-            max_source_samples,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().hop_length,
-            self.mel.config().n_mels,
-            self.raw_audio_length_per_tok,
-            self.offline_left_pad_tokens,
-            self.streaming_right_pad_tokens,
-            self.block_pool_size,
-            self.config.text_dim,
-            self.whisper_encoder.conv1_spec,
-            self.whisper_encoder.conv2_spec,
-            VoxtralRealtimePreparationMode::Finish,
-        )?;
-        Ok(VoxtralRealtimePreparationStageSeal {
-            max_source_samples,
-            max_work_units: u64::try_from(max_source_samples).map_err(|_| {
-                Error::ModelLoadError("Voxtral realtime work ceiling exceeds u64".into())
-            })?,
-            max_materialized_tensor_elements_per_row: self
-                .realtime_materialized_elements(max.mel_frames, max.conv2_frames)?,
-            max_workspace_bytes: self.realtime_workspace_bytes(max.mel_frames, max.conv2_frames)?,
-        })
+        realtime_preparation_stage_seal_for(
+            &self.layout,
+            self.realtime_max_source_samples,
+            self.dtype.size_in_bytes(),
+        )
     }
 
     pub(crate) fn realtime_stream_peak_reservation(
@@ -1407,17 +1455,8 @@ impl VoxtralRealtimeModel {
             })?;
         let geometry = realtime_preparation_geometry_for(
             seal.max_source_samples,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().hop_length,
-            self.mel.config().n_mels,
-            self.raw_audio_length_per_tok,
-            self.offline_left_pad_tokens,
-            self.streaming_right_pad_tokens,
-            self.block_pool_size,
-            self.config.text_dim,
-            self.whisper_encoder.conv1_spec,
-            self.whisper_encoder.conv2_spec,
+            self.layout.target_rate,
+            &self.layout,
             VoxtralRealtimePreparationMode::Finish,
         )?;
         let embedding_bytes = geometry
@@ -1460,28 +1499,12 @@ impl VoxtralRealtimeModel {
         sample_rate: u32,
         mode: VoxtralRealtimePreparationMode,
     ) -> Result<VoxtralRealtimePreparationGeometry> {
-        if source_samples == 0
-            || source_samples > self.realtime_preparation_stage_seal()?.max_source_samples
-        {
+        if source_samples == 0 || source_samples > self.realtime_max_source_samples {
             return Err(Error::InvalidInput(
                 "Voxtral cumulative source samples are outside the sealed realtime range".into(),
             ));
         }
-        realtime_preparation_geometry_for(
-            source_samples,
-            sample_rate,
-            self.mel.config().sample_rate as u32,
-            self.mel.config().hop_length,
-            self.mel.config().n_mels,
-            self.raw_audio_length_per_tok,
-            self.offline_left_pad_tokens,
-            self.streaming_right_pad_tokens,
-            self.block_pool_size,
-            self.config.text_dim,
-            self.whisper_encoder.conv1_spec,
-            self.whisper_encoder.conv2_spec,
-            mode,
-        )
+        realtime_preparation_geometry_for(source_samples, sample_rate, &self.layout, mode)
     }
 
     pub(crate) fn realtime_prepared_resource_usage(
@@ -1548,8 +1571,9 @@ impl VoxtralRealtimeModel {
                 ));
             }
             let left_pad = self
+                .layout
                 .raw_audio_length_per_tok
-                .checked_mul(self.offline_left_pad_tokens)
+                .checked_mul(self.layout.left_pad_tokens)
                 .ok_or_else(|| Error::InvalidInput("Voxtral left padding overflow".into()))?;
             let right_pad = geometry
                 .padded_samples
@@ -1695,11 +1719,6 @@ impl VoxtralRealtimeModel {
         sample_rate: u32,
         mode: VoxtralRealtimePreparationMode,
     ) -> Result<()> {
-        if self.realtime_max_source_samples.is_none() {
-            return Err(Error::ModelLoadError(
-                "Voxtral realtime preparation requires a finite chunk_length_s".into(),
-            ));
-        }
         if state.input_closed || state.finished || state.final_padding_applied {
             return Err(Error::InvalidInput(
                 "Voxtral realtime input is already closed or finished".into(),
@@ -1728,49 +1747,13 @@ impl VoxtralRealtimeModel {
             .len()
             .checked_add(appended_samples)
             .ok_or_else(|| Error::InvalidInput("Voxtral realtime audio length overflow".into()))?;
-        let target_rate = self.mel.config().sample_rate as u32;
-        let ceiling = self.realtime_max_source_samples.unwrap();
-        validate_realtime_sample_ceiling(total, sample_rate, target_rate, ceiling)?;
+        validate_realtime_sample_ceiling(
+            total,
+            sample_rate,
+            self.layout.target_rate,
+            self.realtime_max_source_samples,
+        )?;
         Ok(())
-    }
-
-    fn realtime_materialized_elements(&self, mel_frames: usize, conv_frames: usize) -> Result<u64> {
-        let conv1_frames = conv_output_length(mel_frames, self.whisper_encoder.conv1_spec)?;
-        checked_materialized_elements(
-            mel_frames,
-            conv1_frames,
-            conv_frames,
-            self.mel.config().n_mels,
-            self.whisper_encoder.hidden_size,
-            self.config.text_dim,
-        )
-    }
-
-    fn realtime_workspace_bytes(&self, mel_frames: usize, conv_frames: usize) -> Result<u64> {
-        checked_workspace_bytes(
-            self.realtime_materialized_elements(mel_frames, conv_frames)?,
-            conv_frames,
-            self.whisper_encoder.hidden_size,
-            self.whisper_encoder.ffn_dim,
-            self.whisper_encoder.num_heads,
-            self.whisper_encoder.sliding_window,
-            self.dtype.size_in_bytes(),
-        )
-    }
-
-    fn realtime_time_condition(&self, reference: &Tensor) -> Result<Tensor> {
-        let time = Tensor::from_vec(
-            vec![self.num_delay_tokens as f32],
-            (1,),
-            &self.device.device,
-        )?
-        .to_dtype(self.dtype)?;
-        let condition = self.time_embedding.forward(&time)?;
-        if condition.dtype() == reference.dtype() {
-            Ok(condition)
-        } else {
-            condition.to_dtype(reference.dtype()).map_err(Error::from)
-        }
     }
 
     fn accept_realtime_prediction(
@@ -1781,12 +1764,10 @@ impl VoxtralRealtimeModel {
         let specials = self.tokenizer.specials();
         if token == specials.eos || Some(token) == specials.end_audio {
             state.pending_input_token = None;
-            state.finished = true;
-            return Ok(self.realtime_step(state, String::new()));
+            return self.finish_realtime_text(state);
         }
-        let previous = state.assembled.clone();
         let mut no_callback = None;
-        append_generated_token(
+        let delta = append_generated_token(
             &self.tokenizer,
             &mut state.generated,
             &mut state.assembled,
@@ -1794,7 +1775,23 @@ impl VoxtralRealtimeModel {
             &mut no_callback,
         )?;
         state.pending_input_token = Some(token);
-        let delta = text_delta(&previous, &state.assembled);
+        Ok(self.realtime_step(state, delta))
+    }
+
+    /// Finish the stream, flushing any held-back partial character into the
+    /// final delta.
+    fn finish_realtime_text(
+        &self,
+        state: &mut VoxtralRealtimeState,
+    ) -> Result<VoxtralRealtimeStep> {
+        let mut no_callback = None;
+        let delta = flush_generated_text(
+            &self.tokenizer,
+            &state.generated,
+            &mut state.assembled,
+            &mut no_callback,
+        )?;
+        state.finished = true;
         Ok(self.realtime_step(state, delta))
     }
 
@@ -1848,6 +1845,7 @@ impl VoxtralRealtimeModel {
             "execution": {
                 "device_kind": format!("{:?}", self.device.kind),
                 "dtype": format!("{:?}", self.dtype),
+                "precision": self.precision.diagnostics(),
                 "flash_attention_requested": flash_attention_requested(),
                 "flash_attention_compiled": flash_attention_compiled(),
                 "cache": cache,
@@ -1856,10 +1854,10 @@ impl VoxtralRealtimeModel {
             "config": {
                 "num_delay_tokens": self.num_delay_tokens,
                 "streaming_left_pad_tokens": self.streaming_left_pad_tokens,
-                "offline_left_pad_tokens": self.offline_left_pad_tokens,
-                "streaming_right_pad_tokens": self.streaming_right_pad_tokens,
-                "raw_audio_length_per_tok": self.raw_audio_length_per_tok,
-                "block_pool_size": self.block_pool_size,
+                "offline_left_pad_tokens": self.layout.left_pad_tokens,
+                "streaming_right_pad_tokens": self.layout.right_pad_tokens,
+                "raw_audio_length_per_tok": self.layout.raw_audio_length_per_tok,
+                "block_pool_size": self.layout.pool_size,
                 "audio_length_per_tok": self.audio_length_per_tok
             }
         })
@@ -1887,7 +1885,7 @@ impl VoxtralRealtimeModel {
 
     /// Pool audio embeddings by block_size
     fn pool_audio_embeddings(&self, audio_embeds: &Tensor) -> Result<Tensor> {
-        pool_audio_embeddings_by_block(audio_embeds, self.block_pool_size)
+        pool_audio_embeddings_by_block(audio_embeds, self.layout.pool_size)
     }
 }
 
@@ -1935,12 +1933,74 @@ fn pool_audio_embeddings_by_block(audio_embeds: &Tensor, pool_size: usize) -> Re
     }
 }
 
+/// One stem convolution. The zero padding is applied explicitly before the
+/// convolution (whose own padding is 0), so it can be one-sided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Conv1dGeometry {
     kernel: usize,
     stride: usize,
-    padding: usize,
+    left_padding: usize,
+    right_padding: usize,
     dilation: usize,
+}
+
+impl Conv1dGeometry {
+    /// Symmetric padding of one frame, as in the classic Whisper stem.
+    fn symmetric(kernel: usize, stride: usize) -> Self {
+        Self {
+            kernel,
+            stride,
+            left_padding: 1,
+            right_padding: 1,
+            dilation: 1,
+        }
+    }
+
+    /// Causal padding as in HF `VoxtralRealtimeCausalConv1d` and vLLM
+    /// `WhisperCausalConv1d`: `(k - 1) * d + 1 - stride` zeros on the left
+    /// only (here `d = 1`), so output `j` reads input frames no later than
+    /// `(j + 1) * stride - 1`, the end of its own stride block.
+    fn causal(kernel: usize, stride: usize) -> Self {
+        Self {
+            kernel,
+            stride,
+            left_padding: kernel.saturating_sub(stride),
+            right_padding: 0,
+            dilation: 1,
+        }
+    }
+}
+
+/// The encoder's two-convolution stem, shared by the loaded encoder and the
+/// weights-free realtime layout. Voxtral Realtime's stem is causal; the
+/// classic Whisper branch keeps symmetric padding.
+fn conv_stem_geometry(
+    cfg: &super::config::AudioEncoderConfig,
+    is_voxtral: bool,
+) -> (Conv1dGeometry, Conv1dGeometry) {
+    let conv = if is_voxtral {
+        Conv1dGeometry::causal
+    } else {
+        Conv1dGeometry::symmetric
+    };
+    (
+        conv(cfg.conv1_kernel_size, cfg.conv1_stride),
+        conv(cfg.conv2_kernel_size, cfg.conv2_stride),
+    )
+}
+
+/// Apply one stem convolution with its explicit zero padding.
+fn conv1d_with_geometry(
+    conv: &candle_nn::Conv1d,
+    spec: Conv1dGeometry,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let x = if spec.left_padding == 0 && spec.right_padding == 0 {
+        x.clone()
+    } else {
+        x.pad_with_zeros(D::Minus1, spec.left_padding, spec.right_padding)?
+    };
+    conv.forward(&x).map_err(Error::from)
 }
 
 fn conv_output_length(input: usize, spec: Conv1dGeometry) -> Result<usize> {
@@ -1949,12 +2009,10 @@ fn conv_output_length(input: usize, spec: Conv1dGeometry) -> Result<usize> {
             "Voxtral encoder has invalid convolution geometry".into(),
         ));
     }
-    let padded =
-        input
-            .checked_add(spec.padding.checked_mul(2).ok_or_else(|| {
-                Error::InvalidInput("Voxtral convolution padding overflow".into())
-            })?)
-            .ok_or_else(|| Error::InvalidInput("Voxtral convolution length overflow".into()))?;
+    let padded = input
+        .checked_add(spec.left_padding)
+        .and_then(|length| length.checked_add(spec.right_padding))
+        .ok_or_else(|| Error::InvalidInput("Voxtral convolution length overflow".into()))?;
     let receptive = spec
         .dilation
         .checked_mul(spec.kernel - 1)
@@ -2007,10 +2065,6 @@ pub struct WhisperEncoder {
     is_causal: bool,
     conv1_spec: Conv1dGeometry,
     conv2_spec: Conv1dGeometry,
-    hidden_size: usize,
-    ffn_dim: usize,
-    num_heads: usize,
-    sliding_window: Option<usize>,
 }
 
 impl WhisperEncoder {
@@ -2029,18 +2083,20 @@ impl WhisperEncoder {
         vb: VarBuilder,
         is_voxtral: bool,
     ) -> Result<Self> {
+        let (conv1_spec, conv2_spec) = conv_stem_geometry(cfg, is_voxtral);
+        // Padding is applied by `conv1d_with_geometry`, never by the conv.
         let conv1_config = candle_nn::Conv1dConfig {
-            stride: cfg.conv1_stride,
-            padding: 1,
+            stride: conv1_spec.stride,
+            padding: 0,
             groups: 1,
-            dilation: 1,
+            dilation: conv1_spec.dilation,
             ..Default::default()
         };
         let conv2_config = candle_nn::Conv1dConfig {
-            stride: cfg.conv2_stride,
-            padding: 1,
+            stride: conv2_spec.stride,
+            padding: 0,
             groups: 1,
-            dilation: 1,
+            dilation: conv2_spec.dilation,
             ..Default::default()
         };
 
@@ -2118,22 +2174,8 @@ impl WhisperEncoder {
             ln_post_rms,
             embed_positions,
             is_causal: cfg.is_causal,
-            conv1_spec: Conv1dGeometry {
-                kernel: cfg.conv1_kernel_size,
-                stride: cfg.conv1_stride,
-                padding: 1,
-                dilation: 1,
-            },
-            conv2_spec: Conv1dGeometry {
-                kernel: cfg.conv2_kernel_size,
-                stride: cfg.conv2_stride,
-                padding: 1,
-                dilation: 1,
-            },
-            hidden_size: cfg.d_model,
-            ffn_dim: cfg.encoder_ffn_dim,
-            num_heads: cfg.encoder_attention_heads,
-            sliding_window: (cfg.is_causal && cfg.sliding_window > 0).then_some(cfg.sliding_window),
+            conv1_spec,
+            conv2_spec,
         })
     }
 
@@ -2143,10 +2185,8 @@ impl WhisperEncoder {
         let x = input_features.transpose(1, 2)?;
 
         // Conv layers with gelu
-        let x = self.conv1.forward(&x)?;
-        let x = gelu(&x)?;
-        let x = self.conv2.forward(&x)?;
-        let x = gelu(&x)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
 
         // Transpose back: [batch, hidden, frames] -> [batch, frames, hidden]
         let x = x.transpose(1, 2)?;
@@ -2164,8 +2204,9 @@ impl WhisperEncoder {
 
         // Transformer layers
         let mut x = x;
+        let tables = EncoderForwardTables::default();
         for layer in &self.layers {
-            x = layer.forward(&x, self.is_causal)?;
+            x = layer.forward(&x, self.is_causal, &tables)?;
         }
 
         // Final layer norm
@@ -2191,7 +2232,7 @@ impl WhisperEncoder {
             .iter()
             .map(|length| conv_output_length(*length, self.conv1_spec))
             .collect::<Result<Vec<_>>>()?;
-        let x = gelu(&self.conv1.forward(&x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
         let conv1_frames = x.dim(2)?;
         let conv1_mask = channel_valid_mask(&conv1_lengths, conv1_frames, &x)?;
         let x = x.broadcast_mul(&conv1_mask)?;
@@ -2200,7 +2241,7 @@ impl WhisperEncoder {
             .iter()
             .map(|length| conv_output_length(*length, self.conv2_spec))
             .collect::<Result<Vec<_>>>()?;
-        let x = gelu(&self.conv2.forward(&x)?)?;
+        let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
         let conv2_frames = x.dim(2)?;
         let conv2_channel_mask = channel_valid_mask(&conv2_lengths, conv2_frames, &x)?;
         let x = x.broadcast_mul(&conv2_channel_mask)?.transpose(1, 2)?;
@@ -2213,8 +2254,15 @@ impl WhisperEncoder {
         } else {
             x
         };
+        let tables = EncoderForwardTables::default();
         for layer in &self.layers {
-            x = layer.forward_valid_lengths(&x, self.is_causal, &conv2_lengths, &frame_mask)?;
+            x = layer.forward_valid_lengths(
+                &x,
+                self.is_causal,
+                &conv2_lengths,
+                &frame_mask,
+                &tables,
+            )?;
         }
         let x = if let Some(ln_post_rms) = &self.ln_post_rms {
             ln_post_rms.forward(&x)?
@@ -2238,10 +2286,8 @@ impl WhisperEncoder {
         for mel in mel_features {
             // mel: [n_mels, seq_len] -> [1, n_mels, seq_len]
             let x = prepare_realtime_conv_input(mel)?;
-            let x = self.conv1.forward(&x)?;
-            let x = gelu(&x)?;
-            let x = self.conv2.forward(&x)?;
-            let x = gelu(&x)?;
+            let x = gelu(&conv1d_with_geometry(&self.conv1, self.conv1_spec, &x)?)?;
+            let x = gelu(&conv1d_with_geometry(&self.conv2, self.conv2_spec, &x)?)?;
             // [1, hidden, seq_len] -> [hidden, seq_len]
             let x = x.squeeze(0)?;
             outputs.push(x);
@@ -2351,14 +2397,19 @@ impl WhisperEncoderLayer {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, is_causal: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Tensor> {
         let residual = x;
         let x = if self.is_voxtral {
             self.self_attn_rms_norm.as_ref().unwrap().forward(x)?
         } else {
             self.self_attn_layer_norm.as_ref().unwrap().forward(x)?
         };
-        let x = self.self_attn.forward(&x, is_causal)?;
+        let x = self.self_attn.forward(&x, is_causal, tables)?;
         let x = (residual + x)?;
 
         let residual = &x;
@@ -2393,6 +2444,7 @@ impl WhisperEncoderLayer {
         is_causal: bool,
         valid_lengths: &[usize],
         frame_mask: &Tensor,
+        tables: &EncoderForwardTables,
     ) -> Result<Tensor> {
         let residual = x.broadcast_mul(frame_mask)?;
         let normalized = if self.is_voxtral {
@@ -2409,7 +2461,7 @@ impl WhisperEncoderLayer {
         .broadcast_mul(frame_mask)?;
         let attention = self
             .self_attn
-            .forward_valid_lengths(&normalized, is_causal, valid_lengths, frame_mask)?
+            .forward_valid_lengths(&normalized, is_causal, valid_lengths, frame_mask, tables)?
             .broadcast_mul(frame_mask)?;
         let x = residual
             .broadcast_add(&attention)?
@@ -2510,7 +2562,12 @@ impl WhisperAttention {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, is_causal: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
@@ -2525,14 +2582,7 @@ impl WhisperAttention {
             .transpose(1, 2)?;
 
         if self.use_rope_positions {
-            let (cos, sin) = build_rope_cache(
-                seq_len,
-                self.head_dim,
-                0,
-                self.rope_theta,
-                x.device(),
-                q.dtype(),
-            )?;
+            let (cos, sin) = tables.rope(seq_len, self.head_dim, self.rope_theta, &q)?;
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
@@ -2593,12 +2643,7 @@ impl WhisperAttention {
 
         // Apply causal/sliding mask if needed
         let attn_weights = if is_causal {
-            let mask = create_causal_mask(
-                seq_len,
-                self.sliding_window,
-                x.device(),
-                attn_weights.dtype(),
-            )?;
+            let mask = tables.causal_mask(seq_len, self.sliding_window, &attn_weights)?;
             attn_weights.broadcast_add(&mask)?
         } else {
             attn_weights
@@ -2624,6 +2669,7 @@ impl WhisperAttention {
         is_causal: bool,
         valid_lengths: &[usize],
         frame_mask: &Tensor,
+        tables: &EncoderForwardTables,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
         validate_valid_lengths(batch, seq_len, valid_lengths)?;
@@ -2636,14 +2682,7 @@ impl WhisperAttention {
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
         if self.use_rope_positions {
-            let (cos, sin) = build_rope_cache(
-                seq_len,
-                self.head_dim,
-                0,
-                self.rope_theta,
-                x.device(),
-                q.dtype(),
-            )?;
+            let (cos, sin) = tables.rope(seq_len, self.head_dim, self.rope_theta, &q)?;
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
@@ -2657,14 +2696,13 @@ impl WhisperAttention {
         let weights = q.matmul(&k.transpose(1, 2)?)?;
         let scale = attention_scale_tensor(self.scale, &weights)?;
         let weights = weights.broadcast_mul(&scale)?;
-        let mask = create_valid_attention_mask(
+        let mask = tables.valid_attention_mask(
             valid_lengths,
             self.num_heads,
             seq_len,
             is_causal,
             self.sliding_window,
-            x.device(),
-            weights.dtype(),
+            &weights,
         )?;
         let weights = candle_nn::ops::softmax(&weights.broadcast_add(&mask)?, 2)?;
         let output = weights
@@ -2676,6 +2714,125 @@ impl WhisperAttention {
             .forward(&output)?
             .broadcast_mul(frame_mask)
             .map_err(Error::from)
+    }
+}
+
+/// Attention inputs that depend only on the sequence geometry, built at most
+/// once per encoder forward and shared by every layer. Each layer used to
+/// rebuild them: the RoPE cos/sin tables (host angles, upload, device
+/// `cos`/`sin`) and an O(seq²) host mask uploaded per layer (32 layers; a
+/// 30 s window is a 1500 x 1500 mask). Every entry is keyed by its full
+/// geometry and rebuilt on any mismatch, so a cache hit returns exactly what
+/// the layer would have built.
+#[derive(Default)]
+struct EncoderForwardTables {
+    rope: RefCell<Option<(RopeTableKey, (Tensor, Tensor))>>,
+    causal_mask: RefCell<Option<(CausalMaskKey, Tensor)>>,
+    valid_mask: RefCell<Option<(ValidMaskKey, Tensor)>>,
+    builds: Cell<usize>,
+}
+
+type RopeTableKey = (usize, usize, u64, DType, candle_core::DeviceLocation);
+type CausalMaskKey = (usize, Option<usize>, DType, candle_core::DeviceLocation);
+type ValidMaskKey = (
+    Vec<usize>,
+    usize,
+    usize,
+    bool,
+    Option<usize>,
+    DType,
+    candle_core::DeviceLocation,
+);
+
+impl EncoderForwardTables {
+    fn cached<K: PartialEq, V: Clone>(
+        &self,
+        slot: &RefCell<Option<(K, V)>>,
+        key: K,
+        build: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        if let Some((cached_key, value)) = slot.borrow().as_ref() {
+            if *cached_key == key {
+                return Ok(value.clone());
+            }
+        }
+        let value = build()?;
+        self.builds.set(self.builds.get() + 1);
+        *slot.borrow_mut() = Some((key, value.clone()));
+        Ok(value)
+    }
+
+    fn rope(
+        &self,
+        seq_len: usize,
+        head_dim: usize,
+        rope_theta: f64,
+        reference: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = reference.device();
+        let key = (
+            seq_len,
+            head_dim,
+            rope_theta.to_bits(),
+            reference.dtype(),
+            device.location(),
+        );
+        self.cached(&self.rope, key, || {
+            build_rope_cache(seq_len, head_dim, 0, rope_theta, device, reference.dtype())
+        })
+    }
+
+    fn causal_mask(
+        &self,
+        seq_len: usize,
+        sliding_window: Option<usize>,
+        reference: &Tensor,
+    ) -> Result<Tensor> {
+        let key = (
+            seq_len,
+            sliding_window,
+            reference.dtype(),
+            reference.device().location(),
+        );
+        self.cached(&self.causal_mask, key, || {
+            create_causal_mask(
+                seq_len,
+                sliding_window,
+                reference.device(),
+                reference.dtype(),
+            )
+        })
+    }
+
+    fn valid_attention_mask(
+        &self,
+        valid_lengths: &[usize],
+        heads: usize,
+        seq_len: usize,
+        is_causal: bool,
+        sliding_window: Option<usize>,
+        reference: &Tensor,
+    ) -> Result<Tensor> {
+        let key = (
+            valid_lengths.to_vec(),
+            heads,
+            seq_len,
+            is_causal,
+            sliding_window,
+            reference.dtype(),
+            reference.device().location(),
+        );
+        self.cached(&self.valid_mask, key, || {
+            create_valid_attention_mask(
+                valid_lengths,
+                heads,
+                seq_len,
+                is_causal,
+                sliding_window,
+                reference.device(),
+                reference.dtype(),
+            )
+        })
     }
 }
 
@@ -2833,19 +2990,40 @@ fn drop_last_mel_frame_for_voxtral(log_mel: &mut Vec<Vec<f32>>) {
     log_mel.pop();
 }
 
-fn voxtral_generation_prefix_len(standard_prompt_len: usize) -> usize {
-    standard_prompt_len.saturating_sub(1).max(1)
-}
-
 fn append_generated_token(
     tokenizer: &VoxtralTokenizer,
     generated: &mut Vec<u32>,
     assembled: &mut String,
     token: u32,
     on_delta: &mut Option<&mut dyn FnMut(&str)>,
-) -> Result<()> {
+) -> Result<String> {
+    // Extend the transcript to its last complete character: a character
+    // whose bytes span several tokens appears once its last byte arrives.
     generated.push(token);
-    let decoded = tokenizer.decode_text(generated)?;
+    let decoded = tokenizer.decode_text_prefix(generated)?;
+    Ok(advance_assembled_text(assembled, decoded, on_delta))
+}
+
+/// Decode every generated byte once generation ends, so a trailing partial
+/// character surfaces as U+FFFD instead of vanishing; returns the appended
+/// text.
+fn flush_generated_text(
+    tokenizer: &VoxtralTokenizer,
+    generated: &[u32],
+    assembled: &mut String,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> Result<String> {
+    let decoded = tokenizer.decode_text_final(generated)?;
+    Ok(advance_assembled_text(assembled, decoded, on_delta))
+}
+
+/// Replace the transcript with `decoded`, report the appended text to
+/// `on_delta` one character at a time, and return it.
+fn advance_assembled_text(
+    assembled: &mut String,
+    decoded: String,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> String {
     let delta = text_delta(assembled, &decoded);
     if let Some(on_delta) = on_delta.as_deref_mut() {
         for ch in delta.chars() {
@@ -2854,7 +3032,7 @@ fn append_generated_token(
         }
     }
     *assembled = decoded;
-    Ok(())
+    delta
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -2959,16 +3137,18 @@ fn validate_realtime_sample_ceiling(
     let resampled_samples = resampled_length(source_samples, source_rate, target_rate)?;
     if source_samples > ceiling || resampled_samples > ceiling {
         return Err(Error::InvalidInput(format!(
-            "Voxtral realtime stream has {source_samples} source samples ({resampled_samples} at {target_rate} Hz), exceeding its loaded ceiling"
+            "Voxtral realtime stream has {source_samples} source samples ({resampled_samples} at {target_rate} Hz), exceeding the {ceiling}-sample realtime session ceiling"
         )));
     }
     Ok(resampled_samples)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn realtime_preparation_geometry_for(
-    source_samples: usize,
-    source_rate: u32,
+/// Weights-free geometry of realtime preparation, derived at load from the
+/// published `params.json`, the `config.json` sidecar and the `tekken.json`
+/// audio metadata. Preparation, the stage seal and stream reservations all
+/// read it, so the published configs can be checked without weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VoxtralRealtimeLayout {
     target_rate: u32,
     hop_length: usize,
     n_mels: usize,
@@ -2979,23 +3159,106 @@ fn realtime_preparation_geometry_for(
     text_dim: usize,
     conv1: Conv1dGeometry,
     conv2: Conv1dGeometry,
+    encoder_hidden: usize,
+    encoder_ffn: usize,
+    encoder_heads: usize,
+    encoder_sliding_window: Option<usize>,
+}
+
+impl VoxtralRealtimeLayout {
+    fn new(
+        config: &VoxtralConfig,
+        audio: &AudioConfig,
+        pool_size: usize,
+        audio_length_per_tok: usize,
+    ) -> Result<Self> {
+        let encoder = config.audio_config();
+        let target_rate = u32::try_from(encoder.sampling_rate)
+            .map_err(|_| Error::ModelLoadError("Voxtral sampling rate exceeds u32".into()))?;
+        let (conv1, conv2) = conv_stem_geometry(&encoder, true);
+        let layout = Self {
+            target_rate,
+            hop_length: encoder.hop_length,
+            n_mels: encoder.num_mel_bins,
+            raw_audio_length_per_tok: audio.raw_audio_length_per_tok(),
+            // Offline audio carries the same left silence as a stream
+            // (mistral_common `_get_streaming_pad`); the 39-token prompt then
+            // covers 32 silent tokens plus the first 7 audio tokens.
+            left_pad_tokens: audio.streaming_left_pad_tokens,
+            right_pad_tokens: audio.offline_right_pad_tokens(),
+            pool_size,
+            text_dim: config.text_dim,
+            conv1,
+            conv2,
+            encoder_hidden: encoder.d_model,
+            encoder_ffn: encoder.encoder_ffn_dim,
+            encoder_heads: encoder.encoder_attention_heads,
+            encoder_sliding_window: (encoder.is_causal && encoder.sliding_window > 0)
+                .then_some(encoder.sliding_window),
+        };
+        layout.validate_frame_contract(audio_length_per_tok)?;
+        Ok(layout)
+    }
+
+    /// One audio token must cover exactly the samples and mel frames the
+    /// checkpoint was trained on: `hop * s1 * s2 * pool` samples
+    /// (`raw_audio_length_per_tok`, 160 * 1 * 2 * 4 = 1280) and
+    /// `s1 * s2 * pool` mel frames (`audio_length_per_tok`, 8). A stem that
+    /// disagrees runs the decoder at the wrong audio rate, so it fails the load.
+    fn validate_frame_contract(&self, audio_length_per_tok: usize) -> Result<()> {
+        let mel_frames_per_token = self
+            .conv1
+            .stride
+            .checked_mul(self.conv2.stride)
+            .and_then(|stride| stride.checked_mul(self.pool_size));
+        let samples_per_token =
+            mel_frames_per_token.and_then(|frames| frames.checked_mul(self.hop_length));
+        let (Some(mel_frames_per_token), Some(samples_per_token)) =
+            (mel_frames_per_token, samples_per_token)
+        else {
+            return Err(Error::ModelLoadError(
+                "Voxtral encoder stem geometry overflows".into(),
+            ));
+        };
+        if mel_frames_per_token != audio_length_per_tok
+            || samples_per_token != self.raw_audio_length_per_tok
+        {
+            return Err(Error::ModelLoadError(format!(
+                "Voxtral encoder stem (hop {}, conv strides {} and {}, pooling {}) gives {mel_frames_per_token} mel frames and {samples_per_token} samples per audio token, but the checkpoint expects {audio_length_per_tok} and {}",
+                self.hop_length,
+                self.conv1.stride,
+                self.conv2.stride,
+                self.pool_size,
+                self.raw_audio_length_per_tok
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn realtime_preparation_geometry_for(
+    source_samples: usize,
+    source_rate: u32,
+    layout: &VoxtralRealtimeLayout,
     mode: VoxtralRealtimePreparationMode,
 ) -> Result<VoxtralRealtimePreparationGeometry> {
-    if hop_length == 0 || n_mels == 0 || pool_size == 0 || text_dim == 0 {
+    if layout.hop_length == 0 || layout.n_mels == 0 || layout.pool_size == 0 || layout.text_dim == 0
+    {
         return Err(Error::ModelLoadError(
             "Voxtral realtime preparation has zero-sized model geometry".into(),
         ));
     }
-    let resampled_samples = resampled_length(source_samples, source_rate, target_rate)?;
-    let left_pad = raw_audio_length_per_tok
-        .checked_mul(left_pad_tokens)
+    let resampled_samples = resampled_length(source_samples, source_rate, layout.target_rate)?;
+    let left_pad = layout
+        .raw_audio_length_per_tok
+        .checked_mul(layout.left_pad_tokens)
         .ok_or_else(|| Error::InvalidInput("Voxtral left padding overflow".into()))?;
     let right_pad = if mode == VoxtralRealtimePreparationMode::Finish {
         offline_streaming_padding_samples(
             resampled_samples,
-            raw_audio_length_per_tok,
+            layout.raw_audio_length_per_tok,
             0,
-            right_pad_tokens,
+            layout.right_pad_tokens,
         )
         .1
     } else {
@@ -3005,19 +3268,19 @@ fn realtime_preparation_geometry_for(
         .checked_add(resampled_samples)
         .and_then(|length| length.checked_add(right_pad))
         .ok_or_else(|| Error::InvalidInput("Voxtral padded audio length overflow".into()))?;
-    let mel_frames = padded_samples / hop_length;
-    let conv1_frames = conv_output_length(mel_frames, conv1)?;
-    let conv2_frames = conv_output_length(conv1_frames, conv2)?;
-    let pooled_frames = conv2_frames / pool_size;
+    let mel_frames = padded_samples / layout.hop_length;
+    let conv1_frames = conv_output_length(mel_frames, layout.conv1)?;
+    let conv2_frames = conv_output_length(conv1_frames, layout.conv2)?;
+    let pooled_frames = conv2_frames / layout.pool_size;
     let stable_frames = if mode == VoxtralRealtimePreparationMode::Finish {
         pooled_frames
     } else {
-        pooled_frames.saturating_sub(right_pad_tokens)
+        pooled_frames.saturating_sub(layout.right_pad_tokens)
     };
     let embedding_elements = u64::try_from(pooled_frames)
         .ok()
         .and_then(|frames| {
-            u64::try_from(text_dim)
+            u64::try_from(layout.text_dim)
                 .ok()
                 .and_then(|dim| frames.checked_mul(dim))
         })
@@ -3035,28 +3298,90 @@ fn realtime_preparation_geometry_for(
     })
 }
 
+fn realtime_materialized_elements_for(
+    layout: &VoxtralRealtimeLayout,
+    mel_frames: usize,
+    conv_frames: usize,
+) -> Result<u64> {
+    checked_materialized_elements(
+        mel_frames,
+        conv_output_length(mel_frames, layout.conv1)?,
+        conv_frames,
+        layout.n_mels,
+        layout.encoder_hidden,
+        layout.text_dim,
+    )
+}
+
+fn realtime_workspace_bytes_for(
+    layout: &VoxtralRealtimeLayout,
+    mel_frames: usize,
+    conv_frames: usize,
+    dtype_bytes: usize,
+) -> Result<u64> {
+    checked_workspace_bytes(
+        realtime_materialized_elements_for(layout, mel_frames, conv_frames)?,
+        conv_frames,
+        layout.encoder_hidden,
+        layout.encoder_ffn,
+        layout.encoder_heads,
+        layout.encoder_sliding_window,
+        dtype_bytes,
+    )
+}
+
+/// The worst preparation transaction a loaded model admits: one row holding
+/// the whole session ceiling, finished with its right padding.
+fn realtime_preparation_stage_seal_for(
+    layout: &VoxtralRealtimeLayout,
+    max_source_samples: usize,
+    dtype_bytes: usize,
+) -> Result<VoxtralRealtimePreparationStageSeal> {
+    let max = realtime_preparation_geometry_for(
+        max_source_samples,
+        layout.target_rate,
+        layout,
+        VoxtralRealtimePreparationMode::Finish,
+    )?;
+    Ok(VoxtralRealtimePreparationStageSeal {
+        max_source_samples,
+        max_work_units: u64::try_from(max_source_samples).map_err(|_| {
+            Error::ModelLoadError("Voxtral realtime work ceiling exceeds u64".into())
+        })?,
+        max_materialized_tensor_elements_per_row: realtime_materialized_elements_for(
+            layout,
+            max.mel_frames,
+            max.conv2_frames,
+        )?,
+        max_workspace_bytes: realtime_workspace_bytes_for(
+            layout,
+            max.mel_frames,
+            max.conv2_frames,
+            dtype_bytes,
+        )?,
+    })
+}
+
+/// Longest cumulative source, in samples at the model rate, that one
+/// realtime session may prepare: the checkpoint's `chunk_length_s` when it
+/// sets one, otherwise the izwi session policy, bounded by the model context.
 fn realtime_source_sample_ceiling(
     config: &VoxtralConfig,
-    audio: &super::config::AudioEncoderConfig,
-    raw_audio_length_per_tok: usize,
-    left_pad_tokens: usize,
-    right_pad_tokens: usize,
-) -> Result<Option<usize>> {
-    let Some(seconds) = config
+    layout: &VoxtralRealtimeLayout,
+) -> Result<usize> {
+    let seconds = config
         .multimodal
         .whisper_model_args
         .encoder_args
         .audio_encoding_args
         .chunk_length_s
-    else {
-        return Ok(None);
-    };
-    if !seconds.is_finite() || seconds <= 0.0 || audio.sampling_rate == 0 {
+        .unwrap_or(VOXTRAL_REALTIME_DEFAULT_MAX_SESSION_SECONDS);
+    if !seconds.is_finite() || seconds <= 0.0 || layout.target_rate == 0 {
         return Err(Error::ModelLoadError(
-            "Voxtral chunk_length_s must be finite and positive".into(),
+            "Voxtral realtime session length must be finite and positive".into(),
         ));
     }
-    let policy_samples = (seconds as f64 * audio.sampling_rate as f64).ceil();
+    let policy_samples = (seconds as f64 * layout.target_rate as f64).ceil();
     if policy_samples > usize::MAX as f64 {
         return Err(Error::ModelLoadError(
             "Voxtral realtime sample policy exceeds usize".into(),
@@ -3064,12 +3389,14 @@ fn realtime_source_sample_ceiling(
     }
     let model_samples = config
         .model_max_length
-        .checked_mul(raw_audio_length_per_tok)
+        .checked_mul(layout.raw_audio_length_per_tok)
         .and_then(|total| {
-            raw_audio_length_per_tok
+            layout
+                .raw_audio_length_per_tok
                 .checked_mul(
-                    left_pad_tokens
-                        .saturating_add(right_pad_tokens)
+                    layout
+                        .left_pad_tokens
+                        .saturating_add(layout.right_pad_tokens)
                         .saturating_add(1),
                 )
                 .and_then(|padding| total.checked_sub(padding))
@@ -3083,7 +3410,7 @@ fn realtime_source_sample_ceiling(
             "Voxtral realtime sample ceiling is zero".into(),
         ));
     }
-    Ok(Some(ceiling))
+    Ok(ceiling)
 }
 
 fn checked_materialized_elements(
@@ -3266,14 +3593,38 @@ fn offline_streaming_padding_samples(
     (left_pad, right_pad)
 }
 
-fn offline_left_pad_tokens_for_generation(
-    streaming_left_pad_tokens: usize,
-    num_delay_tokens: usize,
-) -> usize {
-    let generation_prefix_tokens = streaming_left_pad_tokens.saturating_add(num_delay_tokens);
-    generation_prefix_tokens
-        .saturating_mul(2)
-        .max(streaming_left_pad_tokens)
+/// The safetensors files `VoxtralRealtimeModel::load` maps: the Mistral
+/// `consolidated.safetensors` when present, else the HF shards of
+/// `model.safetensors.index.json`, else `model.safetensors`. Load admission
+/// prices the same files (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn voxtral_realtime_weight_files(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    let consolidated_path = model_dir.join("consolidated.safetensors");
+    if consolidated_path.exists() {
+        return Ok(vec![consolidated_path]);
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![model_dir.join("model.safetensors")]);
+    }
+    let index_data = std::fs::read_to_string(&index_path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
+    let index: serde_json::Value = serde_json::from_str(&index_data)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
+
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| Error::InvalidInput("Invalid weight map".to_string()))?;
+
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    Ok(shard_files.iter().map(|f| model_dir.join(f)).collect())
 }
 
 fn load_weights<'a>(
@@ -3281,56 +3632,48 @@ fn load_weights<'a>(
     dtype: DType,
     device: &'a DeviceProfile,
 ) -> Result<VarBuilder<'a>> {
-    // Voxtral uses consolidated.safetensors (single file)
-    let consolidated_path = model_dir.join("consolidated.safetensors");
-    if consolidated_path.exists() {
-        info!("Loading Voxtral from consolidated.safetensors");
-        unsafe {
-            return VarBuilder::from_mmaped_safetensors(
-                &[consolidated_path],
-                dtype,
-                &device.device,
-            )
-            .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)));
-        }
+    let files = voxtral_realtime_weight_files(model_dir)?;
+    info!(
+        "Loading Voxtral weights from {} safetensors file(s)",
+        files.len()
+    );
+    unsafe {
+        staged::metal_staged_safetensors(&files, dtype, &device.device)
+            .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)))
     }
+}
 
-    let index_path = model_dir.join("model.safetensors.index.json");
-
-    if index_path.exists() {
-        let index_data = std::fs::read_to_string(&index_path)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to read index: {}", e)))?;
-        let index: serde_json::Value = serde_json::from_str(&index_data)
-            .map_err(|e| Error::ModelLoadError(format!("Failed to parse index: {}", e)))?;
-
-        let weight_map = index
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .ok_or_else(|| Error::InvalidInput("Invalid weight map".to_string()))?;
-
-        let mut shard_files: Vec<String> = weight_map
-            .values()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        shard_files.sort();
-        shard_files.dedup();
-
-        let shard_paths: Vec<std::path::PathBuf> =
-            shard_files.iter().map(|f| model_dir.join(f)).collect();
-
-        info!("Loading Voxtral with {} shard files", shard_paths.len());
-
-        unsafe {
-            VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load shards: {}", e)))
-        }
+/// Voxtral's own `params.json` when present, else the HF `config.json`.
+fn read_voxtral_config(model_dir: &Path) -> Result<String> {
+    let config_path = if model_dir.join("params.json").exists() {
+        model_dir.join("params.json")
     } else {
-        let weights_path = model_dir.join("model.safetensors");
-        unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device.device)
-                .map_err(|e| Error::ModelLoadError(format!("Failed to load weights: {}", e)))
-        }
-    }
+        model_dir.join("config.json")
+    };
+    std::fs::read_to_string(&config_path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed to read config: {}", e)))
+}
+
+fn voxtral_checkpoint_dtype(
+    config_str: &str,
+    runtime_config: &VoxtralRuntimeConfig,
+) -> Option<DType> {
+    checkpoint_dtype_from_config_json(config_str).or(runtime_config.checkpoint_dtype)
+}
+
+/// The weight dtype `VoxtralRealtimeModel::load` selects for the checkpoint
+/// in `model_dir` on `device`. Load admission prices the checkpoint at this
+/// dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn voxtral_realtime_weight_dtype(
+    model_dir: &Path,
+    device: &DeviceProfile,
+) -> Result<DType> {
+    let config_str = read_voxtral_config(model_dir)?;
+    let runtime_config = load_voxtral_runtime_config(model_dir)?;
+    Ok(select_voxtral_dtype(
+        device,
+        voxtral_checkpoint_dtype(&config_str, &runtime_config),
+    ))
 }
 
 fn load_voxtral_runtime_config(model_dir: &Path) -> Result<VoxtralRuntimeConfig> {
@@ -3357,47 +3700,341 @@ fn load_voxtral_runtime_config(model_dir: &Path) -> Result<VoxtralRuntimeConfig>
     })
 }
 
-fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
-    device.select_model_dtype_with_checkpoint(ModelFamily::Voxtral, checkpoint_dtype)
+/// The `params.json` and `config.json` half of the realtime geometry. The
+/// tokenizer merges the `tekken.json` audio metadata into `audio` at load.
+struct VoxtralRealtimeAudioGeometry {
+    audio: AudioConfig,
+    block_pool_size: usize,
+    audio_length_per_tok: usize,
 }
 
-/// GELU activation function
+fn realtime_audio_geometry(
+    config: &VoxtralConfig,
+    runtime: &VoxtralRuntimeConfig,
+) -> VoxtralRealtimeAudioGeometry {
+    let num_delay_tokens = runtime
+        .default_num_delay_tokens
+        .unwrap_or_else(|| config.num_delay_tokens())
+        .max(1);
+    let block_pool_size = runtime
+        .downsample_factor
+        .unwrap_or_else(|| config.block_pool_size())
+        .max(1);
+    let audio_length_per_tok = runtime
+        .audio_length_per_tok
+        .unwrap_or(block_pool_size.saturating_mul(2))
+        .max(1);
+    let encoder = config.audio_config();
+    VoxtralRealtimeAudioGeometry {
+        audio: AudioConfig {
+            sampling_rate: encoder.sampling_rate,
+            frame_rate: config.frame_rate(),
+            window_size: encoder.window_size,
+            hop_length: encoder.hop_length,
+            num_mel_bins: encoder.num_mel_bins,
+            n_delay_tokens: num_delay_tokens,
+            ..AudioConfig::default()
+        },
+        block_pool_size,
+        audio_length_per_tok,
+    }
+}
+
+/// The delay the tokenizer derived from `tekken.json`'s
+/// `transcription_delay_ms` (mistral_common's source of truth). HF's
+/// `config.json` repeats it as `default_num_delay_tokens`; a checkpoint whose
+/// two copies disagree is ambiguous, so it fails the load.
+fn checked_delay_tokens(audio: &AudioConfig, runtime: &VoxtralRuntimeConfig) -> Result<usize> {
+    match runtime.default_num_delay_tokens {
+        Some(sidecar) if sidecar != audio.n_delay_tokens => Err(Error::ModelLoadError(format!(
+            "Voxtral tekken.json transcription delay gives {} delay tokens, but config.json default_num_delay_tokens is {sidecar}",
+            audio.n_delay_tokens
+        ))),
+        _ => Ok(audio.n_delay_tokens),
+    }
+}
+
+fn select_voxtral_dtype(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DType {
+    voxtral_precision(device, checkpoint_dtype).dtype
+}
+
+/// Voxtral's dtype on `device`, and why: a BF16 checkpoint takes the Metal
+/// BF16-checkpoint LM tier (`backends/device.rs`), `IZWI_METAL_DTYPE`
+/// replaces it, CUDA follows the checkpoint and CPU runs F32.
+fn voxtral_precision(device: &DeviceProfile, checkpoint_dtype: Option<DType>) -> DTypeSelection {
+    let mut request = DTypeSelectionRequest::new(None).with_model_family(ModelFamily::Voxtral);
+    if let Some(dtype) = checkpoint_dtype {
+        request = request.with_checkpoint_dtype(dtype);
+    }
+    device.resolve_dtype(request)
+}
+
+/// Exact (erf) GELU, as HF and vLLM apply after each stem convolution.
 fn gelu(x: &Tensor) -> Result<Tensor> {
-    let coeff = 0.044715f32;
-    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-    let dtype = x.dtype();
-    let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-    let x3 = x_f32.powf(3.0)?;
-    let coeff_t = Tensor::from_vec(vec![coeff], (1,), x.device())?;
-    let x3 = x3.broadcast_mul(&coeff_t)?;
-    let sqrt_t = Tensor::from_vec(vec![sqrt_2_over_pi], (1,), x.device())?;
-    let inner = (&x_f32 + x3)?.broadcast_mul(&sqrt_t)?;
-    let tanh = inner.tanh()?;
-    let one = Tensor::from_vec(vec![1.0f32], (1,), x.device())?;
-    let half = Tensor::from_vec(vec![0.5f32], (1,), x.device())?;
-    let out = x_f32.broadcast_mul(&one.broadcast_add(&tanh)?)?;
-    let out = out.broadcast_mul(&half)?;
-    out.to_dtype(dtype)
-        .map_err(|e| Error::InferenceError(e.to_string()))
+    exact_gelu(x).map_err(Error::from)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::VoxtralConfig;
+    use super::super::tokenizer::{merge_tekken_audio_metadata, AudioConfig};
     use super::{
         apply_interleaved_rotary_emb, argmax, attention_scale_tensor,
         checked_realtime_frontend_host_peak_bytes, checked_realtime_stream_peak_bytes,
-        checked_realtime_text_host_bytes, checked_workspace_bytes, conv_output_length,
-        create_valid_attention_mask, drop_last_mel_frame_for_voxtral, load_voxtral_runtime_config,
-        mel_frames_to_tensor, normalize_log_mel_with_max, offline_left_pad_tokens_for_generation,
+        checked_realtime_text_host_bytes, checked_workspace_bytes, conv1d_with_geometry,
+        conv_output_length, create_valid_attention_mask, drop_last_mel_frame_for_voxtral,
+        load_voxtral_runtime_config, mel_frames_to_tensor, normalize_log_mel_with_max,
         offline_streaming_padding_samples, pool_audio_embeddings_by_block,
-        prepare_realtime_conv_input, realtime_preparation_geometry_for, resample_audio,
+        prepare_realtime_conv_input, realtime_audio_geometry, realtime_preparation_geometry_for,
+        realtime_preparation_stage_seal_for, realtime_source_sample_ceiling, resample_audio,
         select_voxtral_dtype, text_delta, validate_realtime_sample_ceiling,
-        voxtral_generation_prefix_len, voxtral_realtime_cuda_sliding_flash_options,
-        voxtral_realtime_offline_frame_limit, Conv1dGeometry, VoxtralRealtimePreparationMode,
+        voxtral_realtime_cuda_sliding_flash_options, voxtral_realtime_offline_frame_limit,
+        Conv1dGeometry, VoxtralRealtimeLayout, VoxtralRealtimePreparationMode,
     };
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind, DeviceProfile};
     use candle_core::{DType, Device, Tensor};
+    use std::path::PathBuf;
     use uuid::Uuid;
+
+    use super::super::tokenizer::{published_byte_ids, published_excerpt_tokenizer};
+    use super::{
+        append_generated_token, checked_delay_tokens, flush_generated_text, VoxtralRuntimeConfig,
+    };
+    use super::{PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT, VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT};
+
+    /// Sharing one table set across the encoder layers gives bit-identical
+    /// output to rebuilding the RoPE tables and masks in every layer (the
+    /// pre-change behaviour), with one build of each instead of one per layer.
+    #[test]
+    fn encoder_layers_share_rope_and_masks_bit_identically() {
+        use super::{frame_valid_mask, EncoderForwardTables, WhisperEncoder};
+        let device = Device::Cpu;
+        let cfg = super::super::config::AudioEncoderConfig {
+            d_model: 32,
+            encoder_layers: 3,
+            encoder_attention_heads: 4,
+            encoder_ffn_dim: 64,
+            num_mel_bins: 8,
+            max_source_positions: 64,
+            window_size: 400,
+            hop_length: 160,
+            sampling_rate: 16_000,
+            is_causal: true,
+            conv1_kernel_size: 3,
+            conv1_stride: 1,
+            conv2_kernel_size: 3,
+            conv2_stride: 2,
+            global_log_mel_max: None,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            pos_embed: "rope".into(),
+            sliding_window: 5,
+        };
+        let vars = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = WhisperEncoder::load_voxtral(&cfg, vb).unwrap();
+        let mut state = 0x9B05_688C_2B3E_6C1Fu64;
+        let values = (0..2 * 23 * 32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (2, 23, 32), &device).unwrap();
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+
+        let shared = EncoderForwardTables::default();
+        let (mut fresh_x, mut shared_x) = (x.clone(), x.clone());
+        let mut fresh_builds = 0;
+        for layer in &encoder.layers {
+            let fresh = EncoderForwardTables::default();
+            fresh_x = layer.forward(&fresh_x, true, &fresh).unwrap();
+            fresh_builds += fresh.builds.get();
+            shared_x = layer.forward(&shared_x, true, &shared).unwrap();
+        }
+        assert_eq!(bits(&fresh_x), bits(&shared_x));
+        assert_eq!(fresh_builds, 2 * cfg.encoder_layers);
+        assert_eq!(shared.builds.get(), 2);
+
+        let lengths = [23usize, 11];
+        let frame_mask = frame_valid_mask(&lengths, 23, &x).unwrap();
+        let shared = EncoderForwardTables::default();
+        let (mut fresh_x, mut shared_x) = (x.clone(), x.clone());
+        for layer in &encoder.layers {
+            let fresh = EncoderForwardTables::default();
+            fresh_x = layer
+                .forward_valid_lengths(&fresh_x, true, &lengths, &frame_mask, &fresh)
+                .unwrap();
+            shared_x = layer
+                .forward_valid_lengths(&shared_x, true, &lengths, &frame_mask, &shared)
+                .unwrap();
+        }
+        assert_eq!(bits(&fresh_x), bits(&shared_x));
+        assert_eq!(shared.builds.get(), 2);
+
+        // A different geometry in the same table set rebuilds instead of
+        // returning a stale entry.
+        let short = x.narrow(1, 0, 7).unwrap();
+        let expected = encoder.layers[0]
+            .forward(&short, true, &EncoderForwardTables::default())
+            .unwrap();
+        let reused = EncoderForwardTables::default();
+        encoder.layers[0].forward(&x, true, &reused).unwrap();
+        let actual = encoder.layers[0].forward(&short, true, &reused).unwrap();
+        assert_eq!(bits(&expected), bits(&actual));
+        assert_eq!(reused.builds.get(), 4);
+    }
+
+    /// Published configs of mistralai/Voxtral-Mini-4B-Realtime-2602 at
+    /// revision 2769294d: `params.json` and `config.json` verbatim, plus a
+    /// `tekken.json` excerpt (config, audio, named specials, byte tokens).
+    fn published_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voxtral_realtime_2602")
+    }
+
+    /// The weights-free half of `VoxtralRealtimeModel::load` over the
+    /// published configs; only the Tekken vocabulary and weights are skipped.
+    fn published_realtime_layout() -> (VoxtralConfig, AudioConfig, VoxtralRealtimeLayout) {
+        let dir = published_fixture_dir();
+        let params = std::fs::read_to_string(dir.join("params.json")).unwrap();
+        let config: VoxtralConfig = serde_json::from_str(&params).unwrap();
+        let runtime = load_voxtral_runtime_config(&dir).unwrap();
+        let geometry = realtime_audio_geometry(&config, &runtime);
+        let tekken = std::fs::read_to_string(dir.join("tekken_audio.json")).unwrap();
+        let audio = merge_tekken_audio_metadata(geometry.audio, &tekken).unwrap();
+        let layout = VoxtralRealtimeLayout::new(
+            &config,
+            &audio,
+            geometry.block_pool_size,
+            geometry.audio_length_per_tok,
+        )
+        .unwrap();
+        (config, audio, layout)
+    }
+
+    #[test]
+    fn published_realtime_config_seals_without_chunk_length() {
+        let (config, audio, layout) = published_realtime_layout();
+        let encoding = &config
+            .multimodal
+            .whisper_model_args
+            .encoder_args
+            .audio_encoding_args;
+        // mistral_common requires chunk_length_s to be None in streaming mode.
+        assert_eq!(encoding.chunk_length_s, None);
+        assert_eq!(encoding.transcription_format, "streaming");
+        assert_eq!(audio.streaming_left_pad_tokens, 32);
+        assert_eq!(audio.n_delay_tokens, 6);
+        // tekken.json's 480 ms delay agrees with config.json's default.
+        let runtime = load_voxtral_runtime_config(&published_fixture_dir()).unwrap();
+        assert_eq!(checked_delay_tokens(&audio, &runtime).unwrap(), 6);
+
+        let ceiling = realtime_source_sample_ceiling(&config, &layout).unwrap();
+        assert_eq!(ceiling, 480_000);
+
+        let seal =
+            realtime_preparation_stage_seal_for(&layout, ceiling, DType::BF16.size_in_bytes())
+                .unwrap();
+        assert_eq!(seal.max_source_samples, 480_000);
+        assert_eq!(seal.max_work_units, 480_000);
+        assert!(seal.max_materialized_tensor_elements_per_row > 0);
+        assert!(seal.max_workspace_bytes > 0);
+        assert!(seal.max_workspace_bytes < 4 << 30);
+    }
+
+    /// pooled = ceil(N / 1280) + 49: 32 left-pad tokens, 17 right-pad tokens
+    /// (6 delay + 1 + 10 buffer) and the alignment to whole tokens.
+    #[test]
+    fn published_offline_geometry_matches_reference_table() {
+        let (_, _, layout) = published_realtime_layout();
+        // (samples, padded, mel = conv1, conv2, pooled)
+        let table = [
+            (1, 64_000, 400, 200, 50),
+            (16_000, 79_360, 496, 248, 62),
+            (16_001, 79_360, 496, 248, 62),
+            (160_000, 222_720, 1_392, 696, 174),
+            (480_000, 542_720, 3_392, 1_696, 424),
+        ];
+        for (samples, padded, mel, conv2, pooled) in table {
+            let geometry = realtime_preparation_geometry_for(
+                samples,
+                16_000,
+                &layout,
+                VoxtralRealtimePreparationMode::Finish,
+            )
+            .unwrap();
+            assert_eq!(geometry.padded_samples, padded, "{samples} samples");
+            assert_eq!(geometry.mel_frames, mel, "{samples} samples");
+            assert_eq!(geometry.conv1_frames, mel, "{samples} samples");
+            assert_eq!(geometry.conv2_frames, conv2, "{samples} samples");
+            assert_eq!(geometry.pooled_frames, pooled, "{samples} samples");
+            assert_eq!(pooled, samples.div_ceil(1_280) + 49);
+            assert_eq!(geometry.stable_frames, pooled);
+            // HF generates one token per audio token after the 39-token prompt.
+            assert!(pooled > 39);
+        }
+    }
+
+    #[test]
+    fn frame_contract_accepts_published_stem_and_rejects_stride_two() {
+        let (config, audio, layout) = published_realtime_layout();
+        assert_eq!(layout.conv1, Conv1dGeometry::causal(3, 1));
+        assert_eq!(layout.conv2, Conv1dGeometry::causal(3, 2));
+        assert_eq!(layout.raw_audio_length_per_tok, 1_280);
+        assert_eq!(layout.left_pad_tokens, 32);
+        assert_eq!(layout.right_pad_tokens, 17);
+        layout.validate_frame_contract(8).unwrap();
+
+        // The stride-2 stem ran the decoder at 6.25 Hz instead of 12.5 Hz.
+        let mut stride_two = layout;
+        stride_two.conv1 = Conv1dGeometry::symmetric(3, 2);
+        let error = stride_two.validate_frame_contract(8).unwrap_err();
+        assert!(format!("{error}").contains("16 mel frames and 2560 samples"));
+
+        // Load runs the same check against the sidecar's audio_length_per_tok.
+        assert!(VoxtralRealtimeLayout::new(&config, &audio, 4, 16).is_err());
+    }
+
+    #[test]
+    fn realtime_ceiling_honours_chunk_length_and_model_context() {
+        let (mut config, _, layout) = published_realtime_layout();
+        let encoding = &mut config
+            .multimodal
+            .whisper_model_args
+            .encoder_args
+            .audio_encoding_args;
+        encoding.chunk_length_s = Some(10.0);
+        assert_eq!(
+            realtime_source_sample_ceiling(&config, &layout).unwrap(),
+            160_000
+        );
+
+        // A context of 100 tokens leaves room for 100 - pads - 1 tokens of audio.
+        config.model_max_length = 100;
+        let audio_tokens = 100 - layout.left_pad_tokens - layout.right_pad_tokens - 1;
+        assert_eq!(
+            realtime_source_sample_ceiling(&config, &layout).unwrap(),
+            audio_tokens * layout.raw_audio_length_per_tok
+        );
+
+        config
+            .multimodal
+            .whisper_model_args
+            .encoder_args
+            .audio_encoding_args
+            .chunk_length_s = Some(f32::NAN);
+        assert!(realtime_source_sample_ceiling(&config, &layout).is_err());
+    }
 
     #[test]
     fn realtime_stream_peak_covers_transactional_overlap() {
@@ -3451,12 +4088,18 @@ mod tests {
     }
 
     #[test]
-    fn portable_offline_frame_limit_is_unchanged() {
+    fn portable_offline_frame_cap_is_a_hard_error() {
         for backend in [BackendKind::Cpu, BackendKind::Metal] {
             assert_eq!(
-                voxtral_realtime_offline_frame_limit(backend, 8192, 8192).unwrap(),
+                voxtral_realtime_offline_frame_limit(backend, 1024, 8192).unwrap(),
                 1024
             );
+            for frames in [1025, 8192] {
+                let error = voxtral_realtime_offline_frame_limit(backend, frames, 8192)
+                    .expect_err("audio past the portable cap must not be truncated");
+                assert!(matches!(error, crate::error::Error::InvalidInput(_)));
+                assert!(format!("{error}").contains("1024-token CPU/Metal offline limit"));
+            }
         }
     }
 
@@ -3504,25 +4147,6 @@ mod tests {
         assert_eq!(left, 32 * 1_280);
         assert_eq!(right, 639 + 17 * 1_280);
         assert_eq!((left + 16_001 + right) % 1_280, 0);
-    }
-
-    #[test]
-    fn voxtral_offline_padding_covers_generation_prefix() {
-        assert_eq!(offline_left_pad_tokens_for_generation(32, 6), 76);
-
-        let (left, _right) = offline_streaming_padding_samples(
-            16_001,
-            1_280,
-            offline_left_pad_tokens_for_generation(32, 6),
-            17,
-        );
-
-        assert_eq!(left, 76 * 1_280);
-    }
-
-    #[test]
-    fn voxtral_generation_uses_reference_prefix_length() {
-        assert_eq!(voxtral_generation_prefix_len(39), 38);
     }
 
     #[test]
@@ -3653,16 +4277,65 @@ mod tests {
 
     #[test]
     fn voxtral_two_conv_valid_lengths_are_exact_for_unequal_rows() {
-        let conv = Conv1dGeometry {
-            kernel: 3,
-            stride: 2,
-            padding: 1,
-            dilation: 1,
-        };
-        assert_eq!(conv_output_length(9, conv).unwrap(), 5);
-        assert_eq!(conv_output_length(5, conv).unwrap(), 3);
-        assert_eq!(conv_output_length(8, conv).unwrap(), 4);
-        assert_eq!(conv_output_length(4, conv).unwrap(), 2);
+        let conv1 = Conv1dGeometry::causal(3, 1);
+        let conv2 = Conv1dGeometry::causal(3, 2);
+        assert_eq!((conv1.left_padding, conv1.right_padding), (2, 0));
+        assert_eq!((conv2.left_padding, conv2.right_padding), (1, 0));
+        // conv1 keeps every mel frame; conv2 keeps floor(frames / 2).
+        for (mel, conv2_frames) in [(9, 4), (8, 4), (5, 2), (4, 2), (1, 0)] {
+            let conv1_frames = conv_output_length(mel, conv1).unwrap();
+            assert_eq!(conv1_frames, mel);
+            assert_eq!(
+                conv_output_length(conv1_frames, conv2).unwrap(),
+                conv2_frames
+            );
+        }
+    }
+
+    #[test]
+    fn voxtral_causal_conv_matches_geometry_and_never_looks_ahead() {
+        let device = Device::Cpu;
+        for spec in [Conv1dGeometry::causal(3, 1), Conv1dGeometry::causal(3, 2)] {
+            let conv = candle_nn::Conv1d::new(
+                Tensor::ones((1, 1, spec.kernel), DType::F32, &device).unwrap(),
+                None,
+                candle_nn::Conv1dConfig {
+                    stride: spec.stride,
+                    ..Default::default()
+                },
+            );
+            let frames = 11;
+            let base = (0..frames).map(|v| v as f32 + 1.0).collect::<Vec<_>>();
+            let run = |input: &[f32]| {
+                let x = Tensor::from_vec(input.to_vec(), (1, 1, frames), &device).unwrap();
+                conv1d_with_geometry(&conv, spec, &x)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let output = run(&base);
+            assert_eq!(output.len(), conv_output_length(frames, spec).unwrap());
+            // Output 0 sees only zeros on the left plus the first input frame(s).
+            let first_inputs = &base[..spec.kernel - spec.left_padding];
+            assert_eq!(output[0], first_inputs.iter().sum::<f32>());
+
+            for t in 0..frames {
+                let mut perturbed = base.clone();
+                perturbed[t] += 100.0;
+                let changed = run(&perturbed);
+                for (index, (before, after)) in output.iter().zip(&changed).enumerate() {
+                    // Output `index` ends at input frame (index + 1) * stride - 1.
+                    let last_input = (index + 1) * spec.stride - 1;
+                    if last_input < t {
+                        assert_eq!(before, after, "output {index} saw later frame {t}");
+                    } else if index == t / spec.stride {
+                        assert_ne!(before, after, "output {index} ignored its frame {t}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3683,66 +4356,33 @@ mod tests {
 
     #[test]
     fn voxtral_push_and_finish_geometry_partition_the_tail() {
-        let conv = Conv1dGeometry {
-            kernel: 3,
-            stride: 2,
-            padding: 1,
-            dilation: 1,
+        let conv = Conv1dGeometry::causal(3, 2);
+        let layout = VoxtralRealtimeLayout {
+            target_rate: 16_000,
+            hop_length: 160,
+            n_mels: 80,
+            raw_audio_length_per_tok: 1_280,
+            left_pad_tokens: 1,
+            right_pad_tokens: 3,
+            pool_size: 4,
+            text_dim: 16,
+            conv1: conv,
+            conv2: conv,
+            encoder_hidden: 8,
+            encoder_ffn: 16,
+            encoder_heads: 2,
+            encoder_sliding_window: None,
         };
-        let push = realtime_preparation_geometry_for(
-            3_201,
-            16_000,
-            16_000,
-            160,
-            80,
-            1_280,
-            1,
-            3,
-            4,
-            16,
-            conv,
-            conv,
-            VoxtralRealtimePreparationMode::Push,
-        )
-        .unwrap();
-        let finish = realtime_preparation_geometry_for(
-            3_201,
-            16_000,
-            16_000,
-            160,
-            80,
-            1_280,
-            1,
-            3,
-            4,
-            16,
-            conv,
-            conv,
-            VoxtralRealtimePreparationMode::Finish,
-        )
-        .unwrap();
+        let geometry = |mode| realtime_preparation_geometry_for(3_201, 16_000, &layout, mode);
+        let push = geometry(VoxtralRealtimePreparationMode::Push).unwrap();
+        let finish = geometry(VoxtralRealtimePreparationMode::Finish).unwrap();
         assert!(finish.padded_samples > push.padded_samples);
         assert!(finish.pooled_frames >= push.pooled_frames);
         assert_eq!(push.stable_frames, push.pooled_frames.saturating_sub(3));
         assert_eq!(finish.stable_frames, finish.pooled_frames);
         assert_eq!(
             finish,
-            realtime_preparation_geometry_for(
-                3_201,
-                16_000,
-                16_000,
-                160,
-                80,
-                1_280,
-                1,
-                3,
-                4,
-                16,
-                conv,
-                conv,
-                VoxtralRealtimePreparationMode::Finish,
-            )
-            .unwrap()
+            geometry(VoxtralRealtimePreparationMode::Finish).unwrap()
         );
     }
 
@@ -3789,5 +4429,188 @@ mod tests {
         let err = argmax(&logits).expect_err("empty logits should be rejected");
 
         assert!(format!("{err}").contains("Voxtral logits are empty"));
+    }
+
+    #[test]
+    fn delay_tokens_must_match_the_config_sidecar() {
+        let audio = AudioConfig {
+            n_delay_tokens: 6,
+            ..AudioConfig::default()
+        };
+        let sidecar = |delay| VoxtralRuntimeConfig {
+            default_num_delay_tokens: delay,
+            ..VoxtralRuntimeConfig::default()
+        };
+        assert_eq!(checked_delay_tokens(&audio, &sidecar(None)).unwrap(), 6);
+        assert_eq!(checked_delay_tokens(&audio, &sidecar(Some(6))).unwrap(), 6);
+        let error = checked_delay_tokens(&audio, &sidecar(Some(5))).unwrap_err();
+        assert!(format!("{error}").contains("default_num_delay_tokens is 5"));
+    }
+
+    #[test]
+    fn generated_text_streams_split_characters_and_flushes_partial_ones() {
+        let tokenizer = published_excerpt_tokenizer();
+        let mut deltas = Vec::new();
+        let mut record = |delta: &str| deltas.push(delta.to_string());
+        let mut on_delta: Option<&mut dyn FnMut(&str)> = Some(&mut record);
+        let mut generated = Vec::new();
+        let mut assembled = String::new();
+        // "你" (E4 BD A0), then the first byte of another CJK character.
+        let mut appended = Vec::new();
+        for token in published_byte_ids(&["你".as_bytes(), &[0xE5]].concat()) {
+            appended.push(
+                append_generated_token(
+                    &tokenizer,
+                    &mut generated,
+                    &mut assembled,
+                    token,
+                    &mut on_delta,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(appended, ["", "", "你", ""]);
+        assert_eq!(assembled, "你");
+
+        let flushed =
+            flush_generated_text(&tokenizer, &generated, &mut assembled, &mut on_delta).unwrap();
+        assert_eq!(flushed, "\u{FFFD}");
+        assert_eq!(assembled, "你\u{FFFD}");
+        assert_eq!(deltas, ["你", "\u{FFFD}"]);
+    }
+
+    #[test]
+    fn offline_audio_hint_fits_the_portable_frame_cap() {
+        let (_, _, layout) = published_realtime_layout();
+        let frames = |seconds: f32| {
+            realtime_preparation_geometry_for(
+                (seconds * 16_000.0) as usize,
+                16_000,
+                &layout,
+                VoxtralRealtimePreparationMode::Finish,
+            )
+            .unwrap()
+            .pooled_frames
+        };
+        assert_eq!(frames(VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT), 424);
+        // At 12.5 Hz the 1024-token cap is reached at 78 s of audio.
+        assert_eq!(frames(78.0), PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
+        assert!(frames(78.1) > PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT);
+    }
+
+    /// The Voxtral load-time probe on a tiny model: encoder, adapter and
+    /// logits finite, and the F16 run within F16 rounding of F32.
+    fn voxtral_probe_outputs(
+        weights: &std::collections::HashMap<String, Tensor>,
+        device: &Device,
+        dtype: DType,
+    ) -> Vec<(String, Vec<f32>)> {
+        use super::super::audio::{AudioLanguageAdapter, TimeEmbedding};
+        use super::{voxtral_numeric_probe, VoxtralProbeParts, WhisperEncoder};
+        use crate::kernels::numeric_check::host_f32;
+        use crate::models::architectures::voxtral::lm::tests::tiny_ada_model_with_dtype;
+
+        let cfg = voxtral_probe_encoder_config();
+        let tensors = weights
+            .iter()
+            .map(|(name, tensor)| (name.clone(), tensor.to_device(device).unwrap()))
+            .collect();
+        let vb = candle_nn::VarBuilder::from_tensors(tensors, dtype, device);
+        let encoder = WhisperEncoder::load_voxtral(&cfg, vb.pp("encoder")).unwrap();
+        let adapter = AudioLanguageAdapter::load(4 * 32, 4, vb.pp("adapter")).unwrap();
+        let lm = tiny_ada_model_with_dtype(device, 2, dtype);
+        let t_cond = TimeEmbedding::new(4, 10_000.0, device)
+            .unwrap()
+            .forward(&Tensor::new(&[6f32], device).unwrap())
+            .unwrap()
+            .to_dtype(lm.embedding_dtype())
+            .unwrap();
+        let ada = lm.ada_scales(&t_cond).unwrap();
+        voxtral_numeric_probe(
+            VoxtralProbeParts {
+                encoder: &encoder,
+                adapter: &adapter,
+                pool_size: 4,
+                language_model: &lm,
+                ada: &ada,
+                n_mels: 8,
+            },
+            dtype,
+            device,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(name, tensor)| (name, host_f32(&tensor).unwrap()))
+        .collect()
+    }
+
+    fn voxtral_probe_encoder_config() -> super::super::config::AudioEncoderConfig {
+        super::super::config::AudioEncoderConfig {
+            d_model: 32,
+            encoder_layers: 2,
+            encoder_attention_heads: 4,
+            encoder_ffn_dim: 64,
+            num_mel_bins: 8,
+            max_source_positions: 512,
+            window_size: 400,
+            hop_length: 160,
+            sampling_rate: 16_000,
+            is_causal: true,
+            conv1_kernel_size: 3,
+            conv1_stride: 1,
+            conv2_kernel_size: 3,
+            conv2_stride: 2,
+            global_log_mel_max: None,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            pos_embed: "rope".into(),
+            sliding_window: 16,
+        }
+    }
+
+    /// Random encoder and adapter weights for [`voxtral_probe_outputs`].
+    fn voxtral_probe_weights() -> std::collections::HashMap<String, Tensor> {
+        use super::super::audio::AudioLanguageAdapter;
+        use super::WhisperEncoder;
+
+        let cfg = voxtral_probe_encoder_config();
+        let vars = candle_nn::VarMap::new();
+        let host = candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu);
+        WhisperEncoder::load_voxtral(&cfg, host.pp("encoder")).unwrap();
+        AudioLanguageAdapter::load(4 * 32, 4, host.pp("adapter")).unwrap();
+        let data = vars.data().lock().unwrap();
+        data.iter()
+            .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+            .collect()
+    }
+
+    fn assert_voxtral_probe_tracks_f32(device: &Device, dtype: DType) {
+        use crate::kernels::numeric_check::relative_l2;
+        let weights = voxtral_probe_weights();
+        let low = voxtral_probe_outputs(&weights, device, dtype);
+        let reference = voxtral_probe_outputs(&weights, &Device::Cpu, DType::F32);
+        assert_eq!(low.len(), 3);
+        for ((name, low), (_, reference)) in low.iter().zip(&reference) {
+            assert!(low.iter().all(|value| value.is_finite()), "{name}");
+            let rel = relative_l2(low, reference);
+            assert!(rel < 2e-2, "{name}: {dtype:?} vs F32 relative L2 {rel:e}");
+        }
+        // 16 LM positions from the 128-frame window.
+        assert_eq!(low[2].1.len(), 16 * 16);
+    }
+
+    #[test]
+    fn voxtral_numeric_probe_runs_encoder_adapter_and_lm_on_cpu() {
+        assert_voxtral_probe_tracks_f32(&Device::Cpu, DType::F32);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_voxtral_numeric_probe_in_f16_tracks_cpu_f32() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_voxtral_probe_tracks_f32(&device, DType::F16);
     }
 }

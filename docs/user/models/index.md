@@ -45,7 +45,8 @@ For built-in speaker IDs, see [Voice Presets](/models/voice-presets).
 | `Qwen3-ASR-1.7B-GGUF` | Higher-accuracy Qwen3 ASR |
 | `VibeVoice-ASR` | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | NVIDIA multilingual FastConformer-RNNT `.nemo`; native artifact/config/tokenizer and streaming-state support |
-| `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with prompt guidance, speaker-attributed output, and word timestamp support |
+| `Granite-Speech-4.1-2B` | IBM Granite Speech ASR with punctuated, capitalized transcripts (en, fr, de, es, pt, ja); the default Granite Speech model |
+| `Granite-Speech-4.1-2B-Plus` | IBM Granite Speech rich transcription model with speaker-attributed output and native word timestamps; unpunctuated by design (en, fr, de, es, pt) |
 | `LFM2.5-Audio-1.5B-GGUF` | Unified audio model (ASR + speech generation) |
 | `Voxtral-Mini-4B-Realtime-2602` | Mistral Voxtral offline transcription; realtime support planned |
 
@@ -101,7 +102,8 @@ izwi pull Qwen3-ASR-0.6B-GGUF
 # Download NVIDIA Nemotron 3.5 ASR
 izwi pull Nemotron-3.5-ASR-Streaming-0.6B
 
-# Download IBM Granite Speech rich ASR
+# Download IBM Granite Speech (punctuated ASR, and rich ASR with speaker turns)
+izwi pull Granite-Speech-4.1-2B
 izwi pull Granite-Speech-4.1-2B-Plus
 
 # Download Microsoft VibeVoice models

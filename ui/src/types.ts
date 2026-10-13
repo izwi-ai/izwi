@@ -87,6 +87,8 @@ function isNemotronAsrVariant(variant: string): boolean {
 function isGraniteSpeechAsrVariant(variant: string): boolean {
   const normalized = variant.trim().toLowerCase();
   return (
+    normalized === "granite-speech-4.1-2b" ||
+    normalized === "ibm-granite/granite-speech-4.1-2b" ||
     normalized === "granite-speech-4.1-2b-plus" ||
     normalized === "ibm-granite/granite-speech-4.1-2b-plus"
   );

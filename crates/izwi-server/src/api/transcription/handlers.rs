@@ -866,6 +866,28 @@ fn send_stream_event_lossy(
     }
 }
 
+const TRANSCRIPTION_STREAM_DISCONNECTED_ERROR: &str =
+    "Stream client disconnected; transcription was cancelled";
+
+/// Run `work` to completion, or until the SSE client reading `event_tx`
+/// disconnects. Dropping `work` drops the runtime call, whose pending-request
+/// guard cancels the engine request; long-form ASR then stops at its next
+/// chunk boundary instead of holding the model until the end of the file.
+/// Without a stream there is nobody to disconnect and `work` always finishes.
+async fn run_until_stream_disconnect<T>(
+    event_tx: Option<&mpsc::Sender<String>>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(event_tx) = event_tx else {
+        return Some(work.await);
+    };
+    tokio::select! {
+        biased;
+        output = work => Some(output),
+        _ = event_tx.closed() => None,
+    }
+}
+
 fn spawn_transcription_processing_task(
     state: AppState,
     record_id: String,
@@ -875,9 +897,10 @@ fn spawn_transcription_processing_task(
     event_tx: Option<mpsc::Sender<String>>,
 ) {
     tokio::spawn(async move {
-        let result = process_transcription_record(
+        let transcription_store = state.transcription_store.clone();
+        let processing = process_transcription_record(
             state,
-            record_id,
+            record_id.clone(),
             parsed,
             correlation_id,
             workload_class,
@@ -886,8 +909,17 @@ fn spawn_transcription_processing_task(
             None,
             None,
             None,
-        )
-        .await;
+        );
+        let Some(result) = run_until_stream_disconnect(event_tx.as_ref(), processing).await else {
+            let _ = transcription_store
+                .update_processing_status(
+                    record_id,
+                    TranscriptionProcessingStatus::Failed,
+                    Some(TRANSCRIPTION_STREAM_DISCONNECTED_ERROR.to_string()),
+                )
+                .await;
+            return;
+        };
         if let Some(tx) = event_tx {
             let payload = match result {
                 Ok((record, _)) => serde_json::to_string(&StreamFinalEvent {
@@ -1584,6 +1616,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Result<(), ApiError> {
     if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
         validate_batch_transcription_model(parsed.model_id.as_deref())?;
+        validate_transcription_language(parsed.model_id.as_deref(), parsed.language.as_deref())?;
         return Ok(());
     }
 
@@ -1594,12 +1627,23 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
     }
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
     validate_speaker_attributed_asr_model(parsed.model_id.as_deref())?;
-    parsed
+    let model_id = parsed
         .model_id
         .get_or_insert_with(|| DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL.to_string());
+    validate_transcription_language(Some(model_id), parsed.language.as_deref())?;
     parsed.aligner_model_id = None;
     parsed.include_timestamps = false;
     Ok(())
+}
+
+/// Reject a language the routed model does not support (Granite Speech
+/// publishes its list) when the job is created, not when it runs.
+fn validate_transcription_language(
+    model_id: Option<&str>,
+    language: Option<&str>,
+) -> Result<(), ApiError> {
+    izwi_core::validate_asr_language(izwi_core::resolve_asr_model_variant(model_id), language)
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn validate_batch_transcription_model(model_id: Option<&str>) -> Result<(), ApiError> {
@@ -2066,12 +2110,15 @@ mod tests {
     use super::{
         alignments_to_word_records, asr_queue_class, build_segment_records,
         duration_secs_from_millis, initial_summary_state, multipart_field_api_error, parse_bool,
-        parse_create_request, progress_event_payload, sanitize_summary_output,
-        send_stream_event_lossy, send_transcription_terminal_events,
+        parse_create_request, progress_event_payload, run_until_stream_disconnect,
+        sanitize_summary_output, send_stream_event_lossy, send_transcription_terminal_events,
         should_retry_transcription_summary_generation, transcription_summary_messages,
         transcription_summary_params, validate_batch_transcription_model, QueueClass,
         TranscriptionSummaryStatus, TranscriptionWordRecord,
         TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
+    };
+    use super::{
+        prepare_create_request, ParsedTranscriptionCreateRequest, TranscriptionRecordMode,
     };
     use izwi_core::RuntimeService;
     use tokio::sync::mpsc;
@@ -2085,6 +2132,44 @@ mod tests {
     fn wav_data_url(content_type: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes());
         format!("data:{content_type};base64, {b64}\n")
+    }
+
+    /// A job whose language the routed Granite checkpoint does not support
+    /// fails when it is created, not after it was queued.
+    #[test]
+    fn create_request_rejects_languages_the_granite_checkpoint_lacks() {
+        let request = |record_mode, model_id: Option<&str>, language: &str| {
+            ParsedTranscriptionCreateRequest {
+                record_mode,
+                model_id: model_id.map(str::to_string),
+                language: Some(language.to_string()),
+                ..ParsedTranscriptionCreateRequest::default()
+            }
+        };
+
+        let mut base = request(
+            TranscriptionRecordMode::Transcription,
+            Some("Granite-Speech-4.1-2B"),
+            "Japanese",
+        );
+        prepare_create_request(&mut base).unwrap();
+        let mut unsupported = request(
+            TranscriptionRecordMode::Transcription,
+            Some("Granite-Speech-4.1-2B"),
+            "Chinese",
+        );
+        assert_eq!(
+            prepare_create_request(&mut unsupported).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        // Speaker attribution defaults to plus, which drops Japanese.
+        let mut saa = request(TranscriptionRecordMode::SpeakerAttributedAsr, None, "ja");
+        assert_eq!(
+            prepare_create_request(&mut saa).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut parakeet = request(TranscriptionRecordMode::Transcription, None, "Chinese");
+        prepare_create_request(&mut parakeet).unwrap();
     }
 
     #[test]
@@ -2333,6 +2418,51 @@ mod tests {
         // is untouched.
         assert_eq!(event_rx.recv().await.as_deref(), Some("occupied"));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_disconnect_drops_the_transcription_work() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let (event_tx, event_rx) = mpsc::channel::<String>(1);
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        };
+        let driver = tokio::spawn(async move {
+            let outcome = run_until_stream_disconnect(Some(&event_tx), work).await;
+            (outcome, event_tx)
+        });
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+
+        drop(event_rx);
+        let (outcome, _event_tx) = tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("a disconnect must end the stream task")
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Acquire),
+            "the runtime call must be dropped so its request guard cancels"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_without_a_stream_runs_to_completion() {
+        let outcome = run_until_stream_disconnect(None, async { 7 }).await;
+        assert_eq!(outcome, Some(7));
+        let (event_tx, event_rx) = mpsc::channel::<String>(1);
+        let outcome = run_until_stream_disconnect(Some(&event_tx), async { 8 }).await;
+        assert_eq!(outcome, Some(8));
+        drop(event_rx);
     }
 
     #[tokio::test]

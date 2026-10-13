@@ -1,0 +1,233 @@
+//! Safetensors loading that bounds Candle's Metal load staging.
+//!
+//! Candle's own memory-mapped backend uploads each tensor at its stored dtype
+//! and casts it on the device. On Metal that leaves two costs until the next
+//! device synchronization, which a loader otherwise reaches only at its load
+//! fence: the released stored-dtype upload is kept in Candle's buffer pool, and
+//! the kernel-written cast is rounded up to a power of two. Whisper (F16 stored,
+//! F32 on Metal) peaked at 6.3 GB for 3.0 GiB of weights this way.
+//!
+//! [`metal_staged_safetensors`] fixes both on Metal: each tensor is converted
+//! to its requested dtype on the host and uploaded once, at its exact size, and
+//! the device is synchronized every [`METAL_LOAD_SYNC_INTERVAL_BYTES`] of
+//! uploads, which drops every buffer the loader's own device ops (fusions,
+//! casts, pre-scales) released in between. Other devices keep Candle's
+//! backend. Load admission prices this form (`runtime/lifecycle/asr_memory.rs`).
+use std::path::Path;
+use std::sync::Mutex;
+
+use candle_core::safetensors::MmapedSafetensors;
+use candle_core::{DType, Device, Shape, Tensor};
+use candle_nn::var_builder::SimpleBackend;
+use candle_nn::VarBuilder;
+
+/// Uploaded bytes between two device synchronizations during a staged load.
+///
+/// Released buffers stay in Candle's pool until a synchronization, so this,
+/// plus the loader's largest single release, bounds what a load holds beyond
+/// its resident weights: 256 MiB is under 2% of a 16 GB
+/// Mac. A synchronization only waits for the queued casts and concatenations
+/// (uploads are host copies into shared buffers), so the 24 a 6 GB checkpoint
+/// pays cost well under a second, while a smaller interval would trade
+/// little memory for more stalls of the queue.
+pub const METAL_LOAD_SYNC_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Counts uploaded bytes and reports when a synchronization is due.
+#[derive(Debug)]
+pub struct UploadSyncCounter {
+    interval: u64,
+    pending: Mutex<u64>,
+}
+
+impl UploadSyncCounter {
+    pub fn new(interval: u64) -> Self {
+        Self {
+            interval: interval.max(1),
+            pending: Mutex::new(0),
+        }
+    }
+
+    /// Records `bytes` uploaded. Returns `true` when the uploads since the last
+    /// synchronization reached the interval; the count then restarts, so the
+    /// caller must synchronize.
+    pub fn record(&self, bytes: u64) -> bool {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pending = pending.saturating_add(bytes);
+        if *pending >= self.interval {
+            *pending = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Converts on the host, uploads at the exact size, and synchronizes the
+/// device by uploaded bytes.
+struct HostCastSafetensors {
+    inner: MmapedSafetensors,
+    counter: UploadSyncCounter,
+}
+
+impl HostCastSafetensors {
+    fn load(&self, name: &str, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+        let host = self.inner.load(name, &Device::Cpu)?.to_dtype(dtype)?;
+        let bytes = (host.elem_count() as u64).saturating_mul(dtype.size_in_bytes() as u64);
+        let tensor = host.to_device(device)?;
+        drop(host);
+        if self.counter.record(bytes) {
+            device.synchronize()?;
+        }
+        Ok(tensor)
+    }
+}
+
+impl SimpleBackend for HostCastSafetensors {
+    fn get(
+        &self,
+        shape: Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.load(name, dtype, device)?;
+        if tensor.shape() != &shape {
+            Err(candle_core::Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: shape,
+                got: tensor.shape().clone(),
+            }
+            .bt())?
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        self.load(name, dtype, device)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.inner.get(name).is_ok()
+    }
+}
+
+/// A `VarBuilder` over memory-mapped safetensors `paths`, staged as described
+/// in the module docs on Metal and Candle's own backend elsewhere.
+///
+/// # Safety
+///
+/// As [`VarBuilder::from_mmaped_safetensors`]: the files must not be modified
+/// while mapped.
+pub unsafe fn metal_staged_safetensors<P: AsRef<Path>>(
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+) -> candle_core::Result<VarBuilder<'static>> {
+    if !device.is_metal() {
+        return VarBuilder::from_mmaped_safetensors(paths, dtype, device);
+    }
+    host_cast_safetensors(paths, dtype, device, METAL_LOAD_SYNC_INTERVAL_BYTES)
+}
+
+unsafe fn host_cast_safetensors<P: AsRef<Path>>(
+    paths: &[P],
+    dtype: DType,
+    device: &Device,
+    interval: u64,
+) -> candle_core::Result<VarBuilder<'static>> {
+    let backend = HostCastSafetensors {
+        inner: MmapedSafetensors::multi(paths)?,
+        counter: UploadSyncCounter::new(interval),
+    };
+    Ok(VarBuilder::from_backend(
+        Box::new(backend),
+        dtype,
+        device.clone(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_requests_a_synchronization_each_time_uploads_reach_the_interval() {
+        let counter = UploadSyncCounter::new(100);
+        assert!(!counter.record(40));
+        assert!(!counter.record(59));
+        assert!(counter.record(1), "99 + 1 reaches the interval");
+        assert!(!counter.record(99), "the count restarts after a request");
+        assert!(counter.record(250), "one large upload requests at once");
+        assert!(!counter.record(0));
+        assert!(
+            UploadSyncCounter::new(0).record(1),
+            "a zero interval is one byte"
+        );
+    }
+
+    #[test]
+    fn host_cast_backend_matches_candles_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "izwi-staged-safetensors-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("model.safetensors");
+        let weight = Tensor::arange(0f32, 24.0, &Device::Cpu)
+            .and_then(|t| t.reshape((4, 6)))
+            .and_then(|t| (t * 0.37)?.to_dtype(DType::BF16))
+            .expect("weight");
+        let bias = Tensor::ones(6, DType::F16, &Device::Cpu).expect("bias");
+        candle_core::safetensors::save(
+            &[("layer.weight", weight), ("layer.bias", bias)]
+                .into_iter()
+                .map(|(name, tensor)| (name.to_string(), tensor))
+                .collect(),
+            &path,
+        )
+        .expect("save");
+
+        let staged = unsafe { host_cast_safetensors(&[&path], DType::F32, &Device::Cpu, 1) }
+            .expect("staged");
+        let candle =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &Device::Cpu) }
+                .expect("candle");
+        for (name, shape) in [("layer.weight", (4, 6).into()), ("layer.bias", 6.into())] {
+            let shape: Shape = shape;
+            let left = staged.get(shape.clone(), name).expect("staged tensor");
+            let right = candle.get(shape, name).expect("candle tensor");
+            assert_eq!(left.dtype(), DType::F32);
+            assert_eq!(
+                left.flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .expect("left"),
+                right
+                    .flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .expect("right"),
+            );
+        }
+        let f16 = staged
+            .to_dtype(DType::F16)
+            .get((4, 6), "layer.weight")
+            .expect("f16 tensor");
+        assert_eq!(f16.dtype(), DType::F16);
+        assert!(
+            staged.get((6, 4), "layer.weight").is_err(),
+            "shape is checked"
+        );
+        assert!(staged.contains_tensor("layer.bias"));
+        assert!(!staged.contains_tensor("layer.missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

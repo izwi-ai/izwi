@@ -5,6 +5,8 @@
 use candle_core::{DType, Result, Tensor, D};
 use candle_nn::Module;
 
+use super::super::layers::exact_gelu;
+
 /// Sinusoidal Time Embedding for encoding delay tokens
 pub struct TimeEmbedding {
     dim: usize,
@@ -64,34 +66,41 @@ impl AudioLanguageAdapter {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.w_in.forward(x)?;
-        let x = gelu(&x)?;
+        let x = exact_gelu(&x)?;
         self.w_out.forward(&x)
     }
-}
-
-/// GELU activation function
-fn gelu(x: &Tensor) -> Result<Tensor> {
-    let coeff = 0.044715f32;
-    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-    let dtype = x.dtype();
-    let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-    let x3 = x_f32.powf(3.0)?;
-    let coeff_t = Tensor::from_vec(vec![coeff], (1,), x.device())?;
-    let x3 = x3.broadcast_mul(&coeff_t)?;
-    let sqrt_t = Tensor::from_vec(vec![sqrt_2_over_pi], (1,), x.device())?;
-    let inner = (&x_f32 + x3)?.broadcast_mul(&sqrt_t)?;
-    let tanh = inner.tanh()?;
-    let one = Tensor::from_vec(vec![1.0f32], (1,), x.device())?;
-    let half = Tensor::from_vec(vec![0.5f32], (1,), x.device())?;
-    let out = x_f32.broadcast_mul(&one.broadcast_add(&tanh)?)?;
-    let out = out.broadcast_mul(&half)?;
-    out.to_dtype(dtype)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn audio_adapter_uses_exact_gelu() {
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::from_tensors(
+            std::collections::HashMap::from([
+                (
+                    "0.weight".to_string(),
+                    Tensor::ones((1, 1), DType::F32, &device).unwrap(),
+                ),
+                (
+                    "2.weight".to_string(),
+                    Tensor::ones((1, 1), DType::F32, &device).unwrap(),
+                ),
+            ]),
+            DType::F32,
+            &device,
+        );
+        let adapter = AudioLanguageAdapter::load(1, 1, vb).unwrap();
+        let x = Tensor::from_vec(vec![1.0f32], (1, 1), &device).unwrap();
+
+        let out = adapter.forward(&x).unwrap().to_vec2::<f32>().unwrap();
+
+        // HF ACT2FN["gelu"] is exact: 0.8413447 at 1 (tanh form: 0.8411920).
+        assert!((f64::from(out[0][0]) - 0.841_344_746).abs() < 1e-6);
+    }
 
     #[test]
     fn time_embedding_preserves_selected_dtype() {

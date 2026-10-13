@@ -11,7 +11,9 @@ use candle_core::{DType, Tensor, D};
 use serde_json::json;
 use tracing::info;
 
-use crate::backends::{parse_dtype_name, BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{
+    parse_dtype_name, BackendKind, DTypeSelection, DeviceKind, DeviceProfile, MetalDTypeOverride,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
@@ -37,16 +39,20 @@ mod runtime;
 mod transcript;
 
 pub use config::{
-    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig, GraniteSpeechConfig,
-    GraniteSpeechEncoderConfig, GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig,
-    GraniteSpeechProcessorConfig, GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig,
-    GraniteTextConfig,
+    load_granite_speech_chat_template, GraniteSpeechAudioProcessorConfig,
+    GraniteSpeechCheckpointKind, GraniteSpeechConfig, GraniteSpeechEncoderConfig,
+    GraniteSpeechGenerationConfig, GraniteSpeechMelSpecConfig, GraniteSpeechProcessorConfig,
+    GraniteSpeechProjectorConfig, GraniteSpeechTokenizerConfig, GraniteTextConfig,
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
-    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptTokenizer,
-    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_ASR_PROMPT,
-    GRANITE_SPEECH_SPEAKER_PROMPT, GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_PROMPT,
+    classify_granite_speech_prompt, render_granite_speech_prompt, GraniteSpeechLanguage,
+    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptOverride,
+    GraniteSpeechPromptProfile, GraniteSpeechPromptTokenizer, GraniteSpeechRenderedPrompt,
+    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_BASE_ASR_INSTRUCTION,
+    GRANITE_SPEECH_KEYWORD_ASR_INSTRUCTION, GRANITE_SPEECH_PLUS_ASR_INSTRUCTION,
+    GRANITE_SPEECH_SPEAKER_INSTRUCTION, GRANITE_SPEECH_SYSTEM_PROMPT,
+    GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
 };
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
@@ -54,24 +60,89 @@ pub use runtime::{
     GraniteSpeechGeneration, GraniteSpeechGenerationStats, GraniteSpeechGenerationTimings,
     GraniteSpeechLayerDecodeProfile, GraniteSpeechMlpDecodeProfile, GraniteSpeechRuntime,
 };
+pub(crate) use runtime::{granite_load_representation, GraniteLoadRepresentation};
 pub use transcript::{
     parse_granite_speech_output, GraniteSpeechParsedTranscript, GraniteSpeechSegment,
     GraniteSpeechTimestampWord,
 };
 
+/// Files both published checkpoints ship. Plus also ships
+/// `generation_config.json` and nests its audio settings in
+/// `processor_config.json`; base ships `preprocessor_config.json` instead.
 const REQUIRED_ARTIFACTS: &[&str] = &[
     "chat_template.jinja",
     "config.json",
-    "generation_config.json",
     "model.safetensors.index.json",
     "processor_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
 ];
 
+const UNTIED_LM_HEAD_TENSOR: &str = "language_model.lm_head.weight";
 const DEFAULT_MAX_AUDIO_SECONDS: f32 = 9.0 * 60.0;
-const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 5.0 * 60.0;
+/// Plus's card evaluates timestamps on segments up to 3.5 minutes (trained
+/// on up to 5), so one timestamp invocation covers at most that much audio.
+const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 3.5 * 60.0;
+/// Planned timestamp chunks stay at or under a minute: about 600 audio
+/// tokens plus roughly 24 output tokens per second leave ample room in the
+/// 4096-token decoder context.
+const TIMESTAMP_MAX_CHUNK_SECONDS: f32 = 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Reject a request language the variant's checkpoint was not trained on
+/// (IBM's alias table; plus drops Japanese) before the request is admitted.
+/// Non-Granite variants are not checked here.
+pub fn validate_granite_speech_request_language(
+    variant: ModelVariant,
+    language: Option<&str>,
+) -> Result<()> {
+    match GraniteSpeechCheckpointKind::for_variant(variant) {
+        Some(kind) => GraniteSpeechPromptProfile::for_checkpoint(kind)
+            .source_language(language)
+            .map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// How the generic ASR path runs a Granite request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GraniteSpeechRequestPlan {
+    pub(crate) task: GraniteSpeechTask,
+    /// Most audio one invocation of `task` may cover.
+    pub(crate) max_audio_seconds: f32,
+    /// Cap on a planned chunk, below the invocation limit.
+    pub(crate) max_chunk_seconds: Option<f32>,
+    /// Whether chunked ASR may replay earlier text as an assistant prefix
+    /// (plus's incremental decoding; base has no prefix slot).
+    pub(crate) prefix_replay: bool,
+}
+
+/// Native word timestamps are a plus task; every other request, including a
+/// timestamp request for base (which the forced aligner then times), runs
+/// plain ASR.
+pub(crate) fn granite_speech_request_plan(
+    variant: ModelVariant,
+    native_word_timestamps: bool,
+) -> GraniteSpeechRequestPlan {
+    let profile = GraniteSpeechCheckpointKind::for_variant(variant)
+        .map(GraniteSpeechPromptProfile::for_checkpoint);
+    let timestamps = native_word_timestamps
+        && profile.is_some_and(|profile| profile.supports_task(GraniteSpeechTask::WordTimestamps));
+    if timestamps {
+        return GraniteSpeechRequestPlan {
+            task: GraniteSpeechTask::WordTimestamps,
+            max_audio_seconds: TIMESTAMP_MAX_AUDIO_SECONDS,
+            max_chunk_seconds: Some(TIMESTAMP_MAX_CHUNK_SECONDS),
+            prefix_replay: false,
+        };
+    }
+    GraniteSpeechRequestPlan {
+        task: GraniteSpeechTask::Asr,
+        max_audio_seconds: DEFAULT_MAX_AUDIO_SECONDS,
+        max_chunk_seconds: None,
+        prefix_replay: profile.is_some_and(GraniteSpeechPromptProfile::supports_prefix_text),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraniteSpeechAsrTranscriptionOutput {
@@ -103,6 +174,7 @@ pub struct GraniteSpeechAsrModel {
     device: DeviceProfile,
     dtype: DType,
     config: GraniteSpeechConfig,
+    checkpoint_kind: GraniteSpeechCheckpointKind,
     processor: GraniteSpeechProcessorConfig,
     generation: GraniteSpeechGenerationConfig,
     tokenizer_config: GraniteSpeechTokenizerConfig,
@@ -491,31 +563,47 @@ pub(crate) struct GraniteSpeechPhysicalStateSpec {
 
 impl GraniteSpeechAsrModel {
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        if variant != ModelVariant::GraniteSpeech412BPlus {
-            return Err(Error::InvalidInput(format!(
+        let expected_kind = GraniteSpeechCheckpointKind::for_variant(variant).ok_or_else(|| {
+            Error::InvalidInput(format!(
                 "GraniteSpeechAsrModel cannot load non-Granite variant {variant}"
+            ))
+        })?;
+
+        let artifacts = granite_speech_artifacts(model_dir)?;
+        let config = GraniteSpeechConfig::load(model_dir)?;
+        let checkpoint_kind = config.validate()?;
+        if checkpoint_kind != expected_kind {
+            return Err(Error::ModelLoadError(format!(
+                "{variant} expects a {} checkpoint, but {} declares {}",
+                expected_kind.model_type(),
+                model_dir.display(),
+                checkpoint_kind.model_type()
             )));
         }
-
-        let shards = ensure_granite_speech_artifacts(model_dir)?;
-        let config = GraniteSpeechConfig::load(model_dir)?;
-        config.validate_plus()?;
+        validate_granite_lm_head_layout(
+            config.tie_word_embeddings(),
+            artifacts.has_untied_lm_head,
+        )?;
+        let shards = artifacts.shard_paths;
         let processor = GraniteSpeechProcessorConfig::load(model_dir)?;
-        let generation = GraniteSpeechGenerationConfig::load(model_dir)?;
+        let generation = GraniteSpeechGenerationConfig::load(model_dir, &config)?;
         let tokenizer_config = GraniteSpeechTokenizerConfig::load(model_dir)?;
         let chat_template = load_granite_speech_chat_template(model_dir)?;
         let prompt_tokenizer =
             GraniteSpeechPromptTokenizer::load(model_dir, &config, &processor, &tokenizer_config)?;
         let preprocessor = GraniteSpeechPreprocessor::new(processor.clone())?;
         let dtype = select_granite_speech_dtype(&device, config.target_dtype_hint())?;
-        let runtime = GraniteSpeechRuntime::load(&shards, &config, &device, dtype)?;
+        let encoder_precision = resolve_granite_encoder_projection_precision(&device);
+        let runtime =
+            GraniteSpeechRuntime::load(&shards, &config, &device, dtype, &encoder_precision)?;
 
         info!(
-            "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files)",
+            "Loaded Granite Speech ASR in {:?} on {:?} with dtype {:?} ({} shard files); encoder: {}",
             model_dir,
             device.kind,
             dtype,
-            shards.len()
+            shards.len(),
+            runtime.encoder_weight_precision().reason
         );
 
         Ok(Self {
@@ -524,6 +612,7 @@ impl GraniteSpeechAsrModel {
             device,
             dtype,
             config,
+            checkpoint_kind,
             processor,
             generation,
             tokenizer_config,
@@ -536,6 +625,10 @@ impl GraniteSpeechAsrModel {
 
     pub fn config(&self) -> &GraniteSpeechConfig {
         &self.config
+    }
+
+    pub fn checkpoint_kind(&self) -> GraniteSpeechCheckpointKind {
+        self.checkpoint_kind
     }
 
     pub(crate) const fn supports_resumable_prefill(&self) -> bool {
@@ -556,12 +649,17 @@ impl GraniteSpeechAsrModel {
             default_kv_page_size(),
         )?;
         let retained = granite_speech_retained_contract(invocation.clone())?;
-        granite_speech_physical_state_spec(
+        let spec = granite_speech_physical_state_spec(
             stage_graphs,
             retained,
             invocation,
             self.config.text_config.max_position_embeddings,
-        )
+        )?;
+        Ok(if self.supports_resumable_prefill() {
+            spec
+        } else {
+            granite_speech_without_retained_route(spec)
+        })
     }
 
     pub fn processor(&self) -> &GraniteSpeechProcessorConfig {
@@ -1399,11 +1497,13 @@ impl GraniteSpeechAsrModel {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transcribe_with_details_and_prompt_and_options_physical(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
         cache: &mut PhysicalPagedKvCache,
@@ -1413,7 +1513,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
-            GraniteSpeechTask::Asr,
+            task,
             prompt,
             None,
             options,
@@ -1428,6 +1528,7 @@ impl GraniteSpeechAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        task: GraniteSpeechTask,
         prompt: Option<&str>,
         prefix_text: Option<&str>,
         options: GraniteSpeechAsrGenerationOptions,
@@ -1438,7 +1539,7 @@ impl GraniteSpeechAsrModel {
             audio,
             sample_rate,
             language,
-            GraniteSpeechTask::Asr,
+            task,
             prompt,
             prefix_text,
             options,
@@ -1531,6 +1632,7 @@ impl GraniteSpeechAsrModel {
         let features = self.prepare_audio_features(audio, sample_rate)?;
         let mel_prepare = prepare_start.elapsed();
         validate_granite_audio_duration(features.audio_seconds)?;
+        validate_granite_task_audio_duration(task, features.audio_seconds)?;
         let encoder_start = Instant::now();
         let (audio_embeds, audio_stats) = self.runtime.audio_embeddings_with_stats(&features)?;
         let encoder_forward = encoder_start.elapsed();
@@ -1572,7 +1674,7 @@ impl GraniteSpeechAsrModel {
         Ok(GraniteSpeechAsrTranscriptionOutput {
             text,
             language: language.map(str::to_string),
-            diagnostics: Some(granite_diagnostics(
+            diagnostics: Some(self.with_precision_diagnostics(granite_diagnostics(
                 &features,
                 &granite_prompt,
                 &generation,
@@ -1581,8 +1683,17 @@ impl GraniteSpeechAsrModel {
                 &self.device,
                 timings,
                 audio_stats,
-            )),
+            ))),
         })
+    }
+
+    /// Adds the precision each component loaded with, and why, under
+    /// `execution`.
+    fn with_precision_diagnostics(&self, mut diagnostics: serde_json::Value) -> serde_json::Value {
+        diagnostics["execution"]["encoder_weight_precision"] =
+            self.runtime.encoder_weight_precision().diagnostics();
+        diagnostics["execution"]["lm_precision"] = self.runtime.lm_precision().diagnostics();
+        diagnostics
     }
 }
 
@@ -1885,6 +1996,19 @@ fn granite_speech_physical_state_spec(
     })
 }
 
+/// Request preparation routes ASR to the retained sequence graph only for a
+/// model with resumable prefill (`runtime/service.rs`), so without it that
+/// graph never runs: its retained decoder state would be fitted, allocated
+/// and held for nothing (GRN-8). The graph keeps its scratch-only profile.
+fn granite_speech_without_retained_route(
+    mut spec: GraniteSpeechPhysicalStateSpec,
+) -> GraniteSpeechPhysicalStateSpec {
+    spec.retained = None;
+    spec.retained_max_tokens = None;
+    spec.descriptor.retained = RetainedStateCapability::Stateless;
+    spec
+}
+
 fn granite_speech_paged_invocation_bytes(state: &StateDomainSpec, max_tokens: u64) -> Result<u64> {
     let StateDomainSpec::PagedAttention(spec) = state else {
         return Err(Error::ModelLoadError(
@@ -1946,14 +2070,91 @@ fn validate_granite_audio_duration(audio_seconds: f32) -> Result<()> {
     )))
 }
 
-fn select_granite_speech_dtype(device: &DeviceProfile, config_hint: Option<&str>) -> Result<DType> {
-    let explicit = std::env::var("IZWI_GRANITE_SPEECH_DTYPE")
+fn validate_granite_task_audio_duration(task: GraniteSpeechTask, audio_seconds: f32) -> Result<()> {
+    if task != GraniteSpeechTask::WordTimestamps || audio_seconds <= TIMESTAMP_MAX_AUDIO_SECONDS {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "Granite Speech word timestamps cover up to {TIMESTAMP_MAX_AUDIO_SECONDS:.0}s per invocation, got {audio_seconds:.1}s"
+    )))
+}
+
+const GRANITE_SPEECH_DTYPE_ENV: &str = "IZWI_GRANITE_SPEECH_DTYPE";
+
+/// Whether the conformer encoder's linear and pointwise-convolution weights
+/// load as weight-only F16 (F32 activations): on by default on Metal, as
+/// whisper.cpp stores conformer encoders; `IZWI_GRANITE_SPEECH_DTYPE=f32`
+/// or `IZWI_METAL_DTYPE=f32` keeps them F32. Admission prices the encoder
+/// accordingly (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn resolve_granite_encoder_projection_precision(
+    device: &DeviceProfile,
+) -> DTypeSelection {
+    let family = std::env::var(GRANITE_SPEECH_DTYPE_ENV).ok();
+    device.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (GRANITE_SPEECH_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is one of the encoder weights that load
+/// as weight-only F16 under [`resolve_granite_encoder_projection_precision`]
+/// (their biases stay in the encoder dtype).
+pub(crate) fn granite_tensor_is_f16_encoder_projection(name: &str) -> bool {
+    let Some(encoder) = name.strip_prefix("encoder.") else {
+        return false;
+    };
+    if matches!(
+        encoder,
+        "input_linear.weight" | "out.weight" | "out_mid.weight"
+    ) {
+        return true;
+    }
+    let Some((index, tail)) = encoder
+        .strip_prefix("layers.")
+        .and_then(|layer| layer.split_once('.'))
+    else {
+        return false;
+    };
+    index.parse::<usize>().is_ok()
+        && matches!(
+            tail,
+            "ff1.up_proj.weight"
+                | "ff1.down_proj.weight"
+                | "ff2.up_proj.weight"
+                | "ff2.down_proj.weight"
+                | "attn.to_q.weight"
+                | "attn.to_kv.weight"
+                | "attn.to_out.weight"
+                | "conv.up_conv.weight"
+                | "conv.down_conv.weight"
+        )
+}
+
+/// The base weight dtype the Granite Speech loader selects on `device`,
+/// honouring `IZWI_GRANITE_SPEECH_DTYPE`; `config_hint` is the checkpoint
+/// config's dtype. Load admission prices the checkpoint at this dtype
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn select_granite_speech_dtype(
+    device: &DeviceProfile,
+    config_hint: Option<&str>,
+) -> Result<DType> {
+    let explicit = std::env::var(GRANITE_SPEECH_DTYPE_ENV)
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty());
 
     if let Some(raw) = explicit.as_deref() {
         return resolve_explicit_granite_speech_dtype(device, raw);
+    }
+    if device.kind.is_metal()
+        && MetalDTypeOverride::from_env() == MetalDTypeOverride::Auto
+        && device.metal_bf16_checkpoint_lm_tier().dtype == DType::BF16
+    {
+        // Report 13's Apple9+ tier for the BF16 checkpoint (held until
+        // Metal paged attention takes BF16); the encoder stays F32 with
+        // weight-only F16 projections.
+        return Ok(DType::BF16);
     }
 
     config_hint
@@ -2049,6 +2250,10 @@ fn granite_diagnostics(
         "prompt_prefix_tokens": prompt.prefix_text_token_count,
         "prompt_audio_placeholders": prompt.audio_token_positions.len(),
         "prompt": {
+            "profile": prompt.profile.name(),
+            "task": prompt.task.name(),
+            "instruction": prompt.instruction,
+            "prompt_ignored": prompt.prompt_ignored,
             "prompt_tokens": generation.stats.prompt_tokens,
             "prefix_tokens": prompt.prefix_text_token_count,
             "audio_placeholders": prompt.audio_token_positions.len(),
@@ -2108,13 +2313,27 @@ fn granite_diagnostics(
                 "text": segment.text,
             })
         }).collect::<Vec<_>>(),
-        "timestamp_words": parsed.timestamp_words.iter().map(|word| {
-            json!({
-                "word": word.word,
-                "end_time_seconds": word.end_time_seconds,
-            })
-        }).collect::<Vec<_>>(),
+        "timestamp_words": granite_speech_timestamp_words_json(&parsed.timestamp_words),
     })
+}
+
+/// The `timestamp_words` diagnostics schema the OpenAI route reads word
+/// timings from.
+pub(crate) fn granite_speech_timestamp_words_json(
+    words: &[GraniteSpeechTimestampWord],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        words
+            .iter()
+            .map(|word| {
+                json!({
+                    "word": word.word,
+                    "start_time_seconds": word.start_time_seconds,
+                    "end_time_seconds": word.end_time_seconds,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn granite_decode_profile_json(profile: &GraniteSpeechDecodeProfile) -> serde_json::Value {
@@ -2277,6 +2496,30 @@ fn granite_token_debug_enabled() -> bool {
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {
+    granite_speech_artifacts(model_dir).map(|artifacts| artifacts.shard_paths)
+}
+
+struct GraniteSpeechArtifacts {
+    shard_paths: Vec<PathBuf>,
+    has_untied_lm_head: bool,
+}
+
+/// The output head the config resolves must be the one the checkpoint ships:
+/// an untied head needs its own tensor, and a tied config must not silently
+/// discard a trained one.
+fn validate_granite_lm_head_layout(tied: bool, has_untied_lm_head: bool) -> Result<()> {
+    match (tied, has_untied_lm_head) {
+        (false, false) => Err(Error::ModelLoadError(format!(
+            "Granite Speech config unties the output head but the checkpoint index has no {UNTIED_LM_HEAD_TENSOR}"
+        ))),
+        (true, true) => Err(Error::ModelLoadError(format!(
+            "Granite Speech config ties the output head to the embedding but the checkpoint ships {UNTIED_LM_HEAD_TENSOR}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn granite_speech_artifacts(model_dir: &Path) -> Result<GraniteSpeechArtifacts> {
     for file in REQUIRED_ARTIFACTS {
         let path = model_dir.join(file);
         if !path.exists() {
@@ -2339,7 +2582,10 @@ pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>>
         shard_paths.push(path);
     }
 
-    Ok(shard_paths)
+    Ok(GraniteSpeechArtifacts {
+        shard_paths,
+        has_untied_lm_head: weight_map.contains_key(UNTIED_LM_HEAD_TENSOR),
+    })
 }
 
 fn validate_shard_filename(file: &str) -> Result<()> {
@@ -2497,6 +2743,37 @@ mod tests {
     }
 
     #[test]
+    fn disabled_retained_route_allocates_no_retained_state() {
+        let invocation = granite_test_invocation_contract();
+        let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
+        let normal = vec![
+            granite_test_stage(0, StageWorkSelector::PreSequencePreparation),
+            granite_test_stage(1, StageWorkSelector::SequencePrefill),
+            granite_test_stage(2, StageWorkSelector::SequenceDecode),
+        ];
+        let atomic = vec![granite_test_stage(0, StageWorkSelector::Atomic)];
+        let spec = granite_speech_without_retained_route(
+            granite_speech_physical_state_spec(
+                &[normal.as_slice(), atomic.as_slice()],
+                retained,
+                invocation,
+                128,
+            )
+            .unwrap(),
+        );
+
+        assert!(spec.retained.is_none());
+        assert_eq!(spec.retained_max_tokens, None);
+        assert!(matches!(
+            spec.descriptor.retained,
+            RetainedStateCapability::Stateless
+        ));
+        for stages in [normal.as_slice(), atomic.as_slice()] {
+            spec.descriptor.validate_against_stages(stages).unwrap();
+        }
+    }
+
+    #[test]
     fn physical_state_authenticates_static_padded_preparation() {
         let invocation = granite_test_invocation_contract();
         let retained = granite_speech_retained_contract(invocation.clone()).unwrap();
@@ -2591,7 +2868,6 @@ mod tests {
     fn write_required_non_weight_files(model_dir: &Path) {
         std::fs::write(model_dir.join("chat_template.jinja"), "{{ prompt }}").unwrap();
         std::fs::write(model_dir.join("config.json"), "{}").unwrap();
-        std::fs::write(model_dir.join("generation_config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("processor_config.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
         std::fs::write(model_dir.join("tokenizer_config.json"), "{}").unwrap();
@@ -2818,6 +3094,53 @@ mod tests {
     }
 
     #[test]
+    fn granite_encoder_projections_are_weight_only_f16_on_metal_with_f32_escapes() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = GRANITE_DTYPE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let metal = test_profile(DeviceKind::Metal, true);
+        let resolve = || resolve_granite_encoder_projection_precision(&metal).dtype;
+        assert_eq!(resolve(), DType::F16);
+        assert_eq!(
+            resolve_granite_encoder_projection_precision(&DeviceProfile::cpu()).dtype,
+            DType::F32
+        );
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        assert_eq!(resolve(), DType::F32);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        std::env::set_var(GRANITE_SPEECH_DTYPE_ENV, "f32");
+        assert_eq!(resolve(), DType::F32);
+        std::env::remove_var(GRANITE_SPEECH_DTYPE_ENV);
+
+        for name in [
+            "encoder.input_linear.weight",
+            "encoder.out.weight",
+            "encoder.out_mid.weight",
+            "encoder.layers.0.ff1.up_proj.weight",
+            "encoder.layers.15.ff2.down_proj.weight",
+            "encoder.layers.3.attn.to_kv.weight",
+            "encoder.layers.3.conv.up_conv.weight",
+        ] {
+            assert!(granite_tensor_is_f16_encoder_projection(name), "{name}");
+        }
+        for name in [
+            "encoder.input_linear.bias",
+            "encoder.layers.0.ff1.up_proj.bias",
+            "encoder.layers.0.attn.rel_pos_emb.weight",
+            "encoder.layers.0.conv.depth_conv.conv.weight",
+            "encoder.layers.0.post_norm.weight",
+            "encoder.layers.x.ff1.up_proj.weight",
+            "projector.linear.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+        ] {
+            assert!(!granite_tensor_is_f16_encoder_projection(name), "{name}");
+        }
+    }
+
+    #[test]
     fn artifact_validation_requires_index_weight_map() {
         let dir = temp_model_dir();
         write_required_non_weight_files(&dir);
@@ -2860,6 +3183,151 @@ mod tests {
     }
 
     #[test]
+    fn artifact_validation_reports_untied_head_and_needs_no_generation_config() {
+        let dir = temp_model_dir();
+        write_required_non_weight_files(&dir);
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"language_model.lm_head.weight":"model-00002-of-00003.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("model-00002-of-00003.safetensors"), []).unwrap();
+        let artifacts = granite_speech_artifacts(&dir).unwrap();
+        assert!(artifacts.has_untied_lm_head);
+        assert!(!dir.join("generation_config.json").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A catalog variant must load the checkpoint it names: the base variant
+    /// on a plus directory (or the reverse) would serve the wrong prompts
+    /// and capabilities.
+    #[test]
+    fn load_rejects_the_other_checkpoint_kind_before_mapping_weights() {
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/granite_speech");
+        for (fixture, wrong_variant, expected, found) in [
+            (
+                "base",
+                ModelVariant::GraniteSpeech412BPlus,
+                "granite_speech_plus",
+                "granite_speech",
+            ),
+            (
+                "plus",
+                ModelVariant::GraniteSpeech412B,
+                "granite_speech",
+                "granite_speech_plus",
+            ),
+        ] {
+            let dir = temp_model_dir();
+            write_required_non_weight_files(&dir);
+            std::fs::copy(
+                fixtures.join(fixture).join("config.json"),
+                dir.join("config.json"),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                r#"{"weight_map":{"a":"model-00001-of-00003.safetensors"}}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.join("model-00001-of-00003.safetensors"), []).unwrap();
+            let err = GraniteSpeechAsrModel::load(
+                &dir,
+                wrong_variant,
+                test_profile(DeviceKind::Cpu, false),
+            )
+            .err()
+            .expect("mismatched checkpoint must not load")
+            .to_string();
+            assert!(
+                err.contains(&format!("expects a {expected} checkpoint"))
+                    && err.ends_with(&format!("declares {found}")),
+                "{err}"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
+        assert!(GraniteSpeechAsrModel::load(
+            &fixtures.join("base"),
+            ModelVariant::WhisperLargeV3Turbo,
+            test_profile(DeviceKind::Cpu, false),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn lm_head_layout_must_match_the_resolved_tie() {
+        validate_granite_lm_head_layout(true, false).unwrap();
+        validate_granite_lm_head_layout(false, true).unwrap();
+        assert!(validate_granite_lm_head_layout(false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("has no language_model.lm_head.weight"));
+        assert!(validate_granite_lm_head_layout(true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("ships language_model.lm_head.weight"));
+    }
+
+    #[test]
+    fn request_language_validation_follows_each_checkpoint() {
+        let base = ModelVariant::GraniteSpeech412B;
+        let plus = ModelVariant::GraniteSpeech412BPlus;
+        for language in [None, Some(""), Some("en"), Some("German"), Some("ja")] {
+            validate_granite_speech_request_language(base, language).unwrap();
+        }
+        validate_granite_speech_request_language(plus, Some("pt")).unwrap();
+        assert!(validate_granite_speech_request_language(plus, Some("ja"))
+            .unwrap_err()
+            .to_string()
+            .contains("does not support source language 'ja'"));
+        assert!(validate_granite_speech_request_language(base, Some("Chinese")).is_err());
+        validate_granite_speech_request_language(
+            ModelVariant::WhisperLargeV3Turbo,
+            Some("Chinese"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn request_plan_runs_native_timestamps_only_on_plus() {
+        let timestamps = granite_speech_request_plan(ModelVariant::GraniteSpeech412BPlus, true);
+        assert_eq!(timestamps.task, GraniteSpeechTask::WordTimestamps);
+        assert_eq!(timestamps.max_audio_seconds, 210.0);
+        assert_eq!(timestamps.max_chunk_seconds, Some(60.0));
+        assert!(!timestamps.prefix_replay);
+
+        let plus_asr = granite_speech_request_plan(ModelVariant::GraniteSpeech412BPlus, false);
+        assert_eq!(plus_asr.task, GraniteSpeechTask::Asr);
+        assert_eq!(plus_asr.max_audio_seconds, DEFAULT_MAX_AUDIO_SECONDS);
+        assert_eq!(plus_asr.max_chunk_seconds, None);
+        assert!(plus_asr.prefix_replay);
+
+        // Base has no timestamp task (the aligner times its punctuated text)
+        // and no assistant-prefix slot.
+        for requested in [false, true] {
+            let base = granite_speech_request_plan(ModelVariant::GraniteSpeech412B, requested);
+            assert_eq!(base.task, GraniteSpeechTask::Asr);
+            assert_eq!(base.max_chunk_seconds, None);
+            assert!(!base.prefix_replay);
+        }
+    }
+
+    #[test]
+    fn timestamp_invocations_are_limited_to_the_evaluated_range() {
+        assert!(
+            validate_granite_task_audio_duration(GraniteSpeechTask::WordTimestamps, 210.0).is_ok()
+        );
+        assert!(
+            validate_granite_task_audio_duration(GraniteSpeechTask::WordTimestamps, 210.5)
+                .unwrap_err()
+                .to_string()
+                .contains("up to 210s")
+        );
+        assert!(validate_granite_task_audio_duration(GraniteSpeechTask::Asr, 500.0).is_ok());
+    }
+
+    #[test]
     fn audio_duration_guard_allows_nine_minutes_only() {
         assert!(validate_granite_audio_duration(DEFAULT_MAX_AUDIO_SECONDS).is_ok());
         let err = validate_granite_audio_duration(DEFAULT_MAX_AUDIO_SECONDS + 0.1).unwrap_err();
@@ -2881,7 +3349,11 @@ mod tests {
             input_features: vec![vec![0.0; 160]],
         };
         let prompt = GraniteSpeechPrompt {
+            profile: GraniteSpeechPromptProfile::Plus,
+            task: GraniteSpeechTask::WordTimestamps,
             text: "<|audio|>".to_string(),
+            instruction: GRANITE_SPEECH_TIMESTAMP_INSTRUCTION.to_string(),
+            prompt_ignored: false,
             input_ids: vec![100_352],
             audio_token_positions: vec![0],
             prefix_text_token_count: 0,
@@ -3087,5 +3559,17 @@ mod tests {
         assert_eq!(diagnostics["timings_ms"]["model_non_generation"], 2.0);
         assert_eq!(diagnostics["speaker_segments"][0]["speaker"], "Speaker 1");
         assert_eq!(diagnostics["timestamp_words"][0]["word"], "hello");
+        assert_eq!(diagnostics["timestamp_words"][0]["start_time_seconds"], 0.0);
+        assert_eq!(
+            diagnostics["timestamp_words"][0]["end_time_seconds"],
+            0.45f32 as f64
+        );
+        assert_eq!(diagnostics["prompt"]["profile"], "plus");
+        assert_eq!(diagnostics["prompt"]["prompt_ignored"], false);
+        assert_eq!(diagnostics["prompt"]["task"], "word_timestamps");
+        assert_eq!(
+            diagnostics["prompt"]["instruction"],
+            GRANITE_SPEECH_TIMESTAMP_INSTRUCTION
+        );
     }
 }

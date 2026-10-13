@@ -678,15 +678,24 @@ impl InferenceCoordinator {
             .saturating_add(reserved_unified_memory_bytes);
         let materialized_device_memory_bytes =
             known_memory_bytes(authority.materialized.device_bytes);
-        let untracked_device_memory_bytes = match (
-            authority.physical.capacity.device_bytes,
-            authority.physical.available.device_bytes,
-        ) {
-            (ResourceAmount::Known(capacity), ResourceAmount::Known(available)) => capacity
-                .saturating_sub(available)
-                .saturating_sub(materialized_device_memory_bytes),
-            _ => 0,
-        };
+        // With a device observer (Metal's allocated size, CUDA's used device
+        // memory) this is what the process holds beyond every lease's
+        // materialized usage, in the backend's own domain; Metal has no
+        // device-domain capacity, so the capacity difference read zero there.
+        let untracked_device_memory_bytes = self
+            .resources
+            .untracked_device_bytes(self.backend)
+            .unwrap_or_else(|| {
+                match (
+                    authority.physical.capacity.device_bytes,
+                    authority.physical.available.device_bytes,
+                ) {
+                    (ResourceAmount::Known(capacity), ResourceAmount::Known(available)) => capacity
+                        .saturating_sub(available)
+                        .saturating_sub(materialized_device_memory_bytes),
+                    _ => 0,
+                }
+            });
         CoordinatorSnapshot {
             capacity: self.capacity,
             active_jobs: self.active_jobs.load(Ordering::Relaxed),
@@ -1937,6 +1946,17 @@ impl PhysicalCapacityProvider for SharedHostUnifiedCapacityProvider {
     fn refresh_after_release(&self) -> PhysicalCapacitySnapshot {
         self.combined_snapshot(true)
     }
+
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        let providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        providers
+            .values()
+            .filter_map(|provider| provider.observed_device_usage_bytes())
+            .reduce(u64::saturating_add)
+    }
 }
 
 impl SharedHostUnifiedCapacityProvider {
@@ -2496,6 +2516,19 @@ struct DeviceCapacityProbe {
 }
 
 impl DeviceCapacityProbe {
+    /// Without an explicit budget the CPU advisory ledger admitted against
+    /// u64::MAX, so no reservation could ever fail and an oversized load or
+    /// request surfaced as swap or the OOM killer. Bound it by physical memory
+    /// (MemTotal or the cgroup limit on Linux, hw.memsize on macOS) with the
+    /// Metal default's fraction; an operator budget wins unchanged.
+    fn derive_default_cpu_budget(&mut self) {
+        if self.backend == BackendKind::Cpu && self.configured_cap.is_none() {
+            self.configured_cap = self
+                .observed_capacity()
+                .map(|(total, _, _)| metal_default_budget_from_working_set(total));
+        }
+    }
+
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
         Self::apply_optional_cap(self.configured_cap, total, available)
     }
@@ -2637,13 +2670,14 @@ impl DeviceCapacityProvider {
         } else {
             None
         };
-        let probe = DeviceCapacityProbe {
+        let mut probe = DeviceCapacityProbe {
             backend,
             device: Some(device),
             configured_cap,
             configured_host_cap,
             test_capacity: cfg!(test).then_some(1024 * 1024 * 1024 * 1024),
         };
+        probe.derive_default_cpu_budget();
         Self::from_probe(probe)
     }
 
@@ -2737,6 +2771,21 @@ impl PhysicalCapacityProvider for DeviceCapacityProvider {
             .unwrap_or_else(|| self.probe.unavailable_snapshot());
         self.cache.publish_sample(snapshot, sampled_at);
         snapshot
+    }
+
+    fn observed_device_usage_bytes(&self) -> Option<u64> {
+        if self.probe.test_capacity.is_some() {
+            return None;
+        }
+        let device = self.probe.device.as_ref()?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match self.probe.backend {
+            BackendKind::Cpu => None,
+            BackendKind::Metal => metal_allocated_bytes(device),
+            BackendKind::Cuda => cuda_memory_snapshot(device)
+                .map(|(total, available, _)| total.saturating_sub(available)),
+        }))
+        .ok()
+        .flatten()
     }
 }
 
@@ -2868,10 +2917,24 @@ fn metal_memory_snapshot(_device: &DeviceProfile) -> Option<(u64, u64, CapacityS
     None
 }
 
+/// Metal buffers this process holds (`currentAllocatedSize`), Candle's pooled
+/// released buffers included until the device next synchronizes.
+#[cfg(feature = "metal")]
+fn metal_allocated_bytes(device: &DeviceProfile) -> Option<u64> {
+    let metal = device.device.as_metal_device().ok()?.metal_device();
+    u64::try_from(metal.current_allocated_size()).ok()
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_allocated_bytes(_device: &DeviceProfile) -> Option<u64> {
+    None
+}
+
 /// Default Metal advisory-ledger budget as a fraction of the probed working
-/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset. The remaining fraction
-/// absorbs command buffers, staging copies, and allocator metadata that no
-/// per-model static estimate tracks.
+/// set when `IZWI_METAL_MEMORY_BUDGET_BYTES` is unset, and the CPU budget as
+/// the same fraction of physical memory when `IZWI_CPU_MEMORY_BUDGET_BYTES` is
+/// unset. The remaining fraction absorbs command buffers, staging copies, and
+/// allocator metadata that no per-model static estimate tracks.
 const METAL_DEFAULT_BUDGET_NUMERATOR: u64 = 9;
 const METAL_DEFAULT_BUDGET_DENOMINATOR: u64 = 10;
 
@@ -3791,6 +3854,31 @@ Pages free: 10.\n";
             metal_default_budget_from_working_set(u64::MAX),
             u64::MAX / 10 * 9
         );
+    }
+
+    /// CPU's advisory ledger is bounded by physical memory (the probe's total,
+    /// here a fixed test capacity) unless the operator sets a budget.
+    #[test]
+    fn cpu_ledger_budget_is_finite_and_respects_the_operator_budget() {
+        let probe = |configured_cap| DeviceCapacityProbe {
+            backend: BackendKind::Cpu,
+            device: None,
+            configured_cap,
+            configured_host_cap: None,
+            test_capacity: Some(1000),
+        };
+        let mut derived = probe(None);
+        derived.derive_default_cpu_budget();
+        assert_eq!(derived.configured_cap, Some(900));
+        let mut configured = probe(Some(4096));
+        configured.derive_default_cpu_budget();
+        assert_eq!(configured.configured_cap, Some(4096));
+        let mut metal = DeviceCapacityProbe {
+            backend: BackendKind::Metal,
+            ..probe(None)
+        };
+        metal.derive_default_cpu_budget();
+        assert_eq!(metal.configured_cap, None);
     }
 
     #[test]

@@ -1,0 +1,4 @@
+{
+  "audio_token": "<|audio|>",
+  "processor_class": "GraniteSpeechProcessor"
+}

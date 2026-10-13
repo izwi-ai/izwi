@@ -8,8 +8,8 @@ use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
 use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
 
-pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 49;
-pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 73;
+pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 50;
+pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 74;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConformanceCapability {
@@ -615,7 +615,7 @@ mod tests {
                 .iter()
                 .filter(|case| case.retained_state == Stateless)
                 .count(),
-            19
+            20
         );
 
         assert_eq!(
@@ -707,5 +707,19 @@ mod tests {
                 InvocationStateRequired
             );
         }
+        // The base checkpoint serves plain ASR only; speaker turns are plus's.
+        assert_eq!(
+            manifest_case(
+                &manifest,
+                ModelVariant::GraniteSpeech412B,
+                ConformanceCapability::Asr,
+            )
+            .workspace,
+            InvocationStateRequired
+        );
+        assert!(!manifest
+            .iter()
+            .any(|case| case.variant == ModelVariant::GraniteSpeech412B
+                && case.capability == ConformanceCapability::SpeakerAttributedAsr));
     }
 }

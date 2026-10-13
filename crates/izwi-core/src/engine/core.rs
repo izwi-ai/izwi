@@ -17,7 +17,9 @@ use super::cache::composite::{
     allocate_composite_retained_state, project_composite_paged_contract,
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
-use super::cache::managed::{ManagedKvCacheManager, ManagedStateCapacityRequest};
+use super::cache::managed::{
+    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+};
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
 #[cfg(test)]
@@ -26,11 +28,11 @@ use super::execution::{
     AdapterAbiRevision, AdapterInstanceId, BatchBudget, BatchDispatch, BatchId, BatchKey,
     BatchLaneKey, ClockedStateSpan, ConcurrencyClass, DeadlinePhase, DispatchState,
     ExecutionDisposition, ExecutionFailure, ExecutionGroupId, ExecutionMode, ExecutionPlan,
-    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureOrigin,
-    FinishReason as ExecutionFinishReason, ModelInstanceId, NativeBatchMode, OutcomeProvenance,
-    OutputVisibility, PhysicalBatch, PhysicalLaunchPolicy, PrefillMode, ReadyQuantum,
-    RealtimeStageOutcome, RealtimeSubphase, RetryDisposition, SequencePhase, StageId,
-    StageShapePolicy, WorkCost, WorkUnit,
+    ExecutionProfile, ExecutionReport, ExecutionState, ExecutionTracker, FailureKind,
+    FailureOrigin, FailureScope, FinishReason as ExecutionFinishReason, HealthImpact,
+    ModelInstanceId, NativeBatchMode, OutcomeProvenance, OutputVisibility, PhysicalBatch,
+    PhysicalLaunchPolicy, PrefillMode, ReadyQuantum, RealtimeStageOutcome, RealtimeSubphase,
+    RetryDisposition, SequencePhase, StageId, StageShapePolicy, WorkCost, WorkUnit,
 };
 use super::execution_group::{
     ExecutedEngineStep, ExecutionGroupRunner, ExecutionPhase, PreparedEngineStep,
@@ -113,6 +115,26 @@ impl RequestPhaseTiming {
                 .as_secs_f64()
                 * 1000.0,
         )
+    }
+}
+
+/// Why [`EngineCore::begin_execution_plan`] did not register a plan.
+#[derive(Debug)]
+enum PlanBeginError {
+    /// The request's bound adapter cannot run the work its executor profile
+    /// schedules: no single stage matches it, or the stage's batching
+    /// disagrees with the executor. The binding, the profile and the work
+    /// derived from them are fixed for the session, and the scheduler has
+    /// already fallen back to scalar execution, so a retry selects the same
+    /// work and fails the same way. The request fails terminally.
+    AdapterContract(Error),
+    /// Any other failure rolls the schedule back for the run loop to retry.
+    Engine(Error),
+}
+
+impl From<Error> for PlanBeginError {
+    fn from(error: Error) -> Self {
+        Self::Engine(error)
     }
 }
 
@@ -776,7 +798,7 @@ impl EngineCore {
     async fn begin_execution_plan(
         &mut self,
         scheduled: &super::scheduler::ScheduledRequest,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), PlanBeginError> {
         let session = scheduled.session_key();
         if self.active_plans.contains_key(&scheduled.plan_id)
             || self
@@ -787,10 +809,10 @@ impl EngineCore {
                 dispatch.contains_plan(scheduled.plan_id) || dispatch.contains_session(&session)
             })
         {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "execution plan {} duplicates an active session or plan quantum",
                 scheduled.plan_id
-            )));
+            ))));
         }
         let request = self
             .requests
@@ -813,16 +835,17 @@ impl EngineCore {
                     ExecutionMode::Atomic,
                 )
             });
-        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)?;
+        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)
+            .map_err(PlanBeginError::AdapterContract)?;
         if scheduled.is_prefill
             && profile.prefill != PrefillMode::Incremental
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens < request.num_prompt_tokens())
         {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "full-prefill request {} was scheduled as a partial prompt quantum",
                 scheduled.request_id
-            )));
+            ))));
         }
         let mut work = match profile.mode {
             ExecutionMode::Sequence | ExecutionMode::Realtime
@@ -854,7 +877,8 @@ impl EngineCore {
         let bound_stage = request
             .execution_adapter_binding()
             .map(|binding| binding.stage_for_work(&work).cloned())
-            .transpose()?;
+            .transpose()
+            .map_err(PlanBeginError::AdapterContract)?;
         if let WorkUnit::SequenceStep {
             input,
             auxiliary_state,
@@ -862,9 +886,9 @@ impl EngineCore {
         } = &mut work
         {
             if auxiliary_state.is_some() {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "scheduler attempted to author retained auxiliary state".into(),
-                ));
+                )));
             }
             if let Some(stage) = bound_stage.as_ref() {
                 let projected = request.project_auxiliary_state_spans(stage, *input)?;
@@ -884,9 +908,9 @@ impl EngineCore {
                         if span.input().is_empty()
                             || previous_group.is_some_and(|previous| previous >= span.group().get())
                         {
-                            return Err(Error::InferenceError(
+                            return Err(PlanBeginError::Engine(Error::InferenceError(
                                 "projected clocked-state spans are not canonical and unique".into(),
-                            ));
+                            )));
                         }
                         tensor.validate_group_clock(span.group(), span.clock())?;
                         previous_group = Some(span.group().get());
@@ -910,9 +934,9 @@ impl EngineCore {
         };
         if let Some((state_input, auxiliary_state)) = realtime_state {
             if auxiliary_state.is_some() {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "scheduler attempted to author retained realtime state".into(),
-                ));
+                )));
             }
             if let Some(selections) = bound_stage
                 .as_ref()
@@ -932,9 +956,9 @@ impl EngineCore {
                 let mut previous_group = None;
                 for selection in selections {
                     if previous_group.is_some_and(|previous| previous >= selection.group().get()) {
-                        return Err(Error::InferenceError(
+                        return Err(PlanBeginError::Engine(Error::InferenceError(
                             "retained realtime selections are not canonical and unique".into(),
-                        ));
+                        )));
                     }
                     tensor.validate_group_clock(selection.group(), selection.clock())?;
                     spans.push(ClockedStateSpan::new(
@@ -1010,19 +1034,19 @@ impl EngineCore {
             .entry(scheduled.request_id.clone())
             .or_insert_with(|| ExecutionTracker::new(plan.session.clone()));
         if tracker.session() != &plan.session {
-            return Err(Error::InferenceError(format!(
+            return Err(PlanBeginError::Engine(Error::InferenceError(format!(
                 "request {} already has a different active session",
                 scheduled.request_id
-            )));
+            ))));
         }
         if tracker.state() == ExecutionState::Queued {
             tracker.transition(ExecutionState::Admitted)?;
         }
         let running_state = match plan.work {
             WorkUnit::PreSequencePreparation { .. } => {
-                return Err(Error::InferenceError(
+                return Err(PlanBeginError::Engine(Error::InferenceError(
                     "pre-sequence preparation cannot enter EngineCore execution".to_string(),
-                ));
+                )));
             }
             WorkUnit::SequenceStep {
                 phase: super::SequencePhase::Prefill,
@@ -4414,11 +4438,34 @@ impl EngineCore {
             .chain(prefill_scheduled.iter())
             .cloned()
             .collect::<Vec<_>>();
+        let mut contract_failures = Vec::new();
         for scheduled in &all_scheduled {
-            if let Err(error) = self.begin_execution_plan(scheduled).await {
-                self.rollback_unexecuted_schedule(&all_scheduled);
-                return Err(error);
+            match self.begin_execution_plan(scheduled).await {
+                Ok(()) => {}
+                Err(PlanBeginError::AdapterContract(error)) => {
+                    contract_failures.push((scheduled.session_key(), error));
+                }
+                Err(PlanBeginError::Engine(error)) => {
+                    self.rollback_unexecuted_schedule(&all_scheduled);
+                    return Err(error);
+                }
             }
+        }
+        if !contract_failures.is_empty() {
+            // Rescheduling would select the same unsupported work on every
+            // step. Fail those requests now and commit their terminal outputs;
+            // the rest of this schedule runs on the next step.
+            self.rollback_unexecuted_schedule(&all_scheduled);
+            for (session, error) in contract_failures {
+                self.fail_adapter_contract_mismatch(&session, error).await;
+            }
+            let capacity = self.config.resolved_physical_execution_capacity();
+            return Ok(Some(PreparedEngineStep::with_execution_policy(
+                self.executor.clone(),
+                Vec::new(),
+                self.config.physical_execution_mode,
+                capacity.physical_launch_limit,
+            )));
         }
         let now = Instant::now();
 
@@ -4887,6 +4934,12 @@ impl EngineCore {
                 .get(&request_id)
                 .map(|request| request.num_prompt_tokens())
                 .unwrap_or(engine_output.token_stats.prompt_tokens);
+            // ASR executors report generated audio, which is empty for
+            // transcription; the prepared request records the input duration.
+            engine_output.input_audio_duration_secs = self
+                .requests
+                .get(&request_id)
+                .and_then(|request| request.prepared_asr_input_duration_secs());
             // DS9.1: the managed prefix depth this request actually ran with.
             // The scheduler's cursor copy is authoritative — it is cleared
             // when the probed prefix is lost and the row replans from zero.
@@ -5094,6 +5147,32 @@ impl EngineCore {
                 staged_stream_outputs: Vec::new(),
             });
         true
+    }
+
+    /// Fail a request whose bound adapter cannot run the work its executor
+    /// schedules. Nothing was dispatched, so the session is released like any
+    /// other terminal failure.
+    async fn fail_adapter_contract_mismatch(&mut self, session: &super::SessionKey, error: Error) {
+        warn!(
+            request_id = %session.request_id,
+            session_epoch = session.epoch,
+            error = %error,
+            "Loaded adapter cannot run the scheduled work; failing the request"
+        );
+        let message = format!("execution adapter contract mismatch: {error}");
+        self.terminate_request_session(
+            session,
+            ExecutorOutput::error(session.request_id.clone(), message.clone()),
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::Internal,
+                scope: FailureScope::Row,
+                retry: RetryDisposition::Never,
+                health: HealthImpact::None,
+                message,
+            }),
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted),
+        )
+        .await;
     }
 
     pub(crate) async fn handle_stream_delivery_failure(
@@ -5403,6 +5482,7 @@ impl EngineCore {
                         contract,
                         logical_context_tokens,
                         1,
+                        PortableFitHeadroom::Planning,
                     )?,
                     retained_sequence_rows,
                     staged_transaction_rows,
@@ -5459,13 +5539,52 @@ impl EngineCore {
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        let rows = (
+            self.config.max_retained_sequences,
+            self.config.max_staged_transactions,
+        );
+        self.load_managed_model_state_with_portable_copies_and_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            portable_state_copies,
+            rows,
+            0,
+        )
+    }
+
+    /// ASR retained state with its own `(retained, staged)` row counts, at
+    /// most the engine's (ADM-6): the engine rows are sized for chat (on CUDA
+    /// one per 256 MiB of device memory), far wider than ASR concurrency.
+    pub(crate) fn load_managed_model_state_with_portable_copies_and_rows(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+        (retained_rows, staged_rows): (usize, usize),
+        minimum_tokens: u64,
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        if retained_rows == 0
+            || staged_rows == 0
+            || retained_rows > self.config.max_retained_sequences
+            || staged_rows > self.config.max_staged_transactions
+        {
+            return Err(Error::ModelLoadError(
+                "ASR state row limits exceed configured capacity".into(),
+            ));
+        }
         let backend = self.managed_kv_cache.worker_backend();
-        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+        // Only ASR retained state loads through here; it fits within live
+        // memory so the requests it serves can run beside it.
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
             retained_state,
             logical_context_tokens,
             portable_state_copies,
+            (retained_rows, staged_rows),
+            PortableFitHeadroom::Live { minimum_tokens },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5475,13 +5594,12 @@ impl EngineCore {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
                 logical_token_reach,
-                retained_sequence_rows: u32::try_from(self.config.max_retained_sequences).map_err(
-                    |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
-                )?,
-                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
-                    .map_err(|_| {
-                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                    })?,
+                retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
+                    Error::InvalidInput("managed state sequence limit exceeds u32".into())
+                })?,
+                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                })?,
             },
             self.config.block_size,
             retained_state,
@@ -5525,6 +5643,7 @@ impl EngineCore {
             logical_context_tokens,
             1,
             (retained_rows, staged_rows),
+            PortableFitHeadroom::Planning,
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5554,6 +5673,7 @@ impl EngineCore {
         full_contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         if self.composite_retained_state.contains_key(&model_instance) {
             return Err(Error::InvalidInput(
@@ -5567,6 +5687,8 @@ impl EngineCore {
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
+            // Whisper's decoder state: ASR, fitted within live memory.
+            PortableFitHeadroom::Live { minimum_tokens },
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
@@ -5605,6 +5727,7 @@ impl EngineCore {
         contract: &crate::kv::v2::InferenceStateContract,
         loaded_context: Option<usize>,
         portable_state_copies: u32,
+        headroom: PortableFitHeadroom,
     ) -> Result<Option<u64>> {
         self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
@@ -5616,6 +5739,7 @@ impl EngineCore {
                 self.config.max_retained_sequences,
                 self.config.max_staged_transactions,
             ),
+            headroom,
         )
     }
 
@@ -5627,6 +5751,7 @@ impl EngineCore {
         loaded_context: Option<usize>,
         portable_state_copies: u32,
         row_limits: (usize, usize),
+        headroom: PortableFitHeadroom,
     ) -> Result<Option<u64>> {
         if !self.config.portable_context_auto
             && backend != BackendKind::Cuda
@@ -5657,6 +5782,7 @@ impl EngineCore {
                         Error::InvalidInput("managed state transaction limit exceeds u32".into())
                     })?,
                     portable_state_copies,
+                    headroom,
                 )
                 .map(Some);
         }
@@ -6973,6 +7099,75 @@ mod tests {
         assert!(
             core.pending_terminal_outputs.is_empty(),
             "a completed scheduler session must not receive a second terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_without_a_stage_for_scheduled_work_fails_the_request_once() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let request_id = "no-stage".to_string();
+        let mut request = EngineCoreRequest::tts("no stage").with_model_variant(variant);
+        request.id = request_id.clone();
+        request.prompt_tokens = vec![1];
+        // The executor schedules sequence work, but the adapter only has an
+        // atomic stage, so no stage matches before or after the scalar fallback.
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "tts.atomic",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: ExecutionGroupId::new(1),
+                model_instance_id: ModelInstanceId::new(2),
+                adapter_instance_id: AdapterInstanceId::new(3),
+                adapter_abi_revision: AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "tts".to_string(),
+                stages: Arc::from([stage]),
+            })
+            .unwrap();
+        core.add_request(request).unwrap();
+
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("a stage-selection mismatch must not fail the engine step"),
+            );
+            if !core.has_pending_work() {
+                break;
+            }
+        }
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_finished);
+        assert!(
+            outputs[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no stage for scheduled work")),
+            "{:?}",
+            outputs[0].error
+        );
+        assert_eq!(
+            outputs[0].provenance,
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted)
+        );
+        assert!(!core.has_request(&request_id));
+        assert!(
+            !core.has_pending_work(),
+            "a failed request must not leave work for the run loop to retry"
         );
     }
 
@@ -10108,6 +10303,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn asr_output_carries_prepared_input_duration_when_executor_audio_is_empty() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request.id = "asr-input-duration".to_string();
+        core.add_request(request).unwrap();
+        // Admission of prepared audio requires the loaded model lease that
+        // runtime preparation installs alongside it. Install the decoded audio
+        // after admission to model a prepared row whose executor reports none.
+        Arc::get_mut(core.requests.get_mut("asr-input-duration").unwrap())
+            .expect("the core owns the admitted request")
+            .install_prepared_asr_audio(variant, vec![0.0; 36_000], 24_000)
+            .unwrap();
+
+        let outputs = core.step().await.unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].error.is_none(), "{:?}", outputs[0].error);
+        assert_eq!(outputs[0].audio.duration_secs, 0.0);
+        assert_eq!(outputs[0].input_audio_duration_secs, Some(1.5));
+    }
+
     #[test]
     fn unbound_request_does_not_allocate_managed_cache() {
         let executor = UnifiedExecutor::new_for_test(Box::new(ImmediateFinishExecutor));
@@ -10754,6 +10974,7 @@ mod tests {
                 &crate::engine::cache::composite::tests::contract(),
                 crate::kv::v2::StateDomainId::new(2),
                 Some(32),
+                0,
             )
             .unwrap();
         let request_weak = Arc::downgrade(&loaded);

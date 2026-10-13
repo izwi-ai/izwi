@@ -214,6 +214,9 @@ pub struct EngineOutput {
     pub latency_breakdown: Option<LatencyBreakdown>,
     /// Optional model-specific ASR diagnostics payload.
     pub asr_diagnostics: Option<serde_json::Value>,
+    /// Duration of the prepared ASR input audio, stamped from the request.
+    /// `audio` describes generated output and is not the input duration.
+    pub input_audio_duration_secs: Option<f32>,
     /// Backend execution error when generation failed.
     pub error: Option<String>,
     /// Bounded provenance for dispatch, failure, and deadline observability.

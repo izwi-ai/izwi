@@ -26,19 +26,27 @@ use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::audio::{MelConfig, MelNorm, MelScale, MelSpectrogram};
 use crate::backends::state::StaticAttentionLayerValue;
-use crate::backends::{backend_kind_for_device, BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{
+    backend_kind_for_device, BackendKind, DTypeSelection, DTypeSelectionRequest, DeviceKind,
+    DeviceProfile,
+};
 use crate::catalog::ModelFamily;
 use crate::engine::{
     InvocationStaticAttentionLease, RetainedStaticAttentionRuntimeV2,
     RetainedStaticAttentionSequenceId, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{
+    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
+    PrecisionLoad, F16_SAFE_MAX_ABS,
+};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
+use crate::models::shared::weights::staged;
 use crate::tokenizer::Tokenizer;
 
 use super::model::Whisper as LocalWhisper;
@@ -273,6 +281,12 @@ pub(crate) struct WhisperDecodeState {
     max_steps: usize,
     finished: bool,
     rng: StdRng,
+    /// Language resolved once before the prompt was built.
+    language: WhisperLanguageResolution,
+    /// Every finished temperature attempt, kept across fallback restarts.
+    attempts: Vec<WhisperAttemptRecord>,
+    /// The attempt the terminal policy accepted or skipped, with its temperature.
+    published_attempt: Option<(WhisperDecodeAttempt, f32)>,
 }
 
 /// Owns a registered retained cross-attention sequence until construction of
@@ -374,6 +388,8 @@ struct WhisperDecodeCheckpointPayload {
     max_steps: usize,
     finished: bool,
     rng: StdRng,
+    attempts: Vec<WhisperAttemptRecord>,
+    published_attempt: Option<(WhisperDecodeAttempt, f32)>,
     managed_completions_drained: bool,
     current_managed_generation: u64,
 }
@@ -560,6 +576,8 @@ impl WhisperDecodeState {
         self.max_steps = payload.max_steps;
         self.finished = payload.finished;
         self.rng = payload.rng;
+        self.attempts = payload.attempts;
+        self.published_attempt = payload.published_attempt;
         self.managed_completions_drained = payload.managed_completions_drained;
         self.current_managed_generation = payload.current_managed_generation;
         self.active_quantum = None;
@@ -610,6 +628,8 @@ impl WhisperDecodeState {
                 max_steps: self.max_steps,
                 finished: self.finished,
                 rng: self.rng.clone(),
+                attempts: self.attempts.clone(),
+                published_attempt: self.published_attempt.clone(),
                 managed_completions_drained: self.managed_completions_drained,
                 current_managed_generation: self.current_managed_generation,
             }),
@@ -734,6 +754,25 @@ struct WhisperDecodeAttempt {
     sampled_token_count: usize,
     decode_steps: usize,
     profile: WhisperDecodeProfile,
+}
+
+/// One finished retained attempt and the policy verdict on it.
+#[derive(Debug, Clone)]
+struct WhisperAttemptRecord {
+    temperature: f32,
+    attempt: WhisperDecodeAttempt,
+    retry_reasons: Vec<&'static str>,
+    no_speech_skip: bool,
+}
+
+/// Terminal-policy inputs, resolved from the model's generation config.
+#[derive(Debug, Clone, Copy)]
+struct WhisperTerminalPolicy<'a> {
+    temperatures: &'a [f32],
+    logprob_threshold: f32,
+    no_speech_threshold: f32,
+    compression_ratio_threshold: Option<f32>,
+    vocab_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -935,6 +974,12 @@ impl WhisperModel {
             Self::Local(model) => model.decoder.final_linear(x),
         }
     }
+
+    fn numeric_probe(&self, mel: &Tensor, token: u32) -> Result<Vec<(String, Tensor)>> {
+        match self {
+            Self::Local(model) => model.numeric_probe(mel, token),
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -949,14 +994,35 @@ fn whisper_device_diagnostics(
     device_kind: DeviceKind,
     model_dtype: DType,
     cuda_dtype_shim: bool,
+    precision: &PrecisionLoad,
 ) -> serde_json::Value {
     json!({
         "kind": format!("{device_kind:?}"),
         "model_dtype": format!("{model_dtype:?}"),
         "cuda_dtype_shim": cuda_dtype_shim,
         "whisper_impl": whisper_impl_name(cuda_dtype_shim),
+        "precision": whisper_precision_diagnostics(precision),
     })
 }
+
+/// The loaded precision, why, its self-check, and the work that stays F32
+/// whatever the weight dtype.
+fn whisper_precision_diagnostics(precision: &PrecisionLoad) -> serde_json::Value {
+    let mut diagnostics = precision.diagnostics();
+    diagnostics["f32_islands"] = json!(WHISPER_F32_ISLANDS);
+    diagnostics
+}
+
+/// Work Whisper keeps in F32 under F16 weights and activations, as OpenAI
+/// Whisper, whisper.cpp and mlx-whisper do: the log-mel (cast at the encoder
+/// input), attention softmax, LayerNorm statistics (Candle's fused kernel)
+/// and the logits the sampler reads.
+const WHISPER_F32_ISLANDS: &[&str] = &[
+    "log_mel",
+    "attention_softmax",
+    "layer_norm_statistics",
+    "logits",
+];
 
 fn whisper_impl_name(cuda_dtype_shim: bool) -> &'static str {
     if cuda_dtype_shim {
@@ -1006,6 +1072,126 @@ pub struct WhisperTurboAsrModel {
     token_id_to_language_code: HashMap<u32, String>,
     runtime_tuning: WhisperRuntimeTuning,
     cuda_dtype_shim: bool,
+    precision: PrecisionLoad,
+}
+
+const WHISPER_DTYPE_ENV: &str = "IZWI_WHISPER_DTYPE";
+
+/// The weight and activation dtype the Whisper loader selects on `device`,
+/// and why, honouring `IZWI_WHISPER_DTYPE` and then `IZWI_METAL_DTYPE`.
+/// Whisper's checkpoint is F16; Metal runs it in F16 on every Apple family
+/// (the family default in `backends/device.rs`), as whisper.cpp, mlx-whisper
+/// and OpenAI Whisper do. Its Metal decoder state has no BF16 path, so a
+/// BF16 request there runs in F16. A Metal load that is not F32 must still
+/// pass [`whisper_numeric_self_check`] or it reloads in F32.
+pub(crate) fn whisper_weight_precision(device: &DeviceProfile) -> Result<DTypeSelection> {
+    let requested = std::env::var(WHISPER_DTYPE_ENV).ok();
+    let requested = requested
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    let request = DTypeSelectionRequest::new(requested).with_model_family(ModelFamily::WhisperAsr);
+    let selection = match device.try_resolve_dtype(request) {
+        Ok(selection) => selection,
+        Err(err) if device.kind.is_cuda() => {
+            return Err(Error::InvalidInput(format!(
+                "Invalid CUDA Whisper dtype override: {err}"
+            )));
+        }
+        Err(err) => {
+            warn!("Ignoring {WHISPER_DTYPE_ENV} on {:?}: {err}", device.kind);
+            device.resolve_dtype(
+                DTypeSelectionRequest::new(None).with_model_family(ModelFamily::WhisperAsr),
+            )
+        }
+    };
+    if device.kind.is_metal() && selection.dtype == DType::BF16 {
+        return Ok(DTypeSelection {
+            dtype: DType::F16,
+            reason: format!(
+                "{}; Whisper's checkpoint is F16 and its Metal decoder state has no BF16 path, so it runs in F16",
+                selection.reason
+            )
+            .into(),
+        });
+    }
+    Ok(selection)
+}
+
+/// The dtype of [`whisper_weight_precision`]. Load admission prices the
+/// checkpoint at this dtype (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn whisper_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    whisper_weight_precision(device).map(|selection| selection.dtype)
+}
+
+/// Loads Whisper at `selection`'s dtype from `vb_at(dtype)`. With `check`,
+/// a dtype other than F32 is kept only if [`whisper_numeric_self_check`]
+/// passes; otherwise it reloads in F32 and records why.
+fn load_whisper_with_precision(
+    selection: &DTypeSelection,
+    check: bool,
+    config: &WhisperConfig,
+    probe_token: u32,
+    device: &candle_core::Device,
+    mut vb_at: impl FnMut(DType) -> Result<VarBuilder<'static>>,
+) -> Result<(WhisperModel, PrecisionLoad)> {
+    load_with_precision_fallback(
+        "Whisper",
+        selection,
+        check,
+        DType::F32,
+        |dtype| WhisperModel::load(&vb_at(dtype)?, config.clone()),
+        |model| whisper_numeric_self_check(model, config, selection.dtype, probe_token, device),
+    )
+}
+
+/// A 30 s window of xorshift log-mel (the encoder's real input length; the
+/// normalized log-mel lies in about [-1.5, 1.5]) through the encoder, then
+/// one decoder step for `probe_token`: every block output, the encoder
+/// output and the logits must be finite and below [`F16_SAFE_MAX_ABS`].
+fn whisper_numeric_self_check(
+    model: &WhisperModel,
+    config: &WhisperConfig,
+    dtype: DType,
+    probe_token: u32,
+    device: &candle_core::Device,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check(format!("Whisper {dtype:?}"), F16_SAFE_MAX_ABS, || {
+        let frames = config.max_source_positions.saturating_mul(2).max(1);
+        let mel = xorshift_tensor(&[1, config.num_mel_bins, frames], 0x3157, 1.5, device)?
+            .to_dtype(dtype)?;
+        model.numeric_probe(&mel, probe_token)
+    })
+}
+
+/// The safetensors files the Whisper loader maps: the shards of
+/// `model.safetensors.index.json` when present, else `model.safetensors`.
+/// Load admission prices the same files (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn whisper_weight_files(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if !index_path.exists() {
+        return Ok(vec![model_dir.join("model.safetensors")]);
+    }
+    let index_data = fs::read_to_string(index_path)?;
+    let index: serde_json::Value = serde_json::from_str(&index_data)?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            Error::InvalidInput("Invalid Whisper safetensors index format".to_string())
+        })?;
+
+    let mut shard_files: Vec<String> = weight_map
+        .values()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    shard_files.sort();
+    shard_files.dedup();
+
+    Ok(shard_files
+        .iter()
+        .map(|file| model_dir.join(file))
+        .collect())
 }
 
 impl WhisperTurboAsrModel {
@@ -1017,55 +1203,24 @@ impl WhisperTurboAsrModel {
         let generation = read_generation_config(model_dir)?;
         let tokenizer = Tokenizer::from_path(model_dir)?;
 
-        let dtype_override = std::env::var("IZWI_WHISPER_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let model_dtype = match dtype_override.as_deref() {
-            Some(raw) => {
-                device.select_model_dtype_checked(ModelFamily::WhisperAsr, Some(raw), "Whisper")?
-            }
-            None => device.select_model_dtype(ModelFamily::WhisperAsr, None),
-        };
+        let selection = whisper_weight_precision(&device)?;
+        let special = resolve_special_tokens(&tokenizer, &generation)?;
 
-        let index_path = model_dir.join("model.safetensors.index.json");
-        let vb = if index_path.exists() {
-            let index_data = fs::read_to_string(index_path)?;
-            let index: serde_json::Value = serde_json::from_str(&index_data)?;
-            let weight_map = index
-                .get("weight_map")
-                .and_then(|value| value.as_object())
-                .ok_or_else(|| {
-                    Error::InvalidInput("Invalid Whisper safetensors index format".to_string())
-                })?;
-
-            let mut shard_files: Vec<String> = weight_map
-                .values()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect();
-            shard_files.sort();
-            shard_files.dedup();
-
-            let shard_paths: Vec<std::path::PathBuf> = shard_files
-                .iter()
-                .map(|file| model_dir.join(file))
-                .collect();
-
-            unsafe {
-                VarBuilder::from_mmaped_safetensors(&shard_paths, model_dtype, &device.device)?
-            }
-        } else {
-            let model_path = model_dir.join("model.safetensors");
-            unsafe {
-                VarBuilder::from_mmaped_safetensors(&[model_path], model_dtype, &device.device)?
-            }
-        };
+        let weight_files = whisper_weight_files(model_dir)?;
+        let (whisper, precision) = load_whisper_with_precision(
+            &selection,
+            device.kind.is_metal(),
+            &config,
+            special.sot,
+            &device.device,
+            |dtype| unsafe {
+                staged::metal_staged_safetensors(&weight_files, dtype, &device.device)
+                    .map_err(Error::from)
+            },
+        )?;
+        let model_dtype = precision.loaded;
 
         let use_cuda_dtype_shim = use_cuda_whisper_dtype_shim(&device.device);
-        let whisper = WhisperModel::load(&vb, config.clone())?;
-        let special = resolve_special_tokens(&tokenizer, &generation)?;
         let (language_token_ids, token_id_to_language_code) =
             build_language_token_maps(&tokenizer, &generation);
         let language_token_range = contiguous_token_range(&language_token_ids);
@@ -1087,26 +1242,16 @@ impl WhisperTurboAsrModel {
             &special,
             runtime_tuning.suppress_blank,
             &numeral_symbol_tokens,
-            model_dtype,
+            // The decoder's logits are F32 whatever the model dtype.
+            DType::F32,
             &device.device,
         )?;
 
-        let mel = MelSpectrogram::new(MelConfig {
-            sample_rate: whisper::SAMPLE_RATE,
-            n_fft: whisper::N_FFT,
-            win_length: None,
-            hop_length: whisper::HOP_LENGTH,
-            n_mels: config.num_mel_bins,
-            f_min: 0.0,
-            f_max: (whisper::SAMPLE_RATE / 2) as f32,
-            normalize: true,
-            mel_scale: MelScale::Slaney,
-            mel_norm: MelNorm::Slaney,
-        })?;
+        let mel = MelSpectrogram::new(whisper_mel_config(config.num_mel_bins))?;
 
         info!(
-            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={})",
-            device.kind, model_dtype, use_cuda_dtype_shim
+            "Loaded Whisper Large v3 Turbo ASR on {:?} (dtype={:?}, cuda_dtype_shim={}): {}",
+            device.kind, model_dtype, use_cuda_dtype_shim, precision.reason
         );
 
         Ok(Self {
@@ -1128,6 +1273,7 @@ impl WhisperTurboAsrModel {
             token_id_to_language_code,
             runtime_tuning,
             cuda_dtype_shim: use_cuda_dtype_shim,
+            precision,
         })
     }
 
@@ -1533,8 +1679,8 @@ impl WhisperTurboAsrModel {
             prepared.layers.clone(),
         )?;
 
-        let initialized: Result<(Vec<u32>, usize)> = (|| {
-            let resolved_language = self.resolve_request_language_retained(
+        let initialized: Result<(Vec<u32>, usize, WhisperLanguageResolution)> = (|| {
+            let language = self.resolve_request_language_retained(
                 language,
                 &mut self_kv,
                 cross_owner.runtime.as_ref(),
@@ -1549,7 +1695,7 @@ impl WhisperTurboAsrModel {
             let initial_prompt_tokens = self.encode_initial_prompt_tokens(initial_prompt)?;
             let prompt = build_whisper_prompt_prefix(
                 &self.special,
-                resolved_language.as_ref().map(|(token, _)| *token),
+                language.resolved.as_ref().map(|(token, _)| *token),
                 &initial_prompt_tokens,
                 self.config.max_target_positions,
                 self.runtime_tuning.initial_prompt_max_tokens,
@@ -1563,9 +1709,9 @@ impl WhisperTurboAsrModel {
                 self.config.max_target_positions,
                 configured_steps,
             )?;
-            Ok((prompt, max_steps))
+            Ok((prompt, max_steps, language))
         })();
-        let (prompt, max_steps) = initialized?;
+        let (prompt, max_steps, language) = initialized?;
         let (cross_runtime, cross_sequence) = cross_owner.into_decode_state_parts();
 
         Ok(WhisperDecodeState {
@@ -1595,6 +1741,9 @@ impl WhisperTurboAsrModel {
             max_steps,
             finished: false,
             rng: StdRng::from_entropy(),
+            language,
+            attempts: Vec::new(),
+            published_attempt: None,
         })
     }
 
@@ -1632,6 +1781,17 @@ impl WhisperTurboAsrModel {
                 return Err(error);
             }
         };
+        let no_speech_prob = match whisper_sot_row(&state.prompt, self.special.sot)
+            .filter(|row| (span_start..span_end).contains(row))
+            .map(|row| self.no_speech_probability_at_row(&self.whisper, &output, row - span_start))
+            .transpose()
+        {
+            Ok(probability) => probability,
+            Err(error) => {
+                state.self_kv.restore_logical_checkpoint(checkpoint)?;
+                return Err(error);
+            }
+        };
         let pending_logits = if span_end == state.prompt.len() {
             let sequence_len = output.dim(1)?;
             match self
@@ -1649,6 +1809,9 @@ impl WhisperTurboAsrModel {
         } else {
             None
         };
+        if let Some(probability) = no_speech_prob {
+            state.no_speech_prob = probability;
+        }
         state.prefill_progress = span_end;
         state.pending_logits = pending_logits;
         state.managed_completions_drained = false;
@@ -1667,86 +1830,61 @@ impl WhisperTurboAsrModel {
         &self,
         state: &mut WhisperDecodeState,
     ) -> Result<WhisperTerminalTransition> {
-        if !state.finished {
-            return Err(Error::InvalidInput(
-                "Whisper terminal policy requires a finished decode attempt".into(),
-            ));
-        }
-        let avg_logprob = if state.sampled_token_count > 0 {
-            (state.sum_logprobs / state.sampled_token_count as f64) as f32
-        } else {
-            f32::NEG_INFINITY
-        };
-        let attempt = WhisperDecodeAttempt {
-            text: state.assembled.trim().to_string(),
-            avg_logprob,
-            no_speech_prob: state.no_speech_prob,
-            ended_with_eot: state.ended_with_eot,
-            repetition_loop: state.repetition_loop,
-            compression_ratio: token_compression_ratio(
-                &state.generated_tokens,
-                self.config.vocab_size,
-            ),
-            generated_token_count: state.generated_tokens.len(),
-            sampled_token_count: state.sampled_token_count,
-            decode_steps: state.decode_steps,
-            profile: WhisperDecodeProfile::new(false),
-        };
-        let logprob_threshold = self
-            .generation
-            .logprob_threshold
-            .unwrap_or(DEFAULT_LOGPROB_THRESHOLD);
-        let no_speech_threshold = self
-            .generation
-            .no_speech_threshold
-            .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD);
         let temperatures = self.decode_temperatures();
-        let next_temperature = usize::try_from(state.attempt_generation)
-            .ok()
-            .and_then(|index| temperatures.get(index))
-            .copied();
-        let expected_generation = state.current_managed_generation;
-        let new_generation = if next_temperature.is_some() {
-            expected_generation.checked_add(1).ok_or_else(|| {
-                Error::InferenceError("Whisper managed KV generation overflow".into())
-            })?
-        } else {
-            expected_generation
-        };
-        let (transition, best_attempt) = whisper_terminal_policy_transition(
-            attempt,
-            state.temperature,
-            state.best_attempt.take(),
-            next_temperature,
-            logprob_threshold,
-            no_speech_threshold,
-            self.generation.compression_ratio_threshold,
-            expected_generation,
-            new_generation,
-        );
-        state.best_attempt = best_attempt;
-        state.pending_retry = match &transition {
-            WhisperTerminalTransition::RetryRequired {
-                next_temperature,
-                expected_generation,
-                new_generation,
-                ..
-            } => Some(WhisperPendingRetry {
-                next_temperature: *next_temperature,
-                expected_generation: *expected_generation,
-                new_generation: *new_generation,
-                next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(
-                    || Error::InferenceError("Whisper retry attempt generation overflow".into()),
-                )?,
-            }),
-            _ => None,
-        };
-        match &transition {
-            WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
-            WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
-            WhisperTerminalTransition::RetryRequired { .. } => {}
+        resolve_whisper_terminal_transition(
+            state,
+            WhisperTerminalPolicy {
+                temperatures: &temperatures,
+                logprob_threshold: self
+                    .generation
+                    .logprob_threshold
+                    .unwrap_or(DEFAULT_LOGPROB_THRESHOLD),
+                no_speech_threshold: self
+                    .generation
+                    .no_speech_threshold
+                    .unwrap_or(DEFAULT_NO_SPEECH_THRESHOLD),
+                compression_ratio_threshold: self.generation.compression_ratio_threshold,
+                vocab_size: self.config.vocab_size,
+            },
+        )
+    }
+
+    /// Diagnostics for a retained sequence whose terminal policy accepted or
+    /// skipped an attempt, with the keys the atomic path reports. `None`
+    /// until the terminal policy publishes.
+    pub(crate) fn retained_terminal_diagnostics(
+        &self,
+        state: &WhisperDecodeState,
+    ) -> Option<serde_json::Value> {
+        let mut diagnostics = whisper_retained_terminal_diagnostics(state)?;
+        if let Some(root) = diagnostics.as_object_mut() {
+            root.insert(
+                "device".into(),
+                whisper_device_diagnostics(
+                    self.device.kind,
+                    self.model_dtype,
+                    self.cuda_dtype_shim,
+                    &self.precision,
+                ),
+            );
+            root.insert(
+                "fallback_policy".into(),
+                json!({
+                    "no_fallback": self.runtime_tuning.no_fallback,
+                    "max_fallback_retries": self.runtime_tuning.max_fallback_retries,
+                    "max_attempts": self.runtime_tuning.max_fallback_retries.saturating_add(1),
+                }),
+            );
+            root.insert(
+                "language_resolution".into(),
+                json!({
+                    "strategy": state.language.strategy,
+                    "default_language": self.runtime_tuning.default_language,
+                    "detect_ms": state.language.detect_ms,
+                }),
+            );
         }
-        Ok(transition)
+        Some(diagnostics)
     }
 
     pub(crate) fn decode_step_retained(
@@ -1783,7 +1921,7 @@ impl WhisperTurboAsrModel {
         let at_begin = state.generated_tokens.is_empty();
         let mut log_probs = Vec::new();
         let mut profile = WhisperDecodeProfile::new(false);
-        let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+        let (next, next_logprob) = self.select_next_token(
             &logits,
             at_begin,
             state.temperature <= 0.0,
@@ -1801,9 +1939,6 @@ impl WhisperTurboAsrModel {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidInput("Whisper sampled-token count overflow".into()))?;
         state.sum_logprobs += f64::from(next_logprob);
-        if at_begin {
-            state.no_speech_prob = step_no_speech_prob;
-        }
         if next == self.special.eot {
             state.ended_with_eot = true;
             state.finished = true;
@@ -1892,16 +2027,32 @@ impl WhisperTurboAsrModel {
         self_kv: &mut PhysicalPagedKvCache,
         cross_runtime: &RetainedStaticAttentionRuntimeV2,
         cross_sequence: RetainedStaticAttentionSequenceId,
-    ) -> Result<Option<(u32, String)>> {
+    ) -> Result<WhisperLanguageResolution> {
         if let Some(language) = language {
-            return self.resolve_language_token(language);
+            return Ok(WhisperLanguageResolution {
+                resolved: self.resolve_language_token(language)?,
+                hint_used: true,
+                detect_ms: 0.0,
+                strategy: "hint",
+            });
         }
         if let Some(default) = self.runtime_tuning.default_language.as_deref() {
-            return self.resolve_language_token(default);
+            return Ok(WhisperLanguageResolution {
+                resolved: self.resolve_language_token(default)?,
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "default",
+            });
         }
         if self.language_token_ids.is_empty() {
-            return Ok(None);
+            return Ok(WhisperLanguageResolution {
+                resolved: None,
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "detected",
+            });
         }
+        let detect_started = Instant::now();
         self_kv.reset_invocation()?;
         let tokens = Tensor::new(&[[self.special.sot]], &self.device.device)?;
         let output = self.whisper.decoder_forward_retained_at(
@@ -1931,7 +2082,12 @@ impl WhisperTurboAsrModel {
                         .map(|code| (token, code))
                 })
         };
-        Ok(resolved)
+        Ok(WhisperLanguageResolution {
+            resolved,
+            hint_used: false,
+            detect_ms: elapsed_ms(detect_started),
+            strategy: "detected",
+        })
     }
 
     pub(crate) fn physical_state_spec(
@@ -2144,6 +2300,7 @@ impl WhisperTurboAsrModel {
                 self.device.kind,
                 self.model_dtype,
                 self.cuda_dtype_shim,
+                &self.precision,
             ),
             "fallback_attempts": attempted_temperatures.len(),
             "attempted_temperatures": attempted_temperatures,
@@ -2171,9 +2328,11 @@ impl WhisperTurboAsrModel {
                 "effective_samples": trimmed_audio.len(),
                 "trimmed_samples": audio.len().saturating_sub(trimmed_audio.len()),
             },
+            "language": language,
             "language_resolution": {
                 "strategy": language_resolution.strategy,
                 "default_language": self.runtime_tuning.default_language,
+                "detect_ms": language_detect_ms,
             },
             "prompt": {
                 "initial_prompt_requested": prompt_diagnostics.initial_prompt_requested,
@@ -2200,6 +2359,7 @@ impl WhisperTurboAsrModel {
             "decode": {
                 "ended_with_eot": final_attempt.ended_with_eot,
                 "repetition_loop": final_attempt.repetition_loop,
+                "stop_reason": whisper_stop_reason(&final_attempt),
                 "avg_logprob": final_attempt.avg_logprob,
                 "no_speech_prob": final_attempt.no_speech_prob,
                 "compression_ratio": final_attempt.compression_ratio,
@@ -2360,20 +2520,18 @@ impl WhisperTurboAsrModel {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
 
-        let mut mel_spec = self.mel.compute(&mono_16khz)?;
-        if mel_spec.is_empty() {
+        if mono_16khz.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
 
         // Whisper encoder downsamples by 2 before positional embeddings.
-        let max_input_frames = self.config.max_source_positions.saturating_mul(2).max(1);
+        let frames = self.config.max_source_positions.saturating_mul(2).max(1);
         let n_mels = self.config.num_mel_bins;
-        pad_or_trim_mel_frames(&mut mel_spec, n_mels, max_input_frames);
-        let frames = mel_spec.len();
+        let features = whisper_log_mel_frames(&self.mel, &mono_16khz, frames)?;
         let mut flat = vec![0f32; frames * n_mels];
-        for (frame_idx, frame) in mel_spec.iter().enumerate() {
-            for mel_idx in 0..n_mels {
-                flat[mel_idx * frames + frame_idx] = frame[mel_idx];
+        for (frame_idx, frame) in features.chunks_exact(n_mels).enumerate() {
+            for (mel_idx, value) in frame.iter().enumerate() {
+                flat[mel_idx * frames + frame_idx] = *value;
             }
         }
 
@@ -2409,21 +2567,12 @@ impl WhisperTurboAsrModel {
         Ok(masked)
     }
 
-    fn greedy_decode_step_on_device(
-        &self,
-        logits: &Tensor,
-        at_begin: bool,
-        inv_temperature: f32,
-    ) -> Result<(u32, f32, Option<f32>)> {
+    fn greedy_decode_step_on_device(&self, logits: &Tensor, at_begin: bool) -> Result<(u32, f32)> {
         let masked = self.masked_decode_logits(logits, at_begin)?;
-        greedy_decode_step_from_masked_logits(
-            &masked,
-            &self.special,
-            self.config.vocab_size,
-            inv_temperature,
-        )
+        greedy_decode_step_from_masked_logits(&masked, self.special.eot)
     }
 
+    /// Choose the next token and its log-probability for `avg_logprob`.
     fn select_next_token<R: Rng + ?Sized>(
         &self,
         logits: &Tensor,
@@ -2433,11 +2582,10 @@ impl WhisperTurboAsrModel {
         rng: &mut R,
         log_probs_buf: &mut Vec<f32>,
         profile: &mut WhisperDecodeProfile,
-    ) -> Result<(u32, f32, Option<f32>)> {
-        let inv_temperature = 1.0f32 / temperature.max(1e-6);
+    ) -> Result<(u32, f32)> {
         if deterministic && self.runtime_tuning.device_greedy_decode && !self.device.device.is_cpu()
         {
-            match self.greedy_decode_step_on_device(logits, at_begin, inv_temperature) {
+            match self.greedy_decode_step_on_device(logits, at_begin) {
                 Ok(step) => {
                     profile.device_greedy_steps = profile.device_greedy_steps.saturating_add(1);
                     return Ok(step);
@@ -2460,37 +2608,37 @@ impl WhisperTurboAsrModel {
         };
         profile.host_logits_steps = profile.host_logits_steps.saturating_add(1);
         self.apply_decode_constraints(&mut logits_vec, at_begin);
-        if deterministic {
-            if let Some(logsumexp) = scaled_logsumexp(&logits_vec, inv_temperature) {
-                let (next, best_logit) = best_finite_logit(&logits_vec, self.special.eot);
-                let next_scaled_logit = best_logit * inv_temperature;
-                let next_logprob = if next_scaled_logit.is_finite() {
-                    next_scaled_logit - logsumexp
-                } else {
-                    f32::NEG_INFINITY
-                };
-                let no_speech_prob = self.special.no_speech.and_then(|token_id| {
-                    probability_for_token_from_logits(
-                        &logits_vec,
-                        token_id,
-                        logsumexp,
-                        inv_temperature,
-                    )
-                });
-                Ok((next, next_logprob, no_speech_prob))
-            } else {
-                Ok((self.special.eot, f32::NEG_INFINITY, None))
-            }
-        } else {
-            logits_to_log_probs_in_place(&logits_vec, temperature, log_probs_buf);
-            let no_speech_prob = self
-                .special
-                .no_speech
-                .and_then(|token_id| probability_for_token(log_probs_buf, token_id));
-            let (next, next_logprob) =
-                sample_token_from_log_probs(log_probs_buf, temperature, self.special.eot, rng);
-            Ok((next, next_logprob, no_speech_prob))
-        }
+        Ok(select_token_from_filtered_logits(
+            &logits_vec,
+            deterministic,
+            temperature,
+            self.special.eot,
+            rng,
+            log_probs_buf,
+        ))
+    }
+
+    /// Reference no-speech probability (openai `decoding.py`): the softmax
+    /// of the raw logits at the `<|startoftranscript|>` row, read before any
+    /// decode suppression. The suppression masks `<|nospeech|>` itself, so
+    /// the filtered first-step logits can never carry it.
+    fn no_speech_probability_at_row(
+        &self,
+        whisper: &WhisperModel,
+        decoder_output: &Tensor,
+        row: usize,
+    ) -> Result<Option<f32>> {
+        let Some(no_speech) = self.special.no_speech else {
+            return Ok(None);
+        };
+        let logits = whisper
+            .decoder_final_linear(&decoder_output.i((..1, row..row + 1))?)?
+            .i(0)?
+            .i(0)?;
+        Ok(unmasked_token_probability(
+            &tensor_to_f32_vec1(&logits)?,
+            no_speech,
+        ))
     }
 
     fn resolve_language_token(&self, language: &str) -> Result<Option<(u32, String)>> {
@@ -2887,12 +3035,49 @@ fn trimmed_audio_bounds(
     (start, end)
 }
 
-fn pad_or_trim_mel_frames(mel_spec: &mut Vec<Vec<f32>>, n_mels: usize, target_frames: usize) {
-    if mel_spec.len() > target_frames {
-        mel_spec.truncate(target_frames);
-    } else if mel_spec.len() < target_frames {
-        mel_spec.resize_with(target_frames, || vec![0.0; n_mels]);
+fn whisper_mel_config(n_mels: usize) -> MelConfig {
+    MelConfig {
+        sample_rate: whisper::SAMPLE_RATE,
+        n_fft: whisper::N_FFT,
+        win_length: None,
+        hop_length: whisper::HOP_LENGTH,
+        n_mels,
+        f_min: 0.0,
+        f_max: (whisper::SAMPLE_RATE / 2) as f32,
+        // Normalized in `whisper_log_mel_frames`, after the extra STFT frame
+        // is dropped.
+        normalize: false,
+        mel_scale: MelScale::Slaney,
+        mel_norm: MelNorm::Slaney,
     }
+}
+
+/// Frame-major normalized log-mel features for one Whisper window, computed
+/// the way OpenAI's `log_mel_spectrogram(padding=N_SAMPLES)` and HF's
+/// `WhisperFeatureExtractor` do: trim or zero-pad the samples to
+/// `target_frames * HOP_LENGTH` (480,000) BEFORE the STFT, drop the STFT's
+/// last frame, then clamp to `max - 8` and scale over the kept frames only.
+/// Padding the normalized mel with 0.0 afterwards instead gives the encoder a
+/// tail far louder than the trained floor of `(max - 8 + 4) / 4`.
+fn whisper_log_mel_frames(
+    mel: &MelSpectrogram,
+    samples: &[f32],
+    target_frames: usize,
+) -> Result<Vec<f32>> {
+    debug_assert!(!mel.config().normalize);
+    let target_samples = target_frames.saturating_mul(mel.config().hop_length);
+    let mut padded = samples[..samples.len().min(target_samples)].to_vec();
+    padded.resize(target_samples, 0.0);
+    let (mut flat, frames) = mel.compute_flat(&padded)?;
+    let n_mels = mel.config().n_mels;
+    if frames < target_frames {
+        return Err(Error::InferenceError(format!(
+            "Whisper STFT produced {frames} frames for a {target_frames}-frame window"
+        )));
+    }
+    flat.truncate(target_frames * n_mels);
+    MelSpectrogram::whisper_normalize_flat(&mut flat);
+    Ok(flat)
 }
 
 impl WhisperTurboAsrModel {
@@ -2987,7 +3172,13 @@ impl WhisperTurboAsrModel {
             } else {
                 None
             };
-            let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+            if step_idx == 0 {
+                no_speech_prob = whisper_sot_row(&prompt, self.special.sot)
+                    .map(|row| self.no_speech_probability_at_row(whisper, &ys, row))
+                    .transpose()?
+                    .flatten();
+            }
+            let (next, next_logprob) = self.select_next_token(
                 &logits,
                 step_idx == 0,
                 deterministic,
@@ -3000,9 +3191,6 @@ impl WhisperTurboAsrModel {
                 profile.sampling_ms += elapsed_ms(started);
             }
 
-            if step_idx == 0 {
-                no_speech_prob = step_no_speech_prob;
-            }
             sum_logprobs += next_logprob as f64;
             sampled_token_count = sampled_token_count.saturating_add(1);
             if let Some(started) = step_started {
@@ -3101,7 +3289,13 @@ impl WhisperTurboAsrModel {
                 .i(0)?
                 .i(0)?;
 
-            let (next, next_logprob, step_no_speech_prob) = self.select_next_token(
+            if step_idx == 0 {
+                no_speech_prob = whisper_sot_row(&prompt, self.special.sot)
+                    .map(|row| self.no_speech_probability_at_row(whisper, &ys, row))
+                    .transpose()?
+                    .flatten();
+            }
+            let (next, next_logprob) = self.select_next_token(
                 &logits,
                 step_idx == 0,
                 deterministic,
@@ -3111,9 +3305,6 @@ impl WhisperTurboAsrModel {
                 &mut profile,
             )?;
 
-            if step_idx == 0 {
-                no_speech_prob = step_no_speech_prob;
-            }
             sum_logprobs += next_logprob as f64;
             sampled_token_count = sampled_token_count.saturating_add(1);
 
@@ -3384,60 +3575,79 @@ fn tensor_to_f32_vec1(tensor: &Tensor) -> Result<Vec<f32>> {
     tensor.to_vec1::<f32>().map_err(Error::from)
 }
 
-fn greedy_decode_step_from_masked_logits(
-    masked: &Tensor,
-    special: &WhisperSpecialTokens,
-    vocab_size: usize,
-    inv_temperature: f32,
-) -> Result<(u32, f32, Option<f32>)> {
+/// Device greedy step over decode-filtered logits. The log-probability is
+/// taken at temperature 1, as on the host.
+fn greedy_decode_step_from_masked_logits(masked: &Tensor, eot: u32) -> Result<(u32, f32)> {
     let masked_f32 = if masked.dtype() == DType::F32 {
         masked.clone()
     } else {
         masked.to_dtype(DType::F32)?
     };
-    let scaled = if (inv_temperature - 1.0).abs() <= f32::EPSILON {
-        masked_f32.clone()
-    } else {
-        (&masked_f32 * inv_temperature as f64)?
-    };
     let next = masked.argmax(0)?.to_scalar::<u32>()?;
-    let max_scaled = scaled.max(0)?;
-    let logsumexp = scaled
-        .broadcast_sub(&max_scaled)?
+    let max_logit = masked_f32.max(0)?;
+    let logsumexp = masked_f32
+        .broadcast_sub(&max_logit)?
         .exp()?
         .sum_all()?
         .log()?
-        .broadcast_add(&max_scaled)?;
-    let next_scaled_logit = scaled.i(next as usize)?;
-    let no_speech_scaled_logit = special
-        .no_speech
-        .filter(|token_id| (*token_id as usize) < vocab_size)
-        .and_then(|token_id| scaled.i(token_id as usize).ok());
-    let mut stat_tensors = vec![max_scaled, logsumexp, next_scaled_logit];
-    if let Some(no_speech_scaled_logit) = no_speech_scaled_logit {
-        stat_tensors.push(no_speech_scaled_logit);
+        .broadcast_add(&max_logit)?;
+    let next_logit = masked_f32.i(next as usize)?;
+    let stats = Tensor::stack(&[&max_logit, &logsumexp, &next_logit], 0)?.to_vec1::<f32>()?;
+    if !stats[0].is_finite() {
+        return Ok((eot, f32::NEG_INFINITY));
     }
-    let stat_refs: Vec<&Tensor> = stat_tensors.iter().collect();
-    let stats = Tensor::stack(&stat_refs, 0)?.to_vec1::<f32>()?;
-    let max_scaled_value = stats[0];
-    if !max_scaled_value.is_finite() {
-        return Ok((special.eot, f32::NEG_INFINITY, None));
-    }
-    let logsumexp = stats[1];
-    let next_scaled_logit = stats[2];
-    let next_logprob = if next_scaled_logit.is_finite() && logsumexp.is_finite() {
-        next_scaled_logit - logsumexp
+    let (logsumexp, next_logit) = (stats[1], stats[2]);
+    let next_logprob = if next_logit.is_finite() && logsumexp.is_finite() {
+        next_logit - logsumexp
     } else {
         f32::NEG_INFINITY
     };
-    let no_speech_prob = stats.get(3).and_then(|scaled_logit| {
-        if scaled_logit.is_finite() && logsumexp.is_finite() {
-            Some((*scaled_logit - logsumexp).exp())
-        } else {
-            None
-        }
-    });
-    Ok((next, next_logprob, no_speech_prob))
+    Ok((next, next_logprob))
+}
+
+/// Host token selection over decode-filtered logits. Sampling draws from the
+/// logits at `temperature`, but the returned log-probability is
+/// `log_softmax` at temperature 1, as openai's decoder and HF's
+/// `avg_logprobs` compute it. Scaling by `1 / T` at T = 0 made every greedy
+/// token's log-probability 0, so `avg_logprob` never reached the no-speech
+/// or low-logprob thresholds.
+fn select_token_from_filtered_logits<R: Rng + ?Sized>(
+    logits: &[f32],
+    deterministic: bool,
+    temperature: f32,
+    eot: u32,
+    rng: &mut R,
+    log_probs_buf: &mut Vec<f32>,
+) -> (u32, f32) {
+    let next = if deterministic {
+        best_finite_logit(logits, eot).0
+    } else {
+        logits_to_log_probs_in_place(logits, temperature, log_probs_buf);
+        sample_token_from_log_probs(log_probs_buf, temperature, eot, rng).0
+    };
+    (next, unit_temperature_logprob(logits, next))
+}
+
+fn unit_temperature_logprob(logits: &[f32], token_id: u32) -> f32 {
+    let Some(logsumexp) = scaled_logsumexp(logits, 1.0) else {
+        return f32::NEG_INFINITY;
+    };
+    logits
+        .get(token_id as usize)
+        .filter(|logit| logit.is_finite())
+        .map_or(f32::NEG_INFINITY, |logit| logit - logsumexp)
+}
+
+/// Softmax probability of `token_id` over raw, unsuppressed `logits`.
+fn unmasked_token_probability(logits: &[f32], token_id: u32) -> Option<f32> {
+    let logsumexp = scaled_logsumexp(logits, 1.0)?;
+    probability_for_token_from_logits(logits, token_id, logsumexp, 1.0)
+}
+
+/// Row of `<|startoftranscript|>` in a decoder prompt: index 0, or after the
+/// `<|startofprev|>` prompt context.
+fn whisper_sot_row(prompt: &[u32], sot: u32) -> Option<usize> {
+    prompt.iter().rposition(|token| *token == sot)
 }
 
 fn build_whisper_decode_mask_tensors(
@@ -3646,18 +3856,6 @@ fn probability_for_token_from_logits(
     Some((logit * inv_temperature - logsumexp).exp())
 }
 
-fn probability_for_token(log_probs: &[f32], token_id: u32) -> Option<f32> {
-    let idx = token_id as usize;
-    if idx >= log_probs.len() {
-        return None;
-    }
-    let log_prob = log_probs[idx];
-    if !log_prob.is_finite() {
-        return None;
-    }
-    Some(log_prob.exp())
-}
-
 fn sample_token_from_log_probs<R: Rng + ?Sized>(
     log_probs: &[f32],
     temperature: f32,
@@ -3774,6 +3972,9 @@ fn decode_retry_reasons(
     reasons
 }
 
+/// Terminal policy for one finished attempt. Returns the transition, the best
+/// attempt to keep for a pending retry, and the attempt a terminal transition
+/// publishes (accepted or skipped), each with its temperature.
 fn whisper_terminal_policy_transition(
     attempt: WhisperDecodeAttempt,
     temperature: f32,
@@ -3787,6 +3988,7 @@ fn whisper_terminal_policy_transition(
 ) -> (
     WhisperTerminalTransition,
     Option<(WhisperDecodeAttempt, f32)>,
+    Option<(WhisperDecodeAttempt, f32)>,
 ) {
     if should_skip_as_no_speech(&attempt, logprob_threshold, no_speech_threshold) {
         return (
@@ -3794,6 +3996,7 @@ fn whisper_terminal_policy_transition(
                 no_speech_probability: attempt.no_speech_prob,
             },
             None,
+            Some((attempt, temperature)),
         );
     }
     let retry_reasons =
@@ -3815,6 +4018,7 @@ fn whisper_terminal_policy_transition(
                     new_generation,
                 },
                 best,
+                None,
             );
         }
     }
@@ -3825,7 +4029,175 @@ fn whisper_terminal_policy_transition(
             selected_temperature,
         },
         None,
+        Some((selected, selected_temperature)),
     )
+}
+
+/// Apply the terminal policy to a finished retained attempt. Every attempt is
+/// recorded across temperature restarts, and the accepted or skipped attempt
+/// is kept so the published output can carry its diagnostics.
+fn resolve_whisper_terminal_transition(
+    state: &mut WhisperDecodeState,
+    policy: WhisperTerminalPolicy<'_>,
+) -> Result<WhisperTerminalTransition> {
+    if !state.finished {
+        return Err(Error::InvalidInput(
+            "Whisper terminal policy requires a finished decode attempt".into(),
+        ));
+    }
+    let avg_logprob = if state.sampled_token_count > 0 {
+        (state.sum_logprobs / state.sampled_token_count as f64) as f32
+    } else {
+        f32::NEG_INFINITY
+    };
+    let attempt = WhisperDecodeAttempt {
+        text: state.assembled.trim().to_string(),
+        avg_logprob,
+        no_speech_prob: state.no_speech_prob,
+        ended_with_eot: state.ended_with_eot,
+        repetition_loop: state.repetition_loop,
+        compression_ratio: token_compression_ratio(&state.generated_tokens, policy.vocab_size),
+        generated_token_count: state.generated_tokens.len(),
+        sampled_token_count: state.sampled_token_count,
+        decode_steps: state.decode_steps,
+        profile: WhisperDecodeProfile::new(false),
+    };
+    let next_temperature = usize::try_from(state.attempt_generation)
+        .ok()
+        .and_then(|index| policy.temperatures.get(index))
+        .copied();
+    let expected_generation = state.current_managed_generation;
+    let new_generation = if next_temperature.is_some() {
+        expected_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::InferenceError("Whisper managed KV generation overflow".into()))?
+    } else {
+        expected_generation
+    };
+    state.attempts.push(WhisperAttemptRecord {
+        temperature: state.temperature,
+        retry_reasons: decode_retry_reasons(
+            &attempt,
+            policy.logprob_threshold,
+            policy.compression_ratio_threshold,
+        ),
+        no_speech_skip: should_skip_as_no_speech(
+            &attempt,
+            policy.logprob_threshold,
+            policy.no_speech_threshold,
+        ),
+        attempt: attempt.clone(),
+    });
+    let (transition, best_attempt, published_attempt) = whisper_terminal_policy_transition(
+        attempt,
+        state.temperature,
+        state.best_attempt.take(),
+        next_temperature,
+        policy.logprob_threshold,
+        policy.no_speech_threshold,
+        policy.compression_ratio_threshold,
+        expected_generation,
+        new_generation,
+    );
+    state.best_attempt = best_attempt;
+    state.published_attempt = published_attempt;
+    state.pending_retry = match &transition {
+        WhisperTerminalTransition::RetryRequired {
+            next_temperature,
+            expected_generation,
+            new_generation,
+            ..
+        } => Some(WhisperPendingRetry {
+            next_temperature: *next_temperature,
+            expected_generation: *expected_generation,
+            new_generation: *new_generation,
+            next_attempt_generation: state.attempt_generation.checked_add(1).ok_or_else(|| {
+                Error::InferenceError("Whisper retry attempt generation overflow".into())
+            })?,
+        }),
+        _ => None,
+    };
+    match &transition {
+        WhisperTerminalTransition::Accept { text, .. } => state.assembled = text.clone(),
+        WhisperTerminalTransition::SkipNoSpeech { .. } => state.assembled.clear(),
+        WhisperTerminalTransition::RetryRequired { .. } => {}
+    }
+    Ok(transition)
+}
+
+/// Why a decode attempt stopped, as the atomic and retained paths report it.
+fn whisper_stop_reason(attempt: &WhisperDecodeAttempt) -> &'static str {
+    if attempt.ended_with_eot {
+        "eot"
+    } else if attempt.repetition_loop {
+        "repetition_loop"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// Model-independent retained diagnostics: the attempt ladder, the published
+/// attempt's decode metrics and the resolved language. `None` until the
+/// terminal policy accepts or skips an attempt.
+fn whisper_retained_terminal_diagnostics(state: &WhisperDecodeState) -> Option<serde_json::Value> {
+    let (published, selected_temperature) = state.published_attempt.as_ref()?;
+    let no_speech_skip = state
+        .attempts
+        .last()
+        .is_some_and(|record| record.no_speech_skip);
+    // Attempts before the last one each triggered a temperature retry.
+    let retried = state.attempts.len().saturating_sub(1);
+    let mut fallback_reasons = Vec::<&'static str>::new();
+    for record in &state.attempts[..retried] {
+        record_unique_reasons(&mut fallback_reasons, &record.retry_reasons);
+    }
+    if no_speech_skip {
+        record_unique_reason(&mut fallback_reasons, "no_speech");
+    }
+    let language = state
+        .language
+        .resolved
+        .as_ref()
+        .map(|(_token, code)| code.as_str());
+    Some(json!({
+        "model_family": "whisper_asr",
+        "execution": "retained_sequence",
+        "fallback_attempts": state.attempts.len(),
+        "attempted_temperatures": state
+            .attempts
+            .iter()
+            .map(|record| record.temperature)
+            .collect::<Vec<_>>(),
+        "selected_temperature": selected_temperature,
+        "language": language,
+        "language_hint_used": state.language.hint_used,
+        "no_speech_skip": no_speech_skip,
+        "fallback_reasons": fallback_reasons,
+        "decode_attempts": state
+            .attempts
+            .iter()
+            .map(|record| {
+                whisper_attempt_diagnostics(
+                    record.temperature,
+                    &record.attempt,
+                    &record.retry_reasons,
+                    record.no_speech_skip,
+                )
+            })
+            .collect::<Vec<_>>(),
+        "decode": {
+            "ended_with_eot": published.ended_with_eot,
+            "repetition_loop": published.repetition_loop,
+            "stop_reason": whisper_stop_reason(published),
+            "avg_logprob": published.avg_logprob,
+            "no_speech_prob": published.no_speech_prob,
+            "compression_ratio": published.compression_ratio,
+            "decode_steps": published.decode_steps,
+            "generated_tokens": published.generated_token_count,
+            "generated_token_count": published.generated_token_count,
+            "sampled_token_count": published.sampled_token_count,
+        },
+    }))
 }
 
 fn should_retry_decode(
@@ -4004,18 +4376,20 @@ mod tests {
 
     use super::{
         acquire_whisper_cross_sequence_owner, adaptive_decode_budget,
-        apply_whisper_decode_constraints, best_finite_logit, build_whisper_decode_mask_tensors,
+        apply_whisper_decode_constraints, build_whisper_decode_mask_tensors,
         build_whisper_prompt_prefix, capped_decode_temperatures, contiguous_token_range,
         decode_retry_reasons, decode_step_budget, find_suffix_token_repetition,
         greedy_decode_step_from_masked_logits, has_low_word_diversity, logits_to_log_probs,
-        logits_to_log_probs_in_place, pad_or_trim_mel_frames, probability_for_token_from_logits,
-        scaled_logsumexp, tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol,
-        trimmed_audio_bounds, use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
+        logits_to_log_probs_in_place, select_token_from_filtered_logits, should_skip_as_no_speech,
+        tensor_to_f32_vec1, text_delta, token_contains_numeral_or_symbol, trimmed_audio_bounds,
+        unmasked_token_probability, use_cuda_whisper_dtype_shim, whisper_cross_source_identity,
         whisper_decode_profile_diagnostics, whisper_device_diagnostics, whisper_impl_name,
+        whisper_log_mel_frames, whisper_mel_config, whisper_sot_row,
         whisper_terminal_policy_transition, with_whisper_decode_step_transaction,
         WhisperDecodeAttempt, WhisperDecodeProfile, WhisperDecodeState, WhisperPreparedWindow,
         WhisperSpecialTokens, WhisperTerminalTransition,
     };
+    use crate::audio::MelSpectrogram;
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::backends::BackendKind;
@@ -4058,13 +4432,24 @@ mod tests {
     }
 
     #[test]
-    fn whisper_device_diagnostics_keep_cpu_and_metal_on_local_f32() {
+    fn whisper_device_diagnostics_report_the_local_impl_and_precision() {
         for kind in [
             crate::backends::DeviceKind::Cpu,
             crate::backends::DeviceKind::Metal,
         ] {
-            let diagnostics = whisper_device_diagnostics(kind, candle_core::DType::F32, false);
+            let precision = super::PrecisionLoad::unchecked(&crate::backends::DTypeSelection {
+                dtype: DType::F32,
+                reason: "test".into(),
+            });
+            let diagnostics =
+                whisper_device_diagnostics(kind, candle_core::DType::F32, false, &precision);
             let expected_kind = format!("{kind:?}");
+            assert_eq!(diagnostics["precision"]["loaded_dtype"], "F32");
+            assert_eq!(diagnostics["precision"]["reason"], "test");
+            assert_eq!(
+                diagnostics["precision"]["f32_islands"],
+                serde_json::json!(super::WHISPER_F32_ISLANDS)
+            );
 
             assert_eq!(
                 diagnostics.get("kind").and_then(|value| value.as_str()),
@@ -4097,18 +4482,91 @@ mod tests {
         assert_eq!(whisper_impl_name(true), "local_whisper_cuda_dtype_shim");
     }
 
-    #[test]
-    fn whisper_mel_frames_pad_or_trim_to_model_window() {
-        let mut short = vec![vec![1.0, 2.0]];
-        pad_or_trim_mel_frames(&mut short, 2, 3);
-        assert_eq!(short.len(), 3);
-        assert_eq!(short[0], vec![1.0, 2.0]);
-        assert_eq!(short[1], vec![0.0, 0.0]);
-        assert_eq!(short[2], vec![0.0, 0.0]);
+    /// `data/fox.wav`'s int16 PCM scaled by 1/32768, as the golden's
+    /// generator reads it (`tests/fixtures/whisper-hf-features-fox.py`).
+    fn fox_pcm() -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+        let bytes = std::fs::read(path).expect("fox.wav");
+        let mut offset = 12;
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let len = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            let body = offset + 8;
+            if id == b"data" {
+                let (pairs, _) = bytes[body..body + len as usize].as_chunks::<2>();
+                return pairs
+                    .iter()
+                    .map(|pair| i16::from_le_bytes(*pair) as f32 / 32768.0)
+                    .collect();
+            }
+            offset = body + len as usize + (len as usize & 1);
+        }
+        panic!("fox.wav has no data chunk");
+    }
 
-        let mut long = vec![vec![1.0], vec![2.0], vec![3.0]];
-        pad_or_trim_mel_frames(&mut long, 1, 2);
-        assert_eq!(long, vec![vec![1.0], vec![2.0]]);
+    #[test]
+    fn whisper_log_mel_matches_hf_feature_extractor_golden() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/whisper-hf-features-fox.json");
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("golden")).unwrap();
+        let pcm = fox_pcm();
+        let as_f32 = |value: &serde_json::Value| value.as_f64().unwrap() as f32;
+        let as_usize = |value: &serde_json::Value| value.as_u64().unwrap() as usize;
+        let tolerance = 1e-4f32;
+        for (name, case) in golden["cases"].as_object().unwrap() {
+            let (start, len) = (as_usize(&case["start"]), as_usize(&case["len"]));
+            let mut samples = pcm[start..start + len].repeat(as_usize(&case["tile"]));
+            if case["click"].as_bool().unwrap() {
+                // Exactly 30 s ending in a 2 kHz burst: the dropped 3001st STFT
+                // frame is the loudest, so normalizing before the drop fails.
+                samples.truncate(480_000);
+                let burst = [0.0f32, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5];
+                let tail = samples.len() - 80;
+                for (idx, value) in samples[tail..].iter_mut().enumerate() {
+                    *value = burst[idx % burst.len()];
+                }
+            }
+            let (frames, n_mels) = (as_usize(&case["frames"]), as_usize(&case["mels"]));
+            let mel = MelSpectrogram::new(whisper_mel_config(n_mels)).unwrap();
+            let features = whisper_log_mel_frames(&mel, &samples, frames).unwrap();
+            assert_eq!(features.len(), frames * n_mels, "{name}");
+            let frame = |idx: usize| &features[idx * n_mels..(idx + 1) * n_mels];
+
+            let mut worst = 0f32;
+            let mut check = |got: f32, want: f32, what: &str| {
+                let diff = (got - want).abs();
+                assert!(diff <= tolerance, "{name} {what}: {got} vs HF {want}");
+                worst = worst.max(diff);
+            };
+            let max = features.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let min = features.iter().copied().fold(f32::INFINITY, f32::min);
+            let mean = features.iter().map(|v| *v as f64).sum::<f64>() / features.len() as f64;
+            check(max, as_f32(&case["max"]), "max");
+            check(min, as_f32(&case["min"]), "min");
+            check(mean as f32, as_f32(&case["mean"]), "mean");
+            let frame_means = case["frame_means"].as_array().unwrap();
+            for (idx, want) in frame_means.iter().enumerate() {
+                let got = frame(idx).iter().map(|v| *v as f64).sum::<f64>() / n_mels as f64;
+                check(got as f32, as_f32(want), &format!("frame {idx} mean"));
+            }
+            if let Some(floor) = case["floor"].as_f64() {
+                // Past the audio, every cell is the clamped floor (max - 8 + 4) / 4.
+                for value in &features[frame_means.len() * n_mels..] {
+                    check(*value, floor as f32, "padded floor");
+                }
+            }
+            let sampled = case["sampled"].as_array().unwrap();
+            let sampled_frames = case["sampled_frames"].as_array().unwrap();
+            for (idx, column) in sampled_frames.iter().zip(sampled) {
+                let idx = as_usize(idx);
+                for (mel_idx, want) in column.as_array().unwrap().iter().enumerate() {
+                    let at = format!("[{idx}][{mel_idx}]");
+                    check(frame(idx)[mel_idx], as_f32(want), &at);
+                }
+            }
+            eprintln!("{name}: max abs diff vs HF {worst:.2e}");
+        }
     }
 
     #[test]
@@ -4210,43 +4668,182 @@ mod tests {
         assert_eq!(device, host);
     }
 
-    #[test]
-    fn device_greedy_decode_matches_host_greedy_selection() {
-        let special = WhisperSpecialTokens {
+    fn decode_test_special_tokens() -> WhisperSpecialTokens {
+        WhisperSpecialTokens {
             sot: 0,
-            sot_prev: None,
+            sot_prev: Some(10),
             transcribe: 6,
             eot: 1,
             blank: Some(5),
             no_timestamps: Some(8),
             no_speech: Some(4),
-        };
+        }
+    }
+
+    /// `log_softmax` at temperature 1 in f64, the reference's `avg_logprob`.
+    fn reference_logprob(logits: &[f32], token: u32) -> f64 {
+        let finite = logits.iter().filter(|logit| logit.is_finite());
+        let max = finite
+            .clone()
+            .fold(f64::NEG_INFINITY, |max, logit| max.max(f64::from(*logit)));
+        let sum = finite
+            .map(|logit| (f64::from(*logit) - max).exp())
+            .sum::<f64>();
+        f64::from(logits[token as usize]) - (max + sum.ln())
+    }
+
+    #[test]
+    fn device_greedy_decode_matches_host_greedy_selection() {
+        let special = decode_test_special_tokens();
         let mut logits = vec![0.0, -1.0, 3.0, 8.0, 2.0, 4.0, 1.0, 7.0, 0.0, 5.0, 6.0, 9.0];
         apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, true, &[]);
-        let inv_temperature = 1.0;
-        let logsumexp = scaled_logsumexp(&logits, inv_temperature).expect("logsumexp");
-        let (host_next, host_best_logit) = best_finite_logit(&logits, special.eot);
-        let host_logprob = host_best_logit * inv_temperature - logsumexp;
-        let host_no_speech = probability_for_token_from_logits(
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let (host_next, host_logprob) = select_token_from_filtered_logits(
             &logits,
-            special.no_speech.unwrap(),
-            logsumexp,
-            inv_temperature,
+            true,
+            0.0,
+            special.eot,
+            &mut rng,
+            &mut Vec::new(),
         );
         let logits_t = candle_core::Tensor::from_vec(logits, (12,), &candle_core::Device::Cpu)
             .expect("masked logits");
 
-        let (device_next, device_logprob, device_no_speech) =
-            greedy_decode_step_from_masked_logits(&logits_t, &special, 12, inv_temperature)
-                .expect("device greedy");
+        let (device_next, device_logprob) =
+            greedy_decode_step_from_masked_logits(&logits_t, special.eot).expect("device greedy");
 
         assert_eq!(device_next, host_next);
         assert!((device_logprob - host_logprob).abs() < 1e-5);
-        assert!(
-            (device_no_speech.expect("device no speech") - host_no_speech.expect("host no speech"))
-                .abs()
-                < 1e-5
+    }
+
+    #[test]
+    fn decode_logprob_is_unit_temperature_log_softmax_of_filtered_logits() {
+        let special = decode_test_special_tokens();
+        let mut logits = vec![0.0, -1.0, 3.0, 8.0, 2.0, 4.0, 1.0, 7.0, 0.0, 5.0, 6.0, 9.0];
+        apply_whisper_decode_constraints(&mut logits, false, &[], &[], &[], &special, true, &[]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut buffer = Vec::new();
+
+        // Greedy (T = 0): the chosen token keeps its real log-probability
+        // instead of the ~0 that scaling by 1 / T produced.
+        let (next, logprob) = select_token_from_filtered_logits(
+            &logits,
+            true,
+            0.0,
+            special.eot,
+            &mut rng,
+            &mut buffer,
         );
+        assert_eq!(next, 3);
+        assert!((f64::from(logprob) - reference_logprob(&logits, next)).abs() < 1e-5);
+        assert!(
+            logprob < -0.3,
+            "greedy logprob {logprob} must not collapse to 0"
+        );
+
+        // Sampling draws at T, but reports the T = 1 log-probability.
+        for _ in 0..16 {
+            let (sampled, sampled_logprob) = select_token_from_filtered_logits(
+                &logits,
+                false,
+                0.7,
+                special.eot,
+                &mut rng,
+                &mut buffer,
+            );
+            assert!(
+                (f64::from(sampled_logprob) - reference_logprob(&logits, sampled)).abs() < 1e-5
+            );
+        }
+
+        let logits_t = candle_core::Tensor::from_vec(logits.clone(), (12,), &Device::Cpu)
+            .expect("masked logits");
+        let (_, device_logprob) =
+            greedy_decode_step_from_masked_logits(&logits_t, special.eot).expect("device greedy");
+        assert!((f64::from(device_logprob) - reference_logprob(&logits, next)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn no_speech_probability_reads_the_unmasked_sot_logits() {
+        let special = decode_test_special_tokens();
+        // A silence-like SOT row: <|nospeech|> dominates the raw distribution.
+        let raw = vec![0.0, 1.0, 0.5, 0.5, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut filtered = raw.clone();
+        let suppress_tokens = [special.no_speech.unwrap()];
+        apply_whisper_decode_constraints(
+            &mut filtered,
+            true,
+            &suppress_tokens,
+            &[],
+            &[],
+            &special,
+            true,
+            &[],
+        );
+        // Generation config suppresses <|nospeech|>, so filtered logits never
+        // carry it.
+        assert_eq!(unmasked_token_probability(&filtered, 4), None);
+
+        let expected = reference_logprob(&raw, 4).exp();
+        let probability = unmasked_token_probability(&raw, 4).expect("no-speech probability");
+        assert!((f64::from(probability) - expected).abs() < 1e-6);
+        assert!(probability > 0.6);
+    }
+
+    #[test]
+    fn sot_row_follows_the_previous_context_prompt() {
+        let special = decode_test_special_tokens();
+        let bare = build_whisper_prompt_prefix(&special, Some(20), &[], 448, 224)
+            .expect("prompt")
+            .ids;
+        assert_eq!(whisper_sot_row(&bare, special.sot), Some(0));
+
+        let prompted = build_whisper_prompt_prefix(&special, Some(20), &[30, 31], 448, 224)
+            .expect("prompt")
+            .ids;
+        assert_eq!(prompted[..3], [10, 30, 31]);
+        assert_eq!(whisper_sot_row(&prompted, special.sot), Some(3));
+    }
+
+    #[test]
+    fn silence_like_decode_is_skipped_as_no_speech() {
+        let special = decode_test_special_tokens();
+        // The decoder is unsure what to say: near-flat filtered logits.
+        let mut logits = vec![0.0, 0.2, 0.1, 0.3, 0.0, 0.1, 0.0, 0.2, 0.0, 0.0, 0.0, 0.0];
+        apply_whisper_decode_constraints(&mut logits, false, &[4], &[], &[], &special, true, &[]);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let (_, logprob) = select_token_from_filtered_logits(
+            &logits,
+            true,
+            0.0,
+            special.eot,
+            &mut rng,
+            &mut Vec::new(),
+        );
+        let raw_sot = vec![0.0, 1.0, 0.5, 0.5, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let no_speech = unmasked_token_probability(&raw_sot, 4);
+        let attempt = terminal_attempt("you", logprob, no_speech, true);
+
+        assert!(should_skip_as_no_speech(&attempt, -1.0, 0.6));
+        let (transition, _, _) = whisper_terminal_policy_transition(
+            attempt,
+            0.0,
+            None,
+            Some(0.2),
+            -1.0,
+            0.6,
+            None,
+            1,
+            2,
+        );
+        assert!(matches!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech { .. }
+        ));
+
+        // Confident speech is kept even when <|nospeech|> is likely.
+        let confident = terminal_attempt("hello", -0.2, no_speech, true);
+        assert!(!should_skip_as_no_speech(&confident, -1.0, 0.6));
     }
 
     #[test]
@@ -4553,7 +5150,7 @@ mod tests {
 
     #[test]
     fn terminal_policy_no_speech_precedes_temperature_retry() {
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             terminal_attempt("hallucination", -2.0, Some(0.9), false),
             0.0,
             None,
@@ -4571,12 +5168,14 @@ mod tests {
             }
         );
         assert!(best.is_none());
+        let (skipped, temperature) = published.expect("skipped attempt is published");
+        assert_eq!((skipped.no_speech_prob, temperature), (Some(0.9), 0.0));
     }
 
     #[test]
     fn terminal_policy_requests_configured_retry_and_retains_best_attempt() {
         let attempt = terminal_attempt("first", -2.0, Some(0.1), false);
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             attempt.clone(),
             0.0,
             None,
@@ -4601,13 +5200,14 @@ mod tests {
         assert!(reasons.contains(&"missing_eot"));
         assert!(reasons.contains(&"low_logprob"));
         assert_eq!(best.expect("retained best").0.text, attempt.text);
+        assert!(published.is_none(), "a pending retry publishes nothing");
     }
 
     #[test]
     fn terminal_policy_final_attempt_selects_better_prior_attempt() {
         let prior = terminal_attempt("better transcript", -0.2, Some(0.1), true);
         let final_attempt = terminal_attempt("worse", -2.0, Some(0.1), false);
-        let (transition, best) = whisper_terminal_policy_transition(
+        let (transition, best, published) = whisper_terminal_policy_transition(
             final_attempt,
             0.2,
             Some((prior, 0.0)),
@@ -4626,6 +5226,8 @@ mod tests {
             }
         );
         assert!(best.is_none());
+        let (selected, temperature) = published.expect("accepted attempt is published");
+        assert_eq!((selected.text.as_str(), temperature), ("better transcript", 0.0));
     }
 
     fn early_failure_cross_runtime(
@@ -4968,7 +5570,171 @@ mod tests {
             max_steps: 3,
             finished: false,
             rng: rand::rngs::StdRng::seed_from_u64(7),
+            language: super::WhisperLanguageResolution {
+                resolved: Some((20, "en".into())),
+                hint_used: false,
+                detect_ms: 0.0,
+                strategy: "detected",
+            },
+            attempts: Vec::new(),
+            published_attempt: None,
         }
+    }
+
+    const TEST_TERMINAL_TEMPERATURES: [f32; 2] = [0.0, 0.2];
+
+    fn test_terminal_policy() -> super::WhisperTerminalPolicy<'static> {
+        super::WhisperTerminalPolicy {
+            temperatures: &TEST_TERMINAL_TEMPERATURES,
+            logprob_threshold: -1.0,
+            no_speech_threshold: 0.6,
+            compression_ratio_threshold: None,
+            vocab_size: 51_866,
+        }
+    }
+
+    /// Mark the state's current attempt finished with the given decode metrics.
+    fn finish_test_attempt(
+        state: &mut WhisperDecodeState,
+        text: &str,
+        avg_logprob: f64,
+        no_speech_prob: Option<f32>,
+        ended_with_eot: bool,
+    ) {
+        state.generated_tokens = vec![5, 6];
+        state.assembled = text.into();
+        state.sampled_token_count = 2;
+        state.sum_logprobs = avg_logprob * 2.0;
+        state.no_speech_prob = no_speech_prob;
+        state.ended_with_eot = ended_with_eot;
+        state.decode_steps = 2;
+        state.finished = true;
+    }
+
+    fn diagnostic_f64(diagnostics: &serde_json::Value, pointer: &str) -> f64 {
+        diagnostics
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("diagnostics lack numeric {pointer}: {diagnostics}"))
+    }
+
+    #[test]
+    fn retained_terminal_accept_and_skip_publish_decode_diagnostics() {
+        let mut accepted = transactional_test_state();
+        accepted.temperature = 0.0;
+        finish_test_attempt(&mut accepted, "hello there", -0.25, Some(0.125), true);
+        assert!(super::whisper_retained_terminal_diagnostics(&accepted).is_none());
+        let replacement = replacement_test_cache(&accepted, 0);
+        let mut quantum = accepted
+            .begin_managed_quantum(replacement)
+            .expect("terminal quantum");
+
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut accepted, test_terminal_policy())
+                .expect("accept");
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::Accept {
+                text: "hello there".into(),
+                selected_temperature: 0.0,
+            }
+        );
+        // A rolled-back terminal quantum must not leave a published attempt behind.
+        accepted
+            .rollback_managed_quantum(&mut quantum)
+            .expect("rollback terminal quantum");
+        assert!(accepted.attempts.is_empty());
+        assert!(super::whisper_retained_terminal_diagnostics(&accepted).is_none());
+        super::resolve_whisper_terminal_transition(&mut accepted, test_terminal_policy())
+            .expect("accept after rollback");
+
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&accepted).expect("accept diagnostics");
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/avg_logprob"), -0.25);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.125);
+        assert_eq!(diagnostics["decode"]["stop_reason"], "eot");
+        assert_eq!(diagnostics["no_speech_skip"], false);
+        assert_eq!(diagnostics["fallback_attempts"], 1);
+        assert_eq!(diagnostics["selected_temperature"], 0.0);
+        assert_eq!(diagnostics["language"], "en");
+        assert_eq!(diagnostics["execution"], "retained_sequence");
+
+        let mut skipped = transactional_test_state();
+        skipped.temperature = 0.0;
+        finish_test_attempt(&mut skipped, "you", -1.5, Some(0.875), true);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut skipped, test_terminal_policy())
+                .expect("skip");
+        assert_eq!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech {
+                no_speech_probability: Some(0.875)
+            }
+        );
+        assert!(skipped.assembled.is_empty());
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&skipped).expect("skip diagnostics");
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/avg_logprob"), -1.5);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.875);
+        assert_eq!(diagnostics["no_speech_skip"], true);
+        assert_eq!(diagnostics["fallback_reasons"], serde_json::json!(["no_speech"]));
+        assert_eq!(diagnostics["decode_attempts"][0]["no_speech"], true);
+    }
+
+    #[test]
+    fn retained_terminal_diagnostics_keep_attempts_across_fallback_restart() {
+        let mut state = transactional_test_state();
+        install_test_cross_memory(&state);
+        state.temperature = 0.0;
+        finish_test_attempt(&mut state, "garbled", -4.0, Some(0.25), false);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut state, test_terminal_policy())
+                .expect("retry");
+        assert!(matches!(
+            transition,
+            WhisperTerminalTransition::RetryRequired { .. }
+        ));
+        assert!(
+            super::whisper_retained_terminal_diagnostics(&state).is_none(),
+            "a retry publishes no diagnostics"
+        );
+
+        let replacement = generation_test_cache(&state, 2, 0);
+        let mut generation = state
+            .begin_managed_generation(replacement, 1, 2)
+            .expect("begin retry generation");
+        state
+            .commit_managed_quantum(&mut generation)
+            .expect("commit retry generation");
+        assert_eq!(state.temperature, 0.2);
+        finish_test_attempt(&mut state, "you", -1.5, Some(0.875), true);
+        let transition =
+            super::resolve_whisper_terminal_transition(&mut state, test_terminal_policy())
+                .expect("skip on the last temperature");
+        assert!(matches!(
+            transition,
+            WhisperTerminalTransition::SkipNoSpeech { .. }
+        ));
+
+        let diagnostics =
+            super::whisper_retained_terminal_diagnostics(&state).expect("terminal diagnostics");
+        assert_eq!(diagnostics["fallback_attempts"], 2);
+        let temperatures = diagnostics["attempted_temperatures"]
+            .as_array()
+            .expect("temperatures")
+            .iter()
+            .map(|value| value.as_f64().expect("temperature") as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(temperatures, TEST_TERMINAL_TEMPERATURES);
+        let reasons = diagnostics["fallback_reasons"]
+            .as_array()
+            .expect("fallback reasons");
+        assert!(reasons.contains(&serde_json::json!("low_logprob")));
+        assert!(reasons.contains(&serde_json::json!("no_speech")));
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode/no_speech_prob"), 0.875);
+        assert_eq!(diagnostic_f64(&diagnostics, "/decode_attempts/0/avg_logprob"), -4.0);
+        assert_eq!(diagnostics["decode_attempts"][0]["no_speech"], false);
+        assert_eq!(diagnostic_f64(&diagnostics, "/selected_temperature") as f32, 0.2);
     }
 
     fn append_test_decode_token(state: &mut WhisperDecodeState, token: u32) -> Result<()> {
@@ -5577,3 +6343,135 @@ const WHISPER_LANGUAGES: [(&str, &str); 100] = [
     ("su", "sundanese"),
     ("yue", "cantonese"),
 ];
+
+#[cfg(test)]
+mod precision_tests {
+    use candle_core::{DType, Device};
+    use candle_nn::VarBuilder;
+
+    use super::{load_whisper_with_precision, whisper_weight_precision, WHISPER_DTYPE_ENV};
+    use crate::backends::{DTypeSelection, DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::models::architectures::whisper::model::test_fixture::{tiny_config, tiny_tensors};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Restore(&'static [&'static str]);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for name in self.0 {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn metal_profile() -> DeviceProfile {
+        DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn whisper_metal_precision_defaults_to_f16_with_f32_escape_hatches() {
+        let _env = env_lock();
+        let _restore = Restore(&[WHISPER_DTYPE_ENV, "IZWI_METAL_DTYPE"]);
+        std::env::remove_var(WHISPER_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let metal = metal_profile();
+        let default = whisper_weight_precision(&metal).unwrap();
+        assert_eq!(default.dtype, DType::F16);
+        assert!(default.reason.contains("whisper.cpp"), "{}", default.reason);
+        assert_eq!(
+            whisper_weight_precision(&DeviceProfile::cpu())
+                .unwrap()
+                .dtype,
+            DType::F32
+        );
+
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F32);
+        // The family override is more specific than the global one.
+        std::env::set_var(WHISPER_DTYPE_ENV, "f16");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F16);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        std::env::set_var(WHISPER_DTYPE_ENV, "f32");
+        assert_eq!(whisper_weight_precision(&metal).unwrap().dtype, DType::F32);
+
+        // Metal has no BF16 Whisper state; the F16 checkpoint runs in F16.
+        for (family, global) in [("bf16", ""), ("", "bf16")] {
+            std::env::set_var(WHISPER_DTYPE_ENV, family);
+            std::env::set_var("IZWI_METAL_DTYPE", global);
+            let selection = whisper_weight_precision(&metal).unwrap();
+            assert_eq!(selection.dtype, DType::F16, "{family:?} {global:?}");
+            assert!(selection.reason.contains("no BF16 path"), "{}", selection.reason);
+        }
+    }
+
+    fn load(
+        weight_scale: f32,
+        check: bool,
+    ) -> (super::WhisperModel, crate::kernels::numeric_check::PrecisionLoad, Vec<DType>) {
+        let config = tiny_config();
+        let tensors = tiny_tensors(&config, weight_scale);
+        let mut loads = Vec::new();
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test policy".into(),
+        };
+        let (model, precision) = load_whisper_with_precision(
+            &selection,
+            check,
+            &config,
+            3,
+            &Device::Cpu,
+            |dtype| {
+                loads.push(dtype);
+                Ok(VarBuilder::from_tensors(tensors.clone(), dtype, &Device::Cpu))
+            },
+        )
+        .unwrap();
+        (model, precision, loads)
+    }
+
+    #[test]
+    fn whisper_f16_load_keeps_f16_when_the_self_check_passes() {
+        let (_, precision, loads) = load(0.2, true);
+        assert_eq!(loads, [DType::F16]);
+        assert!(!precision.fell_back(), "{}", precision.reason);
+        let report = precision.self_check.as_ref().unwrap();
+        assert!(report.passed, "{}", report.reason);
+        // Every encoder and decoder block, the encoder output and the logits.
+        assert_eq!(report.tensors.len(), 2 + 1 + 2 + 1);
+        assert_eq!(report.tensors.last().unwrap().name, "logits");
+    }
+
+    /// Weights large enough to overflow F16 activations fail the check and
+    /// reload in F32, with the failure as the reason.
+    #[test]
+    fn whisper_f16_load_falls_back_to_f32_when_the_self_check_fails() {
+        let (_, precision, loads) = load(40.0, true);
+        assert_eq!(loads, [DType::F16, DType::F32]);
+        assert!(precision.fell_back());
+        assert_eq!(precision.loaded, DType::F32);
+        assert!(
+            precision.reason.starts_with("test policy; Whisper F16 self-check")
+                && precision.reason.ends_with("fell back to F32"),
+            "{}",
+            precision.reason
+        );
+        assert!(!precision.self_check.as_ref().unwrap().passed);
+        // Off Metal (no check) the requested dtype loads as is.
+        let (_, precision, loads) = load(40.0, false);
+        assert_eq!(loads, [DType::F16]);
+        assert!(precision.self_check.is_none());
+    }
+}

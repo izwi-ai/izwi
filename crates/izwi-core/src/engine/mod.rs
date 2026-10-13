@@ -33,7 +33,11 @@ mod core;
 pub mod execution;
 mod execution_group;
 mod executor;
-pub(crate) use executor::{decode_request_audio_with_rate, qwen3_asr_requires_long_form};
+#[cfg(test)]
+pub(crate) use executor::qwen3_asr_requires_long_form;
+pub(crate) use executor::{
+    asr_route_plan, decode_request_audio_with_rate, AsrRouteCapabilities, PlannedAsrChunks,
+};
 pub mod metrics;
 mod output;
 mod request;
@@ -1488,13 +1492,20 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        if model_for_preparation.asr_requires_long_form(&samples, sample_rate) {
+                        let plan = executor::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &model_for_preparation.asr_route_capabilities(),
+                            request.streaming,
+                        );
+                        if plan.requires_chunk_path() {
                             return Self::finalize_direct_lfm25_audio_asr_preparation(
                                 request,
                                 variant,
                                 model_for_preparation,
                                 samples,
                                 sample_rate,
+                                plan,
                                 context_limit,
                                 None,
                                 None,
@@ -1536,6 +1547,7 @@ impl Engine {
                             model_for_preparation,
                             samples,
                             sample_rate,
+                            plan,
                             context_limit,
                             Some(prompt_tokens),
                             Some(artifact),
@@ -1594,11 +1606,19 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        let long_form = executor::qwen3_asr_requires_long_form(
+                        let capabilities = executor::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let plan = executor::asr_route_plan(
                             &samples,
                             sample_rate,
-                            model_for_shape.max_audio_seconds_hint(),
+                            &capabilities,
+                            request.streaming,
                         );
+                        let long_form = plan.requires_chunk_path();
                         let input_tokens = (!long_form)
                             .then(|| {
                                 model_for_shape.incremental_prompt_token_count(
@@ -1643,6 +1663,7 @@ impl Engine {
                             variant,
                             samples,
                             sample_rate,
+                            plan,
                             context_limit,
                             input_tokens,
                             prepared_encoder,
@@ -1689,17 +1710,26 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        let long_form = executor::qwen3_asr_requires_long_form(
+                        let capabilities = executor::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let plan = executor::asr_route_plan(
                             &samples,
                             sample_rate,
-                            model_for_shape.max_audio_seconds_hint(),
+                            &capabilities,
+                            request.streaming,
                         );
+                        let long_form = plan.requires_chunk_path();
                         if long_form {
                             return Self::finalize_direct_whisper_asr_preparation(
                                 request,
                                 variant,
                                 samples,
                                 sample_rate,
+                                plan,
                                 context_limit,
                                 None,
                                 None,
@@ -1736,6 +1766,7 @@ impl Engine {
                             variant,
                             samples,
                             sample_rate,
+                            plan,
                             context_limit,
                             Some(input_tokens),
                             Some(Arc::new(artifact)),
@@ -1781,6 +1812,18 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
+                        let capabilities = executor::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let plan = executor::asr_route_plan(
+                            &samples,
+                            sample_rate,
+                            &capabilities,
+                            request.streaming,
+                        );
                         let decision = model_for_shape.vibevoice_retained_preparation_decision(
                             samples.len(),
                             sample_rate,
@@ -1794,6 +1837,7 @@ impl Engine {
                                     variant,
                                     samples,
                                     sample_rate,
+                                    plan,
                                     context_limit,
                                     None,
                                     None,
@@ -1830,6 +1874,7 @@ impl Engine {
                                     variant,
                                     samples,
                                     sample_rate,
+                                    plan,
                                     context_limit,
                                     Some(geometry.prompt_tokens),
                                     Some(Arc::new(artifact)),
@@ -1877,17 +1922,29 @@ impl Engine {
                         let request = request;
                         let (samples, sample_rate) =
                             executor::decode_request_audio_with_rate(&request)?;
-                        let long_form = executor::qwen3_asr_requires_long_form(
+                        let capabilities = executor::AsrRouteCapabilities::for_native_model(
+                            &model_for_shape,
+                            variant,
+                            &request,
+                            Some(context_limit),
+                        )?;
+                        let plan = executor::asr_route_plan(
                             &samples,
                             sample_rate,
-                            model_for_shape.max_audio_seconds_hint(),
+                            &capabilities,
+                            request.streaming,
                         );
+                        // Retained preparation renders the plain-ASR prompt; a
+                        // native-timestamp request takes the atomic route.
+                        let long_form =
+                            request.asr_native_word_timestamps || plan.requires_chunk_path();
                         if long_form {
                             return Self::finalize_direct_granite_speech_asr_preparation(
                                 request,
                                 variant,
                                 samples,
                                 sample_rate,
+                                plan,
                                 context_limit,
                                 None,
                                 None,
@@ -1920,6 +1977,7 @@ impl Engine {
                             variant,
                             samples,
                             sample_rate,
+                            plan,
                             context_limit,
                             Some(geometry.prompt_tokens),
                             Some(artifact),
@@ -2061,6 +2119,7 @@ impl Engine {
         model: Lfm25AudioModelLease,
         samples: Vec<f32>,
         sample_rate: u32,
+        plan: PlannedAsrChunks,
         context_limit: usize,
         input_tokens: Option<usize>,
         artifact: Option<Arc<Lfm25AudioPreparedAsrArtifact>>,
@@ -2070,7 +2129,7 @@ impl Engine {
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, artifact) {
             (None, None) => {
-                request.install_prepared_asr_long_form_atomic()?;
+                request.install_prepared_asr_long_form_atomic(plan)?;
                 request.install_lfm25_audio_asr_execution_model(variant, model)?;
             }
             (Some(input_tokens), Some(artifact)) => {
@@ -2107,13 +2166,14 @@ impl Engine {
         variant: ModelVariant,
         samples: Vec<f32>,
         sample_rate: u32,
+        plan: PlannedAsrChunks,
         context_limit: usize,
         input_tokens: Option<usize>,
         encoder_artifact: Option<Arc<Qwen3AsrPreparedAudio>>,
     ) -> Result<EngineCoreRequest> {
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, encoder_artifact) {
-            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (None, None) => request.install_prepared_asr_long_form_atomic(plan)?,
             (Some(input_tokens), Some(artifact)) => {
                 request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
                 request.install_prepared_asr_encoder_artifact(variant, artifact)?;
@@ -2133,6 +2193,7 @@ impl Engine {
         variant: ModelVariant,
         samples: Vec<f32>,
         sample_rate: u32,
+        plan: PlannedAsrChunks,
         context_limit: usize,
         input_tokens: Option<usize>,
         encoder_artifact: Option<
@@ -2141,7 +2202,7 @@ impl Engine {
     ) -> Result<EngineCoreRequest> {
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, encoder_artifact) {
-            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (None, None) => request.install_prepared_asr_long_form_atomic(plan)?,
             (Some(input_tokens), Some(artifact)) => {
                 request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
                 request.install_prepared_whisper_window(variant, artifact)?;
@@ -2161,14 +2222,20 @@ impl Engine {
         variant: ModelVariant,
         samples: Vec<f32>,
         sample_rate: u32,
+        plan: PlannedAsrChunks,
         context_limit: usize,
         input_tokens: Option<usize>,
         artifact: Option<Arc<VibeVoiceAsrPreparedArtifact>>,
     ) -> Result<EngineCoreRequest> {
+        let audio_seconds = samples.len() as f32 / sample_rate.max(1) as f32;
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, artifact) {
-            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (None, None) => request.install_prepared_asr_long_form_atomic(plan)?,
             (Some(input_tokens), Some(artifact)) => {
+                // Admission prices `max_tokens`: narrow an omitted budget to
+                // this audio's duration before the context clamp.
+                request.params.max_tokens =
+                    crate::runtime::vibevoice_asr_planned_max_tokens(&request, audio_seconds);
                 request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
                 request.install_prepared_vibevoice_artifact(variant, artifact)?;
             }
@@ -2187,6 +2254,7 @@ impl Engine {
         variant: ModelVariant,
         samples: Vec<f32>,
         sample_rate: u32,
+        plan: PlannedAsrChunks,
         context_limit: usize,
         input_tokens: Option<usize>,
         artifact: Option<
@@ -2195,7 +2263,7 @@ impl Engine {
     ) -> Result<EngineCoreRequest> {
         request.install_prepared_asr_audio(variant, samples, sample_rate)?;
         match (input_tokens, artifact) {
-            (None, None) => request.install_prepared_asr_long_form_atomic()?,
+            (None, None) => request.install_prepared_asr_long_form_atomic(plan)?,
             (Some(input_tokens), Some(artifact)) => {
                 request.install_prepared_sequence_input_tokens(input_tokens, context_limit)?;
                 request.install_prepared_granite_speech_artifact(variant, artifact)?;
@@ -3036,16 +3104,20 @@ impl Engine {
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
+        rows: (usize, usize),
+        minimum_tokens: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
         self.core
             .write()
             .await
-            .load_managed_model_state_with_portable_copies(
+            .load_managed_model_state_with_portable_copies_and_rows(
                 model_instance,
                 retained_state,
                 logical_context_tokens,
                 portable_state_copies,
+                rows,
+                minimum_tokens,
             )
     }
 
@@ -3055,6 +3127,7 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         let _step = self.step_gate.lock().await;
         self.core.write().await.load_composite_retained_state(
@@ -3062,6 +3135,7 @@ impl Engine {
             contract,
             static_domain,
             logical_context_tokens,
+            minimum_tokens,
         )
     }
 
@@ -3209,7 +3283,11 @@ mod tests {
             .expect("exact multimodal shape");
         assert_eq!(request.num_prompt_tokens(), 37);
         assert!(request.uses_asr_retained_sequence());
-        assert!(request.install_prepared_asr_long_form_atomic().is_err());
+        assert!(request
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests()
+            )
+            .is_err());
     }
 
     #[test]
@@ -3235,6 +3313,7 @@ mod tests {
             variant,
             vec![0.0; 16_000],
             16_000,
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
             4_096,
             Some(32),
             Some(artifact.clone()),
@@ -3268,6 +3347,7 @@ mod tests {
             variant,
             vec![0.0; 16_000],
             16_000,
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
             4_096,
             None,
             None,
@@ -3301,6 +3381,7 @@ mod tests {
             variant,
             vec![0.0; 16_000],
             16_000,
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
             448,
             Some(12),
             Some(artifact.clone()),
@@ -3332,6 +3413,7 @@ mod tests {
             variant,
             vec![0.0; 16_000],
             16_000,
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
             448,
             None,
             None,
@@ -3359,6 +3441,7 @@ mod tests {
             variant,
             vec![0.0; 16_000],
             16_000,
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
             4_096,
             None,
             None,
@@ -3375,6 +3458,38 @@ mod tests {
                 .unwrap(),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn direct_vibevoice_retained_route_prices_the_duration_budget() {
+        let variant = ModelVariant::VibeVoiceAsr;
+        let prepare = |auto: bool, max_tokens: usize, seconds: usize, context: usize| {
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            request.asr_auto_max_tokens = auto;
+            request.params.max_tokens = max_tokens;
+            let artifact = VibeVoiceAsrPreparedArtifact::for_test(64, 4..8, 12_800, 2).unwrap();
+            Engine::finalize_direct_vibevoice_asr_preparation(
+                request,
+                variant,
+                vec![0.0; 16_000 * seconds],
+                16_000,
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+                context,
+                Some(64),
+                Some(Arc::new(artifact)),
+            )
+            .unwrap()
+            .params
+            .max_tokens
+        };
+
+        // An omitted budget is admitted at the 32768 ceiling, then narrowed to
+        // the clip's duration budget before the context clamp.
+        assert_eq!(prepare(true, 32_768, 60, 131_072), 976);
+        assert_eq!(prepare(true, 32_768, 10, 131_072), 512);
+        assert_eq!(prepare(true, 32_768, 60, 564), 500);
+        assert_eq!(prepare(false, 200, 60, 131_072), 200);
     }
 
     struct EndlessSequenceExecutor;

@@ -109,6 +109,61 @@ export IZWI_BACKEND=metal
 izwi serve
 ```
 
+### Metal precision
+
+Each model family picks its own precision on Metal. `IZWI_METAL_DTYPE`
+overrides that choice for every family:
+
+| Value | Effect |
+|-------|--------|
+| `auto` (default) | Each family's Metal policy. |
+| `f32` | F32 weights and activations for every family that uses the shared dtype policy, and F32 encoder weights for Parakeet and Nemotron. Use this if a model produces wrong or empty output on Metal. |
+| `f16`, `bf16` | Lower-precision default for families that use the shared dtype policy. Experimental. BF16 is slower than F16 on M1 and M2. |
+
+A per-family variable such as `IZWI_WHISPER_DTYPE` is more specific and takes
+precedence over `IZWI_METAL_DTYPE`. On Metal, a per-family `f16` or `bf16`
+setting is now applied as written instead of being replaced with F32.
+
+On Metal, Parakeet and Nemotron store their encoder's linear and
+pointwise-convolution weights in F16 and keep activations, normalization,
+convolutions and the decoder in F32, as whisper.cpp does. This roughly halves
+their weight memory (about 2.5 GB to 1.3 GB each). A numeric self-check runs
+at load; if it fails, the model loads in F32 and the reason appears in its
+diagnostics under `weight_precision`. Set `IZWI_PARAKEET_ASR_DTYPE=f32` or
+`IZWI_NEMOTRON_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) to keep every weight
+in F32.
+
+Granite Speech applies the same split to its conformer audio encoder (about
+0.8 GiB less weight memory); its self-check result appears under
+`execution.encoder_weight_precision`, and `IZWI_GRANITE_SPEECH_DTYPE=f32` (or
+`IZWI_METAL_DTYPE=f32`) keeps the encoder in F32. Granite's language model
+keeps its F16 projections and attention on Metal behind a load-time range
+probe; if the probe fails it loads in F32, and the reason appears under
+`execution.lm_precision`. The same two settings now also keep the language
+model fully in F32.
+
+Voxtral Realtime keeps its F16 default on Metal and now runs a short
+encoder-and-decoder self-check at load; if it fails, Voxtral loads in F32 and
+the reason appears under `execution.precision`. `IZWI_METAL_DTYPE=f32` runs it
+in F32. Qwen3-ASR (GGUF) checks its audio encoder and its text model the same
+way, each falling back to F32 on its own (`execution.audio_precision` and
+`execution.text_precision`); `IZWI_METAL_DTYPE=f32` now also applies to it. VibeVoice-ASR
+now runs its language model in F16 on Metal (it was F32) behind the same kind
+of check, and keeps its audio tokenizers and connectors in F32 with F16
+feed-forward weights, about 16 GiB of weights instead of 31 GiB. The results
+appear under `execution.lm_precision` and `execution.tokenizer_weight_precision`,
+and `IZWI_VIBEVOICE_ASR_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) keeps it in F32. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
+Voxtral, VibeVoice and Qwen3-ASR, but it stays off until izwi's Metal attention
+kernels support BF16; those GPUs use F16 for now.
+
+Whisper runs its F16 checkpoint in F16 on every Apple GPU, as whisper.cpp,
+mlx-whisper and OpenAI Whisper do. The log-mel input, attention softmax,
+LayerNorm statistics and logits stay in F32. This halves Whisper's weight
+memory (about 3.0 GiB to 1.5 GiB). A numeric self-check runs one encoder
+window and one decoder step at load; if it fails, Whisper loads in F32 and the
+reason appears in its diagnostics under `device.precision`. Set
+`IZWI_WHISPER_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) to run Whisper in F32.
+
 ---
 
 ## Data Locations

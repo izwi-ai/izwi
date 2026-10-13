@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
+use crate::models::architectures::voxtral::realtime::VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT;
 use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription, VoxtralModelLease,
 };
@@ -211,7 +212,9 @@ impl DiarizationAsrModel {
     fn max_audio_seconds_hint(&self) -> Option<f32> {
         match self {
             Self::Native(model) => model.max_audio_seconds_hint(),
-            Self::Voxtral(_) => None,
+            // Chunk Voxtral within its offline frame cap; a longer single
+            // pass fails on CPU/Metal instead of truncating.
+            Self::Voxtral(_) => Some(VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT),
         }
     }
 
@@ -3372,6 +3375,20 @@ Here is the refined transcript:
     fn attribution_requires_fallback_when_too_many_words_are_unattributed() {
         assert!(attribution_requires_fallback(73, 31, 42));
         assert!(!attribution_requires_fallback(73, 60, 13));
+    }
+
+    #[test]
+    fn voxtral_diarization_chunks_at_its_offline_audio_hint() {
+        // Voxtral reports no audio-token rate, so the hint alone sets the limit.
+        let limit = crate::runtime::asr::compose_invocation_audio_limit(
+            Some(VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT),
+            None,
+            Some(8_256),
+            |_| NativeAsrGenerationOptions::default().max_new_tokens,
+        )
+        .unwrap();
+        assert_eq!(limit, Some(30.0));
+        assert_eq!(combined_chunk_limit(limit, Some(300.0)), Some(30.0));
     }
 
     #[test]

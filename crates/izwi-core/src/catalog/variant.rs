@@ -31,6 +31,72 @@ pub enum ModelFamily {
     Tokenizer,
 }
 
+impl ModelFamily {
+    /// Whether this family's ASR decoder can emit text for input that holds
+    /// no speech. Generative decoders continue a language-model prompt, so
+    /// silence or noise can come back as a plausible phrase ("you", "Okay.").
+    /// Transducers emit blanks for frames without speech. Families without an
+    /// offline ASR decoder report `false`.
+    pub fn hallucinates_on_non_speech(self) -> bool {
+        match self {
+            Self::WhisperAsr
+            | Self::Qwen3Asr
+            | Self::VibeVoiceAsr
+            | Self::GraniteSpeechAsr
+            | Self::Lfm25Audio
+            | Self::Voxtral => true,
+            Self::ParakeetAsr | Self::NemotronAsr => false,
+            Self::Qwen3Tts
+            | Self::KokoroTts
+            | Self::VoxtralTts
+            | Self::VibeVoiceTts
+            | Self::FishS2Tts
+            | Self::SortformerDiarization
+            | Self::Qwen3Chat
+            | Self::Qwen3MoeChat
+            | Self::Qwen35Chat
+            | Self::Qwen35MoeChat
+            | Self::Qwen38Chat
+            | Self::Lfm2Chat
+            | Self::Gemma3Chat
+            | Self::Qwen3ForcedAligner
+            | Self::Tokenizer => false,
+        }
+    }
+
+    /// Whether this family's ASR encoder pads every input to one fixed window
+    /// (Whisper's 30 s mel window). A shorter chunk then costs a full window,
+    /// so the route planner never cuts such a model's audio below its window
+    /// for latency.
+    pub fn asr_fixed_encoder_window(self) -> bool {
+        matches!(self, Self::WhisperAsr)
+    }
+
+    /// Whether one ASR invocation is meant to cover the model's whole audio
+    /// window (VibeVoice's hour-long context, Parakeet's windowed encoder),
+    /// rather than the shared ~30 s long-form chunk.
+    pub fn asr_single_pass_spans_model_window(self) -> bool {
+        matches!(self, Self::VibeVoiceAsr | Self::ParakeetAsr)
+    }
+
+    /// Whether the chunked ASR route can stream this family's text token by
+    /// token while a chunk decodes. Granite's chunk decode replays earlier
+    /// text as a prefix and may re-decode a looping chunk, so its chunk text is
+    /// known only when the chunk finishes.
+    pub fn asr_streams_within_chunk(self) -> bool {
+        matches!(
+            self,
+            Self::WhisperAsr
+                | Self::Qwen3Asr
+                | Self::VibeVoiceAsr
+                | Self::ParakeetAsr
+                | Self::NemotronAsr
+                | Self::Lfm25Audio
+                | Self::Voxtral
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTask {
     Tts,
@@ -117,7 +183,7 @@ impl ModelVariant {
             Qwen3Asr06BGguf | Qwen3Asr17BGguf => ModelFamily::Qwen3Asr,
             VibeVoiceAsr => ModelFamily::VibeVoiceAsr,
             Nemotron35AsrStreaming06B => ModelFamily::NemotronAsr,
-            GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
+            GraniteSpeech412B | GraniteSpeech412BPlus => ModelFamily::GraniteSpeechAsr,
             DiarStreamingSortformer4SpkV21 | Nemotron3Diarization => {
                 ModelFamily::SortformerDiarization
             }
@@ -247,8 +313,8 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
                 VoxtralMini4BRealtime2602
             } else if normalized.contains("nemotron") && normalized.contains("asr") {
                 Nemotron35AsrStreaming06B
-            } else if resolve_granite_speech_variant(&normalized).is_some() {
-                GraniteSpeech412BPlus
+            } else if let Some(granite_speech) = resolve_granite_speech_variant(&normalized) {
+                granite_speech
             } else if normalized.contains("vibevoice") && normalized.contains("asr") {
                 VibeVoiceAsr
             } else if normalized.contains("whisper")
@@ -537,15 +603,14 @@ fn resolve_granite_speech_variant(normalized: &str) -> Option<ModelVariant> {
         return None;
     }
 
-    if normalized.contains("41") || normalized.contains("4dot1") || normalized.contains("2b") {
-        return Some(GraniteSpeech412BPlus);
-    }
-
+    // IBM's library resolves local checkpoints the same way: "plus" names the
+    // rich-transcription model, anything else the punctuating base model,
+    // which is IBM's default.
     if normalized.contains("plus") {
         return Some(GraniteSpeech412BPlus);
     }
 
-    Some(GraniteSpeech412BPlus)
+    Some(GraniteSpeech412B)
 }
 
 fn resolve_qwen35_chat_variant(normalized: &str) -> Option<ModelVariant> {
@@ -781,6 +846,41 @@ mod tests {
     fn resolve_asr_accepts_granite_speech_family_alias() {
         let resolved = resolve_asr_model_variant(Some("granite speech plus"));
         assert_eq!(resolved, ModelVariant::GraniteSpeech412BPlus);
+    }
+
+    #[test]
+    fn granite_speech_names_resolve_to_base_unless_they_say_plus() {
+        for (input, expected) in [
+            (
+                "ibm-granite/granite-speech-4.1-2b",
+                ModelVariant::GraniteSpeech412B,
+            ),
+            ("granite-speech-4.1-2b", ModelVariant::GraniteSpeech412B),
+            ("Granite-Speech-4.1-2B", ModelVariant::GraniteSpeech412B),
+            ("Granite Speech 4.1 2B", ModelVariant::GraniteSpeech412B),
+            (
+                "ibm-granite/granite-speech-4.1-2b-plus",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+            (
+                "Granite-Speech-4.1-2B-Plus",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+        ] {
+            assert_eq!(parse_model_variant(input).unwrap(), expected, "{input}");
+        }
+        for (input, expected) in [
+            ("granite speech", ModelVariant::GraniteSpeech412B),
+            ("granite-speech-4.1", ModelVariant::GraniteSpeech412B),
+            ("granite_speech_2b", ModelVariant::GraniteSpeech412B),
+            ("granite speech plus", ModelVariant::GraniteSpeech412BPlus),
+            (
+                "granite-speech-4.1-2b-plus-local",
+                ModelVariant::GraniteSpeech412BPlus,
+            ),
+        ] {
+            assert_eq!(resolve_asr_model_variant(Some(input)), expected, "{input}");
+        }
     }
 
     #[test]

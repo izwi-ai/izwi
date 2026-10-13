@@ -211,7 +211,8 @@ transcripts, and `job_kind=diarization` for speaker timelines.
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Better | Medium |
 | `VibeVoice-ASR` | 16.2 GB | Long-form Microsoft ASR checkpoint | Medium |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control | Medium |
-| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | IBM rich transcription model with prompt guidance, speaker-attributed output, and word timestamps | Medium |
+| `Granite-Speech-4.1-2B` | 4.6 GB | IBM ASR with punctuated, capitalized transcripts | Medium |
+| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | IBM rich transcription model with speaker-attributed output and native word timestamps; unpunctuated | Medium |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Good integrated speech model | Medium |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Rust/Candle offline transcription; realtime planned | Medium |
 

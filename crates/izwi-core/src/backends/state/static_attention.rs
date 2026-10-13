@@ -19,6 +19,7 @@ use crate::kv::v2::{
     StateUpdateKind, StaticAttentionDomainSpec, StaticAttentionLayerSpec, TensorPhysicalLayout,
     WorkspaceFormula,
 };
+use crate::models::shared::memory::exact::exact_zeros_var;
 
 use super::StateBackendRegistry;
 
@@ -237,8 +238,9 @@ impl InvocationStaticAttentionArena {
                 .map_err(|_| invalid("static-attention key head dimension exceeds usize"))?;
             let value_head_dim = usize::try_from(layer.value_head_dim)
                 .map_err(|_| invalid("static-attention value head dimension exceeds usize"))?;
-            let keys = Var::zeros((max_memory_tokens, kv_heads, key_head_dim), dtype, &device)?;
-            let values = Var::zeros(
+            let keys =
+                exact_zeros_var((max_memory_tokens, kv_heads, key_head_dim), dtype, &device)?;
+            let values = exact_zeros_var(
                 (max_memory_tokens, kv_heads, value_head_dim),
                 dtype,
                 &device,

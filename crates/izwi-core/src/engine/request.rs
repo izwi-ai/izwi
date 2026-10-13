@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::config::EngineCoreConfig;
+use super::executor::PlannedAsrChunks;
 use super::metrics::record_engine_stream_backpressure;
 use super::output::StreamingOutput;
 use super::types::{GenerationParams, Priority, RequestId, TaskType, TokenId};
@@ -901,6 +902,63 @@ enum BorrowedEngineAudioInput<'a> {
     Bytes(&'a Vec<u8>),
 }
 
+/// Which upload field a digest was computed from, and that buffer's address
+/// and length. Replacing the upload through a public field changes it, so
+/// the accessors then hash the new bytes in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AsrSourceAudioIdentity {
+    base64: bool,
+    address: usize,
+    len: usize,
+}
+
+impl AsrSourceAudioIdentity {
+    fn of(audio: BorrowedEngineAudioInput<'_>) -> Self {
+        match audio {
+            BorrowedEngineAudioInput::Base64(value) => Self {
+                base64: true,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+            BorrowedEngineAudioInput::Bytes(value) => Self {
+                base64: false,
+                address: value.as_ptr() as usize,
+                len: value.len(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AsrSourceAudioDigest {
+    identity: AsrSourceAudioIdentity,
+    digest: u64,
+}
+
+/// Hash of an encoded upload's bytes and representation.
+fn asr_source_audio_digest(audio: BorrowedEngineAudioInput<'_>) -> u64 {
+    #[cfg(test)]
+    ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.set(count.get() + 1));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match audio {
+        BorrowedEngineAudioInput::Base64(value) => {
+            0_u8.hash(&mut hasher);
+            value.as_bytes().hash(&mut hasher);
+        }
+        BorrowedEngineAudioInput::Bytes(value) => {
+            1_u8.hash(&mut hasher);
+            value.as_slice().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full upload hashes on this thread, for tests that count them.
+    static ASR_SOURCE_AUDIO_FULL_HASHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl EngineAudioInput {
     fn is_empty(&self) -> bool {
         match self {
@@ -1088,7 +1146,13 @@ pub struct EngineCoreRequest {
     /// instead of manufacturing placeholder token IDs.
     pub(super) prepared_sequence_input_tokens: Option<usize>,
     pub(super) prepared_asr_execution_shape: Option<PreparedAsrExecutionShape>,
+    /// Segmentation a long-form row executes, planned once at preparation.
+    pub(super) prepared_asr_route_plan: Option<Arc<PlannedAsrChunks>>,
     pub(super) prepared_asr_audio: Option<PreparedAsrAudio>,
+    /// Digest of the encoded upload, keyed by the buffer it was computed
+    /// from. Preparation hashes the upload once; the per-step accessors reuse
+    /// the digest while the same buffer is in place.
+    pub(super) asr_source_audio_digest: Option<AsrSourceAudioDigest>,
     pub(super) prepared_asr_encoder_artifact: Option<PreparedAsrEncoderArtifact>,
     /// Executor-produced stream events remain invisible until their exact
     /// execution report has committed.
@@ -1116,8 +1180,13 @@ pub struct EngineCoreRequest {
     pub audio_bytes: Option<Vec<u8>>,
     /// Optional ASR initial prompt/context hint.
     pub asr_prompt: Option<String>,
-    /// Whether ASR max_tokens was filled by a model-specific automatic heuristic.
+    /// Whether the caller left ASR max_tokens unset, so `params.max_tokens` is
+    /// a default or model-specific ceiling that duration-aware families narrow.
     pub asr_auto_max_tokens: bool,
+    /// The caller wants model-native word timestamps. A family that emits
+    /// them (Granite Speech Plus) runs its timestamp task instead of plain
+    /// ASR; the others ignore it and leave timing to the forced aligner.
+    pub asr_native_word_timestamps: bool,
     /// Reference audio for voice cloning (base64 encoded). Processing may move
     /// this buffer into [`Self::task`] and clear this field.
     pub reference_audio: Option<String>,
@@ -1497,31 +1566,66 @@ impl EngineCoreRequest {
         self.selected_asr_prompt().map(String::as_str)
     }
 
+    /// Identity of an ASR request's routed source: model, encoded upload,
+    /// language, prompt and timestamp option. Prepared artifacts record it
+    /// and every executor accessor re-checks it. Hashing a large upload is
+    /// the expensive part, so accessors reuse the digest that preparation
+    /// computed while the same upload buffer is in place, and hash in full
+    /// only when the buffer was replaced (or on a clone of the request).
     fn asr_execution_source_fingerprint(&self, model_variant: ModelVariant) -> Result<u64> {
+        let audio = self.asr_execution_source_audio(model_variant)?;
+        let identity = AsrSourceAudioIdentity::of(audio);
+        let digest = match self.asr_source_audio_digest {
+            Some(cached) if cached.identity == identity => cached.digest,
+            _ => asr_source_audio_digest(audio),
+        };
+        Ok(self.asr_execution_source_fingerprint_with(model_variant, digest))
+    }
+
+    /// Hash the upload in full, cache the digest for the accessors, and
+    /// return the source fingerprint. Every preparation install calls this,
+    /// so an artifact always records the fingerprint of the bytes as they
+    /// were when it was prepared.
+    fn refresh_asr_execution_source_fingerprint(
+        &mut self,
+        model_variant: ModelVariant,
+    ) -> Result<u64> {
+        let audio = self.asr_execution_source_audio(model_variant)?;
+        let cached = AsrSourceAudioDigest {
+            identity: AsrSourceAudioIdentity::of(audio),
+            digest: asr_source_audio_digest(audio),
+        };
+        self.asr_source_audio_digest = Some(cached);
+        Ok(self.asr_execution_source_fingerprint_with(model_variant, cached.digest))
+    }
+
+    fn asr_execution_source_audio(
+        &self,
+        model_variant: ModelVariant,
+    ) -> Result<BorrowedEngineAudioInput<'_>> {
         if self.task_type != TaskType::ASR || self.model_variant != Some(model_variant) {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} source identity does not match its routed task/model",
                 self.id
             )));
         }
-        let audio = self.selected_audio_input().ok_or_else(|| {
+        self.selected_audio_input().ok_or_else(|| {
             Error::InvalidInput(format!("ASR request {} is missing audio input", self.id))
-        })?;
+        })
+    }
+
+    fn asr_execution_source_fingerprint_with(
+        &self,
+        model_variant: ModelVariant,
+        audio_digest: u64,
+    ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model_variant.hash(&mut hasher);
-        match audio {
-            BorrowedEngineAudioInput::Base64(value) => {
-                0_u8.hash(&mut hasher);
-                value.as_bytes().hash(&mut hasher);
-            }
-            BorrowedEngineAudioInput::Bytes(value) => {
-                1_u8.hash(&mut hasher);
-                value.as_slice().hash(&mut hasher);
-            }
-        }
+        audio_digest.hash(&mut hasher);
         self.asr_language_for_execution().hash(&mut hasher);
         self.asr_prompt_for_execution().hash(&mut hasher);
-        Ok(hasher.finish())
+        self.asr_native_word_timestamps.hash(&mut hasher);
+        hasher.finish()
     }
 
     pub(crate) fn speech_messages_for_execution(&self) -> &[ChatMessage] {
@@ -2458,6 +2562,19 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
+        // The service path installs the encoder artifact before the model
+        // lease, when the stage costs cannot be priced yet; price them here
+        // from the artifact's prompt so the stages are never admitted as free
+        // (LFA-2).
+        let prepared_costs = match self.prepared_lfm25_audio_asr_artifact_for_executor()? {
+            Some(artifact) => Self::lfm25_audio_asr_stage_costs(
+                self.execution_adapter_binding.as_ref(),
+                &model,
+                artifact.prompt_tokens,
+                self.params.max_tokens,
+            )?,
+            None => Vec::new(),
+        };
         self.prepared_stage_costs.clear();
         self.incremental_model_execution_ready = Some(IncrementalModelExecutionReady {
             model_variant,
@@ -2472,6 +2589,9 @@ impl EngineCoreRequest {
             voxtral_tts_params: None,
             kokoro_tts: None,
         });
+        for (stage_id, cost) in prepared_costs {
+            self.install_prepared_stage_cost(stage_id, cost)?;
+        }
         Ok(())
     }
 
@@ -2797,7 +2917,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if let Some(current) = self.prepared_asr_audio.as_ref() {
             if current.model_variant == model_variant
                 && current.sample_rate == sample_rate
@@ -2836,6 +2956,15 @@ impl EngineCoreRequest {
         Ok(Some((prepared.samples.clone(), prepared.sample_rate)))
     }
 
+    /// Duration of the canonical input audio decoded at preparation. ASR
+    /// executors report generated audio, which is empty for transcription, so
+    /// this is the request's record of how much audio it transcribes.
+    pub(crate) fn prepared_asr_input_duration_secs(&self) -> Option<f32> {
+        self.prepared_asr_audio
+            .as_ref()
+            .map(|prepared| (prepared.samples.len() as f64 / prepared.sample_rate as f64) as f32)
+    }
+
     pub(crate) fn prepared_asr_audio_retained_bytes(&self) -> Result<usize> {
         self.prepared_asr_audio.as_ref().map_or(Ok(0), |prepared| {
             prepared
@@ -2865,7 +2994,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if let Some(current) = self.prepared_asr_encoder_artifact.as_ref() {
             if current.model_variant == model_variant
                 && current.source_fingerprint == source_fingerprint
@@ -2929,7 +3058,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -2987,7 +3116,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3045,7 +3174,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3103,7 +3232,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3181,7 +3310,7 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        let source_fingerprint = self.asr_execution_source_fingerprint(model_variant)?;
+        let source_fingerprint = self.refresh_asr_execution_source_fingerprint(model_variant)?;
         if self.prepared_asr_encoder_artifact.is_some() {
             return Err(Error::InvalidInput(format!(
                 "ASR request {} already owns an encoder artifact",
@@ -3422,8 +3551,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        if input_tokens == 0 || input_tokens >= max_sequence_tokens {
+        if input_tokens == 0 {
             return Err(Error::InvalidInput(format!(
+                "ASR request {} has an empty exact prefill",
+                self.id
+            )));
+        }
+        if input_tokens >= max_sequence_tokens {
+            // The load fitted a context too small for this request's audio:
+            // a capacity refusal (503); longer audio is chunked upstream.
+            return Err(Error::Overloaded(format!(
                 "ASR request {} exact prefill has {input_tokens} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
                 self.id
             )));
@@ -3448,7 +3585,12 @@ impl EngineCoreRequest {
         Ok(())
     }
 
-    pub(crate) fn install_prepared_asr_long_form_atomic(&mut self) -> Result<()> {
+    /// Route the request to the long-form atomic executor, which runs `plan`
+    /// as planned here.
+    pub(crate) fn install_prepared_asr_long_form_atomic(
+        &mut self,
+        plan: PlannedAsrChunks,
+    ) -> Result<()> {
         if self.task_type != TaskType::ASR {
             return Err(Error::InvalidInput(format!(
                 "Request {} cannot install an ASR long-form route for {:?}",
@@ -3467,7 +3609,13 @@ impl EngineCoreRequest {
             )));
         }
         self.prepared_asr_execution_shape = Some(PreparedAsrExecutionShape::LongFormAtomic);
+        self.prepared_asr_route_plan = Some(Arc::new(plan));
         Ok(())
+    }
+
+    /// The segmentation preparation planned for a long-form row.
+    pub(crate) fn prepared_asr_route_plan(&self) -> Option<Arc<PlannedAsrChunks>> {
+        self.prepared_asr_route_plan.clone()
     }
 
     pub(crate) fn prepared_asr_execution_shape(&self) -> Option<PreparedAsrExecutionShape> {
@@ -4484,7 +4632,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4500,6 +4650,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4546,7 +4697,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4562,6 +4715,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4608,7 +4762,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4624,6 +4780,7 @@ impl EngineCoreRequest {
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4667,7 +4824,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4683,6 +4842,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4727,7 +4887,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4743,6 +4905,7 @@ impl EngineCoreRequest {
             audio_bytes: None,
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -4787,7 +4950,9 @@ impl EngineCoreRequest {
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
+            prepared_asr_route_plan: None,
             prepared_asr_audio: None,
+            asr_source_audio_digest: None,
             prepared_asr_encoder_artifact: None,
             stream_staging: StreamStagingBuffer::default(),
             collect_audio_samples: true,
@@ -4803,6 +4968,7 @@ impl EngineCoreRequest {
             audio_bytes: Some(audio_bytes),
             asr_prompt: None,
             asr_auto_max_tokens: false,
+            asr_native_word_timestamps: false,
             reference_audio: None,
             reference_text: None,
             voice_description: None,
@@ -5410,6 +5576,12 @@ impl EngineCoreRequest {
         self
     }
 
+    /// Ask for model-native word timestamps where the model emits them.
+    pub fn with_asr_native_word_timestamps(mut self, enabled: bool) -> Self {
+        self.asr_native_word_timestamps = enabled;
+        self
+    }
+
     /// Set ASR initial prompt/context hint.
     pub fn with_asr_prompt(mut self, prompt: impl Into<String>) -> Self {
         let prompt = prompt.into();
@@ -5534,10 +5706,21 @@ impl RequestProcessor {
 
         request.stream_policy.validate()?;
 
+        // Parakeet preparation already bounded max_tokens by the input's
+        // emittable labels (E × max_symbols). Long audio exceeds the token
+        // context, which limits nothing in Parakeet's decode, so only an
+        // unprepared Parakeet request keeps the context clamp.
+        let output_bound_prepared = request.task_type == TaskType::ASR
+            && request
+                .model_variant
+                .is_some_and(|variant| variant.family() == ModelFamily::ParakeetAsr)
+            && request.prepared_sequence_input_tokens.is_some();
+
         // Validate and clamp parameters
         self.validate_params(
             request.task_type,
             request.model_variant,
+            output_bound_prepared,
             &mut request.params,
         )?;
 
@@ -5553,6 +5736,7 @@ impl RequestProcessor {
         &self,
         task_type: TaskType,
         model_variant: Option<crate::model::ModelVariant>,
+        output_bound_prepared: bool,
         params: &mut GenerationParams,
     ) -> Result<()> {
         // Clamp temperature
@@ -5579,6 +5763,7 @@ impl RequestProcessor {
                         .unwrap_or(self.config.max_seq_len);
                     params.max_tokens.min(tts_limit)
                 }
+                _ if output_bound_prepared => params.max_tokens,
                 _ => params.max_tokens.min(self.config.max_seq_len),
             };
         }
@@ -5879,6 +6064,54 @@ mod tests {
     }
 
     #[test]
+    fn prepared_asr_accessors_reuse_the_preparation_digest_of_the_upload() {
+        let full_hashes = || super::ASR_SOURCE_AUDIO_FULL_HASHES.with(|count| count.get());
+        let variant = ModelVariant::Qwen3Asr06BGguf;
+        let upload = (0..4 * 1024 * 1024).map(|i| i as u8).collect::<Vec<_>>();
+        let mut request = EngineCoreRequest::asr_bytes(upload.clone()).with_model_variant(variant);
+        request
+            .install_prepared_asr_audio(variant, vec![0.25, -0.5], 16_000)
+            .unwrap();
+        let after_install = full_hashes();
+        for _ in 0..50 {
+            request.prepared_asr_audio_for_executor().unwrap().unwrap();
+        }
+        assert_eq!(
+            full_hashes(),
+            after_install,
+            "accessors rehashed the upload"
+        );
+
+        // A clone owns another buffer, so its accessor hashes in full once.
+        let cloned = request.clone();
+        cloned.prepared_asr_audio_for_executor().unwrap().unwrap();
+        assert_eq!(full_hashes(), after_install + 1);
+
+        // Replacing the upload with different bytes of the same length is
+        // drift, detected by a full hash of the new buffer.
+        let mut changed = upload;
+        changed[0] ^= 1;
+        request.audio_bytes = Some(changed);
+        assert!(request
+            .prepared_asr_audio_for_executor()
+            .unwrap_err()
+            .to_string()
+            .contains("changed after decoded-audio preparation"));
+    }
+
+    #[test]
+    fn prepared_asr_input_duration_is_sample_count_over_rate() {
+        let variant = ModelVariant::ParakeetTdt06BV3;
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        assert_eq!(request.prepared_asr_input_duration_secs(), None);
+
+        request
+            .install_prepared_asr_audio(variant, vec![0.0; 36_000], 24_000)
+            .unwrap();
+        assert_eq!(request.prepared_asr_input_duration_secs(), Some(1.5));
+    }
+
+    #[test]
     fn prepared_qwen_asr_routes_are_mutually_exclusive() {
         let variant = ModelVariant::Qwen3Asr06BGguf;
         let mut normal = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
@@ -5889,12 +6122,19 @@ mod tests {
             .install_prepared_sequence_input_tokens(32, 4096)
             .unwrap();
         assert!(normal.uses_asr_retained_sequence());
-        assert!(normal.install_prepared_asr_long_form_atomic().is_err());
+        assert!(normal
+            .install_prepared_asr_long_form_atomic(
+                crate::engine::PlannedAsrChunks::unexecuted_for_tests()
+            )
+            .is_err());
 
         let mut long = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
         long.install_prepared_asr_audio(variant, vec![0.0; 16], 16_000)
             .unwrap();
-        long.install_prepared_asr_long_form_atomic().unwrap();
+        long.install_prepared_asr_long_form_atomic(
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+        )
+        .unwrap();
         assert!(long.uses_asr_long_form_atomic());
         assert!(long
             .install_prepared_sequence_input_tokens(32, 4096)
@@ -6995,6 +7235,32 @@ mod tests {
 
         let processed = processor.process(request).expect("request should process");
         assert_eq!(processed.params.max_tokens, expected_default);
+    }
+
+    #[test]
+    fn test_request_processor_keeps_prepared_parakeet_decode_budget() {
+        let config = EngineCoreConfig::default();
+        let max_seq_len = config.max_seq_len;
+        let budget = max_seq_len * 4;
+        let processor = RequestProcessor::new(config);
+        let parakeet = |prepared: bool| {
+            let mut request = EngineCoreRequest::asr("UklGRg==")
+                .with_model_variant(ModelVariant::ParakeetTdt06BV3);
+            request.params.max_tokens = budget;
+            if prepared {
+                request
+                    .install_prepared_sequence_input_tokens(1, budget + 1)
+                    .expect("Parakeet budget installs");
+            }
+            processor
+                .process(request)
+                .expect("request should process")
+                .params
+                .max_tokens
+        };
+
+        assert_eq!(parakeet(true), budget);
+        assert_eq!(parakeet(false), max_seq_len);
     }
 
     #[test]

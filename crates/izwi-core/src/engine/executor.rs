@@ -38,12 +38,31 @@ pub(crate) fn decode_request_audio_with_rate(
     audio::decode_request_audio_with_rate(request)
 }
 
+pub(crate) use audio::{AsrRouteCapabilities, PlannedAsrChunks};
+
+/// Route plan for a request's audio; see [`NativeExecutor::asr_route_plan`].
+pub(crate) fn asr_route_plan(
+    samples: &[f32],
+    sample_rate: u32,
+    capabilities: &AsrRouteCapabilities,
+    streaming: bool,
+) -> PlannedAsrChunks {
+    NativeExecutor::asr_route_plan(samples, sample_rate, capabilities, streaming)
+}
+
+/// Whether a non-streaming Qwen3 request needs the long-form route under an
+/// invocation limit of `model_max_chunk_secs`.
+#[cfg(test)]
 pub(crate) fn qwen3_asr_requires_long_form(
     samples: &[f32],
     sample_rate: u32,
     model_max_chunk_secs: Option<f32>,
 ) -> bool {
-    audio::qwen3_asr_requires_long_form(samples, sample_rate, model_max_chunk_secs)
+    let capabilities = AsrRouteCapabilities::for_family(
+        crate::catalog::ModelFamily::Qwen3Asr,
+        model_max_chunk_secs,
+    );
+    asr_route_plan(samples, sample_rate, &capabilities, false).requires_chunk_path()
 }
 
 use super::config::EngineCoreConfig;
@@ -6212,7 +6231,10 @@ mod tests {
         long.model_variant = Some(ModelVariant::Qwen3Asr06BGguf);
         long.install_prepared_asr_audio(ModelVariant::Qwen3Asr06BGguf, vec![0.0; 160], 16_000)
             .unwrap();
-        long.install_prepared_asr_long_form_atomic().unwrap();
+        long.install_prepared_asr_long_form_atomic(
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+        )
+        .unwrap();
         let long_profile = executor.execution_profile(&long).unwrap();
         assert_eq!(long_profile.mode, ExecutionMode::Atomic);
         assert_eq!(long_profile.prefill, PrefillMode::None);
@@ -6248,7 +6270,10 @@ mod tests {
         long.model_variant = Some(variant);
         long.install_prepared_asr_audio(variant, vec![0.0; 160], 16_000)
             .unwrap();
-        long.install_prepared_asr_long_form_atomic().unwrap();
+        long.install_prepared_asr_long_form_atomic(
+            crate::engine::PlannedAsrChunks::unexecuted_for_tests(),
+        )
+        .unwrap();
         let long_profile = executor.execution_profile(&long).unwrap();
         assert_eq!(long_profile.mode, ExecutionMode::Atomic);
         assert_eq!(long_profile.prefill, PrefillMode::None);

@@ -54,6 +54,12 @@ describe("speech route model filters", () => {
 
   it("includes granite speech on regular transcription routes", () => {
     expect(
+      VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-4.1-2B"),
+    ).toBe(true);
+    expect(
+      VIEW_CONFIGS.transcription.modelFilter("ibm-granite/granite-speech-4.1-2b"),
+    ).toBe(true);
+    expect(
       VIEW_CONFIGS.transcription.modelFilter("Granite-Speech-4.1-2B-Plus"),
     ).toBe(true);
     expect(

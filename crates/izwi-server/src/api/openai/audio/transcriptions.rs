@@ -12,12 +12,11 @@ use axum::{
 };
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::resolve_audio_upload_limit_bytes;
 use crate::api::audio_payload::{
@@ -28,89 +27,125 @@ use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{parse_model_variant, AsrTranscription, WorkloadClass};
+use izwi_core::{
+    parse_model_variant, resolve_asr_model_variant, validate_asr_language, AsrTranscription,
+    WorkloadClass,
+};
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
-const TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR: &str =
-    "Transcription stream consumer is too slow; generation was cancelled";
 #[cfg(not(test))]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Transcript text the SSE queue could not take yet.
+///
+/// The runtime calls the delta callback synchronously and can hand over a
+/// whole committed outbox (one delta per decoded token) within one poll, far
+/// faster than the SSE body task is scheduled, so a burst overruns the bounded
+/// queue even while the client reads continuously. Text that does not fit
+/// waits here and goes out as one coalesced delta once the queue has room:
+/// the queue stays bounded, the backlog is bounded by the transcript itself,
+/// generation never waits on the client, and the deltas still concatenate to
+/// the final text.
 #[derive(Debug, Default)]
-struct TranscriptionStreamBackpressure {
-    full: AtomicBool,
+struct PendingTranscriptText {
+    text: Mutex<String>,
     notify: Notify,
 }
 
-impl TranscriptionStreamBackpressure {
-    fn trip(&self) {
-        self.full.store(true, Ordering::Release);
+impl PendingTranscriptText {
+    fn lock(&self) -> MutexGuard<'_, String> {
+        self.text.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Send `delta` now if nothing is waiting ahead of it and the queue has
+    /// room; otherwise append it to the pending text.
+    fn push(&self, event_tx: &mpsc::Sender<String>, delta: String) {
+        let mut pending = self.lock();
+        if pending.is_empty() {
+            match event_tx.try_reserve() {
+                Ok(permit) => {
+                    permit.send(transcript_delta_event_payload(delta));
+                    return;
+                }
+                // A closed receiver has nobody left to receive deltas. The
+                // driver observes `event_tx.closed()` and cancels generation.
+                Err(TrySendError::Closed(())) => return,
+                Err(TrySendError::Full(())) => {}
+            }
+        }
+        pending.push_str(&delta);
+        drop(pending);
         self.notify.notify_one();
     }
 
-    fn is_tripped(&self) -> bool {
-        self.full.load(Ordering::Acquire)
+    fn has_text(&self) -> bool {
+        !self.lock().is_empty()
     }
 
-    async fn notified(&self) {
-        if self.is_tripped() {
-            return;
+    /// Send the pending text, if any, through a reserved queue slot.
+    fn flush(&self, permit: mpsc::Permit<'_, String>) {
+        let mut pending = self.lock();
+        if !pending.is_empty() {
+            let text = std::mem::take(&mut *pending);
+            permit.send(transcript_delta_event_payload(text));
         }
-        self.notify.notified().await;
+    }
+
+    fn take(&self) -> Option<String> {
+        let mut pending = self.lock();
+        (!pending.is_empty()).then(|| std::mem::take(&mut *pending))
     }
 }
 
-fn try_send_transcript_delta(
+/// Run `generation` while forwarding its pending text whenever the queue has
+/// room. Returns the events that close the stream (the text still pending,
+/// then `done` or `error`), or `None` once the client has disconnected.
+async fn drive_transcription_stream<F>(
     event_tx: &mpsc::Sender<String>,
-    backpressure: &TranscriptionStreamBackpressure,
-    delta: String,
-) {
-    match event_tx.try_send(transcript_delta_event_payload(delta)) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => backpressure.trip(),
-        // A closed receiver has nobody left to receive an error event. The
-        // async driver observes `event_tx.closed()` and cancels generation.
-        Err(TrySendError::Closed(_)) => {}
-    }
-}
-
-async fn resolve_transcription_terminal<F>(
-    event_tx: &mpsc::Sender<String>,
-    backpressure: Arc<TranscriptionStreamBackpressure>,
+    pending: &PendingTranscriptText,
     generation: F,
-) -> Option<String>
+) -> Option<Vec<String>>
 where
     F: Future<Output = izwi_core::Result<AsrTranscription>>,
 {
     tokio::pin!(generation);
-    let result = tokio::select! {
-        result = &mut generation => Some(result),
-        _ = event_tx.closed() => return None,
-        _ = backpressure.notified() => None,
+    let result = loop {
+        tokio::select! {
+            result = &mut generation => break result,
+            _ = event_tx.closed() => return None,
+            permit = event_tx.reserve(), if pending.has_text() => match permit {
+                Ok(permit) => pending.flush(permit),
+                Err(_) => return None,
+            },
+            _ = pending.notify.notified() => {}
+        }
     };
 
-    // The overflowing callback and successful generation may become ready in
-    // the same poll. The latch makes the explicit failure authoritative.
-    if result.is_none() || backpressure.is_tripped() {
-        return Some(transcript_error_event_payload(
-            TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR,
-        ));
-    }
-
-    match result.expect("completed transcription result must be present") {
-        Ok(output) => Some(transcript_done_event_payload(
-            output.text,
-            output.language,
-            output.duration_secs,
-        )),
-        Err(err) => Some(transcript_error_event_payload(&err.to_string())),
-    }
+    let mut terminal = pending
+        .take()
+        .map(transcript_delta_event_payload)
+        .into_iter()
+        .collect::<Vec<_>>();
+    terminal.push(match result {
+        Ok(output) => {
+            transcript_done_event_payload(output.text, output.language, output.duration_secs)
+        }
+        Err(err) => transcript_error_event_payload(&err.to_string()),
+    });
+    Some(terminal)
 }
 
-async fn send_transcription_terminal(event_tx: mpsc::Sender<String>, payload: String) {
-    let _ = tokio::time::timeout(TRANSCRIPTION_TERMINAL_SEND_TIMEOUT, event_tx.send(payload)).await;
+async fn send_transcription_terminal(event_tx: mpsc::Sender<String>, payloads: Vec<String>) {
+    let _ = tokio::time::timeout(TRANSCRIPTION_TERMINAL_SEND_TIMEOUT, async {
+        for payload in payloads {
+            if event_tx.send(payload).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 #[derive(Debug, Default)]
@@ -205,6 +240,7 @@ pub async fn transcriptions(
 ) -> Result<Response<Body>, ApiError> {
     let mut req = parse_transcription_request(req).await?;
     validate_transcription_model(req.model.as_deref())?;
+    validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
     let audio = req
         .audio
         .take()
@@ -237,9 +273,12 @@ pub async fn transcriptions(
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
     let started = Instant::now();
+    // A model that emits word timestamps itself (Granite Speech Plus) runs
+    // its timestamp task and returns `timestamp_words`; any other model's
+    // text is timed by the forced aligner below.
     let output = state
         .runtime
-        .asr_transcribe_bytes_with_runtime_context(
+        .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
             audio_bytes.as_slice(),
             req.model.as_deref(),
             req.language.as_deref(),
@@ -247,12 +286,14 @@ pub async fn transcriptions(
             req.max_tokens,
             Some(&ctx.correlation_id),
             permit.runtime_context(),
+            timestamp_request.any(),
         )
         .await?;
 
     let mut words = None;
     let mut segments = None;
     let mut subtitle_segments = None;
+    let mut alignment_error = None;
     let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
     let model_words = extract_model_timestamp_words(output.asr_diagnostics.as_ref());
     let model_segments = extract_model_timestamp_segments(output.asr_diagnostics.as_ref());
@@ -270,7 +311,9 @@ pub async fn transcriptions(
         && ((timestamp_request.words && words.is_none())
             || (timestamp_request.segments && segments.is_none()))
     {
-        let alignments = state
+        // The transcription already succeeded; an aligner failure costs the
+        // word timings, not the transcript.
+        match state
             .runtime
             .force_align_bytes_with_model_and_language(
                 audio_bytes.as_slice(),
@@ -278,16 +321,24 @@ pub async fn transcriptions(
                 output.language.as_deref().or(req.language.as_deref()),
                 req.aligner_model.as_deref(),
             )
-            .await?;
-        let timestamp_words = alignments_to_timestamp_words(alignments);
-        if timestamp_request.words && words.is_none() {
-            words = Some(timestamp_words.clone());
-        }
-        if timestamp_request.segments && segments.is_none() {
-            segments = Some(build_timestamp_segments(
-                &timestamp_words,
-                &chunk_boundaries,
-            ));
+            .await
+        {
+            Ok(alignments) => {
+                let timestamp_words = alignments_to_timestamp_words(alignments);
+                if timestamp_request.words && words.is_none() {
+                    words = Some(timestamp_words.clone());
+                }
+                if timestamp_request.segments && segments.is_none() {
+                    segments = Some(build_timestamp_segments(
+                        &timestamp_words,
+                        &chunk_boundaries,
+                    ));
+                }
+            }
+            Err(err) => {
+                warn!("Forced alignment failed; returning untimed words: {}", err);
+                alignment_error = Some(err.to_string());
+            }
         }
     } else if matches!(response_format.as_str(), "srt" | "vtt") && !output.text.trim().is_empty() {
         if !model_segments.is_empty() {
@@ -325,6 +376,23 @@ pub async fn transcriptions(
         }
     }
 
+    // OpenAI's verbose_json defaults to segment granularity, and a failed
+    // alignment still answers with segments.
+    if response_format == "verbose_json"
+        && segments.is_none()
+        && (timestamp_request.segments || !timestamp_request.any() || alignment_error.is_some())
+    {
+        segments = Some(fallback_timestamp_segments(
+            &output.text,
+            output.duration_secs,
+            output.asr_diagnostics.as_ref(),
+            model_segments,
+            &model_words,
+            &chunk_boundaries,
+        ));
+    }
+    let asr_diagnostics = with_alignment_error(output.asr_diagnostics, alignment_error);
+
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let rtf = if output.duration_secs > 0.0 {
@@ -351,7 +419,7 @@ pub async fn transcriptions(
                     segments,
                     processing_time_ms: elapsed_ms,
                     rtf,
-                    izwi_asr_diagnostics: output.asr_diagnostics,
+                    izwi_asr_diagnostics: asr_diagnostics,
                 })
                 .unwrap(),
             ))
@@ -396,7 +464,6 @@ async fn transcriptions_stream(
     let audio_bytes = audio.bytes;
 
     let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_STREAM_CAPACITY);
-    let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
     let engine = state.runtime.clone();
     let admission_state = state.clone();
 
@@ -409,7 +476,7 @@ async fn transcriptions_stream(
             Err(_) => {
                 send_transcription_terminal(
                     event_tx,
-                    transcript_error_event_payload("Server is shutting down"),
+                    vec![transcript_error_event_payload("Server is shutting down")],
                 )
                 .await;
                 return;
@@ -417,7 +484,8 @@ async fn transcriptions_stream(
         };
 
         let delta_tx = event_tx.clone();
-        let delta_backpressure = backpressure.clone();
+        let pending = Arc::new(PendingTranscriptText::default());
+        let delta_pending = pending.clone();
         let generation = engine.asr_transcribe_streaming_bytes_with_runtime_context(
             audio_bytes.as_slice(),
             model.as_deref(),
@@ -426,11 +494,9 @@ async fn transcriptions_stream(
             max_tokens,
             Some(correlation_id.as_str()),
             permit.runtime_context(),
-            move |delta| {
-                try_send_transcript_delta(&delta_tx, &delta_backpressure, delta);
-            },
+            move |delta| delta_pending.push(&delta_tx, delta),
         );
-        let terminal = resolve_transcription_terminal(&event_tx, backpressure, generation).await;
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
         drop(permit);
         if let Some(terminal) = terminal {
             send_transcription_terminal(event_tx, terminal).await;
@@ -715,6 +781,16 @@ fn validate_transcription_model(model: Option<&str>) -> Result<(), ApiError> {
     }
 }
 
+/// OpenAI rejects language codes a model does not support; so do the ASR
+/// families that publish a language list (Granite Speech).
+fn validate_transcription_language(
+    model: Option<&str>,
+    language: Option<&str>,
+) -> Result<(), ApiError> {
+    validate_asr_language(resolve_asr_model_variant(model), language)
+        .map_err(|err| ApiError::bad_request(err.to_string()))
+}
+
 fn alignments_to_timestamp_words(
     alignments: Vec<(String, u32, u32)>,
 ) -> Vec<TranscriptionTimestampWord> {
@@ -781,6 +857,99 @@ fn build_timestamp_segments(
     }
 
     segments
+}
+
+/// Segments when no timestamp source was asked for or it failed: the model's
+/// own segments or words, else one segment per long-form chunk (its committed
+/// text over its time range), else one segment spanning the audio.
+fn fallback_timestamp_segments(
+    text: &str,
+    duration_secs: f32,
+    diagnostics: Option<&serde_json::Value>,
+    model_segments: Vec<TranscriptionTimestampSegment>,
+    model_words: &[TranscriptionTimestampWord],
+    chunk_boundaries: &[f32],
+) -> Vec<TranscriptionTimestampSegment> {
+    if !model_segments.is_empty() {
+        return model_segments;
+    }
+    if !model_words.is_empty() {
+        return build_timestamp_segments(model_words, chunk_boundaries);
+    }
+    let chunk_segments = extract_chunk_transcript_segments(diagnostics);
+    if !chunk_segments.is_empty() {
+        return chunk_segments;
+    }
+    let mut segments = Vec::new();
+    push_timestamp_segment(
+        &mut segments,
+        0.0,
+        duration_secs.max(0.0),
+        &[text.to_string()],
+    );
+    segments
+}
+
+/// One segment per long-form chunk from the chunk executor's diagnostics.
+/// Overlapping chunks start where the previous segment ended, so segments
+/// never overlap and their texts concatenate to the transcript.
+fn extract_chunk_transcript_segments(
+    diagnostics: Option<&serde_json::Value>,
+) -> Vec<TranscriptionTimestampSegment> {
+    let Some(chunks) = diagnostics
+        .and_then(|diagnostics| {
+            diagnostics
+                .get("chunking")
+                .or_else(|| diagnostics.get("model_diagnostics")?.get("chunking"))
+        })
+        .and_then(|chunking| chunking.get("chunk_transcriptions"))
+        .and_then(|chunks| chunks.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut segments = Vec::new();
+    let mut previous_end = 0.0f32;
+    for chunk in chunks {
+        let text = chunk
+            .get("committed_text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        let start = chunk.get("start_seconds").and_then(|value| value.as_f64());
+        let end = chunk.get("end_seconds").and_then(|value| value.as_f64());
+        let (Some(start), Some(end)) = (start, end) else {
+            continue;
+        };
+        if text.is_empty() || !start.is_finite() || !end.is_finite() {
+            continue;
+        }
+        let start = (start as f32).max(previous_end);
+        let end = (end as f32).max(start);
+        push_timestamp_segment(&mut segments, start, end, &[text.to_string()]);
+        previous_end = end;
+    }
+    segments
+}
+
+/// Report a forced-alignment failure in the diagnostics of a response that
+/// otherwise succeeded.
+fn with_alignment_error(
+    diagnostics: Option<serde_json::Value>,
+    alignment_error: Option<String>,
+) -> Option<serde_json::Value> {
+    let Some(alignment_error) = alignment_error else {
+        return diagnostics;
+    };
+    let mut diagnostics = match diagnostics {
+        Some(serde_json::Value::Object(root)) => root,
+        Some(other) => serde_json::Map::from_iter([("model_diagnostics".to_string(), other)]),
+        None => serde_json::Map::new(),
+    };
+    diagnostics.insert(
+        "alignment_error".to_string(),
+        serde_json::Value::String(alignment_error),
+    );
+    Some(serde_json::Value::Object(diagnostics))
 }
 
 fn timestamp_segment_crosses_chunk_boundary(
@@ -1174,64 +1343,123 @@ mod tests {
         assert_eq!(json.get("delta").and_then(|v| v.as_str()), Some("hello"));
     }
 
-    #[tokio::test]
-    async fn saturated_stream_emits_explicit_terminal_error() {
-        let (event_tx, mut event_rx) = mpsc::channel(1);
-        let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
-        let generation_tx = event_tx.clone();
-        let generation_backpressure = backpressure.clone();
-        let generation = async move {
-            try_send_transcript_delta(
-                &generation_tx,
-                &generation_backpressure,
-                "first".to_string(),
-            );
-            try_send_transcript_delta(
-                &generation_tx,
-                &generation_backpressure,
-                "overflow".to_string(),
-            );
-            // Completion in the overflow poll must still resolve as a terminal
-            // error, otherwise clients receive a truncated successful stream.
-            Ok(AsrTranscription {
-                text: "firstoverflow".to_string(),
-                language: Some("en".to_string()),
-                duration_secs: 1.0,
-                asr_diagnostics: None,
-            })
-        };
-        let driver = tokio::spawn(async move {
-            if let Some(terminal) =
-                resolve_transcription_terminal(&event_tx, backpressure, generation).await
-            {
-                send_transcription_terminal(event_tx, terminal).await;
+    fn transcription(text: String) -> AsrTranscription {
+        AsrTranscription {
+            text,
+            language: Some("en".to_string()),
+            duration_secs: 60.0,
+            asr_diagnostics: None,
+        }
+    }
+
+    /// Run a generation that emits `deltas` back to back within one poll, the
+    /// way the runtime hands over a committed outbox, and return every event
+    /// the client received.
+    async fn stream_burst(
+        capacity: usize,
+        deltas: Vec<String>,
+        read_while_generating: bool,
+    ) -> Vec<serde_json::Value> {
+        let (event_tx, mut event_rx) = mpsc::channel::<String>(capacity);
+        let gate = Arc::new(Notify::new());
+        let consumer_gate = gate.clone();
+        let consumer = tokio::spawn(async move {
+            if !read_while_generating {
+                consumer_gate.notified().await;
             }
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(serde_json::from_str::<serde_json::Value>(&event).expect("event JSON"));
+            }
+            events
         });
+        let pending = PendingTranscriptText::default();
+        let delta_tx = event_tx.clone();
+        let generation = async {
+            let mut text = String::new();
+            for delta in deltas {
+                text.push_str(&delta);
+                pending.push(&delta_tx, delta);
+            }
+            Ok(transcription(text))
+        };
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+            .await
+            .expect("the client is still connected");
+        drop(delta_tx);
+        gate.notify_one();
+        send_transcription_terminal(event_tx, terminal).await;
+        consumer.await.expect("consumer task")
+    }
 
-        let first: serde_json::Value = serde_json::from_str(
-            &event_rx
-                .recv()
-                .await
-                .expect("first delta must be delivered"),
-        )
-        .expect("delta JSON");
-        assert_eq!(first["type"], "transcript.text.delta");
-        assert_eq!(first["delta"], "first");
+    fn assert_deltas_concatenate_to_done(events: &[serde_json::Value]) -> usize {
+        let (done, deltas) = events.split_last().expect("events");
+        assert_eq!(done["type"], "transcript.text.done", "{done}");
+        let mut streamed = String::new();
+        for delta in deltas {
+            assert_eq!(delta["type"], "transcript.text.delta", "{delta}");
+            streamed.push_str(delta["delta"].as_str().expect("delta text"));
+        }
+        assert_eq!(streamed, done["text"].as_str().expect("done text"));
+        deltas.len()
+    }
 
-        let terminal: serde_json::Value = serde_json::from_str(
-            &event_rx
-                .recv()
-                .await
-                .expect("backpressure error must be delivered"),
-        )
-        .expect("terminal JSON");
-        assert_eq!(terminal["type"], "error");
-        assert_eq!(
-            terminal["error"]["message"],
-            TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR
-        );
-        driver.await.expect("stream driver must finish");
-        assert!(event_rx.recv().await.is_none());
+    #[tokio::test]
+    async fn token_rate_burst_streams_completely_to_a_reading_client() {
+        // A 60 s LFM2.5 chunk-driver stream: one delta per token, delivered
+        // from a committed outbox far faster than the SSE body is polled.
+        let deltas = (0..2_000).map(|idx| format!("w{idx} ")).collect();
+        let events = stream_burst(TRANSCRIPTION_STREAM_CAPACITY, deltas, true).await;
+        assert_deltas_concatenate_to_done(&events);
+    }
+
+    #[tokio::test]
+    async fn saturated_stream_coalesces_deltas_instead_of_failing() {
+        let deltas = ["first ", "second ", "third ", "fourth"]
+            .map(str::to_string)
+            .to_vec();
+        let events = stream_burst(1, deltas, false).await;
+        let delta_events = assert_deltas_concatenate_to_done(&events);
+        assert_eq!(events[0]["delta"], "first ");
+        assert_eq!(events[1]["delta"], "second third fourth");
+        assert_eq!(delta_events, 2);
+    }
+
+    #[tokio::test]
+    async fn generation_error_still_sends_the_text_streamed_before_it() {
+        let (event_tx, mut event_rx) = mpsc::channel::<String>(1);
+        let pending = PendingTranscriptText::default();
+        let generation = async {
+            pending.push(&event_tx, "a ".to_string());
+            pending.push(&event_tx, "b".to_string());
+            Err(izwi_core::Error::InferenceError("boom".to_string()))
+        };
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+            .await
+            .expect("the client is still connected");
+        let reader = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(serde_json::from_str::<serde_json::Value>(&event).unwrap());
+            }
+            events
+        });
+        send_transcription_terminal(event_tx, terminal).await;
+        let events = reader.await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["delta"], "a ");
+        assert_eq!(events[1]["delta"], "b");
+        assert_eq!(events[2]["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn disconnected_client_cancels_generation() {
+        let (event_tx, event_rx) = mpsc::channel::<String>(1);
+        drop(event_rx);
+        let pending = PendingTranscriptText::default();
+        let terminal =
+            drive_transcription_stream(&event_tx, &pending, std::future::pending()).await;
+        assert!(terminal.is_none());
     }
 
     #[tokio::test]
@@ -1240,18 +1468,14 @@ mod tests {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx.send("queued-delta".to_string()).await.unwrap();
-        let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
 
         let driver = tokio::spawn(async move {
-            let terminal = resolve_transcription_terminal(&event_tx, backpressure, async {
-                Ok(AsrTranscription {
-                    text: "done".to_string(),
-                    language: Some("en".to_string()),
-                    duration_secs: 1.0,
-                    asr_diagnostics: None,
-                })
-            })
-            .await;
+            let pending = PendingTranscriptText::default();
+            let generation = async {
+                pending.push(&event_tx, "unsent".to_string());
+                Ok(transcription("done".to_string()))
+            };
+            let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
                 send_transcription_terminal(event_tx, terminal).await;
@@ -1349,6 +1573,26 @@ mod tests {
         let err = TimestampGranularityRequest::parse(Some(&requested))
             .expect_err("unknown granularity should be rejected");
         assert!(err.message.contains("Unsupported timestamp granularity"));
+    }
+
+    #[test]
+    fn transcription_language_is_checked_against_the_routed_granite_checkpoint() {
+        validate_transcription_language(Some("Granite-Speech-4.1-2B"), Some("ja")).unwrap();
+        validate_transcription_language(Some("granite speech"), Some("German")).unwrap();
+        let err = validate_transcription_language(Some("Granite-Speech-4.1-2B-Plus"), Some("ja"))
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err
+            .message
+            .contains("supported source languages: de, en, es, fr, pt"));
+        assert_eq!(
+            validate_transcription_language(Some("Granite-Speech-4.1-2B"), Some("klingon"))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        validate_transcription_language(Some("Whisper-Large-v3-Turbo"), Some("klingon")).unwrap();
+        validate_transcription_language(None, Some("klingon")).unwrap();
     }
 
     #[test]
@@ -1564,5 +1808,79 @@ mod tests {
         assert!(srt.contains("2\n00:00:02,000 --> 00:00:02,400"));
         assert!(vtt.starts_with("WEBVTT"));
         assert!(vtt.contains("00:00:02.000 --> 00:00:02.400"));
+    }
+
+    #[test]
+    fn default_segments_follow_the_long_form_chunks() {
+        let diagnostics = serde_json::json!({
+            "chunking": {
+                "chunk_transcriptions": [
+                    { "start_seconds": 0.0, "end_seconds": 30.0, "committed_text": "one two three" },
+                    { "start_seconds": 28.5, "end_seconds": 55.0, "committed_text": "four" },
+                    { "start_seconds": 55.0, "end_seconds": 60.0, "committed_text": "" },
+                    { "skipped": true }
+                ]
+            }
+        });
+
+        let segments = fallback_timestamp_segments(
+            "one two three four",
+            60.0,
+            Some(&diagnostics),
+            Vec::new(),
+            &[],
+            &[],
+        );
+
+        let spans: Vec<(f32, f32, &str)> = segments
+            .iter()
+            .map(|segment| (segment.start, segment.end, segment.text.as_str()))
+            .collect();
+        assert_eq!(spans, [(0.0, 30.0, "one two three"), (30.0, 55.0, "four")]);
+        assert_eq!(segments[1].id, 1);
+    }
+
+    #[test]
+    fn default_segments_prefer_model_timings_then_span_a_single_window() {
+        let model_words = vec![
+            TranscriptionTimestampWord {
+                word: "Hello".to_string(),
+                start: 0.2,
+                end: 0.6,
+            },
+            TranscriptionTimestampWord {
+                word: "there.".to_string(),
+                start: 0.7,
+                end: 1.1,
+            },
+        ];
+        let from_words =
+            fallback_timestamp_segments("Hello there.", 3.0, None, Vec::new(), &model_words, &[]);
+        assert_eq!(from_words.len(), 1);
+        assert_eq!((from_words[0].start, from_words[0].end), (0.2, 1.1));
+
+        let single = fallback_timestamp_segments("Hello there.", 3.0, None, Vec::new(), &[], &[]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            (single[0].start, single[0].end, single[0].text.as_str()),
+            (0.0, 3.0, "Hello there.")
+        );
+
+        assert!(fallback_timestamp_segments("  ", 3.0, None, Vec::new(), &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn alignment_errors_are_reported_in_the_diagnostics() {
+        assert_eq!(with_alignment_error(None, None), None);
+        let diagnostics = with_alignment_error(
+            Some(serde_json::json!({ "model_family": "parakeet" })),
+            Some("aligner window exceeded".to_string()),
+        )
+        .expect("diagnostics");
+        assert_eq!(diagnostics["model_family"], "parakeet");
+        assert_eq!(diagnostics["alignment_error"], "aligner window exceeded");
+
+        let created = with_alignment_error(None, Some("boom".to_string())).expect("diagnostics");
+        assert_eq!(created["alignment_error"], "boom");
     }
 }

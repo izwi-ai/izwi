@@ -1,7 +1,15 @@
-use candle_core::{Shape, Tensor};
+use candle_core::{DType, Shape, Tensor};
 use candle_nn::{Linear, Module};
 
 use crate::error::{Error, Result};
+
+/// Exact (erf) GELU, the activation HF transformers and vLLM use for
+/// Voxtral's conv stem, audio adapter and Ada-norm (`nn.functional.gelu`,
+/// `ACT2FN["gelu"]`). Candle's `gelu` is the tanh approximation. Computed in
+/// F32 and returned in the input dtype.
+pub(super) fn exact_gelu(x: &Tensor) -> candle_core::Result<Tensor> {
+    x.to_dtype(DType::F32)?.gelu_erf()?.to_dtype(x.dtype())
+}
 
 pub(super) fn linear_forward_last_dim(linear: &Linear, x: &Tensor) -> Result<Tensor> {
     if x.rank() <= 2 {
@@ -42,7 +50,29 @@ pub(super) fn linear_forward_last_dim(linear: &Linear, x: &Tensor) -> Result<Ten
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device, IndexOp, Tensor};
+    use candle_core::{Device, IndexOp, Tensor};
+
+    #[test]
+    fn exact_gelu_matches_erf_not_tanh() {
+        let device = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, -1.0, 0.0, 3.0], (4,), &device).unwrap();
+
+        let y = exact_gelu(&x).unwrap().to_vec1::<f32>().unwrap();
+
+        // 0.5 * x * (1 + erf(x / sqrt(2))); the tanh form gives 0.8411920 at 1.
+        for (got, want) in y
+            .iter()
+            .zip([0.841_344_746, -0.158_655_254, 0.0, 2.995_950_306])
+        {
+            assert!((f64::from(*got) - want).abs() < 1e-6, "{got} != {want}");
+        }
+
+        let half = x.to_dtype(DType::F16).unwrap();
+        let y = exact_gelu(&half).unwrap();
+        assert_eq!(y.dtype(), DType::F16);
+        let y = y.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert!((f64::from(y[0]) - 0.841_344_746).abs() < 1e-3);
+    }
 
     #[test]
     fn linear_forward_last_dim_flattens_rank3_inputs() {

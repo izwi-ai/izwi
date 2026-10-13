@@ -4,6 +4,7 @@ mod nemo;
 mod physical;
 mod preprocessor;
 
+use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -18,14 +19,23 @@ use crate::backends::state::{
     InvocationTensorComponentValue, InvocationTensorUpdateV2, PhysicalStateTransactionId,
     StateComponentValue, TensorStateArena,
 };
-use crate::backends::DeviceProfile;
+use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{depthwise_conv1d, DepthwiseConv1dSpec};
+use crate::kernels::f16_weight_linear::{
+    load_weight_only_f16, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
+    F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
 };
 use crate::model::ModelVariant;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
 };
@@ -34,24 +44,310 @@ use crate::tokenizer::Tokenizer;
 
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
+pub(crate) use nemo::{parakeet_checkpoint_paths, parakeet_native_artifacts_complete};
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
-use preprocessor::ParakeetPreprocessor;
+use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
+
+/// The dtype the Parakeet loader reads every weight in, and the activation
+/// dtype on every backend. On Metal the encoder's projection weights are then
+/// stored in F16 (see [`resolve_parakeet_projection_precision`]). Load
+/// admission prices the checkpoint from both
+/// (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) const PARAKEET_WEIGHT_DTYPE: DType = DType::F32;
+
+/// Parakeet's dtype override. On Metal, `f32` keeps every weight in F32 and
+/// `f16` stores the encoder projections in F16; see
+/// [`resolve_parakeet_projection_precision`].
+pub(crate) const PARAKEET_ASR_DTYPE_ENV: &str = "IZWI_PARAKEET_ASR_DTYPE";
+
+/// Whether the encoder's projection weights (FFN, attention q/k/v/out/pos,
+/// pointwise convs and the subsampling output projection) load in F16 on
+/// `device`: F16 when they do, F32 when every weight stays F32. The rest
+/// stays F32 as in whisper.cpp's Parakeet converter: subsampling convs,
+/// depthwise conv and BatchNorm, LayerNorms, biases, positional biases, and
+/// the TDT predictor and joint. Activations are F32 throughout. A failed
+/// load-time self-check still falls back to F32 ([`load_weight_only_f16`]).
+pub(crate) fn resolve_parakeet_projection_precision(device: &DeviceProfile) -> DTypeSelection {
+    let family = std::env::var(PARAKEET_ASR_DTYPE_ENV).ok();
+    device.resolve_metal_weight_only_f16(
+        family
+            .as_deref()
+            .map(|value| (PARAKEET_ASR_DTYPE_ENV, value)),
+    )
+}
+
+/// Whether checkpoint tensor `name` is one of the encoder projections that
+/// load in F16 when [`resolve_parakeet_projection_precision`] selects F16
+/// (their biases stay F32). Admission prices these at F16.
+pub(crate) fn parakeet_tensor_is_f16_projection(name: &str) -> bool {
+    let Some(encoder) = name.strip_prefix("encoder.") else {
+        return false;
+    };
+    if encoder == "pre_encode.out.weight" {
+        return true;
+    }
+    let Some((index, tail)) = encoder
+        .strip_prefix("layers.")
+        .and_then(|layer| layer.split_once('.'))
+    else {
+        return false;
+    };
+    index.parse::<usize>().is_ok()
+        && matches!(
+            tail,
+            "feed_forward1.linear1.weight"
+                | "feed_forward1.linear2.weight"
+                | "feed_forward2.linear1.weight"
+                | "feed_forward2.linear2.weight"
+                | "self_attn.linear_q.weight"
+                | "self_attn.linear_k.weight"
+                | "self_attn.linear_v.weight"
+                | "self_attn.linear_out.weight"
+                | "self_attn.linear_pos.weight"
+                | "conv.pointwise_conv1.weight"
+                | "conv.pointwise_conv2.weight"
+        )
+}
+
+/// The host-side builder for weights that load in F16: they are read on the
+/// CPU and converted there, so their F32 form never reaches the GPU.
+fn projection_vb<'a>(vb: &VarBuilder<'a>, f16: Option<&Device>) -> VarBuilder<'a> {
+    match f16 {
+        Some(_) => vb.clone().set_device(Device::Cpu),
+        None => vb.clone(),
+    }
+}
 
 const SAMPLE_RATE: u32 = 16_000;
-const ENCODER_LAYERS: usize = 24;
-const ENCODER_DIM: usize = 1024;
-const ENCODER_HEADS: usize = 8;
-const ENCODER_HEAD_DIM: usize = ENCODER_DIM / ENCODER_HEADS;
-const FF_DIM: usize = ENCODER_DIM * 4;
 const PRED_HIDDEN: usize = 640;
-const CONV_SUB_CHANNELS: usize = 256;
-const CONV_KERNEL_1D: usize = 9;
 const SUBSAMPLING_FACTOR: usize = 8;
 const FRAME_HOP_MS: f32 = 10.0;
 const DEFAULT_MAX_SYMBOLS: usize = 10;
+/// Seconds per encoder frame: 10 ms feature hop × 8× subsampling.
+const ENCODER_FRAME_SECONDS: f64 = FRAME_HOP_MS as f64 * SUBSAMPLING_FACTOR as f64 / 1000.0;
 pub(crate) const PARAKEET_RETAINED_PREFILL_STAGE: &str = "asr.prefill.parakeet.predictor";
 pub(crate) const PARAKEET_RETAINED_DECODE_STAGE: &str = "asr.decode.parakeet.joint";
 pub(crate) const PARAKEET_RETAINED_WORKSPACE_PER_ROW_BYTES: u64 = 16 * 1024 * 1024;
+
+/// FastConformer encoder geometry. `V3` is parakeet-tdt-0.6b-v3; tests build
+/// tiny random encoders from smaller values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderGeometry {
+    mel_bins: usize,
+    subsampling_channels: usize,
+    layers: usize,
+    dim: usize,
+    heads: usize,
+    ff_dim: usize,
+    conv_kernel: usize,
+}
+
+impl EncoderGeometry {
+    const V3: Self = Self {
+        mel_bins: 128,
+        subsampling_channels: 256,
+        layers: 24,
+        dim: 1024,
+        heads: 8,
+        ff_dim: 4096,
+        conv_kernel: 9,
+    };
+
+    const fn head_dim(self) -> usize {
+        self.dim / self.heads
+    }
+
+    /// Mel bins left after the three stride-2 subsampling convolutions.
+    fn subsampled_mel_bins(self) -> usize {
+        subsampled_len_3x(self.mel_bins)
+    }
+}
+
+/// Long audio is encoded in overlapping windows of encoder frames instead of
+/// one full-attention pass whose memory grows as T². Each window keeps only
+/// its centre, so every kept frame sees `left_context` frames before it and
+/// `right_context` after it unless it lies at the real start or end of the
+/// audio. One TDT decode then runs over the stitched frames, which keeps the
+/// predictor state and frame timestamps continuous across seams. This is
+/// NVIDIA's chunked-inference recipe for this model with simulated
+/// streaming (left/chunk/right buffers, one decode over concatenated outputs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderWindowing {
+    frames: usize,
+    left_context: usize,
+    right_context: usize,
+}
+
+impl EncoderWindowing {
+    /// 81.92 s windows with 10.24 s of context on each side, keeping 61.44 s.
+    /// A power-of-two window keeps Metal's pooled buffers exactly sized, and
+    /// 128 frames of context exceed the 96 frames over which 24 layers of
+    /// kernel-9 convolutions spread window-edge effects.
+    const V3: Self = Self {
+        frames: 1024,
+        left_context: 128,
+        right_context: 128,
+    };
+}
+
+/// One encoder window in encoder frames: `[start, end)` is encoded and
+/// `[keep_start, keep_end)` is copied into the stitched output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncoderWindow {
+    start: usize,
+    end: usize,
+    keep_start: usize,
+    keep_end: usize,
+}
+
+impl EncoderWindow {
+    /// The log-mel columns that produce this window's frames: whole groups
+    /// of the ×8 subsampling, clipped to the spectrogram. Stopping at
+    /// `8 · end` also drops the STFT padding column when the valid frames are
+    /// a multiple of 8, where it would add an encoder frame NeMo masks.
+    fn feature_columns(&self, feature_frames: usize) -> Range<usize> {
+        self.start * SUBSAMPLING_FACTOR..(self.end * SUBSAMPLING_FACTOR).min(feature_frames)
+    }
+}
+
+/// Plans windows of exactly `window` frames over `encoded_len` frames. The
+/// first window keeps `[0, window - right)`; each later one starts `left`
+/// frames before the previous kept range ends, and the last is shifted left
+/// to end at the audio's end. Inputs of at most `window` frames are a single
+/// window, which is the whole-utterance encode.
+fn plan_encoder_windows(
+    encoded_len: usize,
+    window: usize,
+    left: usize,
+    right: usize,
+) -> Result<Vec<EncoderWindow>> {
+    if encoded_len <= window {
+        return Ok((encoded_len > 0)
+            .then_some(EncoderWindow {
+                start: 0,
+                end: encoded_len,
+                keep_start: 0,
+                keep_end: encoded_len,
+            })
+            .into_iter()
+            .collect());
+    }
+    if window <= left.saturating_add(right) {
+        return Err(Error::InvalidInput(format!(
+            "Parakeet encoder window {window} leaves no centre between contexts {left} and {right}"
+        )));
+    }
+    let mut windows = Vec::with_capacity(encoded_len.div_ceil(window - left - right) + 1);
+    let mut keep_start = 0usize;
+    loop {
+        let start = keep_start.saturating_sub(left);
+        let end = start + window;
+        if end >= encoded_len {
+            windows.push(EncoderWindow {
+                start: encoded_len - window,
+                end: encoded_len,
+                keep_start,
+                keep_end: encoded_len,
+            });
+            return Ok(windows);
+        }
+        let keep_end = end - right;
+        windows.push(EncoderWindow {
+            start,
+            end,
+            keep_start,
+            keep_end,
+        });
+        keep_start = keep_end;
+    }
+}
+
+/// Peak preparation memory beyond the weights and the retained artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParakeetPreparationBytes {
+    /// Host log-mel pipeline: mono copy, pre-emphasis and padded copies,
+    /// power spectrum and log-mel.
+    pub(crate) host_bytes: u64,
+    /// One encoder window's peak: the first subsampling convolution and its
+    /// ReLU copy, the attention scores and `rel_shift` buffers, and the
+    /// per-frame activations of a layer.
+    pub(crate) window_bytes: u64,
+    /// The stitched `[1, E, D]` output, copied into the exact-size retained
+    /// artifact at the end.
+    pub(crate) output_bytes: u64,
+}
+
+impl ParakeetPreparationBytes {
+    pub(crate) fn device_bytes(self) -> Result<u64> {
+        self.window_bytes
+            .checked_add(self.output_bytes)
+            .ok_or_else(|| Error::Overloaded("Parakeet preparation bytes overflowed".into()))
+    }
+}
+
+/// Prices the windowed encode of `samples` 16 kHz samples. Windows bound
+/// the quadratic attention terms at `W` frames whatever the length; Metal
+/// pools round every buffer up to a power of two.
+pub(crate) fn parakeet_preparation_bytes(
+    samples: usize,
+    backend: BackendKind,
+) -> Result<ParakeetPreparationBytes> {
+    const F32_BYTES: u64 = 4;
+    const HOST_BYTES_PER_SAMPLE: u64 = 22;
+    // About six [T, ff_dim] activations are live inside a layer at once: the
+    // feed-forward block's linear, sigmoid and product, plus residual and
+    // convolution-module buffers (report 11 sizes them as 98,304·T bytes).
+    const LAYER_ACTIVATIONS: u64 = 6;
+    let geometry = EncoderGeometry::V3;
+    let overflow = || Error::Overloaded("Parakeet preparation bytes overflowed".into());
+    let round = |bytes: u64| -> Result<u64> {
+        if backend == BackendKind::Metal {
+            bytes.checked_next_power_of_two().ok_or_else(overflow)
+        } else {
+            Ok(bytes)
+        }
+    };
+    let as_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let valid_frames = preprocessor::valid_feature_frames(samples);
+    let encoded_len = as_u64(subsampled_len_3x(valid_frames))?;
+    // The STFT emits one padding frame past the valid ones.
+    let window = as_u64(subsampled_len_3x(valid_frames + 1).min(EncoderWindowing::V3.frames))?;
+    let (channels, mel_bins) = (
+        as_u64(geometry.subsampling_channels)?,
+        as_u64(geometry.mel_bins)?,
+    );
+    let (heads, dim, ff_dim) = (
+        as_u64(geometry.heads)?,
+        as_u64(geometry.dim)?,
+        as_u64(geometry.ff_dim)?,
+    );
+    let multiply = |values: &[u64]| {
+        values
+            .iter()
+            .try_fold(1u64, |product, value| product.checked_mul(*value))
+            .ok_or_else(overflow)
+    };
+    // conv0 output [channels, 8T/2, mels/2] and its ReLU copy.
+    let subsampling = multiply(&[2, channels, 4 * window, mel_bins / 2, F32_BYTES])?;
+    let scores = multiply(&[heads, window, window, F32_BYTES])?;
+    // q_v·pᵀ, its zero pad and the reshaped copy, each [H, T, 2T].
+    let rel_shift = multiply(&[heads, window, 2 * window, F32_BYTES])?;
+    let activation = multiply(&[window, ff_dim, F32_BYTES])?;
+    let window_bytes = [
+        round(subsampling)?,
+        round(scores)?,
+        multiply(&[3, round(rel_shift)?])?,
+        multiply(&[LAYER_ACTIVATIONS, round(activation)?])?,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+    .ok_or_else(overflow)?;
+    Ok(ParakeetPreparationBytes {
+        host_bytes: multiply(&[as_u64(samples)?, HOST_BYTES_PER_SAMPLE])?,
+        window_bytes,
+        output_bytes: round(multiply(&[encoded_len, dim, F32_BYTES])?)?,
+    })
+}
 
 pub struct ParakeetAsrTranscriptionOutput {
     pub text: String,
@@ -68,17 +364,13 @@ pub(crate) struct ParakeetPreparedEncoderArtifact {
     resampled_samples: usize,
     feature_frames: usize,
     language: Option<String>,
+    windowing: EncoderWindowing,
+    encoder_windows: usize,
+    log_mel_ms: f64,
+    encode_ms: f64,
 }
 
 impl ParakeetPreparedEncoderArtifact {
-    pub(crate) fn decode_budget(&self, max_symbols: usize) -> Result<usize> {
-        self.encoded_len
-            .checked_mul(max_symbols)
-            .and_then(|value| value.checked_mul(8))
-            .map(|value| value.max(1))
-            .ok_or_else(|| Error::Overloaded("Parakeet retained decode budget overflowed".into()))
-    }
-
     pub(crate) fn resident_tensor_bytes(&self) -> Result<u64> {
         let mut accounting = TensorStorageAccounting::default();
         accounting.add_tensor(&self.encoded).ok_or_else(|| {
@@ -86,10 +378,39 @@ impl ParakeetPreparedEncoderArtifact {
         })?;
         Ok(accounting.bytes())
     }
+}
 
-    pub(crate) const fn encoded_len(&self) -> usize {
-        self.encoded_len
+/// Encoder frames (E) the front end produces for `samples` at `sample_rate`:
+/// the same resampled length, `N / hop` valid feature frames and ×8
+/// subsampling the encoder itself uses, so preparation can size the decode
+/// before any audio is encoded.
+pub(crate) fn parakeet_encoded_len_for_samples(samples: usize, sample_rate: u32) -> usize {
+    let resampled = resampled_len(samples, sample_rate, SAMPLE_RATE);
+    subsampled_len_3x(preprocessor::valid_feature_frames(resampled))
+}
+
+/// Upper bound on the labels TDT greedy decoding can emit: at most
+/// `max_symbols` per encoder frame, so `E × max_symbols` bounds every
+/// transcript of this input.
+pub(crate) fn parakeet_max_emittable_tokens(
+    samples: usize,
+    sample_rate: u32,
+    max_symbols: usize,
+) -> Result<usize> {
+    if sample_rate == 0 {
+        return Err(Error::InvalidInput(
+            "Parakeet sample rate must be greater than zero".into(),
+        ));
     }
+    let encoded_len = parakeet_encoded_len_for_samples(samples, sample_rate);
+    if encoded_len == 0 {
+        return Err(Error::InvalidInput(
+            "Parakeet audio is shorter than one 80 ms encoder frame".into(),
+        ));
+    }
+    encoded_len
+        .checked_mul(max_symbols.max(1))
+        .ok_or_else(|| Error::Overloaded("Parakeet decode budget overflowed".into()))
 }
 
 #[derive(Clone)]
@@ -101,14 +422,20 @@ pub(crate) struct ParakeetRetainedDecodeState {
     emit_count_at_t: usize,
     guard_steps: usize,
     token_ids: Vec<usize>,
+    token_frames: Vec<TdtTokenFrame>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     counters: ParakeetDecodeCounters,
     finished: bool,
+    stop_reason: Option<&'static str>,
 }
 
 pub(crate) struct ParakeetRetainedDecodeBatchRow<'a> {
     pub(crate) artifact: &'a ParakeetPreparedEncoderArtifact,
     pub(crate) state: &'a mut ParakeetRetainedDecodeState,
+    /// The request's decode budget. The scheduler stops scheduling a row at
+    /// this many tokens, so the row must finish here rather than strand.
+    pub(crate) max_tokens: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +475,9 @@ struct ParakeetDecodeCounters {
     tdt_blank_steps: usize,
     host_argmax_reads: usize,
     device_argmax_scalar_reads: usize,
+    /// Tokens passed to the text decoder: O(emitted tokens) with the
+    /// incremental detokenizer.
+    detokenized_tokens: u64,
 }
 
 pub struct ParakeetAsrModel {
@@ -159,6 +489,8 @@ pub struct ParakeetAsrModel {
     blank_idx: usize,
     num_durations: usize,
     max_symbols: usize,
+    encoder_windowing: EncoderWindowing,
+    weight_precision: WeightOnlyF16Load,
 }
 
 enum ParakeetDecoder {
@@ -176,6 +508,103 @@ impl ParakeetDecoder {
             }
         }
     }
+
+    /// Whether the SentencePiece piece for `id` opens a word (`▁` prefix).
+    fn starts_word(&self, id: usize) -> bool {
+        match self {
+            Self::Vocab(vocab) => vocab.get(id).is_some_and(|piece| piece.starts_with('▁')),
+            Self::HfTokenizer(tokenizer) => u32::try_from(id)
+                .ok()
+                .and_then(|id| tokenizer.id_to_token(id))
+                .is_some_and(|piece| piece.starts_with('▁')),
+        }
+    }
+
+    /// Word timings in the `timestamp_words` shape the API reads, from each
+    /// emitted token's encoder frame and TDT duration.
+    fn timestamp_words(
+        &self,
+        token_ids: &[usize],
+        token_frames: &[TdtTokenFrame],
+    ) -> serde_json::Value {
+        let words = tdt_word_timestamps(
+            token_ids,
+            token_frames,
+            |id| self.starts_word(id),
+            |ids| self.decode(ids),
+        );
+        serde_json::Value::Array(
+            words
+                .into_iter()
+                .map(|word| {
+                    serde_json::json!({
+                        "word": word.text,
+                        "start_time_seconds": word.start_frame as f64 * ENCODER_FRAME_SECONDS,
+                        "end_time_seconds": word.end_frame as f64 * ENCODER_FRAME_SECONDS,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Where TDT emitted a token: the encoder frame the joint read and the
+/// duration (in frames) it predicted with the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TdtTokenFrame {
+    frame: usize,
+    duration: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TdtWordTimestamp {
+    text: String,
+    start_frame: usize,
+    end_frame: usize,
+}
+
+/// Group emitted tokens into words as NeMo does for TDT timestamps: a word
+/// starts at its first token's frame and ends at its last token's frame plus
+/// that token's duration. Punctuation-only words join the word before them.
+fn tdt_word_timestamps(
+    token_ids: &[usize],
+    token_frames: &[TdtTokenFrame],
+    starts_word: impl Fn(usize) -> bool,
+    decode: impl Fn(&[usize]) -> String,
+) -> Vec<TdtWordTimestamp> {
+    let count = token_ids.len().min(token_frames.len());
+    let mut words: Vec<TdtWordTimestamp> = Vec::new();
+    let mut start = 0usize;
+    for end in 1..=count {
+        if end < count && !starts_word(token_ids[end]) {
+            continue;
+        }
+        let group = start..end;
+        start = end;
+        let text = decode(&token_ids[group.clone()]).trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let start_frame = token_frames[group.start].frame;
+        let end_frame = token_frames[group]
+            .iter()
+            .map(|emission| emission.frame + emission.duration)
+            .max()
+            .unwrap_or(start_frame)
+            .max(start_frame);
+        match words.last_mut() {
+            Some(previous) if !text.chars().any(char::is_alphanumeric) => {
+                previous.text.push_str(&text);
+                previous.end_frame = previous.end_frame.max(end_frame);
+            }
+            _ => words.push(TdtWordTimestamp {
+                text,
+                start_frame,
+                end_frame,
+            }),
+        }
+    }
+    words
 }
 
 impl ParakeetAsrModel {
@@ -226,11 +655,19 @@ impl ParakeetAsrModel {
         physical::parakeet_physical_state_spec(stage_graphs)
     }
 
+    /// Labels TDT greedy decoding may emit per encoder frame.
+    pub(crate) const fn max_symbols_per_frame(&self) -> usize {
+        self.max_symbols
+    }
+
+    /// Encodes the audio into the artifact the retained decode reads.
+    /// `checkpoint` runs between encoder windows; its error aborts the encode.
     pub(crate) fn prepare_retained_encoder(
         &self,
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<ParakeetPreparedEncoderArtifact> {
         if audio.is_empty() {
             return Err(Error::InvalidInput("Empty audio input".into()));
@@ -240,33 +677,59 @@ impl ParakeetAsrModel {
                 "Parakeet sample rate must be greater than zero".into(),
             ));
         }
+        let log_mel_started = Instant::now();
         let mono = if sample_rate == SAMPLE_RATE {
             audio.to_vec()
         } else {
             resample_linear(audio, sample_rate, SAMPLE_RATE)
         };
-        let (features, feature_frames, _) = self
-            .preprocessor
-            .compute_features_with_upload_timing(&mono)?;
-        let mut timings = ParakeetTimings::default();
-        let (encoded, encoded_len) =
-            self.network
-                .encode_with_timings(&features, feature_frames, &mut timings)?;
-        if encoded_len == 0 {
-            return Err(Error::InferenceError(
-                "Parakeet encoder produced no decodable frames".into(),
-            ));
+        let resampled_samples = mono.len();
+        let log_mel = self.preprocessor.compute_log_mel(&mono)?;
+        drop(mono);
+        let log_mel_ms = elapsed_ms(log_mel_started);
+        let encode_started = Instant::now();
+        let encoded = self.encode_log_mel(&log_mel, &mut ParakeetTimings::default(), checkpoint)?;
+        let encode_ms = elapsed_ms(encode_started);
+        // Preparation sized the decode budget from the sample count alone.
+        let budgeted_len = parakeet_encoded_len_for_samples(audio.len(), sample_rate);
+        if encoded.encoded_len != budgeted_len {
+            return Err(Error::InferenceError(format!(
+                "Parakeet encoder produced {} frames but its decode budget assumed {budgeted_len}",
+                encoded.encoded_len
+            )));
         }
-        let encoded = encoded.narrow(1, 0, encoded_len)?;
         Ok(ParakeetPreparedEncoderArtifact {
-            encoded: deep_copy_tensor_storage(&encoded)?,
-            encoded_len,
+            encoded: deep_copy_tensor_storage(&encoded.encoded)?,
+            encoded_len: encoded.encoded_len,
             input_samples: audio.len(),
             input_sample_rate: sample_rate,
-            resampled_samples: mono.len(),
-            feature_frames,
+            resampled_samples,
+            feature_frames: log_mel.valid_frames(),
             language: language.map(ToOwned::to_owned),
+            windowing: self.encoder_windowing,
+            encoder_windows: encoded.windows,
+            log_mel_ms,
+            encode_ms,
         })
+    }
+
+    /// Runs the windowed encoder over a host log-mel, normalizing each
+    /// window's columns over that window as NVIDIA's chunked inference does.
+    fn encode_log_mel(
+        &self,
+        log_mel: &ParakeetLogMel,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let device = self.preprocessor.device();
+        self.network.encoder.encode_windows(
+            log_mel.frames(),
+            subsampled_len_3x(log_mel.valid_frames()),
+            self.encoder_windowing,
+            &mut |columns| log_mel.normalize_and_upload(columns, device),
+            timings,
+            checkpoint,
+        )
     }
 
     pub(crate) fn start_retained_decode(&self) -> Result<ParakeetRetainedDecodeState> {
@@ -300,9 +763,12 @@ impl ParakeetAsrModel {
                     emit_count_at_t: 0,
                     guard_steps: 0,
                     token_ids: Vec::new(),
+                    token_frames: Vec::new(),
+                    detokenizer: IncrementalDetokenizer::new(),
                     assembled: String::new(),
                     counters: ParakeetDecodeCounters::default(),
                     finished: false,
+                    stop_reason: None,
                 })
             })
             .collect()
@@ -394,21 +860,38 @@ impl ParakeetAsrModel {
         artifact: &ParakeetPreparedEncoderArtifact,
         state: &ParakeetRetainedDecodeState,
     ) -> ParakeetAsrTranscriptionOutput {
+        let mut diagnostics = serde_json::json!({
+            "input_samples": artifact.input_samples,
+            "input_sample_rate": artifact.input_sample_rate,
+            "resampled_samples": artifact.resampled_samples,
+            "feature_frames": artifact.feature_frames,
+            "encoded_frames": artifact.encoded_len,
+            "encoder_windows": artifact.encoder_windows,
+            "encoder_window_frames": artifact.windowing.frames,
+            "encoder_window_left_context": artifact.windowing.left_context,
+            "encoder_window_right_context": artifact.windowing.right_context,
+            "log_mel_ms": artifact.log_mel_ms,
+            "encode_ms": artifact.encode_ms,
+            "tdt_joint_steps": state.counters.tdt_joint_steps,
+            "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
+            "detokenized_tokens": state.counters.detokenized_tokens,
+            "tdt_blank_steps": state.counters.tdt_blank_steps,
+            "host_argmax_reads": state.counters.host_argmax_reads,
+            "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
+            "weight_precision": self.weight_precision.diagnostics(),
+        });
+        if let Some(stop_reason) = state.stop_reason {
+            diagnostics["stop_reason"] = stop_reason.into();
+        }
+        // The cursor runs over the whole windowed encoding, so frames are
+        // already offsets from the start of the audio.
+        diagnostics["timestamp_words"] = self
+            .decoder
+            .timestamp_words(&state.token_ids, &state.token_frames);
         ParakeetAsrTranscriptionOutput {
             text: state.assembled.clone(),
             language: artifact.language.clone(),
-            diagnostics: Some(serde_json::json!({
-                "input_samples": artifact.input_samples,
-                "input_sample_rate": artifact.input_sample_rate,
-                "resampled_samples": artifact.resampled_samples,
-                "feature_frames": artifact.feature_frames,
-                "encoded_frames": artifact.encoded_len,
-                "tdt_joint_steps": state.counters.tdt_joint_steps,
-                "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
-                "tdt_blank_steps": state.counters.tdt_blank_steps,
-                "host_argmax_reads": state.counters.host_argmax_reads,
-                "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
-            })),
+            diagnostics: Some(diagnostics),
         }
     }
 
@@ -452,19 +935,19 @@ impl ParakeetAsrModel {
                 let predictor = Tensor::cat(&predictor_rows, 0)?;
                 let logits = self.joint_batch_rows(&encoded, &predictor)?;
                 let (_, output_width) = logits.dims2()?;
+                let token_end = self.blank_idx + 1;
+                if output_width < token_end + self.num_durations {
+                    return Err(Error::InferenceError(
+                        "Parakeet retained joint output has invalid geometry".into(),
+                    ));
+                }
+                // One readback for every row's label and duration.
+                let selections =
+                    tdt_batch_labels_and_durations(&logits, token_end, self.num_durations)?;
                 let mut emitted = Vec::new();
                 for (index, row) in rows.iter_mut().enumerate() {
-                    let token_end = self.blank_idx + 1;
-                    if output_width < token_end + self.num_durations {
-                        return Err(Error::InferenceError(
-                            "Parakeet retained joint output has invalid geometry".into(),
-                        ));
-                    }
-                    let row_logits = logits.i(index)?;
-                    let label = argmax_1d(&row_logits.narrow(0, 0, token_end)?)?;
-                    let duration =
-                        argmax_1d(&row_logits.narrow(0, token_end, self.num_durations)?)?
-                            .min(self.num_durations.saturating_sub(1));
+                    let (label, duration) = selections[index];
+                    let duration = duration.min(self.num_durations.saturating_sub(1));
                     let mut jump = duration;
                     if label == self.blank_idx && jump == 0 {
                         jump = 1;
@@ -478,7 +961,7 @@ impl ParakeetAsrModel {
                         .state
                         .counters
                         .device_argmax_scalar_reads
-                        .saturating_add(2);
+                        .saturating_add(1);
                     if label == self.blank_idx {
                         row.state.counters.tdt_blank_steps =
                             row.state.counters.tdt_blank_steps.saturating_add(1);
@@ -495,6 +978,10 @@ impl ParakeetAsrModel {
                         continue;
                     }
                     row.state.token_ids.push(label);
+                    row.state.token_frames.push(TdtTokenFrame {
+                        frame: t_cur,
+                        duration,
+                    });
                     emitted.push((index, label));
                 }
                 if !emitted.is_empty() {
@@ -522,18 +1009,37 @@ impl ParakeetAsrModel {
                 }
                 let mut steps = Vec::with_capacity(rows.len());
                 for row in rows.iter_mut() {
-                    let previous = row.state.assembled.clone();
-                    row.state.assembled = self.decoder.decode(&row.state.token_ids);
-                    let delta = text_delta(&previous, &row.state.assembled);
+                    let mut delta = row
+                        .state
+                        .detokenizer
+                        .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
                     let guard_limit = row
                         .artifact
                         .encoded_len
                         .saturating_mul(self.max_symbols)
                         .saturating_mul(8)
                         .max(512);
-                    row.state.finished = row.state.t >= row.artifact.encoded_len
-                        || row.state.guard_steps >= guard_limit;
-                    row.state.counters.tdt_emitted_tokens = row.state.token_ids.len();
+                    let tokens = row.state.token_ids.len();
+                    // Every frame emitting `max_symbols` labels exhausts the
+                    // input as surely as the cursor passing its end does.
+                    let exhausted = row.state.t >= row.artifact.encoded_len
+                        || tokens >= row.artifact.encoded_len.saturating_mul(self.max_symbols);
+                    let budget_reached = !exhausted && tokens >= row.max_tokens.max(1);
+                    if budget_reached {
+                        row.state.stop_reason = Some("max_tokens");
+                    }
+                    row.state.finished =
+                        exhausted || budget_reached || row.state.guard_steps >= guard_limit;
+                    if row.state.finished {
+                        delta.push_str(
+                            &row.state
+                                .detokenizer
+                                .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
+                        );
+                    }
+                    row.state.assembled.push_str(&delta);
+                    row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
+                    row.state.counters.tdt_emitted_tokens = tokens;
                     steps.push(ParakeetRetainedDecodeStep {
                         delta,
                         text: row.state.assembled.clone(),
@@ -574,14 +1080,15 @@ impl ParakeetAsrModel {
         let (artifacts, decoder, vb) = if variant.is_parakeet_nemo() {
             let artifacts = ensure_parakeet_artifacts(model_dir, variant)?;
             let tokenizer_vocab = decode::load_tokenizer_vocab(&artifacts.tokenizer_vocab_path)?;
-            let vb = VarBuilder::from_pth(&artifacts.checkpoint_path, DType::F32, &device)
-                .map_err(|e| {
-                    Error::ModelLoadError(format!(
-                        "Failed to load Parakeet checkpoint {}: {}",
-                        artifacts.checkpoint_path.display(),
-                        e
-                    ))
-                })?;
+            let vb =
+                VarBuilder::from_pth(&artifacts.checkpoint_path, PARAKEET_WEIGHT_DTYPE, &device)
+                    .map_err(|e| {
+                        Error::ModelLoadError(format!(
+                            "Failed to load Parakeet checkpoint {}: {}",
+                            artifacts.checkpoint_path.display(),
+                            e
+                        ))
+                    })?;
             (Some(artifacts), ParakeetDecoder::Vocab(tokenizer_vocab), vb)
         } else if variant.is_parakeet_mlx() {
             let weights_path = model_dir.join("model.safetensors");
@@ -606,7 +1113,17 @@ impl ParakeetAsrModel {
         };
 
         let preprocessor = ParakeetPreprocessor::load(&vb, model_dir)?;
-        let network = ParakeetNetwork::load(&vb)?;
+        let projection_precision = resolve_parakeet_projection_precision(&device_profile);
+        let (network, weight_precision) = ParakeetNetwork::load(&vb, projection_precision)?;
+        tracing::info!(
+            "Parakeet encoder projections load in {}: {}",
+            if weight_precision.projections_f16 {
+                "F16"
+            } else {
+                "F32"
+            },
+            weight_precision.reason
+        );
 
         let blank_idx = network.blank_idx;
         let num_durations = network.num_durations;
@@ -620,6 +1137,8 @@ impl ParakeetAsrModel {
             blank_idx,
             num_durations,
             max_symbols: DEFAULT_MAX_SYMBOLS,
+            encoder_windowing: EncoderWindowing::V3,
+            weight_precision,
         })
     }
 
@@ -746,29 +1265,35 @@ impl ParakeetAsrModel {
         timings.resample_ms = elapsed_ms(resample_started);
 
         let feature_started = Instant::now();
-        let (features, feature_frames, feature_upload_ms) = self
-            .preprocessor
-            .compute_features_with_upload_timing(&mono_16khz)?;
-        let feature_prepare_ms = elapsed_ms(feature_started);
-        timings.feature_upload_ms = feature_upload_ms;
-        timings.feature_extract_ms = (feature_prepare_ms - feature_upload_ms).max(0.0);
+        let log_mel = self.preprocessor.compute_log_mel(&mono_16khz)?;
+        let feature_frames = log_mel.valid_frames();
+        timings.feature_extract_ms = elapsed_ms(feature_started);
 
-        let (encoded, encoded_len) =
-            self.network
-                .encode_with_timings(&features, feature_frames, &mut timings)?;
+        let ParakeetEncoded {
+            encoded,
+            encoded_len,
+            windows: encoder_windows,
+        } = self.encode_log_mel(&log_mel, &mut timings, &|| Ok(()))?;
+        drop(log_mel);
 
         let mut token_ids = Vec::<usize>::new();
+        let mut token_frames = Vec::<TdtTokenFrame>::new();
         let mut assembled = String::new();
         let mut decode_counters = ParakeetDecodeCounters::default();
+        let mut detokenizer = IncrementalDetokenizer::new();
+        let decode_text = |ids: &[usize]| -> Result<String> { Ok(self.decoder.decode(ids)) };
 
-        let mut on_token = |token_id: usize| {
+        let mut on_token = |token_id: usize, emission: TdtTokenFrame| {
             token_ids.push(token_id);
-            let decoded = self.decoder.decode(&token_ids);
-            let delta = text_delta(&assembled, &decoded);
+            token_frames.push(emission);
+            // The decoder is infallible, so a step cannot fail.
+            let delta = detokenizer
+                .step(&token_ids, decode_text)
+                .unwrap_or_default();
             if !delta.is_empty() {
                 on_delta(delta.as_str());
+                assembled.push_str(&delta);
             }
-            assembled = decoded;
         };
 
         let decode_started = Instant::now();
@@ -795,16 +1320,22 @@ impl ParakeetAsrModel {
         }
         timings.tdt_decode_ms = elapsed_ms(decode_started);
 
-        if assembled.is_empty() {
-            assembled = self.decoder.decode(&token_ids);
+        let held_back = detokenizer.finish(&token_ids, decode_text)?;
+        if !held_back.is_empty() {
+            on_delta(held_back.as_str());
+            assembled.push_str(&held_back);
         }
 
+        decode_counters.detokenized_tokens = detokenizer.decoded_tokens();
         decode_counters.tdt_emitted_tokens = token_ids.len();
         timings.model_total_ms = elapsed_ms(model_started);
 
-        let diagnostics = parakeet_diagnostics_json(
+        let mut diagnostics = parakeet_diagnostics_json(
             &self.variant,
-            &features,
+            self.preprocessor.device(),
+            self.network.encoder.geometry,
+            self.encoder_windowing,
+            encoder_windows,
             &timings,
             &decode_counters,
             sample_rate,
@@ -815,6 +1346,8 @@ impl ParakeetAsrModel {
             language,
             self.max_symbols,
         );
+        diagnostics["timestamp_words"] = self.decoder.timestamp_words(&token_ids, &token_frames);
+        diagnostics["execution"]["weight_precision"] = self.weight_precision.diagnostics();
 
         Ok(ParakeetAsrTranscriptionOutput {
             text: assembled,
@@ -851,7 +1384,10 @@ fn select_device_for_parakeet(device_profile: &DeviceProfile) -> Device {
 
 fn parakeet_diagnostics_json(
     variant: &ModelVariant,
-    features: &Tensor,
+    device: &Device,
+    geometry: EncoderGeometry,
+    windowing: EncoderWindowing,
+    encoder_windows: usize,
     timings: &ParakeetTimings,
     decode: &ParakeetDecodeCounters,
     input_sample_rate: u32,
@@ -885,22 +1421,28 @@ fn parakeet_diagnostics_json(
             "tdt_blank_steps": decode.tdt_blank_steps,
             "host_argmax_reads": decode.host_argmax_reads,
             "device_argmax_scalar_reads": decode.device_argmax_scalar_reads,
+            "detokenized_tokens": decode.detokenized_tokens,
             "generated_tokens": decode.tdt_emitted_tokens,
             "max_symbols_per_frame": max_symbols,
         },
         "execution": {
-            "device_kind": parakeet_device_kind(features.device()),
-            "encoder_layers": ENCODER_LAYERS,
-            "encoder_dim": ENCODER_DIM,
-            "encoder_heads": ENCODER_HEADS,
-            "encoder_head_dim": ENCODER_HEAD_DIM,
-            "conformer_conv_kernel": CONV_KERNEL_1D,
-            "depthwise_conv1d_groups": ENCODER_DIM,
-            "subsampling_channels": CONV_SUB_CHANNELS,
-            "metal_softmax_last_dim": features.device().is_metal(),
-            "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(features.device()),
-            "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(features.device()),
-            "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(features.device()),
+            "device_kind": parakeet_device_kind(device),
+            "encoder_layers": geometry.layers,
+            "encoder_dim": geometry.dim,
+            "encoder_heads": geometry.heads,
+            "encoder_head_dim": geometry.head_dim(),
+            "conformer_conv_kernel": geometry.conv_kernel,
+            "depthwise_conv1d_groups": geometry.dim,
+            "subsampling_channels": geometry.subsampling_channels,
+            "encoder_windows": encoder_windows,
+            "encoder_window_frames": windowing.frames,
+            "encoder_window_left_context": windowing.left_context,
+            "encoder_window_right_context": windowing.right_context,
+            "metal_softmax_last_dim": device.is_metal(),
+            "metal_depthwise_conv1d": metal_kernels::depthwise_conv1d_enabled_for_device(device),
+            "metal_depthwise_conv2d": metal_kernels::depthwise_conv2d_enabled_for_device(device),
+            "conformer_conv_fused": metal_kernels::depthwise_conv1d_bias_swish_enabled_for_device(device),
+            "shared_depthwise_conv1d_calls_total": crate::kernels::depthwise_conv::depthwise_conv1d_calls(),
         },
         "timings_ms": {
             "resample": timings.resample_ms,
@@ -934,8 +1476,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 }
 
 struct ParakeetNetwork {
-    pre_encode: ConvSubsamplingDw,
-    layers: Vec<ConformerLayer>,
+    encoder: ParakeetEncoder,
     predictor: Predictor,
     joint: Joint,
     blank_idx: usize,
@@ -943,59 +1484,35 @@ struct ParakeetNetwork {
 }
 
 impl ParakeetNetwork {
-    fn load(vb: &VarBuilder) -> Result<Self> {
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("encoder.pre_encode"))?;
-
-        let mut layers = Vec::with_capacity(ENCODER_LAYERS);
-        for idx in 0..ENCODER_LAYERS {
-            layers.push(ConformerLayer::load(
-                vb.pp(format!("encoder.layers.{idx}")),
-            )?);
-        }
-
+    fn load(
+        vb: &VarBuilder,
+        projection_precision: DTypeSelection,
+    ) -> Result<(Self, WeightOnlyF16Load)> {
+        let (encoder, weight_precision) = ParakeetEncoder::load_with_precision(
+            vb.pp("encoder"),
+            EncoderGeometry::V3,
+            projection_precision,
+        )?;
         let predictor = Predictor::load(vb.pp("decoder.prediction"))?;
-        let joint = Joint::load(vb.pp("joint"), ENCODER_DIM, predictor.blank_idx + 1)?;
+        let joint = Joint::load(
+            vb.pp("joint"),
+            encoder.geometry.dim,
+            predictor.blank_idx + 1,
+        )?;
 
         let blank_idx = predictor.blank_idx;
         let num_durations = joint.num_durations;
 
-        Ok(Self {
-            pre_encode,
-            layers,
-            predictor,
-            joint,
-            blank_idx,
-            num_durations,
-        })
-    }
-
-    fn encode(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
-        let mut timings = ParakeetTimings::default();
-        self.encode_with_timings(features, feature_frames, &mut timings)
-    }
-
-    fn encode_with_timings(
-        &self,
-        features: &Tensor,
-        feature_frames: usize,
-        timings: &mut ParakeetTimings,
-    ) -> Result<(Tensor, usize)> {
-        let pre_encode_started = Instant::now();
-        let (mut x, encoded_len) = self.pre_encode.forward(features, feature_frames)?;
-        timings.pre_encode_ms = elapsed_ms(pre_encode_started);
-
-        let pos_started = Instant::now();
-        let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, ENCODER_DIM, x.device())?;
-        timings.pos_emb_ms = elapsed_ms(pos_started);
-
-        let layers_started = Instant::now();
-        for layer in &self.layers {
-            x = layer.forward(&x, &pos_emb)?;
-        }
-        timings.encoder_layers_ms = elapsed_ms(layers_started);
-
-        Ok((x, encoded_len))
+        Ok((
+            Self {
+                encoder,
+                predictor,
+                joint,
+                blank_idx,
+                num_durations,
+            },
+            weight_precision,
+        ))
     }
 
     fn decode_tdt_greedy(
@@ -1006,7 +1523,7 @@ impl ParakeetNetwork {
         num_durations: usize,
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?; // [T, D]
 
@@ -1040,7 +1557,7 @@ impl ParakeetNetwork {
         max_symbols: usize,
         counters: &mut ParakeetDecodeCounters,
         predictor_state: &mut InvocationTensorLease,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let encoded = encoded.i((0, ..encoded_len, ..))?;
         let predictor_out =
@@ -1073,7 +1590,7 @@ impl ParakeetNetwork {
         counters: &mut ParakeetDecodeCounters,
         mut predictor_out: Tensor,
         mut predictor_step: impl FnMut(usize) -> Result<Tensor>,
-        on_token: &mut dyn FnMut(usize),
+        on_token: &mut dyn FnMut(usize, TdtTokenFrame),
     ) -> Result<()> {
         let mut t = 0usize;
         let mut last_emit_t = usize::MAX;
@@ -1088,6 +1605,8 @@ impl ParakeetNetwork {
             guard_steps += 1;
 
             let t_cur = t;
+            // Frame the joint read when it produced `label`.
+            let mut frame = t_cur;
             let enc_t = encoded.i((t_cur, ..))?.unsqueeze(0)?.unsqueeze(0)?; // [1,1,D]
             let logits = self
                 .joint
@@ -1096,14 +1615,10 @@ impl ParakeetNetwork {
                 .squeeze(0)?
                 .squeeze(0)?; // [V + 1 + num_durations]
 
-            let token_logits = logits.i(..(blank_idx + 1))?;
-            let duration_logits = logits.i((blank_idx + 1)..)?;
-
             counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
             counters.device_argmax_scalar_reads =
-                counters.device_argmax_scalar_reads.saturating_add(2);
-            let mut label = argmax_1d(&token_logits)?;
-            let duration_idx = argmax_1d(&duration_logits)?;
+                counters.device_argmax_scalar_reads.saturating_add(1);
+            let (mut label, duration_idx) = tdt_label_and_duration(&logits, blank_idx + 1)?;
             let mut jump = duration_idx.min(num_durations.saturating_sub(1));
 
             if label == blank_idx && jump == 0 {
@@ -1114,6 +1629,7 @@ impl ParakeetNetwork {
 
             while label == blank_idx && t < encoded_len {
                 counters.tdt_blank_steps = counters.tdt_blank_steps.saturating_add(1);
+                frame = t;
                 let enc_t = encoded.i((t, ..))?.unsqueeze(0)?.unsqueeze(0)?;
                 let logits = self
                     .joint
@@ -1122,14 +1638,11 @@ impl ParakeetNetwork {
                     .squeeze(0)?
                     .squeeze(0)?;
 
-                let token_logits = logits.i(..(blank_idx + 1))?;
-                let duration_logits = logits.i((blank_idx + 1)..)?;
-
                 counters.tdt_joint_steps = counters.tdt_joint_steps.saturating_add(1);
                 counters.device_argmax_scalar_reads =
-                    counters.device_argmax_scalar_reads.saturating_add(2);
-                label = argmax_1d(&token_logits)?;
-                let duration_idx = argmax_1d(&duration_logits)?;
+                    counters.device_argmax_scalar_reads.saturating_add(1);
+                let duration_idx;
+                (label, duration_idx) = tdt_label_and_duration(&logits, blank_idx + 1)?;
                 jump = duration_idx.min(num_durations.saturating_sub(1));
 
                 if label == blank_idx && jump == 0 {
@@ -1155,7 +1668,13 @@ impl ParakeetNetwork {
                 continue;
             }
 
-            on_token(label);
+            on_token(
+                label,
+                TdtTokenFrame {
+                    frame,
+                    duration: jump,
+                },
+            );
             predictor_out = predictor_step(label)?;
         }
 
@@ -1163,16 +1682,182 @@ impl ParakeetNetwork {
     }
 }
 
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
+struct ParakeetEncoder {
+    geometry: EncoderGeometry,
+    pre_encode: ConvSubsamplingDw,
+    layers: Vec<ConformerLayer>,
+}
+
+impl ParakeetEncoder {
+    /// Loads the encoder with its projections in F16 on `f16` when given.
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), geometry, f16)?;
+        let layers = (0..geometry.layers)
+            .map(|idx| ConformerLayer::load(vb.pp(format!("layers.{idx}")), geometry, f16))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            geometry,
+            pre_encode,
+            layers,
+        })
     }
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current.chars().skip(common).collect()
+
+    /// Loads the encoder at `precision` (F16 = weight-only F16 projections),
+    /// keeping F16 only if [`Self::weight_only_f16_self_check`] passes.
+    fn load_with_precision(
+        vb: VarBuilder,
+        geometry: EncoderGeometry,
+        precision: DTypeSelection,
+    ) -> Result<(Self, WeightOnlyF16Load)> {
+        load_weight_only_f16(
+            "Parakeet",
+            &precision,
+            &vb.device().clone(),
+            |f16| Self::load(vb.clone(), geometry, f16),
+            |encoder| encoder.weight_only_f16_self_check(&vb),
+        )
+    }
+
+    /// Checks the F16 conversion against the original F32 weight of the first
+    /// FFN projection, then runs the encoder on xorshift log-mel features and
+    /// requires the subsampling output and every layer output to be finite and
+    /// inside the F16-safe range.
+    fn weight_only_f16_self_check(&self, vb: &VarBuilder) -> NumericSelfCheckReport {
+        run_numeric_self_check("Parakeet weight-only F16", F16_SAFE_MAX_ABS, || {
+            let geometry = self.geometry;
+            let layer0 = self
+                .layers
+                .first()
+                .ok_or_else(|| Error::ModelLoadError("Parakeet encoder has no layers".into()))?;
+            if let Some(converted) = layer0.ff1.linear1.as_f16() {
+                let original = mlx::load_linear_no_bias(
+                    geometry.dim,
+                    geometry.ff_dim,
+                    projection_vb(vb, Some(&Device::Cpu)).pp("layers.0.feed_forward1.linear1"),
+                )?;
+                let relative = converted.check_against(original.weight(), None, 8)?;
+                if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+                    return Err(Error::ModelLoadError(format!(
+                        "layers.0.feed_forward1.linear1 in F16 differs from its F32 weights by relative L2 {relative:.3e}"
+                    )));
+                }
+            }
+            let device = vb.device();
+            let features = xorshift_tensor(&[1, geometry.mel_bins, 64], 0xA5A5, 2.0, device)?;
+            let mut x = self.pre_encode.forward(&features)?;
+            let mut outputs = vec![("pre_encode".to_string(), x.clone())];
+            let pos = build_rel_positional_embedding(x.dim(1)?, geometry.dim, device)?;
+            for (index, layer) in self.layers.iter().enumerate() {
+                x = layer.forward(&x, &pos)?;
+                outputs.push((format!("layers.{index}"), x.clone()));
+            }
+            Ok::<_, Error>(outputs)
+        })
+    }
+
+    /// Encodes `encoded_len` frames window by window (see
+    /// [`EncoderWindowing`]). `window_features` returns the
+    /// `[1, mel_bins, columns]` features of a log-mel column range, and
+    /// `checkpoint` runs before every window so a cancelled or expired
+    /// request stops within one window.
+    fn encode_windows(
+        &self,
+        feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_features: &mut dyn FnMut(Range<usize>) -> Result<Tensor>,
+        timings: &mut ParakeetTimings,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        let plan = plan_encoder_windows(
+            encoded_len,
+            windowing.frames,
+            windowing.left_context,
+            windowing.right_context,
+        )?;
+        if plan.is_empty() {
+            return Err(Error::InferenceError(
+                "Parakeet encoder produced no decodable frames".into(),
+            ));
+        }
+        let mut stitched: Option<Tensor> = None;
+        let mut pos_emb: Option<Tensor> = None;
+        for window in &plan {
+            checkpoint()?;
+            let upload_started = Instant::now();
+            let features = window_features(window.feature_columns(feature_frames))?;
+            timings.feature_upload_ms += elapsed_ms(upload_started);
+
+            let frames = window.end - window.start;
+            let pre_encode_started = Instant::now();
+            let x = self.pre_encode.forward(&features)?;
+            drop(features);
+            if x.dim(1)? < frames {
+                return Err(Error::InferenceError(format!(
+                    "Parakeet window produced {} encoder frames, expected {frames}",
+                    x.dim(1)?
+                )));
+            }
+            // Attention must see only this window's frames, never one made
+            // purely of STFT padding.
+            let mut x = x.narrow(1, 0, frames)?;
+            timings.pre_encode_ms += elapsed_ms(pre_encode_started);
+
+            // Relative positions depend only on i - j, so one embedding of
+            // the window length serves every window.
+            let pos_started = Instant::now();
+            let pos = match pos_emb.take() {
+                Some(pos) if pos.dim(1)? == 2 * frames - 1 => pos,
+                _ => build_rel_positional_embedding(frames, self.geometry.dim, x.device())?,
+            };
+            timings.pos_emb_ms += elapsed_ms(pos_started);
+
+            let layers_started = Instant::now();
+            for layer in &self.layers {
+                x = layer.forward(&x, &pos)?;
+            }
+            timings.encoder_layers_ms += elapsed_ms(layers_started);
+            pos_emb = Some(pos);
+
+            if plan.len() == 1 {
+                return Ok(ParakeetEncoded {
+                    encoded: x,
+                    encoded_len,
+                    windows: 1,
+                });
+            }
+            let output = match stitched.take() {
+                Some(output) => output,
+                None => Tensor::zeros((1, encoded_len, self.geometry.dim), x.dtype(), x.device())?,
+            };
+            // Copy the kept frames: a narrowed view would keep the whole
+            // window's buffer alive until the end of the encode.
+            let kept = x.narrow(
+                1,
+                window.keep_start - window.start,
+                window.keep_end - window.keep_start,
+            )?;
+            output.slice_set(&kept, 1, window.keep_start)?;
+            drop((kept, x));
+            // Metal returns pooled buffers only at a synchronization point.
+            output.device().synchronize()?;
+            stitched = Some(output);
+        }
+        Ok(ParakeetEncoded {
+            encoded: stitched.ok_or_else(|| {
+                Error::InferenceError("Parakeet windowed encode stitched no frames".into())
+            })?,
+            encoded_len,
+            windows: plan.len(),
+        })
+    }
+}
+
+/// The stitched `[1, E, D]` encoder output.
+struct ParakeetEncoded {
+    encoded: Tensor,
+    encoded_len: usize,
+    windows: usize,
 }
 
 struct ConvSubsamplingDw {
@@ -1181,11 +1866,12 @@ struct ConvSubsamplingDw {
     conv3: Conv2d,
     conv5: Conv2d,
     conv6: Conv2d,
-    out: Linear,
+    out: ProjectionLinear,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let channels = geometry.subsampling_channels;
         let stride_cfg = Conv2dConfig {
             stride: 2,
             padding: 1,
@@ -1197,30 +1883,25 @@ impl ConvSubsamplingDw {
             ..Default::default()
         };
 
-        let conv0 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, stride_cfg, vb.pp("conv.0"))?;
+        let conv0 = mlx::load_conv2d(1, channels, 3, stride_cfg, vb.pp("conv.0"))?;
 
         let mut dw_stride_cfg = stride_cfg;
-        dw_stride_cfg.groups = CONV_SUB_CHANNELS;
+        dw_stride_cfg.groups = channels;
         // Depthwise conv tensors are shaped [out_channels, in_channels/groups, k, k].
         // For groups=channels this second dimension is 1.
-        let conv2 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, dw_stride_cfg, vb.pp("conv.2"))?;
-        let conv3 = mlx::load_conv2d(
-            CONV_SUB_CHANNELS,
-            CONV_SUB_CHANNELS,
-            1,
-            point_cfg,
-            vb.pp("conv.3"),
-        )?;
-        let conv5 = mlx::load_conv2d(1, CONV_SUB_CHANNELS, 3, dw_stride_cfg, vb.pp("conv.5"))?;
-        let conv6 = mlx::load_conv2d(
-            CONV_SUB_CHANNELS,
-            CONV_SUB_CHANNELS,
-            1,
-            point_cfg,
-            vb.pp("conv.6"),
-        )?;
+        let conv2 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.2"))?;
+        let conv3 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.3"))?;
+        let conv5 = mlx::load_conv2d(1, channels, 3, dw_stride_cfg, vb.pp("conv.5"))?;
+        let conv6 = mlx::load_conv2d(channels, channels, 1, point_cfg, vb.pp("conv.6"))?;
 
-        let out = mlx::load_linear(CONV_SUB_CHANNELS * 16, ENCODER_DIM, vb.pp("out"))?;
+        let out = ProjectionLinear::new(
+            mlx::load_linear(
+                channels * geometry.subsampled_mel_bins(),
+                geometry.dim,
+                projection_vb(&vb, f16).pp("out"),
+            )?,
+            f16,
+        )?;
 
         Ok(Self {
             conv0,
@@ -1232,7 +1913,7 @@ impl ConvSubsamplingDw {
         })
     }
 
-    fn forward(&self, features: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
+    fn forward(&self, features: &Tensor) -> Result<Tensor> {
         // Input features are [B=1, MELS, T]. Convert to [B, 1, T, MELS]
         let mut x = features.transpose(1, 2)?.unsqueeze(1)?;
 
@@ -1248,15 +1929,10 @@ impl ConvSubsamplingDw {
         x = x.relu()?;
 
         let (b, c, t, f) = x.dims4()?;
-        let x = x
-            .transpose(1, 2)?
+        x.transpose(1, 2)?
             .reshape((b, t, c * f))?
-            .apply(&self.out)?;
-
-        // Padding in the frontend/STFT path can slightly overestimate lengths.
-        // Clamp to the actual encoder time dimension to keep positional shapes valid.
-        let encoded_len = subsampled_len_3x(feature_frames).min(t);
-        Ok((x, encoded_len))
+            .apply(&self.out)
+            .map_err(Error::from)
     }
 }
 
@@ -1299,20 +1975,21 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let norm_ff1 = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward1"))?;
-        let ff1 = FeedForward::load(vb.pp("feed_forward1"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let dim = geometry.dim;
+        let norm_ff1 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward1"))?;
+        let ff1 = FeedForward::load(vb.pp("feed_forward1"), geometry, f16)?;
 
-        let norm_self_att = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_self_att"))?;
-        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"))?;
+        let norm_self_att = layer_norm(dim, 1e-5, vb.pp("norm_self_att"))?;
+        let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), geometry, f16)?;
 
-        let norm_conv = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"))?;
+        let norm_conv = layer_norm(dim, 1e-5, vb.pp("norm_conv"))?;
+        let conv = ConformerConv::load(vb.pp("conv"), geometry, f16)?;
 
-        let norm_ff2 = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_feed_forward2"))?;
-        let ff2 = FeedForward::load(vb.pp("feed_forward2"))?;
+        let norm_ff2 = layer_norm(dim, 1e-5, vb.pp("norm_feed_forward2"))?;
+        let ff2 = FeedForward::load(vb.pp("feed_forward2"), geometry, f16)?;
 
-        let norm_out = layer_norm(ENCODER_DIM, 1e-5, vb.pp("norm_out"))?;
+        let norm_out = layer_norm(dim, 1e-5, vb.pp("norm_out"))?;
 
         Ok(Self {
             norm_ff1,
@@ -1351,14 +2028,21 @@ impl ConformerLayer {
 }
 
 struct FeedForward {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: ProjectionLinear,
+    linear2: ProjectionLinear,
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let linear1 = mlx::load_linear_no_bias(ENCODER_DIM, FF_DIM, vb.pp("linear1"))?;
-        let linear2 = mlx::load_linear_no_bias(FF_DIM, ENCODER_DIM, vb.pp("linear2"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let vb = projection_vb(&vb, f16);
+        let linear1 = ProjectionLinear::new(
+            mlx::load_linear_no_bias(geometry.dim, geometry.ff_dim, vb.pp("linear1"))?,
+            f16,
+        )?;
+        let linear2 = ProjectionLinear::new(
+            mlx::load_linear_no_bias(geometry.ff_dim, geometry.dim, vb.pp("linear2"))?,
+            f16,
+        )?;
         Ok(Self { linear1, linear2 })
     }
 
@@ -1372,49 +2056,59 @@ impl FeedForward {
 }
 
 struct ConformerConv {
-    pointwise_conv1: Conv1d,
+    dim: usize,
+    pointwise_conv1: PointwiseConv1d,
     depthwise_conv: Conv1d,
     folded_depthwise_weight: Tensor,
     folded_depthwise_bias: Tensor,
     batch_norm: candle_nn::BatchNorm,
-    pointwise_conv2: Conv1d,
+    pointwise_conv2: PointwiseConv1d,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let pointwise_conv1 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM * 2,
-            1,
-            Conv1dConfig::default(),
-            vb.pp("pointwise_conv1"),
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let dim = geometry.dim;
+        let pointwise_vb = projection_vb(&vb, f16);
+        let pointwise_conv1 = PointwiseConv1d::new(
+            mlx::load_conv1d_no_bias(
+                dim,
+                dim * 2,
+                1,
+                Conv1dConfig::default(),
+                pointwise_vb.pp("pointwise_conv1"),
+            )?,
+            f16,
         )?;
 
         let depthwise_conv = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM,
-            CONV_KERNEL_1D,
+            dim,
+            dim,
+            geometry.conv_kernel,
             Conv1dConfig {
-                padding: (CONV_KERNEL_1D - 1) / 2,
-                groups: ENCODER_DIM,
+                padding: (geometry.conv_kernel - 1) / 2,
+                groups: dim,
                 ..Default::default()
             },
             vb.pp("depthwise_conv"),
         )?;
 
-        let batch_norm = batch_norm(ENCODER_DIM, 1e-5, vb.pp("batch_norm"))?;
+        let batch_norm = batch_norm(dim, 1e-5, vb.pp("batch_norm"))?;
         let (folded_depthwise_weight, folded_depthwise_bias) =
             fold_depthwise_conv1d_batch_norm(&depthwise_conv, &batch_norm)?;
 
-        let pointwise_conv2 = mlx::load_conv1d_no_bias(
-            ENCODER_DIM,
-            ENCODER_DIM,
-            1,
-            Conv1dConfig::default(),
-            vb.pp("pointwise_conv2"),
+        let pointwise_conv2 = PointwiseConv1d::new(
+            mlx::load_conv1d_no_bias(
+                dim,
+                dim,
+                1,
+                Conv1dConfig::default(),
+                pointwise_vb.pp("pointwise_conv2"),
+            )?,
+            f16,
         )?;
 
         Ok(Self {
+            dim,
             pointwise_conv1,
             depthwise_conv,
             folded_depthwise_weight,
@@ -1429,8 +2123,8 @@ impl ConformerConv {
         let mut x = x.transpose(1, 2)?;
 
         x = self.pointwise_conv1.forward(&x)?;
-        let x_a = x.i((.., ..ENCODER_DIM, ..))?;
-        let x_b = x.i((.., ENCODER_DIM.., ..))?;
+        let x_a = x.i((.., ..self.dim, ..))?;
+        let x_b = x.i((.., self.dim.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
         if let Some(fused) = metal_kernels::try_depthwise_conv1d_bias_swish(
@@ -1443,18 +2137,25 @@ impl ConformerConv {
         ) {
             x = fused;
         } else {
-            x = if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
+            let cfg = self.depthwise_conv.config();
+            if let Some(depthwise) = metal_kernels::try_depthwise_conv1d(
                 &x,
                 self.depthwise_conv.weight(),
-                self.depthwise_conv.config().padding,
-                self.depthwise_conv.config().stride,
-                self.depthwise_conv.config().dilation,
+                cfg.padding,
+                cfg.stride,
+                cfg.dilation,
             ) {
-                depthwise
+                x = self.batch_norm.forward_t(&depthwise, false)?;
             } else {
-                self.depthwise_conv.forward(&x)?
-            };
-            x = self.batch_norm.forward_t(&x, false)?;
+                // Non-Metal: shared shift-and-accumulate op with the folded
+                // BatchNorm instead of Candle's per-channel grouped conv.
+                x = depthwise_conv1d(
+                    &x,
+                    &self.folded_depthwise_weight,
+                    Some(&self.folded_depthwise_bias),
+                    DepthwiseConv1dSpec::symmetric(cfg.padding).with_dilation(cfg.dilation),
+                )?;
+            }
             x = swish(&x)?;
         }
         x = self.pointwise_conv2.forward(&x)?;
@@ -1490,28 +2191,42 @@ fn fold_depthwise_conv1d_batch_norm(
 }
 
 struct RelPosSelfAttention {
-    linear_q: Linear,
-    linear_k: Linear,
-    linear_v: Linear,
-    linear_out: Linear,
-    linear_pos: Linear,
+    heads: usize,
+    head_dim: usize,
+    linear_q: ProjectionLinear,
+    linear_k: ProjectionLinear,
+    linear_v: ProjectionLinear,
+    linear_out: ProjectionLinear,
+    linear_pos: ProjectionLinear,
     pos_bias_u: Tensor,
     pos_bias_v: Tensor,
 }
 
 impl RelPosSelfAttention {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let linear_q = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_q"))?;
-        let linear_k = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_k"))?;
-        let linear_v = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_v"))?;
-        let linear_out = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_out"))?;
-        let linear_pos = mlx::load_linear_no_bias(ENCODER_DIM, ENCODER_DIM, vb.pp("linear_pos"))?;
+    fn load(vb: VarBuilder, geometry: EncoderGeometry, f16: Option<&Device>) -> Result<Self> {
+        let dim = geometry.dim;
+        let (heads, head_dim) = (geometry.heads, geometry.head_dim());
+        let projection_vb = projection_vb(&vb, f16);
+        let projection = |name: &str| {
+            ProjectionLinear::new(
+                mlx::load_linear_no_bias(dim, dim, projection_vb.pp(name))?,
+                f16,
+            )
+            .map_err(Error::from)
+        };
+        let linear_q = projection("linear_q")?;
+        let linear_k = projection("linear_k")?;
+        let linear_v = projection("linear_v")?;
+        let linear_out = projection("linear_out")?;
+        let linear_pos = projection("linear_pos")?;
 
         // In Parakeet checkpoints these are direct tensors under self_attn.*.
-        let pos_bias_u = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_u")?;
-        let pos_bias_v = vb.get((ENCODER_HEADS, ENCODER_HEAD_DIM), "pos_bias_v")?;
+        let pos_bias_u = vb.get((heads, head_dim), "pos_bias_u")?;
+        let pos_bias_v = vb.get((heads, head_dim), "pos_bias_v")?;
 
         Ok(Self {
+            heads,
+            head_dim,
             linear_q,
             linear_k,
             linear_v,
@@ -1523,39 +2238,36 @@ impl RelPosSelfAttention {
     }
 
     fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
-        let (b, t, _d) = x.dims3()?;
+        let (b, t, d) = x.dims3()?;
+        let (heads, head_dim) = (self.heads, self.head_dim);
 
         let q = self
             .linear_q
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?; // [B, H, T, Dh]
         let k = self
             .linear_k
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let v = self
             .linear_v
             .forward(x)?
-            .reshape((b, t, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((b, t, heads, head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
 
         let p = self
             .linear_pos
             .forward(pos_emb)?
-            .reshape((1, 2 * t - 1, ENCODER_HEADS, ENCODER_HEAD_DIM))?
+            .reshape((1, 2 * t - 1, heads, head_dim))?
             .transpose(1, 2)?; // [1, H, 2T-1, Dh]
 
-        let pos_bias_u = self
-            .pos_bias_u
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
-        let pos_bias_v = self
-            .pos_bias_v
-            .reshape((1, ENCODER_HEADS, 1, ENCODER_HEAD_DIM))?;
+        let pos_bias_u = self.pos_bias_u.reshape((1, heads, 1, head_dim))?;
+        let pos_bias_v = self.pos_bias_v.reshape((1, heads, 1, head_dim))?;
 
         let q_u = q.broadcast_add(&pos_bias_u)?;
         let q_v = q.broadcast_add(&pos_bias_v)?;
@@ -1568,7 +2280,7 @@ impl RelPosSelfAttention {
 
         let scores = matrix_ac
             .broadcast_add(&matrix_bd)?
-            .affine(1.0 / (ENCODER_HEAD_DIM as f64).sqrt(), 0.0)?;
+            .affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
         let scores = if scores.is_contiguous() {
             scores
         } else {
@@ -1577,7 +2289,7 @@ impl RelPosSelfAttention {
         let attn = ops::softmax_last_dim(&scores)?;
 
         let out = attn.matmul(&v)?;
-        let out = out.transpose(1, 2)?.reshape((b, t, ENCODER_DIM))?;
+        let out = out.transpose(1, 2)?.reshape((b, t, d))?;
 
         self.linear_out
             .forward(&out)
@@ -2046,24 +2758,53 @@ fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
 }
 
-fn argmax_1d(x: &Tensor) -> Result<usize> {
-    let width = x.dims1()?;
-    if width == 0 {
-        return Err(Error::InferenceError(
-            "Parakeet argmax received empty logits".to_string(),
-        ));
+/// The TDT label (argmax over `logits[..token_end]`) and duration index
+/// (argmax over the rest) of one joint output, read back together: one
+/// device-to-host sync per joint step instead of two.
+fn tdt_label_and_duration(logits: &Tensor, token_end: usize) -> Result<(usize, usize)> {
+    let width = logits.dims1()?;
+    if token_end == 0 || width <= token_end {
+        return Err(Error::InferenceError(format!(
+            "Parakeet TDT joint output of width {width} has no token or duration logits after {token_end}"
+        )));
     }
-    let idx = x.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
+    let selected =
+        tdt_batch_labels_and_durations(&logits.unsqueeze(0)?, token_end, width - token_end)?;
+    Ok(selected[0])
+}
+
+/// Per-row TDT label and duration indices of a `(rows, width)` joint output
+/// with one readback for all rows.
+fn tdt_batch_labels_and_durations(
+    logits: &Tensor,
+    token_end: usize,
+    num_durations: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let (rows, width) = logits.dims2()?;
+    if token_end == 0 || num_durations == 0 || width < token_end + num_durations {
+        return Err(Error::InferenceError(format!(
+            "Parakeet TDT joint output of width {width} cannot hold {token_end} token and {num_durations} duration logits"
+        )));
+    }
+    let labels = logits.narrow(1, 0, token_end)?.argmax(D::Minus1)?;
+    let durations = logits
+        .narrow(1, token_end, num_durations)?
+        .argmax(D::Minus1)?;
+    let selected = Tensor::stack(&[labels, durations], 0)?.to_dtype(DType::U32)?;
     crate::models::shared::telemetry::record_dtype_cast();
-    crate::models::shared::telemetry::record_host_read(DType::U32, 1);
-    let idx = idx.to_dtype(DType::U32)?.to_scalar::<u32>()?;
-    usize::try_from(idx)
-        .map_err(|_| Error::InferenceError(format!("Parakeet argmax index exceeds usize: {idx}")))
+    crate::models::shared::telemetry::record_host_read(DType::U32, 2 * rows);
+    let selected = selected.to_vec2::<u32>()?;
+    (0..rows)
+        .map(|row| Ok((selected[0][row] as usize, selected[1][row] as usize)))
+        .collect()
+}
+
+fn resampled_len(len: usize, src_rate: u32, dst_rate: u32) -> usize {
+    if src_rate == dst_rate || len < 2 {
+        return len;
+    }
+    let ratio = dst_rate as f64 / src_rate as f64;
+    ((len as f64) * ratio).round().max(1.0) as usize
 }
 
 fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
@@ -2072,7 +2813,7 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     }
 
     let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
+    let out_len = resampled_len(audio.len(), src_rate, dst_rate);
 
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
@@ -2088,9 +2829,271 @@ fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_1d, Joint, LstmCell, Predictor, PRED_HIDDEN};
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    use super::{
+        build_rel_positional_embedding, parakeet_encoded_len_for_samples,
+        parakeet_max_emittable_tokens, parakeet_preparation_bytes,
+        parakeet_tensor_is_f16_projection, plan_encoder_windows, subsampled_len_3x,
+        tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
+        ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
+        ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
+        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
+        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+    };
+    use super::{tdt_batch_labels_and_durations, tdt_label_and_duration};
+    use crate::backends::{BackendKind, DTypeSelection};
+    use crate::error::{Error, Result};
+    use crate::model::ModelVariant;
     use candle_core::{DType, Device, Tensor};
-    use candle_nn::Linear;
+    use candle_nn::{Linear, VarBuilder};
+
+    use crate::kernels::f16_weight_linear::WeightOnlyF16Load;
+    use crate::kernels::numeric_check::{host_f32, relative_l2};
+
+    /// Small enough to run on CPU in milliseconds; two layers keep conv edge
+    /// effects within 4 × 2 + 1 frames of a window boundary.
+    const TINY: EncoderGeometry = EncoderGeometry {
+        mel_bins: 128,
+        subsampling_channels: 4,
+        layers: 2,
+        dim: 32,
+        heads: 4,
+        ff_dim: 64,
+        conv_kernel: 9,
+    };
+
+    /// xorshift64: unstructured values, so a wrong index cannot cancel out.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next_unit(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+
+        fn values(&mut self, len: usize, scale: f32, offset: f32) -> Vec<f32> {
+            (0..len)
+                .map(|_| offset + scale * self.next_unit())
+                .collect()
+        }
+    }
+
+    struct RandomWeights<'a> {
+        rng: XorShift,
+        device: &'a Device,
+        tensors: HashMap<String, Tensor>,
+    }
+
+    impl RandomWeights<'_> {
+        fn put(&mut self, name: String, shape: &[usize], scale: f32, offset: f32) {
+            let values = self.rng.values(shape.iter().product(), scale, offset);
+            let tensor = Tensor::from_vec(values, shape, self.device).unwrap();
+            self.tensors.insert(name, tensor);
+        }
+
+        fn put_weight(&mut self, name: String, shape: &[usize], fan_in: usize) {
+            self.put(name, shape, 1.0 / (fan_in as f32).sqrt(), 0.0);
+        }
+    }
+
+    /// A NeMo-layout encoder checkpoint with random weights, loaded through
+    /// the production loaders.
+    fn random_encoder(geometry: EncoderGeometry, seed: u64, device: &Device) -> ParakeetEncoder {
+        ParakeetEncoder::load(random_encoder_vb(geometry, seed, device), geometry, None).unwrap()
+    }
+
+    /// The random encoder checkpoint of [`random_encoder`] as a VarBuilder.
+    fn random_encoder_vb(
+        geometry: EncoderGeometry,
+        seed: u64,
+        device: &Device,
+    ) -> VarBuilder<'static> {
+        VarBuilder::from_tensors(
+            random_encoder_tensors(geometry, seed, device),
+            DType::F32,
+            device,
+        )
+    }
+
+    fn random_encoder_tensors(
+        geometry: EncoderGeometry,
+        seed: u64,
+        device: &Device,
+    ) -> HashMap<String, Tensor> {
+        let (c, d, ff, k) = (
+            geometry.subsampling_channels,
+            geometry.dim,
+            geometry.ff_dim,
+            geometry.conv_kernel,
+        );
+        let mut weights = RandomWeights {
+            rng: XorShift(seed),
+            device,
+            tensors: HashMap::new(),
+        };
+        for (conv, shape) in [
+            ("conv.0", [c, 1, 3, 3]),
+            ("conv.2", [c, 1, 3, 3]),
+            ("conv.3", [c, c, 1, 1]),
+            ("conv.5", [c, 1, 3, 3]),
+            ("conv.6", [c, c, 1, 1]),
+        ] {
+            let fan_in = shape[1] * shape[2] * shape[3];
+            weights.put_weight(format!("pre_encode.{conv}.weight"), &shape, fan_in);
+            weights.put(format!("pre_encode.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        let subsampled = c * geometry.subsampled_mel_bins();
+        weights.put_weight("pre_encode.out.weight".into(), &[d, subsampled], subsampled);
+        weights.put("pre_encode.out.bias".into(), &[d], 0.1, 0.0);
+        for layer in 0..geometry.layers {
+            let prefix = format!("layers.{layer}");
+            for norm in [
+                "norm_feed_forward1",
+                "norm_self_att",
+                "norm_conv",
+                "norm_feed_forward2",
+                "norm_out",
+            ] {
+                weights.put(format!("{prefix}.{norm}.weight"), &[d], 0.1, 1.0);
+                weights.put(format!("{prefix}.{norm}.bias"), &[d], 0.1, 0.0);
+            }
+            for ffn in ["feed_forward1", "feed_forward2"] {
+                weights.put_weight(format!("{prefix}.{ffn}.linear1.weight"), &[ff, d], d);
+                weights.put_weight(format!("{prefix}.{ffn}.linear2.weight"), &[d, ff], ff);
+            }
+            let attention = format!("{prefix}.self_attn");
+            for projection in [
+                "linear_q",
+                "linear_k",
+                "linear_v",
+                "linear_out",
+                "linear_pos",
+            ] {
+                weights.put_weight(format!("{attention}.{projection}.weight"), &[d, d], d);
+            }
+            for bias in ["pos_bias_u", "pos_bias_v"] {
+                let shape = [geometry.heads, geometry.head_dim()];
+                weights.put(format!("{attention}.{bias}"), &shape, 0.1, 0.0);
+            }
+            let conv = format!("{prefix}.conv");
+            weights.put_weight(format!("{conv}.pointwise_conv1.weight"), &[2 * d, d, 1], d);
+            weights.put_weight(format!("{conv}.depthwise_conv.weight"), &[d, 1, k], k);
+            weights.put(format!("{conv}.batch_norm.weight"), &[d], 0.1, 1.0);
+            weights.put(format!("{conv}.batch_norm.bias"), &[d], 0.1, 0.0);
+            weights.put(format!("{conv}.batch_norm.running_mean"), &[d], 0.1, 0.0);
+            weights.put(format!("{conv}.batch_norm.running_var"), &[d], 0.25, 1.0);
+            weights.put_weight(format!("{conv}.pointwise_conv2.weight"), &[d, d, 1], d);
+        }
+        weights.tensors
+    }
+
+    fn random_log_mel(frames: usize, valid_frames: usize, seed: u64) -> ParakeetLogMel {
+        let values = XorShift(seed).values(TINY.mel_bins * frames, 4.0, -2.0);
+        ParakeetLogMel::from_parts(values, TINY.mel_bins, frames, valid_frames)
+    }
+
+    /// Today's whole-utterance encode: every log-mel column through one
+    /// pre-encode and one attention pass. `truncate_first` drops the STFT
+    /// padding frame before attention (the windowed encoder's behaviour);
+    /// otherwise it is dropped afterwards, as before windowing.
+    fn whole_utterance_encode(
+        encoder: &ParakeetEncoder,
+        features: &Tensor,
+        encoded_len: usize,
+        truncate_first: bool,
+    ) -> Tensor {
+        let mut x = encoder.pre_encode.forward(features).unwrap();
+        if truncate_first {
+            x = x.narrow(1, 0, encoded_len).unwrap();
+        }
+        let pos =
+            build_rel_positional_embedding(x.dim(1).unwrap(), encoder.geometry.dim, x.device())
+                .unwrap();
+        for layer in &encoder.layers {
+            x = layer.forward(&x, &pos).unwrap();
+        }
+        x.narrow(1, 0, encoded_len).unwrap()
+    }
+
+    fn encode_windows(
+        encoder: &ParakeetEncoder,
+        feature_frames: usize,
+        encoded_len: usize,
+        windowing: EncoderWindowing,
+        window_features: &mut dyn FnMut(std::ops::Range<usize>) -> Result<Tensor>,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<ParakeetEncoded> {
+        encoder.encode_windows(
+            feature_frames,
+            encoded_len,
+            windowing,
+            window_features,
+            &mut ParakeetTimings::default(),
+            checkpoint,
+        )
+    }
+
+    /// Largest absolute difference; NaN or infinity counts as infinitely far.
+    fn max_abs_diff(left: &Tensor, right: &Tensor) -> f32 {
+        assert_eq!(left.dims(), right.dims());
+        let values = |tensor: &Tensor| tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        values(left)
+            .into_iter()
+            .zip(values(right))
+            .map(|(left, right)| {
+                let difference = (left - right).abs();
+                if difference.is_finite() {
+                    difference
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// The non-Metal conformer conv (shared shift-and-accumulate depthwise op
+    /// with the folded BatchNorm) matches Candle's per-channel grouped conv
+    /// followed by the unfolded BatchNorm.
+    #[test]
+    fn conformer_conv_shared_depthwise_matches_candle_grouped_conv() {
+        use candle_nn::{Module, ModuleT};
+
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 0x51ED_2701, &device);
+        let values = XorShift(0xC0FF_EE11).values(2 * 37 * TINY.dim, 1.0, 0.0);
+        let x = Tensor::from_vec(values, (2, 37, TINY.dim), &device).unwrap();
+        for layer in &encoder.layers {
+            let conv = &layer.conv;
+            let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+            let actual = conv.forward(&x).unwrap();
+            assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+
+            let h = conv
+                .pointwise_conv1
+                .forward(&x.transpose(1, 2).unwrap())
+                .unwrap();
+            let gate = h.narrow(1, 0, TINY.dim).unwrap();
+            let value = h.narrow(1, TINY.dim, TINY.dim).unwrap();
+            let h = gate
+                .broadcast_mul(&candle_nn::ops::sigmoid(&value).unwrap())
+                .unwrap();
+            let h = conv.depthwise_conv.forward(&h).unwrap();
+            let h = conv.batch_norm.forward_t(&h, false).unwrap();
+            let h = super::swish(&h).unwrap();
+            let expected = conv
+                .pointwise_conv2
+                .forward(&h)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let diff = max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "max |diff| {diff}");
+        }
+    }
 
     fn zero_lstm(device: &Device) -> LstmCell {
         LstmCell {
@@ -2110,24 +3113,788 @@ mod tests {
         }
     }
 
+    /// A model whose joint always emits label 0 with duration 0, so every
+    /// encoder frame emits exactly `max_symbols` labels. The retained decode
+    /// only reads the prepared artifact, never the encoder.
+    fn forced_label_model(device: &Device) -> ParakeetAsrModel {
+        let predictor = zero_predictor(device);
+        let joint = Joint {
+            pred: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, PRED_HIDDEN), DType::F32, device).unwrap(),
+                None,
+            ),
+            enc: Linear::new(
+                Tensor::zeros((PRED_HIDDEN, TINY.dim), DType::F32, device).unwrap(),
+                None,
+            ),
+            // Labels [0, 1, blank] then durations [0, 1].
+            out: Linear::new(
+                Tensor::zeros((5, PRED_HIDDEN), DType::F32, device).unwrap(),
+                Some(Tensor::new(&[4f32, 1.0, 0.0, 3.0, 0.0], device).unwrap()),
+            ),
+            num_classes_with_blank: 3,
+            num_durations: 2,
+        };
+        let blank_idx = predictor.blank_idx;
+        let num_durations = joint.num_durations;
+        ParakeetAsrModel {
+            variant: ModelVariant::ParakeetTdt06BV3,
+            _artifacts: None,
+            decoder: ParakeetDecoder::Vocab(vec!["\u{2581}a".into(), "\u{2581}b".into()]),
+            preprocessor: ParakeetPreprocessor::for_tests(device.clone()),
+            network: ParakeetNetwork {
+                encoder: random_encoder(TINY, 1, device),
+                predictor,
+                joint,
+                blank_idx,
+                num_durations,
+            },
+            blank_idx,
+            num_durations,
+            max_symbols: DEFAULT_MAX_SYMBOLS,
+            encoder_windowing: EncoderWindowing::V3,
+            weight_precision: WeightOnlyF16Load::dense("test"),
+        }
+    }
+
+    fn zero_artifact(device: &Device, encoded_len: usize) -> ParakeetPreparedEncoderArtifact {
+        ParakeetPreparedEncoderArtifact {
+            encoded: Tensor::zeros((1, encoded_len, TINY.dim), DType::F32, device).unwrap(),
+            encoded_len,
+            input_samples: encoded_len * 1280,
+            input_sample_rate: 16_000,
+            resampled_samples: encoded_len * 1280,
+            feature_frames: encoded_len * 8,
+            language: None,
+            windowing: EncoderWindowing::V3,
+            encoder_windows: 1,
+            log_mel_ms: 0.0,
+            encode_ms: 0.0,
+        }
+    }
+
+    fn decode_until_finished(
+        model: &ParakeetAsrModel,
+        artifact: &ParakeetPreparedEncoderArtifact,
+        max_tokens: usize,
+    ) -> (Vec<ParakeetRetainedDecodeStep>, serde_json::Value) {
+        let mut state = model.start_retained_decode().unwrap();
+        let mut steps = Vec::new();
+        while steps
+            .last()
+            .is_none_or(|step: &ParakeetRetainedDecodeStep| !step.finished)
+        {
+            assert!(steps.len() <= 1_000, "retained decode never finished");
+            let mut rows = [ParakeetRetainedDecodeBatchRow {
+                artifact,
+                state: &mut state,
+                max_tokens,
+            }];
+            steps.extend(model.retained_decode_step_batch(&mut rows).unwrap());
+        }
+        let diagnostics = model
+            .retained_decode_output(artifact, &state)
+            .diagnostics
+            .unwrap();
+        (steps, diagnostics)
+    }
+
     #[test]
-    fn parakeet_argmax_selects_half_logits_on_device() {
+    fn parakeet_encoded_len_follows_front_end_geometry() {
+        // test.wav: 3.6 s -> 360 valid feature frames -> 45 encoder frames.
+        assert_eq!(parakeet_encoded_len_for_samples(57_600, 16_000), 45);
+        assert_eq!(parakeet_encoded_len_for_samples(172_800, 48_000), 45);
+        // 29.7 s -> 2970 feature frames -> ceil(2970 / 8) frames.
+        assert_eq!(parakeet_encoded_len_for_samples(475_200, 16_000), 372);
+        assert_eq!(parakeet_encoded_len_for_samples(159, 16_000), 0);
+        assert_eq!(parakeet_encoded_len_for_samples(160, 16_000), 1);
+
+        assert_eq!(
+            parakeet_max_emittable_tokens(475_200, 16_000, DEFAULT_MAX_SYMBOLS).unwrap(),
+            3_720
+        );
+        assert!(matches!(
+            parakeet_max_emittable_tokens(159, 16_000, DEFAULT_MAX_SYMBOLS),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            parakeet_max_emittable_tokens(16_000, 0, DEFAULT_MAX_SYMBOLS),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn retained_decode_finishes_at_max_tokens_with_stop_reason() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2], (4,), &device)
+        let model = forced_label_model(&device);
+        let artifact = zero_artifact(&device, 4);
+
+        let (steps, diagnostics) = decode_until_finished(&model, &artifact, 5);
+
+        assert_eq!(steps.len(), 5);
+        assert!(steps[..4].iter().all(|step| !step.finished));
+        assert_eq!(steps[4].tokens_generated, 5);
+        assert_eq!(diagnostics["stop_reason"], "max_tokens");
+        assert_eq!(diagnostics["tdt_emitted_tokens"], 5);
+    }
+
+    #[test]
+    fn retained_decode_at_emittable_bound_ends_without_cap() {
+        let device = Device::Cpu;
+        let model = forced_label_model(&device);
+        let artifact = zero_artifact(&device, 4);
+        let bound = artifact.encoded_len * DEFAULT_MAX_SYMBOLS;
+
+        let (steps, diagnostics) = decode_until_finished(&model, &artifact, bound);
+
+        // Every frame emits max_symbols labels, so the bound is exactly the
+        // transcript: the decode ends there without reporting a cap.
+        assert_eq!(steps.last().unwrap().tokens_generated, bound);
+        assert_eq!(steps.len(), bound);
+        assert!(diagnostics.get("stop_reason").is_none());
+        // The streamed deltas are the transcript, detokenized incrementally:
+        // re-decoding every step would pass bound·(bound+1)/2 tokens.
+        let deltas = steps
+            .iter()
+            .map(|step| step.delta.as_str())
+            .collect::<String>();
+        assert_eq!(deltas, steps.last().unwrap().text);
+        let detokenized = diagnostics["detokenized_tokens"].as_u64().unwrap();
+        assert!(
+            detokenized <= 4 * bound as u64,
+            "detokenized {detokenized} tokens"
+        );
+
+        // Each frame emits max_symbols one-token words with zero duration,
+        // timed at 80 ms per encoder frame.
+        let words = diagnostics["timestamp_words"].as_array().unwrap();
+        assert_eq!(words.len(), bound);
+        for (index, word) in words.iter().enumerate() {
+            let frame = (index / DEFAULT_MAX_SYMBOLS) as f64;
+            assert_eq!(word["word"], "a");
+            assert!((word["start_time_seconds"].as_f64().unwrap() - frame * 0.08).abs() < 1e-9);
+            assert!((word["end_time_seconds"].as_f64().unwrap() - frame * 0.08).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn tdt_words_span_their_tokens_and_absorb_punctuation() {
+        let vocab: Vec<String> = ["▁Hel", "lo", "▁world", "▁,", "▁again", "!", "<unk>"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let decoder = ParakeetDecoder::Vocab(vocab);
+        let emissions = [
+            (0, 2, 1),
+            (1, 3, 2),
+            (2, 6, 1),
+            (3, 8, 0),
+            (6, 9, 0),
+            (4, 10, 3),
+            (5, 13, 1),
+        ];
+        let token_ids: Vec<usize> = emissions.iter().map(|(id, ..)| *id).collect();
+        let token_frames: Vec<TdtTokenFrame> = emissions
+            .iter()
+            .map(|(_, frame, duration)| TdtTokenFrame {
+                frame: *frame,
+                duration: *duration,
+            })
+            .collect();
+
+        let words = tdt_word_timestamps(
+            &token_ids,
+            &token_frames,
+            |id| decoder.starts_word(id),
+            |ids| decoder.decode(ids),
+        );
+
+        let spans: Vec<(&str, usize, usize)> = words
+            .iter()
+            .map(|word| (word.text.as_str(), word.start_frame, word.end_frame))
+            .collect();
+        // `<unk>` decodes to nothing and continues the word before it.
+        assert_eq!(
+            spans,
+            [("Hello", 2, 5), ("world,", 6, 9), ("again!", 10, 14)]
+        );
+
+        let json = decoder.timestamp_words(&token_ids, &token_frames);
+        assert_eq!(json[0]["word"], "Hello");
+        assert!((json[0]["start_time_seconds"].as_f64().unwrap() - 0.16).abs() < 1e-9);
+        assert!((json[0]["end_time_seconds"].as_f64().unwrap() - 0.40).abs() < 1e-9);
+        assert!((json[2]["end_time_seconds"].as_f64().unwrap() - 1.12).abs() < 1e-9);
+    }
+
+    fn f16_precision() -> DTypeSelection {
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "test: weight-only F16".into(),
+        }
+    }
+
+    /// Every projection the recipe lists is F16 and nothing else is.
+    fn assert_projection_split(encoder: &ParakeetEncoder, f16: bool) {
+        assert_eq!(encoder.pre_encode.out.as_f16().is_some(), f16);
+        for layer in &encoder.layers {
+            for projection in [
+                &layer.ff1.linear1,
+                &layer.ff1.linear2,
+                &layer.ff2.linear1,
+                &layer.ff2.linear2,
+                &layer.self_attn.linear_q,
+                &layer.self_attn.linear_k,
+                &layer.self_attn.linear_v,
+                &layer.self_attn.linear_out,
+                &layer.self_attn.linear_pos,
+            ] {
+                assert_eq!(projection.as_f16().is_some(), f16);
+            }
+            assert_eq!(layer.conv.pointwise_conv1.as_f16().is_some(), f16);
+            assert_eq!(layer.conv.pointwise_conv2.as_f16().is_some(), f16);
+            // The recipe's F32 tensors.
+            assert_eq!(layer.conv.depthwise_conv.weight().dtype(), DType::F32);
+            assert_eq!(layer.conv.folded_depthwise_weight.dtype(), DType::F32);
+            assert_eq!(layer.self_attn.pos_bias_u.dtype(), DType::F32);
+        }
+        assert_eq!(encoder.pre_encode.conv0.weight().dtype(), DType::F32);
+        assert_eq!(encoder.pre_encode.conv3.weight().dtype(), DType::F32);
+    }
+
+    fn encode_probe(encoder: &ParakeetEncoder, device: &Device) -> Vec<f32> {
+        let frames = 8 * 40 + 1;
+        let features = random_log_mel(frames, frames - 1, 17)
+            .normalize_and_upload(0..frames, device)
+            .unwrap();
+        let encoded = whole_utterance_encode(encoder, &features, 40, true);
+        host_f32(&encoded).unwrap()
+    }
+
+    #[test]
+    fn weight_only_f16_encoder_matches_f32_on_cpu() {
+        let device = Device::Cpu;
+        let reference = encode_probe(&random_encoder(TINY, 31, &device), &device);
+        let (encoder, precision) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, 31, &device),
+            TINY,
+            f16_precision(),
+        )
+        .unwrap();
+        assert!(precision.projections_f16, "{}", precision.reason);
+        assert!(precision.self_check.as_ref().unwrap().passed);
+        assert_projection_split(&encoder, true);
+        let rel = relative_l2(&encode_probe(&encoder, &device), &reference);
+        assert!(rel > 0.0 && rel < 1e-2, "relative L2 {rel:e}");
+        assert_eq!(
+            precision.diagnostics()["projection_weights"],
+            serde_json::json!("F16")
+        );
+    }
+
+    /// Admission's F16 tensor set is exactly the set the loader converts.
+    #[test]
+    fn f16_projection_names_match_the_loader() {
+        let device = Device::Cpu;
+        let tensors = random_encoder_tensors(TINY, 37, &device);
+        let (encoder, _) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, 37, &device),
+            TINY,
+            f16_precision(),
+        )
+        .unwrap();
+        let f16_weights = std::iter::once(encoder.pre_encode.out.as_f16().unwrap())
+            .chain(encoder.layers.iter().flat_map(|layer| {
+                [
+                    &layer.ff1.linear1,
+                    &layer.ff1.linear2,
+                    &layer.ff2.linear1,
+                    &layer.ff2.linear2,
+                    &layer.self_attn.linear_q,
+                    &layer.self_attn.linear_k,
+                    &layer.self_attn.linear_v,
+                    &layer.self_attn.linear_out,
+                    &layer.self_attn.linear_pos,
+                ]
+                .into_iter()
+                .map(|projection| projection.as_f16().unwrap())
+                .chain([
+                    layer.conv.pointwise_conv1.as_f16().unwrap(),
+                    layer.conv.pointwise_conv2.as_f16().unwrap(),
+                ])
+            }))
+            .map(|linear| linear.out_features() * linear.in_features())
+            .sum::<usize>();
+        let named = tensors
+            .iter()
+            .filter(|(name, _)| parakeet_tensor_is_f16_projection(&format!("encoder.{name}")))
+            .map(|(_, tensor)| tensor.elem_count())
+            .sum::<usize>();
+        assert_eq!(named, f16_weights);
+        assert_eq!(
+            tensors
+                .keys()
+                .filter(|name| parakeet_tensor_is_f16_projection(&format!("encoder.{name}")))
+                .count(),
+            1 + 11 * TINY.layers
+        );
+        for name in [
+            "encoder.pre_encode.out.bias",
+            "encoder.pre_encode.conv.3.weight",
+            "encoder.layers.0.conv.depthwise_conv.weight",
+            "encoder.layers.x.feed_forward1.linear1.weight",
+            "joint.enc.weight",
+            "decoder.prediction.dec_rnn.lstm.weight_ih_l0",
+        ] {
+            assert!(!parakeet_tensor_is_f16_projection(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn f32_precision_keeps_every_weight_dense() {
+        let device = Device::Cpu;
+        let (encoder, precision) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, 32, &device),
+            TINY,
+            DTypeSelection {
+                dtype: DType::F32,
+                reason: "test: F32".into(),
+            },
+        )
+        .unwrap();
+        assert!(!precision.projections_f16);
+        assert!(precision.self_check.is_none());
+        assert_projection_split(&encoder, false);
+    }
+
+    /// A weight F16 cannot represent turns the F16 encoder non-finite; the
+    /// self-check must catch it and reload in F32 with the reason recorded.
+    #[test]
+    fn failed_self_check_falls_back_to_f32() {
+        let device = Device::Cpu;
+        let mut tensors = random_encoder_tensors(TINY, 33, &device);
+        let name = "layers.1.feed_forward2.linear2.weight";
+        let weight = &tensors[name];
+        let mut values = host_f32(weight).unwrap();
+        values[0] = 1.0e5;
+        let replaced = Tensor::from_vec(values, weight.dims(), &device).unwrap();
+        tensors.insert(name.into(), replaced);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+
+        let (encoder, precision) =
+            ParakeetEncoder::load_with_precision(vb, TINY, f16_precision()).unwrap();
+        assert!(!precision.projections_f16);
+        let report = precision.self_check.as_ref().unwrap();
+        assert!(!report.passed);
+        assert!(
+            precision.reason.contains("fell back to F32"),
+            "{}",
+            precision.reason
+        );
+        assert!(
+            precision.reason.contains("layers.1"),
+            "{}",
+            precision.reason
+        );
+        assert_projection_split(&encoder, false);
+        assert!(encode_probe(&encoder, &device)
+            .iter()
+            .all(|value| value.is_finite()));
+    }
+
+    /// A bad conversion of the probed projection fails the transform check
+    /// even when the encoder output stays finite.
+    #[test]
+    fn self_check_compares_the_conversion_with_the_original_weights() {
+        let device = Device::Cpu;
+        let (mut encoder, _) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, 34, &device),
+            TINY,
+            f16_precision(),
+        )
+        .unwrap();
+        let other =
+            ParakeetEncoder::load(random_encoder_vb(TINY, 35, &device), TINY, Some(&device))
+                .unwrap();
+        encoder.layers[0].ff1.linear1 = other.layers[0].ff1.linear1.clone();
+        let report = encoder.weight_only_f16_self_check(&random_encoder_vb(TINY, 34, &device));
+        assert!(!report.passed);
+        assert!(
+            report.reason.contains("feed_forward1.linear1"),
+            "{}",
+            report.reason
+        );
+    }
+
+    /// Production loading on Metal: the projections take ggml's
+    /// f16 x f32 kernel, the self-check passes on the device, and the
+    /// encoder matches the CPU F32 encoder.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_weight_only_f16_encoder_engages_ggml_and_matches_cpu_f32() {
+        use crate::kernels::f16_weight_linear::F16WeightLinearPath;
+
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let reference = encode_probe(&random_encoder(TINY, 36, &Device::Cpu), &Device::Cpu);
+        let (encoder, precision) = ParakeetEncoder::load_with_precision(
+            random_encoder_vb(TINY, 36, &device),
+            TINY,
+            f16_precision(),
+        )
+        .unwrap();
+        assert!(precision.projections_f16, "{}", precision.reason);
+        assert_projection_split(&encoder, true);
+        for layer in &encoder.layers {
+            for projection in [&layer.ff1.linear1, &layer.self_attn.linear_pos] {
+                assert_eq!(
+                    projection.as_f16().unwrap().path(),
+                    F16WeightLinearPath::GgmlF16F32
+                );
+            }
+            assert_eq!(
+                layer.conv.pointwise_conv2.as_f16().unwrap().path(),
+                F16WeightLinearPath::GgmlF16F32
+            );
+        }
+        let rel = relative_l2(&encode_probe(&encoder, &device), &reference);
+        assert!(rel < 1e-2, "relative L2 {rel:e}");
+    }
+
+    #[test]
+    fn max_abs_diff_treats_nan_as_infinitely_far() {
+        let device = Device::Cpu;
+        let finite = Tensor::new(&[1f32, 2.0], &device).unwrap();
+        let with_nan = Tensor::new(&[1f32, f32::NAN], &device).unwrap();
+        assert_eq!(max_abs_diff(&finite, &with_nan), f32::INFINITY);
+        assert_eq!(max_abs_diff(&finite, &finite), 0.0);
+    }
+
+    #[test]
+    fn encoder_window_plan_partitions_frames_with_context() {
+        let w = EncoderWindowing::V3;
+        let plan = |encoded_len| {
+            plan_encoder_windows(encoded_len, w.frames, w.left_context, w.right_context).unwrap()
+        };
+        for encoded_len in [1, 895, 896, 1023, 1024, 1025, 1793, 45_000] {
+            let windows = plan(encoded_len);
+            let mut kept_until = 0;
+            for window in &windows {
+                assert_eq!(window.keep_start, kept_until, "E={encoded_len}");
+                assert!(window.start <= window.keep_start && window.keep_start < window.keep_end);
+                assert!(window.keep_end <= window.end && window.end <= encoded_len);
+                kept_until = window.keep_end;
+                if encoded_len > w.frames {
+                    assert_eq!(window.end - window.start, w.frames, "E={encoded_len}");
+                }
+                assert!(window.start == 0 || window.keep_start - window.start >= w.left_context);
+                assert!(
+                    window.end == encoded_len || window.end - window.keep_end >= w.right_context
+                );
+                // Both STFT tails: valid % 8 != 0 (one padding column past
+                // 8E - 3) and valid % 8 == 0 (padding column at 8E).
+                for feature_frames in [8 * encoded_len - 2, 8 * encoded_len + 1] {
+                    let columns = window.feature_columns(feature_frames);
+                    assert_eq!(columns.start, 8 * window.start);
+                    assert_eq!(columns.end, (8 * window.end).min(feature_frames));
+                    assert_eq!(subsampled_len_3x(columns.len()), window.end - window.start);
+                }
+            }
+            assert_eq!(kept_until, encoded_len, "E={encoded_len}");
+        }
+
+        let whole = |encoded_len| EncoderWindow {
+            start: 0,
+            end: encoded_len,
+            keep_start: 0,
+            keep_end: encoded_len,
+        };
+        assert_eq!(plan(1), vec![whole(1)]);
+        assert_eq!(plan(1024), vec![whole(1024)]);
+        assert_eq!(
+            plan(1025),
+            vec![
+                EncoderWindow {
+                    start: 0,
+                    end: 1024,
+                    keep_start: 0,
+                    keep_end: 896,
+                },
+                EncoderWindow {
+                    start: 1,
+                    end: 1025,
+                    keep_start: 896,
+                    keep_end: 1025,
+                },
+            ]
+        );
+        assert_eq!(plan(1793).len(), 3);
+        // 60 minutes: one 896-frame head, 57 centres of 768 and a tail.
+        assert_eq!(plan(45_000).len(), 59);
+        assert!(plan(0).is_empty());
+        assert!(plan_encoder_windows(2048, 256, 128, 128).is_err());
+    }
+
+    #[test]
+    fn single_window_encode_matches_whole_utterance_encode() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 3, &device);
+        // 203 % 8 != 0: the padding column shares the last encoder frame.
+        // 200 % 8 == 0: it would add a frame, which attention no longer sees.
+        for valid in [203usize, 200] {
+            let frames = valid + 1;
+            let log_mel = random_log_mel(frames, valid, valid as u64);
+            let encoded_len = subsampled_len_3x(valid);
+            let windowed = encode_windows(
+                &encoder,
+                frames,
+                encoded_len,
+                EncoderWindowing::V3,
+                &mut |columns| log_mel.normalize_and_upload(columns, &device),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(windowed.windows, 1);
+            assert_eq!(windowed.encoded.dims(), &[1, encoded_len, TINY.dim]);
+
+            let features = log_mel.normalize_and_upload(0..frames, &device).unwrap();
+            let before = whole_utterance_encode(&encoder, &features, encoded_len, false);
+            if valid % 8 != 0 {
+                assert_eq!(
+                    windowed.encoded.to_vec3::<f32>().unwrap(),
+                    before.to_vec3::<f32>().unwrap()
+                );
+            } else {
+                let truncated = whole_utterance_encode(&encoder, &features, encoded_len, true);
+                assert!(max_abs_diff(&windowed.encoded, &truncated) <= 1e-5);
+                assert!(max_abs_diff(&windowed.encoded, &before) > 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_encode_with_neutral_attention_matches_whole_utterance_encode() {
+        let device = Device::Cpu;
+        let mut encoder = random_encoder(TINY, 5, &device);
+        // With attention silenced only per-frame blocks and kernel-9
+        // convolutions remain, so context of 4 frames per layer, plus the
+        // first subsampled frame, makes every kept frame exact.
+        for layer in &mut encoder.layers {
+            let weight = Tensor::zeros((TINY.dim, TINY.dim), DType::F32, &device).unwrap();
+            layer.self_attn.linear_out = Linear::new(weight, None).into();
+        }
+        let valid = 8 * 150 + 5;
+        let frames = valid + 1;
+        let encoded_len = subsampled_len_3x(valid);
+        // One normalization for every window, so only stitching can differ.
+        let features = random_log_mel(frames, valid, 21)
+            .normalize_and_upload(0..frames, &device)
+            .unwrap();
+        let reference = whole_utterance_encode(&encoder, &features, encoded_len, true);
+        let windowed = |context: usize| {
+            let windowing = EncoderWindowing {
+                frames: 48,
+                left_context: context,
+                right_context: context,
+            };
+            encode_windows(
+                &encoder,
+                frames,
+                encoded_len,
+                windowing,
+                &mut |columns| {
+                    Ok(features
+                        .narrow(2, columns.start, columns.len())?
+                        .contiguous()?)
+                },
+                &|| Ok(()),
+            )
+            .unwrap()
+        };
+
+        let exact = windowed(4 * TINY.layers + 2);
+        assert!(exact.windows > 3);
+        assert!(max_abs_diff(&exact.encoded, &reference) <= 1e-5);
+        // Too little context leaves window-edge effects in kept frames.
+        assert!(max_abs_diff(&windowed(2).encoded, &reference) > 1e-3);
+    }
+
+    #[test]
+    fn windowed_encode_stops_at_a_cancelled_checkpoint() {
+        let device = Device::Cpu;
+        let encoder = random_encoder(TINY, 9, &device);
+        let valid = 8 * 100;
+        let log_mel = random_log_mel(valid + 1, valid, 4);
+        let windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 8,
+            right_context: 8,
+        };
+        let encoded_windows = Cell::new(0);
+        let cancelled = Cell::new(false);
+
+        let result = encode_windows(
+            &encoder,
+            valid + 1,
+            subsampled_len_3x(valid),
+            windowing,
+            &mut |columns| {
+                encoded_windows.set(encoded_windows.get() + 1);
+                // The request is cancelled while its first window encodes.
+                cancelled.set(true);
+                log_mel.normalize_and_upload(columns, &device)
+            },
+            &|| {
+                if cancelled.get() {
+                    return Err(Error::Cancelled("parakeet-test".into()));
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(Error::Cancelled(_))));
+        assert_eq!(encoded_windows.get(), 1);
+    }
+
+    #[test]
+    fn retained_encoder_artifact_reports_its_windows() {
+        let device = Device::Cpu;
+        let mut model = forced_label_model(&device);
+        model.encoder_windowing = EncoderWindowing {
+            frames: 32,
+            left_context: 10,
+            right_context: 10,
+        };
+        // 4 s: 400 valid feature frames, 50 encoder frames, three windows.
+        let audio = XorShift(13).values(64_037, 0.1, 0.0);
+
+        let artifact = model
+            .prepare_retained_encoder(&audio, 16_000, Some("en"), &|| Ok(()))
+            .unwrap();
+        assert_eq!(artifact.encoded_len, 50);
+        assert_eq!(artifact.encoder_windows, 3);
+        assert_eq!(artifact.encoded.dims(), &[1, 50, TINY.dim]);
+        let state = model.start_retained_decode().unwrap();
+        let diagnostics = model
+            .retained_decode_output(&artifact, &state)
+            .diagnostics
+            .unwrap();
+        assert_eq!(diagnostics["encoded_frames"], 50);
+        assert_eq!(diagnostics["encoder_windows"], 3);
+        assert_eq!(diagnostics["encoder_window_frames"], 32);
+        assert_eq!(diagnostics["encoder_window_left_context"], 10);
+        assert_eq!(diagnostics["encoder_window_right_context"], 10);
+        assert!(diagnostics["encode_ms"].as_f64().is_some());
+
+        let checkpoints = Cell::new(0);
+        let cancelled = model.prepare_retained_encoder(&audio, 16_000, None, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            if checkpoints.get() > 1 {
+                return Err(Error::Cancelled("parakeet-test".into()));
+            }
+            Ok(())
+        });
+        assert!(matches!(cancelled, Err(Error::Cancelled(_))));
+        assert_eq!(checkpoints.get(), 2);
+    }
+
+    #[test]
+    fn preparation_pricing_is_bounded_by_the_window() {
+        const GIB: u64 = 1 << 30;
+        let minute = 60 * 16_000;
+        let total = |samples: usize, backend: BackendKind| {
+            let bytes = parakeet_preparation_bytes(samples, backend).unwrap();
+            bytes.host_bytes + bytes.device_bytes().unwrap()
+        };
+        let backends = [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda];
+
+        for backend in backends {
+            let mut previous = 0;
+            let lengths = (0..=60 * minute)
+                .step_by(16_000 * 7 + 13)
+                .chain(1_300_000..1_320_000)
+                .chain([60 * minute]);
+            let mut lengths = lengths.collect::<Vec<_>>();
+            lengths.sort_unstable();
+            for samples in lengths {
+                let bytes = total(samples, backend);
+                assert!(bytes >= previous, "{backend:?} pricing fell at {samples}");
+                previous = bytes;
+            }
+            assert!(total(60 * minute, backend) <= 5 * GIB / 2, "{backend:?}");
+        }
+
+        // E = 1024 frames: the window term is final from here on and equals
+        // report 11's 832 MiB on every backend (all its buffers are powers
+        // of two at W = 1024).
+        let full_window = parakeet_preparation_bytes(8192 * 160, BackendKind::Cpu)
+            .unwrap()
+            .window_bytes;
+        assert_eq!(full_window, 832 << 20);
+        for minutes in [2, 10, 30, 60] {
+            for backend in backends {
+                let bytes = parakeet_preparation_bytes(minutes * minute, backend).unwrap();
+                assert_eq!(bytes.window_bytes, full_window);
+            }
+        }
+        for samples in [16_000, 7 * minute + 4_321, 60 * minute] {
+            assert!(total(samples, BackendKind::Metal) >= total(samples, BackendKind::Cpu));
+        }
+    }
+
+    /// The pre-change per-head argmax: one scalar readback per head.
+    fn reference_argmax(x: &Tensor) -> usize {
+        x.argmax(candle_core::D::Minus1)
+            .unwrap()
+            .to_dtype(DType::U32)
+            .unwrap()
+            .to_scalar::<u32>()
+            .unwrap() as usize
+    }
+
+    #[test]
+    fn parakeet_tdt_argmax_selects_half_logits_on_device() {
+        let device = Device::Cpu;
+        let logits = Tensor::from_vec(vec![0.1f32, -0.3, 0.8, 0.2, 0.5, 0.9, -1.0], (7,), &device)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
 
-        assert_eq!(argmax_1d(&logits).unwrap(), 2);
+        assert_eq!(tdt_label_and_duration(&logits, 4).unwrap(), (2, 1));
     }
 
     #[test]
-    fn parakeet_argmax_rejects_empty_logits() {
+    fn parakeet_tdt_argmax_rejects_missing_heads() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
-        let err = argmax_1d(&logits).expect_err("empty logits should be rejected");
+        let logits = Tensor::from_vec(vec![0.1f32, 0.2], (2,), &device).unwrap();
+        assert!(tdt_label_and_duration(&logits, 2).is_err());
+        assert!(tdt_label_and_duration(&logits, 0).is_err());
+        let empty = Tensor::from_vec(Vec::<f32>::new(), (0,), &device).unwrap();
+        assert!(tdt_label_and_duration(&empty, 0).is_err());
+    }
 
-        assert!(format!("{err}").contains("Parakeet argmax received empty logits"));
+    /// One combined readback selects the same label and duration as the two
+    /// per-head argmax readbacks it replaces, for single rows and batches.
+    #[test]
+    fn combined_tdt_readback_matches_per_head_argmax() {
+        let device = Device::Cpu;
+        let (token_end, durations, rows) = (8193, 5, 3);
+        let values = XorShift(0x7DD4_1A2B).values(rows * (token_end + durations), 8.0, 0.0);
+        let logits = Tensor::from_vec(values, (rows, token_end + durations), &device).unwrap();
+        let batch = tdt_batch_labels_and_durations(&logits, token_end, durations).unwrap();
+        for (row, &selected) in batch.iter().enumerate() {
+            let row_logits = logits.get(row).unwrap();
+            let expected = (
+                reference_argmax(&row_logits.narrow(0, 0, token_end).unwrap()),
+                reference_argmax(&row_logits.narrow(0, token_end, durations).unwrap()),
+            );
+            assert_eq!(selected, expected);
+            assert_eq!(
+                tdt_label_and_duration(&row_logits, token_end).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

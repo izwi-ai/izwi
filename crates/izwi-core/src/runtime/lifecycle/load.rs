@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
@@ -25,6 +25,7 @@ use crate::kv::v2::{
 use crate::kv::InferenceStateContractProvider;
 use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
+use crate::models::architectures::qwen3::asr::Qwen3AsrContextBound;
 use crate::models::registry::NativeAsrModel;
 use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::models::shared::weights::gguf::TensorStorageInventory;
@@ -36,6 +37,8 @@ use crate::runtime::lifecycle::controller::{
 };
 use crate::runtime::service::RuntimeService;
 
+#[path = "asr_memory.rs"]
+mod asr_memory;
 #[path = "qwen36moe_memory.rs"]
 mod qwen36moe_memory;
 #[path = "qwen38_memory.rs"]
@@ -158,6 +161,33 @@ fn portable_invocation_context_intent(
                 .map_or(maximum, |tokens| maximum.min(tokens)),
         },
     }
+}
+
+/// `(floor, growth)` budgets of a portable state fit. Required state (the
+/// model-authored minimum, an explicit context) is admitted against
+/// planning headroom; live headroom (`live`, already clamped to planning)
+/// caps only the automatic growth above it. Right after a large load the
+/// live sample undercounts memory the OS reclaims on demand (clean
+/// file-backed pages of the checkpoint just read, compressible pages):
+/// Granite's 10 MiB minimum was refused against 0.8 GB live beside 1 GiB of
+/// reserve while planning headroom held gigabytes.
+fn state_fit_budgets(
+    planning_bytes: u64,
+    live: ResourceAmount,
+    safety_reserve_bytes: u64,
+) -> (u64, u64) {
+    let floor = planning_bytes.saturating_sub(safety_reserve_bytes);
+    let growth = match live {
+        ResourceAmount::Known(bytes) => bytes.saturating_sub(safety_reserve_bytes),
+        ResourceAmount::Unknown => floor,
+    };
+    (floor, growth.min(floor))
+}
+
+/// The one-chunk floor of an ASR variant's decoder context (`0` for other
+/// variants, and for ASR families without an LLM decoder context).
+fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
+    super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
 }
 
 fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
@@ -421,17 +451,139 @@ fn model_memory_estimate(variant: ModelVariant) -> ModelMemoryEstimate {
     }
 }
 
+/// The load-domain bytes of a load authorization: host memory on CPU, unified
+/// memory on Metal, device memory on CUDA.
+fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> ResourceAmount {
+    match backend {
+        BackendKind::Cpu => authorization.host_bytes,
+        BackendKind::Metal => authorization.unified_bytes,
+        BackendKind::Cuda => authorization.device_bytes,
+    }
+}
+
+/// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
+/// rows are sized for chat (on CUDA one per 256 MiB of device memory, about
+/// 320 on an H100), and every ASR retained row owns a prepared-input tensor
+/// and a sequence's worth of KV. ASR keeps the portable default of 8
+/// concurrent sequences, never fewer than one decode batch; operator-set rows
+/// are kept as configured.
+fn asr_state_rows(
+    automatic_rows: bool,
+    engine_retained_rows: usize,
+    engine_staged_rows: usize,
+) -> (usize, usize) {
+    const ASR_AUTOMATIC_RETAINED_ROWS: usize = 8;
+    let retained = if automatic_rows {
+        engine_retained_rows.min(ASR_AUTOMATIC_RETAINED_ROWS.max(engine_staged_rows))
+    } else {
+        engine_retained_rows
+    }
+    .max(1);
+    (retained, engine_staged_rows.min(retained).max(1))
+}
+
+/// Fold the request floor into an ASR load's authorization before anything is
+/// evicted for it (ADM-10): the weights must leave room for one request
+/// envelope per execution slot, or no request could run beside the loaded
+/// model. The minimal state itself (one page per row) is small beside it.
+fn admit_asr_request_floor(
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    floor_bytes: u64,
+) -> Result<ResourceVector> {
+    let (ResourceAmount::Known(resident), ResourceAmount::Known(peak)) = (
+        load_domain_bytes(plan.resident_authorization, backend),
+        load_domain_bytes(plan.load_authorization, backend),
+    ) else {
+        return Ok(plan.load_authorization);
+    };
+    let required = resident
+        .checked_add(floor_bytes)
+        .ok_or_else(|| Error::ModelLoadError("ASR request floor overflow".into()))?
+        .max(peak);
+    let mut authorization = plan.load_authorization;
+    match backend {
+        BackendKind::Cpu => authorization.host_bytes = ResourceAmount::Known(required),
+        BackendKind::Metal => authorization.unified_bytes = ResourceAmount::Known(required),
+        BackendKind::Cuda => authorization.device_bytes = ResourceAmount::Known(required),
+    }
+    Ok(authorization)
+}
+
+/// One observed-usage checkpoint of a load (ADM-8): the device observer's
+/// reading and the ledger's reserved bytes, both in the load domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceUsageSample {
+    observed: u64,
+    reserved: u64,
+}
+
+/// Fixed part of the observed-materialization tolerance. Candle's Metal pool
+/// keeps a buffer per size class it has served even after a synchronization
+/// drops released ones, and the plan leaves out derived tensors under about
+/// 1 MiB per family; a CUDA context lazily allocates module and stream
+/// memory on its first kernels. A few hundred MiB covers these.
+const MATERIALIZATION_TOLERANCE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How far observed growth may exceed what the ledger authorized before the
+/// load fails: an eighth of the authorization (the plans' own conservative
+/// approximations, such as the Metal pool serving a smaller tensor from a
+/// larger freed buffer, are well inside that), and never less than
+/// [`MATERIALIZATION_TOLERANCE_FLOOR_BYTES`]. An excess beyond it means the
+/// plan prices a different representation than the loader allocates, which
+/// is the defect class the reconciliation exists to catch.
+fn materialization_tolerance_bytes(authorized_bytes: u64) -> u64 {
+    (authorized_bytes / 8).max(MATERIALIZATION_TOLERANCE_FLOOR_BYTES)
+}
+
+/// The device growth observed between two checkpoints of a load, failing the
+/// load when it exceeds what the ledger authorized over the same interval
+/// plus [`materialization_tolerance_bytes`]. `own_authorized_bytes` is what
+/// this load held before `before` was sampled (its weight peak); every lease
+/// reserved in between, the load's own state leases and any concurrent
+/// request workspace alike, is authorized through the ledger growth, so a
+/// concurrent allocation counts on both sides.
+fn reconcile_observed_growth(
+    variant: ModelVariant,
+    stage: &str,
+    before: DeviceUsageSample,
+    after: DeviceUsageSample,
+    own_authorized_bytes: u64,
+) -> Result<u64> {
+    let observed_growth = after.observed.saturating_sub(before.observed);
+    let authorized_bytes =
+        own_authorized_bytes.saturating_add(after.reserved.saturating_sub(before.reserved));
+    let tolerance_bytes = materialization_tolerance_bytes(authorized_bytes);
+    if observed_growth > authorized_bytes.saturating_add(tolerance_bytes) {
+        return Err(Error::ModelLoadError(format!(
+            "{variant} {stage} allocated more device memory than its admission authorized: observed_bytes={observed_growth}, authorized_bytes={authorized_bytes}, tolerance_bytes={tolerance_bytes}; the residency plan under-prices this load"
+        )));
+    }
+    Ok(observed_growth)
+}
+
 /// Static load peak that decides whether a Metal OOM retry can fit. The
 /// catalog's `memory_required_gb` is one coarse figure for every backend (80
 /// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
 /// these checkpoints use the per-backend representation estimate that load
-/// admission prices instead.
+/// admission prices instead. An ASR checkpoint (`asr_checkpoint`: its path and
+/// the load device) is judged by the residency plan first admission priced.
 fn retry_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,
+    asr_checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
+    if let Some((model_path, device)) = asr_checkpoint {
+        if let Ok(Some(plan)) = asr_memory::resource_plan(variant, model_path, device) {
+            if let ResourceAmount::Known(bytes) =
+                load_domain_bytes(plan.load_authorization, backend)
+            {
+                return bytes;
+            }
+        }
+    }
     match variant {
         ModelVariant::Qwen3827BFp8
             if !crate::models::architectures::qwen38::native::synthetic_geometry_enabled() =>
@@ -441,14 +593,8 @@ fn retry_load_peak_bytes(
         ModelVariant::Qwen36Moe35BA3BFp8
             if !crate::models::architectures::qwen36moe::native::synthetic_geometry_enabled() =>
         {
-            let peak = qwen36moe_memory::resource_plan(backend, performance).map(|plan| {
-                let peak = plan.load_authorization;
-                match backend {
-                    BackendKind::Cpu => peak.host_bytes,
-                    BackendKind::Metal => peak.unified_bytes,
-                    BackendKind::Cuda => peak.device_bytes,
-                }
-            });
+            let peak = qwen36moe_memory::resource_plan(backend, performance)
+                .map(|plan| load_domain_bytes(plan.load_authorization, backend));
             match peak {
                 Ok(ResourceAmount::Known(bytes)) => bytes,
                 _ => catalog(),
@@ -478,87 +624,171 @@ fn collect_checkpoint_files(path: &Path, depth: usize, files: &mut Vec<PathBuf>)
     Ok(())
 }
 
-fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
+/// How a checkpoint stores one tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredDType {
+    /// A safetensors or PyTorch tensor, which Candle loads as a dense tensor.
+    Dense(candle_core::DType),
+    /// A GGUF tensor. Candle loads every GGUF tensor, F32 ones included, as a
+    /// `QTensor`.
+    Ggml(candle_core::quantized::GgmlDType),
+    /// A safetensors dtype Candle cannot load: only its stored bytes are known.
+    Unsupported,
+}
+
+/// One tensor as its checkpoint header records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusTensor {
+    name: String,
+    dtype: StoredDType,
+    shape: Vec<usize>,
+    /// Payload bytes in the file.
+    stored_bytes: u64,
+}
+
+impl CensusTensor {
+    fn elements(&self) -> u64 {
+        u64::try_from(
+            self.shape
+                .iter()
+                .try_fold(1_usize, |acc, &dim| acc.checked_mul(dim))
+                .unwrap_or(usize::MAX),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+/// The header census of one checkpoint file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusFile {
+    path: PathBuf,
+    tensors: Vec<CensusTensor>,
+}
+
+/// Header census of the checkpoint files under a model path: the tensor list
+/// of every readable checkpoint, without materializing any payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CheckpointCensus {
+    files: Vec<CensusFile>,
+    /// Size of the largest container whose tensors cannot be listed (a `.nemo`
+    /// archive, or a PTH file Candle cannot parse).
+    container_fallback_bytes: u64,
+}
+
+impl CheckpointCensus {
+    fn tensors(&self) -> impl Iterator<Item = &CensusTensor> {
+        self.files.iter().flat_map(|file| file.tensors.iter())
+    }
+
+    fn inventory(&self) -> Option<TensorStorageInventory> {
+        if self.files.is_empty() {
+            // The compressed artifact size is a conservative lower bound until
+            // the extracted checkpoint header exists.
+            let bytes = self.container_fallback_bytes;
+            return (bytes > 0).then_some(TensorStorageInventory {
+                total_bytes: bytes,
+                largest_tensor_bytes: bytes,
+                largest_tensor_elements: 0,
+                tensor_count: 1,
+            });
+        }
+        Some(
+            self.tensors()
+                .fold(TensorStorageInventory::default(), |inv, tensor| {
+                    inv.push(tensor.stored_bytes, tensor.elements())
+                }),
+        )
+    }
+}
+
+/// The header census of one checkpoint file, or `None` for a file that is not
+/// a checkpoint or a PTH file Candle cannot parse.
+fn census_checkpoint_file(file: &Path) -> Result<Option<CensusFile>> {
+    let tensors = match file.extension().and_then(|value| value.to_str()) {
+        Some("gguf") => crate::models::shared::weights::gguf::GgufLoader::from_path(file)?
+            .tensor_census()?
+            .into_iter()
+            .map(|tensor| CensusTensor {
+                name: tensor.name,
+                dtype: StoredDType::Ggml(tensor.dtype),
+                shape: tensor.shape,
+                stored_bytes: tensor.bytes,
+            })
+            .collect(),
+        Some("safetensors") => {
+            // SAFETY: Candle owns the read-only mapping for the lifetime of
+            // the parsed tensor views read below.
+            let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(file) }?;
+            tensors
+                .tensors()
+                .into_iter()
+                .map(|(name, view)| {
+                    let stored_bytes = u64::try_from(view.data().len()).map_err(|_| {
+                        Error::ModelLoadError("safetensors tensor size exceeds u64".into())
+                    })?;
+                    Ok(CensusTensor {
+                        name,
+                        dtype: candle_core::DType::try_from(view.dtype())
+                            .map_or(StoredDType::Unsupported, StoredDType::Dense),
+                        shape: view.shape().to_vec(),
+                        stored_bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        Some("pth" | "ckpt") => {
+            let Ok(infos) = candle_core::pickle::read_pth_tensor_info(file, false, None) else {
+                return Ok(None);
+            };
+            infos
+                .into_iter()
+                .map(|info| {
+                    let elements =
+                        u64::try_from(info.layout.shape().elem_count()).unwrap_or(u64::MAX);
+                    CensusTensor {
+                        name: info.name,
+                        dtype: StoredDType::Dense(info.dtype),
+                        shape: info.layout.shape().dims().to_vec(),
+                        stored_bytes: elements.saturating_mul(info.dtype.size_in_bytes() as u64),
+                    }
+                })
+                .collect()
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(CensusFile {
+        path: file.to_path_buf(),
+        tensors,
+    }))
+}
+
+fn checkpoint_census(path: &Path) -> Result<CheckpointCensus> {
     let mut files = Vec::new();
     collect_checkpoint_files(path, 3, &mut files)?;
-    let mut found = false;
-    let mut container_fallback = 0_u64;
-    let mut aggregate = TensorStorageInventory::default();
+    let mut census = CheckpointCensus::default();
     for file in files {
         let extension = file.extension().and_then(|value| value.to_str());
-        let inventory = match extension {
-            Some("gguf") => {
-                let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&file)?;
-                Some(loader.tensor_storage_inventory()?)
-            }
-            Some("safetensors") => {
-                // SAFETY: Candle owns the read-only mapping for the lifetime of
-                // the parsed tensor views returned below.
-                let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::new(&file) }?;
-                Some(tensors.tensors().into_iter().try_fold(
-                    TensorStorageInventory::default(),
-                    |inv, (_, tensor)| {
-                        let bytes = u64::try_from(tensor.data().len()).map_err(|_| {
-                            Error::ModelLoadError("safetensors tensor size exceeds u64".into())
-                        })?;
-                        let elements = u64::try_from(
-                            tensor
-                                .shape()
-                                .iter()
-                                .try_fold(1_usize, |acc: usize, &dim| acc.checked_mul(dim))
-                                .unwrap_or(usize::MAX),
-                        )
-                        .map_err(|_| {
-                            Error::ModelLoadError(
-                                "safetensors tensor element count exceeds u64".into(),
-                            )
-                        })?;
-                        Ok::<_, Error>(inv.push(bytes, elements))
-                    },
-                )?)
-            }
-            Some("pth" | "ckpt") => {
-                let parsed = candle_core::pickle::read_pth_tensor_info(&file, false, None)
-                    .ok()
-                    .map(|infos| {
-                        infos
-                            .into_iter()
-                            .fold(TensorStorageInventory::default(), |inv, info| {
-                                let elements = u64::try_from(info.layout.shape().elem_count())
-                                    .unwrap_or(u64::MAX);
-                                let bytes =
-                                    elements.saturating_mul(info.dtype.size_in_bytes() as u64);
-                                inv.push(bytes, elements)
-                            })
-                    });
-                if parsed.is_none() {
-                    container_fallback = container_fallback.max(file.metadata()?.len());
+        let container = match extension {
+            // NeMo is a tar container (gzip-compressed for some checkpoints).
+            Some("nemo") => true,
+            _ => match census_checkpoint_file(&file)? {
+                Some(parsed) => {
+                    census.files.push(parsed);
+                    false
                 }
-                parsed
-            }
-            // NeMo is a zip container. Its compressed artifact size is a
-            // conservative lower bound until the repacked PTH header exists.
-            Some("nemo") => {
-                let bytes = file.metadata()?.len();
-                container_fallback = container_fallback.max(bytes);
-                None
-            }
-            _ => None,
+                None => matches!(extension, Some("pth" | "ckpt")),
+            },
         };
-        if let Some(file_inventory) = inventory {
-            found = true;
-            aggregate = aggregate.merge(file_inventory);
+        if container {
+            census.container_fallback_bytes =
+                census.container_fallback_bytes.max(file.metadata()?.len());
         }
     }
-    if !found && container_fallback > 0 {
-        return Ok(Some(TensorStorageInventory {
-            total_bytes: container_fallback,
-            largest_tensor_bytes: container_fallback,
-            largest_tensor_elements: 0,
-            tensor_count: 1,
-        }));
-    }
-    Ok(found.then_some(aggregate))
+    Ok(census)
+}
+
+fn checkpoint_tensor_inventory(path: &Path) -> Result<Option<TensorStorageInventory>> {
+    Ok(checkpoint_census(path)?.inventory())
 }
 
 /// Per-tensor instantiation slack: device buffer page rounding, storage
@@ -1105,18 +1335,41 @@ impl ModelLifecycleController {
         executions: &[LoadedExecutionContract],
         remaining_automatic_state_groups: u64,
     ) -> Result<()> {
-        let safety_reserve_bytes =
-            portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes);
         let backend = self.backend_router.context().backend_kind;
         if backend == BackendKind::Cuda {
             return Ok(());
         }
         let axis_bounds = descriptor.capacity_axis_bounds(StateCapacityAxis::DecoderContext);
-        let ResourceAmount::Known(headroom_bytes) = self
-            .coordinator
-            .resource_authority()
-            .planning_headroom_bytes(backend)?
-        else {
+        // ASR state leaves live room for the requests it serves (ADM-7), and
+        // keeps the one reserve the retained fit keeps too (ADM-11): the
+        // configured floor or the measured untracked growth, not a catalog
+        // difference.
+        let authority = self.coordinator.resource_authority();
+        let asr = asr_memory::is_asr_variant(variant);
+        let headroom = authority.planning_headroom_bytes(backend)?;
+        let (live_headroom, safety_reserve_bytes) = if asr {
+            (
+                authority.state_fit_headroom_bytes(backend)?,
+                authority.state_safety_reserve_bytes(
+                    backend,
+                    self.config.portable_context_reserve_bytes,
+                ),
+            )
+        } else {
+            (
+                headroom,
+                portable_context_reserve_bytes(variant, self.config.portable_context_reserve_bytes),
+            )
+        };
+        // A capacity shortfall of ASR state is a 503, not a load defect.
+        let does_not_fit = |message: String| {
+            if asr {
+                Error::Overloaded(message)
+            } else {
+                Error::ModelLoadError(message)
+            }
+        };
+        let ResourceAmount::Known(headroom_bytes) = headroom else {
             let Some((_, maximum)) = axis_bounds else {
                 return Ok(());
             };
@@ -1130,9 +1383,10 @@ impl ModelLifecycleController {
                 .publish_effective_context(variant, fallback)?;
             return Ok(());
         };
-        let budget = headroom_bytes.saturating_sub(safety_reserve_bytes);
+        let (budget, growth_budget) =
+            state_fit_budgets(headroom_bytes, live_headroom, safety_reserve_bytes);
         let automatic_budget =
-            automatic_state_group_budget(budget, remaining_automatic_state_groups);
+            automatic_state_group_budget(growth_budget, remaining_automatic_state_groups);
         let required = |tokens: Option<u64>| -> Result<u64> {
             let mut candidate = descriptor.clone();
             if let Some(tokens) = tokens {
@@ -1161,7 +1415,7 @@ impl ModelLifecycleController {
         let Some((minimum, maximum)) = axis_bounds else {
             let bytes = required(None)?;
             if bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -1177,7 +1431,7 @@ impl ModelLifecycleController {
         let selected = if let PortableInvocationContextIntent::Explicit { selected } = intent {
             let bytes = required(Some(selected))?;
             if bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -1186,14 +1440,21 @@ impl ModelLifecycleController {
             let PortableInvocationContextIntent::Automatic { ceiling } = intent else {
                 unreachable!("portable invocation context intent was matched above")
             };
+            // An ASR invocation holds at least one chunk per sequence, unless
+            // the model's own context is smaller (P2.5).
+            let minimum = if asr {
+                minimum.max(asr_minimum_tokens(variant).min(maximum))
+            } else {
+                minimum
+            };
             if ceiling < minimum {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "published automatic context is below the invocation minimum: context={ceiling}, minimum={minimum}"
                 )));
             }
             let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
                 )));
             }
@@ -1432,6 +1693,13 @@ impl ModelLifecycleController {
             )?;
             return fish_s2_resource_plan(backend, memory);
         }
+        // ASR families price what their loader allocates on every backend;
+        // the catalog figure stays a display value for them.
+        if let Some(plan) =
+            asr_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
+        {
+            return Ok(plan);
+        }
         let estimate = if backend == BackendKind::Cuda {
             model_memory_estimate(variant)
         } else {
@@ -1563,7 +1831,7 @@ impl ModelLifecycleController {
                         live_headroom,
                         "Reclaiming pooled Metal scratch before rejecting the load"
                     );
-                    MetalPoolManager::global().clear_all();
+                    self.flush_metal_pools().await;
                     self.coordinator
                         .resource_authority()
                         .refresh_physical_capacity_after_release();
@@ -1582,6 +1850,73 @@ impl ModelLifecycleController {
             );
             self.unload_model_locked(victim).await?;
         }
+    }
+
+    /// One reconciliation checkpoint for an ASR load, or `None` for other
+    /// families and backends without a device observer (CPU).
+    fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
+        if !asr_memory::is_asr_variant(variant) {
+            return None;
+        }
+        let authority = self.coordinator.resource_authority();
+        let observed = authority.observed_device_usage_bytes()?;
+        Some(DeviceUsageSample {
+            observed,
+            reserved: authority
+                .reserved_bytes_in_domain(self.backend_router.context().backend_kind),
+        })
+    }
+
+    fn asr_state_rows(&self) -> (usize, usize) {
+        let engine = self.core_engine.config();
+        asr_state_rows(
+            engine.automatic_row_limits.retained_sequences,
+            engine.max_retained_sequences,
+            engine.max_staged_transactions,
+        )
+    }
+
+    /// Reserve one ASR request envelope per execution slot for the state
+    /// fits to leave free, or `None` for a variant without one.
+    fn hold_asr_request_envelope(
+        &self,
+        variant: ModelVariant,
+        backend: BackendKind,
+    ) -> Result<Option<ResourceLease>> {
+        let slots = self.coordinator.physical_execution_admission().capacity();
+        let Some(envelope) =
+            super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
+        else {
+            return Ok(None);
+        };
+        let mut resources = ResourceVector::zero();
+        match backend {
+            BackendKind::Cpu => {
+                resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+            }
+            BackendKind::Metal => {
+                resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+            }
+            BackendKind::Cuda => {
+                resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
+                resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
+            }
+        }
+        let lease = self.coordinator.resource_authority().reserve(
+            ReservationOwner::new(
+                ReservationClass::Model,
+                format!("{variant}:asr-request-envelope"),
+            ),
+            resources,
+        )?;
+        info!(
+            model = %variant,
+            request_slots = slots,
+            host_bytes = envelope.host_bytes,
+            accelerator_bytes = envelope.accelerator_bytes,
+            "Holding the ASR request envelope out of the state fits"
+        );
+        Ok(Some(lease))
     }
 
     async fn reserve_model_resources(
@@ -1635,6 +1970,26 @@ impl ModelLifecycleController {
         }
     }
 
+    /// Releases the Metal buffers nothing references any more: izwi's
+    /// padding pool, and Candle's buffer pool, which keeps every released
+    /// buffer until the device next synchronizes (a failed load leaves all of
+    /// its uploads there). Candle reports a failed command buffer once and
+    /// stops tracking it, and releases its pool only after a clean wait, so a
+    /// failed synchronization is retried once.
+    async fn flush_metal_pools(&self) {
+        MetalPoolManager::global().clear_all();
+        for attempt in 1..=2 {
+            match self.core_engine.synchronize_worker_device().await {
+                Ok(()) => return,
+                Err(error) => warn!(
+                    attempt,
+                    error = %error,
+                    "Synchronizing the device to release Candle's buffer pool failed"
+                ),
+            }
+        }
+    }
+
     /// Whether a load failure must trigger the Metal command-buffer OOM
     /// ladder (pooled-scratch flush and one retry before poisoning). Real
     /// Metal backends classify by backend kind; CPU test harnesses opt in
@@ -1676,7 +2031,7 @@ impl ModelLifecycleController {
             // dirty residency state would compound the damage. Fail closed.
             return Err(error);
         }
-        MetalPoolManager::global().clear_all();
+        self.flush_metal_pools().await;
 
         // A retry only makes sense if the flush actually freed enough pooled
         // scratch to fit the model's load peak. Re-probe live headroom after
@@ -1684,8 +2039,15 @@ impl ModelLifecycleController {
         // peak, a second full load is guaranteed to hit the same command-buffer
         // OOM and would burn another GGUF read + F16 materialization + fence
         // (tens of seconds) before poisoning. Skip straight to the poison.
-        let backend = self.backend_router.context().backend_kind;
-        let required_bytes = retry_load_peak_bytes(variant, backend, &self.config.performance);
+        let context = self.backend_router.context();
+        let backend = context.backend_kind;
+        let model_path = self.model_manager.downloaded_model_path(variant);
+        let required_bytes = retry_load_peak_bytes(
+            variant,
+            backend,
+            &self.config.performance,
+            model_path.as_deref().map(|path| (path, &context.device)),
+        );
         self.coordinator
             .resource_authority()
             .refresh_physical_capacity_after_release();
@@ -1776,6 +2138,20 @@ impl ModelLifecycleController {
                 device_capacity,
             )?;
         }
+        if asr_memory::is_asr_variant(variant) {
+            let backend = self.backend_router.context().backend_kind;
+            let slots = self.coordinator.physical_execution_admission().capacity();
+            if let Some(envelope) =
+                super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
+            {
+                let floor_bytes = match backend {
+                    BackendKind::Cuda => envelope.accelerator_bytes,
+                    BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+                };
+                resource_plan.load_authorization =
+                    admit_asr_request_floor(&resource_plan, backend, floor_bytes)?;
+            }
+        }
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
         let portable_load_bytes = match self.backend_router.context().backend_kind {
@@ -1817,6 +2193,7 @@ impl ModelLifecycleController {
             // the peak host/device authorization and authoritative Loading slot
             // are both installed above.
             let weights_started = Instant::now();
+            let usage_before_weights = self.sample_device_usage(variant);
             let instantiated = self.instantiate_model(acquired).await?;
             let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
             let preparation_started = Instant::now();
@@ -1923,6 +2300,36 @@ impl ModelLifecycleController {
             self.core_engine.synchronize_worker_device().await?;
             let upload_fence_ms = fence_started.elapsed().as_secs_f64() * 1000.0;
             self.publish_loaded_model(instantiated).await?;
+            let backend = self.backend_router.context().backend_kind;
+            // Truth reconciliation (ADM-8): the fence has executed every
+            // upload and dropped the staging Candle held, so the observed
+            // growth is what the weights occupy. A load that outgrew its
+            // authorized peak fails here, before any state is fitted beside
+            // a model the ledger under-counts.
+            let observed_weights = match usage_before_weights {
+                Some(before) => match self.sample_device_usage(variant) {
+                    Some(after) => {
+                        let own_bytes = match load_domain_bytes(
+                            resource_plan.load_authorization,
+                            backend,
+                        ) {
+                            ResourceAmount::Known(bytes) => bytes,
+                            ResourceAmount::Unknown => u64::MAX,
+                        };
+                        let observed =
+                            reconcile_observed_growth(variant, "weight load", before, after, own_bytes)?;
+                        info!(
+                            model = %variant,
+                            observed_bytes = observed,
+                            authorized_bytes = own_bytes,
+                            "Observed device growth of the weight load"
+                        );
+                        Some((backend, observed))
+                    }
+                    None => None,
+                },
+                None => None,
+            };
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
             // invocation state so live headroom does not charge the model once
@@ -1931,8 +2338,21 @@ impl ModelLifecycleController {
                 variant,
                 resource_plan.resident_authorization,
                 resource_plan.deferred_resident_authorization,
+                observed_weights,
             )?;
-            let backend = self.backend_router.context().backend_kind;
+            // The request envelope stays out of reach of every state fit below
+            // (ADM-4): the fits spend headroom less pending claims, so held
+            // here, one full chunk per execution slot is still free when the
+            // first request runs beside the fitted state.
+            if asr_memory::is_asr_variant(variant) {
+                // The cached live sample can predate the fence that released
+                // the load's staging; the state fits read a fresh one.
+                self.coordinator
+                    .resource_authority()
+                    .refresh_physical_capacity_after_release();
+            }
+            let request_envelope_hold = self.hold_asr_request_envelope(variant, backend)?;
+            let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
             let state_started = Instant::now();
@@ -2025,7 +2445,11 @@ impl ModelLifecycleController {
                         .collect::<Vec<_>>();
                     let physical_spec =
                         model.granite_speech_physical_state_spec(&stage_graphs)?;
-                    let (retained, retained_uses) = if capability == CapabilityKind::Asr {
+                    // Without resumable prefill the model authors no retained
+                    // route, and its state is not allocated (GRN-8).
+                    let retained_route = capability == CapabilityKind::Asr
+                        && physical_spec.retained.is_some();
+                    let (retained, retained_uses) = if retained_route {
                         let retained_contract = physical_spec.retained.as_ref().ok_or_else(|| {
                             Error::ModelLoadError(
                                 "Granite Speech ASR graph did not author retained decoder state"
@@ -2046,6 +2470,8 @@ impl ModelLifecycleController {
                                 retained_contract,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -2159,7 +2585,18 @@ impl ModelLifecycleController {
                             .iter()
                             .map(|contract| contract.stages.as_ref())
                             .collect::<Vec<_>>();
-                        let physical_spec = loaded.qwen3_physical_state_spec(&stage_graphs)?;
+                        // A configured context wins; otherwise Qwen3-ASR bounds
+                        // its state by one planned chunk per sequence.
+                        let context_bound =
+                            if self.config.max_sequence_length.explicit_tokens().is_some() {
+                                Qwen3AsrContextBound::Configured
+                            } else {
+                                Qwen3AsrContextBound::Automatic {
+                                    retained_rows: self.asr_state_rows().0,
+                                }
+                            };
+                        let physical_spec =
+                            loaded.qwen3_physical_state_spec(&stage_graphs, context_bound)?;
                         let retained_max_tokens = physical_spec.retained_max_tokens;
                         let physical = self
                             .core_engine
@@ -2168,11 +2605,17 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
+                        // The retained pool serves several sequences, but one
+                        // sequence or invocation never exceeds its own bound.
                         self.model_registry.publish_effective_context(
                             variant,
-                            physical.logical_token_reach(),
+                            physical
+                                .logical_token_reach()
+                                .min(physical_spec.sequence_tokens as u64),
                         )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
@@ -2238,11 +2681,26 @@ impl ModelLifecycleController {
                                     .into(),
                             )
                         })?;
-                        let retained_max_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
+                        let native_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
                             Error::ModelLoadError(
                                 "VibeVoice ASR retained decoder state has no context bound".into(),
                             )
                         })?;
+                        // The retained route takes one tokenizer chunk, so
+                        // without a configured context each retained row is
+                        // bounded by one chunk's prompt and duration budget
+                        // (P2.5), not the decoder's native context.
+                        let retained_max_tokens =
+                            if self.config.max_sequence_length.explicit_tokens().is_some() {
+                                native_tokens
+                            } else {
+                                crate::runtime::asr_automatic_context(
+                                    native_tokens,
+                                    loaded.vibevoice_retained_sequence_ceiling()?,
+                                    self.asr_state_rows().0,
+                                )
+                                .1
+                            };
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2250,11 +2708,19 @@ impl ModelLifecycleController {
                                 retained_contract,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
+                        // The legacy invocation route keeps the duration-budget
+                        // ceiling (32,768 decode tokens); its own fit bounds it
+                        // by memory.
+                        let invocation_ceiling = native_tokens.min(
+                            crate::models::architectures::vibevoice::asr::VIBEVOICE_ASR_AUTO_MAX_TOKENS,
+                        ) as u64;
                         self.model_registry.publish_effective_context(
                             variant,
-                            retained.logical_token_reach(),
+                            retained.logical_token_reach().max(invocation_ceiling),
                         )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
@@ -2312,6 +2778,7 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 physical_spec.retained_static_domain,
                                 Some(physical_spec.retained_max_tokens),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         let retained_uses = contracts
@@ -2599,6 +3066,8 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -2986,6 +3455,22 @@ impl ModelLifecycleController {
                 self.model_registry
                     .publish_effective_context(variant, effective_context)?;
             }
+            if let Some(before) = usage_before_state {
+                // State arenas are zero-filled by queued blits; synchronize so
+                // the observation covers what they really occupy.
+                self.core_engine.synchronize_worker_device().await?;
+                if let Some(after) = self.sample_device_usage(variant) {
+                    let observed =
+                        reconcile_observed_growth(variant, "state allocation", before, after, 0)?;
+                    info!(
+                        model = %variant,
+                        observed_bytes = observed,
+                        authorized_bytes = after.reserved.saturating_sub(before.reserved),
+                        "Observed device growth of the state allocation"
+                    );
+                }
+            }
+            drop(request_envelope_hold);
             let state_allocation_ms = state_started.elapsed().as_secs_f64() * 1000.0;
             let binding_started = Instant::now();
             self.bind_loaded_model_bundle_draft(
@@ -3188,13 +3673,15 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
-        is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
-        loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
-        portable_invocation_context_intent,
-        qwen38_representation_memory_estimate, residency_budget_has_capacity,
-        select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
+        admit_asr_request_floor, asr_state_rows, automatic_state_group_budget,
+        estimate_from_tensor_inventory, fish_s2_resource_plan, is_metal_command_buffer_oom,
+        kokoro_effective_context_tokens, loaded_asr_state_publication_route,
+        managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
+        model_resource_plan, now_unix_millis, plan_invocation_allocations,
+        portable_context_reserve_bytes, portable_invocation_context_intent,
+        qwen38_representation_memory_estimate, reconcile_observed_growth,
+        residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
+        validate_scratch_only_invocation_publication, DeviceUsageSample,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
         QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
         QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
@@ -3417,6 +3904,64 @@ mod tests {
                 .unwrap(),
             catalog
         );
+    }
+
+    /// The header census lists every tensor with its stored dtype, shape and
+    /// payload bytes, and the inventory folds the same records.
+    #[test]
+    fn checkpoint_census_records_every_tensor_header() {
+        use super::{checkpoint_census, checkpoint_tensor_inventory, StoredDType};
+        let dir = std::env::temp_dir().join(format!("izwi-census-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("shards")).unwrap();
+        let device = candle_core::Device::Cpu;
+        let zeros = |shape: &[usize], dtype| candle_core::Tensor::zeros(shape, dtype, &device).unwrap();
+        candle_core::safetensors::save(
+            &HashMap::from([
+                ("embed".to_string(), zeros(&[300, 16], candle_core::DType::BF16)),
+                ("norm".to_string(), zeros(&[16], candle_core::DType::F32)),
+            ]),
+            dir.join("shards/model.safetensors"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.nemo"), vec![0u8; 4096]).unwrap();
+
+        let census = checkpoint_census(&dir).unwrap();
+        assert_eq!(census.files.len(), 1);
+        assert_eq!(census.container_fallback_bytes, 4096);
+        let mut tensors = census.files[0]
+            .tensors
+            .iter()
+            .map(|t| (t.name.as_str(), t.dtype, t.shape.clone(), t.stored_bytes))
+            .collect::<Vec<_>>();
+        tensors.sort_by_key(|tensor| tensor.0);
+        assert_eq!(
+            tensors,
+            [
+                ("embed", StoredDType::Dense(candle_core::DType::BF16), vec![300, 16], 9600),
+                ("norm", StoredDType::Dense(candle_core::DType::F32), vec![16], 64),
+            ]
+        );
+        assert_eq!(
+            checkpoint_tensor_inventory(&dir).unwrap(),
+            Some(TensorStorageInventory {
+                total_bytes: 9664,
+                largest_tensor_bytes: 9600,
+                largest_tensor_elements: 4800,
+                tensor_count: 2,
+            })
+        );
+        // Without a readable checkpoint the container size stands in.
+        std::fs::remove_dir_all(dir.join("shards")).unwrap();
+        assert_eq!(
+            checkpoint_tensor_inventory(&dir).unwrap(),
+            Some(TensorStorageInventory {
+                total_bytes: 4096,
+                largest_tensor_bytes: 4096,
+                largest_tensor_elements: 0,
+                tensor_count: 1,
+            })
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -3868,7 +4413,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let performance = crate::performance::PerformanceConfig::default();
-        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance);
+        let peak = |variant, backend| retry_load_peak_bytes(variant, backend, &performance, None);
 
         // Qwen3.8 on Metal (raw block FP8, about 29.9 GiB at load; 51.9 GiB
         // expanded to F16) sits far below the 80 GiB catalog figure that used
@@ -4595,6 +5140,244 @@ mod tests {
         );
     }
 
+    /// Truth reconciliation (ADM-8): growth beyond the authorization plus the
+    /// tolerance fails the load; growth inside it, or matched by leases
+    /// reserved over the same interval (the load's own state, a concurrent
+    /// request), passes and reports the observed bytes.
+    #[test]
+    fn observed_growth_beyond_the_authorization_fails_the_load() {
+        const MIB: u64 = 1024 * 1024;
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let sample = |observed, reserved| DeviceUsageSample { observed, reserved };
+        let authorized = 4 * 1024 * MIB;
+        let tolerance = materialization_tolerance_bytes(authorized);
+        assert_eq!(tolerance, 512 * MIB);
+        assert_eq!(materialization_tolerance_bytes(MIB), 256 * MIB);
+
+        let before = sample(100 * MIB, authorized);
+        let within = sample(100 * MIB + authorized + tolerance, authorized);
+        assert_eq!(
+            reconcile_observed_growth(variant, "weight load", before, within, authorized).unwrap(),
+            authorized + tolerance
+        );
+        let over = sample(within.observed + 1, authorized);
+        let error = reconcile_observed_growth(variant, "weight load", before, over, authorized)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("under-prices"), "{error}");
+
+        // State leases reserved between the samples authorize their growth.
+        let state_before = sample(0, 1_000 * MIB);
+        let state_after = sample(1_200 * MIB, 2_000 * MIB);
+        assert!(reconcile_observed_growth(
+            variant,
+            "state allocation",
+            state_before,
+            state_after,
+            0
+        )
+        .is_ok());
+        let state_unauthorized = sample(1_200 * MIB, 1_000 * MIB);
+        assert!(reconcile_observed_growth(
+            variant,
+            "state allocation",
+            state_before,
+            state_unauthorized,
+            0
+        )
+        .is_err());
+        // A release elsewhere (observed shrinking) never fails a load.
+        assert_eq!(
+            reconcile_observed_growth(variant, "weight load", sample(MIB, 0), sample(0, 0), 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The Granite shape from a live Metal run: after the weights land, live
+    /// headroom (0.8 GB) is below the 1 GiB reserve while planning headroom
+    /// holds gigabytes. The minimum state must still be admitted (against
+    /// planning); live memory caps only growth above it.
+    #[test]
+    fn asr_state_floor_is_admitted_against_planning_when_live_undercounts() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let reserve = GIB;
+        let (floor, growth) =
+            state_fit_budgets(5 * GIB, ResourceAmount::Known(796_545_836), reserve);
+        assert_eq!(floor, 4 * GIB);
+        assert_eq!(growth, 0);
+        assert!(
+            10_485_760 <= floor,
+            "a one-page minimum fits the floor budget"
+        );
+        let (floor, growth) = state_fit_budgets(5 * GIB, ResourceAmount::Known(3 * GIB), reserve);
+        assert_eq!((floor, growth), (4 * GIB, 2 * GIB));
+        // Live never raises growth above the planning floor.
+        let (floor, growth) = state_fit_budgets(2 * GIB, ResourceAmount::Known(9 * GIB), reserve);
+        assert_eq!((floor, growth), (GIB, GIB));
+        assert_eq!(
+            state_fit_budgets(2 * GIB, ResourceAmount::Unknown, reserve),
+            (GIB, GIB)
+        );
+    }
+
+    /// ASR rows: chat's automatic rows (320 on an H100) collapse to 8, never
+    /// below one decode batch; operator rows stay as configured.
+    #[test]
+    fn asr_state_rows_come_from_the_asr_policy_not_chat_rows() {
+        assert_eq!(asr_state_rows(true, 320, 4), (8, 4));
+        assert_eq!(asr_state_rows(true, 320, 16), (16, 16));
+        assert_eq!(asr_state_rows(true, 4, 4), (4, 4));
+        assert_eq!(asr_state_rows(false, 320, 32), (320, 32));
+        assert_eq!(asr_state_rows(true, 0, 0), (1, 1));
+    }
+
+    /// The request floor joins the load authorization before eviction: the
+    /// authorization is the larger of the weight peak and resident weights
+    /// plus the floor.
+    #[test]
+    fn asr_request_floor_joins_the_load_authorization() {
+        let estimate = ModelMemoryEstimate {
+            load_peak_bytes: 1_000,
+            resident_bytes: 800,
+        };
+        let plan = model_resource_plan(BackendKind::Metal, estimate);
+        let unified = |authorization: ResourceVector| authorization.unified_bytes;
+        assert_eq!(
+            unified(admit_asr_request_floor(&plan, BackendKind::Metal, 100).unwrap()),
+            ResourceAmount::Known(1_000)
+        );
+        assert_eq!(
+            unified(admit_asr_request_floor(&plan, BackendKind::Metal, 500).unwrap()),
+            ResourceAmount::Known(1_300)
+        );
+        let cuda = model_resource_plan(BackendKind::Cuda, estimate);
+        let authorization = admit_asr_request_floor(&cuda, BackendKind::Cuda, 500).unwrap();
+        assert_eq!(authorization.device_bytes, ResourceAmount::Known(1_300));
+        assert_eq!(authorization.host_bytes, cuda.load_authorization.host_bytes);
+    }
+
+    /// On a 16 GB M1 Pro-like Metal budget (0.9 × the 12.7 GB working set),
+    /// a state fit that spends everything it may see after the model's
+    /// weights and the held request envelope still leaves one full-chunk
+    /// envelope free once the hold is released (ADM-1, ADM-4).
+    #[test]
+    fn state_fits_leave_one_request_envelope_on_a_16_gb_metal_budget() {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        const BUDGET: u64 = 11_441_804_076;
+        let unified = |bytes| ResourceVector {
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        };
+        // Metal-allocated resident weights from the residency plans.
+        for (variant, resident_gib) in [
+            (ModelVariant::Qwen3Asr06BGguf, 1.54),
+            (ModelVariant::Qwen3Asr17BGguf, 3.30),
+            (ModelVariant::Lfm25Audio15BGguf, 2.08),
+            (ModelVariant::GraniteSpeech412BPlus, 5.87),
+        ] {
+            let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                Arc::new(VectorCapacityProvider {
+                    snapshot: PhysicalCapacitySnapshot {
+                        capacity: unified(BUDGET),
+                        available: unified(BUDGET),
+                        source: CapacitySource::Test,
+                    },
+                }),
+            ));
+            let resident = (resident_gib * GIB) as u64;
+            let _model = authority
+                .reserve_with_initial_materialized(
+                    ReservationOwner::new(ReservationClass::Model, "weights"),
+                    unified(resident),
+                    unified(resident),
+                )
+                .unwrap();
+            let envelope = super::super::asr_envelope::deferred_request_envelope(
+                variant,
+                BackendKind::Metal,
+                1,
+            )
+            .unwrap()
+            .unwrap()
+            .total_bytes()
+            .unwrap();
+            let hold = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Model, "envelope"),
+                    unified(envelope),
+                )
+                .unwrap();
+            let ResourceAmount::Known(fit) = authority
+                .state_fit_headroom_bytes(BackendKind::Metal)
+                .unwrap()
+            else {
+                panic!("known headroom");
+            };
+            let _state = authority
+                .reserve(
+                    ReservationOwner::new(ReservationClass::Cache, "greedy-state"),
+                    unified(fit),
+                )
+                .unwrap();
+            drop(hold);
+            let ResourceAmount::Known(left) = authority
+                .planning_headroom_bytes(BackendKind::Metal)
+                .unwrap()
+            else {
+                panic!("known headroom");
+            };
+            assert!(left >= envelope, "{variant}: {left} < {envelope}");
+            assert!(fit > 0, "{variant}");
+        }
+    }
+
+    /// The weight lease records the smaller of the estimate and the observed
+    /// growth: priced bytes the loader never allocated stay pending.
+    #[tokio::test]
+    async fn observed_weight_growth_is_recorded_as_materialized() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-observed-weights-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let authority = vector_authority(all_memory_capacity(1024));
+        let bytes = |n| ResourceVector {
+            unified_bytes: ResourceAmount::Known(n),
+            ..ResourceVector::zero()
+        };
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "observed-weights"),
+                bytes(256),
+            )
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, lease)
+            .unwrap();
+        runtime
+            .model_lifecycle
+            .finalize_slot_materialization_with_pending(
+                variant,
+                bytes(200),
+                ResourceVector::zero(),
+                Some((BackendKind::Metal, 150)),
+            )
+            .unwrap();
+        let snapshot = authority.snapshot();
+        assert_eq!(snapshot.reserved, bytes(200));
+        assert_eq!(snapshot.materialized, bytes(150));
+        assert_eq!(snapshot.pending, bytes(50));
+        assert!(runtime.model_lifecycle.remove_resident_slot(variant));
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
     #[test]
     fn explicit_invocation_context_remains_mandatory_after_state_publication() {
         let explicit = ContextLengthPreference::explicit(32_768).unwrap();
@@ -4751,7 +5534,7 @@ mod tests {
             .unwrap();
         runtime
             .model_lifecycle
-            .finalize_slot_materialization_with_pending(variant, bytes(64), bytes(16))
+            .finalize_slot_materialization_with_pending(variant, bytes(64), bytes(16), None)
             .unwrap();
         assert!(matches!(
             authority.reserve(
@@ -5278,8 +6061,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn idle_reaper_unloads_idle_transient_models_but_preserves_pins() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-reap-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();
@@ -5391,8 +6178,12 @@ mod tests {
         std::fs::remove_dir_all(models_dir).unwrap();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn residency_budget_evicts_granite_before_loading_another_asr_model() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let models_dir =
             std::env::temp_dir().join(format!("izwi-runtime-residency-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&models_dir).unwrap();

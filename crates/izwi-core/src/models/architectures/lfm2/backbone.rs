@@ -375,7 +375,8 @@ struct ProjectionHead {
 
 pub struct QuantizedLfm2Backbone {
     cfg: Lfm2BackboneConfig,
-    token_embeddings: Embedding,
+    /// `None` for a backbone that only runs on supplied embeddings.
+    token_embeddings: Option<Embedding>,
     output_head: ProjectionHead,
     layers: Vec<LayerWeights>,
     norm: LfmRmsNorm,
@@ -1044,38 +1045,70 @@ impl ProjectionHead {
 
 impl QuantizedLfm2Backbone {
     pub fn load(loader: &GgufLoader, cfg: Lfm2BackboneConfig, device: &Device) -> Result<Self> {
+        Self::load_inner(loader, cfg, device, true)
+    }
+
+    /// A backbone that only ever runs on supplied embeddings, such as the
+    /// LFM2.5-Audio detokenizer: its token-embedding table (dequantized to
+    /// F32 by [`Self::load`]) is never read, so it is not loaded.
+    pub fn load_for_embeds(
+        loader: &GgufLoader,
+        cfg: Lfm2BackboneConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::load_inner(loader, cfg, device, false)
+    }
+
+    fn load_inner(
+        loader: &GgufLoader,
+        cfg: Lfm2BackboneConfig,
+        device: &Device,
+        with_token_embeddings: bool,
+    ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
-        let (cos, sin) = precompute_freqs(
-            cfg.embedding_length / cfg.attention_head_count,
-            cfg.rope_freq_base as f32,
-            cfg.context_length,
-            device,
-        )?;
+        let (context_length, head_dim) = rope_table_geometry(&cfg)?;
+        let (cos, sin) =
+            precompute_freqs(head_dim, cfg.rope_freq_base as f32, context_length, device)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
-        let token_embedding_q = load_qtensor_any(
-            loader,
-            device,
-            &[
-                "token_embd.weight".to_string(),
-                "tok_embeddings.weight".to_string(),
-                "model.embed_tokens.weight".to_string(),
-                "lfm.embed_tokens.weight".to_string(),
-                "emb.emb.weight".to_string(),
-                "emb.weight".to_string(),
-            ],
-        )?;
-        let token_embeddings_weight = token_embedding_q.dequantize(device).map_err(Error::from)?;
-        let (vocab_size, hidden_size) = token_embeddings_weight.dims2()?;
+        let embedding_names = [
+            "token_embd.weight".to_string(),
+            "tok_embeddings.weight".to_string(),
+            "model.embed_tokens.weight".to_string(),
+            "lfm.embed_tokens.weight".to_string(),
+            "emb.emb.weight".to_string(),
+            "emb.weight".to_string(),
+        ];
+        let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
+            let token_embedding_q = load_qtensor_any(loader, device, &embedding_names)?;
+            let weight = token_embedding_q.dequantize(device).map_err(Error::from)?;
+            let (vocab_size, hidden_size) = weight.dims2()?;
+            (
+                Some(Embedding::new(weight, hidden_size)),
+                vocab_size,
+                hidden_size,
+            )
+        } else {
+            let shape = embedding_names
+                .iter()
+                .find_map(|name| loader.tensor_shape(name))
+                .ok_or_else(|| {
+                    Error::ModelLoadError("LFM2 GGUF has no token-embedding tensor".into())
+                })?;
+            let [vocab_size, hidden_size] = shape[..] else {
+                return Err(Error::ModelLoadError(format!(
+                    "LFM2 token embedding has shape {shape:?}, expected two dimensions"
+                )));
+            };
+            (None, vocab_size, hidden_size)
+        };
         if hidden_size != cfg.embedding_length {
             return Err(Error::ModelLoadError(format!(
                 "LFM2 embedding width mismatch: GGUF has {hidden_size}, metadata says {}",
                 cfg.embedding_length
             )));
         }
-
-        let token_embeddings = Embedding::new(token_embeddings_weight, hidden_size);
         let norm = LfmRmsNorm::from_qtensor(
             load_qtensor_any(
                 loader,
@@ -1301,6 +1334,10 @@ impl QuantizedLfm2Backbone {
 
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
         self.token_embeddings
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InferenceError("LFM2 backbone was loaded without token embeddings".into())
+            })?
             .forward(token_ids)
             .map_err(Error::from)
     }
@@ -1363,11 +1400,7 @@ impl QuantizedLfm2Backbone {
                 "LFM2 retained decode batch is empty".into(),
             ));
         }
-        let input = Tensor::from_slice(
-            token_ids,
-            (batch, 1),
-            self.token_embeddings.embeddings().device(),
-        )?;
+        let input = Tensor::from_slice(token_ids, (batch, 1), self.norm.weight.device())?;
         let embeds = self.embed_tokens(&input)?;
         let hidden = self.forward_embeds_retained_step_batch(&embeds, positions, states, caches)?;
         self.project_last_hidden(&hidden)
@@ -1872,6 +1905,18 @@ fn normalize_shortconv_weight(
     conv_weight.contiguous().map_err(Error::from)
 }
 
+/// The (positions, head dim) of the RoPE cos/sin tables a backbone
+/// precomputes at load: F32 `cos` and `sin` of `[positions, head_dim / 2]`
+/// plus their `[positions, head_dim]` concatenation. Load admission prices
+/// them (`runtime/lifecycle/asr_memory.rs`).
+pub(crate) fn rope_table_geometry(cfg: &Lfm2BackboneConfig) -> Result<(usize, usize)> {
+    let head_dim = cfg
+        .embedding_length
+        .checked_div(cfg.attention_head_count)
+        .ok_or_else(|| Error::ModelLoadError("LFM2 attention head count is zero".into()))?;
+    Ok((cfg.context_length, head_dim))
+}
+
 fn precompute_freqs(
     head_dim: usize,
     freq_base: f32,
@@ -1956,6 +2001,108 @@ mod tests {
     };
     use crate::kv::v2::StateComponentId;
     use candle_core::{DType, Device, Tensor};
+
+    #[test]
+    fn embeds_only_backbone_skips_the_token_table_and_matches_the_full_load() {
+        use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+        use gguf_file::Value;
+
+        let path = std::env::temp_dir().join(format!(
+            "izwi-lfm2-embeds-only-{}.gguf",
+            uuid::Uuid::new_v4()
+        ));
+        let metadata = [
+            ("general.architecture", Value::String("lfm2".into())),
+            ("lfm2.block_count", Value::U32(2)),
+            ("lfm2.context_length", Value::U32(32)),
+            ("lfm2.embedding_length", Value::U32(4)),
+            ("lfm2.attention.head_count", Value::U32(1)),
+            (
+                "lfm2.attention.head_count_kv",
+                Value::Array(vec![Value::U32(1), Value::U32(0)]),
+            ),
+            ("lfm2.attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+            ("lfm2.shortconv.l_cache", Value::U32(3)),
+        ];
+        let mut weights = vec![];
+        let mut seed = 0u32;
+        let mut add = |name: String, shape: &[usize]| {
+            let elements = shape.iter().product::<usize>();
+            let values = (0..elements)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                })
+                .collect::<Vec<_>>();
+            let tensor = Tensor::from_vec(values, shape, &Device::Cpu).unwrap();
+            weights.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
+        };
+        add("token_embd.weight".into(), &[7, 4]);
+        add("output_norm.weight".into(), &[4]);
+        add("dense_2.weight".into(), &[5, 4]);
+        for layer in 0..2 {
+            for name in ["attn_norm", "ffn_norm"] {
+                add(format!("blk.{layer}.{name}.weight"), &[4]);
+            }
+            for name in ["ffn_gate", "ffn_up", "ffn_down"] {
+                add(format!("blk.{layer}.{name}.weight"), &[4, 4]);
+            }
+        }
+        for name in ["attn_q_norm", "attn_k_norm"] {
+            add(format!("blk.0.{name}.weight"), &[4]);
+        }
+        for name in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+            add(format!("blk.0.{name}.weight"), &[4, 4]);
+        }
+        add("blk.1.shortconv.in_proj.weight".into(), &[12, 4]);
+        add("blk.1.shortconv.out_proj.weight".into(), &[4, 4]);
+        add("blk.1.shortconv.conv.weight".into(), &[4, 3]);
+        let mut file = std::fs::File::create(&path).unwrap();
+        gguf_file::write(
+            &mut file,
+            &metadata
+                .iter()
+                .map(|(name, value)| (*name, value))
+                .collect::<Vec<_>>(),
+            &weights
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        drop(file);
+        let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&path).unwrap();
+        let config = super::super::config::parse_lfm2_backbone_config(&loader).unwrap();
+        let full =
+            super::QuantizedLfm2Backbone::load(&loader, config.clone(), &Device::Cpu).unwrap();
+        let embeds_only =
+            super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, &Device::Cpu).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(full.token_embeddings.is_some());
+        assert!(embeds_only.token_embeddings.is_none());
+        assert_eq!(embeds_only.vocab_size(), full.vocab_size());
+        let ids = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
+        assert!(embeds_only.embed_tokens(&ids).is_err());
+
+        let embeds = Tensor::from_vec(
+            (0..12).map(|v| (v as f32 * 0.37).sin()).collect::<Vec<_>>(),
+            (1, 3, 4),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let project = |backbone: &super::QuantizedLfm2Backbone| {
+            let hidden = backbone.forward_embeds_stateless(&embeds).unwrap();
+            backbone
+                .project_hidden(&hidden)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(project(&embeds_only), project(&full));
+    }
 
     #[test]
     fn lfm2_batched_rotary_matches_scalar_at_ragged_positions() {

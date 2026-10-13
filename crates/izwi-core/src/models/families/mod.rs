@@ -50,7 +50,10 @@ const QWEN3_ASR_VARIANTS: &[ModelVariant] =
     &[ModelVariant::Qwen3Asr06BGguf, ModelVariant::Qwen3Asr17BGguf];
 const VIBEVOICE_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::VibeVoiceAsr];
 const NEMOTRON_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::Nemotron35AsrStreaming06B];
-const GRANITE_SPEECH_ASR_VARIANTS: &[ModelVariant] = &[ModelVariant::GraniteSpeech412BPlus];
+const GRANITE_SPEECH_ASR_VARIANTS: &[ModelVariant] = &[
+    ModelVariant::GraniteSpeech412B,
+    ModelVariant::GraniteSpeech412BPlus,
+];
 const SORTFORMER_DIARIZATION_VARIANTS: &[ModelVariant] =
     &[ModelVariant::DiarStreamingSortformer4SpkV21, ModelVariant::Nemotron3Diarization];
 const QWEN3_CHAT_VARIANTS: &[ModelVariant] = &[

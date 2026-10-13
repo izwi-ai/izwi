@@ -487,6 +487,11 @@ impl Tokenizer {
         self.inner.token_to_id(token)
     }
 
+    /// The vocabulary piece for `id`, before any decoder normalization.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
     pub fn special_tokens(&self) -> &SpecialTokens {
         &self.special_tokens
     }

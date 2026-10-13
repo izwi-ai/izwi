@@ -165,7 +165,8 @@ selected model or forced aligner can provide word timing metadata.
 | `Qwen3-ASR-1.7B-GGUF` | 2.5 GB | Medium | Better |
 | `VibeVoice-ASR` | 16.2 GB | Medium | Microsoft long-form ASR checkpoint |
 | `Nemotron-3.5-ASR-Streaming-0.6B` | 2.37 GB | Medium | 40-locale NVIDIA FastConformer-RNNT; native offline transcription with prompt-conditioned language control |
-| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with prompt guidance and word timestamps |
+| `Granite-Speech-4.1-2B` | 4.6 GB | Medium | IBM ASR with punctuated, capitalized transcripts |
+| `Granite-Speech-4.1-2B-Plus` | 4.2 GB | Medium | IBM rich transcription model with speaker turns and native word timestamps; unpunctuated |
 | `LFM2.5-Audio-1.5B-GGUF` | 1.2 GB | Medium | Unified audio model with transcription support |
 | `Voxtral-Mini-4B-Realtime-2602` | 8 GB | Medium | Rust/Candle offline transcription; realtime planned |
 
