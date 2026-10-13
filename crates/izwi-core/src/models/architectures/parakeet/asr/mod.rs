@@ -23,7 +23,8 @@ use crate::backends::{BackendKind, DTypeSelection, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kernels::f16_weight_linear::{
-    PointwiseConv1d, ProjectionLinear, F16_PROJECTION_MAX_RELATIVE_L2,
+    load_weight_only_f16, PointwiseConv1d, ProjectionLinear, WeightOnlyF16Load,
+    F16_PROJECTION_MAX_RELATIVE_L2,
 };
 use crate::kernels::numeric_check::{
     run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
@@ -63,7 +64,7 @@ pub(crate) const PARAKEET_ASR_DTYPE_ENV: &str = "IZWI_PARAKEET_ASR_DTYPE";
 /// stays F32 as in whisper.cpp's Parakeet converter: subsampling convs,
 /// depthwise conv and BatchNorm, LayerNorms, biases, positional biases, and
 /// the TDT predictor and joint. Activations are F32 throughout. A failed
-/// load-time self-check still falls back to F32 ([`ParakeetWeightPrecision`]).
+/// load-time self-check still falls back to F32 ([`load_weight_only_f16`]).
 pub(crate) fn resolve_parakeet_projection_precision(device: &DeviceProfile) -> DTypeSelection {
     let family = std::env::var(PARAKEET_ASR_DTYPE_ENV).ok();
     device.resolve_metal_weight_only_f16(
@@ -104,33 +105,6 @@ pub(crate) fn parakeet_tensor_is_f16_projection(name: &str) -> bool {
                 | "conv.pointwise_conv1.weight"
                 | "conv.pointwise_conv2.weight"
         )
-}
-
-/// The encoder projection precision a Parakeet model loaded with, and why.
-#[derive(Debug, Clone)]
-pub(crate) struct ParakeetWeightPrecision {
-    projections_f16: bool,
-    reason: String,
-    self_check: Option<NumericSelfCheckReport>,
-}
-
-impl ParakeetWeightPrecision {
-    fn dense(reason: impl Into<String>) -> Self {
-        Self {
-            projections_f16: false,
-            reason: reason.into(),
-            self_check: None,
-        }
-    }
-
-    fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({
-            "projection_weights": if self.projections_f16 { "F16" } else { "F32" },
-            "activations": "F32",
-            "reason": self.reason,
-            "self_check": self.self_check.as_ref().map(NumericSelfCheckReport::diagnostics),
-        })
-    }
 }
 
 /// The host-side builder for weights that load in F16: they are read on the
@@ -510,7 +484,7 @@ pub struct ParakeetAsrModel {
     num_durations: usize,
     max_symbols: usize,
     encoder_windowing: EncoderWindowing,
-    weight_precision: ParakeetWeightPrecision,
+    weight_precision: WeightOnlyF16Load,
 }
 
 enum ParakeetDecoder {
@@ -1486,7 +1460,7 @@ impl ParakeetNetwork {
     fn load(
         vb: &VarBuilder,
         projection_precision: DTypeSelection,
-    ) -> Result<(Self, ParakeetWeightPrecision)> {
+    ) -> Result<(Self, WeightOnlyF16Load)> {
         let (encoder, weight_precision) = ParakeetEncoder::load_with_precision(
             vb.pp("encoder"),
             EncoderGeometry::V3,
@@ -1708,46 +1682,20 @@ impl ParakeetEncoder {
         })
     }
 
-    /// Loads the encoder at `precision` (F16 = weight-only F16 projections).
-    /// F16 projections are kept only if [`Self::weight_only_f16_self_check`]
-    /// passes; otherwise the encoder reloads with every weight in F32 and the
-    /// reason is recorded.
+    /// Loads the encoder at `precision` (F16 = weight-only F16 projections),
+    /// keeping F16 only if [`Self::weight_only_f16_self_check`] passes.
     fn load_with_precision(
         vb: VarBuilder,
         geometry: EncoderGeometry,
         precision: DTypeSelection,
-    ) -> Result<(Self, ParakeetWeightPrecision)> {
-        if precision.dtype != DType::F16 {
-            let encoder = Self::load(vb, geometry, None)?;
-            return Ok((encoder, ParakeetWeightPrecision::dense(precision.reason)));
-        }
-        let device = vb.device().clone();
-        let encoder = Self::load(vb.clone(), geometry, Some(&device))?;
-        let report = encoder.weight_only_f16_self_check(&vb);
-        if report.passed {
-            return Ok((
-                encoder,
-                ParakeetWeightPrecision {
-                    projections_f16: true,
-                    reason: precision.reason.into_owned(),
-                    self_check: Some(report),
-                },
-            ));
-        }
-        tracing::warn!(
-            "Parakeet weight-only F16 failed its load-time self-check; reloading in F32: {}",
-            report.reason
-        );
-        drop(encoder);
-        let encoder = Self::load(vb, geometry, None)?;
-        Ok((
-            encoder,
-            ParakeetWeightPrecision {
-                projections_f16: false,
-                reason: format!("{}; fell back to F32", report.reason),
-                self_check: Some(report),
-            },
-        ))
+    ) -> Result<(Self, WeightOnlyF16Load)> {
+        load_weight_only_f16(
+            "Parakeet",
+            &precision,
+            &vb.device().clone(),
+            |f16| Self::load(vb.clone(), geometry, f16),
+            |encoder| encoder.weight_only_f16_self_check(&vb),
+        )
     }
 
     /// Checks the F16 conversion against the original F32 weight of the first
@@ -2855,8 +2803,8 @@ mod tests {
         tdt_word_timestamps, EncoderGeometry, EncoderWindow, EncoderWindowing, Joint, LstmCell,
         ParakeetAsrModel, ParakeetDecoder, ParakeetEncoded, ParakeetEncoder, ParakeetLogMel,
         ParakeetNetwork, ParakeetPreparedEncoderArtifact, ParakeetPreprocessor,
-        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings,
-        ParakeetWeightPrecision, Predictor, TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
+        ParakeetRetainedDecodeBatchRow, ParakeetRetainedDecodeStep, ParakeetTimings, Predictor,
+        TdtTokenFrame, DEFAULT_MAX_SYMBOLS, PRED_HIDDEN,
     };
     use crate::backends::{BackendKind, DTypeSelection};
     use crate::error::{Error, Result};
@@ -2864,6 +2812,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{Linear, VarBuilder};
 
+    use crate::kernels::f16_weight_linear::WeightOnlyF16Load;
     use crate::kernels::numeric_check::{host_f32, relative_l2};
 
     /// Small enough to run on CPU in milliseconds; two layers keep conv edge
@@ -3127,7 +3076,7 @@ mod tests {
             num_durations,
             max_symbols: DEFAULT_MAX_SYMBOLS,
             encoder_windowing: EncoderWindowing::V3,
-            weight_precision: ParakeetWeightPrecision::dense("test"),
+            weight_precision: WeightOnlyF16Load::dense("test"),
         }
     }
 

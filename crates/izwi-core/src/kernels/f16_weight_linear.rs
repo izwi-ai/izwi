@@ -24,7 +24,8 @@ use candle_core::quantized::{GgmlDType, QStorage, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Conv1d, Linear};
 
-use super::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+use super::numeric_check::{host_f32, relative_l2, xorshift_tensor, NumericSelfCheckReport};
+use crate::backends::DTypeSelection;
 
 /// ggml's `mul_mm` reads the reduction dimension in blocks of 32 with no tail.
 const GGML_MUL_MM_K_BLOCK: usize = 32;
@@ -215,6 +216,80 @@ impl F16WeightLinear {
             &host_f32(&reference)?,
         ))
     }
+}
+
+/// The projection precision a model loaded with, and why.
+#[derive(Debug, Clone)]
+pub struct WeightOnlyF16Load {
+    pub projections_f16: bool,
+    pub reason: String,
+    pub self_check: Option<NumericSelfCheckReport>,
+}
+
+impl WeightOnlyF16Load {
+    pub fn dense(reason: impl Into<String>) -> Self {
+        Self {
+            projections_f16: false,
+            reason: reason.into(),
+            self_check: None,
+        }
+    }
+
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "projection_weights": if self.projections_f16 { "F16" } else { "F32" },
+            "activations": "F32",
+            "reason": self.reason,
+            "self_check": self.self_check.as_ref().map(NumericSelfCheckReport::diagnostics),
+        })
+    }
+}
+
+/// Loads a model at `precision` (F16 = weight-only F16 projections on
+/// `device`, from `DeviceProfile::resolve_metal_weight_only_f16`). `load`
+/// builds the model with its projections in F16 on the given device, or all
+/// dense with `None`. The F16 model is kept only if `self_check` passes;
+/// otherwise it is dropped, the model reloads dense, and the reason is
+/// recorded.
+pub fn load_weight_only_f16<T, E>(
+    label: &str,
+    precision: &DTypeSelection,
+    device: &Device,
+    mut load: impl FnMut(Option<&Device>) -> std::result::Result<T, E>,
+    self_check: impl FnOnce(&T) -> NumericSelfCheckReport,
+) -> std::result::Result<(T, WeightOnlyF16Load), E> {
+    if precision.dtype != DType::F16 {
+        return Ok((
+            load(None)?,
+            WeightOnlyF16Load::dense(precision.reason.clone()),
+        ));
+    }
+    let model = load(Some(device))?;
+    let report = self_check(&model);
+    if report.passed {
+        return Ok((
+            model,
+            WeightOnlyF16Load {
+                projections_f16: true,
+                reason: precision.reason.to_string(),
+                self_check: Some(report),
+            },
+        ));
+    }
+    tracing::warn!(
+        "{label} weight-only F16 failed its load-time self-check; reloading in F32: {}",
+        report.reason
+    );
+    drop(model);
+    let model = load(None)?;
+    Ok((
+        model,
+        WeightOnlyF16Load {
+            projections_f16: false,
+            reason: format!("{}; fell back to F32", report.reason),
+            self_check: Some(report),
+        },
+    ))
 }
 
 /// A projection held dense (Candle's `Linear`, any dtype) or weight-only F16.
@@ -416,6 +491,62 @@ mod tests {
         let wrong = (dense.weight() * -1.0).unwrap();
         let rel = f16.check_against(&wrong, dense.bias(), 8).unwrap();
         assert!(rel > F16_PROJECTION_MAX_RELATIVE_L2, "{rel:e}");
+    }
+
+    #[test]
+    fn weight_only_f16_load_keeps_f16_only_when_the_self_check_passes() {
+        use crate::kernels::numeric_check::{run_numeric_self_check, F16_SAFE_MAX_ABS};
+
+        let device = Device::Cpu;
+        let (dense, _) = layers(8, 32, false, &device);
+        let precision = |dtype| DTypeSelection {
+            dtype,
+            reason: "test policy".into(),
+        };
+        let load = |f16: Option<&Device>| ProjectionLinear::new(dense.clone(), f16);
+        let check = |scale: f32| {
+            move |layer: &ProjectionLinear| {
+                run_numeric_self_check("probe", F16_SAFE_MAX_ABS, || {
+                    let x = xorshift_tensor(&[2, 32], 1, scale, &Device::Cpu)?;
+                    Ok::<_, candle_core::Error>(vec![("y".into(), layer.forward(&x)?)])
+                })
+            }
+        };
+
+        let (layer, outcome) =
+            load_weight_only_f16("test", &precision(DType::F16), &device, load, check(1.0))
+                .unwrap();
+        assert!(outcome.projections_f16 && layer.as_f16().is_some());
+        assert!(outcome.self_check.unwrap().passed);
+
+        let mut loads = Vec::new();
+        let (layer, outcome) = load_weight_only_f16(
+            "test",
+            &precision(DType::F16),
+            &device,
+            |f16| {
+                loads.push(f16.is_some());
+                load(f16)
+            },
+            check(1.0e9),
+        )
+        .unwrap();
+        assert_eq!(loads, [true, false]);
+        assert!(!outcome.projections_f16 && layer.as_f16().is_none());
+        assert!(
+            outcome.reason.ends_with("fell back to F32"),
+            "{}",
+            outcome.reason
+        );
+        assert_eq!(outcome.diagnostics()["projection_weights"], "F32");
+
+        let (layer, outcome) =
+            load_weight_only_f16("test", &precision(DType::F32), &device, load, |_| {
+                unreachable!("no self-check for a dense load")
+            })
+            .unwrap();
+        assert!(layer.as_f16().is_none() && outcome.self_check.is_none());
+        assert_eq!(outcome.reason, "test policy");
     }
 
     #[test]
