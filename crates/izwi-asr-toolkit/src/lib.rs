@@ -266,10 +266,15 @@ pub fn plan_audio_chunks(
         }
 
         if total.saturating_sub(next_start) < min_chunk_samples {
-            if let Some(last) = chunks.last_mut() {
+            // Fold a short tail into the last chunk only while that chunk
+            // stays within the hard maximum; the model cannot see past it.
+            if let Some(last) = chunks
+                .last_mut()
+                .filter(|last| total - last.start_sample <= hard_max_samples)
+            {
                 last.end_sample = total;
+                break;
             }
-            break;
         }
 
         start = next_start;
@@ -1160,6 +1165,24 @@ mod tests {
         let max_allowed = secs_to_samples(20.0, sr as f32);
         for chunk in &chunks {
             assert!(chunk.len_samples() <= max_allowed);
+        }
+    }
+
+    /// A tail shorter than the minimum chunk is folded into the last chunk
+    /// only when that keeps the chunk within the hard maximum.
+    #[test]
+    fn short_tail_never_stretches_a_chunk_past_the_hard_maximum() {
+        let cfg = AsrLongFormConfig::default();
+        let sr = 1_000u32;
+        let max_allowed = secs_to_samples(28.5, sr as f32);
+        for tenths in 286..=340 {
+            let samples = vec![0.0f32; tenths * 100];
+            let chunks = plan_audio_chunks(&samples, sr, &cfg, Some(28.5));
+            assert!(chunks.len() > 1, "{tenths}");
+            assert_eq!(chunks.last().unwrap().end_sample, samples.len());
+            for chunk in &chunks {
+                assert!(chunk.len_samples() <= max_allowed, "{tenths}: {chunk:?}");
+            }
         }
     }
 
