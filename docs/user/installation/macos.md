@@ -145,7 +145,9 @@ model fully in F32.
 Voxtral Realtime keeps its F16 default on Metal and now runs a short
 encoder-and-decoder self-check at load; if it fails, Voxtral loads in F32 and
 the reason appears under `execution.precision`. `IZWI_METAL_DTYPE=f32` runs it
-in F32. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
+in F32. Qwen3-ASR (GGUF) checks its audio encoder and its text model the same
+way, each falling back to F32 on its own (`execution.audio_precision` and
+`execution.text_precision`); `IZWI_METAL_DTYPE=f32` now also applies to it. On Apple M3 and newer GPUs, BF16 is the intended default for Granite,
 Voxtral, VibeVoice and Qwen3-ASR, but it stays off until izwi's Metal attention
 kernels support BF16; those GPUs use F16 for now.
 

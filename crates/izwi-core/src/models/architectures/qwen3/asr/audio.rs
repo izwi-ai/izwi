@@ -539,6 +539,11 @@ impl AudioTower {
         })
     }
 
+    /// Mel bins per input feature frame.
+    pub(crate) fn mel_bins(&self) -> usize {
+        self.cfg.num_mel_bins
+    }
+
     pub fn forward(&self, mel: &Tensor, feature_lens: Option<&[usize]>) -> Result<Tensor> {
         let bsz = mel.dim(0)?;
         let total_frames = mel.dim(3)?;
@@ -952,6 +957,11 @@ fn gelu(x: &Tensor) -> Result<Tensor> {
 }
 
 #[cfg(test)]
+pub(crate) fn tiny_audio_tower_for_test(device: &candle_core::Device) -> AudioTower {
+    tests::tiny_audio_tower(device)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use candle_core::shape::ShapeWithOneHole;
@@ -1002,7 +1012,7 @@ mod tests {
         )
     }
 
-    fn tiny_audio_tower(device: &Device) -> AudioTower {
+    pub(super) fn tiny_audio_tower(device: &Device) -> AudioTower {
         let cfg = AudioConfig {
             d_model: 4,
             encoder_attention_heads: 1,
