@@ -264,8 +264,7 @@ impl Lfm25AudioHead {
             profile.codebook_steps = profile.codebook_steps.saturating_add(1);
         }
 
-        let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
-        Ok((Lfm25SampledAudioFrame { samples, embedding }, profile))
+        Ok((self.finish_frame(samples, hidden.device())?, profile))
     }
 
     pub(crate) fn sample_audio_frame_retained(
@@ -326,8 +325,7 @@ impl Lfm25AudioHead {
                     self.depth_embeddings[codebook_idx].embed_sample(&sample, hidden.device())?;
                 samples.push(sample);
             }
-            let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
-            return Ok(vec![Lfm25SampledAudioFrame { samples, embedding }]);
+            return Ok(vec![self.finish_frame(samples, hidden.device())?]);
         }
 
         let depth_input = self.depth_linear.forward(hidden)?.reshape((
@@ -366,10 +364,7 @@ impl Lfm25AudioHead {
             next_embed = Tensor::stack(&embeds.iter().collect::<Vec<_>>(), 0)?;
         }
         rows.into_iter()
-            .map(|samples| {
-                let embedding = self.embed_sampled_audio_frame(&samples, hidden.device())?;
-                Ok(Lfm25SampledAudioFrame { samples, embedding })
-            })
+            .map(|samples| self.finish_frame(samples, hidden.device()))
             .collect()
     }
 
@@ -494,11 +489,16 @@ impl Lfm25AudioHead {
         })
     }
 
-    fn embed_sampled_audio_frame(
+    /// Close one sampled frame as the references do: when codebook 0 is
+    /// end-of-audio, every codebook becomes end-of-audio (`next_token[:] =
+    /// 2048` in liquid-audio, the same in llama.cpp), and the frame embedding
+    /// fed back to the backbone is built from those codes. Device-resident
+    /// codes stay on device; the override is a `where` on the stacked codes.
+    fn finish_frame(
         &self,
-        samples: &[CodebookSample],
+        samples: Vec<CodebookSample>,
         device: &Device,
-    ) -> Result<Tensor> {
+    ) -> Result<Lfm25SampledAudioFrame> {
         if samples.len() != self.codebooks {
             return Err(Error::InvalidInput(format!(
                 "Expected {} audio codebooks, received {}",
@@ -506,33 +506,73 @@ impl Lfm25AudioHead {
                 samples.len()
             )));
         }
-
         if samples
             .iter()
-            .all(|sample| matches!(sample, CodebookSample::DeviceGreedy(_)))
+            .all(|sample| matches!(sample, CodebookSample::Host(_)))
         {
-            let tensors = samples
+            let mut tokens = samples
                 .iter()
-                .filter_map(|sample| match sample {
-                    CodebookSample::DeviceGreedy(token) => Some(token),
-                    CodebookSample::Host(_) => None,
-                })
-                .collect::<Vec<_>>();
-            let token_ids = Tensor::cat(&tensors, 0)?
-                .broadcast_add(&self.codebook_offsets_tensor)?
-                .reshape((1, self.codebooks))?
-                .contiguous()?;
-            let embeds = self.frame_embedding.forward(&token_ids)?;
-            let embeds = embeds.sum(1)?;
-            return embeds.unsqueeze(1).map_err(Error::from);
+                .map(CodebookSample::to_token)
+                .collect::<Result<Vec<_>>>()?;
+            end_of_audio_frame_host(&mut tokens, self.audio_end_token_id);
+            let embedding = self.embed_audio_frame(&tokens, device)?;
+            return Ok(Lfm25SampledAudioFrame {
+                samples: tokens.into_iter().map(CodebookSample::Host).collect(),
+                embedding,
+            });
         }
 
         let tokens = samples
             .iter()
-            .map(CodebookSample::to_token)
+            .map(|sample| match sample {
+                CodebookSample::Host(token) => {
+                    Tensor::from_vec(vec![*token], (1,), device).map_err(Error::from)
+                }
+                CodebookSample::DeviceGreedy(token) => Ok(token.clone()),
+            })
             .collect::<Result<Vec<_>>>()?;
-        self.embed_audio_frame(&tokens, device)
+        let tokens = end_of_audio_frame_device(&Tensor::cat(&tokens, 0)?, self.audio_end_token_id)?;
+        let token_ids = tokens
+            .broadcast_add(&self.codebook_offsets_tensor)?
+            .reshape((1, self.codebooks))?
+            .contiguous()?;
+        let embedding = self
+            .frame_embedding
+            .forward(&token_ids)?
+            .sum(1)?
+            .unsqueeze(1)?;
+        let samples = (0..self.codebooks)
+            .map(|codebook| {
+                tokens
+                    .narrow(0, codebook, 1)
+                    .map(CodebookSample::DeviceGreedy)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Lfm25SampledAudioFrame { samples, embedding })
     }
+}
+
+/// When codebook 0 is end-of-audio, every codebook becomes end-of-audio.
+fn end_of_audio_frame_host(tokens: &mut [u32], end: u32) {
+    if tokens.first() == Some(&end) {
+        tokens.fill(end);
+    }
+}
+
+/// [`end_of_audio_frame_host`] on a `[codebooks]` U32 tensor, without a
+/// readback.
+fn end_of_audio_frame_device(tokens: &Tensor, end: u32) -> Result<Tensor> {
+    let codebooks = tokens.dim(0)?;
+    let all_end = Tensor::full(end, codebooks, tokens.device())?;
+    let is_end = tokens
+        .narrow(0, 0, 1)?
+        .to_dtype(DType::F32)?
+        .eq(f64::from(end))?
+        .broadcast_as(codebooks)?;
+    is_end
+        .where_cond(&all_end, tokens)?
+        .contiguous()
+        .map_err(Error::from)
 }
 
 struct Depthformer {
@@ -1400,6 +1440,56 @@ fn ensure_rank3(hidden: &Tensor) -> Result<Tensor> {
 mod tests {
     use super::{CodebookSample, Lfm25SampledAudioFrame};
     use candle_core::{DType, Device, Tensor};
+
+    /// LFT-4: an end-of-audio frame is fed back as all end-of-audio codes,
+    /// on host and on device; EOA outside codebook 0 changes nothing.
+    #[test]
+    fn end_of_audio_frame_feeds_back_all_end_codes() {
+        let end = 2048u32;
+        let mut eoa = vec![end, 5, 6, 7, 1, 2, 3, 4];
+        super::end_of_audio_frame_host(&mut eoa, end);
+        assert_eq!(eoa, vec![end; 8]);
+        let mut speech = vec![9, end, 6, 7, 1, 2, 3, 4];
+        super::end_of_audio_frame_host(&mut speech, end);
+        assert_eq!(speech, vec![9, end, 6, 7, 1, 2, 3, 4]);
+
+        let device = Device::Cpu;
+        let run = |tokens: Vec<u32>| {
+            let tensor = Tensor::from_vec(tokens, 8, &device).unwrap();
+            super::end_of_audio_frame_device(&tensor, end)
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()
+        };
+        assert_eq!(run(vec![end, 5, 6, 7, 1, 2, 3, 4]), vec![end; 8]);
+        assert_eq!(
+            run(vec![9, end, 6, 7, 1, 2, 3, 4]),
+            vec![9, end, 6, 7, 1, 2, 3, 4]
+        );
+    }
+
+    /// The device end-of-audio override runs on Metal without a readback.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_end_of_audio_frame_override_matches_host() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        for tokens in [
+            vec![2048u32, 5, 6, 7, 1, 2, 3, 4],
+            vec![9, 2048, 6, 7, 1, 2, 3, 4],
+        ] {
+            let mut expected = tokens.clone();
+            super::end_of_audio_frame_host(&mut expected, 2048);
+            let tensor = Tensor::from_vec(tokens, 8, &device).unwrap();
+            let actual = super::end_of_audio_frame_device(&tensor, 2048)
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 
     /// LFT-3: Depthformer RoPE matches the reference `apply_rotary_emb`
     /// (complex multiply over adjacent pairs, theta 1e6) at codebook
