@@ -1429,7 +1429,10 @@ struct NemotronPreprocessor {
 
 #[derive(Clone)]
 pub(super) struct NemotronStreamingFeatureState {
+    /// Preemphasized samples from `preemphasized_base` on: the STFT context
+    /// of the next frame (under `N_FFT` samples) plus anything newer.
     preemphasized: Vec<f32>,
+    preemphasized_base: usize,
     last_raw_sample: Option<f32>,
     next_frame: usize,
     input_finished: bool,
@@ -1694,6 +1697,7 @@ impl NemotronStreamingFeatureState {
     pub(super) fn new() -> Self {
         Self {
             preemphasized: Vec::new(),
+            preemphasized_base: 0,
             last_raw_sample: None,
             next_frame: 0,
             input_finished: false,
@@ -1734,19 +1738,40 @@ impl NemotronStreamingFeatureState {
         self.input_finished = true;
     }
 
+    pub(super) fn retained_samples(&self) -> usize {
+        self.preemphasized.len()
+    }
+
+    /// Preemphasized samples pushed since the stream began.
+    fn total_samples(&self) -> usize {
+        self.preemphasized_base + self.preemphasized.len()
+    }
+
     fn ready_frames(&self) -> usize {
-        if self.preemphasized.is_empty() {
+        let total = self.total_samples();
+        if total == 0 {
             return 0;
         }
         if self.input_finished {
-            return (self.preemphasized.len() / HOP_LENGTH).max(1);
+            return (total / HOP_LENGTH).max(1);
         }
 
         let center_pad = N_FFT / 2;
-        if self.preemphasized.len() < center_pad {
+        if total < center_pad {
             return 0;
         }
-        ((self.preemphasized.len() - center_pad) / HOP_LENGTH) + 1
+        ((total - center_pad) / HOP_LENGTH) + 1
+    }
+
+    /// Drop samples no frame from `next_frame` on can read: frame `f` reads
+    /// from `f * HOP_LENGTH - N_FFT / 2`.
+    fn retire_samples_before_frame(&mut self, next_frame: usize) {
+        let keep_from = (next_frame * HOP_LENGTH).saturating_sub(N_FFT / 2);
+        let retire = keep_from
+            .saturating_sub(self.preemphasized_base)
+            .min(self.preemphasized.len());
+        self.preemphasized.drain(..retire);
+        self.preemphasized_base += retire;
     }
 }
 
@@ -2267,12 +2292,14 @@ impl NemotronPreprocessor {
         let frames = ready_frames - start_frame;
         let mel = self.compute_mel_frames(
             &state.preemphasized,
+            state.preemphasized_base,
             start_frame,
             frames,
             state.input_finished,
         )?;
         let features = Tensor::from_vec(mel, (1, N_MELS, frames), &self.device)?;
         state.next_frame = ready_frames;
+        state.retire_samples_before_frame(ready_frames);
 
         Ok(Some(NemotronStreamingFeatureChunk {
             features,
@@ -2283,9 +2310,12 @@ impl NemotronPreprocessor {
         }))
     }
 
+    /// Mel frames `start_frame..start_frame + frames` from `preemphasized`,
+    /// whose first element is stream sample `base`.
     fn compute_mel_frames(
         &self,
         preemphasized: &[f32],
+        base: usize,
         start_frame: usize,
         frames: usize,
         allow_right_padding: bool,
@@ -2307,12 +2337,19 @@ impl NemotronPreprocessor {
                     .checked_add(i)
                     .and_then(|v| v.checked_sub(center_pad))
                 {
-                    Some(src_idx) if src_idx < preemphasized.len() => preemphasized[src_idx],
+                    Some(src_idx) if src_idx < base => {
+                        return Err(Error::InferenceError(format!(
+                            "Nemotron streaming frontend frame {frame_idx} requires retired sample {src_idx}; samples from {base} are retained"
+                        )));
+                    }
+                    Some(src_idx) if src_idx - base < preemphasized.len() => {
+                        preemphasized[src_idx - base]
+                    }
                     Some(_) if allow_right_padding => 0.0,
                     Some(src_idx) => {
                         return Err(Error::InferenceError(format!(
                             "Nemotron streaming frontend frame {frame_idx} requires sample {src_idx}, but only {} samples are available",
-                            preemphasized.len()
+                            base + preemphasized.len()
                         )));
                     }
                     None => 0.0,
@@ -5063,6 +5100,34 @@ mod tests {
         let refs = chunks.iter().collect::<Vec<_>>();
         let streamed = Tensor::cat(&refs, 2).unwrap();
         assert_tensor_close(&streamed, &full, 1e-4);
+    }
+
+    #[test]
+    fn streaming_feature_state_keeps_only_the_next_frames_context_over_a_long_stream() {
+        let preprocessor = test_preprocessor(FeatureNormalize::None);
+        let mut state = NemotronStreamingFeatureState::new();
+        // Ten minutes of audio in 80 ms packets.
+        let packet = (0..1_280)
+            .map(|idx| ((idx as f32) * 0.021).sin() * 0.3)
+            .collect::<Vec<_>>();
+        let mut frames = 0;
+        let mut peak = 0;
+        for _ in 0..7_500 {
+            state.push_samples(&packet).unwrap();
+            if let Some(chunk) = preprocessor.compute_streaming_features(&mut state).unwrap() {
+                assert_eq!(chunk.start_frame, frames);
+                frames += chunk.frames;
+            }
+            peak = peak.max(state.retained_samples());
+        }
+        assert_eq!(state.total_samples(), 7_500 * 1_280);
+        // The next frame's STFT context plus one packet: under N_FFT + packet.
+        assert!(peak < N_FFT + packet.len(), "retained {peak} samples");
+        assert!(state.retained_samples() < N_FFT);
+        state.finish_input();
+        let tail = preprocessor.compute_streaming_features(&mut state).unwrap();
+        frames += tail.map_or(0, |chunk| chunk.frames);
+        assert_eq!(frames, 7_500 * 1_280 / HOP_LENGTH);
     }
 
     #[test]
