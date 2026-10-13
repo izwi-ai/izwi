@@ -384,7 +384,7 @@ fn select_batch_rows(tensor: &Tensor, rows: &[usize]) -> Result<Tensor> {
     Tensor::cat(&selected.iter().collect::<Vec<_>>(), 0).map_err(Error::from)
 }
 
-fn bounded_duration_frames(
+pub(super) fn bounded_duration_frames(
     duration_values: Vec<f32>,
     max_expanded_frames: usize,
 ) -> Result<(Vec<u32>, usize)> {
