@@ -1584,6 +1584,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
 fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Result<(), ApiError> {
     if parsed.record_mode != TranscriptionRecordMode::SpeakerAttributedAsr {
         validate_batch_transcription_model(parsed.model_id.as_deref())?;
+        validate_transcription_language(parsed.model_id.as_deref(), parsed.language.as_deref())?;
         return Ok(());
     }
 
@@ -1594,12 +1595,23 @@ fn prepare_create_request(parsed: &mut ParsedTranscriptionCreateRequest) -> Resu
     }
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
     validate_speaker_attributed_asr_model(parsed.model_id.as_deref())?;
-    parsed
+    let model_id = parsed
         .model_id
         .get_or_insert_with(|| DEFAULT_SPEAKER_ATTRIBUTED_ASR_MODEL.to_string());
+    validate_transcription_language(Some(model_id), parsed.language.as_deref())?;
     parsed.aligner_model_id = None;
     parsed.include_timestamps = false;
     Ok(())
+}
+
+/// Reject a language the routed model does not support (Granite Speech
+/// publishes its list) when the job is created, not when it runs.
+fn validate_transcription_language(
+    model_id: Option<&str>,
+    language: Option<&str>,
+) -> Result<(), ApiError> {
+    izwi_core::validate_asr_language(izwi_core::resolve_asr_model_variant(model_id), language)
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn validate_batch_transcription_model(model_id: Option<&str>) -> Result<(), ApiError> {
@@ -2073,6 +2085,9 @@ mod tests {
         TranscriptionSummaryStatus, TranscriptionWordRecord,
         TRANSCRIPTION_TERMINAL_SEND_TIMEOUT,
     };
+    use super::{
+        prepare_create_request, ParsedTranscriptionCreateRequest, TranscriptionRecordMode,
+    };
     use izwi_core::RuntimeService;
     use tokio::sync::mpsc;
 
@@ -2085,6 +2100,44 @@ mod tests {
     fn wav_data_url(content_type: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(wav_bytes());
         format!("data:{content_type};base64, {b64}\n")
+    }
+
+    /// A job whose language the routed Granite checkpoint does not support
+    /// fails when it is created, not after it was queued.
+    #[test]
+    fn create_request_rejects_languages_the_granite_checkpoint_lacks() {
+        let request = |record_mode, model_id: Option<&str>, language: &str| {
+            ParsedTranscriptionCreateRequest {
+                record_mode,
+                model_id: model_id.map(str::to_string),
+                language: Some(language.to_string()),
+                ..ParsedTranscriptionCreateRequest::default()
+            }
+        };
+
+        let mut base = request(
+            TranscriptionRecordMode::Transcription,
+            Some("Granite-Speech-4.1-2B"),
+            "Japanese",
+        );
+        prepare_create_request(&mut base).unwrap();
+        let mut unsupported = request(
+            TranscriptionRecordMode::Transcription,
+            Some("Granite-Speech-4.1-2B"),
+            "Chinese",
+        );
+        assert_eq!(
+            prepare_create_request(&mut unsupported).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        // Speaker attribution defaults to plus, which drops Japanese.
+        let mut saa = request(TranscriptionRecordMode::SpeakerAttributedAsr, None, "ja");
+        assert_eq!(
+            prepare_create_request(&mut saa).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+        let mut parakeet = request(TranscriptionRecordMode::Transcription, None, "Chinese");
+        prepare_create_request(&mut parakeet).unwrap();
     }
 
     #[test]

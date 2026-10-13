@@ -28,7 +28,10 @@ use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{parse_model_variant, AsrTranscription, WorkloadClass};
+use izwi_core::{
+    parse_model_variant, resolve_asr_model_variant, validate_asr_language, AsrTranscription,
+    WorkloadClass,
+};
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
 const TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR: &str =
@@ -205,6 +208,7 @@ pub async fn transcriptions(
 ) -> Result<Response<Body>, ApiError> {
     let mut req = parse_transcription_request(req).await?;
     validate_transcription_model(req.model.as_deref())?;
+    validate_transcription_language(req.model.as_deref(), req.language.as_deref())?;
     let audio = req
         .audio
         .take()
@@ -237,9 +241,12 @@ pub async fn transcriptions(
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
     let started = Instant::now();
+    // A model that emits word timestamps itself (Granite Speech Plus) runs
+    // its timestamp task and returns `timestamp_words`; any other model's
+    // text is timed by the forced aligner below.
     let output = state
         .runtime
-        .asr_transcribe_bytes_with_runtime_context(
+        .asr_transcribe_bytes_with_runtime_context_and_word_timestamps(
             audio_bytes.as_slice(),
             req.model.as_deref(),
             req.language.as_deref(),
@@ -247,6 +254,7 @@ pub async fn transcriptions(
             req.max_tokens,
             Some(&ctx.correlation_id),
             permit.runtime_context(),
+            timestamp_request.any(),
         )
         .await?;
 
@@ -713,6 +721,16 @@ fn validate_transcription_model(model: Option<&str>) -> Result<(), ApiError> {
             trimmed
         )))
     }
+}
+
+/// OpenAI rejects language codes a model does not support; so do the ASR
+/// families that publish a language list (Granite Speech).
+fn validate_transcription_language(
+    model: Option<&str>,
+    language: Option<&str>,
+) -> Result<(), ApiError> {
+    validate_asr_language(resolve_asr_model_variant(model), language)
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
 fn alignments_to_timestamp_words(
@@ -1349,6 +1367,26 @@ mod tests {
         let err = TimestampGranularityRequest::parse(Some(&requested))
             .expect_err("unknown granularity should be rejected");
         assert!(err.message.contains("Unsupported timestamp granularity"));
+    }
+
+    #[test]
+    fn transcription_language_is_checked_against_the_routed_granite_checkpoint() {
+        validate_transcription_language(Some("Granite-Speech-4.1-2B"), Some("ja")).unwrap();
+        validate_transcription_language(Some("granite speech"), Some("German")).unwrap();
+        let err = validate_transcription_language(Some("Granite-Speech-4.1-2B-Plus"), Some("ja"))
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err
+            .message
+            .contains("supported source languages: de, en, es, fr, pt"));
+        assert_eq!(
+            validate_transcription_language(Some("Granite-Speech-4.1-2B"), Some("klingon"))
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+        validate_transcription_language(Some("Whisper-Large-v3-Turbo"), Some("klingon")).unwrap();
+        validate_transcription_language(None, Some("klingon")).unwrap();
     }
 
     #[test]

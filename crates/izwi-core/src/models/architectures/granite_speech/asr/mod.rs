@@ -44,12 +44,13 @@ pub use config::{
 };
 pub use preprocessor::{GraniteSpeechAudioFeatures, GraniteSpeechPreprocessor};
 pub use prompt::{
-    render_granite_speech_prompt, GraniteSpeechLanguage, GraniteSpeechPrompt,
-    GraniteSpeechPromptOptions, GraniteSpeechPromptProfile, GraniteSpeechPromptTokenizer,
-    GraniteSpeechRenderedPrompt, GraniteSpeechSpecialTokens, GraniteSpeechTask,
-    GRANITE_SPEECH_BASE_ASR_INSTRUCTION, GRANITE_SPEECH_KEYWORD_ASR_INSTRUCTION,
-    GRANITE_SPEECH_PLUS_ASR_INSTRUCTION, GRANITE_SPEECH_SPEAKER_INSTRUCTION,
-    GRANITE_SPEECH_SYSTEM_PROMPT, GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
+    classify_granite_speech_prompt, render_granite_speech_prompt, GraniteSpeechLanguage,
+    GraniteSpeechPrompt, GraniteSpeechPromptOptions, GraniteSpeechPromptOverride,
+    GraniteSpeechPromptProfile, GraniteSpeechPromptTokenizer, GraniteSpeechRenderedPrompt,
+    GraniteSpeechSpecialTokens, GraniteSpeechTask, GRANITE_SPEECH_BASE_ASR_INSTRUCTION,
+    GRANITE_SPEECH_KEYWORD_ASR_INSTRUCTION, GRANITE_SPEECH_PLUS_ASR_INSTRUCTION,
+    GRANITE_SPEECH_SPEAKER_INSTRUCTION, GRANITE_SPEECH_SYSTEM_PROMPT,
+    GRANITE_SPEECH_TIMESTAMP_INSTRUCTION,
 };
 pub use runtime::{
     GraniteSpeechAttentionDecodeProfile, GraniteSpeechAudioEmbeddingStats,
@@ -85,6 +86,21 @@ const TIMESTAMP_MAX_AUDIO_SECONDS: f32 = 3.5 * 60.0;
 /// 4096-token decoder context.
 const TIMESTAMP_MAX_CHUNK_SECONDS: f32 = 60.0;
 static NEXT_GRANITE_SPEECH_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Reject a request language the variant's checkpoint was not trained on
+/// (IBM's alias table; plus drops Japanese) before the request is admitted.
+/// Non-Granite variants are not checked here.
+pub fn validate_granite_speech_request_language(
+    variant: ModelVariant,
+    language: Option<&str>,
+) -> Result<()> {
+    match GraniteSpeechCheckpointKind::for_variant(variant) {
+        Some(kind) => GraniteSpeechPromptProfile::for_checkpoint(kind)
+            .source_language(language)
+            .map(|_| ()),
+        None => Ok(()),
+    }
+}
 
 /// How the generic ASR path runs a Granite request.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2189,6 +2205,7 @@ fn granite_diagnostics(
             "profile": prompt.profile.name(),
             "task": prompt.task.name(),
             "instruction": prompt.instruction,
+            "prompt_ignored": prompt.prompt_ignored,
             "prompt_tokens": generation.stats.prompt_tokens,
             "prefix_tokens": prompt.prefix_text_token_count,
             "audio_placeholders": prompt.audio_token_positions.len(),
@@ -3127,6 +3144,26 @@ mod tests {
     }
 
     #[test]
+    fn request_language_validation_follows_each_checkpoint() {
+        let base = ModelVariant::GraniteSpeech412B;
+        let plus = ModelVariant::GraniteSpeech412BPlus;
+        for language in [None, Some(""), Some("en"), Some("German"), Some("ja")] {
+            validate_granite_speech_request_language(base, language).unwrap();
+        }
+        validate_granite_speech_request_language(plus, Some("pt")).unwrap();
+        assert!(validate_granite_speech_request_language(plus, Some("ja"))
+            .unwrap_err()
+            .to_string()
+            .contains("does not support source language 'ja'"));
+        assert!(validate_granite_speech_request_language(base, Some("Chinese")).is_err());
+        validate_granite_speech_request_language(
+            ModelVariant::WhisperLargeV3Turbo,
+            Some("Chinese"),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn request_plan_runs_native_timestamps_only_on_plus() {
         let timestamps = granite_speech_request_plan(ModelVariant::GraniteSpeech412BPlus, true);
         assert_eq!(timestamps.task, GraniteSpeechTask::WordTimestamps);
@@ -3240,6 +3277,7 @@ mod tests {
             task: GraniteSpeechTask::WordTimestamps,
             text: "<|audio|>".to_string(),
             instruction: GRANITE_SPEECH_TIMESTAMP_INSTRUCTION.to_string(),
+            prompt_ignored: false,
             input_ids: vec![100_352],
             audio_token_positions: vec![0],
             prefix_text_token_count: 0,
@@ -3451,6 +3489,7 @@ mod tests {
             0.45f32 as f64
         );
         assert_eq!(diagnostics["prompt"]["profile"], "plus");
+        assert_eq!(diagnostics["prompt"]["prompt_ignored"], false);
         assert_eq!(diagnostics["prompt"]["task"], "word_timestamps");
         assert_eq!(
             diagnostics["prompt"]["instruction"],

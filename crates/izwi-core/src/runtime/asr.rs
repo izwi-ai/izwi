@@ -17,7 +17,8 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::{ModelResidencyLease, ModelVariant};
 use crate::models::architectures::granite_speech::asr::{
-    granite_speech_request_plan, parse_granite_speech_output, GraniteSpeechTask,
+    granite_speech_request_plan, parse_granite_speech_output,
+    validate_granite_speech_request_language, GraniteSpeechTask,
 };
 use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparationBatchGeometry, VoxtralRealtimePreparationGeometry,
@@ -311,6 +312,18 @@ fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVa
         ModelFamily::NemotronAsr | ModelFamily::Voxtral
     )
     .then_some(variant)
+}
+
+/// Check a request's language against what the routed ASR model was trained
+/// on, so an unsupported language fails as invalid input before admission.
+/// Only families with a published language list (Granite Speech) check it.
+pub fn validate_asr_language(variant: ModelVariant, language: Option<&str>) -> Result<()> {
+    match variant.family() {
+        ModelFamily::GraniteSpeechAsr => {
+            validate_granite_speech_request_language(variant, language)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// IBM's automatic Granite budget, `ceil(200 * max(1, secs / 30))` tokens.
@@ -2362,6 +2375,7 @@ impl RuntimeService {
         streaming: bool,
         native_word_timestamps: bool,
     ) -> Result<AdmittedEngineRequest> {
+        validate_asr_language(variant, language)?;
         let audio_bytes = match audio_input {
             AsrAudioInput::Base64("") => {
                 return Err(Error::InvalidInput(
@@ -3569,6 +3583,7 @@ impl RuntimeService {
         P: FnMut(AsrProgress) + Send + 'static,
     {
         let variant = resolve_speaker_attributed_asr_variant(model_id)?;
+        validate_asr_language(variant, language)?;
         let audio_bytes = audio_input.input_bytes();
         if audio_bytes == 0 {
             return Err(Error::InvalidInput(

@@ -24,6 +24,62 @@ pub const GRANITE_SPEECH_PLUS_ASR_INSTRUCTION: &str =
 pub const GRANITE_SPEECH_SPEAKER_INSTRUCTION: &str = "Speaker attribution: Transcribe and denote who is speaking by adding [Speaker 1]: and [Speaker 2]: tags before speaker turns.";
 pub const GRANITE_SPEECH_TIMESTAMP_INSTRUCTION: &str = "Timestamps: Transcribe the speech. After each word, add a timestamp tag showing the end time in centiseconds, e.g. hello [T:45] world [T:82]";
 
+/// Openings of the instructions IBM's cards and library use. A request
+/// `prompt` that starts with one (or with the audio token) is a Granite
+/// instruction, as in the base card's llama-server example.
+const GRANITE_SPEECH_INSTRUCTION_STEMS: &[&str] = &[
+    "transcribe the speech",
+    "can you transcribe",
+    "translate the speech",
+    "Speaker attribution:",
+    "Timestamps:",
+];
+/// izwi's documented keyword form (`keywords: Izwi, Granite Speech`).
+const GRANITE_SPEECH_KEYWORDS_PREFIX: &str = "keywords:";
+
+/// What a request's free-form `prompt` means to Granite. OpenAI's `prompt` is
+/// context text (vocabulary, style, the previous segment), not an
+/// instruction; replacing Granite's trained instruction with it degrades
+/// the transcript, so only recognisable Granite instructions override it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraniteSpeechPromptOverride {
+    /// A Granite instruction that replaces the default one.
+    Instruction(String),
+    /// Keywords for IBM's keyword-biasing prompt.
+    Keywords(Vec<String>),
+    /// Context the model was not trained to follow; the default instruction
+    /// is kept and diagnostics report `prompt_ignored`.
+    Ignored,
+}
+
+pub fn classify_granite_speech_prompt(raw: &str, audio_token: &str) -> GraniteSpeechPromptOverride {
+    let prompt = raw.trim();
+    let starts_with = |prefix: &str| {
+        prompt
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    if prompt.starts_with(audio_token)
+        || GRANITE_SPEECH_INSTRUCTION_STEMS
+            .iter()
+            .any(|stem| starts_with(stem))
+    {
+        return GraniteSpeechPromptOverride::Instruction(prompt.to_string());
+    }
+    if starts_with(GRANITE_SPEECH_KEYWORDS_PREFIX) {
+        let keywords = prompt[GRANITE_SPEECH_KEYWORDS_PREFIX.len()..]
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|keyword| !keyword.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !keywords.is_empty() {
+            return GraniteSpeechPromptOverride::Keywords(keywords);
+        }
+    }
+    GraniteSpeechPromptOverride::Ignored
+}
+
 /// A language IBM's library knows, with its alias table and labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraniteSpeechLanguage {
@@ -221,6 +277,8 @@ pub struct GraniteSpeechPromptOptions {
     pub language: Option<String>,
     pub keywords: Vec<String>,
     pub prefix_text: Option<String>,
+    /// A request's free-form prompt, classified by
+    /// [`classify_granite_speech_prompt`].
     pub custom_prompt: Option<String>,
 }
 
@@ -251,6 +309,8 @@ pub struct GraniteSpeechRenderedPrompt {
     pub text: String,
     /// The instruction after the audio token, keywords included.
     pub instruction: String,
+    /// The request prompt was context text, not a Granite instruction.
+    pub prompt_ignored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +319,7 @@ pub struct GraniteSpeechPrompt {
     pub task: GraniteSpeechTask,
     pub text: String,
     pub instruction: String,
+    pub prompt_ignored: bool,
     pub input_ids: Vec<u32>,
     pub audio_token_positions: Vec<usize>,
     pub prefix_text_token_count: usize,
@@ -286,9 +347,22 @@ pub fn render_granite_speech_prompt(
         )));
     }
 
-    let keywords = normalize_keywords(&options.keywords);
-    let custom = options
+    let mut keywords = options.keywords.clone();
+    let mut custom = None;
+    let mut prompt_ignored = false;
+    if let Some(raw) = options
         .custom_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        match classify_granite_speech_prompt(raw, audio_token) {
+            GraniteSpeechPromptOverride::Instruction(prompt) => custom = Some(prompt),
+            GraniteSpeechPromptOverride::Keywords(extra) => keywords.extend(extra),
+            GraniteSpeechPromptOverride::Ignored => prompt_ignored = true,
+        }
+    }
+    let keywords = normalize_keywords(&keywords);
+    let custom = custom
         .as_deref()
         .map(|prompt| strip_leading_audio_token(prompt, audio_token))
         .filter(|prompt| !prompt.is_empty());
@@ -309,7 +383,11 @@ pub fn render_granite_speech_prompt(
             "<|start_of_role|>system<|end_of_role|>{GRANITE_SPEECH_SYSTEM_PROMPT}<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>{content}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>{prefix}"
         ),
     };
-    Ok(GraniteSpeechRenderedPrompt { text, instruction })
+    Ok(GraniteSpeechRenderedPrompt {
+        text,
+        instruction,
+        prompt_ignored,
+    })
 }
 
 fn validate_task(
@@ -540,6 +618,7 @@ impl GraniteSpeechPromptTokenizer {
             task: options.task,
             text: rendered.text,
             instruction: rendered.instruction,
+            prompt_ignored: rendered.prompt_ignored,
             input_ids,
             audio_token_positions,
             prefix_text_token_count,
@@ -700,10 +779,78 @@ mod tests {
             )
         );
         let misplaced = GraniteSpeechPromptOptions {
-            custom_prompt: Some("transcribe <|audio|> please".into()),
+            custom_prompt: Some("transcribe the speech <|audio|> again".into()),
             ..GraniteSpeechPromptOptions::default()
         };
         assert!(base(misplaced).is_err());
+    }
+
+    #[test]
+    fn request_prompts_override_only_with_a_granite_instruction() {
+        let prompt = |text: &str| GraniteSpeechPromptOptions {
+            custom_prompt: Some(text.to_string()),
+            ..GraniteSpeechPromptOptions::default()
+        };
+        let rendered = |profile, text: &str| {
+            render_granite_speech_prompt(profile, AUDIO, &prompt(text)).unwrap()
+        };
+
+        // The base card's llama-server example passes its instruction as
+        // the OpenAI prompt.
+        let card = rendered(
+            GraniteSpeechPromptProfile::Base,
+            "transcribe the speech with proper punctuation and capitalization.",
+        );
+        assert_eq!(card.instruction, GRANITE_SPEECH_BASE_ASR_INSTRUCTION);
+        assert!(!card.prompt_ignored);
+        let raw = rendered(
+            GraniteSpeechPromptProfile::Base,
+            "Can you transcribe the speech into a written format?",
+        );
+        assert_eq!(
+            raw.text,
+            "USER: <|audio|>Can you transcribe the speech into a written format?\n ASSISTANT:"
+        );
+        for instruction in [
+            "Translate the speech to English.",
+            "speaker attribution: Transcribe and denote who is speaking.",
+            "TIMESTAMPS: Transcribe the speech.",
+        ] {
+            assert_eq!(
+                rendered(GraniteSpeechPromptProfile::Plus, instruction).instruction,
+                instruction
+            );
+        }
+
+        // OpenAI-style context keeps the trained instruction.
+        let context = rendered(
+            GraniteSpeechPromptProfile::Base,
+            "The following is a quarterly earnings call with Izwi.",
+        );
+        assert!(context.prompt_ignored);
+        assert_eq!(
+            context.text,
+            "USER: <|audio|>transcribe the speech with proper punctuation and capitalization.\n ASSISTANT:"
+        );
+
+        // izwi's documented `keywords:` form becomes IBM keyword biasing.
+        let keywords = rendered(
+            GraniteSpeechPromptProfile::Base,
+            "Keywords: Izwi, Granite Speech\nKokoro, ",
+        );
+        assert!(!keywords.prompt_ignored);
+        assert_eq!(
+            keywords.instruction,
+            "transcribe the speech to text. Keywords: Izwi, Granite Speech, Kokoro"
+        );
+        assert_eq!(
+            rendered(GraniteSpeechPromptProfile::Plus, "keywords: Izwi").instruction,
+            "can you transcribe the speech into a written format? Keywords: Izwi"
+        );
+        assert_eq!(
+            classify_granite_speech_prompt("keywords:  , ", AUDIO),
+            GraniteSpeechPromptOverride::Ignored
+        );
     }
 
     #[test]

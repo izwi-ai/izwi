@@ -315,12 +315,12 @@ Multipart fields:
 | `file` or `audio` | Uploaded audio file. |
 | `audio_base64` | Base64 audio alternative. |
 | `model` | Optional ASR, Granite Speech, Voxtral offline transcription, or audio-chat model variant. Voxtral realtime is planned separately. |
-| `language` | Optional language hint. |
+| `language` | Optional language hint. Granite Speech accepts IBM's codes and names (base: en, fr, de, es, pt, ja; plus drops ja), names it in the instruction, and rejects other languages with `400`. |
 | `response_format` | `json`, `verbose_json`, `text`, `srt`, or `vtt`. Default `json`. |
 | `stream` | `true`, `1`, `yes`, or `on` enables SSE. |
-| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback. |
+| `timestamp_granularities[]` | Optional `word`, `segment`, or both. Requires `response_format=verbose_json`; model-provided timestamps are used before forced alignment fallback (`Granite-Speech-4.1-2B-Plus` runs its native timestamp mode; base Granite text is timed by the aligner). |
 | `aligner_model` | Optional forced-aligner model for timestamp generation. Defaults to `Qwen3-ForcedAligner-0.6B`. |
-| `prompt` | Optional ASR prompt/context. Granite Speech uses this for prompt guidance and keyword biasing. |
+| `prompt` | Optional ASR prompt/context. Granite Speech uses it only when it is a Granite instruction (it starts with `<|audio|>`, `transcribe the speech`, `can you transcribe`, `translate the speech`, `Speaker attribution:` or `Timestamps:`) or `keywords: a, b` for keyword biasing; other text is ignored and reported as `prompt_ignored` in the diagnostics. |
 | `max_tokens` | Optional ASR decoder token budget. |
 | `temperature` | Accepted for compatibility; currently ignored by native ASR models. |
 

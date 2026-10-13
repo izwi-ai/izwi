@@ -36,7 +36,7 @@ pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
     invocation_decode_room,
 };
-pub use asr::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
+pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,
