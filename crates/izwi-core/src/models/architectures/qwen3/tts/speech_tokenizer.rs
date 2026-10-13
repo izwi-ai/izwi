@@ -2643,4 +2643,52 @@ mod tests {
         eprintln!("max abs diff {error:e}, relative L2 {rel:e}");
         assert!(error < 1e-4 && rel < 1e-5, "max abs {error}, rel {rel}");
     }
+
+    /// QTTS-10/11 parity gate for an F16 speech-tokenizer decoder on Metal:
+    /// the same codes (72 frames, xorshift, all 16 codebooks) decoded in F16
+    /// and in F32 on Metal. Opt-in (ignored, real weights, about 1.5 GB);
+    /// the decoder stays F32 by default unless this gate passes.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a local Qwen3-TTS speech_tokenizer checkpoint and a Metal device"]
+    fn metal_f16_decoder_parity_gate() {
+        use crate::kernels::numeric_check::{max_abs_diff, relative_l2};
+
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let dir = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            std::env::var_os("IZWI_TEST_QWEN_TTS_SPEECH_TOKENIZER")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(
+                            "Library/Application Support/izwi/models/\
+                             Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer",
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let codes = xorshift_codes(16, 72, 2048);
+        let decode = |dtype| {
+            SpeechTokenizerDecoder::load(&dir, metal.clone(), dtype, false)
+                .unwrap()
+                .decode(&codes)
+                .unwrap()
+        };
+        let full = decode(DType::F32);
+        let half = decode(DType::F16);
+        let rel = relative_l2(&half, &full);
+        let error = max_abs_diff(&half, &full);
+        let snr_db = -20.0 * rel.log10();
+        eprintln!("F16 vs F32 decoder: relative L2 {rel:e}, SNR {snr_db:.1} dB, max abs {error:e}");
+        assert!(half.iter().all(|v| v.is_finite()));
+        assert!(
+            snr_db >= 30.0,
+            "F16 decoder SNR {snr_db:.1} dB is below the 30 dB gate"
+        );
+    }
 }
