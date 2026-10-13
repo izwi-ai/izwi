@@ -1,5 +1,6 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
@@ -43,13 +44,16 @@ impl EspeakPhonemizer {
             ));
         }
 
+        if trimmed.contains('\0') {
+            return Err(Error::InvalidInput(
+                "Kokoro TTS input text contains a NUL character".to_string(),
+            ));
+        }
+
         let voice = espeak_voice_for(language, speaker);
         let output = Command::new(&self.bin_path)
-            .arg("-q")
-            .arg("--ipa=3")
-            .arg("-v")
-            .arg(&voice)
-            .arg(trimmed)
+            .args(espeak_args(&voice, trimmed))
+            .stdin(Stdio::null())
             .output()
             .map_err(|e| {
                 Error::ModelLoadError(format!(
@@ -70,9 +74,16 @@ impl EspeakPhonemizer {
         let raw = String::from_utf8_lossy(&output.stdout);
         let normalized = normalize_espeak_ipa(&raw);
         if normalized.is_empty() {
-            return Err(Error::InferenceError(
-                "espeak-ng returned empty phonemes for Kokoro request".to_string(),
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let detail = if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            };
+            return Err(Error::InferenceError(format!(
+                "espeak-ng returned empty phonemes for Kokoro request{detail}"
+            )));
         }
         Ok(normalized)
     }
@@ -80,6 +91,25 @@ impl EspeakPhonemizer {
     pub fn bin_path(&self) -> &Path {
         &self.bin_path
     }
+}
+
+/// The espeak-ng argument vector for one phonemization call.
+///
+/// User text is untrusted: espeak-ng parses its argv with getopt, so text such
+/// as `-f/etc/passwd` would otherwise be read as an option (here: speak a local
+/// file) and text such as `-5 degrees` would be rejected as an invalid option.
+/// The `--` terminator makes getopt treat everything after it as an operand, so
+/// the text is always phonemized literally. The text must stay the final
+/// argument, after the terminator.
+fn espeak_args<'a>(voice: &'a str, text: &'a str) -> [&'a OsStr; 6] {
+    [
+        OsStr::new("-q"),
+        OsStr::new("--ipa=3"),
+        OsStr::new("-v"),
+        OsStr::new(voice),
+        OsStr::new("--"),
+        OsStr::new(text),
+    ]
 }
 
 fn resolve_bin(candidate: &str) -> Option<PathBuf> {
@@ -190,7 +220,86 @@ pub fn normalize_espeak_ipa(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{espeak_voice_for, normalize_espeak_ipa};
+    use super::{espeak_args, espeak_voice_for, normalize_espeak_ipa, EspeakPhonemizer};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn espeak_args_terminate_options_before_user_text() {
+        for text in [
+            "-f/etc/passwd",
+            "--version",
+            "- First item",
+            "-5 degrees",
+            "hello",
+        ] {
+            let args = espeak_args("en-us", text);
+            let n = args.len();
+            assert_eq!(
+                args[n - 1],
+                OsStr::new(text),
+                "text must be the last argument"
+            );
+            assert_eq!(args[n - 2], OsStr::new("--"), "`--` must precede the text");
+            assert!(
+                args[..n - 2].iter().all(|a| *a != OsStr::new(text)),
+                "text must not appear among the options"
+            );
+        }
+    }
+
+    /// Runs only when espeak-ng is installed; otherwise the argv test above is
+    /// the guard.
+    fn installed_espeak() -> Option<EspeakPhonemizer> {
+        match EspeakPhonemizer::auto() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                eprintln!("espeak-ng not installed; skipping live phonemizer check");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn leading_dash_text_is_phonemized_literally() {
+        let Some(espeak) = installed_espeak() else {
+            return;
+        };
+        let minus = espeak
+            .phonemize("-5 degrees outside.", Some("en"), None)
+            .expect("`-5 degrees` must phonemize");
+        assert!(minus.starts_with("mˈaɪnəs"), "got {minus:?}");
+        let item = espeak
+            .phonemize("- First item, then second.", Some("en"), None)
+            .expect("`- First item` must phonemize");
+        assert!(item.contains("fˈɜːst"), "got {item:?}");
+        let version = espeak
+            .phonemize("--version", Some("en"), None)
+            .expect("`--version` must phonemize");
+        assert!(
+            !version.contains("eSpeak") && !version.contains('/'),
+            "got {version:?}"
+        );
+    }
+
+    #[test]
+    fn file_option_text_never_reads_the_file() {
+        let Some(espeak) = installed_espeak() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("izwi-kokoro-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.txt");
+        std::fs::write(&path, "zebra zebra zebra").unwrap();
+        let input = format!("-f{}", path.display());
+        let result = espeak.phonemize(&input, Some("en"), None);
+        let file_phonemes = espeak.phonemize("zebra", Some("en"), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let phonemes = result.expect("`-f<path>` must phonemize as text");
+        assert!(
+            !phonemes.contains(&file_phonemes),
+            "espeak-ng spoke the file contents: {phonemes:?}"
+        );
+    }
 
     #[test]
     fn normalizes_zero_width_and_spacing() {
