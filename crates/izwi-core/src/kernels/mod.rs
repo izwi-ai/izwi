@@ -11,6 +11,7 @@
 pub mod buffer_pool;
 pub mod cpu_q8;
 pub mod cuda;
+pub mod depthwise_conv;
 pub mod f16_weight_linear;
 pub mod metal;
 #[cfg(feature = "metal")]

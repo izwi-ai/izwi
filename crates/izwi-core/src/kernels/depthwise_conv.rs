@@ -1,0 +1,439 @@
+//! Depthwise (groups == channels) 1-D convolution as shift-and-accumulate.
+//!
+//! Candle's grouped `conv1d` splits the input and kernel into `groups` chunks
+//! and runs one single-group convolution per chunk before concatenating them
+//! (candle-core `conv.rs`). For a depthwise layer that is one im2col/matmul
+//! pair per channel: 1024-2048 dispatches per layer, 25k-100k per encoder
+//! pass. Here the output is the sum over the K taps of a shifted input slice
+//! scaled by that tap's per-channel weight,
+//!
+//! `y[b, c, t] = bias[c] + Σ_k x_pad[b, c, t + k·dilation] · w[c, k]`,
+//!
+//! which is 2K + 2 element-wise ops whatever the channel count. It uses only
+//! ordinary tensor ops, so it is valid on every backend and dtype. Half
+//! precision inputs accumulate in F32 and are cast back once.
+//!
+//! A folded inference BatchNorm (or any per-channel affine applied after the
+//! convolution) is expressed through [`fold_channel_affine`] at load time and
+//! passed as `weight`/`bias`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use candle_core::{DType, Result, Tensor};
+
+static SHIFT_ACCUMULATE_CALLS: AtomicU64 = AtomicU64::new(0);
+static SHIFT_ACCUMULATE_TAPS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of depthwise convolutions served by the shared
+/// shift-and-accumulate op (diagnostics: shows the path engaged).
+pub fn depthwise_conv1d_calls() -> u64 {
+    SHIFT_ACCUMULATE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Process-wide count of taps accumulated by the shared op. Each tap is one
+/// multiply plus one add, independent of the channel count.
+pub fn depthwise_conv1d_taps() -> u64 {
+    SHIFT_ACCUMULATE_TAPS.load(Ordering::Relaxed)
+}
+
+/// Memory layout of the activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvLayout {
+    /// `(batch, channels, time)`, as Candle's `conv1d`.
+    ChannelsFirst,
+    /// `(batch, time, channels)`.
+    ChannelsLast,
+}
+
+/// Geometry of a stride-1 depthwise convolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthwiseConv1dSpec {
+    pub pad_left: usize,
+    pub pad_right: usize,
+    pub dilation: usize,
+    pub layout: ConvLayout,
+}
+
+impl DepthwiseConv1dSpec {
+    /// Candle-style symmetric zero padding on both sides.
+    pub fn symmetric(padding: usize) -> Self {
+        Self::padded(padding, padding)
+    }
+
+    /// Explicit left/right zero padding (`0, 0` for pre-padded inputs).
+    pub fn padded(pad_left: usize, pad_right: usize) -> Self {
+        Self {
+            pad_left,
+            pad_right,
+            dilation: 1,
+            layout: ConvLayout::ChannelsFirst,
+        }
+    }
+
+    pub fn with_dilation(mut self, dilation: usize) -> Self {
+        self.dilation = dilation;
+        self
+    }
+
+    pub fn with_layout(mut self, layout: ConvLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+}
+
+/// Whether `weight` is a depthwise kernel for a `stride`-strided convolution
+/// with `groups` groups over `channels` channels that [`depthwise_conv1d`]
+/// can serve.
+pub fn is_depthwise_conv1d(weight: &Tensor, channels: usize, groups: usize, stride: usize) -> bool {
+    stride == 1
+        && groups == channels
+        && channels > 0
+        && matches!(weight.dims(), [c, 1, k] if *c == channels && *k > 0)
+}
+
+/// Depthwise 1-D convolution. `weight` is `(C, 1, K)` or `(C, K)`; `bias` is
+/// `(C,)`. Matches `conv1d(pad(x), weight, padding=0, stride=1, dilation,
+/// groups=C) + bias` up to summation order.
+pub fn depthwise_conv1d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    spec: DepthwiseConv1dSpec,
+) -> Result<Tensor> {
+    let (channel_dim, time_dim) = match spec.layout {
+        ConvLayout::ChannelsFirst => (1, 2),
+        ConvLayout::ChannelsLast => (2, 1),
+    };
+    let (_batch, _, _) = x.dims3()?;
+    let channels = x.dim(channel_dim)?;
+    let taps = match weight.dims() {
+        [c, 1, k] | [c, k] if *c == channels && *k > 0 => *k,
+        dims => candle_core::bail!(
+            "depthwise conv1d weight {dims:?} does not match {channels} channels"
+        ),
+    };
+    let dilation = spec.dilation.max(1);
+    let padded_len = x.dim(time_dim)? + spec.pad_left + spec.pad_right;
+    let span = dilation * (taps - 1) + 1;
+    if padded_len < span {
+        candle_core::bail!(
+            "depthwise conv1d input of padded length {padded_len} is shorter than the kernel span {span}"
+        );
+    }
+    let out_len = padded_len - span + 1;
+
+    let out_dtype = x.dtype();
+    let acc_dtype = match out_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        dtype => dtype,
+    };
+    let x = x.to_dtype(acc_dtype)?;
+    let x = if spec.pad_left > 0 || spec.pad_right > 0 {
+        x.pad_with_zeros(time_dim, spec.pad_left, spec.pad_right)?
+    } else {
+        x
+    };
+    // Per-tap weight rows shaped to broadcast against the activation.
+    let weight = weight.reshape((channels, taps))?.to_dtype(acc_dtype)?;
+    let weight = match spec.layout {
+        ConvLayout::ChannelsFirst => weight.reshape((1, channels, taps))?,
+        ConvLayout::ChannelsLast => weight.t()?.contiguous()?.reshape((1, taps, channels))?,
+    };
+    let tap_weight = |k: usize| -> Result<Tensor> {
+        match spec.layout {
+            ConvLayout::ChannelsFirst => weight.narrow(2, k, 1),
+            ConvLayout::ChannelsLast => weight.narrow(1, k, 1),
+        }
+    };
+
+    let mut acc = x
+        .narrow(time_dim, 0, out_len)?
+        .broadcast_mul(&tap_weight(0)?)?;
+    for k in 1..taps {
+        let shifted = x.narrow(time_dim, k * dilation, out_len)?;
+        acc = (acc + shifted.broadcast_mul(&tap_weight(k)?)?)?;
+    }
+    if let Some(bias) = bias {
+        let bias = bias.to_dtype(acc_dtype)?;
+        let bias = match spec.layout {
+            ConvLayout::ChannelsFirst => bias.reshape((1, channels, 1))?,
+            ConvLayout::ChannelsLast => bias.reshape((1, 1, channels))?,
+        };
+        acc = acc.broadcast_add(&bias)?;
+    }
+
+    SHIFT_ACCUMULATE_CALLS.fetch_add(1, Ordering::Relaxed);
+    SHIFT_ACCUMULATE_TAPS.fetch_add(taps as u64, Ordering::Relaxed);
+    acc.to_dtype(out_dtype)
+}
+
+/// Fold a per-channel affine `y' = y * scale + shift` applied after a
+/// depthwise convolution into its weight and bias.
+pub fn fold_channel_affine(
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    scale: &Tensor,
+    shift: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let channels = scale.dims1()?;
+    let mut scale_shape = vec![1usize; weight.rank()];
+    scale_shape[0] = channels;
+    let folded_weight = weight
+        .broadcast_mul(&scale.reshape(scale_shape)?)?
+        .contiguous()?;
+    let folded_bias = match bias {
+        Some(bias) => bias.broadcast_mul(scale)?.broadcast_add(shift)?,
+        None => shift.clone(),
+    };
+    Ok((folded_weight, folded_bias.contiguous()?))
+}
+
+/// The per-channel `(scale, shift)` of an inference BatchNorm:
+/// `scale = gamma / sqrt(var + eps)`, `shift = beta - mean * scale`.
+pub fn batch_norm_affine(
+    running_mean: &Tensor,
+    running_var: &Tensor,
+    eps: f64,
+    weight_and_bias: Option<(&Tensor, &Tensor)>,
+) -> Result<(Tensor, Tensor)> {
+    let std = (running_var + eps)?.sqrt()?;
+    let (scale, shift) = match weight_and_bias {
+        Some((gamma, beta)) => {
+            let scale = gamma.broadcast_div(&std)?;
+            let shift = beta.broadcast_sub(&scale.broadcast_mul(running_mean)?)?;
+            (scale, shift)
+        }
+        None => {
+            let scale = std.recip()?;
+            let shift = scale.broadcast_mul(running_mean)?.neg()?;
+            (scale, shift)
+        }
+    };
+    Ok((scale, shift))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next_f32(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+
+        fn tensor(&mut self, shape: &[usize]) -> Tensor {
+            let n = shape.iter().product::<usize>();
+            let data = (0..n).map(|_| self.next_f32()).collect::<Vec<_>>();
+            Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+        }
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims());
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| {
+                let d = (x - y).abs();
+                if d.is_finite() {
+                    d
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
+    }
+
+    fn candle_reference(
+        x: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        pad_left: usize,
+        pad_right: usize,
+        dilation: usize,
+    ) -> Tensor {
+        let channels = x.dim(1).unwrap();
+        let padded = x.pad_with_zeros(2, pad_left, pad_right).unwrap();
+        let y = padded.conv1d(weight, 0, 1, dilation, channels).unwrap();
+        match bias {
+            Some(bias) => y
+                .broadcast_add(&bias.reshape((1, channels, 1)).unwrap())
+                .unwrap(),
+            None => y,
+        }
+    }
+
+    #[test]
+    fn max_abs_diff_saturates_nan() {
+        let a = Tensor::new(&[f32::NAN, 0.0], &Device::Cpu).unwrap();
+        let b = Tensor::new(&[0.0f32, 0.0], &Device::Cpu).unwrap();
+        assert_eq!(max_abs_diff(&a, &b), f32::INFINITY);
+    }
+
+    #[test]
+    fn shift_accumulate_matches_candle_grouped_conv1d() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        // (batch, channels, time, taps, pad_left, pad_right, dilation, bias)
+        let cases = [
+            (1, 64, 37, 9, 4, 4, 1, false), // Parakeet / LFM symmetric
+            (2, 48, 50, 15, 7, 7, 1, true), // Granite odd kernel
+            (1, 32, 41, 4, 2, 1, 1, false), // Granite-style even kernel
+            (2, 16, 29, 9, 8, 0, 1, true),  // causal (Nemotron / VibeVoice)
+            (1, 24, 33, 7, 12, 0, 2, true), // dilated causal
+            (1, 8, 9, 9, 0, 0, 1, false),   // pre-padded, single output
+            (1, 12, 20, 1, 0, 0, 1, true),  // pointwise depthwise
+        ];
+        for (batch, channels, time, taps, left, right, dilation, with_bias) in cases {
+            let x = rng.tensor(&[batch, channels, time]);
+            let weight = rng.tensor(&[channels, 1, taps]);
+            let bias = with_bias.then(|| rng.tensor(&[channels]));
+            let expected = candle_reference(&x, &weight, bias.as_ref(), left, right, dilation);
+            let spec = DepthwiseConv1dSpec::padded(left, right).with_dilation(dilation);
+            let actual = depthwise_conv1d(&x, &weight, bias.as_ref(), spec).unwrap();
+            let diff = max_abs_diff(&expected, &actual);
+            assert!(
+                diff <= 1e-5,
+                "case {:?}: max |diff| {diff}",
+                (batch, channels, time, taps, left, right, dilation)
+            );
+
+            // (C, K) weights and the channels-last layout give the same result.
+            let last = depthwise_conv1d(
+                &x.transpose(1, 2).unwrap().contiguous().unwrap(),
+                &weight.reshape((channels, taps)).unwrap(),
+                bias.as_ref(),
+                spec.with_layout(ConvLayout::ChannelsLast),
+            )
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+            assert!(max_abs_diff(&expected, &last) <= 1e-5);
+        }
+    }
+
+    #[test]
+    fn shift_accumulate_accepts_strided_inputs_and_half_precision() {
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        let (channels, time, taps) = (40, 64, 9);
+        // A transposed (non-contiguous) channels-first view.
+        let x = rng.tensor(&[1, time, channels]).transpose(1, 2).unwrap();
+        let weight = rng.tensor(&[channels, 1, taps]);
+        let bias = rng.tensor(&[channels]);
+        let expected = candle_reference(&x.contiguous().unwrap(), &weight, Some(&bias), 4, 4, 1);
+        let actual =
+            depthwise_conv1d(&x, &weight, Some(&bias), DepthwiseConv1dSpec::symmetric(4)).unwrap();
+        assert!(max_abs_diff(&expected, &actual) <= 1e-5);
+
+        let half = depthwise_conv1d(
+            &x.to_dtype(DType::F16).unwrap(),
+            &weight.to_dtype(DType::F16).unwrap(),
+            Some(&bias.to_dtype(DType::F16).unwrap()),
+            DepthwiseConv1dSpec::symmetric(4),
+        )
+        .unwrap();
+        assert_eq!(half.dtype(), DType::F16);
+        // F16 storage of inputs and the output bounds the error, not the sum.
+        let half = half.to_dtype(DType::F32).unwrap();
+        assert!(max_abs_diff(&expected, &half) <= 2e-2);
+    }
+
+    #[test]
+    fn folded_batch_norm_matches_conv_then_batch_norm() {
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+        let (channels, time, taps) = (32, 45, 15);
+        let x = rng.tensor(&[2, channels, time]);
+        let weight = rng.tensor(&[channels, 1, taps]);
+        let mean = rng.tensor(&[channels]);
+        let var = rng
+            .tensor(&[channels])
+            .abs()
+            .unwrap()
+            .affine(1.0, 0.1)
+            .unwrap();
+        let gamma = rng.tensor(&[channels]);
+        let beta = rng.tensor(&[channels]);
+        let bn = candle_nn::BatchNorm::new(
+            channels,
+            mean.clone(),
+            var.clone(),
+            gamma.clone(),
+            beta.clone(),
+            1e-5,
+        )
+        .unwrap();
+        let conv = candle_reference(&x, &weight, None, 7, 7, 1);
+        let expected = candle_nn::ModuleT::forward_t(&bn, &conv, false).unwrap();
+
+        let (scale, shift) = batch_norm_affine(&mean, &var, 1e-5, Some((&gamma, &beta))).unwrap();
+        let (w, b) = fold_channel_affine(&weight, None, &scale, &shift).unwrap();
+        let actual = depthwise_conv1d(&x, &w, Some(&b), DepthwiseConv1dSpec::symmetric(7)).unwrap();
+        let diff = max_abs_diff(&expected, &actual);
+        // Relative to the output scale (|y| up to ~30 here), 1e-5 relative.
+        let scale_max = expected
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff <= 1e-5 * scale_max.max(1.0), "max |diff| {diff}");
+    }
+
+    #[test]
+    fn rejects_mismatched_weights_and_short_inputs() {
+        let x = Tensor::zeros((1, 4, 3), DType::F32, &Device::Cpu).unwrap();
+        let wrong = Tensor::zeros((5, 1, 3), DType::F32, &Device::Cpu).unwrap();
+        assert!(depthwise_conv1d(&x, &wrong, None, DepthwiseConv1dSpec::symmetric(1)).is_err());
+        let long = Tensor::zeros((4, 1, 9), DType::F32, &Device::Cpu).unwrap();
+        assert!(depthwise_conv1d(&x, &long, None, DepthwiseConv1dSpec::padded(0, 0)).is_err());
+        assert!(is_depthwise_conv1d(&long, 4, 4, 1));
+        assert!(!is_depthwise_conv1d(&long, 4, 4, 2));
+        assert!(!is_depthwise_conv1d(&long, 4, 1, 1));
+    }
+
+    #[test]
+    fn counts_calls_and_taps() {
+        let x = Tensor::zeros((1, 4, 16), DType::F32, &Device::Cpu).unwrap();
+        let w = Tensor::zeros((4, 1, 9), DType::F32, &Device::Cpu).unwrap();
+        let (calls, taps) = (depthwise_conv1d_calls(), depthwise_conv1d_taps());
+        depthwise_conv1d(&x, &w, None, DepthwiseConv1dSpec::symmetric(4)).unwrap();
+        // Other tests may run concurrently; the counters only grow.
+        assert!(depthwise_conv1d_calls() > calls);
+        assert!(depthwise_conv1d_taps() >= taps + 9);
+    }
+
+    /// CPU micro-benchmark against Candle's per-group loop (Parakeet geometry:
+    /// 1024 channels, kernel 9, ~60 s of encoder frames).
+    #[test]
+    #[ignore]
+    fn bench_shift_accumulate_vs_candle_grouped_conv1d() {
+        let mut rng = XorShift(0x0123_4567_89AB_CDEF);
+        for (channels, taps, time) in [(1024, 9, 750), (2048, 15, 200), (512, 9, 1500)] {
+            let x = rng.tensor(&[1, channels, time]);
+            let weight = rng.tensor(&[channels, 1, taps]);
+            let pad = (taps - 1) / 2;
+            let iters = 5;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                candle_reference(&x, &weight, None, pad, pad, 1);
+            }
+            let candle = start.elapsed() / iters;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                depthwise_conv1d(&x, &weight, None, DepthwiseConv1dSpec::symmetric(pad)).unwrap();
+            }
+            let shared = start.elapsed() / iters;
+            eprintln!(
+                "C={channels} K={taps} T={time}: candle grouped {candle:?}, shift-accumulate {shared:?} ({:.1}x)",
+                candle.as_secs_f64() / shared.as_secs_f64()
+            );
+        }
+    }
+}
