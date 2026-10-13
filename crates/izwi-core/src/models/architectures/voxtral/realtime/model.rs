@@ -1,6 +1,7 @@
 //! Main Voxtral Realtime model implementation.
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -2119,8 +2120,9 @@ impl WhisperEncoder {
 
         // Transformer layers
         let mut x = x;
+        let tables = EncoderForwardTables::default();
         for layer in &self.layers {
-            x = layer.forward(&x, self.is_causal)?;
+            x = layer.forward(&x, self.is_causal, &tables)?;
         }
 
         // Final layer norm
@@ -2168,8 +2170,15 @@ impl WhisperEncoder {
         } else {
             x
         };
+        let tables = EncoderForwardTables::default();
         for layer in &self.layers {
-            x = layer.forward_valid_lengths(&x, self.is_causal, &conv2_lengths, &frame_mask)?;
+            x = layer.forward_valid_lengths(
+                &x,
+                self.is_causal,
+                &conv2_lengths,
+                &frame_mask,
+                &tables,
+            )?;
         }
         let x = if let Some(ln_post_rms) = &self.ln_post_rms {
             ln_post_rms.forward(&x)?
@@ -2304,14 +2313,19 @@ impl WhisperEncoderLayer {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, is_causal: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Tensor> {
         let residual = x;
         let x = if self.is_voxtral {
             self.self_attn_rms_norm.as_ref().unwrap().forward(x)?
         } else {
             self.self_attn_layer_norm.as_ref().unwrap().forward(x)?
         };
-        let x = self.self_attn.forward(&x, is_causal)?;
+        let x = self.self_attn.forward(&x, is_causal, tables)?;
         let x = (residual + x)?;
 
         let residual = &x;
@@ -2346,6 +2360,7 @@ impl WhisperEncoderLayer {
         is_causal: bool,
         valid_lengths: &[usize],
         frame_mask: &Tensor,
+        tables: &EncoderForwardTables,
     ) -> Result<Tensor> {
         let residual = x.broadcast_mul(frame_mask)?;
         let normalized = if self.is_voxtral {
@@ -2362,7 +2377,7 @@ impl WhisperEncoderLayer {
         .broadcast_mul(frame_mask)?;
         let attention = self
             .self_attn
-            .forward_valid_lengths(&normalized, is_causal, valid_lengths, frame_mask)?
+            .forward_valid_lengths(&normalized, is_causal, valid_lengths, frame_mask, tables)?
             .broadcast_mul(frame_mask)?;
         let x = residual
             .broadcast_add(&attention)?
@@ -2463,7 +2478,12 @@ impl WhisperAttention {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, is_causal: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        is_causal: bool,
+        tables: &EncoderForwardTables,
+    ) -> Result<Tensor> {
         let (bsz, seq_len, _) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
@@ -2478,14 +2498,7 @@ impl WhisperAttention {
             .transpose(1, 2)?;
 
         if self.use_rope_positions {
-            let (cos, sin) = build_rope_cache(
-                seq_len,
-                self.head_dim,
-                0,
-                self.rope_theta,
-                x.device(),
-                q.dtype(),
-            )?;
+            let (cos, sin) = tables.rope(seq_len, self.head_dim, self.rope_theta, &q)?;
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
@@ -2546,12 +2559,7 @@ impl WhisperAttention {
 
         // Apply causal/sliding mask if needed
         let attn_weights = if is_causal {
-            let mask = create_causal_mask(
-                seq_len,
-                self.sliding_window,
-                x.device(),
-                attn_weights.dtype(),
-            )?;
+            let mask = tables.causal_mask(seq_len, self.sliding_window, &attn_weights)?;
             attn_weights.broadcast_add(&mask)?
         } else {
             attn_weights
@@ -2577,6 +2585,7 @@ impl WhisperAttention {
         is_causal: bool,
         valid_lengths: &[usize],
         frame_mask: &Tensor,
+        tables: &EncoderForwardTables,
     ) -> Result<Tensor> {
         let (batch, seq_len, _) = x.dims3()?;
         validate_valid_lengths(batch, seq_len, valid_lengths)?;
@@ -2589,14 +2598,7 @@ impl WhisperAttention {
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
         if self.use_rope_positions {
-            let (cos, sin) = build_rope_cache(
-                seq_len,
-                self.head_dim,
-                0,
-                self.rope_theta,
-                x.device(),
-                q.dtype(),
-            )?;
+            let (cos, sin) = tables.rope(seq_len, self.head_dim, self.rope_theta, &q)?;
             q = apply_interleaved_rotary_emb(&q, &cos, &sin)?;
             k = apply_interleaved_rotary_emb(&k, &cos, &sin)?;
         }
@@ -2610,14 +2612,13 @@ impl WhisperAttention {
         let weights = q.matmul(&k.transpose(1, 2)?)?;
         let scale = attention_scale_tensor(self.scale, &weights)?;
         let weights = weights.broadcast_mul(&scale)?;
-        let mask = create_valid_attention_mask(
+        let mask = tables.valid_attention_mask(
             valid_lengths,
             self.num_heads,
             seq_len,
             is_causal,
             self.sliding_window,
-            x.device(),
-            weights.dtype(),
+            &weights,
         )?;
         let weights = candle_nn::ops::softmax(&weights.broadcast_add(&mask)?, 2)?;
         let output = weights
@@ -2629,6 +2630,125 @@ impl WhisperAttention {
             .forward(&output)?
             .broadcast_mul(frame_mask)
             .map_err(Error::from)
+    }
+}
+
+/// Attention inputs that depend only on the sequence geometry, built at most
+/// once per encoder forward and shared by every layer. Each layer used to
+/// rebuild them: the RoPE cos/sin tables (host angles, upload, device
+/// `cos`/`sin`) and an O(seq²) host mask uploaded per layer (32 layers; a
+/// 30 s window is a 1500 x 1500 mask). Every entry is keyed by its full
+/// geometry and rebuilt on any mismatch, so a cache hit returns exactly what
+/// the layer would have built.
+#[derive(Default)]
+struct EncoderForwardTables {
+    rope: RefCell<Option<(RopeTableKey, (Tensor, Tensor))>>,
+    causal_mask: RefCell<Option<(CausalMaskKey, Tensor)>>,
+    valid_mask: RefCell<Option<(ValidMaskKey, Tensor)>>,
+    builds: Cell<usize>,
+}
+
+type RopeTableKey = (usize, usize, u64, DType, candle_core::DeviceLocation);
+type CausalMaskKey = (usize, Option<usize>, DType, candle_core::DeviceLocation);
+type ValidMaskKey = (
+    Vec<usize>,
+    usize,
+    usize,
+    bool,
+    Option<usize>,
+    DType,
+    candle_core::DeviceLocation,
+);
+
+impl EncoderForwardTables {
+    fn cached<K: PartialEq, V: Clone>(
+        &self,
+        slot: &RefCell<Option<(K, V)>>,
+        key: K,
+        build: impl FnOnce() -> Result<V>,
+    ) -> Result<V> {
+        if let Some((cached_key, value)) = slot.borrow().as_ref() {
+            if *cached_key == key {
+                return Ok(value.clone());
+            }
+        }
+        let value = build()?;
+        self.builds.set(self.builds.get() + 1);
+        *slot.borrow_mut() = Some((key, value.clone()));
+        Ok(value)
+    }
+
+    fn rope(
+        &self,
+        seq_len: usize,
+        head_dim: usize,
+        rope_theta: f64,
+        reference: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = reference.device();
+        let key = (
+            seq_len,
+            head_dim,
+            rope_theta.to_bits(),
+            reference.dtype(),
+            device.location(),
+        );
+        self.cached(&self.rope, key, || {
+            build_rope_cache(seq_len, head_dim, 0, rope_theta, device, reference.dtype())
+        })
+    }
+
+    fn causal_mask(
+        &self,
+        seq_len: usize,
+        sliding_window: Option<usize>,
+        reference: &Tensor,
+    ) -> Result<Tensor> {
+        let key = (
+            seq_len,
+            sliding_window,
+            reference.dtype(),
+            reference.device().location(),
+        );
+        self.cached(&self.causal_mask, key, || {
+            create_causal_mask(
+                seq_len,
+                sliding_window,
+                reference.device(),
+                reference.dtype(),
+            )
+        })
+    }
+
+    fn valid_attention_mask(
+        &self,
+        valid_lengths: &[usize],
+        heads: usize,
+        seq_len: usize,
+        is_causal: bool,
+        sliding_window: Option<usize>,
+        reference: &Tensor,
+    ) -> Result<Tensor> {
+        let key = (
+            valid_lengths.to_vec(),
+            heads,
+            seq_len,
+            is_causal,
+            sliding_window,
+            reference.dtype(),
+            reference.device().location(),
+        );
+        self.cached(&self.valid_mask, key, || {
+            create_valid_attention_mask(
+                valid_lengths,
+                heads,
+                seq_len,
+                is_causal,
+                sliding_window,
+                reference.device(),
+                reference.dtype(),
+            )
+        })
     }
 }
 
@@ -3586,6 +3706,99 @@ mod tests {
         append_generated_token, checked_delay_tokens, flush_generated_text, VoxtralRuntimeConfig,
     };
     use super::{PORTABLE_OFFLINE_AUDIO_FRAME_LIMIT, VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT};
+
+    /// Sharing one table set across the encoder layers gives bit-identical
+    /// output to rebuilding the RoPE tables and masks in every layer (the
+    /// pre-change behaviour), with one build of each instead of one per layer.
+    #[test]
+    fn encoder_layers_share_rope_and_masks_bit_identically() {
+        use super::{frame_valid_mask, EncoderForwardTables, WhisperEncoder};
+        let device = Device::Cpu;
+        let cfg = super::super::config::AudioEncoderConfig {
+            d_model: 32,
+            encoder_layers: 3,
+            encoder_attention_heads: 4,
+            encoder_ffn_dim: 64,
+            num_mel_bins: 8,
+            max_source_positions: 64,
+            window_size: 400,
+            hop_length: 160,
+            sampling_rate: 16_000,
+            is_causal: true,
+            conv1_kernel_size: 3,
+            conv1_stride: 1,
+            conv2_kernel_size: 3,
+            conv2_stride: 2,
+            global_log_mel_max: None,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            pos_embed: "rope".into(),
+            sliding_window: 5,
+        };
+        let vars = candle_nn::VarMap::new();
+        let vb = candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let encoder = WhisperEncoder::load_voxtral(&cfg, vb).unwrap();
+        let mut state = 0x9B05_688C_2B3E_6C1Fu64;
+        let values = (0..2 * 23 * 32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (2, 23, 32), &device).unwrap();
+        let bits = |t: &Tensor| {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+
+        let shared = EncoderForwardTables::default();
+        let (mut fresh_x, mut shared_x) = (x.clone(), x.clone());
+        let mut fresh_builds = 0;
+        for layer in &encoder.layers {
+            let fresh = EncoderForwardTables::default();
+            fresh_x = layer.forward(&fresh_x, true, &fresh).unwrap();
+            fresh_builds += fresh.builds.get();
+            shared_x = layer.forward(&shared_x, true, &shared).unwrap();
+        }
+        assert_eq!(bits(&fresh_x), bits(&shared_x));
+        assert_eq!(fresh_builds, 2 * cfg.encoder_layers);
+        assert_eq!(shared.builds.get(), 2);
+
+        let lengths = [23usize, 11];
+        let frame_mask = frame_valid_mask(&lengths, 23, &x).unwrap();
+        let shared = EncoderForwardTables::default();
+        let (mut fresh_x, mut shared_x) = (x.clone(), x.clone());
+        for layer in &encoder.layers {
+            let fresh = EncoderForwardTables::default();
+            fresh_x = layer
+                .forward_valid_lengths(&fresh_x, true, &lengths, &frame_mask, &fresh)
+                .unwrap();
+            shared_x = layer
+                .forward_valid_lengths(&shared_x, true, &lengths, &frame_mask, &shared)
+                .unwrap();
+        }
+        assert_eq!(bits(&fresh_x), bits(&shared_x));
+        assert_eq!(shared.builds.get(), 2);
+
+        // A different geometry in the same table set rebuilds instead of
+        // returning a stale entry.
+        let short = x.narrow(1, 0, 7).unwrap();
+        let expected = encoder.layers[0]
+            .forward(&short, true, &EncoderForwardTables::default())
+            .unwrap();
+        let reused = EncoderForwardTables::default();
+        encoder.layers[0].forward(&x, true, &reused).unwrap();
+        let actual = encoder.layers[0].forward(&short, true, &reused).unwrap();
+        assert_eq!(bits(&expected), bits(&actual));
+        assert_eq!(reused.builds.get(), 4);
+    }
 
     /// Published configs of mistralai/Voxtral-Mini-4B-Realtime-2602 at
     /// revision 2769294d: `params.json` and `config.json` verbatim, plus a
