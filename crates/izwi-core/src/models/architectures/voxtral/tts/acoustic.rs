@@ -193,7 +193,7 @@ impl FlowMatchingAudioTransformer {
             )?);
         }
         let norm = candle_nn::rms_norm(args.dim, args.norm_eps, vb.pp("norm"))?;
-        let time_embedding = TimeEmbedding::new(args.dim, args.rope_theta, vb.device())?;
+        let time_embedding = TimeEmbedding::new(args.dim, TIME_EMBEDDING_THETA, vb.device())?;
         Ok(Self {
             input_projection,
             time_projection,
@@ -499,6 +499,11 @@ impl AcousticFeedForward {
         linear_forward_last_dim(&self.w2, &hidden)
     }
 }
+
+/// The reference `TimeEmbedding(dim, theta=10000.0)` (vllm-omni
+/// voxtral_tts_audio_generation.py): a fixed constant, not the acoustic
+/// transformer's `rope_theta` (equal today, but independent).
+const TIME_EMBEDDING_THETA: f64 = 10_000.0;
 
 impl TimeEmbedding {
     fn new(dim: usize, theta: f64, device: &candle_core::Device) -> Result<Self> {
@@ -1037,6 +1042,28 @@ mod tests {
         assert_eq!(codes[0][0], AudioSpecialToken::End.id());
         assert!(codes[0][1] >= AUDIO_SPECIAL_TOKEN_COUNT);
         assert!(codes[0][2] >= AUDIO_SPECIAL_TOKEN_COUNT);
+    }
+
+    /// VXT-12: the time embedding uses the reference's fixed theta 10000,
+    /// whatever `rope_theta` the acoustic transformer config carries.
+    #[test]
+    fn time_embedding_theta_is_the_reference_constant() {
+        let device = Device::Cpu;
+        let mut config = tiny_acoustic_config();
+        config
+            .multimodal
+            .audio_model_args
+            .acoustic_transformer_args
+            .rope_theta = 1_000_000.0;
+        let vb = VarBuilder::from_tensors(tiny_acoustic_tensors(&device), DType::F32, &device);
+        let transformer = FlowMatchingAudioTransformer::load(&config, vb).unwrap();
+        let inv_freq = transformer
+            .time_embedding
+            .inv_freq
+            .to_vec1::<f32>()
+            .unwrap();
+        // dim 4: half 2, inv_freq[1] = 10000^(-1/2).
+        assert!((inv_freq[1] - 0.01).abs() < 1e-7, "{inv_freq:?}");
     }
 
     fn tiny_acoustic_config() -> VoxtralTtsConfig {
