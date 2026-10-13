@@ -16,7 +16,7 @@ use crate::{Error, Result};
 
 use super::chat::ChatGenerationConfig;
 
-const DEVICE_SORT_CHUNK: usize = 1024;
+pub(crate) const DEVICE_SORT_CHUNK: usize = 1024;
 const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
 const DEVICE_SAMPLING_TENSOR_CACHE_ENTRIES: usize = 8;
 pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
@@ -1240,7 +1240,7 @@ pub fn resident_top_k_sample(
 
 /// `-ln(-ln(u))` for `count` uniforms, the Gumbel(0, 1) noise of the
 /// Gumbel-max trick.
-fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
+pub(crate) fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
     (0..count)
         .map(|_| {
             let uniform = f64::from(draw()).clamp(1e-12, 1.0 - 1e-12);
@@ -1264,6 +1264,16 @@ fn gumbel_top_k_token(scores: &Tensor, k: usize, gumbel: &[f32]) -> Result<Tenso
         .to_dtype(DType::U32)?
         .index_select(&pick, 0)
         .map_err(Error::from)
+}
+
+/// The `k` largest values of a rank-1 `values`, sorted descending, and their
+/// U32 indices, computed on the values' device. `None` when `k` is 0 or above
+/// the device sort bound.
+pub(crate) fn device_top_k(values: &Tensor, k: usize) -> Result<Option<(Tensor, Tensor)>> {
+    if k == 0 || k > DEVICE_SORT_CHUNK {
+        return Ok(None);
+    }
+    bounded_topk(values, k).map(Some)
 }
 
 fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {

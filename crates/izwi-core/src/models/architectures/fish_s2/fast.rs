@@ -1,14 +1,17 @@
 //! Fast codebook decoder for Fish S2 DualAR generation.
 
-use candle_core::{DType, IndexOp, Tensor};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
 pub use super::sampling::FishS2Sampler;
-use super::sampling::FishS2SamplingDistribution;
+use super::sampling::{sample_resident, FishS2ResidentDraws, FishS2SamplingDistribution};
 use crate::error::{Error, Result};
 use crate::models::architectures::fish_s2::config::FishS2Config;
 use crate::models::architectures::fish_s2::rotary::FishS2RotaryCache;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
+use crate::models::shared::telemetry;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishS2FastConfig {
@@ -309,6 +312,21 @@ impl FishS2FastDecoder {
         samplers: &mut [&mut FishS2Sampler],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Vec<FishS2GeneratedFrame>> {
+        let resident = resident_fast_sampling(slow_hidden.device());
+        self.generate_frames_batch_with(semantic_tokens, slow_hidden, samplers, caches, resident)
+    }
+
+    /// [`Self::generate_frames_batch`] with the fast-code sampling chosen
+    /// explicitly: `resident` keeps codes on the device and reads the frame
+    /// back once (falling back to the host when a sampler's policy needs it).
+    fn generate_frames_batch_with(
+        &self,
+        semantic_tokens: &[u32],
+        slow_hidden: &Tensor,
+        samplers: &mut [&mut FishS2Sampler],
+        caches: &mut [&mut PhysicalPagedKvCache],
+        resident: bool,
+    ) -> Result<Vec<FishS2GeneratedFrame>> {
         let rows = semantic_tokens.len();
         if rows == 0
             || rows != caches.len()
@@ -348,23 +366,60 @@ impl FishS2FastDecoder {
             .collect::<Vec<_>>();
         let ids = Tensor::from_slice(&semantic_codes, (rows, 1), slow_hidden.device())?;
         let mut current = self.embeddings.forward(&ids)?;
+        let draws = self.resident_draws(samplers, slow_hidden.device(), resident)?;
+        let mut resident = ResidentCodes::default();
         for depth in 1..self.cfg.num_codebooks {
             let logits = self.forward_step_batch(&current, depth, caches, true)?;
-            let mut codes = Vec::with_capacity(rows);
-            for (row, (sampler, frame)) in samplers.iter_mut().zip(&mut frames).enumerate() {
-                let code = sample_logits(&logits.i((row, 0))?, sampler)?;
-                frame.codebooks.push(code);
-                codes.push(code);
-            }
+            let next_ids = if let Some(draws) = &draws {
+                let mut codes = Vec::with_capacity(rows);
+                for (row, (sampler, draws)) in samplers.iter().zip(draws).enumerate() {
+                    codes.push(resident.sample(&logits.i((row, 0))?, sampler, draws, depth - 1)?);
+                }
+                Tensor::cat(&codes, 0)?
+            } else {
+                let mut codes = Vec::with_capacity(rows);
+                for (sampler, frame) in samplers.iter_mut().zip(&mut frames) {
+                    let row = codes.len();
+                    let code = sample_logits(&logits.i((row, 0))?, sampler)?;
+                    frame.codebooks.push(code);
+                    codes.push(code);
+                }
+                Tensor::from_slice(&codes, rows, slow_hidden.device())?
+            };
             if depth + 1 < self.cfg.num_codebooks {
-                current = self.embeddings.forward(&Tensor::from_slice(
-                    &codes,
-                    (rows, 1),
-                    slow_hidden.device(),
-                )?)?;
+                current = self.embeddings.forward(&next_ids.reshape((rows, 1))?)?;
+            }
+        }
+        if draws.is_some() {
+            // Codes were drawn depth by depth, rows within a depth.
+            let codes = resident.read_back()?;
+            for (index, code) in codes.into_iter().enumerate() {
+                frames[index % rows].codebooks.push(code);
             }
         }
         Ok(frames)
+    }
+
+    /// Per-row resident draws for one frame, or `None` for the host path
+    /// (CPU, or a policy the device sampler does not serve).
+    fn resident_draws(
+        &self,
+        samplers: &mut [&mut FishS2Sampler],
+        device: &Device,
+        resident: bool,
+    ) -> Result<Option<Vec<FishS2ResidentDraws>>> {
+        if !resident {
+            return Ok(None);
+        }
+        let tokens = self.cfg.num_codebooks.saturating_sub(1);
+        let mut draws = Vec::with_capacity(samplers.len());
+        for sampler in samplers.iter_mut() {
+            match sampler.resident_draws(tokens, device)? {
+                Some(row) => draws.push(row),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(draws))
     }
 
     pub fn generate_frame(
@@ -374,6 +429,18 @@ impl FishS2FastDecoder {
         sampler: &mut FishS2Sampler,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<FishS2GeneratedFrame> {
+        let resident = resident_fast_sampling(slow_hidden.device());
+        self.generate_frame_with(semantic_token_id, slow_hidden, sampler, cache, resident)
+    }
+
+    fn generate_frame_with(
+        &self,
+        semantic_token_id: u32,
+        slow_hidden: &Tensor,
+        sampler: &mut FishS2Sampler,
+        cache: &mut PhysicalPagedKvCache,
+        resident: bool,
+    ) -> Result<FishS2GeneratedFrame> {
         let semantic_code =
             semantic_code_from_token_id_from_fast_config(&self.cfg, semantic_token_id)?;
         cache.reset_invocation()?;
@@ -382,14 +449,30 @@ impl FishS2FastDecoder {
 
         let mut codebooks = vec![semantic_code];
         let mut current = self.codebook_embedding(semantic_code)?;
+        let tokens = self.cfg.num_codebooks.saturating_sub(1);
+        let draws = if resident {
+            sampler.resident_draws(tokens, slow_hidden.device())?
+        } else {
+            None
+        };
+        let mut resident = ResidentCodes::default();
         for codebook_idx in 1..self.cfg.num_codebooks {
             let logits = self.forward_step(&current, codebook_idx, cache)?;
             let row = logits.i((0, 0))?;
-            let code = sample_logits(&row, sampler)?;
-            codebooks.push(code);
+            let next = match &draws {
+                Some(draws) => resident.sample(&row, sampler, draws, codebook_idx - 1)?,
+                None => {
+                    let code = sample_logits(&row, sampler)?;
+                    codebooks.push(code);
+                    Tensor::from_vec(vec![code], 1, row.device())?
+                }
+            };
             if codebook_idx + 1 < self.cfg.num_codebooks {
-                current = self.codebook_embedding(code)?;
+                current = self.embeddings.forward(&next.reshape((1, 1))?)?;
             }
+        }
+        if draws.is_some() {
+            codebooks.extend(resident.read_back()?);
         }
         Ok(FishS2GeneratedFrame {
             semantic_token_id,
@@ -609,6 +692,68 @@ impl FishS2FastMlp {
     }
 }
 
+static FISH_S2_RESIDENT_FAST_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of Fish fast-codebook frames sampled on the device
+/// with a single code readback (FSH-4).
+pub fn fish_s2_resident_fast_frames() -> u64 {
+    FISH_S2_RESIDENT_FAST_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Fast codes are sampled on the device where readbacks are synchronizing
+/// device round trips (CUDA, Metal). On the CPU the host sampler reads
+/// memory that is already local.
+fn resident_fast_sampling(device: &Device) -> bool {
+    device.is_cuda() || device.is_metal()
+}
+
+/// One frame's device-resident fast codes and the non-finite logit counts
+/// of the rows they were drawn from, read back together once.
+#[derive(Default)]
+struct ResidentCodes {
+    codes: Vec<Tensor>,
+    non_finite: Vec<Tensor>,
+}
+
+impl ResidentCodes {
+    /// Draw one code (left on the device as a `[1]` U32 tensor).
+    fn sample(
+        &mut self,
+        row: &Tensor,
+        sampler: &FishS2Sampler,
+        draws: &FishS2ResidentDraws,
+        token: usize,
+    ) -> Result<Tensor> {
+        let (code, non_finite) =
+            sample_resident(row, sampler.temperature, sampler.top_p, draws, token)?.ok_or_else(
+                || Error::InferenceError("Fish S2 resident fast sampler lost its policy".into()),
+            )?;
+        self.codes.push(code.clone());
+        self.non_finite.push(non_finite);
+        Ok(code)
+    }
+
+    /// The codes in draw order, from one readback; an error if any sampled
+    /// row held a non-finite logit.
+    fn read_back(self) -> Result<Vec<u32>> {
+        let count = self.codes.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let packed = Tensor::cat(&[self.codes, self.non_finite].concat(), 0)?;
+        telemetry::record_host_read(DType::U32, packed.elem_count());
+        let values = packed.to_vec1::<u32>()?;
+        FISH_S2_RESIDENT_FAST_FRAMES.fetch_add(1, Ordering::Relaxed);
+        let non_finite = values[count..].iter().map(|&v| u64::from(v)).sum::<u64>();
+        if non_finite > 0 {
+            return Err(Error::InferenceError(format!(
+                "Fish S2 fast logits contain {non_finite} non-finite values"
+            )));
+        }
+        Ok(values[..count].to_vec())
+    }
+}
+
 pub(crate) fn sample_logits(row: &Tensor, sampler: &mut FishS2Sampler) -> Result<u32> {
     super::sampling::validate_policy(sampler.temperature, sampler.top_p)?;
     let distribution =
@@ -733,6 +878,118 @@ mod tests {
         );
         let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         FishS2FastDecoder::load(cfg, vb).unwrap()
+    }
+
+    /// FSH-4: a device-resident frame reads its fast codes back once (the
+    /// host sampler reads every code: num_codebooks - 1 per frame) and, when
+    /// greedy, picks exactly the host's codes. Batched resident rows match
+    /// scalar resident rows, and a non-finite logit fails the frame.
+    #[test]
+    fn resident_fast_frame_reads_its_codes_back_once() {
+        let device = Device::Cpu;
+        let decoder = tiny_decoder(&device);
+        let cfg = decoder.config().clone();
+        let cache = || {
+            super::super::physical::test_physical_cache(
+                303,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.num_codebooks,
+            )
+        };
+        let slow_hidden = Tensor::from_vec(vec![0.4f32, -0.2, 0.9], (1, 1, 3), &device).unwrap();
+        let mut host_cache = cache();
+        let mut resident_cache = cache();
+        let mut host_sampler = FishS2Sampler::new(0.0, 0.9, 5);
+        let mut resident_sampler = FishS2Sampler::new(0.0, 0.9, 5);
+        for semantic in [22u32, 25, 27] {
+            let before = telemetry::thread_host_reads();
+            let host = decoder
+                .generate_frame_with(
+                    semantic,
+                    &slow_hidden,
+                    &mut host_sampler,
+                    &mut host_cache,
+                    false,
+                )
+                .unwrap();
+            let host_reads = telemetry::thread_host_reads() - before;
+            let before = telemetry::thread_host_reads();
+            let resident = decoder
+                .generate_frame_with(
+                    semantic,
+                    &slow_hidden,
+                    &mut resident_sampler,
+                    &mut resident_cache,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(telemetry::thread_host_reads() - before, 1);
+            assert_eq!(host_reads, (cfg.num_codebooks - 1) as u64);
+            assert_eq!(resident, host);
+        }
+
+        // Sampled rows: the batch draws each row from its own sampler.
+        let caches = || {
+            super::super::physical::test_physical_caches(
+                304,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.num_codebooks,
+                3,
+            )
+        };
+        let mut batch_caches = caches();
+        let mut scalar_caches = caches();
+        let mut samplers = (0..3)
+            .map(|row| FishS2Sampler::new(0.8, 0.8, row + 40))
+            .collect::<Vec<_>>();
+        let mut scalar_samplers = samplers.clone();
+        let hidden = Tensor::from_vec(
+            (0..9).map(|i| (i as f32 * 0.7).cos()).collect::<Vec<_>>(),
+            (3, 1, 3),
+            &device,
+        )
+        .unwrap();
+        let ids = [21u32, 24, 26];
+        let expected = (0..3)
+            .map(|row| {
+                decoder
+                    .generate_frame_with(
+                        ids[row],
+                        &hidden.narrow(0, row, 1).unwrap(),
+                        &mut scalar_samplers[row],
+                        &mut scalar_caches[row],
+                        true,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let before = telemetry::thread_host_reads();
+        let actual = decoder
+            .generate_frames_batch_with(
+                &ids,
+                &hidden,
+                &mut samplers.iter_mut().collect::<Vec<_>>(),
+                &mut batch_caches.iter_mut().collect::<Vec<_>>(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(telemetry::thread_host_reads() - before, 1);
+        assert_eq!(actual, expected);
+
+        let mut codes = ResidentCodes::default();
+        let nan = Tensor::from_vec(vec![0.0f32, f32::NAN, 1.0], 3, &device).unwrap();
+        let mut sampler = FishS2Sampler::new(0.7, 0.9, 3);
+        let draws = sampler.resident_draws(1, &device).unwrap().unwrap();
+        codes.sample(&nan, &sampler, &draws, 0).unwrap();
+        assert!(codes
+            .read_back()
+            .unwrap_err()
+            .to_string()
+            .contains("non-finite"));
     }
 
     #[test]
