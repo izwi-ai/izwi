@@ -6,6 +6,50 @@ const DEFAULT_CHUNK_MAX_CHARS: usize = 480;
 const CHUNK_MAX_CHARS_MIN: usize = 80;
 const CHUNK_MAX_CHARS_MAX: usize = 4000;
 
+/// Silence between two long-form segments: a sentence pause, not the raw
+/// back-to-back concatenation that ran sentences together (TPIPE-5).
+const SEGMENT_PAUSE_SECS: f32 = 0.12;
+/// A short fade on each side of the pause, so no segment ends or starts on
+/// a click.
+const SEGMENT_FADE_SECS: f32 = 0.01;
+
+fn seconds_to_samples(secs: f32, sample_rate: u32) -> usize {
+    (secs * sample_rate as f32).round().max(1.0) as usize
+}
+
+/// Fade the first samples of a segment in from silence.
+pub(crate) fn fade_in_segment(samples: &mut [f32], sample_rate: u32) {
+    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(samples.len());
+    for (index, sample) in samples.iter_mut().take(fade).enumerate() {
+        *sample *= (index + 1) as f32 / (fade + 1) as f32;
+    }
+}
+
+/// The pause before a later segment, followed by that segment faded in.
+pub(crate) fn pause_then_segment(segment: &[f32], sample_rate: u32) -> Vec<f32> {
+    let pause = seconds_to_samples(SEGMENT_PAUSE_SECS, sample_rate);
+    let mut out = Vec::with_capacity(pause + segment.len());
+    out.resize(pause, 0.0);
+    out.extend_from_slice(segment);
+    fade_in_segment(&mut out[pause..], sample_rate);
+    out
+}
+
+/// Append one long-form segment: the first as is, a later one after a
+/// faded-out tail and a short pause, faded in.
+pub(crate) fn append_segment(joined: &mut Vec<f32>, segment: &[f32], sample_rate: u32) {
+    if joined.is_empty() {
+        joined.extend_from_slice(segment);
+        return;
+    }
+    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(joined.len());
+    let tail = joined.len() - fade;
+    for (index, sample) in joined[tail..].iter_mut().enumerate() {
+        *sample *= (fade - index) as f32 / (fade + 1) as f32;
+    }
+    joined.extend(pause_then_segment(segment, sample_rate));
+}
+
 fn chunk_max_chars() -> usize {
     std::env::var("IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS")
         .ok()
@@ -138,117 +182,6 @@ fn should_enable_chunking(variant: ModelVariant, requested_max_tokens: usize) ->
     requested_max_tokens == 0 || requested_max_tokens >= model_max_frames
 }
 
-fn is_sentence_break(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | '!' | '?' | ';' | ':' | '。' | '！' | '？' | '；' | '：' | '\n'
-    )
-}
-
-fn push_trimmed(units: &mut Vec<String>, current: &mut String) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        units.push(trimmed.to_string());
-    }
-    current.clear();
-}
-
-fn split_sentence_units(text: &str) -> Vec<String> {
-    let mut units = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        current.push(ch);
-        if is_sentence_break(ch) {
-            push_trimmed(&mut units, &mut current);
-        }
-    }
-    push_trimmed(&mut units, &mut current);
-
-    if units.is_empty() {
-        vec![text.trim().to_string()]
-    } else {
-        units
-    }
-}
-
-fn split_overlong_unit(unit: &str, max_chars: usize) -> Vec<String> {
-    let char_len = unit.chars().count();
-    if char_len <= max_chars {
-        return vec![unit.trim().to_string()];
-    }
-
-    let words: Vec<&str> = unit.split_whitespace().collect();
-    if words.len() > 1 {
-        let mut out = Vec::new();
-        let mut current = String::new();
-        let mut current_chars = 0usize;
-
-        for word in words {
-            let word_chars = word.chars().count();
-            let sep_chars = if current.is_empty() { 0 } else { 1 };
-            if current_chars + sep_chars + word_chars <= max_chars {
-                if !current.is_empty() {
-                    current.push(' ');
-                }
-                current.push_str(word);
-                current_chars += sep_chars + word_chars;
-                continue;
-            }
-
-            if !current.is_empty() {
-                out.push(current.clone());
-                current.clear();
-                current_chars = 0;
-            }
-
-            if word_chars <= max_chars {
-                current.push_str(word);
-                current_chars = word_chars;
-                continue;
-            }
-
-            // Single unbroken token longer than chunk limit (e.g. CJK block or URL).
-            let mut token_chunk = String::new();
-            let mut token_chars = 0usize;
-            for ch in word.chars() {
-                token_chunk.push(ch);
-                token_chars += 1;
-                if token_chars >= max_chars {
-                    out.push(token_chunk.clone());
-                    token_chunk.clear();
-                    token_chars = 0;
-                }
-            }
-            if !token_chunk.is_empty() {
-                out.push(token_chunk);
-            }
-        }
-
-        if !current.is_empty() {
-            out.push(current);
-        }
-        return out;
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut current_chars = 0usize;
-    for ch in unit.chars() {
-        current.push(ch);
-        current_chars += 1;
-        if current_chars >= max_chars {
-            out.push(current.clone());
-            current.clear();
-            current_chars = 0;
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
 pub fn split_tts_text_for_long_form(
     variant: ModelVariant,
     requested_max_tokens: usize,
@@ -275,11 +208,12 @@ pub fn split_tts_text_for_long_form(
         return vec![trimmed.to_string()];
     }
 
-    let max_chars = chunk_max_chars();
-    let mut chunks = Vec::new();
-    for sentence in split_sentence_units(trimmed) {
-        chunks.extend(split_overlong_unit(sentence.as_str(), max_chars));
-    }
+    // Whole sentences, packed up to the character cap and what one request
+    // of this family can speak (TPIPE-5).
+    let chunks =
+        crate::api::sentence_split::pack_sentences(trimmed, chunk_max_chars(), &|segment| {
+            !crate::api::tts_policy::tts_text_exceeds_one_request(variant, segment)
+        });
 
     if chunks.is_empty() {
         vec![trimmed.to_string()]
@@ -390,7 +324,7 @@ pub async fn generate_long_form_tts(
         } else {
             sample_rate = Some(output.sample_rate);
         }
-        merged_samples.extend_from_slice(&output.samples);
+        append_segment(&mut merged_samples, &output.samples, output.sample_rate);
         total_tokens = total_tokens.saturating_add(output.total_tokens);
         total_time_ms += output.total_time_ms;
         constituent_diagnostics.push(output.diagnostics);
@@ -802,14 +736,54 @@ mod tests {
         ));
     }
 
+    /// TPIPE-5: short sentences pack into one request instead of one request
+    /// per sentence; text longer than one request splits between whole
+    /// sentences, and every segment fits one request.
     #[test]
-    fn qwen_auto_chunking_splits_sentences() {
+    fn qwen_auto_chunking_packs_whole_sentences_up_to_one_request() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
         let chunks = split_tts_text_for_long_form(
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+            variant,
             0,
             "Hello world. This is sentence two! Final line?",
         );
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks,
+            vec!["Hello world. This is sentence two! Final line?"]
+        );
+        let sentence = "Dr. Smith paid $3.50 at 10:30 for the long and winding trip home. ";
+        let text = sentence.repeat(30);
+        let chunks = split_tts_text_for_long_form(variant, 0, &text);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(
+                chunk.starts_with("Dr. Smith") && chunk.ends_with("home."),
+                "{chunk}"
+            );
+            assert!(!crate::api::tts_policy::tts_text_exceeds_one_request(
+                variant, chunk
+            ));
+        }
+    }
+
+    /// Segments join with a faded tail, a 120 ms pause and a faded head, not
+    /// back to back.
+    #[test]
+    fn segments_join_with_a_faded_pause() {
+        let rate = 24_000;
+        let mut joined = Vec::new();
+        append_segment(&mut joined, &[1.0; 480], rate);
+        assert_eq!(joined, vec![1.0; 480]);
+        append_segment(&mut joined, &[1.0; 480], rate);
+        let pause = 2_880;
+        assert_eq!(joined.len(), 480 + pause + 480);
+        // The first segment fades out over its last 10 ms (240 samples).
+        assert_eq!(joined[239], 1.0);
+        assert!(joined[479] > 0.0 && joined[479] < 0.01);
+        assert!(joined[480..480 + pause].iter().all(|sample| *sample == 0.0));
+        // The second fades in over its first 10 ms.
+        assert!(joined[480 + pause] > 0.0 && joined[480 + pause] < 0.01);
+        assert_eq!(*joined.last().unwrap(), 1.0);
     }
 
     #[test]
@@ -830,22 +804,15 @@ mod tests {
     }
 
     #[test]
-    fn qwen_voice_design_auto_chunking_splits_sentences() {
-        let chunks = split_tts_text_for_long_form(
+    fn qwen_voice_design_and_base_pack_the_same_way() {
+        for variant in [
             ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
-            0,
-            "Voice design sentence one. Voice design sentence two.",
-        );
-        assert_eq!(chunks.len(), 2);
-    }
-
-    #[test]
-    fn qwen_base_auto_chunking_splits_sentences() {
-        let chunks = split_tts_text_for_long_form(
             ModelVariant::Qwen3Tts12Hz06BBase,
-            0,
-            "Voice cloning sentence one. Voice cloning sentence two.",
-        );
-        assert_eq!(chunks.len(), 2);
+        ] {
+            let chunks =
+                split_tts_text_for_long_form(variant, 0, &"One sentence here. ".repeat(80));
+            assert!(chunks.len() > 1, "{variant}");
+            assert!(chunks.iter().all(|chunk| chunk.ends_with("here.")));
+        }
     }
 }

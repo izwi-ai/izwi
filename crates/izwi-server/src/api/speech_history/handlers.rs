@@ -2192,7 +2192,10 @@ async fn stream_record_creation(
         let mut global_sequence = 0usize;
         let mut failed = false;
         let mut failure_message: Option<String> = None;
-        for request in planned_requests {
+        for (request_index, request) in planned_requests.into_iter().enumerate() {
+            // A later long-form segment opens with a short pause and fades in
+            // (TPIPE-5); its predecessor's PCM is already sent.
+            let mut pause_pending = request_index > 0;
             let mut request_statistics = StreamRequestStatistics::default();
             let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(32);
             let generation_engine = runtime.clone();
@@ -2245,6 +2248,18 @@ async fn stream_record_creation(
                     }
                 };
 
+                let chunk = if pause_pending && !chunk.samples.is_empty() {
+                    pause_pending = false;
+                    AudioChunk {
+                        samples: crate::api::tts_long_form::pause_then_segment(
+                            &chunk.samples,
+                            chunk_sample_rate,
+                        ),
+                        ..chunk
+                    }
+                } else {
+                    chunk
+                };
                 total_samples += chunk.samples.len();
                 audio_duration_secs += chunk.samples.len() as f32 / chunk_sample_rate as f32;
                 let pcm_ms = stream_entry_started.elapsed().as_secs_f64() * 1000.0;
