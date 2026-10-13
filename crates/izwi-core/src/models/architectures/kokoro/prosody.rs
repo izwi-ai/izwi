@@ -19,6 +19,7 @@ use candle_nn::{LSTMConfig, RNN};
 use rayon::prelude::*;
 
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv;
 #[cfg(feature = "metal")]
 use crate::kernels::metal_encoder::IzwiMetalCommandEncoderExt;
 
@@ -1141,13 +1142,39 @@ impl AdainResBlk1d {
         let mut y = self.norm1.forward(x, style)?;
         y = ops::leaky_relu(&y, 0.2).map_err(Error::from)?;
         if let Some(pool) = &self.pool {
-            y = pool.forward(&y).map_err(Error::from)?;
+            y = depthwise_pool_forward(pool, &y)?;
         }
         y = self.conv1.forward(&y).map_err(Error::from)?;
         y = self.norm2.forward(&y, style)?;
         y = ops::leaky_relu(&y, 0.2).map_err(Error::from)?;
         self.conv2.forward(&y).map_err(Error::from)
     }
+}
+
+/// Runs the AdaIN block's depthwise 2x upsampler (`groups == channels`)
+/// through the shared phase-decomposed kernel instead of Candle's grouped
+/// `conv_transpose1d`, which issues one transposed conv per channel (up to
+/// 1090 in the decoder) plus a concatenation.
+fn depthwise_pool_forward(pool: &ConvTranspose1d, x: &Tensor) -> Result<Tensor> {
+    let cfg = pool.config();
+    let channels = x.dim(1).map_err(Error::from)?;
+    if !depthwise_conv::is_depthwise_conv_transpose1d(
+        pool.weight(),
+        channels,
+        cfg.groups,
+        cfg.dilation,
+    ) {
+        return pool.forward(x).map_err(Error::from);
+    }
+    depthwise_conv::depthwise_conv_transpose1d(
+        x,
+        pool.weight(),
+        pool.bias(),
+        cfg.stride,
+        cfg.padding,
+        cfg.output_padding,
+    )
+    .map_err(Error::from)
 }
 
 #[derive(Debug)]
@@ -1373,6 +1400,41 @@ pub(crate) fn fuse_weight_norm_dim0(weight_v: &Tensor, weight_g: &Tensor) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KOK-10: the AdaIN block's depthwise 2x upsampler runs through the
+    /// shared phase-decomposed kernel and matches Candle's grouped
+    /// `conv_transpose1d` (one transposed conv per channel plus a concat) at
+    /// the predictor (512 channels) and decoder (1090 channels) widths.
+    #[test]
+    fn adain_pool_uses_the_depthwise_transposed_kernel() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let device = candle_core::Device::Cpu;
+        for (seed, channels, frames) in [(11u64, 512usize, 41usize), (12, 1090, 23)] {
+            let weight = xorshift_tensor(&[channels, 1, 3], seed, 0.5, &device).unwrap();
+            let bias = xorshift_tensor(&[channels], seed + 100, 0.1, &device).unwrap();
+            let pool = ConvTranspose1d::new(
+                weight,
+                Some(bias),
+                ConvTranspose1dConfig {
+                    padding: 1,
+                    output_padding: 1,
+                    stride: 2,
+                    dilation: 1,
+                    groups: channels,
+                },
+            );
+            let x = xorshift_tensor(&[1, channels, frames], seed + 200, 1.0, &device).unwrap();
+            let before = depthwise_conv::depthwise_conv_transpose1d_calls();
+            let fast = depthwise_pool_forward(&pool, &x).unwrap();
+            assert!(depthwise_conv::depthwise_conv_transpose1d_calls() > before);
+            let reference = pool.forward(&x).unwrap();
+            assert_eq!(fast.dims(), &[1, channels, 2 * frames]);
+            assert_eq!(fast.dims(), reference.dims());
+            let diff = max_abs_diff(&host_f32(&fast).unwrap(), &host_f32(&reference).unwrap());
+            assert!(diff <= 1e-5, "{channels} channels: max |diff| {diff}");
+        }
+    }
 
     #[test]
     fn duration_frame_ceiling_is_enforced_before_alignment_construction() {
