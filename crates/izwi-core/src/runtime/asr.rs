@@ -177,6 +177,38 @@ const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
 /// budgeting audio tokens; per-invocation admission uses exact counts.
 pub(crate) const ASR_TEXT_PROMPT_TOKEN_RESERVE: usize = 128;
 
+/// Tokens one ASR decoder sequence needs for one full chunk (P2.5): its text
+/// prompt, the audio tokens of `chunk_secs` at `audio_token_rate`, and
+/// `decode_tokens` of output. No request decodes more than one chunk at a
+/// time (longer input is chunked), so this, not the model's native context,
+/// is the automatic per-sequence ceiling of every LLM-decoder ASR family.
+pub(crate) fn asr_sequence_ceiling(
+    text_prompt_tokens: usize,
+    audio_token_rate: f32,
+    chunk_secs: f32,
+    decode_tokens: usize,
+) -> usize {
+    let audio_tokens = (chunk_secs.max(0.0) * audio_token_rate.max(0.0)).ceil() as usize;
+    text_prompt_tokens
+        .saturating_add(audio_tokens)
+        .saturating_add(decode_tokens)
+}
+
+/// `(sequence, retained)` token bounds of an automatic ASR context: one
+/// `sequence_ceiling` per sequence, and one per concurrent sequence in the
+/// shared retained pool, never above the model's native context.
+pub(crate) fn asr_automatic_context(
+    native_tokens: usize,
+    sequence_ceiling: usize,
+    retained_rows: usize,
+) -> (usize, usize) {
+    let sequence = sequence_ceiling.min(native_tokens);
+    let retained = sequence
+        .saturating_mul(retained_rows.max(1))
+        .min(native_tokens);
+    (sequence, retained)
+}
+
 /// Smallest audio duration in seconds an invocation chunk planner will still
 /// emit before declaring the invocation context infeasible.
 pub(crate) const ASR_MIN_VIABLE_CHUNK_SECS: f32 = 4.0;
@@ -4856,6 +4888,30 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock};
     use uuid::Uuid;
+
+    /// The shared automatic ASR ceiling: prompt, one chunk of audio tokens and
+    /// the decode budget per sequence; one per retained row, under the native
+    /// context. Qwen3-ASR's 1,307 and VibeVoice's retained 1,938 come from it.
+    #[test]
+    fn shared_asr_ceiling_bounds_one_chunk_per_sequence() {
+        assert_eq!(
+            asr_sequence_ceiling(ASR_TEXT_PROMPT_TOKEN_RESERVE, 13.0, 30.0 / 0.95, 768),
+            1_307
+        );
+        assert_eq!(
+            asr_sequence_ceiling(
+                512,
+                7.5,
+                60.0,
+                crate::models::architectures::vibevoice::asr::vibevoice_auto_asr_max_tokens_for_duration(60.0)
+            ),
+            1_938
+        );
+        assert_eq!(asr_sequence_ceiling(128, 13.0, -1.0, 768), 896);
+        assert_eq!(asr_automatic_context(65_536, 1_938, 8), (1_938, 15_504));
+        assert_eq!(asr_automatic_context(65_536, 1_938, 0), (1_938, 1_938));
+        assert_eq!(asr_automatic_context(1_024, 1_938, 8), (1_024, 1_024));
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

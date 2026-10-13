@@ -53,6 +53,7 @@ use crate::models::shared::memory::accounting::{
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
+use crate::runtime::asr_automatic_context as qwen3_asr_automatic_context;
 
 pub(crate) use audio::QWEN3_ASR_AUDIO_POSITIONS;
 use audio::AudioTower;
@@ -128,30 +129,17 @@ const QWEN3_ASR_PLANNED_CHUNK_FRACTION: f32 = 0.95;
 /// reserve, its audio tokens and a decode reserve. This is the smallest
 /// context at which every planner still admits a full chunk.
 fn qwen3_asr_sequence_ceiling(audio_token_rate: f32, max_chunk_secs: f32) -> usize {
-    let planned_secs = max_chunk_secs / QWEN3_ASR_PLANNED_CHUNK_FRACTION;
     // Preparation plans single-pass input with the default generation budget;
     // chunk execution decodes at most the transcription cap.
     let decode_reserve = crate::models::registry::NativeAsrGenerationOptions::default()
         .max_new_tokens
         .max(DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS);
-    crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE
-        .saturating_add((planned_secs * audio_token_rate).ceil() as usize)
-        .saturating_add(decode_reserve)
-}
-
-/// `(sequence, retained)` token bounds for the automatic ASR ceiling: one
-/// planned chunk per sequence, and one per concurrent sequence in the shared
-/// retained pool, never above the model's native context.
-fn qwen3_asr_automatic_context(
-    native_tokens: usize,
-    sequence_ceiling: usize,
-    retained_rows: usize,
-) -> (usize, usize) {
-    let sequence = sequence_ceiling.min(native_tokens);
-    let retained = sequence
-        .saturating_mul(retained_rows.max(1))
-        .min(native_tokens);
-    (sequence, retained)
+    crate::runtime::asr_sequence_ceiling(
+        crate::runtime::ASR_TEXT_PROMPT_TOKEN_RESERVE,
+        audio_token_rate,
+        max_chunk_secs / QWEN3_ASR_PLANNED_CHUNK_FRACTION,
+        decode_reserve,
+    )
 }
 
 fn qwen3_asr_state_dtype(dtype: DType) -> Result<StateDType> {

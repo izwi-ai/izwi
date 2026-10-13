@@ -434,6 +434,55 @@ fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> Res
     }
 }
 
+/// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
+/// rows are sized for chat (on CUDA one per 256 MiB of device memory, about
+/// 320 on an H100), and every ASR retained row owns a prepared-input tensor
+/// and a sequence's worth of KV. ASR keeps the portable default of 8
+/// concurrent sequences, never fewer than one decode batch; operator-set rows
+/// are kept as configured.
+fn asr_state_rows(
+    automatic_rows: bool,
+    engine_retained_rows: usize,
+    engine_staged_rows: usize,
+) -> (usize, usize) {
+    const ASR_AUTOMATIC_RETAINED_ROWS: usize = 8;
+    let retained = if automatic_rows {
+        engine_retained_rows.min(ASR_AUTOMATIC_RETAINED_ROWS.max(engine_staged_rows))
+    } else {
+        engine_retained_rows
+    }
+    .max(1);
+    (retained, engine_staged_rows.min(retained).max(1))
+}
+
+/// Fold the request floor into an ASR load's authorization before anything is
+/// evicted for it (ADM-10): the weights must leave room for one request
+/// envelope per execution slot, or no request could run beside the loaded
+/// model. The minimal state itself (one page per row) is small beside it.
+fn admit_asr_request_floor(
+    plan: &ModelResourcePlan,
+    backend: BackendKind,
+    floor_bytes: u64,
+) -> Result<ResourceVector> {
+    let (ResourceAmount::Known(resident), ResourceAmount::Known(peak)) = (
+        load_domain_bytes(plan.resident_authorization, backend),
+        load_domain_bytes(plan.load_authorization, backend),
+    ) else {
+        return Ok(plan.load_authorization);
+    };
+    let required = resident
+        .checked_add(floor_bytes)
+        .ok_or_else(|| Error::ModelLoadError("ASR request floor overflow".into()))?
+        .max(peak);
+    let mut authorization = plan.load_authorization;
+    match backend {
+        BackendKind::Cpu => authorization.host_bytes = ResourceAmount::Known(required),
+        BackendKind::Metal => authorization.unified_bytes = ResourceAmount::Known(required),
+        BackendKind::Cuda => authorization.device_bytes = ResourceAmount::Known(required),
+    }
+    Ok(authorization)
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1773,6 +1822,15 @@ impl ModelLifecycleController {
         })
     }
 
+    fn asr_state_rows(&self) -> (usize, usize) {
+        let engine = self.core_engine.config();
+        asr_state_rows(
+            engine.automatic_row_limits.retained_sequences,
+            engine.max_retained_sequences,
+            engine.max_staged_transactions,
+        )
+    }
+
     /// Reserve one ASR request envelope per execution slot for the state
     /// fits to leave free, or `None` for a variant without one.
     fn hold_asr_request_envelope(
@@ -2034,6 +2092,20 @@ impl ModelLifecycleController {
                 safety_reserve_bytes,
                 device_capacity,
             )?;
+        }
+        if asr_memory::is_asr_variant(variant) {
+            let backend = self.backend_router.context().backend_kind;
+            let slots = self.coordinator.physical_execution_admission().capacity();
+            if let Some(envelope) =
+                super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
+            {
+                let floor_bytes = match backend {
+                    BackendKind::Cuda => envelope.accelerator_bytes,
+                    BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+                };
+                resource_plan.load_authorization =
+                    admit_asr_request_floor(&resource_plan, backend, floor_bytes)?;
+            }
         }
         self.ensure_model_budget_before_load(variant, max_loaded_models)
             .await?;
@@ -2346,6 +2418,7 @@ impl ModelLifecycleController {
                                 retained_contract,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -2466,7 +2539,7 @@ impl ModelLifecycleController {
                                 Qwen3AsrContextBound::Configured
                             } else {
                                 Qwen3AsrContextBound::Automatic {
-                                    retained_rows: self.core_engine.config().max_retained_sequences,
+                                    retained_rows: self.asr_state_rows().0,
                                 }
                             };
                         let physical_spec =
@@ -2479,6 +2552,7 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
                             )
                             .await?;
                         // The retained pool serves several sequences, but one
@@ -2553,11 +2627,26 @@ impl ModelLifecycleController {
                                     .into(),
                             )
                         })?;
-                        let retained_max_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
+                        let native_tokens = physical_spec.retained_max_tokens.ok_or_else(|| {
                             Error::ModelLoadError(
                                 "VibeVoice ASR retained decoder state has no context bound".into(),
                             )
                         })?;
+                        // The retained route takes one tokenizer chunk, so
+                        // without a configured context each retained row is
+                        // bounded by one chunk's prompt and duration budget
+                        // (P2.5), not the decoder's native context.
+                        let retained_max_tokens =
+                            if self.config.max_sequence_length.explicit_tokens().is_some() {
+                                native_tokens
+                            } else {
+                                crate::runtime::asr_automatic_context(
+                                    native_tokens,
+                                    loaded.vibevoice_retained_sequence_ceiling()?,
+                                    self.asr_state_rows().0,
+                                )
+                                .1
+                            };
                         let retained = self
                             .core_engine
                             .load_managed_model_state_with_portable_copies(
@@ -2565,11 +2654,18 @@ impl ModelLifecycleController {
                                 retained_contract,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
                             )
                             .await?;
+                        // The legacy invocation route keeps the duration-budget
+                        // ceiling (32,768 decode tokens); its own fit bounds it
+                        // by memory.
+                        let invocation_ceiling = native_tokens.min(
+                            crate::models::architectures::vibevoice::asr::VIBEVOICE_ASR_AUTO_MAX_TOKENS,
+                        ) as u64;
                         self.model_registry.publish_effective_context(
                             variant,
-                            retained.logical_token_reach(),
+                            retained.logical_token_reach().max(invocation_ceiling),
                         )?;
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
@@ -2914,6 +3010,7 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
                                 2,
+                                self.asr_state_rows(),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -3519,14 +3616,15 @@ impl RuntimeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_state_group_budget, estimate_from_tensor_inventory, fish_s2_resource_plan,
-        is_metal_command_buffer_oom, kokoro_effective_context_tokens, now_unix_millis,
-        loaded_asr_state_publication_route, managed_chat_capacity_policy, model_memory_estimate,
-        model_resource_plan, plan_invocation_allocations, portable_context_reserve_bytes,
-        materialization_tolerance_bytes, portable_invocation_context_intent,
+        admit_asr_request_floor, asr_state_rows, automatic_state_group_budget,
+        estimate_from_tensor_inventory, fish_s2_resource_plan, is_metal_command_buffer_oom,
+        kokoro_effective_context_tokens, loaded_asr_state_publication_route,
+        managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
+        model_resource_plan, now_unix_millis, plan_invocation_allocations,
+        portable_context_reserve_bytes, portable_invocation_context_intent,
         qwen38_representation_memory_estimate, reconcile_observed_growth,
-        residency_budget_has_capacity, DeviceUsageSample,
-        select_lru_eviction_candidate, validate_scratch_only_invocation_publication,
+        residency_budget_has_capacity, select_lru_eviction_candidate,
+        validate_scratch_only_invocation_publication, DeviceUsageSample,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
         QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
         QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
@@ -5037,6 +5135,42 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// ASR rows: chat's automatic rows (320 on an H100) collapse to 8, never
+    /// below one decode batch; operator rows stay as configured.
+    #[test]
+    fn asr_state_rows_come_from_the_asr_policy_not_chat_rows() {
+        assert_eq!(asr_state_rows(true, 320, 4), (8, 4));
+        assert_eq!(asr_state_rows(true, 320, 16), (16, 16));
+        assert_eq!(asr_state_rows(true, 4, 4), (4, 4));
+        assert_eq!(asr_state_rows(false, 320, 32), (320, 32));
+        assert_eq!(asr_state_rows(true, 0, 0), (1, 1));
+    }
+
+    /// The request floor joins the load authorization before eviction: the
+    /// authorization is the larger of the weight peak and resident weights
+    /// plus the floor.
+    #[test]
+    fn asr_request_floor_joins_the_load_authorization() {
+        let estimate = ModelMemoryEstimate {
+            load_peak_bytes: 1_000,
+            resident_bytes: 800,
+        };
+        let plan = model_resource_plan(BackendKind::Metal, estimate);
+        let unified = |authorization: ResourceVector| authorization.unified_bytes;
+        assert_eq!(
+            unified(admit_asr_request_floor(&plan, BackendKind::Metal, 100).unwrap()),
+            ResourceAmount::Known(1_000)
+        );
+        assert_eq!(
+            unified(admit_asr_request_floor(&plan, BackendKind::Metal, 500).unwrap()),
+            ResourceAmount::Known(1_300)
+        );
+        let cuda = model_resource_plan(BackendKind::Cuda, estimate);
+        let authorization = admit_asr_request_floor(&cuda, BackendKind::Cuda, 500).unwrap();
+        assert_eq!(authorization.device_bytes, ResourceAmount::Known(1_300));
+        assert_eq!(authorization.host_bytes, cuda.load_authorization.host_bytes);
     }
 
     /// On a 16 GB M1 Pro-like Metal budget (0.9 × the 12.7 GB working set),

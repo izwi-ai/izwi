@@ -5539,15 +5539,49 @@ impl EngineCore {
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        let rows = (
+            self.config.max_retained_sequences,
+            self.config.max_staged_transactions,
+        );
+        self.load_managed_model_state_with_portable_copies_and_rows(
+            model_instance,
+            retained_state,
+            logical_context_tokens,
+            portable_state_copies,
+            rows,
+        )
+    }
+
+    /// ASR retained state with its own `(retained, staged)` row counts, at
+    /// most the engine's (ADM-6): the engine rows are sized for chat (on CUDA
+    /// one per 256 MiB of device memory), far wider than ASR concurrency.
+    pub(crate) fn load_managed_model_state_with_portable_copies_and_rows(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+        retained_state: &crate::kv::v2::InferenceStateContract,
+        logical_context_tokens: Option<usize>,
+        portable_state_copies: u32,
+        (retained_rows, staged_rows): (usize, usize),
+    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
+        if retained_rows == 0
+            || staged_rows == 0
+            || retained_rows > self.config.max_retained_sequences
+            || staged_rows > self.config.max_staged_transactions
+        {
+            return Err(Error::ModelLoadError(
+                "ASR state row limits exceed configured capacity".into(),
+            ));
+        }
         let backend = self.managed_kv_cache.worker_backend();
         // Only ASR retained state loads through here; it fits within live
         // memory so the requests it serves can run beside it.
-        let logical_token_reach = self.resolve_managed_token_reach_for_contract(
+        let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
             retained_state,
             logical_context_tokens,
             portable_state_copies,
+            (retained_rows, staged_rows),
             PortableFitHeadroom::Live,
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
@@ -5558,13 +5592,12 @@ impl EngineCore {
                     Error::InvalidInput("managed KV page budget exceeds u32".into())
                 })?,
                 logical_token_reach,
-                retained_sequence_rows: u32::try_from(self.config.max_retained_sequences).map_err(
-                    |_| Error::InvalidInput("managed state sequence limit exceeds u32".into()),
-                )?,
-                staged_transaction_rows: u32::try_from(self.config.max_staged_transactions)
-                    .map_err(|_| {
-                        Error::InvalidInput("managed state transaction limit exceeds u32".into())
-                    })?,
+                retained_sequence_rows: u32::try_from(retained_rows).map_err(|_| {
+                    Error::InvalidInput("managed state sequence limit exceeds u32".into())
+                })?,
+                staged_transaction_rows: u32::try_from(staged_rows).map_err(|_| {
+                    Error::InvalidInput("managed state transaction limit exceeds u32".into())
+                })?,
             },
             self.config.block_size,
             retained_state,

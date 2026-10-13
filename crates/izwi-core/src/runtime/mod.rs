@@ -30,7 +30,10 @@ mod voice_metrics;
 mod voice_session;
 
 pub(crate) use asr::vibevoice_asr_planned_max_tokens;
-pub(crate) use asr::{compose_invocation_audio_limit, ASR_TEXT_PROMPT_TOKEN_RESERVE};
+pub(crate) use asr::{
+    asr_automatic_context, asr_sequence_ceiling, compose_invocation_audio_limit,
+    ASR_TEXT_PROMPT_TOKEN_RESERVE,
+};
 
 pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,

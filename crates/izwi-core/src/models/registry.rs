@@ -1766,6 +1766,15 @@ impl NativeAsrModel {
         }
     }
 
+    pub(crate) fn vibevoice_retained_sequence_ceiling(&self) -> Result<usize> {
+        match self {
+            Self::VibeVoice(model) => model.retained_sequence_ceiling(),
+            _ => Err(Error::ModelLoadError(
+                "non-VibeVoice ASR model has no VibeVoice retained ceiling".to_string(),
+            )),
+        }
+    }
+
     pub(crate) fn vibevoice_scalar_preparation_stage_seal(
         &self,
         backend: BackendKind,

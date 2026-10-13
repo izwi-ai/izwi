@@ -54,8 +54,19 @@ pub struct Lfm25AudioDecoderConfig {
     pub interleaved_n_audio: usize,
 }
 
+/// The main backbone's config, with its context clamped to the published
+/// model's native 32,768 tokens (LFA-6). The GGUF carries the LFM2 base's
+/// 128,000, which sized the retained state, the RoPE tables and every stage
+/// seal (a 32.7 TiB preparation ceiling) for contexts the model was never
+/// trained for.
 pub fn parse_main_backbone_config(loader: &GgufLoader) -> Result<Lfm2BackboneConfig> {
-    parse_lfm2_backbone_config(loader)
+    let mut config = parse_lfm2_backbone_config(loader)?;
+    config.context_length = clamp_main_context(config.context_length);
+    Ok(config)
+}
+
+fn clamp_main_context(context_length: usize) -> usize {
+    context_length.min(crate::model::ModelVariant::LFM25_AUDIO_NATIVE_CONTEXT_TOKENS)
 }
 
 pub fn parse_detokenizer_config(loader: &GgufLoader) -> Result<Lfm2BackboneConfig> {
@@ -199,8 +210,17 @@ mod tests {
     use candle_core::{Device, Tensor};
     use uuid::Uuid;
 
-    use super::parse_audio_encoder_config;
+    use super::{clamp_main_context, parse_audio_encoder_config};
     use crate::models::shared::weights::gguf::GgufLoader;
+
+    /// The GGUF's 128,000-token LFM2 context is clamped to the published
+    /// model's 32,768; a smaller context is kept (LFA-6).
+    #[test]
+    fn main_context_is_clamped_to_the_native_context() {
+        assert_eq!(clamp_main_context(128_000), 32_768);
+        assert_eq!(clamp_main_context(32_768), 32_768);
+        assert_eq!(clamp_main_context(4_096), 4_096);
+    }
 
     fn make_temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("izwi-lfm25-audio-config-{}", Uuid::new_v4()));

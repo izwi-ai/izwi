@@ -728,6 +728,29 @@ impl VibeVoiceAsrModel {
         })
     }
 
+    /// Tokens one retained-route sequence needs (P2.5): its text prompt, one
+    /// tokenizer chunk of audio placeholders and that chunk's duration
+    /// budget, within the decoder context. The retained route takes no more
+    /// than one chunk, so this, not the 131,072-token decoder context, bounds
+    /// each of its sequences.
+    pub(crate) fn retained_sequence_ceiling(&self) -> Result<usize> {
+        let chunk_secs = TOKENIZER_STREAMING_CHUNK_SECONDS as f32;
+        let ceiling = crate::runtime::asr_sequence_ceiling(
+            RETAINED_PROMPT_TEXT_TOKENS,
+            self.audio_token_rate(),
+            chunk_secs,
+            vibevoice_auto_asr_max_tokens_for_duration(chunk_secs),
+        );
+        let context = self
+            .config
+            .decoder_config
+            .max_position_embeddings
+            .ok_or_else(|| {
+                Error::ModelLoadError("VibeVoice ASR decoder context is unbounded".into())
+            })?;
+        Ok(ceiling.min(context))
+    }
+
     /// The longest prompt the retained route prepares: one tokenizer chunk of
     /// audio placeholders and [`RETAINED_PROMPT_TEXT_TOKENS`] of text, within
     /// the decoder context.

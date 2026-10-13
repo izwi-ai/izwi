@@ -3044,16 +3044,18 @@ impl Engine {
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
+        rows: (usize, usize),
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
         self.core
             .write()
             .await
-            .load_managed_model_state_with_portable_copies(
+            .load_managed_model_state_with_portable_copies_and_rows(
                 model_instance,
                 retained_state,
                 logical_context_tokens,
                 portable_state_copies,
+                rows,
             )
     }
 
