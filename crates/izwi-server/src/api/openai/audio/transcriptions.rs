@@ -12,8 +12,7 @@ use axum::{
 };
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
@@ -34,86 +33,119 @@ use izwi_core::{
 };
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
-const TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR: &str =
-    "Transcription stream consumer is too slow; generation was cancelled";
 #[cfg(not(test))]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Transcript text the SSE queue could not take yet.
+///
+/// The runtime calls the delta callback synchronously and can hand over a
+/// whole committed outbox (one delta per decoded token) within one poll, far
+/// faster than the SSE body task is scheduled, so a burst overruns the bounded
+/// queue even while the client reads continuously. Text that does not fit
+/// waits here and goes out as one coalesced delta once the queue has room:
+/// the queue stays bounded, the backlog is bounded by the transcript itself,
+/// generation never waits on the client, and the deltas still concatenate to
+/// the final text.
 #[derive(Debug, Default)]
-struct TranscriptionStreamBackpressure {
-    full: AtomicBool,
+struct PendingTranscriptText {
+    text: Mutex<String>,
     notify: Notify,
 }
 
-impl TranscriptionStreamBackpressure {
-    fn trip(&self) {
-        self.full.store(true, Ordering::Release);
+impl PendingTranscriptText {
+    fn lock(&self) -> MutexGuard<'_, String> {
+        self.text.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Send `delta` now if nothing is waiting ahead of it and the queue has
+    /// room; otherwise append it to the pending text.
+    fn push(&self, event_tx: &mpsc::Sender<String>, delta: String) {
+        let mut pending = self.lock();
+        if pending.is_empty() {
+            match event_tx.try_reserve() {
+                Ok(permit) => {
+                    permit.send(transcript_delta_event_payload(delta));
+                    return;
+                }
+                // A closed receiver has nobody left to receive deltas. The
+                // driver observes `event_tx.closed()` and cancels generation.
+                Err(TrySendError::Closed(())) => return,
+                Err(TrySendError::Full(())) => {}
+            }
+        }
+        pending.push_str(&delta);
+        drop(pending);
         self.notify.notify_one();
     }
 
-    fn is_tripped(&self) -> bool {
-        self.full.load(Ordering::Acquire)
+    fn has_text(&self) -> bool {
+        !self.lock().is_empty()
     }
 
-    async fn notified(&self) {
-        if self.is_tripped() {
-            return;
+    /// Send the pending text, if any, through a reserved queue slot.
+    fn flush(&self, permit: mpsc::Permit<'_, String>) {
+        let mut pending = self.lock();
+        if !pending.is_empty() {
+            let text = std::mem::take(&mut *pending);
+            permit.send(transcript_delta_event_payload(text));
         }
-        self.notify.notified().await;
+    }
+
+    fn take(&self) -> Option<String> {
+        let mut pending = self.lock();
+        (!pending.is_empty()).then(|| std::mem::take(&mut *pending))
     }
 }
 
-fn try_send_transcript_delta(
+/// Run `generation` while forwarding its pending text whenever the queue has
+/// room. Returns the events that close the stream (the text still pending,
+/// then `done` or `error`), or `None` once the client has disconnected.
+async fn drive_transcription_stream<F>(
     event_tx: &mpsc::Sender<String>,
-    backpressure: &TranscriptionStreamBackpressure,
-    delta: String,
-) {
-    match event_tx.try_send(transcript_delta_event_payload(delta)) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => backpressure.trip(),
-        // A closed receiver has nobody left to receive an error event. The
-        // async driver observes `event_tx.closed()` and cancels generation.
-        Err(TrySendError::Closed(_)) => {}
-    }
-}
-
-async fn resolve_transcription_terminal<F>(
-    event_tx: &mpsc::Sender<String>,
-    backpressure: Arc<TranscriptionStreamBackpressure>,
+    pending: &PendingTranscriptText,
     generation: F,
-) -> Option<String>
+) -> Option<Vec<String>>
 where
     F: Future<Output = izwi_core::Result<AsrTranscription>>,
 {
     tokio::pin!(generation);
-    let result = tokio::select! {
-        result = &mut generation => Some(result),
-        _ = event_tx.closed() => return None,
-        _ = backpressure.notified() => None,
+    let result = loop {
+        tokio::select! {
+            result = &mut generation => break result,
+            _ = event_tx.closed() => return None,
+            permit = event_tx.reserve(), if pending.has_text() => match permit {
+                Ok(permit) => pending.flush(permit),
+                Err(_) => return None,
+            },
+            _ = pending.notify.notified() => {}
+        }
     };
 
-    // The overflowing callback and successful generation may become ready in
-    // the same poll. The latch makes the explicit failure authoritative.
-    if result.is_none() || backpressure.is_tripped() {
-        return Some(transcript_error_event_payload(
-            TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR,
-        ));
-    }
-
-    match result.expect("completed transcription result must be present") {
-        Ok(output) => Some(transcript_done_event_payload(
-            output.text,
-            output.language,
-            output.duration_secs,
-        )),
-        Err(err) => Some(transcript_error_event_payload(&err.to_string())),
-    }
+    let mut terminal = pending
+        .take()
+        .map(transcript_delta_event_payload)
+        .into_iter()
+        .collect::<Vec<_>>();
+    terminal.push(match result {
+        Ok(output) => {
+            transcript_done_event_payload(output.text, output.language, output.duration_secs)
+        }
+        Err(err) => transcript_error_event_payload(&err.to_string()),
+    });
+    Some(terminal)
 }
 
-async fn send_transcription_terminal(event_tx: mpsc::Sender<String>, payload: String) {
-    let _ = tokio::time::timeout(TRANSCRIPTION_TERMINAL_SEND_TIMEOUT, event_tx.send(payload)).await;
+async fn send_transcription_terminal(event_tx: mpsc::Sender<String>, payloads: Vec<String>) {
+    let _ = tokio::time::timeout(TRANSCRIPTION_TERMINAL_SEND_TIMEOUT, async {
+        for payload in payloads {
+            if event_tx.send(payload).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 #[derive(Debug, Default)]
@@ -432,7 +464,6 @@ async fn transcriptions_stream(
     let audio_bytes = audio.bytes;
 
     let (event_tx, mut event_rx) = mpsc::channel::<String>(TRANSCRIPTION_STREAM_CAPACITY);
-    let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
     let engine = state.runtime.clone();
     let admission_state = state.clone();
 
@@ -445,7 +476,7 @@ async fn transcriptions_stream(
             Err(_) => {
                 send_transcription_terminal(
                     event_tx,
-                    transcript_error_event_payload("Server is shutting down"),
+                    vec![transcript_error_event_payload("Server is shutting down")],
                 )
                 .await;
                 return;
@@ -453,7 +484,8 @@ async fn transcriptions_stream(
         };
 
         let delta_tx = event_tx.clone();
-        let delta_backpressure = backpressure.clone();
+        let pending = Arc::new(PendingTranscriptText::default());
+        let delta_pending = pending.clone();
         let generation = engine.asr_transcribe_streaming_bytes_with_runtime_context(
             audio_bytes.as_slice(),
             model.as_deref(),
@@ -462,11 +494,9 @@ async fn transcriptions_stream(
             max_tokens,
             Some(correlation_id.as_str()),
             permit.runtime_context(),
-            move |delta| {
-                try_send_transcript_delta(&delta_tx, &delta_backpressure, delta);
-            },
+            move |delta| delta_pending.push(&delta_tx, delta),
         );
-        let terminal = resolve_transcription_terminal(&event_tx, backpressure, generation).await;
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
         drop(permit);
         if let Some(terminal) = terminal {
             send_transcription_terminal(event_tx, terminal).await;
@@ -1313,64 +1343,123 @@ mod tests {
         assert_eq!(json.get("delta").and_then(|v| v.as_str()), Some("hello"));
     }
 
-    #[tokio::test]
-    async fn saturated_stream_emits_explicit_terminal_error() {
-        let (event_tx, mut event_rx) = mpsc::channel(1);
-        let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
-        let generation_tx = event_tx.clone();
-        let generation_backpressure = backpressure.clone();
-        let generation = async move {
-            try_send_transcript_delta(
-                &generation_tx,
-                &generation_backpressure,
-                "first".to_string(),
-            );
-            try_send_transcript_delta(
-                &generation_tx,
-                &generation_backpressure,
-                "overflow".to_string(),
-            );
-            // Completion in the overflow poll must still resolve as a terminal
-            // error, otherwise clients receive a truncated successful stream.
-            Ok(AsrTranscription {
-                text: "firstoverflow".to_string(),
-                language: Some("en".to_string()),
-                duration_secs: 1.0,
-                asr_diagnostics: None,
-            })
-        };
-        let driver = tokio::spawn(async move {
-            if let Some(terminal) =
-                resolve_transcription_terminal(&event_tx, backpressure, generation).await
-            {
-                send_transcription_terminal(event_tx, terminal).await;
+    fn transcription(text: String) -> AsrTranscription {
+        AsrTranscription {
+            text,
+            language: Some("en".to_string()),
+            duration_secs: 60.0,
+            asr_diagnostics: None,
+        }
+    }
+
+    /// Run a generation that emits `deltas` back to back within one poll, the
+    /// way the runtime hands over a committed outbox, and return every event
+    /// the client received.
+    async fn stream_burst(
+        capacity: usize,
+        deltas: Vec<String>,
+        read_while_generating: bool,
+    ) -> Vec<serde_json::Value> {
+        let (event_tx, mut event_rx) = mpsc::channel::<String>(capacity);
+        let gate = Arc::new(Notify::new());
+        let consumer_gate = gate.clone();
+        let consumer = tokio::spawn(async move {
+            if !read_while_generating {
+                consumer_gate.notified().await;
             }
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(serde_json::from_str::<serde_json::Value>(&event).expect("event JSON"));
+            }
+            events
         });
+        let pending = PendingTranscriptText::default();
+        let delta_tx = event_tx.clone();
+        let generation = async {
+            let mut text = String::new();
+            for delta in deltas {
+                text.push_str(&delta);
+                pending.push(&delta_tx, delta);
+            }
+            Ok(transcription(text))
+        };
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+            .await
+            .expect("the client is still connected");
+        drop(delta_tx);
+        gate.notify_one();
+        send_transcription_terminal(event_tx, terminal).await;
+        consumer.await.expect("consumer task")
+    }
 
-        let first: serde_json::Value = serde_json::from_str(
-            &event_rx
-                .recv()
-                .await
-                .expect("first delta must be delivered"),
-        )
-        .expect("delta JSON");
-        assert_eq!(first["type"], "transcript.text.delta");
-        assert_eq!(first["delta"], "first");
+    fn assert_deltas_concatenate_to_done(events: &[serde_json::Value]) -> usize {
+        let (done, deltas) = events.split_last().expect("events");
+        assert_eq!(done["type"], "transcript.text.done", "{done}");
+        let mut streamed = String::new();
+        for delta in deltas {
+            assert_eq!(delta["type"], "transcript.text.delta", "{delta}");
+            streamed.push_str(delta["delta"].as_str().expect("delta text"));
+        }
+        assert_eq!(streamed, done["text"].as_str().expect("done text"));
+        deltas.len()
+    }
 
-        let terminal: serde_json::Value = serde_json::from_str(
-            &event_rx
-                .recv()
-                .await
-                .expect("backpressure error must be delivered"),
-        )
-        .expect("terminal JSON");
-        assert_eq!(terminal["type"], "error");
-        assert_eq!(
-            terminal["error"]["message"],
-            TRANSCRIPTION_STREAM_BACKPRESSURE_ERROR
-        );
-        driver.await.expect("stream driver must finish");
-        assert!(event_rx.recv().await.is_none());
+    #[tokio::test]
+    async fn token_rate_burst_streams_completely_to_a_reading_client() {
+        // A 60 s LFM2.5 chunk-driver stream: one delta per token, delivered
+        // from a committed outbox far faster than the SSE body is polled.
+        let deltas = (0..2_000).map(|idx| format!("w{idx} ")).collect();
+        let events = stream_burst(TRANSCRIPTION_STREAM_CAPACITY, deltas, true).await;
+        assert_deltas_concatenate_to_done(&events);
+    }
+
+    #[tokio::test]
+    async fn saturated_stream_coalesces_deltas_instead_of_failing() {
+        let deltas = ["first ", "second ", "third ", "fourth"]
+            .map(str::to_string)
+            .to_vec();
+        let events = stream_burst(1, deltas, false).await;
+        let delta_events = assert_deltas_concatenate_to_done(&events);
+        assert_eq!(events[0]["delta"], "first ");
+        assert_eq!(events[1]["delta"], "second third fourth");
+        assert_eq!(delta_events, 2);
+    }
+
+    #[tokio::test]
+    async fn generation_error_still_sends_the_text_streamed_before_it() {
+        let (event_tx, mut event_rx) = mpsc::channel::<String>(1);
+        let pending = PendingTranscriptText::default();
+        let generation = async {
+            pending.push(&event_tx, "a ".to_string());
+            pending.push(&event_tx, "b".to_string());
+            Err(izwi_core::Error::InferenceError("boom".to_string()))
+        };
+        let terminal = drive_transcription_stream(&event_tx, &pending, generation)
+            .await
+            .expect("the client is still connected");
+        let reader = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(serde_json::from_str::<serde_json::Value>(&event).unwrap());
+            }
+            events
+        });
+        send_transcription_terminal(event_tx, terminal).await;
+        let events = reader.await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["delta"], "a ");
+        assert_eq!(events[1]["delta"], "b");
+        assert_eq!(events[2]["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn disconnected_client_cancels_generation() {
+        let (event_tx, event_rx) = mpsc::channel::<String>(1);
+        drop(event_rx);
+        let pending = PendingTranscriptText::default();
+        let terminal =
+            drive_transcription_stream(&event_tx, &pending, std::future::pending()).await;
+        assert!(terminal.is_none());
     }
 
     #[tokio::test]
@@ -1379,18 +1468,14 @@ mod tests {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx.send("queued-delta".to_string()).await.unwrap();
-        let backpressure = Arc::new(TranscriptionStreamBackpressure::default());
 
         let driver = tokio::spawn(async move {
-            let terminal = resolve_transcription_terminal(&event_tx, backpressure, async {
-                Ok(AsrTranscription {
-                    text: "done".to_string(),
-                    language: Some("en".to_string()),
-                    duration_secs: 1.0,
-                    asr_diagnostics: None,
-                })
-            })
-            .await;
+            let pending = PendingTranscriptText::default();
+            let generation = async {
+                pending.push(&event_tx, "unsent".to_string());
+                Ok(transcription("done".to_string()))
+            };
+            let terminal = drive_transcription_stream(&event_tx, &pending, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
                 send_transcription_terminal(event_tx, terminal).await;
