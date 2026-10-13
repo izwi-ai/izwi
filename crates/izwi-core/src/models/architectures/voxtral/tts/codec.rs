@@ -153,6 +153,9 @@ struct VoxtralCodecFeedForward {
 enum VoxtralPadMode {
     Constant,
     Replicate,
+    /// The reference `pad1d(mode="reflect")`, including its zero extension
+    /// of inputs no longer than the padding.
+    Reflect,
 }
 
 impl VoxtralCodecDecoder {
@@ -249,7 +252,9 @@ impl VoxtralCodecDecoder {
             1,
             args.conv_weight_norm,
             false,
-            VoxtralPadMode::Replicate,
+            // The reference `output_proj = CausalConv1d(...)` keeps the
+            // default `pad_mode="reflect"`; only `decoder_blocks.0` replicates.
+            VoxtralPadMode::Reflect,
             vb.pp("output_proj"),
         )?;
 
@@ -994,7 +999,30 @@ fn pad_1d(x: &Tensor, left: usize, right: usize, mode: VoxtralPadMode) -> Result
     match mode {
         VoxtralPadMode::Constant => x.pad_with_zeros(2, left, right).map_err(Error::from),
         VoxtralPadMode::Replicate => pad_replicate(x, left, right),
+        VoxtralPadMode::Reflect => pad_reflect(x, left, right),
     }
+}
+
+/// `pad1d(x, (left, right), mode="reflect")` from the reference tokenizer:
+/// an input no longer than the larger pad is first zero-extended on the
+/// right so the reflection exists, and that extension is cut off again.
+fn pad_reflect(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
+    let len = x.dim(2)?;
+    let max_pad = left.max(right);
+    let extra = if len <= max_pad { max_pad - len + 1 } else { 0 };
+    let extended = len + extra;
+    let mut indices = Vec::with_capacity(left + extended + right);
+    indices.extend((1..=left).rev().map(|offset| offset as u32));
+    indices.extend((0..extended).map(|index| index as u32));
+    indices.extend((0..right).map(|offset| (extended - 2 - offset) as u32));
+    indices.truncate(indices.len() - extra);
+    let source = if extra > 0 {
+        x.pad_with_zeros(2, 0, extra)?.contiguous()?
+    } else {
+        x.contiguous()?
+    };
+    let indices = Tensor::from_vec(indices, (left + len + right,), x.device())?;
+    source.index_select(&indices, 2).map_err(Error::from)
 }
 
 fn pad_replicate(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
@@ -1185,6 +1213,42 @@ mod tests {
         let timeline = VoxtralCodecTimeline::new(vec![semantic, acoustic_a, acoustic_b]).unwrap();
         let samples = decoder.decode_timeline(&timeline).unwrap();
         assert_eq!(samples.len(), 4);
+    }
+
+    /// VXT-8: reflect padding matches the reference `pad1d` (NumPy
+    /// `np.pad(mode="reflect")` goldens), including the zero extension of
+    /// inputs no longer than the padding.
+    #[test]
+    fn reflect_padding_matches_reference_pad1d() {
+        let device = Device::Cpu;
+        let cases: [(&[f32], usize, usize, &[f32]); 4] = [
+            (&[1.0, 2.0, 3.0, 4.0], 2, 0, &[3.0, 2.0, 1.0, 2.0, 3.0, 4.0]),
+            (&[1.0, 2.0], 2, 0, &[0.0, 2.0, 1.0, 2.0]),
+            (&[5.0], 2, 1, &[0.0, 0.0, 5.0, 0.0]),
+            (&[1.0, 2.0, 3.0], 2, 1, &[3.0, 2.0, 1.0, 2.0, 3.0, 2.0]),
+        ];
+        for (input, left, right, expected) in cases {
+            // Two channels, the second negated, to check per-channel indexing.
+            let mut values = input.to_vec();
+            values.extend(input.iter().map(|v| -v));
+            let x = Tensor::from_vec(values, (1, 2, input.len()), &device).unwrap();
+            let padded = pad_1d(&x, left, right, VoxtralPadMode::Reflect).unwrap();
+            let rows = padded.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+            assert_eq!(rows[0], expected, "{input:?} ({left}, {right})");
+            let negated: Vec<f32> = expected.iter().map(|v| -v).collect();
+            assert_eq!(rows[1], negated);
+        }
+
+        // As in the reference: only `decoder_blocks.0` replicates;
+        // `output_proj` keeps CausalConv1d's default reflect padding.
+        let vb = VarBuilder::from_tensors(tiny_codec_tensors(&device), DType::F32, &device)
+            .pp("audio_tokenizer");
+        let decoder = VoxtralCodecDecoder::load(&tiny_codec_config(), vb).unwrap();
+        assert_eq!(decoder.output_proj.pad_mode, VoxtralPadMode::Reflect);
+        let VoxtralDecoderBlock::Conv(input_proj) = &decoder.decoder_blocks[0] else {
+            panic!("decoder_blocks.0 must be the input projection conv");
+        };
+        assert_eq!(input_proj.pad_mode, VoxtralPadMode::Replicate);
     }
 
     #[test]
