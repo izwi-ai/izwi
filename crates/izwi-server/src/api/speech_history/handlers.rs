@@ -328,6 +328,24 @@ fn speech_stream_response(event_rx: mpsc::Receiver<BudgetedStreamEvent>) -> Resp
         .expect("static speech stream response")
 }
 
+/// What a speech stream waits on next: the model's next chunk, the end of
+/// its output, or the client leaving.
+enum StreamInput {
+    Chunk(AudioChunk),
+    Finished,
+    Disconnected,
+}
+
+async fn next_stream_input(
+    chunk_rx: &mut mpsc::Receiver<AudioChunk>,
+    events: &mpsc::Sender<BudgetedStreamEvent>,
+) -> StreamInput {
+    tokio::select! {
+        chunk = chunk_rx.recv() => chunk.map_or(StreamInput::Finished, StreamInput::Chunk),
+        _ = events.closed() => StreamInput::Disconnected,
+    }
+}
+
 #[derive(Clone)]
 struct StreamEventSender {
     sender: mpsc::Sender<BudgetedStreamEvent>,
@@ -2225,7 +2243,19 @@ async fn stream_record_creation(
 
             let mut encoding_failed = false;
             let mut stream_closed = false;
-            while let Some(chunk) = chunk_rx.recv().await {
+            loop {
+                // A client that leaves is noticed while the model is still
+                // generating, not only at the next event send (TPIPE-8).
+                let chunk = match next_stream_input(&mut chunk_rx, &event_tx.sender).await {
+                    StreamInput::Chunk(chunk) => chunk,
+                    StreamInput::Finished => break,
+                    StreamInput::Disconnected => {
+                        failure_message
+                            .get_or_insert_with(|| STREAM_CLIENT_DISCONNECTED_MESSAGE.to_string());
+                        stream_closed = true;
+                        break;
+                    }
+                };
                 // Terminal-only chunks carry committed frame counts and execution
                 // time; metadata must be consumed even when no PCM remains.
                 request_statistics.observe(&chunk);
@@ -2369,6 +2399,11 @@ async fn stream_record_creation(
             statistics_measured &= request_statistics.measured;
             stop_reasons.push(request_statistics.stop_reason);
             drop(chunk_rx);
+            if encoding_failed || stream_closed {
+                // Nobody will receive the audio: cancel the generation rather
+                // than wait for it to finish.
+                generation_task.abort();
+            }
             let generation_outcome = generation_task.await;
             if encoding_failed || stream_closed {
                 if stream_closed && failure_message.is_none() {
@@ -3162,6 +3197,38 @@ mod tests {
             vec![0.0; 4096],
         ));
         assert_eq!(unknown.tokens, 0);
+    }
+
+    /// TPIPE-8: a stream notices the client leaving while the model is still
+    /// generating (a final-only model sends nothing until it finishes).
+    #[tokio::test]
+    async fn a_departed_client_is_noticed_before_the_next_chunk() {
+        let (_chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(1);
+        let (events, event_rx) = mpsc::channel::<BudgetedStreamEvent>(1);
+        drop(event_rx);
+        let input = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_stream_input(&mut chunk_rx, &events),
+        )
+        .await
+        .expect("a closed client is noticed without waiting for audio");
+        assert!(matches!(input, StreamInput::Disconnected));
+
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(1);
+        let (events, _event_rx) = mpsc::channel::<BudgetedStreamEvent>(1);
+        chunk_tx
+            .send(AudioChunk::new("r".into(), 0, vec![0.1]))
+            .await
+            .unwrap();
+        drop(chunk_tx);
+        assert!(matches!(
+            next_stream_input(&mut chunk_rx, &events).await,
+            StreamInput::Chunk(_)
+        ));
+        assert!(matches!(
+            next_stream_input(&mut chunk_rx, &events).await,
+            StreamInput::Finished
+        ));
     }
 
     /// The first-party stream reports why each request ended: the terminal
