@@ -3730,7 +3730,12 @@ impl EngineCoreRequest {
     }
 
     pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
-        Lfm25AudioGenerationConfig::default()
+        // A per-request seed derived from the request id, as audio chat does.
+        Lfm25AudioGenerationConfig::tts(
+            self.params.audio_temperature,
+            self.params.audio_top_k,
+            Self::chat_request_seed(&self.id),
+        )
     }
 
     pub(crate) fn install_vibevoice_tts_execution_model(
@@ -7436,5 +7441,23 @@ mod tests {
                 RealtimeAsrOperationPayload::Finish,
             )
             .is_err());
+    }
+
+    /// LFT-2: an LFM TTS request samples audio codes at the reference
+    /// 0.8 / top-k 64 with a request-derived seed, and honours overrides.
+    #[test]
+    fn lfm25_tts_generation_config_uses_reference_audio_sampling() {
+        let mut request = EngineCoreRequest::tts("hello");
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.8, 64));
+        assert_eq!(config.text.temperature, 0.0);
+        assert_eq!(
+            config.seed,
+            EngineCoreRequest::chat_request_seed(&request.id)
+        );
+        request.params.audio_temperature = Some(0.5);
+        request.params.audio_top_k = Some(10);
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.5, 10));
     }
 }
