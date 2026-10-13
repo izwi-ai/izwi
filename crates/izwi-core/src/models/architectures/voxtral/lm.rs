@@ -4,6 +4,7 @@
 //! which uses different tensor naming conventions (wq/wk/wv/wo, w1/w2/w3) and
 //! root-level layer structure compared to standard Qwen3.
 
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -133,6 +134,32 @@ impl VoxtralLM {
         &self.device
     }
 
+    /// The dtype of the token embeddings (and so of the decoder activations).
+    pub(crate) fn embedding_dtype(&self) -> DType {
+        self.embed_tokens.embeddings().dtype()
+    }
+
+    /// Precompute every layer's Ada RMSNorm gain for `t_cond`. Pass `t_cond`
+    /// in [`Self::embedding_dtype`], the dtype the gains are applied in.
+    pub(crate) fn ada_scales(&self, t_cond: &Tensor) -> Result<VoxtralAdaScales> {
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .ada_rms_norm
+                    .as_ref()
+                    .map(|ada| {
+                        let scale = ada.forward(t_cond)?;
+                        let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device())?;
+                        scale.broadcast_add(&one).map_err(Error::from)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(VoxtralAdaScales { layers })
+    }
+
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -198,15 +225,10 @@ impl VoxtralLM {
         start_pos: usize,
         cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        let (hidden, prepared) = self.prepare_managed_hidden_with_embeds(
-            embeds,
-            start_pos,
-            cache,
-            position_ids,
-            t_cond,
-        )?;
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids, ada)?;
         let logits = self.logits_from_hidden(&hidden)?;
         cache.commit_prepared(prepared)?;
         Ok(logits)
@@ -218,15 +240,10 @@ impl VoxtralLM {
         start_pos: usize,
         cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        let (hidden, prepared) = self.prepare_managed_hidden_with_embeds(
-            embeds,
-            start_pos,
-            cache,
-            position_ids,
-            t_cond,
-        )?;
+        let (hidden, prepared) =
+            self.prepare_managed_hidden_with_embeds(embeds, start_pos, cache, position_ids, ada)?;
         cache.commit_prepared(prepared)?;
         Ok(hidden)
     }
@@ -238,9 +255,9 @@ impl VoxtralLM {
         embeds: &Tensor,
         start_positions: &[usize],
         caches: &mut [&mut PhysicalPagedKvCache],
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, t_cond, true)
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, true)
     }
 
     /// Decode one embedded token per retained row and return the normalized
@@ -250,9 +267,9 @@ impl VoxtralLM {
         embeds: &Tensor,
         start_positions: &[usize],
         caches: &mut [&mut PhysicalPagedKvCache],
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
     ) -> Result<Tensor> {
-        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, t_cond, false)
+        self.forward_managed_decode_batch_impl(embeds, start_positions, caches, ada, false)
     }
 
     fn forward_managed_decode_batch_impl(
@@ -260,7 +277,7 @@ impl VoxtralLM {
         embeds: &Tensor,
         start_positions: &[usize],
         caches: &mut [&mut PhysicalPagedKvCache],
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
         project_logits: bool,
     ) -> Result<Tensor> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
@@ -269,9 +286,6 @@ impl VoxtralLM {
             || hidden_size != self.cfg.hidden_size
             || start_positions.len() != batch_size
             || caches.len() != batch_size
-            || t_cond.is_some_and(|condition| {
-                condition.dims3().ok() != Some((batch_size, 1, self.cfg.hidden_size))
-            })
         {
             return Err(Error::InvalidInput(format!(
                 "Voxtral managed decode expects matching [batch,1,{}] rows, got {:?}",
@@ -281,20 +295,14 @@ impl VoxtralLM {
         }
         if batch_size == 1 {
             return if project_logits {
-                self.forward_managed_with_embeds(
-                    embeds,
-                    start_positions[0],
-                    caches[0],
-                    None,
-                    t_cond,
-                )
+                self.forward_managed_with_embeds(embeds, start_positions[0], caches[0], None, ada)
             } else {
                 self.forward_managed_hidden_with_embeds(
                     embeds,
                     start_positions[0],
                     caches[0],
                     None,
-                    t_cond,
+                    ada,
                 )
             };
         }
@@ -380,6 +388,7 @@ impl VoxtralLM {
             let mut completions =
                 KvWriteCompletionCollector::new(arena.config(), lowered.logical_slots())?;
             let layer_result = (|| -> Result<Tensor> {
+                let rope = LmRopeTables::default();
                 let mut x = embeds.clone();
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let cache_refs = caches
@@ -394,7 +403,8 @@ impl VoxtralLM {
                         &metadata,
                         &mut completions,
                         layer_idx,
-                        t_cond,
+                        ada,
+                        &rope,
                     )?;
                 }
                 let hidden = self.norm.forward(&x)?;
@@ -450,7 +460,7 @@ impl VoxtralLM {
         start_pos: usize,
         cache: &mut PhysicalPagedKvCache,
         position_ids: Option<&Tensor>,
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
     ) -> Result<(Tensor, PreparedPhysicalPagedStep)> {
         let (batch_size, sequence_len, hidden_size) = embeds.dims3()?;
         if batch_size != 1 || sequence_len == 0 || hidden_size != self.cfg.hidden_size {
@@ -482,6 +492,7 @@ impl VoxtralLM {
         )?;
         cache.slots_for_append(start_pos, sequence_len)?;
         let mut prepared = cache.prepare_append(start_pos, sequence_len)?;
+        let rope = LmRopeTables::default();
         let mut x = embeds.clone();
         for (idx, layer) in self.layers.iter().enumerate() {
             x = layer.forward_managed(
@@ -491,7 +502,8 @@ impl VoxtralLM {
                 cache,
                 &mut prepared,
                 idx,
-                t_cond,
+                ada,
+                &rope,
             )?;
         }
         let hidden = self.norm.forward(&x)?;
@@ -567,12 +579,21 @@ impl VoxtralLayer {
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
+        rope: &LmRopeTables,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self
             .self_attn
-            .forward_managed(&normed, start_pos, position_ids, cache, prepared, layer_idx)
+            .forward_managed(
+                &normed,
+                start_pos,
+                position_ids,
+                cache,
+                prepared,
+                layer_idx,
+                rope,
+            )
             .map_err(|err| {
                 Error::InferenceError(format!(
                     "Voxtral LM layer {layer_idx} attention failed: {err}"
@@ -581,19 +602,8 @@ impl VoxtralLayer {
         let x = x.broadcast_add(&attn_out)?;
 
         let mut normed = self.post_attention_layernorm.forward(&x)?;
-        if let Some(ada_rms_norm) = &self.ada_rms_norm {
-            let t_cond = t_cond.ok_or_else(|| {
-                Error::InferenceError(
-                    "Voxtral LM requires delay conditioning for Ada RMSNorm".to_string(),
-                )
-            })?;
-            let mut scale = ada_rms_norm.forward(t_cond)?;
-            if scale.dtype() != normed.dtype() {
-                scale = scale.to_dtype(normed.dtype())?;
-            }
-            let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device())?;
-            let scale = scale.broadcast_add(&one)?;
-            normed = normed.broadcast_mul(&scale)?;
+        if self.ada_rms_norm.is_some() {
+            normed = apply_ada_scale(&normed, ada, layer_idx)?;
         }
         let mlp_out = self.mlp.forward(&normed).map_err(|err| {
             Error::InferenceError(format!(
@@ -614,7 +624,8 @@ impl VoxtralLayer {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
-        t_cond: Option<&Tensor>,
+        ada: Option<&VoxtralAdaScales>,
+        rope: &LmRopeTables,
     ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self
@@ -627,6 +638,7 @@ impl VoxtralLayer {
                 metadata,
                 completions,
                 layer_idx,
+                rope,
             )
             .map_err(|err| {
                 Error::InferenceError(format!(
@@ -635,18 +647,8 @@ impl VoxtralLayer {
             })?;
         let x = x.broadcast_add(&attn_out)?;
         let mut normed = self.post_attention_layernorm.forward(&x)?;
-        if let Some(ada_rms_norm) = &self.ada_rms_norm {
-            let t_cond = t_cond.ok_or_else(|| {
-                Error::InferenceError(
-                    "Voxtral LM requires delay conditioning for Ada RMSNorm".into(),
-                )
-            })?;
-            let mut scale = ada_rms_norm.forward(t_cond)?;
-            if scale.dtype() != normed.dtype() {
-                scale = scale.to_dtype(normed.dtype())?;
-            }
-            let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device())?;
-            normed = normed.broadcast_mul(&scale.broadcast_add(&one)?)?;
+        if self.ada_rms_norm.is_some() {
+            normed = apply_ada_scale(&normed, ada, layer_idx)?;
         }
         let mlp_out = self.mlp.forward(&normed).map_err(|err| {
             Error::InferenceError(format!(
@@ -706,6 +708,7 @@ impl VoxtralAttention {
         cache: &PhysicalPagedKvCache,
         prepared: &mut PreparedPhysicalPagedStep,
         layer_idx: usize,
+        rope: &LmRopeTables,
     ) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
@@ -737,8 +740,8 @@ impl VoxtralAttention {
         q = self.apply_qk_norm(q, &self.q_norm, self.num_heads, seq_len)?;
         k = self.apply_qk_norm(k, &self.k_norm, self.num_kv_heads, seq_len)?;
 
-        q = self.apply_rope(q, start_pos, position_ids)?;
-        k = self.apply_rope(k, start_pos, position_ids)?;
+        q = self.apply_rope(q, start_pos, position_ids, rope)?;
+        k = self.apply_rope(k, start_pos, position_ids, rope)?;
 
         let q = q.squeeze(0)?;
         let k = k.squeeze(0)?;
@@ -763,6 +766,7 @@ impl VoxtralAttention {
         metadata: &KvDecodeBatchMetadata,
         completions: &mut KvWriteCompletionCollector,
         layer_idx: usize,
+        rope: &LmRopeTables,
     ) -> Result<Tensor> {
         let (batch, sequence_len, _) = x.dims3()?;
         if batch == 0
@@ -817,8 +821,8 @@ impl VoxtralAttention {
         let mut key_rows = Vec::with_capacity(batch);
         let mut value_rows = Vec::with_capacity(batch);
         for (row, position) in start_positions.iter().copied().enumerate() {
-            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, position, None)?;
-            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, position, None)?;
+            let q_row = self.apply_rope(q.i(row)?.unsqueeze(0)?, position, None, rope)?;
+            let k_row = self.apply_rope(k.i(row)?.unsqueeze(0)?, position, None, rope)?;
             query_rows.push(q_row.reshape((self.num_heads, self.head_dim))?);
             key_rows.push(k_row.reshape((self.num_kv_heads, self.head_dim))?);
             value_rows.push(v.i(row)?.reshape((self.num_kv_heads, self.head_dim))?);
@@ -876,10 +880,37 @@ impl VoxtralAttention {
         x: Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
+        rope: &LmRopeTables,
     ) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
+        if position_ids.is_none() {
+            // Positions follow from `start_pos`: every layer (and q and k)
+            // shares one table per position span for the whole forward.
+            let key = LmRopeKey {
+                seq_len,
+                start_pos,
+                head_dim: self.head_dim,
+                rope_theta_bits: self.rope_theta.to_bits(),
+                use_mrope: self.use_mrope,
+                mrope_section: self.mrope_section.clone(),
+                dtype: x.dtype(),
+                device: x.device().location(),
+            };
+            let (cos, sin) = rope.get_or_build(key, || self.rope_tables(&x, start_pos, None))?;
+            return apply_interleaved_rotary_emb(&x, &cos, &sin);
+        }
+        let (cos, sin) = self.rope_tables(&x, start_pos, position_ids)?;
+        apply_interleaved_rotary_emb(&x, &cos, &sin)
+    }
 
-        let (cos, sin) = if self.use_mrope {
+    fn rope_tables(
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let seq_len = x.dim(1)?;
+        let tables = if self.use_mrope {
             let position_ids = if let Some(position_ids) = position_ids {
                 position_ids.clone()
             } else {
@@ -911,8 +942,81 @@ impl VoxtralAttention {
                 x.dtype(),
             )?
         };
+        Ok(tables)
+    }
+}
 
-        apply_interleaved_rotary_emb(&x, &cos, &sin)
+#[derive(Clone, PartialEq)]
+struct LmRopeKey {
+    seq_len: usize,
+    start_pos: usize,
+    head_dim: usize,
+    rope_theta_bits: u64,
+    use_mrope: bool,
+    mrope_section: Option<Vec<usize>>,
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+}
+
+/// RoPE cos/sin tables built during one LM forward, shared by q and k and by
+/// every layer. Previously each layer built them twice (once for q, once for
+/// k): 2 x 26 host-angle uploads and device cos/sin per decode step, and per
+/// row in a decode batch. A table is reused only for an identical key.
+#[derive(Default)]
+struct LmRopeTables {
+    tables: RefCell<Vec<(LmRopeKey, (Tensor, Tensor))>>,
+    builds: Cell<usize>,
+}
+
+impl LmRopeTables {
+    fn get_or_build(
+        &self,
+        key: LmRopeKey,
+        build: impl FnOnce() -> Result<(Tensor, Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some((_, tables)) = self
+            .tables
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == key)
+        {
+            return Ok(tables.clone());
+        }
+        let tables = build()?;
+        self.builds.set(self.builds.get() + 1);
+        self.tables.borrow_mut().push((key, tables.clone()));
+        Ok(tables)
+    }
+}
+
+/// Per-layer Ada RMSNorm gains `1 + up(gelu(down(t_cond)))` for one delay
+/// condition. The condition depends only on the loaded model's delay tokens,
+/// so the gains are computed once (at load) instead of in every layer of
+/// every step (two matmuls, a GELU, a `Tensor::ones` and an add per layer).
+#[derive(Clone)]
+pub(crate) struct VoxtralAdaScales {
+    layers: Vec<Option<Tensor>>,
+}
+
+fn apply_ada_scale(
+    normed: &Tensor,
+    ada: Option<&VoxtralAdaScales>,
+    layer_idx: usize,
+) -> Result<Tensor> {
+    let scale = ada
+        .and_then(|ada| ada.layers.get(layer_idx))
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
+            Error::InferenceError(
+                "Voxtral LM requires delay conditioning for Ada RMSNorm".to_string(),
+            )
+        })?;
+    if scale.dtype() == normed.dtype() {
+        normed.broadcast_mul(scale).map_err(Error::from)
+    } else {
+        normed
+            .broadcast_mul(&scale.to_dtype(normed.dtype())?)
+            .map_err(Error::from)
     }
 }
 
@@ -1086,6 +1190,184 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    fn xorshift_values(count: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// Two layers with Ada RMSNorm and xorshift weights.
+    fn tiny_ada_model(device: &Device, layers: usize) -> VoxtralLM {
+        let mut cfg = tiny_cfg();
+        cfg.num_hidden_layers = layers;
+        cfg.vocab_size = 16;
+        cfg.max_position_embeddings = Some(32);
+        cfg.ada_rms_norm_t_cond = true;
+        cfg.ada_rms_norm_t_cond_dim = 2;
+        let mut tensors = HashMap::new();
+        let mut seed = 0xA54F_F53A_5F1D_36F1u64;
+        let mut put = |name: String, shape: (usize, usize)| {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let values = xorshift_values(shape.0 * shape.1, seed);
+            tensors.insert(name, Tensor::from_vec(values, shape, device).unwrap());
+        };
+        put("tok_embeddings.weight".into(), (16, 4));
+        put("output.weight".into(), (16, 4));
+        for layer in 0..layers {
+            for (name, shape) in [
+                ("attention.wq.weight", (4, 4)),
+                ("attention.wk.weight", (2, 4)),
+                ("attention.wv.weight", (2, 4)),
+                ("attention.wo.weight", (4, 4)),
+                ("feed_forward.w1.weight", (8, 4)),
+                ("feed_forward.w3.weight", (8, 4)),
+                ("feed_forward.w2.weight", (4, 8)),
+                ("ada_rms_norm_t_cond.0.weight", (2, 4)),
+                ("ada_rms_norm_t_cond.2.weight", (4, 2)),
+            ] {
+                put(format!("layers.{layer}.{name}"), shape);
+            }
+        }
+        let mut norms = vec!["norm.weight".to_string()];
+        for layer in 0..layers {
+            norms.push(format!("layers.{layer}.attention_norm.weight"));
+            norms.push(format!("layers.{layer}.ffn_norm.weight"));
+        }
+        for name in norms {
+            tensors.insert(name, Tensor::ones(4, DType::F32, device).unwrap());
+        }
+        VoxtralLM::load(
+            cfg,
+            VarBuilder::from_tensors(tensors, DType::F32, device),
+            false,
+        )
+        .unwrap()
+    }
+
+    fn bits(tensor: &Tensor) -> Vec<u32> {
+        tensor
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect()
+    }
+
+    /// Gains precomputed once equal the per-step Ada RMSNorm computation they
+    /// replace, bit for bit, in every layer.
+    #[test]
+    fn precomputed_ada_scales_match_per_step_ada_norm_bit_for_bit() {
+        let device = Device::Cpu;
+        let model = tiny_ada_model(&device, 2);
+        let t_cond = Tensor::from_vec(xorshift_values(4, 0x5BE0_CD19), (1, 4), &device).unwrap();
+        let normed =
+            Tensor::from_vec(xorshift_values(5 * 4, 0x1F83_D9AB), (1, 5, 4), &device).unwrap();
+        let scales = model.ada_scales(&t_cond).unwrap();
+        for (idx, layer) in model.layers.iter().enumerate() {
+            // Pre-change per-step formula.
+            let scale = layer
+                .ada_rms_norm
+                .as_ref()
+                .unwrap()
+                .forward(&t_cond)
+                .unwrap();
+            let one = Tensor::ones(scale.shape(), scale.dtype(), scale.device()).unwrap();
+            let expected = normed
+                .broadcast_mul(&scale.broadcast_add(&one).unwrap())
+                .unwrap();
+            let actual = apply_ada_scale(&normed, Some(&scales), idx).unwrap();
+            assert_eq!(bits(&expected), bits(&actual), "layer {idx}");
+        }
+        assert!(apply_ada_scale(&normed, None, 0).is_err());
+    }
+
+    /// One RoPE table per position span serves q, k and every layer, bit
+    /// identical to building it per call; other spans get their own tables.
+    #[test]
+    fn rope_tables_are_shared_across_q_k_and_layers_bit_identically() {
+        let device = Device::Cpu;
+        let model = tiny_ada_model(&device, 2);
+        let q =
+            Tensor::from_vec(xorshift_values(5 * 2 * 2, 0x6A09), (1, 5, 2, 2), &device).unwrap();
+        let k = Tensor::from_vec(xorshift_values(5 * 2, 0xBB67), (1, 5, 1, 2), &device).unwrap();
+        let shared = LmRopeTables::default();
+        for start_pos in [0usize, 7] {
+            for layer in &model.layers {
+                let attention = &layer.self_attn;
+                for x in [&q, &k] {
+                    let fresh = LmRopeTables::default();
+                    let expected = attention
+                        .apply_rope(x.clone(), start_pos, None, &fresh)
+                        .unwrap();
+                    assert_eq!(fresh.builds.get(), 1);
+                    let actual = attention
+                        .apply_rope(x.clone(), start_pos, None, &shared)
+                        .unwrap();
+                    assert_eq!(bits(&expected), bits(&actual));
+                }
+            }
+        }
+        // Two position spans across 2 layers x {q, k}: two builds, not eight.
+        assert_eq!(shared.builds.get(), 2);
+    }
+
+    /// Precomputed Ada gains drive prefill, scalar decode and batched decode;
+    /// a batched step matches the scalar steps row for row.
+    #[test]
+    fn ada_conditioned_batch_decode_matches_scalar_rows() {
+        let device = Device::Cpu;
+        let model = tiny_ada_model(&device, 1);
+        let t_cond = Tensor::from_vec(xorshift_values(4, 0x3C6E_F372), (1, 4), &device).unwrap();
+        let scales = model.ada_scales(&t_cond).unwrap();
+        let (_, mut caches) = shared_decode_caches(5, 913, 16);
+        let mut scalar_a = caches.remove(0);
+        let mut scalar_b = caches.remove(0);
+        let mut batch_a = caches.remove(0);
+        let mut batch_b = caches.remove(0);
+        let prompt_a = deterministic_embeds(2, 3, &device);
+        let prompt_b = deterministic_embeds(3, 5, &device);
+        for (cache, prompt) in [
+            (&mut scalar_a, &prompt_a),
+            (&mut batch_a, &prompt_a),
+            (&mut scalar_b, &prompt_b),
+            (&mut batch_b, &prompt_b),
+        ] {
+            model
+                .forward_managed_with_embeds(prompt, 0, cache, None, Some(&scales))
+                .unwrap();
+            cache.take_completed_writes();
+        }
+        assert!(model
+            .forward_managed_with_embeds(&prompt_a, 0, &mut caches[0], None, None)
+            .is_err());
+        let step_a = deterministic_embeds(1, 11, &device);
+        let step_b = deterministic_embeds(1, 19, &device);
+        let scalar_a_logits = model
+            .forward_managed_with_embeds(&step_a, 2, &mut scalar_a, None, Some(&scales))
+            .unwrap();
+        let scalar_b_logits = model
+            .forward_managed_with_embeds(&step_b, 3, &mut scalar_b, None, Some(&scales))
+            .unwrap();
+        let batch_logits = model
+            .forward_managed_decode_batch_with_embeds(
+                &Tensor::cat(&[&step_a, &step_b], 0).unwrap(),
+                &[2, 3],
+                &mut [&mut batch_a, &mut batch_b],
+                Some(&scales),
+            )
+            .unwrap();
+        assert_close(&scalar_a_logits, &batch_logits.narrow(0, 0, 1).unwrap());
+        assert_close(&scalar_b_logits, &batch_logits.narrow(0, 1, 1).unwrap());
     }
 
     fn shared_decode_caches(

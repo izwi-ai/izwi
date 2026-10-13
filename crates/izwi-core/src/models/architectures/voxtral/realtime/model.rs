@@ -18,7 +18,7 @@ use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::CacheDomainId;
 use crate::models::architectures::qwen3::core::build_rope_cache;
-use crate::models::architectures::voxtral::lm::VoxtralLM;
+use crate::models::architectures::voxtral::lm::{VoxtralAdaScales, VoxtralLM};
 use crate::models::architectures::voxtral::{
     voxtral_invocation_contract, voxtral_physical_state_spec, voxtral_realtime_physical_state_spec,
     voxtral_retained_contract, VoxtralPhysicalStateSpec, VoxtralRealtimePhysicalStateSpec,
@@ -128,7 +128,8 @@ pub struct VoxtralRealtimeModel {
     whisper_encoder: WhisperEncoder,
     audio_adapter: AudioLanguageAdapter,
     language_model: VoxtralLM,
-    time_embedding: TimeEmbedding,
+    /// Per-layer Ada RMSNorm gains for the model's fixed delay condition.
+    ada_scales: VoxtralAdaScales,
     mel: MelSpectrogram,
     global_log_mel_max: Option<f32>,
     num_delay_tokens: usize,
@@ -299,6 +300,14 @@ impl VoxtralRealtimeModel {
 
         let time_embedding =
             TimeEmbedding::new(config.text_config().hidden_size, 10000.0, &device.device)?;
+        // The delay condition is fixed for the loaded model: compute the LM's
+        // Ada RMSNorm gains once instead of in every layer of every step.
+        let time = Tensor::from_vec(vec![num_delay_tokens as f32], (1,), &device.device)?
+            .to_dtype(dtype)?;
+        let t_cond = time_embedding
+            .forward(&time)?
+            .to_dtype(language_model.embedding_dtype())?;
+        let ada_scales = language_model.ada_scales(&t_cond)?;
 
         info!(
             "Loaded Voxtral Realtime model on {:?} with dtype {:?} (checkpoint_dtype={:?})",
@@ -314,7 +323,7 @@ impl VoxtralRealtimeModel {
             whisper_encoder,
             audio_adapter,
             language_model,
-            time_embedding,
+            ada_scales,
             mel,
             global_log_mel_max: audio_cfg.global_log_mel_max,
             num_delay_tokens,
@@ -717,13 +726,12 @@ impl VoxtralRealtimeModel {
             audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
         }
         let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
-        let t_cond = self.realtime_time_condition(&prompt_embeds)?;
         let logits = self.language_model.forward_managed_with_embeds(
             &prompt_embeds,
             0,
             cache,
             None,
-            Some(&t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         state.prompt_initialized = true;
@@ -839,7 +847,6 @@ impl VoxtralRealtimeModel {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Vec<VoxtralRealtimeStep>> {
             let mut embed_rows = Vec::with_capacity(rows.len());
-            let mut condition_rows = Vec::with_capacity(rows.len());
             let mut positions = Vec::with_capacity(rows.len());
             for row in rows.iter() {
                 let input_token = row
@@ -858,12 +865,10 @@ impl VoxtralRealtimeModel {
                     audio_step = audio_step.to_dtype(text_embed.dtype())?;
                 }
                 let step_embeds = audio_step.broadcast_add(&text_embed)?;
-                condition_rows.push(self.realtime_time_condition(&step_embeds)?);
                 embed_rows.push(step_embeds);
                 positions.push(row.state.next_audio_frame);
             }
             let embeds = Tensor::cat(&embed_rows.iter().collect::<Vec<_>>(), 0)?;
-            let conditions = Tensor::stack(&condition_rows.iter().collect::<Vec<_>>(), 0)?;
             let output = {
                 let mut caches = rows
                     .iter_mut()
@@ -874,7 +879,7 @@ impl VoxtralRealtimeModel {
                         &embeds,
                         &positions,
                         &mut caches,
-                        Some(&conditions),
+                        Some(&self.ada_scales),
                     )?
             };
             let (batch, sequence, _) = output.dims3()?;
@@ -959,13 +964,12 @@ impl VoxtralRealtimeModel {
             audio_step = audio_step.to_dtype(text_embed.dtype())?;
         }
         let step_embeds = audio_step.broadcast_add(&text_embed)?;
-        let t_cond = self.realtime_time_condition(&step_embeds)?;
         let logits = self.language_model.forward_managed_with_embeds(
             &step_embeds,
             state.next_audio_frame,
             cache,
             None,
-            Some(&t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         state.next_audio_frame = state
@@ -1136,15 +1140,6 @@ impl VoxtralRealtimeModel {
             });
         }
 
-        // Apply time conditioning
-        let time_tensor = Tensor::from_vec(
-            vec![self.num_delay_tokens as f32],
-            (1,),
-            &self.device.device,
-        )?
-        .to_dtype(self.dtype)?;
-        let t_cond = self.time_embedding.forward(&time_tensor)?;
-
         // Generate
         let prompt_tokens = self.tokenizer.build_transcription_prompt()?;
         let prompt_len = prompt_tokens.len();
@@ -1180,17 +1175,12 @@ impl VoxtralRealtimeModel {
             audio_prompt = audio_prompt.to_dtype(text_embeds.dtype())?;
         }
         let prompt_embeds = audio_prompt.broadcast_add(&text_embeds)?;
-        let prompt_t_cond = if t_cond.dtype() == prompt_embeds.dtype() {
-            t_cond.clone()
-        } else {
-            t_cond.to_dtype(prompt_embeds.dtype())?
-        };
         let logits = self.language_model.forward_managed_with_embeds(
             &prompt_embeds,
             0,
             cache,
             None,
-            Some(&prompt_t_cond),
+            Some(&self.ada_scales),
         )?;
         let next_logits = logits.i((0, logits.dim(1)? - 1))?;
         let mut next = argmax(&next_logits)?;
@@ -1222,18 +1212,13 @@ impl VoxtralRealtimeModel {
                 audio_step = audio_step.to_dtype(text_embed.dtype())?;
             }
             let step_embeds = audio_step.broadcast_add(&text_embed)?;
-            let step_t_cond = if t_cond.dtype() == step_embeds.dtype() {
-                t_cond.clone()
-            } else {
-                t_cond.to_dtype(step_embeds.dtype())?
-            };
 
             let logits = self.language_model.forward_managed_with_embeds(
                 &step_embeds,
                 frame_idx,
                 cache,
                 None,
-                Some(&step_t_cond),
+                Some(&self.ada_scales),
             )?;
             let next_logits = logits.i((0, logits.dim(1)? - 1))?;
             next = argmax(&next_logits)?;
@@ -1656,21 +1641,6 @@ impl VoxtralRealtimeModel {
             self.realtime_max_source_samples,
         )?;
         Ok(())
-    }
-
-    fn realtime_time_condition(&self, reference: &Tensor) -> Result<Tensor> {
-        let time = Tensor::from_vec(
-            vec![self.num_delay_tokens as f32],
-            (1,),
-            &self.device.device,
-        )?
-        .to_dtype(self.dtype)?;
-        let condition = self.time_embedding.forward(&time)?;
-        if condition.dtype() == reference.dtype() {
-            Ok(condition)
-        } else {
-            condition.to_dtype(reference.dtype()).map_err(Error::from)
-        }
     }
 
     fn accept_realtime_prediction(
