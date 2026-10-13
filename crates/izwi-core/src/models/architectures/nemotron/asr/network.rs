@@ -2866,9 +2866,16 @@ impl ConformerConv {
             return Ok(y);
         }
 
-        self.depthwise_conv
-            .forward(x)
-            .map_err(|e| Error::InferenceError(e.to_string()))
+        // CPU/CUDA: shared shift-and-accumulate op instead of Candle's
+        // per-channel grouped conv. Inputs arrive causally pre-padded.
+        crate::kernels::depthwise_conv::depthwise_conv1d(
+            x,
+            self.depthwise_conv.weight(),
+            None,
+            crate::kernels::depthwise_conv::DepthwiseConv1dSpec::symmetric(cfg.padding)
+                .with_dilation(cfg.dilation),
+        )
+        .map_err(|e| Error::InferenceError(e.to_string()))
     }
 }
 
@@ -3948,6 +3955,61 @@ mod tests {
         );
         assert!(!cache.contains_key(&99));
         assert_eq!(cache.len(), 2);
+    }
+
+    /// The CPU/CUDA conformer depthwise conv (shared shift-and-accumulate op)
+    /// matches Candle's per-channel grouped conv on causally padded input.
+    #[test]
+    fn conformer_depthwise_conv_shared_op_matches_candle_grouped_conv() {
+        let device = Device::Cpu;
+        let mut state = 0x8F1B_3C27_D4E5_A609u64;
+        let mut tensor = |shape: &[usize]| {
+            let n = shape.iter().product::<usize>();
+            let values = (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+                })
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, &device).unwrap()
+        };
+        let pointwise = |t: Tensor| Conv1d::new(t, None, Conv1dConfig::default());
+        let conv = ConformerConv {
+            pointwise_conv1: pointwise(tensor(&[2 * ENCODER_DIM, ENCODER_DIM, 1])),
+            depthwise_conv: Conv1d::new(
+                tensor(&[ENCODER_DIM, 1, CONV_KERNEL_1D]),
+                None,
+                Conv1dConfig {
+                    padding: 0,
+                    groups: ENCODER_DIM,
+                    ..Default::default()
+                },
+            ),
+            conv_norm: LayerNorm::new(tensor(&[ENCODER_DIM]), tensor(&[ENCODER_DIM]), 1e-5),
+            pointwise_conv2: pointwise(tensor(&[ENCODER_DIM, ENCODER_DIM, 1])),
+        };
+        let x = tensor(&[2, ENCODER_DIM, 23])
+            .pad_with_zeros(2, CONV_KERNEL_1D - 1, 0)
+            .unwrap();
+        let calls = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        let actual = conv.depthwise_conv_forward(&x).unwrap();
+        assert!(crate::kernels::depthwise_conv::depthwise_conv1d_calls() > calls);
+        let expected = conv.depthwise_conv.forward(&x).unwrap();
+        assert_eq!(actual.dims(), expected.dims());
+        let diff = (actual - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .into_iter()
+            .map(|d| if d.is_finite() { d } else { f32::INFINITY })
+            .fold(0.0f32, f32::max);
+        assert!(diff <= 1e-5, "max |diff| {diff}");
     }
 
     fn test_preprocessor(normalize: FeatureNormalize) -> NemotronPreprocessor {
