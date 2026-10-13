@@ -1518,11 +1518,12 @@ impl InferenceCoordinator {
                             ));
                         }
                         Err(error) => {
-                            let message = error.to_string();
+                            // Every live row fails with the operation's own
+                            // error kind: an input error stays a 400 rather
+                            // than becoming an internal error.
                             for index in &live {
-                                outcomes[*index] = Some(PreparationPhysicalOutcome::Failed(
-                                    Error::InferenceError(message.clone()),
-                                ));
+                                outcomes[*index] =
+                                    Some(PreparationPhysicalOutcome::Failed(error.replicate()));
                             }
                             return Ok(outcomes
                                 .into_iter()
@@ -4697,6 +4698,49 @@ Pages free: 10.\n";
         );
         drop(output);
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
+    }
+
+    /// A preparation that fails as a whole reports its own error kind on
+    /// every live row: Kokoro's over-long input surfaced as a 500
+    /// "Inference error: Invalid input: ..." instead of a 400.
+    #[tokio::test]
+    async fn native_preparation_failure_keeps_the_error_kind_on_every_row() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("native-prep-fail-a")).await.unwrap();
+        let second = coordinator.admit(job("native-prep-fail-b")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let row = |job| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 4, 16),
+                4,
+                PreparationCancellation::default(),
+            )
+        };
+        let outcomes = coordinator
+            .run_loaded_native_preparation_batch::<usize, _>(
+                vec![row(first), row(second)],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "tts.prepare.kokoro".to_string(),
+                },
+                |_| Err(Error::InvalidInput("text too long".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    PreparationRowOutcome::Failed(Error::InvalidInput(message))
+                        if message == "text too long"
+                ),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -173,6 +173,7 @@ pub use metrics::{
     ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
+pub(crate) use request::KokoroPreparedText;
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
     EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,

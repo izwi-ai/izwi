@@ -14,17 +14,12 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
-use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
-use crate::models::architectures::vibevoice::tts::{
-    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
-};
+use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use crate::models::architectures::voxtral::tts::{
     voxtral_tts_auto_max_frames_for_text, VoxtralTtsGenerationParams,
 };
-use crate::models::shared::chat::{ChatMessage, ChatRole};
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
-use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::{CapabilityLoadOptions, RuntimeService};
@@ -341,33 +336,6 @@ pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Re
     )?;
     Ok(total)
 }
-
-fn vibevoice_reference_from_request(
-    request: &GenerationRequest,
-) -> Result<VibeVoiceSpeakerReference> {
-    let ref_audio = request.reference_audio.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    let ref_text = request.reference_text.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    if ref_text.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "VibeVoice TTS reference_text cannot be empty".to_string(),
-        ));
-    }
-    let (audio_samples, sample_rate) = decode_reference_audio_base64(ref_audio)?;
-    Ok(VibeVoiceSpeakerReference {
-        audio_samples,
-        sample_rate,
-        text: ref_text.to_string(),
-    })
-}
-
 fn qwen_tts_streaming_uses_final_only(
     is_cuda: bool,
     variant: ModelVariant,
@@ -375,20 +343,6 @@ fn qwen_tts_streaming_uses_final_only(
 ) -> bool {
     matches!(variant.family(), ModelFamily::Qwen3Tts) && !(is_cuda && chunked_codec_stream_enabled)
 }
-
-fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            role: ChatRole::System,
-            content: lfm25_audio_tts_system_prompt(speaker).to_string(),
-        },
-        ChatMessage {
-            role: ChatRole::User,
-            content: text.trim().to_string(),
-        },
-    ]
-}
-
 async fn send_direct_tts_chunk(
     job: &JobLease,
     chunk_tx: &mpsc::Sender<AudioChunk>,
@@ -501,113 +455,6 @@ impl RuntimeService {
                     .map(|_| variant)
             })
     }
-
-    async fn lfm25_audio_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_audio_chat(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio model loaded".to_string()))?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .unwrap_or_else(|| self.config.portable_context_ceiling());
-        let max_new_tokens = if request.config.options.max_tokens == 0 {
-            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(context_limit.max(1))
-        } else {
-            request
-                .config
-                .options
-                .max_tokens
-                .min(tts_explicit_output_limit(
-                    self.backend_router.context().backend_kind,
-                    variant,
-                    context_limit,
-                ))
-        };
-        let requested_speaker = request
-            .config
-            .options
-            .speaker
-            .clone()
-            .or_else(|| request.config.options.voice.clone());
-        let request_id = request.id;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let started = Instant::now();
-                    let output = model
-                        .generate_sequential_with_callback_from_invocation_workspace(
-                            &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
-                            max_new_tokens,
-                            leases,
-                            &mut |_delta| {},
-                        )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id,
-                        samples: output.samples,
-                        sample_rate: output.sample_rate,
-                        total_tokens: output.tokens_generated,
-                        total_time_ms,
-                        diagnostics: output.diagnostics,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn lfm25_audio_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .lfm25_audio_tts_generate(job, request, variant, true)
-            .await?;
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.is_final = true;
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
-
     async fn voxtral_tts_generate(
         &self,
         job: &JobLease,
@@ -736,107 +583,6 @@ impl RuntimeService {
         });
         send_direct_tts_chunk(job, &chunk_tx, chunk).await
     }
-
-    async fn vibevoice_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_vibevoice_tts(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let reference = vibevoice_reference_from_request(&request)?;
-                    let requested_speaker = request.config.options.speaker.as_deref().or(request
-                        .config
-                        .options
-                        .voice
-                        .as_deref());
-                    let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
-                        &request.config,
-                        &text,
-                        model.default_diffusion_steps(),
-                    );
-                    let started = Instant::now();
-                    let output = model.generate_with_reference_physical(
-                        &text,
-                        &reference,
-                        requested_speaker,
-                        params,
-                        leases,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id: request.id,
-                        samples: output.samples,
-                        sample_rate: output.sample_rate,
-                        total_tokens: output.frames_generated,
-                        total_time_ms,
-                        diagnostics: None,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn vibevoice_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .vibevoice_tts_generate(job, request, variant, true)
-            .await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
-
     async fn qwen_tts_final_only_streaming(
         &self,
         mut request: GenerationRequest,
@@ -904,17 +650,8 @@ impl RuntimeService {
                 .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
                 .await?;
             let result = match resolved_variant.family() {
-                ModelFamily::KokoroTts => self.kokoro_tts_generate(&job, request).await,
-                ModelFamily::Lfm25Audio => {
-                    self.lfm25_audio_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
                 ModelFamily::VoxtralTts => {
                     self.voxtral_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                ModelFamily::VibeVoiceTts => {
-                    self.vibevoice_tts_generate(&job, request, resolved_variant, false)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),
@@ -995,21 +732,8 @@ impl RuntimeService {
                     self.kokoro_tts_generate_streaming(&job, request, chunk_tx)
                         .await
                 }
-                ModelFamily::Lfm25Audio => {
-                    self.lfm25_audio_tts_generate_streaming(
-                        &job,
-                        request,
-                        resolved_variant,
-                        chunk_tx,
-                    )
-                    .await
-                }
                 ModelFamily::VoxtralTts => {
                     self.voxtral_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
-                        .await
-                }
-                ModelFamily::VibeVoiceTts => {
-                    self.vibevoice_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
                         .await
                 }
                 _ => unreachable!("direct TTS family checked above"),

@@ -67,6 +67,36 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// An error of the same kind with the same message, for reporting one
+    /// failure on several rows. Kinds that wrap a foreign error (I/O,
+    /// serialization, HTTP) become an `InferenceError` with its text.
+    pub(crate) fn replicate(&self) -> Self {
+        match self {
+            Self::InvalidInput(message) => Self::InvalidInput(message.clone()),
+            Self::ModelNotFound(message) => Self::ModelNotFound(message.clone()),
+            Self::ModelError(message) => Self::ModelError(message.clone()),
+            Self::ModelLoadError(message) => Self::ModelLoadError(message.clone()),
+            Self::DownloadError(message) => Self::DownloadError(message.clone()),
+            Self::TokenizationError(message) => Self::TokenizationError(message.clone()),
+            Self::InferenceError(message) => Self::InferenceError(message.clone()),
+            Self::Timeout(message) => Self::Timeout(message.clone()),
+            Self::Cancelled(message) => Self::Cancelled(message.clone()),
+            Self::Overloaded(message) => Self::Overloaded(message.clone()),
+            Self::Backpressure(message) => Self::Backpressure(message.clone()),
+            Self::AudioError(message) => Self::AudioError(message.clone()),
+            Self::ConfigError(message) => Self::ConfigError(message.clone()),
+            Self::MissingDependency(message) => Self::MissingDependency(message.clone()),
+            Self::HfHubError(message) => Self::HfHubError(message.clone()),
+            Self::SafetensorsError(message) => Self::SafetensorsError(message.clone()),
+            Self::UnsupportedPlatform(message) => Self::UnsupportedPlatform(message.clone()),
+            Self::IoError(_) | Self::SerializationError(_) | Self::HttpError(_) => {
+                Self::InferenceError(self.to_string())
+            }
+        }
+    }
+}
+
 impl From<hf_hub::api::sync::ApiError> for Error {
     fn from(e: hf_hub::api::sync::ApiError) -> Self {
         Error::HfHubError(e.to_string())

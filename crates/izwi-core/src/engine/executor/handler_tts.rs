@@ -378,6 +378,71 @@ fn retained_tts_batch_model_call(
     }
 }
 
+/// Silence between consecutive chunks of one Kokoro request.
+const KOKORO_CHUNK_PAUSE_SECS: f32 = 0.04;
+
+/// Synthesize every live row's chunks, batching chunk `i` of every row that
+/// has one into a single static call (never wider than the cohort), and
+/// join each row's chunks in order with a short pause.
+fn synthesize_kokoro_chunked_rows(
+    rows: &[crate::engine::KokoroPreparedText],
+    mut generate: impl FnMut(
+        &[crate::models::architectures::kokoro::KokoroPreparedRequest],
+    )
+        -> Result<Vec<crate::models::architectures::kokoro::KokoroSynthesisResult>>,
+) -> Result<Vec<crate::models::architectures::kokoro::KokoroSynthesisResult>> {
+    use crate::models::architectures::kokoro::KokoroSynthesisResult;
+    let mut joined: Vec<Option<KokoroSynthesisResult>> = vec![None; rows.len()];
+    let rounds = rows.iter().map(|row| row.chunks.len()).max().unwrap_or(0);
+    for round in 0..rounds {
+        let members = (0..rows.len())
+            .filter(|row| round < rows[*row].chunks.len())
+            .collect::<Vec<_>>();
+        let batch = members
+            .iter()
+            .map(|row| rows[*row].chunks[round].clone())
+            .collect::<Vec<_>>();
+        let results = generate(&batch)?;
+        if results.len() != members.len() {
+            return Err(Error::InferenceError(format!(
+                "Kokoro returned {} results for {} chunks",
+                results.len(),
+                members.len()
+            )));
+        }
+        for (row, chunk) in members.into_iter().zip(results) {
+            let Some(output) = joined[row].as_mut() else {
+                joined[row] = Some(chunk);
+                continue;
+            };
+            if output.sample_rate != chunk.sample_rate {
+                return Err(Error::InferenceError(format!(
+                    "Kokoro chunk sample rate changed from {} to {}",
+                    output.sample_rate, chunk.sample_rate
+                )));
+            }
+            let pause = (output.sample_rate as f32 * KOKORO_CHUNK_PAUSE_SECS).round() as usize;
+            output.samples.resize(output.samples.len() + pause, 0.0);
+            output.samples.extend_from_slice(&chunk.samples);
+            output.tokens_generated = output
+                .tokens_generated
+                .checked_add(chunk.tokens_generated)
+                .ok_or_else(|| Error::Overloaded("Kokoro token count overflowed".into()))?;
+            output.phonemes.push(' ');
+            output.phonemes.push_str(chunk.phonemes.trim());
+        }
+    }
+    joined
+        .into_iter()
+        .enumerate()
+        .map(|(row, output)| {
+            output.ok_or_else(|| {
+                Error::InferenceError(format!("Kokoro row {row} prepared no chunks"))
+            })
+        })
+        .collect()
+}
+
 fn kokoro_live_row_indices(cancelled: &[bool]) -> Vec<usize> {
     cancelled
         .iter()
@@ -687,7 +752,11 @@ impl NativeExecutor {
 
         if !live_indices.is_empty() {
             let model = model.expect("live Kokoro rows establish an exact model");
-            let results = Self::run_blocking(|| model.generate_prepared_batch(&artifacts))?;
+            let results = Self::run_blocking(|| {
+                synthesize_kokoro_chunked_rows(&artifacts, |batch| {
+                    model.generate_prepared_batch(batch)
+                })
+            })?;
             let mut results = scatter_kokoro_rows(requests.len(), &live_indices, results)?;
             if let Some(call) = retained_tts_batch_model_call(
                 crate::engine::NativeBatchMode::Static,
@@ -4140,6 +4209,65 @@ fn fish_execution_timing(
 
 #[cfg(test)]
 mod tests {
+    /// Chunked Kokoro rows synthesize chunk `i` of every row in one batch
+    /// (never wider than the cohort) and join each row's chunks in order
+    /// with a 40 ms pause.
+    #[test]
+    fn kokoro_chunked_rows_batch_by_round_and_join_in_order() {
+        use crate::models::architectures::kokoro::{KokoroPreparedRequest, KokoroSynthesisResult};
+        let chunk = |tokens: usize| KokoroPreparedRequest {
+            source_text: "x".into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            phonemes: "p".into(),
+            token_ids: vec![tokens as u32; tokens],
+            ref_style: candle_core::Tensor::zeros(
+                (1, 4),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            speed: 1.0,
+        };
+        let row = |chunks: Vec<KokoroPreparedRequest>| crate::engine::KokoroPreparedText {
+            source_text: "x".into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            chunks,
+        };
+        let rows = [row(vec![chunk(1), chunk(2), chunk(3)]), row(vec![chunk(7)])];
+        let mut widths = Vec::new();
+        let results = super::synthesize_kokoro_chunked_rows(&rows, |batch| {
+            widths.push(batch.len());
+            Ok(batch
+                .iter()
+                .map(|prepared| KokoroSynthesisResult {
+                    samples: vec![prepared.token_ids[0] as f32; 2],
+                    sample_rate: 1_000,
+                    tokens_generated: prepared.token_ids.len(),
+                    phonemes: "p".into(),
+                })
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(widths, [2, 1, 1]);
+        let pause = vec![0.0; 40];
+        let expected = [
+            vec![1.0; 2],
+            pause.clone(),
+            vec![2.0; 2],
+            pause,
+            vec![3.0; 2],
+        ]
+        .concat();
+        assert_eq!(results[0].samples, expected);
+        assert_eq!(results[0].tokens_generated, 6);
+        assert_eq!(results[0].phonemes, "p p p");
+        assert_eq!(results[1].samples, vec![7.0; 2]);
+    }
+
     #[test]
     fn fish_fresh_terminal_row_discards_state_without_poisoning_lease() {
         use crate::engine::executor::PendingQuantumFinalizer;

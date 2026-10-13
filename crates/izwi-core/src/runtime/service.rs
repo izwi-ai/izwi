@@ -6055,7 +6055,8 @@ impl RuntimeService {
                         "Kokoro preparation must remain scalar".into(),
                     ));
                 }
-                let artifact = Arc::new(model_for_preparation.prepare_request(
+                let artifact = Arc::new(crate::runtime::kokoro::prepare_kokoro_text(
+                    &*model_for_preparation,
                     &text,
                     speaker.as_deref(),
                     language.as_deref(),
@@ -6931,10 +6932,11 @@ impl RuntimeService {
     /// before binding or engine admission. Keep the family pipeline in one place.
     async fn prepare_request_for_binding(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<&ModelResidencyLease>,
     ) -> Result<(EngineCoreRequest, JobLease)> {
+        request.normalize_tts_params_before_preparation();
         let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease)
             .await?;

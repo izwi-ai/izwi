@@ -1,7 +1,6 @@
 //! Kokoro TTS runtime helpers (isolated from generic runtime routing).
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tracing::info;
@@ -10,13 +9,13 @@ use crate::engine::WorkUnit;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::{
-    kokoro_output_budget, KokoroSynthesisResult, KokoroTtsModel,
+    kokoro_output_budget, KokoroPreparedRequest, KokoroSynthesisResult, KokoroTtsModel,
 };
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::service::RuntimeService;
 use crate::runtime::tts::direct_tts_retained_input_bytes;
-use crate::runtime::types::{AudioChunk, GenerationRequest, GenerationResult};
+use crate::runtime::types::{AudioChunk, GenerationRequest};
 
 const KOKORO_STREAM_TARGET_CHARS: usize = 180;
 const KOKORO_STREAM_MIN_CHARS: usize = 64;
@@ -46,75 +45,6 @@ impl RuntimeService {
         }
         Self::default_kokoro_variant()
     }
-
-    pub(crate) async fn kokoro_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-    ) -> Result<GenerationResult> {
-        let retained_input_bytes = u64::try_from(direct_tts_retained_input_bytes(&request)?)
-            .map_err(|_| Error::InvalidInput("Kokoro retained input exceeds u64".to_string()))?;
-        let output_budget =
-            kokoro_output_budget(&request.text, request.config.options.speed)?.max_samples;
-        let variant = self.resolve_kokoro_variant_for_request(&request).await;
-        self.observe_broker_capability_request(CapabilityKind::Tts, Some(variant), false)?;
-        let (residency_lease, execution_contract) = self
-            .load_capability_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                false,
-                ExecutionTargetKind::DirectModel,
-            )
-            .await?;
-        let model = self
-            .model_registry
-            .get_kokoro(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
-        let observation_job = job.clone();
-
-        self.coordinator
-            .run_loaded_blocking_stage(
-                job,
-                execution_contract,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move || {
-                    let _residency_lease = residency_lease;
-                    let opts = &request.config.options;
-                    let speaker = opts.speaker.as_deref().or(opts.voice.as_deref());
-                    let started = Instant::now();
-                    let result = synthesize_kokoro_with_fallback(
-                        model,
-                        &request.text,
-                        speaker,
-                        request.language.as_deref(),
-                        opts.speed,
-                        output_budget,
-                    )?;
-                    record_kokoro_materialized_output(
-                        &observation_job,
-                        retained_input_bytes,
-                        result.samples.capacity(),
-                        output_budget,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id: request.id,
-                        samples: result.samples,
-                        sample_rate: result.sample_rate,
-                        total_tokens: result.tokens_generated,
-                        total_time_ms,
-                        diagnostics: None,
-                    })
-                },
-            )
-            .await
-    }
-
     pub(crate) async fn kokoro_tts_generate_streaming(
         &self,
         job: &JobLease,
@@ -280,6 +210,69 @@ fn synthesize_kokoro_with_fallback(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Phonemizes one piece of text against the voice pack: the loaded model,
+/// or a fake in tests of the chunk planner.
+pub(crate) trait KokoroPreparer {
+    fn prepare(
+        &self,
+        text: &str,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        speed: f32,
+    ) -> Result<KokoroPreparedRequest>;
+}
+
+impl KokoroPreparer for KokoroTtsModel {
+    fn prepare(
+        &self,
+        text: &str,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        speed: f32,
+    ) -> Result<KokoroPreparedRequest> {
+        self.prepare_request(text, speaker, language, speed)
+    }
+}
+
+/// Prepare a Kokoro request for engine synthesis: the whole text when it
+/// fits the voice pack's 510-phoneme limit, otherwise the chunks the
+/// planner splits it into (the streaming route's planner), each prepared.
+pub(crate) fn prepare_kokoro_text(
+    model: &impl KokoroPreparer,
+    text: &str,
+    speaker: Option<&str>,
+    language: Option<&str>,
+    speed: f32,
+) -> Result<crate::engine::KokoroPreparedText> {
+    let chunks = match model.prepare(text, speaker, language, speed) {
+        Ok(prepared) => vec![prepared],
+        Err(err) if is_kokoro_voice_pack_limit_error(&err) => {
+            let planned = plan_kokoro_text_chunks(model, text, speaker, language, speed)?;
+            info!(
+                chunks = planned.len(),
+                "Kokoro text exceeds the voice-pack limit; synthesizing planned chunks"
+            );
+            planned
+                .iter()
+                .map(|chunk| model.prepare(chunk, speaker, language, speed))
+                .collect::<Result<Vec<_>>>()?
+        }
+        Err(err) => return Err(err),
+    };
+    if chunks.is_empty() {
+        return Err(Error::InvalidInput(
+            "Kokoro text produced no synthesizable chunks".to_string(),
+        ));
+    }
+    Ok(crate::engine::KokoroPreparedText {
+        source_text: text.to_string(),
+        requested_speaker: speaker.map(str::to_string),
+        requested_language: language.map(str::to_string),
+        requested_speed: speed,
+        chunks,
+    })
 }
 
 fn is_kokoro_voice_pack_limit_error(err: &Error) -> bool {
@@ -457,7 +450,7 @@ fn generate_chunked_kokoro(
 }
 
 fn plan_kokoro_streaming_chunks(
-    model: &KokoroTtsModel,
+    model: &impl KokoroPreparer,
     text: &str,
     speaker: Option<&str>,
     language: Option<&str>,
@@ -538,7 +531,7 @@ fn split_text_for_streaming(text: &str, target_chars: usize, min_chars: usize) -
 }
 
 fn plan_kokoro_text_chunks(
-    model: &KokoroTtsModel,
+    model: &impl KokoroPreparer,
     text: &str,
     speaker: Option<&str>,
     language: Option<&str>,
@@ -560,7 +553,7 @@ fn plan_kokoro_text_chunks(
             ));
         }
 
-        match model.prepare_request(remaining, speaker, language, speed) {
+        match model.prepare(remaining, speaker, language, speed) {
             Ok(_) => {
                 chunks.push(remaining.trim_end().to_string());
                 break;
@@ -600,7 +593,7 @@ fn plan_kokoro_text_chunks(
 }
 
 fn find_max_fitting_prefix_chars(
-    model: &KokoroTtsModel,
+    model: &impl KokoroPreparer,
     text: &str,
     speaker: Option<&str>,
     language: Option<&str>,
@@ -626,7 +619,7 @@ fn find_max_fitting_prefix_chars(
             continue;
         }
 
-        match model.prepare_request(prefix, speaker, language, speed) {
+        match model.prepare(prefix, speaker, language, speed) {
             Ok(_) => {
                 best = prefix.chars().count();
                 lo = mid.saturating_add(1);
@@ -659,7 +652,7 @@ fn find_max_fitting_prefix_chars(
         if prefix.is_empty() {
             continue;
         }
-        match model.prepare_request(prefix, speaker, language, speed) {
+        match model.prepare(prefix, speaker, language, speed) {
             Ok(_) => return Ok(prefix.chars().count()),
             Err(err) if is_kokoro_voice_pack_limit_error(&err) => continue,
             Err(Error::InvalidInput(msg))
@@ -740,6 +733,75 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::engine::{ExecutionGroupId, ModelInstanceId};
     use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+
+    /// A voice pack that takes one phoneme per non-space character and
+    /// refuses more than 510, as the model does.
+    pub(crate) struct FakeKokoroPreparer;
+
+    impl KokoroPreparer for FakeKokoroPreparer {
+        fn prepare(
+            &self,
+            text: &str,
+            speaker: Option<&str>,
+            language: Option<&str>,
+            speed: f32,
+        ) -> Result<KokoroPreparedRequest> {
+            let phonemes = text.chars().filter(|ch| !ch.is_whitespace()).count();
+            if phonemes > 510 {
+                return Err(Error::InvalidInput(format!(
+                    "Kokoro phoneme sequence length {phonemes} exceeds voice-pack limit (510)"
+                )));
+            }
+            Ok(KokoroPreparedRequest {
+                source_text: text.to_string(),
+                requested_speaker: speaker.map(str::to_string),
+                requested_language: language.map(str::to_string),
+                requested_speed: speed,
+                phonemes: "p".repeat(phonemes.max(1)),
+                token_ids: vec![1; phonemes.max(1)],
+                ref_style: candle_core::Tensor::zeros(
+                    (1, 256),
+                    candle_core::DType::F32,
+                    &candle_core::Device::Cpu,
+                )
+                .unwrap(),
+                speed,
+            })
+        }
+    }
+
+    /// KOK-1/TPIPE-1: non-stream text beyond the voice pack's 510 phonemes
+    /// returned 500 because only the streaming route planned chunks. The
+    /// engine route now prepares the same planned chunks: each fits, they
+    /// keep every word in order, and short text stays one chunk.
+    #[test]
+    fn engine_kokoro_preparation_plans_chunks_for_text_beyond_the_voice_pack() {
+        let sentence = "The quick brown fox jumps over the lazy dog near the river bank. ";
+        let long = sentence.repeat(25);
+        assert!(long.split_whitespace().count() >= 250);
+        let prepared =
+            prepare_kokoro_text(&FakeKokoroPreparer, &long, Some("af_heart"), None, 1.0).unwrap();
+        assert!(
+            prepared.chunks.len() > 1,
+            "{} chunks",
+            prepared.chunks.len()
+        );
+        assert!(prepared
+            .chunks
+            .iter()
+            .all(|chunk| chunk.token_ids.len() <= 510));
+        let rejoined = prepared
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.source_text.split_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(rejoined, long.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(prepared.source_text, long);
+        assert_eq!(prepared.requested_speaker.as_deref(), Some("af_heart"));
+
+        let short = prepare_kokoro_text(&FakeKokoroPreparer, sentence, None, None, 1.0).unwrap();
+        assert_eq!(short.chunks.len(), 1);
+    }
 
     #[test]
     fn kokoro_routes_streaming_requests_through_the_published_streaming_capability() {
