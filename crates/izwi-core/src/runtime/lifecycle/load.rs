@@ -3270,6 +3270,11 @@ impl ModelLifecycleController {
                             state_fit_reserve,
                         )
                         .await?;
+                    // Each request reserves the encoder memory it creates
+                    // (prefill workspace), so the rows are not also pending.
+                    self.core_engine
+                        .price_tensor_rows_with_requests(model_instance_id)
+                        .await?;
                     self.model_registry.publish_effective_context(
                         variant,
                         retained.logical_token_reach(),

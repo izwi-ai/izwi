@@ -5555,6 +5555,16 @@ impl EngineCore {
         )
     }
 
+    /// Record a loaded model's tensor rows as reserved by the requests that
+    /// create them (see `ManagedKvCacheManager::price_tensor_rows_with_requests`).
+    pub(crate) fn price_tensor_rows_with_requests(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+    ) -> Result<()> {
+        self.managed_kv_cache
+            .price_tensor_rows_with_requests(model_instance)
+    }
+
     /// Retained ASR or TTS state with its own `(retained, staged)` row
     /// counts, at most the engine's (ADM-6): the engine rows are sized for
     /// chat (on CUDA one per 256 MiB of device memory), far wider than ASR

@@ -417,6 +417,11 @@ struct ManagedKvModelState {
     /// Tensor-arena committed backing recorded on the lease beside
     /// `materialized_resources`; the rest of the tensor envelope is pending.
     tensor_materialized_bytes: u64,
+    /// The requests that create this model's tensor rows already reserve
+    /// them, so the whole envelope is recorded on the lease at load and is
+    /// never a pending claim (see
+    /// [`ManagedKvCacheManager::price_tensor_rows_with_requests`]).
+    tensor_rows_request_priced: bool,
     allocation_ledger: StateAllocationLedger,
 }
 
@@ -1531,6 +1536,7 @@ impl ManagedKvCacheManager {
                 resource_lease,
                 materialized_resources,
                 tensor_materialized_bytes: 0,
+                tensor_rows_request_priced: false,
                 allocation_ledger,
             },
         );
@@ -1540,6 +1546,39 @@ impl ManagedKvCacheManager {
             })?)
             .ok_or_else(|| Error::InvalidInput("managed KV arena generation overflow".into()))?;
         Ok(runtime)
+    }
+
+    /// Stop charging a model's lazy tensor rows as pending live claims, for
+    /// a model whose requests reserve the rows they create (Qwen3-TTS prices
+    /// its encoder memory in the prefill workspace, then commits it). The
+    /// envelope stays authorized (planning still holds it); recording it as
+    /// materialized means a row is counted once, by its request, and the
+    /// rows no request has created never refuse a request whose own need
+    /// fits live memory. Idempotent.
+    pub(crate) fn price_tensor_rows_with_requests(
+        &mut self,
+        model_instance: ModelInstanceId,
+    ) -> Result<()> {
+        let state = self.models.get_mut(&model_instance).ok_or_else(|| {
+            Error::InvalidInput("managed tensor rows target an unbound model".into())
+        })?;
+        if state.tensor_rows_request_priced {
+            return Ok(());
+        }
+        let Some(arena) = state.runtime.tensor_state() else {
+            return Err(Error::InvalidInput(
+                "request-priced tensor rows need a model with tensor state".into(),
+            ));
+        };
+        let envelope = arena.capacity().authorized_bytes();
+        if let Some(lease) = state.resource_lease.as_ref() {
+            lease.record_materialized_usage(state.materialized_resources.checked_add(
+                tensor_state_resources(state.runtime.plan.backend, envelope)?,
+            )?)?;
+        }
+        state.tensor_materialized_bytes = envelope;
+        state.tensor_rows_request_priced = true;
+        Ok(())
     }
 
     /// Resolve an arena runtime that was allocated by model loading. Request
@@ -4206,6 +4245,9 @@ fn tensor_state_resources(backend: BackendKind, bytes: u64) -> Result<ResourceVe
 /// Every caller has already applied its arena transition, so a failure here
 /// is logged rather than returned: a stale record keeps the previous claim.
 fn reconcile_tensor_materialization(state: &mut ManagedKvModelState) {
+    if state.tensor_rows_request_priced {
+        return;
+    }
     let Some(arena) = state.runtime.tensor_state() else {
         return;
     };
@@ -10272,6 +10314,117 @@ mod tests {
         drop(request);
         assert_eq!(authority.snapshot().reservations, 0);
         assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        Ok(())
+    }
+
+    /// Live Qwen3-TTS 0.6B: every request was refused because ten lazy
+    /// encoder-memory rows sized at 32,768 positions (1,342,382,080 B) sat
+    /// in `existing_pending`. Rows are now sized from the TTS state ceiling
+    /// (2,524 positions), and because each request reserves the row it
+    /// creates in its prefill workspace, the unused rows are no pending
+    /// claim: a request whose own need fits live memory is admitted.
+    #[test]
+    fn qwen_tts_tensor_rows_follow_the_tts_ceiling_and_never_block_a_fitting_request() -> Result<()>
+    {
+        use crate::models::architectures::qwen3::tts::{
+            qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+            tests::cache_test_config,
+        };
+        const AVAILABLE: u64 = 2_304_168_748;
+        let provider = Arc::new(DriverFreeProvider {
+            capacity: 16 * 1024 * 1024 * 1024,
+            available: std::sync::atomic::AtomicU64::new(AVAILABLE),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let config = cache_test_config();
+        let full = qwen3_tts_inference_state_contract(
+            &config,
+            candle_core::DType::F32,
+            candle_core::DType::F32,
+            16,
+        )?;
+        let retained = qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32)?;
+        let model = ModelInstanceId::new(606);
+        let mut manager = ManagedKvCacheManager::new(Some(authority.clone()));
+        let runtime = manager.bind_model_state_with_capacity(
+            model,
+            BackendKind::Cpu,
+            ManagedStateCapacityRequest {
+                total_paged_pages: 8 * 160,
+                logical_token_reach: Some(2_560),
+                retained_sequence_rows: 8,
+                staged_transaction_rows: 2,
+            },
+            16,
+            &retained,
+        )?;
+        let arena = runtime.tensor_state().expect("tensor arena").clone();
+        // 2,524 x 1,024 F32 encoder memory plus the embedding, hidden and
+        // logits rows; ten rows are about 0.1 GB.
+        assert_eq!(arena.capacity().per_sequence_bytes(), 10_358_784);
+        let envelope = arena.capacity().authorized_bytes();
+        assert_eq!(envelope, 103_587_840);
+        // Bound alone, the unused rows are pending and refuse a request
+        // that fits by itself.
+        assert!(!workspace_fits(&authority, AVAILABLE)?);
+        assert!(workspace_fits(&authority, AVAILABLE - envelope)?);
+
+        let reserved = authority.snapshot().reserved;
+        manager.price_tensor_rows_with_requests(model)?;
+        manager.price_tensor_rows_with_requests(model)?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        assert!(!workspace_fits(&authority, AVAILABLE + 1)?);
+        // Planning still holds the whole envelope.
+        assert_eq!(authority.snapshot().reserved, reserved);
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            envelope
+        );
+
+        // A request's committed row and its release leave the envelope
+        // recorded: the request paid for the row, the lease never re-pends it.
+        let session = SessionKey::new("qwen-tts-request".into(), 1);
+        let prefill = manager
+            .prepare(&runtime, 1, &session, &sequence_work(0, 12), None)?
+            .expect("prefill reservation");
+        let row = |shape: (usize, usize, usize)| {
+            Some(Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap())
+        };
+        arena.stage_replace(
+            PhysicalStateTransactionId::new(prefill.txn_id)?,
+            StateDomainId::new(2),
+            0,
+            12,
+            [
+                (1, 1, 40, 1_024),
+                (2, 1, 1, 1_024),
+                (3, 1, 1, 1_024),
+                (4, 1, 1, 3_072),
+            ]
+            .into_iter()
+            .map(|(id, batch, sequence, width)| StateComponentValue {
+                component: StateComponentId::new(id),
+                tensor: row((batch, sequence, width)),
+            })
+            .collect(),
+        )?;
+        manager.finalize(
+            &prefill,
+            Some(&prefill.completed_write_receipt_for_test()),
+            true,
+        )?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        manager.release_session(&session)?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            envelope
+        );
+
+        drop(arena);
+        drop(runtime);
+        assert!(manager.unload_model(model)?);
+        assert_eq!(authority.snapshot().reservations, 0);
         Ok(())
     }
 

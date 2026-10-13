@@ -3083,6 +3083,17 @@ impl Engine {
         )
     }
 
+    pub(crate) async fn price_tensor_rows_with_requests(
+        &self,
+        model_instance: ModelInstanceId,
+    ) -> Result<()> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .price_tensor_rows_with_requests(model_instance)
+    }
+
     pub(crate) async fn load_managed_model_state_with_row_limits(
         &self,
         model_instance: ModelInstanceId,
