@@ -17,7 +17,9 @@ use crate::error::{Error, Result};
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
-use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+use crate::models::shared::attention::gqa::{
+    banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask, BANDED_QUERY_BLOCK,
+};
 
 /// Speech Tokenizer Configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -105,11 +107,6 @@ pub struct DecoderConfig {
 fn default_decoder_sliding_window() -> usize {
     72
 }
-
-/// Query rows per sliding-window attention block. The score tensor of one
-/// block is `[heads, block, block + window - 1]`, so attention memory stays
-/// bounded however many codec frames are decoded.
-const SLIDING_ATTENTION_QUERY_BLOCK: usize = 128;
 
 /// Codec frames per upsampler/vocoder window in [`SpeechTokenizerDecoder::decode`].
 /// The vocoder's activations run at up to 24 kHz (about 8 MiB of live F32
@@ -1059,11 +1056,13 @@ impl Attention {
             }
         }
 
-        let out = sliding_window_attention(
+        // Query blocks against only the keys their band reaches: no T x T
+        // score or mask tensor.
+        let out = banded_sdpa_bhsd(
             &q,
             &k,
             &v,
-            self.sliding_window,
+            AttentionBand::causal_window(self.sliding_window),
             1.0 / (self.head_dim as f64).sqrt(),
         )?;
         let out = out
@@ -2113,7 +2112,7 @@ fn decode_workspace_upper_bound_bytes(
     // scores, the transformer's linear activations, and the pre-conv/latent
     // tensors that stay live while the vocoder windows run.
     let frames = to_u64(codec_frames)?;
-    let block = codec_frames.min(SLIDING_ATTENTION_QUERY_BLOCK);
+    let block = codec_frames.min(BANDED_QUERY_BLOCK);
     let keys = codec_frames.min(block + cfg.sliding_window.max(1) - 1);
     let attention = mul(
         mul(to_u64(cfg.num_attention_heads)?, to_u64(block)?)?,
@@ -2197,73 +2196,6 @@ fn causal_mask(
         }
     }
     Tensor::from_vec(data, (1, seq_len, total_len), device)?
-        .to_dtype(dtype)
-        .map_err(Error::from)
-}
-
-/// Causal self-attention over `[batch, heads, seq, dim]` restricted to the
-/// last `window` keys, as Hugging Face's sliding-window mask defines it: query
-/// `i` sees key `j` iff `i - window < j <= i`. Queries run in blocks of
-/// [`SLIDING_ATTENTION_QUERY_BLOCK`] against only the keys their band can
-/// reach, so no `seq x seq` score or mask tensor is ever built.
-fn sliding_window_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    window: usize,
-    softmax_scale: f64,
-) -> Result<Tensor> {
-    let seq_len = q.dim(2)?;
-    let window = window.max(1);
-    let mut blocks = Vec::with_capacity(seq_len.div_ceil(SLIDING_ATTENTION_QUERY_BLOCK));
-    let mut start = 0;
-    while start < seq_len {
-        let len = SLIDING_ATTENTION_QUERY_BLOCK.min(seq_len - start);
-        let key_start = start.saturating_sub(window - 1);
-        let key_len = start + len - key_start;
-        let mask = sliding_window_mask(
-            len,
-            key_len,
-            start - key_start,
-            window,
-            q.device(),
-            q.dtype(),
-        )?;
-        blocks.push(compact_gqa_sdpa_bhsd(
-            &q.narrow(2, start, len)?,
-            &k.narrow(2, key_start, key_len)?,
-            &v.narrow(2, key_start, key_len)?,
-            Some(CompactGqaMask::Additive(&mask)),
-            softmax_scale,
-        )?);
-        start += len;
-    }
-    if blocks.len() == 1 {
-        return Ok(blocks.remove(0));
-    }
-    Tensor::cat(&blocks, 2).map_err(Error::from)
-}
-
-/// Additive `[1, q_len, k_len]` mask for one query block whose first query
-/// sits `query_offset` keys after the block's first key.
-fn sliding_window_mask(
-    q_len: usize,
-    k_len: usize,
-    query_offset: usize,
-    window: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
-    let mut data = vec![0f32; q_len * k_len];
-    for (i, row) in data.chunks_exact_mut(k_len).enumerate() {
-        let query = query_offset + i;
-        for (j, value) in row.iter_mut().enumerate() {
-            if j > query || j + window <= query {
-                *value = -1e4;
-            }
-        }
-    }
-    Tensor::from_vec(data, (1, q_len, k_len), device)?
         .to_dtype(dtype)
         .map_err(Error::from)
 }
@@ -2476,74 +2408,6 @@ mod tests {
                 "vector_quantization_hidden_dimension": 16}}"#,
         )
         .unwrap()
-    }
-
-    /// Dense f64 reference: softmax over keys `i - window < j <= i`, with K/V
-    /// head `h / (q_heads / kv_heads)` serving query head `h`.
-    fn dense_sliding_reference(
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        (q_heads, kv_heads, seq, dim): (usize, usize, usize, usize),
-        window: usize,
-    ) -> Vec<f32> {
-        let scale = 1.0 / (dim as f64).sqrt();
-        let mut out = vec![0f32; q_heads * seq * dim];
-        for h in 0..q_heads {
-            let kv = h / (q_heads / kv_heads);
-            for i in 0..seq {
-                let keys = (i + 1).saturating_sub(window)..=i;
-                let scores: Vec<f64> = keys
-                    .clone()
-                    .map(|j| {
-                        (0..dim)
-                            .map(|d| {
-                                f64::from(q[(h * seq + i) * dim + d])
-                                    * f64::from(k[(kv * seq + j) * dim + d])
-                            })
-                            .sum::<f64>()
-                            * scale
-                    })
-                    .collect();
-                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-                let total: f64 = weights.iter().sum();
-                for d in 0..dim {
-                    let value: f64 = keys
-                        .clone()
-                        .zip(&weights)
-                        .map(|(j, w)| w * f64::from(v[(kv * seq + j) * dim + d]))
-                        .sum();
-                    out[(h * seq + i) * dim + d] = (value / total) as f32;
-                }
-            }
-        }
-        out
-    }
-
-    /// QTTS-9: blocked sliding-window attention equals a dense banded
-    /// reference across query-block boundaries (200 frames, 128-row blocks,
-    /// the published 72-frame window, GQA 4:2).
-    #[test]
-    fn sliding_window_attention_matches_dense_banded_reference() {
-        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
-
-        let (q_heads, kv_heads, seq, dim, window) = (4, 2, 200, 8, 72);
-        let device = &Device::Cpu;
-        let q = xorshift_tensor(&[1, q_heads, seq, dim], 1, 1.0, device).unwrap();
-        let k = xorshift_tensor(&[1, kv_heads, seq, dim], 2, 1.0, device).unwrap();
-        let v = xorshift_tensor(&[1, kv_heads, seq, dim], 3, 1.0, device).unwrap();
-        let out = sliding_window_attention(&q, &k, &v, window, 1.0 / (dim as f64).sqrt()).unwrap();
-        assert_eq!(out.dims(), &[1, q_heads, seq, dim]);
-        let reference = dense_sliding_reference(
-            &host_f32(&q).unwrap(),
-            &host_f32(&k).unwrap(),
-            &host_f32(&v).unwrap(),
-            (q_heads, kv_heads, seq, dim),
-            window,
-        );
-        let error = max_abs_diff(&host_f32(&out).unwrap(), &reference);
-        assert!(error < 1e-5, "sliding attention max abs error {error}");
     }
 
     /// QTTS-9: every pre-transformer layer attends to at most
