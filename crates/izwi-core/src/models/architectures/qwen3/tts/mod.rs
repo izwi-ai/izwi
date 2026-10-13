@@ -14,11 +14,11 @@ use speaker_encoder::SpeakerEncoder;
 mod talker;
 mod tokenizer;
 
-pub(crate) use budget::qwen3_tts_state_floor_tokens;
 pub use budget::{
     qwen3_tts_auto_max_frames_for_text, qwen3_tts_auto_max_output_frames,
     QWEN3_TTS_AUTO_MAX_AUDIO_SECS,
 };
+pub(crate) use budget::{qwen3_tts_retained_memory_tokens, qwen3_tts_state_floor_tokens};
 pub use config::Qwen3TtsConfig;
 pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
@@ -1221,7 +1221,8 @@ fn qwen3_tts_retained_state_contract(
 ) -> Result<InferenceStateContract> {
     let state_dtype = qwen3_tts_state_dtype(dtype)?;
     let hidden = config.talker_config.hidden_size;
-    let max_sequence = config.talker_config.max_position_embeddings;
+    let max_sequence =
+        qwen3_tts_retained_memory_tokens(config.talker_config.max_position_embeddings);
     let vocab = config.talker_config.vocab_size;
     retained
         .domains
@@ -2172,10 +2173,11 @@ impl Qwen3TtsModel {
         let retained_tokens = prefill_tokens
             .checked_add(trailing_tokens)
             .ok_or_else(|| Error::InferenceError("Qwen3-TTS retained sequence overflow".into()))?;
-        if retained_tokens > self.config.talker_config.max_position_embeddings {
-            return Err(Error::InferenceError(format!(
-                "Qwen3-TTS prepared and trailing memory require {retained_tokens} tokens, exceeding context {}",
-                self.config.talker_config.max_position_embeddings
+        let retained_limit =
+            qwen3_tts_retained_memory_tokens(self.config.talker_config.max_position_embeddings);
+        if retained_tokens > retained_limit {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS prompt and text need {retained_tokens} tokens, above the {retained_limit} one request may hold; split the text"
             )));
         }
         let retained_sequence_memory = Tensor::cat(&[&prefill_embeds, &trailing_text_hidden], 1)?;
@@ -4760,14 +4762,17 @@ pub(crate) mod tests {
 
         assert_eq!(tensor.sequence_capacity(), 16);
         assert_eq!(tensor.transaction_capacity(), 16);
-        assert_eq!(tensor.per_sequence_bytes(), 67_119_104);
-        assert_eq!(tensor.authorized_bytes(), 2_147_811_328);
+        // The encoder memory row holds the 2,524-token state floor (one
+        // prompt plus 120 s of frames), not the 32,768 position embeddings
+        // (67,119,104 B a row).
+        assert_eq!(tensor.per_sequence_bytes(), 2_524 * 1_024 * 2 + 10_240);
+        assert_eq!(tensor.authorized_bytes(), 32 * (2_524 * 1_024 * 2 + 10_240));
 
         // Before the shared page/row fix, the 512 pages needed by one 32K
         // context were treated as 512 retained sequences and added to the 16
         // transaction rows. That 35.4 GB state claim alone can reject a model
         // load on a 48 GB L40S after weights are resident.
-        let legacy_authorization = tensor.per_sequence_bytes() * (512 + 16);
+        let legacy_authorization = 67_119_104_u64 * (512 + 16);
         assert_eq!(legacy_authorization, 35_438_886_912);
         assert_eq!(
             allocation

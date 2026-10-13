@@ -57,6 +57,14 @@ pub(crate) fn qwen3_tts_state_floor_tokens() -> usize {
     QWEN3_TTS_STATE_PROMPT_TOKENS + qwen3_tts_auto_max_output_frames()
 }
 
+/// Text positions one request's retained encoder memory may hold: the
+/// prompt plus the trailing text the talker reads one per frame. Both fit
+/// in the state floor, so the retained tensor rows are sized from it, not
+/// from the talker's position embeddings (32,768: 1.34 GB of rows at 0.6B).
+pub(crate) fn qwen3_tts_retained_memory_tokens(max_position_embeddings: usize) -> usize {
+    qwen3_tts_state_floor_tokens().min(max_position_embeddings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
