@@ -47,7 +47,8 @@ use crate::models::architectures::lfm25_audio::{
     model::{
         Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
         Lfm25AudioAsrStepResourceEnvelope, Lfm25AudioPreparedAsrArtifact,
-        Lfm25AudioTtsStageCeiling, Lfm25AudioTtsStepResourceEnvelope,
+        Lfm25AudioTtsPreparationEnvelope, Lfm25AudioTtsStageCeiling,
+        Lfm25AudioTtsStepResourceEnvelope,
     },
     physical::{
         Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
@@ -3149,6 +3150,15 @@ impl NativeAudioChatModel {
     pub(crate) fn lfm25_audio_tts_stage_ceiling(&self) -> Result<Lfm25AudioTtsStageCeiling> {
         match self {
             Self::Lfm25Audio(model) => model.tts_stage_ceiling(),
+        }
+    }
+
+    pub(crate) fn lfm25_audio_tts_preparation_envelope(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Lfm25AudioTtsPreparationEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => model.tts_preparation_envelope(messages),
         }
     }
 

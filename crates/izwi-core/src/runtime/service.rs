@@ -6769,10 +6769,19 @@ impl RuntimeService {
             })?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        // Priced from this request's prompt bound, never the model ceiling
+        // (LFT-1): the ceiling's full-context prefill refused every request.
+        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+        let envelope = model.lfm25_audio_tts_preparation_envelope(&messages)?;
+        if envelope.backend != backend || envelope.max_prompt_tokens > ceiling.max_prompt_tokens {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS preparation envelope exceeds its loaded ceiling".into(),
+            ));
+        }
         let preparation_resources = asr_encoder_retained_resources(
             backend,
             retained_request_host_bytes,
-            ceiling.max_retained_resident_bytes,
+            envelope.max_retained_resident_bytes,
         )?;
         let preparation_spec = JobSpec {
             request_id: request.id.clone(),
@@ -6799,16 +6808,15 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
         let work = WorkUnit::PreSequencePreparation {
             kind: "tts.prepare.lfm25_audio".into(),
         };
-        let workspace = lfm25_audio_tts_preparation_workspace(backend, ceiling.max_workspace_bytes);
+        let workspace = lfm25_audio_tts_preparation_workspace(backend, envelope.workspace_bytes);
         let cost = crate::engine::WorkCost::with_workspace(
-            u64::try_from(ceiling.max_prompt_tokens).map_err(|_| {
-                Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into())
+            u64::try_from(envelope.max_prompt_tokens).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS prompt bound exceeds u64".into())
             })?,
-            ceiling.max_materialized_tensor_elements,
+            envelope.max_materialized_tensor_elements,
             workspace,
         );
         let cancellation = PreparationCancellation::default();
@@ -6817,7 +6825,7 @@ impl RuntimeService {
             &preparation_contract,
             &work,
             cost,
-            ceiling.max_materialized_tensor_elements,
+            envelope.max_materialized_tensor_elements,
             cancellation.clone(),
         )?;
         let model_for_preparation = model.clone();
@@ -6870,9 +6878,9 @@ impl RuntimeService {
             PreparationRowOutcome::Failed(error) => return Err(error),
         };
         if artifact.prompt_tokens == 0
-            || artifact.prompt_tokens > ceiling.max_prompt_tokens
-            || artifact.materialized_tensor_elements > ceiling.max_materialized_tensor_elements
-            || artifact.retained_resident_bytes > ceiling.max_retained_resident_bytes
+            || artifact.prompt_tokens > envelope.max_prompt_tokens
+            || artifact.materialized_tensor_elements > envelope.max_materialized_tensor_elements
+            || artifact.retained_resident_bytes > envelope.max_retained_resident_bytes
         {
             drop(artifact);
             drop(request);

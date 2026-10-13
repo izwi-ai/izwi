@@ -3084,6 +3084,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
                     max_codebooks: 8,
                     max_materialized_tensor_elements: 4_096 * 2_048,
                     max_retained_resident_bytes: 4_096 * 2_048 * 4,
+                    max_preparation_workspace_bytes: 4_096 * 2_048 * 4,
                     max_workspace_bytes: 64 * 1024 * 1024,
                 },
             )
@@ -3127,7 +3128,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
             .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
-        preparation.max_workspace_bytes = ceiling.max_workspace_bytes;
+        preparation.max_workspace_bytes = ceiling.max_preparation_workspace_bytes;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
