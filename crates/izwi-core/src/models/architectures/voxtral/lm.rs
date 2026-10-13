@@ -1305,7 +1305,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn tiny_decode_model(device: &Device, sliding_window: Option<usize>) -> VoxtralLM {
+    pub(crate) fn tiny_decode_model(device: &Device, sliding_window: Option<usize>) -> VoxtralLM {
         let mut cfg = tiny_cfg();
         cfg.num_hidden_layers = 1;
         cfg.vocab_size = 16;
@@ -1611,7 +1611,7 @@ pub(crate) mod tests {
         assert_close(&scalar_b_logits, &batch_logits.narrow(0, 1, 1).unwrap());
     }
 
-    fn shared_decode_caches(
+    pub(crate) fn shared_decode_caches(
         rows: usize,
         model_instance: u64,
         pages_per_row: usize,
@@ -1659,7 +1659,7 @@ pub(crate) mod tests {
         (arena, caches)
     }
 
-    fn deterministic_embeds(len: usize, offset: usize, device: &Device) -> Tensor {
+    pub(crate) fn deterministic_embeds(len: usize, offset: usize, device: &Device) -> Tensor {
         Tensor::from_vec(
             (0..len * 4)
                 .map(|index| ((index + offset) as f32 - 5.0) / 11.0)

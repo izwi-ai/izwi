@@ -435,37 +435,11 @@ impl VoxtralTtsModel {
                 "Voxtral TTS retained prefill quantum is invalid".into(),
             ));
         }
-        let consumed = max_tokens.min(state.artifact.prompt_tokens - state.prefill_cursor);
-        let input = state
-            .artifact
-            .prompt_embeddings
-            .narrow(1, state.prefill_cursor, consumed)?;
-        let hidden = pipeline.language_model.forward_managed_hidden_with_embeds(
-            &input,
-            state.lm_position,
-            cache,
-            None,
-            None,
-        )?;
-        state.prefill_cursor += consumed;
-        state.lm_position += consumed;
-        if state.prefill_cursor == state.artifact.prompt_tokens {
-            state.last_hidden = Some(last_sequence_hidden(
-                &hidden,
-                "Voxtral TTS retained prefill",
-            )?);
-            state.phase = VoxtralTtsRetainedPhase::Decode;
-        }
-        Ok(VoxtralTtsPrefillStep {
-            consumed_tokens: consumed,
-            prefill_cursor: state.prefill_cursor,
-            prompt_tokens: state.artifact.prompt_tokens,
-            complete: state.phase == VoxtralTtsRetainedPhase::Decode,
-        })
+        prefill_row_span(&pipeline.language_model, state, cache, max_tokens)
     }
 
-    /// Advance a ragged retained prompt cohort in one-token wavefronts. Each
-    /// wave with more than one active row is one physical paged LM launch.
+    /// Advance a ragged retained prompt cohort: each row's scheduled span of
+    /// its prompt is one LM prefill launch (see [`prefill_cohort_spans`]).
     pub(crate) fn retained_prefill_batch(
         &self,
         states: &mut [&mut VoxtralTtsRetainedState],
@@ -494,83 +468,7 @@ impl VoxtralTtsModel {
         let pipeline = self.pipeline.as_ref().ok_or_else(|| {
             Error::InferenceError("Voxtral TTS retained prefill requires loaded weights".into())
         })?;
-        let mut consumed = vec![0usize; states.len()];
-        let mut lm_launch_widths = Vec::new();
-        let mut max_lm_launch_width = 0usize;
-        let mut scalar_lm_launches = 0usize;
-        loop {
-            let active = states
-                .iter()
-                .enumerate()
-                .filter_map(|(row, state)| {
-                    (consumed[row] < max_tokens[row]
-                        && state.prefill_cursor < state.artifact.prompt_tokens)
-                        .then_some(row)
-                })
-                .collect::<Vec<_>>();
-            if active.is_empty() {
-                break;
-            }
-            let embeddings = active
-                .iter()
-                .map(|&row| {
-                    states[row]
-                        .artifact
-                        .prompt_embeddings
-                        .narrow(1, states[row].prefill_cursor, 1)
-                })
-                .collect::<candle_core::Result<Vec<_>>>()?;
-            let embeds = Tensor::cat(&embeddings.iter().collect::<Vec<_>>(), 0)?;
-            let positions = active
-                .iter()
-                .map(|&row| states[row].lm_position)
-                .collect::<Vec<_>>();
-            let mut cache_refs = caches
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(row, cache)| active.contains(&row).then_some(&mut **cache))
-                .collect::<Vec<_>>();
-            let hidden = pipeline
-                .language_model
-                .forward_managed_decode_batch_hidden_with_embeds(
-                    &embeds,
-                    &positions,
-                    &mut cache_refs,
-                    None,
-                )?;
-            max_lm_launch_width = max_lm_launch_width.max(active.len());
-            scalar_lm_launches += usize::from(active.len() == 1);
-            lm_launch_widths.push(active.len());
-            for (wave_row, &state_row) in active.iter().enumerate() {
-                let state = &mut states[state_row];
-                state.prefill_cursor += 1;
-                state.lm_position += 1;
-                consumed[state_row] += 1;
-                state.last_hidden = Some(last_sequence_hidden(
-                    &hidden.narrow(0, wave_row, 1)?,
-                    "Voxtral TTS retained batched prefill",
-                )?);
-                if state.prefill_cursor == state.artifact.prompt_tokens {
-                    state.phase = VoxtralTtsRetainedPhase::Decode;
-                }
-            }
-        }
-        let steps = states
-            .iter()
-            .enumerate()
-            .map(|(row, state)| VoxtralTtsPrefillStep {
-                consumed_tokens: consumed[row],
-                prefill_cursor: state.prefill_cursor,
-                prompt_tokens: state.artifact.prompt_tokens,
-                complete: state.phase == VoxtralTtsRetainedPhase::Decode,
-            })
-            .collect();
-        Ok(VoxtralTtsPrefillBatch {
-            steps,
-            lm_launch_widths,
-            max_lm_launch_width,
-            scalar_lm_launches,
-        })
+        prefill_cohort_spans(&pipeline.language_model, states, caches, max_tokens)
     }
 
     pub(crate) fn retained_decode_step(
@@ -1022,6 +920,72 @@ impl VoxtralTtsPipeline {
     }
 }
 
+/// Prefill up to `max_tokens` of `state`'s prompt from its cursor in one LM
+/// launch.
+fn prefill_row_span(
+    language_model: &VoxtralLM,
+    state: &mut VoxtralTtsRetainedState,
+    cache: &mut PhysicalPagedKvCache,
+    max_tokens: usize,
+) -> Result<VoxtralTtsPrefillStep> {
+    let consumed = max_tokens.min(state.artifact.prompt_tokens - state.prefill_cursor);
+    if consumed > 0 {
+        let input = state
+            .artifact
+            .prompt_embeddings
+            .narrow(1, state.prefill_cursor, consumed)?;
+        let hidden = language_model.forward_managed_hidden_with_embeds(
+            &input,
+            state.lm_position,
+            cache,
+            None,
+            None,
+        )?;
+        state.prefill_cursor += consumed;
+        state.lm_position += consumed;
+        if state.prefill_cursor == state.artifact.prompt_tokens {
+            state.last_hidden = Some(last_sequence_hidden(
+                &hidden,
+                "Voxtral TTS retained prefill",
+            )?);
+            state.phase = VoxtralTtsRetainedPhase::Decode;
+        }
+    }
+    Ok(VoxtralTtsPrefillStep {
+        consumed_tokens: consumed,
+        prefill_cursor: state.prefill_cursor,
+        prompt_tokens: state.artifact.prompt_tokens,
+        complete: state.phase == VoxtralTtsRetainedPhase::Decode,
+    })
+}
+
+/// Prefill a ragged retained cohort, each row's span in one launch. This
+/// used to advance every row one token per wavefront: B prompts of ~300
+/// tokens took ~300 decode-width launches. Now it takes B prefill launches,
+/// each reported as a width-1 launch.
+fn prefill_cohort_spans(
+    language_model: &VoxtralLM,
+    states: &mut [&mut VoxtralTtsRetainedState],
+    caches: &mut [&mut PhysicalPagedKvCache],
+    max_tokens: &[usize],
+) -> Result<VoxtralTtsPrefillBatch> {
+    let mut steps = Vec::with_capacity(states.len());
+    let mut lm_launch_widths = Vec::new();
+    for ((state, cache), &span) in states.iter_mut().zip(caches.iter_mut()).zip(max_tokens) {
+        let step = prefill_row_span(language_model, state, cache, span)?;
+        if step.consumed_tokens > 0 {
+            lm_launch_widths.push(1);
+        }
+        steps.push(step);
+    }
+    Ok(VoxtralTtsPrefillBatch {
+        steps,
+        max_lm_launch_width: usize::from(!lm_launch_widths.is_empty()),
+        scalar_lm_launches: lm_launch_widths.len(),
+        lm_launch_widths,
+    })
+}
+
 fn last_sequence_hidden(hidden: &Tensor, context: &str) -> Result<Tensor> {
     if hidden.rank() != 3 {
         return Err(Error::InferenceError(format!(
@@ -1412,6 +1376,82 @@ mod tests {
         let codebooks = frames_to_codebooks(vec![vec![2, 3, 4], vec![5, 6, 7]]).unwrap();
         assert_eq!(codebooks, vec![vec![2, 5], vec![3, 6], vec![4, 7]]);
         assert!(frames_to_codebooks(vec![vec![1], vec![1, 2]]).is_err());
+    }
+
+    /// VXT-11: a ragged retained cohort prefills each row's span in one LM
+    /// launch (2 launches for prompts of 5 and 3 tokens, where one-token
+    /// wavefronts took 5), and lands on the same final hidden state and
+    /// cache cursor as feeding the prompt one token at a time.
+    #[test]
+    fn ragged_retained_prefill_runs_one_launch_per_row_span() {
+        use crate::models::architectures::voxtral::lm::tests::{
+            deterministic_embeds, shared_decode_caches, tiny_decode_model,
+        };
+        use crate::models::architectures::voxtral::tts::retained::VoxtralTtsPreparedArtifact;
+
+        let device = Device::Cpu;
+        let model = tiny_decode_model(&device, None);
+        let prompts = [
+            deterministic_embeds(5, 3, &device),
+            deterministic_embeds(3, 17, &device),
+        ];
+        let state_for = |prompt: &Tensor| {
+            VoxtralTtsRetainedState::new(
+                Arc::new(VoxtralTtsPreparedArtifact {
+                    prompt_embeddings: prompt.clone(),
+                    prompt_tokens: prompt.dim(1).unwrap(),
+                    source_text: Arc::from("hello"),
+                    voice: Arc::from("default"),
+                    retained_resident_bytes: 64,
+                }),
+                VoxtralTtsGenerationParams {
+                    max_frames: 2,
+                    ..Default::default()
+                },
+                16,
+            )
+            .unwrap()
+        };
+        let (_, mut caches) = shared_decode_caches(4, 931, 8);
+        let mut reference_caches = caches.split_off(2);
+        let mut states = prompts.iter().map(state_for).collect::<Vec<_>>();
+        let batch = prefill_cohort_spans(
+            &model,
+            &mut states.iter_mut().collect::<Vec<_>>(),
+            &mut caches.iter_mut().collect::<Vec<_>>(),
+            &[5, 3],
+        )
+        .unwrap();
+        assert_eq!(batch.lm_launch_widths, vec![1, 1]);
+        assert_eq!(batch.scalar_lm_launches, 2);
+
+        for ((prompt, state), cache) in prompts.iter().zip(&states).zip(&mut reference_caches) {
+            assert_eq!(state.phase, VoxtralTtsRetainedPhase::Decode);
+            assert_eq!(state.lm_position, prompt.dim(1).unwrap());
+            let mut last = None;
+            for position in 0..prompt.dim(1).unwrap() {
+                let hidden = model
+                    .forward_managed_hidden_with_embeds(
+                        &prompt.narrow(1, position, 1).unwrap(),
+                        position,
+                        cache,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                cache.take_completed_writes();
+                last = Some(last_sequence_hidden(&hidden, "reference").unwrap());
+            }
+            let expected = last.unwrap().to_vec1::<f32>().unwrap();
+            let actual = state
+                .last_hidden
+                .as_ref()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let diff = crate::kernels::numeric_check::max_abs_diff(&actual, &expected);
+            assert!(diff <= 1e-5, "max |diff| {diff}");
+        }
     }
 
     #[test]
