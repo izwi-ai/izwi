@@ -277,6 +277,9 @@ pub(crate) struct VibeVoiceTtsRetainedState {
     /// Per-frame waveforms decoded during generation, parallel to
     /// `scaled_latents` and checkpointed with it.
     frame_audio: Vec<Tensor>,
+    /// Frames whose waveform [`VibeVoiceTtsModel::stream_retained_audio`]
+    /// has handed out.
+    streamed_frames: usize,
     frame_noises: Vec<Tensor>,
     finished: bool,
     active_quantum: Option<u64>,
@@ -302,6 +305,7 @@ struct VibeVoiceTtsRetainedCheckpointPayload {
     semantic_clock: u64,
     scaled_latents: Vec<Tensor>,
     frame_audio: Vec<Tensor>,
+    streamed_frames: usize,
     finished: bool,
     staged_step: Option<VibeVoiceTtsRetainedDecodeStep>,
     managed_completions_drained: bool,
@@ -634,6 +638,7 @@ impl VibeVoiceTtsModel {
             semantic_clock: 0,
             scaled_latents: Vec::with_capacity(max_frames),
             frame_audio: Vec::with_capacity(max_frames),
+            streamed_frames: 0,
             frame_noises,
             finished: false,
             active_quantum: None,
@@ -668,6 +673,7 @@ impl VibeVoiceTtsModel {
                 semantic_clock: 0,
                 scaled_latents: Vec::new(),
                 frame_audio: Vec::new(),
+                streamed_frames: 0,
                 finished: false,
                 staged_step: None,
                 managed_completions_drained: true,
@@ -1020,6 +1026,30 @@ impl VibeVoiceTtsModel {
             frames_generated: state.scaled_latents.len(),
             profile,
         })
+    }
+
+    /// Progressive audio (VVT-10): the waveforms of the frames committed
+    /// since the last call, read back in one copy. They are the samples
+    /// [`Self::finalize_retained_state`] concatenates (the streaming decode
+    /// is causal with carried caches), so concatenating every call's output
+    /// gives the final waveform. Call between quanta; a request streamed this
+    /// way finishes with this call instead of the final concatenation.
+    pub(crate) fn stream_retained_audio(
+        &self,
+        state: &mut VibeVoiceTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        self.validate_retained_state(state)?;
+        if state.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained TTS streams audio only between quanta".into(),
+            ));
+        }
+        if state.frame_audio.len() != state.scaled_latents.len() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained TTS is missing a frame waveform to stream".into(),
+            ));
+        }
+        take_streamed_frame_audio(&state.frame_audio, &mut state.streamed_frames)
     }
 
     fn validate_retained_state(&self, state: &VibeVoiceTtsRetainedState) -> Result<()> {
@@ -1722,6 +1752,7 @@ impl VibeVoiceTtsRetainedState {
                 semantic_clock: self.semantic_clock,
                 scaled_latents: self.scaled_latents.clone(),
                 frame_audio: self.frame_audio.clone(),
+                streamed_frames: self.streamed_frames,
                 finished: self.finished,
                 staged_step: self.staged_step.clone(),
                 managed_completions_drained: self.managed_completions_drained,
@@ -1770,6 +1801,7 @@ impl VibeVoiceTtsRetainedState {
         self.semantic_clock = payload.semantic_clock;
         self.scaled_latents = payload.scaled_latents;
         self.frame_audio = payload.frame_audio;
+        self.streamed_frames = payload.streamed_frames;
         self.finished = payload.finished;
         self.staged_step = payload.staged_step;
         self.managed_completions_drained = payload.managed_completions_drained;
@@ -2410,10 +2442,41 @@ fn quietest_cut_before(samples: &[f32], limit: usize, search: usize, window: usi
         .unwrap_or(limit)
 }
 
+/// The frames of `frame_audio` after `*streamed`, concatenated and read back
+/// once; `*streamed` advances past them.
+fn take_streamed_frame_audio(frame_audio: &[Tensor], streamed: &mut usize) -> Result<Vec<f32>> {
+    let from = (*streamed).min(frame_audio.len());
+    let samples = VibeVoiceAcousticTokenizer::concat_frame_audio(&frame_audio[from..])?;
+    *streamed = frame_audio.len();
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// VVT-10: streaming hands out each committed frame's waveform once, in
+    /// order, so the stream concatenates to the final waveform.
+    #[test]
+    fn streamed_frame_audio_concatenates_to_the_final_waveform() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = candle_core::Device::Cpu;
+        let frames = (0..7)
+            .map(|frame| xorshift_tensor(&[1, 1, 3200], 0xF00 + frame, 0.5, &device).unwrap())
+            .collect::<Vec<_>>();
+        let whole = VibeVoiceAcousticTokenizer::concat_frame_audio(&frames).unwrap();
+        let mut streamed_frames = 0;
+        let mut streamed = Vec::new();
+        for committed in [1usize, 1, 4, 4, 7, 7] {
+            let chunk =
+                take_streamed_frame_audio(&frames[..committed], &mut streamed_frames).unwrap();
+            assert_eq!(streamed_frames, committed);
+            streamed.extend(chunk);
+        }
+        assert_eq!(streamed, whole);
+    }
 
     use candle_nn::VarBuilder;
 
