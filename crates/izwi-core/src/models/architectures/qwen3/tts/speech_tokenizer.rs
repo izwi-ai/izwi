@@ -95,7 +95,20 @@ pub struct DecoderConfig {
     pub upsample_rates: Vec<usize>,
     pub upsampling_ratios: Vec<usize>,
     pub vector_quantization_hidden_dimension: usize,
+    /// Every pre-transformer layer is `sliding_attention` over this many keys
+    /// (the reference config's `layer_types` and `sliding_window`).
+    #[serde(default = "default_decoder_sliding_window")]
+    pub sliding_window: usize,
 }
+
+fn default_decoder_sliding_window() -> usize {
+    72
+}
+
+/// Query rows per sliding-window attention block. The score tensor of one
+/// block is `[heads, block, block + window - 1]`, so attention memory stays
+/// bounded however many codec frames are decoded.
+const SLIDING_ATTENTION_QUERY_BLOCK: usize = 128;
 
 /// Causal Conv1d with left padding only.
 struct CausalConv1d {
@@ -918,10 +931,16 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_theta: f64,
+    sliding_window: usize,
 }
 
 impl Attention {
     fn load(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
+        if cfg.sliding_window == 0 {
+            return Err(Error::ModelError(
+                "speech-tokenizer decoder sliding_window must be non-zero".into(),
+            ));
+        }
         Ok(Self {
             q_proj: candle_nn::linear_no_bias(
                 cfg.hidden_size,
@@ -947,6 +966,7 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
+            sliding_window: cfg.sliding_window,
         })
     }
 
@@ -1001,8 +1021,9 @@ impl Attention {
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
-        let total_len = k.dim(2)?;
-        if flash_attention_requested() && total_len == seq_len {
+        // Plain causal attention equals the sliding window while every query
+        // sees at most `sliding_window` keys, so the fused path stays valid.
+        if flash_attention_requested() && seq_len <= self.sliding_window {
             if let Some(fused_out) =
                 try_fused_self_attention(&q, &k, &v, None, self.head_dim, true)?
             {
@@ -1015,12 +1036,11 @@ impl Attention {
             }
         }
 
-        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
-        let out = compact_gqa_sdpa_bhsd(
+        let out = sliding_window_attention(
             &q,
             &k,
             &v,
-            Some(CompactGqaMask::Additive(&mask)),
+            self.sliding_window,
             1.0 / (self.head_dim as f64).sqrt(),
         )?;
         let out = out
@@ -2022,6 +2042,73 @@ fn causal_mask(
         .map_err(Error::from)
 }
 
+/// Causal self-attention over `[batch, heads, seq, dim]` restricted to the
+/// last `window` keys, as Hugging Face's sliding-window mask defines it: query
+/// `i` sees key `j` iff `i - window < j <= i`. Queries run in blocks of
+/// [`SLIDING_ATTENTION_QUERY_BLOCK`] against only the keys their band can
+/// reach, so no `seq x seq` score or mask tensor is ever built.
+fn sliding_window_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    window: usize,
+    softmax_scale: f64,
+) -> Result<Tensor> {
+    let seq_len = q.dim(2)?;
+    let window = window.max(1);
+    let mut blocks = Vec::with_capacity(seq_len.div_ceil(SLIDING_ATTENTION_QUERY_BLOCK));
+    let mut start = 0;
+    while start < seq_len {
+        let len = SLIDING_ATTENTION_QUERY_BLOCK.min(seq_len - start);
+        let key_start = start.saturating_sub(window - 1);
+        let key_len = start + len - key_start;
+        let mask = sliding_window_mask(
+            len,
+            key_len,
+            start - key_start,
+            window,
+            q.device(),
+            q.dtype(),
+        )?;
+        blocks.push(compact_gqa_sdpa_bhsd(
+            &q.narrow(2, start, len)?,
+            &k.narrow(2, key_start, key_len)?,
+            &v.narrow(2, key_start, key_len)?,
+            Some(CompactGqaMask::Additive(&mask)),
+            softmax_scale,
+        )?);
+        start += len;
+    }
+    if blocks.len() == 1 {
+        return Ok(blocks.remove(0));
+    }
+    Tensor::cat(&blocks, 2).map_err(Error::from)
+}
+
+/// Additive `[1, q_len, k_len]` mask for one query block whose first query
+/// sits `query_offset` keys after the block's first key.
+fn sliding_window_mask(
+    q_len: usize,
+    k_len: usize,
+    query_offset: usize,
+    window: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut data = vec![0f32; q_len * k_len];
+    for (i, row) in data.chunks_exact_mut(k_len).enumerate() {
+        let query = query_offset + i;
+        for (j, value) in row.iter_mut().enumerate() {
+            if j > query || j + window <= query {
+                *value = -1e4;
+            }
+        }
+    }
+    Tensor::from_vec(data, (1, q_len, k_len), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
 fn ceil_div(n: usize, d: usize) -> usize {
     if d == 0 {
         return 0;
@@ -2162,5 +2249,171 @@ mod tests {
 
         let (indices, _) = codebook.quantize(&frames).expect("quantize");
         assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![0]);
+    }
+
+    /// Deterministic xorshift weights keyed by tensor name: norm gains near
+    /// one, everything else small, so stacked blocks stay O(1).
+    struct XorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for XorshiftWeights {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            _: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let seed = name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+            });
+            let gain = name.ends_with("norm.weight");
+            let scale = if gain { 0.1 } else { 0.3 };
+            let values = crate::kernels::numeric_check::xorshift_tensor(
+                shape.dims(),
+                seed,
+                scale,
+                &Device::Cpu,
+            )?;
+            let values = if gain { (values + 1.0)? } else { values };
+            values.to_dtype(dtype)?.to_device(device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    fn xorshift_vb(device: &Device) -> VarBuilder<'static> {
+        VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, device.clone())
+    }
+
+    /// The published 12 Hz decoder geometry shrunk to a few channels: two
+    /// pre-transformer layers with a 6-frame sliding window, the same
+    /// upsampling topology at x2 x2 then x3 x2 (24 samples per frame).
+    fn tiny_speech_tokenizer_config() -> SpeechTokenizerConfig {
+        serde_json::from_str(
+            r#"{"architectures": ["Qwen3TTSTokenizerV2Model"],
+            "model_type": "qwen3_tts_tokenizer_12hz", "encoder_valid_num_quantizers": 4,
+            "input_sample_rate": 24000, "output_sample_rate": 24000,
+            "decode_upsample_rate": 24, "encode_downsample_rate": 24,
+            "decoder_config": {"latent_dim": 16, "codebook_dim": 16, "codebook_size": 32,
+                "decoder_dim": 16, "hidden_size": 16, "intermediate_size": 32,
+                "hidden_act": "silu", "num_hidden_layers": 2, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-5,
+                "rope_theta": 10000, "num_quantizers": 4, "num_semantic_quantizers": 1,
+                "semantic_codebook_size": 32, "sliding_window": 6,
+                "upsample_rates": [3, 2], "upsampling_ratios": [2, 2],
+                "vector_quantization_hidden_dimension": 16}}"#,
+        )
+        .unwrap()
+    }
+
+    /// Dense f64 reference: softmax over keys `i - window < j <= i`, with K/V
+    /// head `h / (q_heads / kv_heads)` serving query head `h`.
+    fn dense_sliding_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        (q_heads, kv_heads, seq, dim): (usize, usize, usize, usize),
+        window: usize,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (dim as f64).sqrt();
+        let mut out = vec![0f32; q_heads * seq * dim];
+        for h in 0..q_heads {
+            let kv = h / (q_heads / kv_heads);
+            for i in 0..seq {
+                let keys = (i + 1).saturating_sub(window)..=i;
+                let scores: Vec<f64> = keys
+                    .clone()
+                    .map(|j| {
+                        (0..dim)
+                            .map(|d| {
+                                f64::from(q[(h * seq + i) * dim + d])
+                                    * f64::from(k[(kv * seq + j) * dim + d])
+                            })
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for d in 0..dim {
+                    let value: f64 = keys
+                        .clone()
+                        .zip(&weights)
+                        .map(|(j, w)| w * f64::from(v[(kv * seq + j) * dim + d]))
+                        .sum();
+                    out[(h * seq + i) * dim + d] = (value / total) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// QTTS-9: blocked sliding-window attention equals a dense banded
+    /// reference across query-block boundaries (200 frames, 128-row blocks,
+    /// the published 72-frame window, GQA 4:2).
+    #[test]
+    fn sliding_window_attention_matches_dense_banded_reference() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let (q_heads, kv_heads, seq, dim, window) = (4, 2, 200, 8, 72);
+        let device = &Device::Cpu;
+        let q = xorshift_tensor(&[1, q_heads, seq, dim], 1, 1.0, device).unwrap();
+        let k = xorshift_tensor(&[1, kv_heads, seq, dim], 2, 1.0, device).unwrap();
+        let v = xorshift_tensor(&[1, kv_heads, seq, dim], 3, 1.0, device).unwrap();
+        let out = sliding_window_attention(&q, &k, &v, window, 1.0 / (dim as f64).sqrt()).unwrap();
+        assert_eq!(out.dims(), &[1, q_heads, seq, dim]);
+        let reference = dense_sliding_reference(
+            &host_f32(&q).unwrap(),
+            &host_f32(&k).unwrap(),
+            &host_f32(&v).unwrap(),
+            (q_heads, kv_heads, seq, dim),
+            window,
+        );
+        let error = max_abs_diff(&host_f32(&out).unwrap(), &reference);
+        assert!(error < 1e-5, "sliding attention max abs error {error}");
+    }
+
+    /// QTTS-9: every pre-transformer layer attends to at most
+    /// `sliding_window` keys, so a change to frame 0 cannot reach frames at
+    /// or past the window through one layer (masked weights are exactly zero).
+    #[test]
+    fn decoder_attention_ignores_keys_outside_its_sliding_window() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let config = tiny_speech_tokenizer_config().decoder_config;
+        let window = config.sliding_window;
+        let attention = Attention::load(&config, xorshift_vb(&Device::Cpu)).unwrap();
+        let seq = 3 * window;
+        let x = xorshift_tensor(&[1, seq, config.hidden_size], 5, 1.0, &Device::Cpu).unwrap();
+        let bump = Tensor::ones((1, 1, config.hidden_size), DType::F32, &Device::Cpu).unwrap();
+        let perturbed = Tensor::cat(
+            &[
+                (x.narrow(1, 0, 1).unwrap() + bump).unwrap(),
+                x.narrow(1, 1, seq - 1).unwrap(),
+            ],
+            1,
+        )
+        .unwrap();
+        let base = host_f32(&attention.forward(&x).unwrap()).unwrap();
+        let moved = host_f32(&attention.forward(&perturbed).unwrap()).unwrap();
+        let width = config.hidden_size;
+        let frame_changed =
+            |t: usize| base[t * width..(t + 1) * width] != moved[t * width..(t + 1) * width];
+        assert!(
+            (0..window).all(frame_changed),
+            "frames inside the window must see frame 0"
+        );
+        assert!(
+            (window..seq).all(|t| !frame_changed(t)),
+            "frames past the window attended to frame 0"
+        );
     }
 }
