@@ -589,6 +589,28 @@ impl Lfm25AudioModel {
             .decode(state.audio_codes(), &self.device.device)
     }
 
+    /// Streamed audio for a retained TTS state (LFT-5): the samples of the
+    /// codes generated since the last call, exactly as the final
+    /// [`Self::detokenize_retained_tts_state`] would produce them, plus the
+    /// ISTFT tail once the state has finished. Call it after a committed
+    /// quantum (the stream rides in the state's checkpoint, so a rolled-back
+    /// quantum rolls it back too). A request streamed this way must not also
+    /// take the whole-utterance detokenize.
+    pub(crate) fn stream_retained_tts_audio(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        let finished = state.finished();
+        let (pending, stream) = state.audio_stream_parts();
+        let mut samples =
+            self.detokenizer
+                .decode_stream_step(stream, &pending, &self.device.device)?;
+        if finished {
+            samples.extend(self.detokenizer.finish_stream(stream));
+        }
+        Ok(samples)
+    }
+
     pub(crate) fn retained_asr_prefill_step(
         &self,
         state: &mut Lfm25AudioAsrRetainedState,

@@ -1837,30 +1837,102 @@ impl QuantizedLfm2Backbone {
 
         let mut hidden_states = input_embeds.clone();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            diagnostics::check_layer(&hidden_states, "input", layer_idx, 0)?;
-            let residual = hidden_states.clone();
-            let hidden = layer.operator_norm.forward(&hidden_states)?;
-            diagnostics::check_layer(&hidden, "operator norm", layer_idx, 0)?;
-            let hidden = match &layer.kind {
-                LayerKind::Attention(attention) => attention.forward_stateless(&hidden, mask, 0)?,
-                LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
-            };
-            diagnostics::check_layer(&hidden, "operator output", layer_idx, 0)?;
-            hidden_states = (&hidden + &residual)?;
-            diagnostics::check_layer(&hidden_states, "residual", layer_idx, 0)?;
-
-            let residual = hidden_states.clone();
-            let hidden = layer.ffn_norm.forward(&hidden_states)?;
-            let hidden = layer.mlp.forward(&hidden)?;
-            diagnostics::check_layer(&hidden, "MLP output", layer_idx, 0)?;
-            hidden_states = (&hidden + &residual)?;
-            diagnostics::check_layer(&hidden_states, "residual", layer_idx, 0)?;
+            hidden_states = Self::stateless_layer(layer, layer_idx, &hidden_states, mask, 0)?;
         }
         {
             let normalized = self.norm.forward(&hidden_states)?;
             diagnostics::check(&normalized, "final norm", 0)?;
             Ok(normalized)
         }
+    }
+
+    /// One layer of the stateless forward over `hidden_states`, whose first
+    /// row is position `index_pos`.
+    fn stateless_layer(
+        layer: &LayerWeights,
+        layer_idx: usize,
+        hidden_states: &Tensor,
+        mask: StatelessAttentionMask<'_>,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        diagnostics::check_layer(hidden_states, "input", layer_idx, index_pos)?;
+        let residual = hidden_states.clone();
+        let hidden = layer.operator_norm.forward(hidden_states)?;
+        diagnostics::check_layer(&hidden, "operator norm", layer_idx, index_pos)?;
+        let hidden = match &layer.kind {
+            LayerKind::Attention(attention) => {
+                attention.forward_stateless(&hidden, mask, index_pos)?
+            }
+            LayerKind::ShortConv(shortconv) => shortconv.forward_stateless(&hidden)?,
+        };
+        diagnostics::check_layer(&hidden, "operator output", layer_idx, index_pos)?;
+        let hidden_states = (&hidden + &residual)?;
+        diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
+
+        let residual = hidden_states.clone();
+        let hidden = layer.ffn_norm.forward(&hidden_states)?;
+        let hidden = layer.mlp.forward(&hidden)?;
+        diagnostics::check_layer(&hidden, "MLP output", layer_idx, index_pos)?;
+        let hidden_states = (&hidden + &residual)?;
+        diagnostics::check_layer(&hidden_states, "residual", layer_idx, index_pos)?;
+        Ok(hidden_states)
+    }
+
+    /// The stateless forward fed incrementally (LFT-5): `input_embeds` are
+    /// the positions after those `stream` has consumed, and the result is
+    /// exactly their rows of [`Self::forward_embeds_stateless`] over the
+    /// whole sequence. The model is causal with bounded reach, so each layer
+    /// keeps only the inputs its operator can still see: the last
+    /// `sliding_window - 1` rows before an attention layer and the last
+    /// `l_cache - 1` rows before a ShortConv layer, and it runs them again
+    /// with the new rows at their absolute positions.
+    pub(crate) fn forward_embeds_stream(
+        &self,
+        stream: &mut Lfm2StatelessStream,
+        input_embeds: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, rows, hidden) = input_embeds.dims3()?;
+        if batch != 1 || hidden != self.cfg.embedding_length || rows == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 stream input does not match the loaded backbone".into(),
+            ));
+        }
+        let Some(window) = self.cfg.attention_sliding_window else {
+            return Err(Error::InvalidInput(
+                "LFM2 stateless streaming needs a sliding attention window".into(),
+            ));
+        };
+        if stream.tails.len() != self.layers.len() {
+            stream.tails = vec![None; self.layers.len()];
+        }
+        let start = stream.positions;
+        let mut hidden_states = input_embeds.clone();
+        for (layer_idx, (layer, tail)) in self.layers.iter().zip(&mut stream.tails).enumerate() {
+            let keep = match &layer.kind {
+                LayerKind::Attention(_) => window.saturating_sub(1),
+                LayerKind::ShortConv(shortconv) => shortconv.l_cache.saturating_sub(1),
+            };
+            let (full, cached) = match tail.as_ref() {
+                Some(tail) => (Tensor::cat(&[tail, &hidden_states], 1)?, tail.dim(1)?),
+                None => (hidden_states.clone(), 0),
+            };
+            let full_len = full.dim(1)?;
+            let kept = keep.min(full_len);
+            *tail = (kept > 0)
+                .then(|| full.narrow(1, full_len - kept, kept))
+                .transpose()?;
+            let mask = if full_len <= 1 {
+                StatelessAttentionMask::None
+            } else {
+                StatelessAttentionMask::Band(AttentionBand::causal_window(window))
+            };
+            hidden_states = Self::stateless_layer(layer, layer_idx, &full, mask, start - cached)?
+                .narrow(1, cached, rows)?;
+        }
+        stream.positions += rows;
+        let normalized = self.norm.forward(&hidden_states)?;
+        diagnostics::check(&normalized, "final norm", start)?;
+        Ok(normalized)
     }
 
     fn mask(&self, seq_len: usize, device: &Device) -> Result<Tensor> {
@@ -1873,6 +1945,21 @@ impl QuantizedLfm2Backbone {
             })
             .collect();
         Tensor::from_slice(&mask, (seq_len, seq_len), device).map_err(Error::from)
+    }
+}
+
+/// Per-layer input tails of [`QuantizedLfm2Backbone::forward_embeds_stream`]:
+/// the positions consumed and, before each layer, the rows its operator can
+/// still reach. Tensors are immutable, so a clone is an exact checkpoint.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lfm2StatelessStream {
+    positions: usize,
+    tails: Vec<Option<Tensor>>,
+}
+
+impl Lfm2StatelessStream {
+    pub(crate) fn positions(&self) -> usize {
+        self.positions
     }
 }
 
@@ -2054,7 +2141,7 @@ fn load_optional_bias_any(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         lfm25_cuda_flash_attention_options, lfm2_attention_position_masked,
         Lfm2ShortConvRuntimeState,
@@ -2168,6 +2255,15 @@ mod tests {
     /// 8-wide embeddings, GQA 2:1 and an optional sliding window, written to
     /// a temporary F32 GGUF and loaded for embeds.
     fn tiny_windowed_backbone(sliding_window: Option<u32>) -> super::QuantizedLfm2Backbone {
+        tiny_windowed_backbone_with_head(sliding_window, 5)
+    }
+
+    /// The tiny three-layer backbone (attention, ShortConv, attention) with
+    /// an output head of `head_outputs` rows.
+    pub(crate) fn tiny_windowed_backbone_with_head(
+        sliding_window: Option<u32>,
+        head_outputs: usize,
+    ) -> super::QuantizedLfm2Backbone {
         use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
         use gguf_file::Value;
 
@@ -2206,7 +2302,7 @@ mod tests {
         };
         add("token_embd.weight".into(), &[7, 8]);
         add("output_norm.weight".into(), &[8]);
-        add("dense_2.weight".into(), &[5, 8]);
+        add("dense_2.weight".into(), &[head_outputs, 8]);
         for layer in 0..3 {
             for name in ["attn_norm", "ffn_norm"] {
                 add(format!("blk.{layer}.{name}.weight"), &[8]);
@@ -2249,6 +2345,44 @@ mod tests {
         backbone
     }
 
+    /// LFT-5: feeding the stateless forward in uneven steps (single rows,
+    /// steps shorter and longer than the 30-row window) reproduces the
+    /// whole-sequence forward row for row, keeping only `window - 1` rows
+    /// before each attention layer and `l_cache - 1` before the ShortConv.
+    #[test]
+    fn streamed_stateless_forward_matches_the_whole_sequence() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let backbone = tiny_windowed_backbone(Some(30));
+        let embeds = xorshift_tensor(&[1, 300, 8], 23, 1.0, &Device::Cpu).unwrap();
+        let whole = host_f32(&backbone.forward_embeds_stateless(&embeds).unwrap()).unwrap();
+        let mut stream = super::Lfm2StatelessStream::default();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for step in [6usize, 1, 12, 47, 6, 100, 128] {
+            parts.push(
+                backbone
+                    .forward_embeds_stream(&mut stream, &embeds.narrow(1, start, step).unwrap())
+                    .unwrap(),
+            );
+            start += step;
+        }
+        assert_eq!(stream.positions(), 300);
+        let tails = stream
+            .tails
+            .iter()
+            .map(|tail| tail.as_ref().unwrap().dim(1).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tails, [29, 2, 29]);
+        let streamed = host_f32(&Tensor::cat(&parts, 1).unwrap()).unwrap();
+        let scale = whole.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let error = max_abs_diff(&streamed, &whole);
+        assert!(
+            error < 1e-5 * scale.max(1.0),
+            "streamed vs whole max abs {error}"
+        );
+    }
+
     /// LFT-6: the detokenizer's stateless forward runs its sliding-window
     /// attention banded (no `[heads, T, T]` planes) and matches the dense
     /// masked forward across query-block boundaries.
@@ -2284,6 +2418,64 @@ mod tests {
             host_f32(&causal.forward_embeds_stateless(&short).unwrap()).unwrap(),
             host_f32(&causal.forward_embeds_stateless_with(&short, true).unwrap()).unwrap()
         );
+    }
+
+    /// LFT-5 on the published detokenizer backbone (dequantized, as above):
+    /// 600 positions streamed in codec-frame steps (6 positions per frame)
+    /// match the whole-sequence forward.
+    #[test]
+    #[ignore = "needs the local LFM2.5-Audio tokenizer GGUF"]
+    fn published_detokenizer_stream_matches_whole_sequence() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+
+        let path = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            std::env::var_os("IZWI_TEST_LFM25_DETOKENIZER_GGUF")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(
+                            "Library/Application Support/izwi/models/LFM2.5-Audio-1.5B-GGUF/\
+                             tokenizer-LFM2.5-Audio-1.5B-Q4_0.gguf",
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let loader = crate::models::shared::weights::gguf::GgufLoader::from_path(&path).unwrap();
+        let config = super::super::config::parse_lfm2_backbone_config(&loader).unwrap();
+        let width = config.embedding_length;
+        let backbone = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            let previous = std::env::var_os("CANDLE_DEQUANTIZE_ALL");
+            std::env::set_var("CANDLE_DEQUANTIZE_ALL", "1");
+            let backbone =
+                super::QuantizedLfm2Backbone::load_for_embeds(&loader, config, &Device::Cpu);
+            match previous {
+                Some(value) => std::env::set_var("CANDLE_DEQUANTIZE_ALL", value),
+                None => std::env::remove_var("CANDLE_DEQUANTIZE_ALL"),
+            }
+            backbone.unwrap()
+        };
+        let embeds = xorshift_tensor(&[1, 600, width], 17, 1.0, &Device::Cpu).unwrap();
+        let whole = host_f32(&backbone.forward_embeds_stateless(&embeds).unwrap()).unwrap();
+        let mut stream = super::Lfm2StatelessStream::default();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        for frames in [1usize, 4, 2, 8, 16, 32, 37] {
+            let rows = frames * 6;
+            parts.push(
+                backbone
+                    .forward_embeds_stream(&mut stream, &embeds.narrow(1, start, rows).unwrap())
+                    .unwrap(),
+            );
+            start += rows;
+        }
+        assert_eq!(start, 600);
+        let streamed = host_f32(&Tensor::cat(&parts, 1).unwrap()).unwrap();
+        let rel = relative_l2(&streamed, &whole);
+        eprintln!("published detokenizer stream vs whole: relative L2 {rel:e}");
+        assert!(rel < 1e-5, "relative L2 {rel}");
     }
 
     /// The published LFM2.5-Audio detokenizer (window 30, 16 heads) gives the
